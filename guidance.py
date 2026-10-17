@@ -561,6 +561,32 @@ def _withheld(meta, since, warning):
             'warning': warning + '. ' + REPAIR_NEXT_ACTION, 'next_action': REPAIR_NEXT_ACTION}
 
 
+#: The one sentence every reader shows while this actor has not acknowledged the current
+#: version (kittrial-5bb.325). The guidance TEXT is never copied: a reader gets the
+#: version and the command, and reads the text through `guidance get`.
+ITEM_TITLE = 'Guidance changed since you last acknowledged it'
+ITEM_COMMAND = 'guidance get, then guidance ack --version %s'
+ITEM_TEXT = (ITEM_TITLE + '. Read it with `guidance get`, then record the read with '
+             '`guidance ack --version %s`.')
+
+
+def move_item(version, actor):
+    """The one move row a reader adds when ACTOR has not acknowledged VERSION.
+
+    It is the caller's own move (``whose_move`` 'you'), and it carries the version in a
+    field the wait fingerprint covers (``guidance_version``, see waiting.MOVE_FIELDS), so
+    a blocking wait wakes for a new version and its fingerprint changes when the version
+    changes or the acknowledgement clears it. Version and command only, never the text.
+    """
+    return {'task': 'guidance', 'kind': 'guidance', 'title': ITEM_TITLE,
+            'whose_move': 'you', 'next_actor': actor,
+            'review_state': 'guidance-changed',
+            'guidance_version': version,
+            'command': ITEM_COMMAND % version,
+            'text': ITEM_TEXT % version,
+            'source': 'guidance version %s' % version}
+
+
 def state(path, actor=None, operators=None):
     """The version block shared by the read, brief, work and resume responses.
 
@@ -596,6 +622,12 @@ def state(path, actor=None, operators=None):
         result['warning'] = warning
     if result['attention']:
         result['next_action'] = REPAIR_NEXT_ACTION if result['unbound'] else 'guidance get'
+    # The ONE move row (kittrial-5bb.325): present only for a named actor that has not
+    # acknowledged a present, BOUND current version. Withheld text keeps today's
+    # attention/repair behaviour and gets no item; a project with no guidance has none;
+    # an unreadable guidance record answers before this line and keeps its own shape.
+    result['item'] = (move_item(current, actor)
+                      if actor and current is not None and bound and not acknowledged else None)
     return result
 
 

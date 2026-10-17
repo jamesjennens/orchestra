@@ -503,6 +503,16 @@ class InProcessBackend:
         service = (self.actor_namespace, actor_names.SERVICE_NAMESPACE)
         return {name: actor_names.collision(name, service=service) for name in names}
 
+    def guidance_state(self, project_id, actor):
+        """No guidance store in this backend: answer ``None``, never an error.
+
+        This service-local backend has no host project directory, so it cannot hold the
+        standing guidance at all. ``None`` means "not readable here" and the agent
+        routes add no guidance item; the canonical endpoint backend
+        (:meth:`EndpointBackend.guidance_state`) is the one that reads it.
+        """
+        return None
+
     @property
     def state(self):
         return self.service.state['canonical']
@@ -3067,6 +3077,21 @@ class EndpointBackend:
         steps as not available on this server.
         """
         return self._run('setup-status', project_id, self.actor_namespace + '/read', [])
+
+    def guidance_state(self, project_id, actor):
+        """One actor's guidance version block (kittrial-5bb.325).
+
+        Read from the project's coordination sidecar under this service's runtime root
+        (``<root>/projects/<project>``), the same files the host's ``setup-status`` read
+        uses, with the same module the endpoint uses, so the web agent routes cannot
+        disagree with ``work``, ``brief`` or ``session resume`` about the current version,
+        this actor's acknowledgement, or the one move item. It costs no endpoint read, so
+        the one-cheap-read rule of the polled routes (kittrial-5bb.281/.285) still holds.
+        Version and command only: the guidance TEXT never enters an agent answer.
+        """
+        import guidance as guidance_module
+        project_path = Path(self.root) / 'projects' / project_id
+        return guidance_module.brief_block(project_path, actor)
 
     #: How long the host's session names of one project are reused (kittrial-5bb.198). A task
     #: list names its assignees on every read, and a session registered just now may show by
@@ -5880,6 +5905,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(ctx.principal, project_id):
                 continue
+            # The guidance acknowledgement is a move row too (kittrial-5bb.325), so a web
+            # agent's wait wakes for a new version and its fingerprint changes with it;
+            # the row is the same one /v1/agents/me/next shows as its first next_action.
+            item = self._agent_guidance_item(project_id, actor)
+            if item is not None:
+                rows.append(dict(item, project=project_id))
             read = self._agent_project_tasks(project_id)
             for task in read.get('tasks') or []:
                 if not isinstance(task, dict):
@@ -6602,6 +6633,42 @@ class ApiHandler(BaseHTTPRequestHandler):
                                   # its limit is still handed somewhere to go.
                                   'claim_limit_refusal': True})
 
+    def _agent_guidance_item(self, project_id, actor):
+        """This actor's guidance move item for one project, or None (kittrial-5bb.325).
+
+        A backend with no guidance store (the in-process test backend) or a guidance
+        read that fails answers None: a guidance read never turns another read into an
+        error, exactly as an unreadable guidance record keeps its own repaired shape.
+        The item carries the version and the command, never the guidance text.
+        """
+        reader = getattr(self.backend, 'guidance_state', None)
+        if reader is None:
+            return None
+        try:
+            block = reader(project_id, actor)
+        except Exception:
+            return None
+        item = block.get('item') if isinstance(block, dict) else None
+        return item if isinstance(item, dict) else None
+
+    @staticmethod
+    def _guidance_action(project_id, actor, item):
+        """The one guidance acknowledgement as the agent's first next_action.
+
+        Priority 0 puts it ahead of every task action: the coordinator cannot reach a run
+        prompt that never calls `guidance get`, so a changed guidance version is the
+        agent's own move on its queue (kittrial-5bb.325). It carries the version and the
+        command the endpoint's own item names, and no task link, because it is not a task.
+        """
+        return {'priority': 0, 'kind': 'guidance', 'project': project_id,
+                'task': item.get('task') or 'guidance',
+                'title': item.get('title'), 'status': None,
+                'review_state': item.get('review_state'),
+                'assignee': actor, 'reason': item.get('text'),
+                'command': item.get('command'),
+                'guidance_version': item.get('guidance_version'),
+                'links': {'project': '/v1/projects/%s' % project_id}}
+
     def _agent_attention(self, principal, agent, many=False):
         """Owner/agent-visible attention, computed at read time from bounded reads.
 
@@ -6633,13 +6700,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
                   'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
-                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0}
+                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0, 'guidance': 0}
         #: The rows that count against this agent's claim limit and hard cap, by the one
         #: rule the gate uses, so /v1/agents/me/next and the gate cannot disagree about
         #: held and available (kittrial-5bb.276 revision; hard cap in kittrial-5bb.300).
         claim_held = 0
         claim_blocked = 0
         own_actions = []
+        guidance_actions = []
         claimable_actions = []
         review_actions = []
         truncated = False
@@ -6647,6 +6715,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(principal, project_id):
                 continue
+            # The guidance acknowledgement (kittrial-5bb.325) is this agent's own move in
+            # every project it may read: one row per project whose current version this
+            # actor has not acknowledged. No guidance set means no row.
+            #
+            # Single-agent reads only: this item is the calling agent's own move, so the
+            # owner's multi-agent listing (``many``) does not pay one extra host read per
+            # agent per project for a row its reader cannot act on.
+            if not many:
+                item = self._agent_guidance_item(project_id, actor)
+                if item is not None:
+                    counts['guidance'] += 1
+                    guidance_actions.append(self._guidance_action(project_id, actor, item))
             try:
                 read = self._agent_project_tasks(project_id,many=many)
                 own = self._agent_own_tasks(project_id, actor, many=many)
@@ -6779,7 +6859,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if counts['review_recommended'] + counts['to_review'] > len(review_actions):
             truncated = True
             actions_truncated = True
-        actions = own_actions + review_actions + claimable_actions
+        actions = guidance_actions + own_actions + review_actions + claimable_actions
         actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0),
                                    0 if a['kind'] == 'in-progress' and a.get('newer_activity') is True else 1,
                                    a['project'], a['task']))
@@ -6807,19 +6887,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'unknown'
         else:
             state = 'idle'
-        return {'state': state, 'summary': self._agent_summary(
-                    state, counts, snapshot_truncated, own_tasks_truncated)
-                    + self._agent_review_summary(counts, snapshot_truncated)
-                    + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
-                        % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
-                       if counts['newer_activity'] else ''),
+        summary = (self._agent_summary(state, counts, snapshot_truncated, own_tasks_truncated)
+                   + self._agent_review_summary(counts, snapshot_truncated)
+                   + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
+                       % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
+                      if counts['newer_activity'] else ''))
+        if guidance_actions:
+            # A changed guidance version leads, because it changes what the agent should do
+            # next and no run prompt is guaranteed to run `guidance get` (kittrial-5bb.325).
+            summary = ('The project guidance changed since this agent last acknowledged it; read it and '
+                       'record the read before other work. ' + summary)
+        return {'state': state, 'summary': summary,
                 'counts': counts, 'claim_limit_held': claim_held,
                 'claim_limit_blocked': claim_blocked, 'actions': actions,
                 'truncated': truncated,
                 'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
                 'actions_truncated':actions_truncated,
                 'computed_at': now_iso(self.service._now())}
-
     @staticmethod
     def _agent_summary(state, counts, snapshot_truncated=False, own_tasks_truncated=False):
         claimable = ('at least ' if snapshot_truncated else '') + str(counts.get('claimable', 0))
@@ -6915,8 +6999,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         where = (' in %s' % directory) if directory else ''
         first = attention['actions'][0] if attention['actions'] else None
         if first:
-            what = ('Next: %s on %s in project %s.'
-                    % (first['kind'], first['task'], first['project']))
+            if first.get('kind') == 'guidance':
+                # The guidance row is not a task (kittrial-5bb.325): name the command.
+                what = ('Next: the project guidance changed; %s.'
+                        % (first.get('command') or 'run guidance get, then guidance ack --version VERSION'))
+            else:
+                what = ('Next: %s on %s in project %s.'
+                        % (first['kind'], first['task'], first['project']))
         else:
             what = 'There is nothing queued right now.'
         # kittrial-5bb.48: the secret never reaches curl's argv. curl reads the header
