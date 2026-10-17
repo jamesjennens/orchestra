@@ -88,7 +88,74 @@ def drop_internal_from_ready(rows):
     return shown
 
 
-def claimable(issue_type, status, assignee, contribution_id, review_state, record_anchor=False, labels=None):
+#: The dependency types that block a claim. ``parent-child`` and ``related`` do not
+#: (kittrial-5bb.293 item 3b: only the blocking type blocks).
+BLOCKING_DEPENDENCY_TYPES = frozenset({'blocks', 'blocked-by', 'depends'})
+
+
+def dependency_ref(dep):
+    """(other_id, type, other_status) from one dependency entry, in either native shape.
+
+    ``bd export`` writes ``depends_on_id``/``type`` and no status; ``bd show`` writes
+    expanded issues keyed ``id``/``dependency_type`` that DO carry the other end's
+    ``status`` (kittrial-5bb.293 rev3/rev4). All three are read so every surface
+    answers the same fact, and a single-task view can see the block without a
+    snapshot of the other end.
+    """
+    if not isinstance(dep, dict):
+        return None, None, None
+    other = dep.get('depends_on_id') or dep.get('id')
+    kind = dep.get('type') or dep.get('dependency_type')
+    status = dep.get('status') or dep.get('depends_on_status')
+    return other, kind, status
+
+
+def dependency_index(rows):
+    """One id -> row map for a snapshot, so per-row checks do not rebuild it."""
+    return {r.get('id'): r for r in rows or [] if isinstance(r, dict) and r.get('id')}
+
+
+def open_dependency_ids(row, rows, index=None):
+    """The ids of ``row``'s dependencies whose task is not closed (kittrial-5bb.293).
+
+    A bd dependency (``bd dep``) whose other end is still open blocks the task: it
+    must not look claimable. Only the blocking types block (kittrial-5bb.293 item 3b):
+    ``parent-child`` and ``related`` do not. ``rows`` is the snapshot the caller
+    already holds; ``index`` is its :func:`dependency_index` (built once per snapshot,
+    item 2a). A dependency whose task is missing from the snapshot is unknown and is
+    NOT counted as open (the claim can still be refused atomically).
+    """
+    if not isinstance(row, dict):
+        return []
+    by_id = index if index is not None else (dependency_index(rows) if rows is not None else None)
+    open_ids = []
+    for dep in row.get('dependencies') or []:
+        other_id, kind, dep_status = dependency_ref(dep)
+        if kind not in BLOCKING_DEPENDENCY_TYPES:
+            continue
+        other = by_id.get(other_id) if by_id is not None else None
+        if isinstance(other, dict):
+            status = other.get('status')
+        elif dep_status is not None:
+            status = dep_status
+        else:
+            continue
+        if status != 'closed':
+            open_ids.append(str(other_id))
+    return open_ids
+
+
+def open_dependency_sentence(open_ids):
+    """One plain sentence naming the open dependency a claim is refused for."""
+    if not open_ids:
+        return None
+    names = ', '.join('`%s`' % i for i in open_ids[:5])
+    more = '' if len(open_ids) <= 5 else ' (and %d more)' % (len(open_ids) - 5)
+    return 'Task is blocked by an open dependency: %s%s. Close it first.' % (names, more)
+
+
+def claimable(issue_type, status, assignee, contribution_id, review_state, record_anchor=False,
+              labels=None, open_dependencies=None):
     """One bounded interpretation of claimable work (kittrial-5bb.6 deliverable b).
 
     Advisory only: claimability is not a reservation, and an atomic claim can still
@@ -101,6 +168,8 @@ def claimable(issue_type, status, assignee, contribution_id, review_state, recor
     or a requirement record by the `requirement`/`brd-section` LABEL (kittrial-5bb.277),
     which is never claimable whatever its status, assignee or contribution.
     """
+    if open_dependencies:
+        return False
     if str(issue_type or 'task') in CLAIMABLE_EXCLUDED_TYPES:
         return False
     if record_anchor:
@@ -779,6 +848,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     from reserved_comments import is_record_anchor
     from review_workflow import author_key
     from coordination import is_merge_slot
+    dep_index=dependency_index(rows)
     malformed_named=[]
     unparseable_count=0
     for row in rows:
@@ -983,9 +1053,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # The one bounded claimability answer for this row (kittrial-5bb.6 deliverable b).
         # It is computed before the move because next_actor needs it: an unassigned,
         # undelivered row may name `anyone` only when somebody could actually take it.
+        row_open_deps=open_dependency_ids(row,rows,index=dep_index)
         row_claimable=claimable(row.get('issue_type'),row.get('status'),row.get('assignee'),
                                 contribution.get('comment_id'),state,
-                                record_anchor=is_record_anchor(row),labels=row.get('labels'))
+                                record_anchor=is_record_anchor(row),labels=row.get('labels'),
+                                open_dependencies=row_open_deps)
         # Whose move it is, one plain sentence saying so, and the caller-neutral ROLE of
         # that same decision -- ONE call, so a row can never name one mover and deny
         # another (kittrial-5bb.6 review item 2). Derived from the validated review state

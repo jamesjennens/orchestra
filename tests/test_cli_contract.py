@@ -175,7 +175,10 @@ class WorkHelpContractTests(unittest.TestCase):
         # reference-review attention fields (kittrial-5bb.66, .41 7.1).
         self.assertLessEqual(BRIEF_FIELDS, set(result))
         self.assertEqual(set(result) - BRIEF_FIELDS, {'attention', 'attention_total', 'attention_more',
-                                                      'reference_drafts_matching','newer','directions'})
+                                                      'reference_drafts_matching','newer','directions',
+                                                      # kittrial-5bb.293 item 1: how to read a cut
+                                                      # field over the caller's own route.
+                                                      'read_whole'})
 
 
 class CheckpointErrorContractTests(unittest.TestCase):

@@ -222,6 +222,54 @@ def _native_anchor_rows(root,path,actor,tokens):
         resolved[token]=(rid,row)
     return resolved
 
+def _claims_the_row(args):
+    """True when the bd invocation claims the row or makes it in_progress (kittrial-5bb.293).
+
+    Flags are matched by PARSED argument, not substring: a ``--notes`` text that
+    contains ``in_progress`` never triggers this (rev3).
+    """
+    args=list(args or [])
+    if '--claim' in args or any(a.startswith('--claim=') for a in args):
+        return True
+    for i,a in enumerate(args):
+        if a in ('--status','-s') and i+1<len(args) and args[i+1]=='in_progress':
+            return True
+        if a.startswith('--status=') and a.split('=',1)[1]=='in_progress':
+            return True
+    return False
+
+
+def _guard_open_dependency_on_claim(root,path,actor,row):
+    """Refuse a claim on a task blocked by an open dependency (kittrial-5bb.293 item 3a)."""
+    from work import BLOCKING_DEPENDENCY_TYPES, dependency_index, dependency_ref, open_dependency_ids, open_dependency_sentence
+    deps=[]
+    ids=[]
+    for d in row.get('dependencies') or []:
+        other_id,kind=dependency_ref(d)
+        if kind in BLOCKING_DEPENDENCY_TYPES and other_id:
+            deps.append(d);ids.append(other_id)
+    if not deps:return
+    # Fail CLOSED: read the other ends in ONE native read; a missing one is open.
+    completed=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,
+                             'show',*ids,'--json'],env=environment(root),
+                            capture_output=True,text=True,encoding='utf-8',timeout=60)
+    try:
+        others=json.loads(completed.stdout or '[]')
+    except ValueError:
+        others=[]
+    if isinstance(others,dict):others=[others]
+    by_id=dependency_index([r for r in others if isinstance(r,dict)])
+    missing=[i for i in ids if i not in by_id]
+    if missing:
+        raise ValueError('Refusing to claim %s: it is blocked by an open dependency: `%s`. '
+                         'Its status cannot be read, so the claim is refused.'
+                         %(row.get('id'),'`, `'.join(missing[:5])))
+    open_deps=open_dependency_ids(row,[r for r in others if isinstance(r,dict)],index=by_id)
+    if open_deps:
+        raise ValueError('Refusing to claim %s: %s'
+                         %(row.get('id'),open_dependency_sentence(open_deps) or 'it is blocked by an open dependency'))
+
+
 def _guard_record_anchor_status(root,path,args,actor):
     """Read-before-write guard: a status change never moves a record anchor.
 
@@ -255,6 +303,12 @@ def _guard_record_anchor_status(root,path,args,actor):
         if is_merge_slot(row):
             raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
                              %(command,canonical,merge_slot_sentence(canonical)))
+        # A claim (or an assignee/status change that makes the row in_progress) on a
+        # task blocked by an open dependency is refused, the same rule the HTTP claim
+        # route and work.claimable() apply (kittrial-5bb.293 item 3a). Fails CLOSED
+        # when the other ends cannot be read (item 3c).
+        if command in ('claim', 'update') and _claims_the_row(args):
+            _guard_open_dependency_on_claim(root,path,actor,row)
 
 def _guard_record_anchor_title(root,path,args,actor,rows=None):
     """Read-before-write guard: the title of a record anchor is not changed through bd (kittrial-5bb.97).
