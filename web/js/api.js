@@ -392,6 +392,9 @@ export function createApi(transport) {
     checkpoint: (pid, tid, body) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/checkpoints`, body),
     review: (pid, tid, body) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/reviews`, body),
     queue: (pid, params) => call('GET', `/v1/projects/${pid}/queue`, { params }),
+    // The lane board (kittrial-5bb.263): one server read of who holds what, who is free and
+    // the three flags. `idle_minutes` is this page's argument, `limit`/`cursor` page it.
+    lanes: (pid, params) => call('GET', `/v1/projects/${pid}/lanes`, { params }),
     myWork: () => call('GET', '/v1/me/work'),
     agents: (params) => call('GET', '/v1/agents', { params }),
     // A document of the installed kit, as the client's `docs NAME` serves it (kittrial-5bb.226).
