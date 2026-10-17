@@ -2526,7 +2526,10 @@ class EndpointBackend:
 
     def owner_requirements(self, principal, project_id, action, fields, key, task=None):
         operation_id=self._result_key(principal,project_id,'requirements.'+action,key,task)
-        authority=authority_request(principal,project_id,CAP_PROJECT_ADMIN,now=self.service._expiry_now())
+        # `coordinate`: an owner holds it, a coordinator holds it by role, and an agent
+        # credential holds it only through the project's coordinator grant
+        # (kittrial-5bb.278). The endpoint re-decides the same capability.
+        authority=authority_request(principal,project_id,CAP_COORDINATE,now=self.service._expiry_now())
         args=[action]+([task] if task is not None else [])
         attachment={'payload':{'flag':'--file','text':json.dumps(fields,ensure_ascii=False)}}
         reply=self._endpoint('owner-requirements',project_id,principal.user_id,args,attachment,
@@ -2540,7 +2543,7 @@ class EndpointBackend:
         return self._checked(reply)
 
     def owner_requirement_recoveries(self, principal, project_id):
-        authority=authority_request(principal,project_id,CAP_PROJECT_ADMIN,now=self.service._expiry_now())
+        authority=authority_request(principal,project_id,CAP_COORDINATE,now=self.service._expiry_now())
         reply=self._endpoint('owner-requirements',project_id,principal.user_id,['recoveries'],
                              authority=authority,require_authority=True,route='requirements.recoveries')
         return self._checked(reply,reading=True)
@@ -7812,23 +7815,57 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not hasattr(self.backend,'requirements_read') or not hasattr(self.backend,'owner_requirements'):
             raise not_implemented('Requirements editing needs the canonical tracker backend')
 
+    def _requirement_editor_here(self, ctx, pid=None):
+        """The requirement editor this caller is here, or None (kittrial-5bb.278).
+
+        One rule with the canonical endpoint: `http_authority.requirement_editor` reads
+        the live membership or the live coordinator grant, so a page render and the
+        effect-time check cannot disagree about who may write.
+        """
+        import http_authority
+        try:
+            return http_authority.requirement_editor(
+                self.service.state, pid or ctx.params['pid'],
+                {'via': ctx.principal.via, 'user_id': ctx.principal.user_id,
+                 'credential_id': ctx.principal.credential_id})
+        except http_authority.AuthorityDenied:
+            return None
+
     def _requirements_owner(self, ctx):
-        pid=ctx.params['pid']
-        self._project(ctx,CAP_PROJECT_ADMIN)
-        if (ctx.principal.via!='session' or ctx.principal.credential_id or ctx.principal.agent_id
-                or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
-            raise forbidden('Requirements editing needs the signed-in project owner')
+        """Authorize one requirements route: a project's owner OR coordinator may write.
+
+        `coordinate` is the live capability (an owner holds it, a coordinator holds it by
+        role, and an agent credential holds it only through the project's coordinator
+        grant). The capability check runs first so a non-member keeps the service's own
+        answer (404, never a hint that the project exists) and an expired or revoked
+        credential keeps its own sentence; a member or credential that is merely not the
+        project's editor gets one sentence naming the rule. The membership/grant rule
+        itself is :func:`http_authority.requirement_editor`: the same function the
+        canonical endpoint re-checks at effect time.
+        """
+        pid = ctx.params['pid']
+        import http_authority
+        try:
+            self._project(ctx, CAP_COORDINATE)
+        except HttpError as error:
+            if error.status != 403:
+                raise
+            raise forbidden(http_authority.REQUIREMENT_EDITOR_REFUSED) from None
+        editor = self._requirement_editor_here(ctx, pid)
+        if editor is None:
+            raise forbidden(http_authority.REQUIREMENT_EDITOR_REFUSED)
+        return editor
 
     def _requirements_state_only(self, ctx, result):
         """A member who cannot finish the transition reads the state, not its handles.
 
-        A current owner still receives the exact operation id and receipt hash its
-        finish/abandon route needs; contributors and viewers receive the state,
-        reason and a sentence naming who can act.
+        A current owner OR coordinator still receives the exact operation id and receipt
+        hash its finish/abandon route needs (kittrial-5bb.278: a coordinator may finish
+        what it may also start); contributors and viewers receive the state, reason and a
+        sentence naming who can act.
         """
         pid=ctx.params['pid']
-        owner=(ctx.principal.via=='session' and not ctx.principal.agent_id
-               and self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)=='owner')
+        owner=self._requirement_editor_here(ctx,pid) is not None
         if owner:
             return result
         def without_operation(record):
@@ -7887,7 +7924,11 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _requirements_write(self, ctx, action, status=200):
         self._requirements_backend()
-        self._requirements_owner(ctx)
+        editor=self._requirements_owner(ctx)
+        if action=='governance' and editor.get('role')!='owner':
+            # The coordinator's decision 11(i) of kittrial-5bb.278: the governance-mode
+            # switch changes the rules, not requirement text, so it stays the owner's.
+            raise forbidden('Switching requirements governance needs the signed-in project owner')
         fields,operation_id=self._proposal_body(ctx,{
             'create':('kind','parent','title','description','key'),
             'revise':('expected_revision','expected_sha256','title','description'),
@@ -7924,12 +7965,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                         recorded[token]=ctx.request_id
             return result,result
         return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
-                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True,
+                            capability=CAP_COORDINATE,serialize=False,canonical=True,
                             # Terminal replay authority belongs to the canonical
                             # owner adapter. Its durable identity still deduplicates
                             # effects; a service response must not bypass that check.
                             idempotent=action not in ('withdraw','supersede','finish','abandon'),
-                            audit_success=action not in ('withdraw','supersede','finish','abandon'))
+                            audit_success=action not in ('withdraw','supersede','finish','abandon'),
+                            audit_metadata=self._requirement_agent_audit(ctx))
+
+    def _requirement_agent_audit(self, ctx):
+        """The agent that acted, and its grant, recorded beside the human account.
+
+        A person's own write adds nothing: the audit entry already carries the account.
+        For an agent credential the accepting party stays the human account (owner
+        decision 11(ii) of kittrial-5bb.278), so the entry names the agent and the exact
+        grant it acted on. Bounded, redacted values only.
+        """
+        editor = self._requirement_editor_here(ctx, ctx.params.get('pid'))
+        if not editor or not editor.get('agent_id'):
+            return None
+        grant = editor.get('grant') or {}
+        return {'acting_agent': editor['agent_id'],
+                'coordinator_grant': {'granted_by': grant.get('granted_by'),
+                                      'granted_at': grant.get('granted_at')}}
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
@@ -7956,13 +8014,137 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
         result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
-        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
-                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        result['can_edit']=self._requirements_page_editor(ctx)
         return 200,result
+
+    def _requirements_page_editor(self,ctx):
+        """Whether this page is editable IN THE BROWSER for this caller.
+
+        A person's page (owner or coordinator, kittrial-5bb.278); an agent credential uses
+        the routes and http_client. Unchanged for an owner, so no owner sees a difference.
+        """
+        if ctx.principal.via!='session' or ctx.principal.agent_id:
+            return False
+        return self._requirement_editor_here(ctx,ctx.params['pid']) is not None
 
     @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements')
     def requirements_create(self,ctx):
         return self._requirements_write(ctx,'create',status=201)
+
+    #: One batch acceptance is bounded (kittrial-5bb.278): one action, many requirements.
+    REQUIREMENT_BATCH_MAX = 200
+    #: Said of every item a stopped batch never reached, so none is silently dropped.
+    REQUIREMENT_BATCH_NOT_ATTEMPTED = ('Not attempted: stop_on_error stopped this batch after an '
+                                       'earlier item was refused.')
+
+    def _requirements_batch_items(self, ctx):
+        """Validate the whole batch before ANY effect; a bad item refuses the request."""
+        payload = dict(ctx.payload or {})
+        operation_id = payload.pop('operation_id', None)
+        if operation_id is not None:
+            raise invalid('Use the Idempotency-Key header for requirements writes')
+        unknown = sorted(set(payload) - {'items', 'stop_on_error'})
+        if unknown:
+            raise invalid('A batch acceptance does not take: %s' % ', '.join(unknown)[:200])
+        stop = payload.get('stop_on_error', False)
+        if not isinstance(stop, bool):
+            raise invalid('stop_on_error must be true or false')
+        items = payload.get('items')
+        if not isinstance(items, list) or not items:
+            raise invalid('A batch acceptance needs 1 to %d items' % self.REQUIREMENT_BATCH_MAX)
+        if len(items) > self.REQUIREMENT_BATCH_MAX:
+            raise invalid('A batch acceptance takes at most %d items' % self.REQUIREMENT_BATCH_MAX)
+        import requirement_governance as governance
+        seen, checked = set(), []
+        for item in items:
+            if not isinstance(item, dict):
+                raise invalid('Each batch item is an object with id, expected_revision and '
+                              'expected_sha256')
+            unknown = sorted(set(item) - {'id', 'expected_revision', 'expected_sha256'})
+            if unknown:
+                raise invalid('A batch item does not take: %s' % ', '.join(unknown)[:200])
+            rid = item.get('id')
+            if not isinstance(rid, str) or not SAFE_ID.match(rid):
+                raise invalid('Each batch item needs a requirement id')
+            if rid in seen:
+                raise invalid('A batch acceptance names requirement %s twice' % rid)
+            seen.add(rid)
+            expected_revision = item.get('expected_revision')
+            if type(expected_revision) is not int or expected_revision < 1:
+                raise invalid('Invalid expected requirements revision for %s' % rid)
+            try:
+                governance.digest(item.get('expected_sha256'))
+            except ValueError:
+                raise invalid('Expected requirements hash is required for %s; reload and try again'
+                              % rid) from None
+            checked.append({'id': rid, 'expected_revision': expected_revision,
+                            'expected_sha256': item['expected_sha256']})
+        return checked, stop
+
+    @staticmethod
+    def _requirement_batch_reason(error):
+        """The refused item's own sentence: the canonical detail when there is one.
+
+        ``_checked`` keeps a canonical refusal's own words in ``detail`` and a generic
+        sentence in ``message``. A batch answer must say WHY an item was not accepted, so
+        the detail wins, bounded, with the endpoint's ``ValueError:`` prefix removed.
+        """
+        for text in (error.detail, error.message):
+            if isinstance(text, str) and text.strip():
+                said = text.strip()
+                if said.startswith('ValueError: '):
+                    said = said[len('ValueError: '):]
+                return said[:300]
+        return 'Not accepted'
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/accept-batch')
+    def requirements_accept_batch(self,ctx):
+        """Accept many requirements in one action (kittrial-5bb.278, slice 10).
+
+        Per item, and no rollback (the coordinator's decision 11(iii)): a native acceptance
+        cannot be undone, so a refused item changes nothing while the items around it stay
+        accepted. Each item runs the SAME canonical adapter as a single acceptance, with its
+        own operation id derived from this request's Idempotency-Key and the item id, so an
+        exact replay of the batch accepts nothing twice. `stop_on_error` (optional, default
+        false) stops after the first refusal, and every item it never reached is listed as
+        refused with the reason it was not attempted: nothing is dropped silently.
+        """
+        self._requirements_backend()
+        self._requirements_owner(ctx)
+        items, stop = self._requirements_batch_items(ctx)
+        pid = ctx.params['pid']
+        if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
+            raise invalid('This project uses governed requirements. Ask its owner to enable simple editing.')
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            accepted, refused = [], []
+            for position, item in enumerate(items):
+                fields = {'expected_revision': item['expected_revision'],
+                          'expected_sha256': item['expected_sha256']}
+                try:
+                    result = self.backend.owner_requirements(ctx.principal, pid, 'accept', fields,
+                                                             key, item['id'])
+                except HttpError as error:
+                    # The words of a refusal are the answer (kittrial-5bb.156); an uncertain
+                    # outcome is not, and must stop the batch instead of being reported as a
+                    # per-item refusal.
+                    if error.status >= 500:
+                        raise
+                    refused.append({'id': item['id'],
+                                    'reason': self._requirement_batch_reason(error)})
+                    if stop:
+                        refused.extend({'id': rest['id'],
+                                        'reason': self.REQUIREMENT_BATCH_NOT_ATTEMPTED}
+                                       for rest in items[position + 1:])
+                        break
+                else:
+                    accepted.append(result)
+            answer = {'accepted': accepted, 'refused': refused,
+                      'summary': {'accepted': len(accepted), 'refused': len(refused)}}
+            return answer, answer
+        return self._mutate(ctx,'requirements.accept-batch',pid,write,capability=CAP_COORDINATE,
+                            serialize=False,audit_metadata=self._requirement_agent_audit(ctx))
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
     def requirements_get(self,ctx):
@@ -7972,8 +8154,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
-        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
-                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        result['can_edit']=self._requirements_page_editor(ctx)
         return 200,result
 
     def _requirement_author(self,ctx,item):
@@ -7987,7 +8168,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         account=author.get('text')
         user=self.service.state.get('users',{}).get(account)
         role=self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(account)
-        if not isinstance(user,dict) or role!='owner':
+        if not isinstance(user,dict) or role not in ('owner','coordinator'):
             result['pending_author']={'kind':'unknown','text':'', 'omitted_chars':0,'at':author.get('at')}
             return result
         name=user.get('display_name') or user.get('username')

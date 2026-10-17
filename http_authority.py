@@ -608,6 +608,88 @@ def coordinator_grant_capabilities(state, credential, project_id, held):
     return frozenset(cap for cap in GRANT_CAPABILITIES if cap in held)
 
 
+#: Who may write and accept a project's own requirements on the web (kittrial-5bb.278,
+#: slice 10). A signed-in member needs one of these current roles; an agent needs the
+#: project's coordinator grant beside its own account holding coordinate here.
+REQUIREMENT_EDITOR_ROLES = ('owner', 'coordinator')
+
+#: Said to everyone who may not edit a project's requirements, whatever name they sent.
+#: It names the rule and the people who can act; it never names the operator allowlist,
+#: which is not consulted on this path at all.
+REQUIREMENT_EDITOR_REFUSED = (
+    "Editing a project's requirements needs its owner or a coordinator: a signed-in "
+    "member with the coordinator or owner role, or an agent holding the project's "
+    "coordinator grant.")
+
+
+def requirement_editor(state, project_id, request):
+    """``{'account_id', 'agent_id', 'grant', 'role'}`` of a project's requirement editor.
+
+    A project's coordinator edits, accepts, withdraws and supersedes requirements on the
+    web exactly as its owner does (kittrial-5bb.278; owner decision 01a13b6f allows
+    self-acceptance). Two shapes are accepted, both read from LIVE state on every call:
+
+    * a signed-in person whose current membership of the project is ``owner`` or
+      ``coordinator`` (the membership is required, as it always has been here: a superuser
+      who is not a member of the project is not its requirements editor);
+    * an agent credential whose agent holds the project's coordinator grant while the
+      credential's own human account still holds ``coordinate`` there. The account named
+      in the record stays that human account (the party owner decision 11(ii) settled);
+      the agent and its grant are recorded beside it in the service audit.
+
+    Anything else is denied with :data:`REQUIREMENT_EDITOR_REFUSED`. No operator
+    allowlist is read here: the host commands keep their own.
+
+    ``request`` is an :func:`authority_request` descriptor (or the ``authority`` block the
+    service sends the canonical endpoint), so both the web service and the endpoint judge
+    the same fields.
+    """
+    if not isinstance(state, dict):
+        raise deny(401, 'unauthenticated', 'Service authority state is unavailable')
+    via = request.get('via')
+    user_id = request.get('user_id')
+    if not isinstance(user_id, str) or not user_id:
+        raise deny(401, 'unauthenticated', 'Authentication required')
+    if via == 'session':
+        user = state.get('users', {}).get(user_id)
+        if not isinstance(user, dict) or user.get('disabled'):
+            raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
+        # The project's own membership is what counts here, exactly as before this slice:
+        # a superuser who is not a member of the project is not its requirements editor.
+        # (Every other route reads a superuser as the project's owner; this one has always
+        # required the membership, and slice 10 does not widen it.)
+        role = state.get('memberships', {}).get(project_id, {}).get(user_id)
+        if role not in REQUIREMENT_EDITOR_ROLES:
+            raise deny(403, 'forbidden', REQUIREMENT_EDITOR_REFUSED)
+        return {'account_id': user_id, 'agent_id': None, 'grant': None, 'role': role}
+    if via != 'credential':
+        raise deny(401, 'unauthenticated', 'Authentication required')
+    credential = state.get('credentials', {}).get(request.get('credential_id'))
+    if not isinstance(credential, dict):
+        raise deny(401, 'unauthenticated', CREDENTIAL_EXPIRED_MESSAGE)
+    agent_id = credential.get('agent_id')
+    grant = coordinator_grant(state, project_id, agent_id) if agent_id else None
+    if agent_id is None or grant is None:
+        raise deny(403, 'forbidden', REQUIREMENT_EDITOR_REFUSED)
+    agent = state.get('agents', {}).get(agent_id)
+    if not isinstance(agent, dict) or not agent.get('enabled'):
+        raise deny(401, 'unauthenticated', 'Agent is disabled')
+    if project_id not in (agent.get('projects') or []):
+        raise deny(404, 'not_found', 'Project not found')
+    issuer = state.get('users', {}).get(credential.get('user_id'))
+    if not isinstance(issuer, dict) or issuer.get('disabled'):
+        raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
+    if issuer.get('superuser'):
+        held = ROLE_CAPABILITIES['owner']
+    else:
+        held = ROLE_CAPABILITIES.get(
+            state.get('memberships', {}).get(project_id, {}).get(issuer['id']), frozenset())
+    if CAP_COORDINATE not in held:
+        raise deny(403, 'forbidden', REQUIREMENT_EDITOR_REFUSED)
+    return {'account_id': credential['user_id'], 'agent_id': agent_id, 'grant': grant,
+            'role': 'coordinator'}
+
+
 def project_grant(user):
     """The account's "may create projects" grant as ``{'limit', 'granted_by', 'granted_at'}``, or None.
 

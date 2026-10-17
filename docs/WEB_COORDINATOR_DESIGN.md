@@ -457,6 +457,18 @@ coordinator can do in a browser is said.
   web variants of the coordinator prompt and the worker guide. Earlier slices
   add their own command as they go; this one closes the gaps and writes the
   guides.
+- **10. Requirements by the coordinator, and batch acceptance** (this is
+  kittrial-5bb.278; the note is `docs/WEB_REQUIREMENTS_COORDINATOR_DESIGN.md`).
+  Everything a project's OWNER can do to requirements and the BRD on the site,
+  a project's COORDINATOR can do too: a person with the Coordinator role, and an
+  agent holding the project's coordinator grant, with no operator-list read on
+  the web path. The capability is `coordinate`; the membership or grant is
+  re-read at effect time. Owner decisions 11(i)-(iii) settle what stays the
+  owner's (the governance-mode switch), who the accepting party is (the human
+  account, with the agent and its grant in the audit), and the batch semantics
+  (per item, 200 with accepted and refused, no rollback).
+  *In the browser:* the requirements page and a "Accept several at once"
+  control; an agent uses the routes and `http_client.py`.
 
 Order: 1a, 1b and 2 take the person out of every approval and make integration
 a record; they are the "agents first" order. If more in the browser matters

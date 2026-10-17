@@ -101,6 +101,45 @@ function terminalForm(ctx, pid, item, candidates) {
     h('label', null, confirm, ' I understand this cannot be undone in the browser.'), button, message));
 }
 
+// Accept many in one action (slice 10, kittrial-5bb.278). The server accepts per item:
+// a refused one is named with its reason and the rest stay accepted, so this shows
+// exactly which ones need a reload instead of pretending the batch was all or nothing.
+function batchAccept(ctx, pid, items) {
+  const chosen = new Set();
+  const message = h('p', { role: 'status', class: 'small' });
+  const outcome = h('div');
+  const rows = items.map((item) => {
+    const box = h('input', { type: 'checkbox' });
+    box.addEventListener('change', () => { if (box.checked) chosen.add(item.id); else chosen.delete(item.id); });
+    return h('label', null, box, ' ', displayText(item.current.title), ' ',
+      h('span', { class: 'small' }, `· ${item.current.acceptance_state === 'accepted' ? 'pending edit' : 'draft'} revision ${item.current.revision}`));
+  });
+  const button = h('button', { type: 'button' }, 'Accept selected');
+  button.addEventListener('click', async () => {
+    if (!chosen.size) { message.textContent = 'Select at least one requirement.'; return; }
+    button.disabled = true;
+    try {
+      const body = { items: items.filter((item) => chosen.has(item.id))
+        .map((item) => ({ id: item.id, ...expected(item.current) })) };
+      const answer = await ctx.api.acceptRequirements(pid, body);
+      const refused = answer.refused || [];
+      const accepted = (answer.accepted || []).length;
+      message.textContent = `Accepted ${accepted}; not accepted ${refused.length}.`;
+      outcome.replaceChildren(
+        refused.length ? h('div', null,
+          h('p', null, 'These were not accepted, and nothing else was undone:'),
+          h('ul', null, refused.map((entry) => h('li', null, `${displayText(entry.id)} · ${displayText(entry.reason)}`))),
+          h('p', { class: 'small' }, 'Reload before trying them again; the others are already accepted.')) : null);
+      if (!refused.length) await ctx.go(`/p/${pid}/requirements`);
+      else button.disabled = false;
+    } catch (error) { message.textContent = describe(error); button.disabled = false; }
+  });
+  return h('details', { class: 'panel' }, h('summary', null, 'Accept several at once'),
+    h('div', { class: 'panel-body stack' },
+      h('p', null, 'Accept many requirements in one action. Each one is accepted on its own: one that was refused is named with why, and the others stay accepted.'),
+      rows, h('div', { class: 'actions' }, button, message), outcome));
+}
+
 function editor(ctx, pid, item, parent, done) {
   const record = item?.current;
   const title = h('input', { id: 'requirement-title', value: record?.title || '', maxlength: 200, required: true });
@@ -171,6 +210,11 @@ export async function brd(ctx, { pid }, project, data) {
     } }, 'Start requirements');
   }
   const document = await ctx.api.brd(pid);
+  // Anything that is not accepted yet, or that carries a pending edit, can be accepted
+  // in one action. An agent uses the route; this is the person's page.
+  const batchable = owner && simple ? data.items.filter((item) => item.kind === 'requirement'
+    && active(item) && item.current
+    && (item.current.acceptance_state !== 'accepted' || item.pending_draft)) : [];
   let recovery = null;
   if (owner && simple) {
     try {
@@ -213,7 +257,8 @@ export async function brd(ctx, { pid }, project, data) {
     h('h2', null, 'Withdrawn, superseded or unverified requirements'),
     data.items.filter((item) => item.kind === 'requirement' && !active(item)).map(card)) : null,
   data.items.filter((item) => item.unreadable).map(card),
-  !data.items.length ? h('p', null, 'No requirements yet.') : null, add, recovery,
+  !data.items.length ? h('p', null, 'No requirements yet.') : null, add,
+  batchable.length ? batchAccept(ctx, pid, batchable) : null, recovery,
   h('section', { class: 'panel' }, h('h2', null, 'Decisions'), (document.decisions || []).map((d) => h('p', null, `${displayText(d.title)} · revision ${d.revision}`))));
 }
 
