@@ -54,7 +54,7 @@ function stateBadge(state) {
 
 function verificationBadge(status) {
   const s = status || 'unverified';
-  const tone = s === 'verified' ? 'ok' : (s === 'drifted' || s === 'failed') ? 'crit' : 'muted';
+  const tone = (s === 'verified' || s === 'attested') ? 'ok' : (s === 'drifted' || s === 'failed') ? 'crit' : 'muted';
   return h('span', { class: 'badge ' + tone, 'data-verification-badge': s }, 'verification: ' + s);
 }
 
@@ -986,13 +986,21 @@ export async function capabilityPage(ctx, { pid, key }) {
         const btn = form.querySelector('button');
         await act(btn, async () => {
           try {
+            const passed = v.passed !== 'false';
+            const pointers = [...(shown.code || []), ...(shown.tests || []), ...(shown.anchors || [])];
+            const results = pointers.map((pointer) => ({
+              pointer,
+              resolved: passed,
+              reason: passed ? null : 'missing-pointer',
+            }));
             await ctx.api.verifyCapability(pid, key, {
               revision: Number(v.revision || shown.revision),
               record_sha256: (v.record_sha256 || shown.sha256 || '').trim(),
               commit: (v.commit || 'a'.repeat(40)).trim(),
               checked_at: (v.checked_at || new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')).trim(),
               source: (v.source || 'ast').trim(),
-              passed: v.passed !== 'false',
+              passed,
+              results,
             });
             toast('Capability verification recorded.', 'ok');
             await ctx.render();

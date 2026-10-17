@@ -416,7 +416,8 @@ def dispatch(canonical, request, tmp, run=None):
         config_data = json.loads(config_file.read_text(encoding='utf-8')) if config_file.is_file() else {}
         operators = config_data.get('operators') or []
         verifiers = config_data.get('verifiers') or []
-        by_service = canonical.authority_config is not None and canonical.require_authority
+        launched = canonical.authority_config is not None
+        by_service = launched and canonical.require_authority
         base_writes = reference_records.CONTRIBUTOR_OPERATIONS if action == 'ref' else records.WRITE_COMMANDS
         http_writes = getattr(records, 'HTTP_WRITE_COMMANDS', ()) if by_service else ()
         writes = base_writes + http_writes
@@ -447,9 +448,10 @@ def dispatch(canonical, request, tmp, run=None):
                     return json.dumps(found)
                 raise ValueError('unsupported native read')
             if action == 'ref':
-                result = records.read(args, ref_run, operators)
+                result = records.read(args, ref_run, operators, web_service=launched)
             else:
-                result = records.read(args, ref_run, operators, verifiers=verifiers, journal=canonical.path)
+                result = records.read(args, ref_run, operators, verifiers=verifiers, journal=canonical.path,
+                                      web_service=launched)
             return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
 
         class RecordsRefusal(ValueError):
@@ -515,12 +517,13 @@ def dispatch(canonical, request, tmp, run=None):
                 payload = reference_records.write_payload(args, attachments, commands=writes)
                 result = reference_records.apply_native(
                     payload, actor, run, canonical.path, operator=coordinator,
-                    operators=operators, web_coordinator=coordinator, party_check=party_check)
+                    operators=operators, web_coordinator=coordinator, party_check=party_check,
+                    web_service=by_service)
             else:
                 result = records.write(
                     args, attachments, actor, run, canonical.path, operators,
                     verifiers=verifiers, web_coordinator=coordinator,
-                    party_check=party_check, person=user_id)
+                    party_check=party_check, person=user_id, web_service=by_service)
         except RecordsRefusal as error:
             return envelope(2, stderr=str(error) + '\n', records_status=error.status)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')

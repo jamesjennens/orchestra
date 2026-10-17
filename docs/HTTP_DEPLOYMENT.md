@@ -3478,8 +3478,8 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
 | --- | --- | --- |
 | `GET /v1/projects/{id}/references`, `GET .../references/find?q=...`, `GET .../references/{key}` | `projects.read` | any member of the project, a superuser, a personal agent granted the project, or a worker credential for the project |
 | `GET /v1/projects/{id}/capabilities`, `GET .../capabilities/find?q=...`, `GET .../capabilities/{key}` | `projects.read` | any member of the project, a superuser, a personal agent granted the project, or a worker credential for the project |
-| `POST /v1/projects/{id}/references`, `PATCH /v1/projects/{id}/references/{key}`, `POST .../references/{key}/revisions` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `tasks` scope); a `viewer` is refused (`403`) |
-| `POST /v1/projects/{id}/capabilities`, `PATCH /v1/projects/{id}/capabilities/{key}`, `POST .../capabilities/{key}/revisions`, `POST .../capabilities/{key}/aliases` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `tasks` scope); a `viewer` is refused (`403`) |
+| `POST /v1/projects/{id}/references`, `PATCH /v1/projects/{id}/references/{key}`, `POST .../references/{key}/revisions` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
+| `POST /v1/projects/{id}/capabilities`, `PATCH /v1/projects/{id}/capabilities/{key}`, `POST .../capabilities/{key}/revisions`, `POST .../capabilities/{key}/aliases` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
 | `POST /v1/projects/{id}/references/{key}/accept`, `POST .../references/{key}/retire` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project; never a contributor, viewer, ungranted agent or worker credential (`403`) |
 | `POST /v1/projects/{id}/capabilities/{key}/accept`, `POST .../capabilities/{key}/retire`, `POST .../capabilities/{key}/verify`, `POST .../capabilities/{key}/aliases/reject` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project; never a contributor, viewer, ungranted agent or worker credential (`403`) |
 
@@ -3506,42 +3506,45 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
 - **Accepting writes the F3 evidence comment and the next revision as accepted.**
   `POST .../accept` requires `expected_revision` and `record_sha256` of the newest draft
   revision plus `evidence` (or an explicit `acceptance` object with `owners`, `approvers`,
-  `policy`, `decision_id` and `evidence`); when the shorthand `evidence` string is sent, the
-  server constructs the F3 `acceptance` block naming the authenticated coordinator as owner and
-  approver. Accepting an already-accepted revision is refused (`422`); revise it as a draft
+  `policy`, `decision_id` and `evidence`); `acceptance.approvers` is server-bound to the
+  authenticated coordinator (`[f"account:{user_id}"]`, refusing any forged approver list with
+  `422`), and `acceptance.owners` is verified against the project's human owner/coordinator
+  members. Accepting an already-accepted revision is refused (`422`); revise it as a draft
   first, then accept that draft.
 - **Retiring supersedes the newest revision by an existing `successor` key** (which may not form
   a cycle) and records the F3 `Kind: *-acceptance-v1` retirement evidence and the `superseded`
   revision.
 - **What stays live when a role or grant is removed.** Acceptance and retirement evidence
   comments (`Kind: reference-acceptance-v1`, `Kind: capability-acceptance-v1`) and coordinator
-  verifications (`Kind: capability-verification-v1` with `identity: "verified"`) written by a
-  web coordinator (`usr_<16hex>` or `agent_<16hex>`) are recognized as live by
+  verification attestations (`Kind: capability-verification-v1` with `identity: "attested"`)
+  written by a web coordinator (`usr_<16hex>` or `agent_<16hex>`) are recognized as live by
   `keyed_entries.evidence_is_live` and `capability_verification`. Lowering a coordinator to
   contributor or revoking an agent's coordinator grant stops their **next** `accept`, `retire`,
   `verify` or `aliases/reject` immediately (`403`) and leaves the acceptances, retirements and
   verifications they already recorded live (`acceptance_inert: false`,
-  `verification_state: "verified"`).
+  `verification_state: "attested"`).
 
 ### Self-acceptance and `approval_by_another_party`
 
 - **Both proposer and acceptor (or verifier) are always recorded and returned** (`proposer` and
   `acceptor` on `accept` and `retire`; `proposer` and `verifier` on `verify`; `proposed_by` and
-  `accepted_by` on `get` and `list`).
+  `accepted_by` on `get` and `list`), along with `draft_authors` and `accepted_draft_authors`
+  tracking every author who contributed a draft revision since the prior acceptance.
 - **A granted personal agent never accepts or verifies a draft written by its own party**,
-  whatever the server's `approval_by_another_party` setting says (`403`). The party of the
-  draft's author includes the owning account (`usr_...`), every personal agent of that account
-  (`agent_...`), and every actor name held by a worker credential of that account in the
-  project.
+  whatever the server's `approval_by_another_party` setting says (`403`). Every draft author in
+  the unaccepted revision chain (`draft_authors` for acceptance, `accepted_draft_authors` for
+  verification) is checked against the caller's party. The party of a draft's author includes
+  the owning account (`usr_...`), every personal agent of that account (`agent_...`), and every
+  actor name held by a worker credential of that account in the project.
 - **For a signed-in human coordinator or owner:**
   - When `approval_by_another_party` is **off** (the default), a human coordinator or owner may
     accept or verify a draft revision they (or one of their agents or worker credentials) wrote,
     matching the requirement routes (kittrial-5bb.278).
   - When `approval_by_another_party` is **on** (`--approval-by-another-party`), a human
-    coordinator or owner is refused (`403`) when accepting or verifying a draft revision whose
-    author belongs to their own party (their account, one of their agents, or one of their
-    worker credential actors). Another coordinator or owner of a different party must accept or
-    verify it.
+    coordinator or owner is refused (`403`) when accepting or verifying a revision where any
+    author in its unaccepted draft chain belongs to their own party (their account, one of their
+    agents, or one of their worker credential actors). Another coordinator or owner of an
+    independent party must accept or verify it.
 
 ### `points_to` and `pointers_validation` on capability records
 
@@ -3557,10 +3560,15 @@ object:
   `pointers_validation: {"checked": "syntax-and-requirements", "checkout_validated": false,
   "verified_commit": null, "note": "..."}` naming both `capability check --repo <PATH>` and
   `POST /v1/projects/{id}/capabilities/{key}/verify` (or `admin.py capability-verify`).
-- On `POST /v1/projects/{id}/capabilities/{key}/verify` (which takes the 40-hex `commit`,
-  `revision`, `record_sha256`, `passed` and optional `results` / `source` / `tool` and writes a
-  trusted `Kind: capability-verification-v1` record with `identity: "verified"`), and on `get`,
-  `list` and `find` once a passing trusted verification matches the current revision and
-  `sha256`, `pointers_validation` reports `checkout_validated: true` and `verified_commit:
-  "<40-hex>"`.
+- On `POST /v1/projects/{id}/capabilities/{key}/verify`, the caller must supply explicit
+  40-hex `commit`, `revision`, `record_sha256`, `passed` (boolean), and non-empty per-pointer
+  `results` (missing any of `commit`, `passed`, or `results` is refused with `422`). Because the
+  web coordinator attests to pointer checks without the server running `capability check`
+  against a repository checkout, the endpoint records `Kind: capability-verification-v1` with
+  `submitter.identity: "attested"`, `verification_state: "attested"`, `trusted: false`,
+  `attested: true`, and `pointers_validation: {"checked": "web-coordinator-attested",
+  "checkout_validated": false, "verified_commit": "<40-hex>", ...}`. Only `admin.py
+  capability-verify --repo <PATH>` (where the host validates pointers against a real repository
+  checkout) records `submitter.identity: "verified"`, `verification_state: "verified"`,
+  `trusted: true`, and `pointers_validation.checkout_validated: true`.
 

@@ -1248,7 +1248,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=capability_misses.report(path,lambda:reference_records.NowAnswered(reference_records.read_rows(run),configured_operators(root)),limit,log)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
             looked_up=reference_records.miss_phrase(args)
-            try:result=reference_records.read(args,run,configured_operators(root))
+            try:result=reference_records.read(args,run,configured_operators(root),web_service=authority_config is not None)
             except ValueError as error:
                 # `ref get` of a key nobody has recorded is a lookup that missed.
                 if looked_up is not None and str(error).startswith('Unknown reference key'):counted(looked_up,False)
@@ -1265,7 +1265,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             try:
                 result=reference_records.apply_native(payload,actor,runner,path,operator=coordinator,
                                                       operators=configured_operators(root),
-                                                      web_coordinator=coordinator,party_check=party_check)
+                                                      web_coordinator=coordinator,party_check=party_check,
+                                                      web_service=by_service)
             except RecordsRefusal as error:
                 return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
@@ -1306,7 +1307,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=capability_misses.report(path,lambda:capability_records.exact_index(capability_records.read_catalog(run)[0],configured_operators(root)),limit)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
             result=capability_records.read(args,run,configured_operators(root),
-                                           verifiers=configured_verifiers(root),journal=path)
+                                           verifiers=configured_verifiers(root),journal=path,
+                                           web_service=authority_config is not None)
             if args[:1]==['find'] and isinstance(result,dict) and isinstance(result.get('found'),bool):
                 # Telemetry (kittrial-5bb.77): count the find and, with no exact match, its
                 # normalised phrase. Its own non-blocking lock file, never .coordination.lock;
@@ -1324,7 +1326,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             try:
                 result=capability_records.write(args,request.get('attachments',{}),actor,runner,path,operators,
                                                 verifiers=configured_verifiers(root),
-                                                web_coordinator=coordinator,party_check=party_check,person=user_id)
+                                                web_coordinator=coordinator,party_check=party_check,person=user_id,
+                                                web_service=by_service)
             except RecordsRefusal as error:
                 return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}

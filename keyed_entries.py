@@ -599,12 +599,15 @@ class AnchoredKind:
 
     # -- payloads ------------------------------------------------------------------------------
 
-    def validate_payload(self, payload, operator=False):
+    def validate_payload(self, payload, operator=False, web_coordinator=False):
         if not isinstance(payload, dict):
             raise ValueError('%s payload must be an object' % self.noun)
         core.refuse_injected_labels(payload, '%s operation' % self.noun)
         operation = payload.get('operation')
-        allowed_operations = self.operator_operations if operator else CONTRIBUTOR_OPERATIONS
+        if operator:
+            allowed_operations = OPERATOR_OPERATIONS + (('retire',) if (self.supports_retire or web_coordinator) else ())
+        else:
+            allowed_operations = CONTRIBUTOR_OPERATIONS
         if operation not in allowed_operations:
             raise ValueError('operation must be one of ' + ', '.join(allowed_operations))
         if not operator:
@@ -840,15 +843,42 @@ class AnchoredKind:
             return authors[max(drafts)]
         return authors.get(revision) or authors.get(1)
 
+    def draft_authors_for(self, row, revision, existing=None):
+        """All distinct native authors who wrote drafts in the unaccepted cycle up through `revision`."""
+        authors = self.revision_authors_on(row)
+        if existing is None:
+            try:
+                existing = self.existing_revisions(row)
+            except ValueError:
+                existing = {}
+        accepted_before = [rev for rev, rec in existing.items()
+                           if rec.get('acceptance_state') in ('accepted', 'superseded') and rev < revision]
+        floor = max(accepted_before) if accepted_before else 0
+        out = []
+        for rev in sorted(existing):
+            if floor < rev <= revision and (existing.get(rev) or {}).get('acceptance_state') == 'draft':
+                author = authors.get(rev)
+                if author and author not in out:
+                    out.append(author)
+        if not out:
+            proposer = self.draft_proposer_for(row, revision, existing)
+            if proposer:
+                out.append(proposer)
+        return out
+
     def check_acceptance(self, payload, existing, record, operator, row, run=None, party_check=None, seen=None):
         if not operator:
             return None
         proposer = self.draft_proposer_for(row, payload.get('revision', 1), existing)
+        draft_authors = self.draft_authors_for(row, payload.get('revision', 1), existing)
         if isinstance(seen, dict):
             seen['proposer'] = proposer
+            seen['draft_authors'] = draft_authors
             seen['record'] = record
         if party_check is not None and payload.get('operation') == 'accept':
             party_check(proposer)
+            for draft_author in draft_authors:
+                party_check(draft_author)
         if self.acceptance_rules is not None:
             self.acceptance_rules(record, payload['acceptance'], run)
         return core.bind_acceptance(payload['acceptance'], record)
@@ -878,14 +908,14 @@ class AnchoredKind:
     # -- write entry points ----------------------------------------------------------------------
 
     def apply_native(self, payload, actor, run, project, operator=False, operators=None,
-                     web_coordinator=False, party_check=None, seen=None):
+                     web_coordinator=False, party_check=None, seen=None, web_service=False):
         """`operators` is the deployment allowlist. On the operator route it authorizes the
         actor (unless `web_coordinator=True`, where the endpoint verified `CAP_COORDINATE`
         and project membership); on both routes it decides which operator voids apply, so
         the endpoint supplies it to contributor writes too (it authorizes nothing there)."""
         if operator and not web_coordinator:
             core.require_configured_operator(actor, operators, self.spec.accept_action)
-        self.validate_payload(payload, operator=operator)
+        self.validate_payload(payload, operator=operator, web_coordinator=web_coordinator)
         self.pre_write(payload, run, operators)
         if operator and payload['operation'] == 'draft' and self.acceptance_rules is not None:
             # A direct accepted revision creates its anchor, so its acceptance rules are
@@ -893,17 +923,19 @@ class AnchoredKind:
             self.acceptance_rules(self.entry_record(payload, 1, 'accepted'), payload['acceptance'], run)
         seen = seen if isinstance(seen, dict) else {}
         outcome = core.apply_native(payload, actor, run, project,
-                                    self.write_spec(operators, run, party_check=party_check, seen=seen),
+                                    self.write_spec(operators, run, party_check=party_check, seen=seen,
+                                                    web_coordinator=web_coordinator),
                                     operator=operator, operators=operators, web_coordinator=web_coordinator)
-        if payload['operation'] in ('accept', 'retire'):
-            outcome['proposer'] = seen.get('proposer')
-            outcome['acceptor'] = actor
-        elif payload['operation'] == 'draft':
-            outcome['proposer'] = actor
-            outcome['acceptor'] = actor
-        else:
-            outcome['proposer'] = actor
-            outcome['acceptor'] = None
+        if web_coordinator or web_service:
+            if payload['operation'] in ('accept', 'retire'):
+                outcome['proposer'] = seen.get('proposer')
+                outcome['acceptor'] = actor
+            elif payload['operation'] == 'draft':
+                outcome['proposer'] = actor
+                outcome['acceptor'] = actor
+            else:
+                outcome['proposer'] = actor
+                outcome['acceptor'] = None
         return outcome
 
     # -- batch acceptance (.60 section 4; shared with references by kittrial-5bb.98) --------------
@@ -1039,7 +1071,7 @@ class AnchoredKind:
                 'revision': outcome['revision'], 'native_id': outcome['native_id'],
                 'record_comment_id': outcome.get('record_comment_id')}
 
-    def write_spec(self, operators, run=None, party_check=None, seen=None):
+    def write_spec(self, operators, run=None, party_check=None, seen=None, web_coordinator=False):
         """The kind's spec for one write, whose reads see each row as `live_row` does.
 
         The writer then agrees with the readers: a comment an applied operator void names
@@ -1047,6 +1079,8 @@ class AnchoredKind:
         is the write's own native runner, for acceptance rules that read (`acceptance_rules`).
         """
         spec = copy.copy(self.spec)
+        spec.validate = lambda payload, operator: self.validate_payload(
+            payload, operator=operator, web_coordinator=web_coordinator)
         spec.check_acceptance = lambda payload, existing, record, operator, row: self.check_acceptance(
             payload, existing, record, operator, row, run=run, party_check=party_check, seen=seen)
         spec.read_rows = lambda run, payload=None: self.live_rows(self.spec.read_rows(run, payload), operators)
@@ -1396,7 +1430,8 @@ class AnchoredKind:
                 'record_comment_id': None, 'acceptance': None, 'acceptance_inert': False,
                 'inert_operator': None, 'proposed': None, 'proposed_comment_id': None,
                 'proposer': None, 'acceptor': None, 'proposed_by': None, 'accepted_by': None,
-                'accepted_proposer': None, 'revision_authors': {}, 'warnings': []}
+                'accepted_proposer': None, 'draft_authors': [], 'accepted_draft_authors': [],
+                'revision_authors': {}, 'warnings': []}
         if row.get('malformed'):
             view.update(state='malformed', record=None, acceptance=None, proposed=None)
             view['warnings'].append({'code': 'malformed', 'detail': str(row.get('error') or 'malformed row')[:200]})
@@ -1470,15 +1505,28 @@ class AnchoredKind:
                 if inert is None:
                     inert = (number, evidence[0][1] or evidence[0][0]['operator'],
                              inert_reason(evidence[0][0], evidence[0][1], allowlist))
+            accepted_draft_authors = []
             if chosen is not None:
                 number, item = chosen
                 record, comment_id = revisions[number]
                 prior_drafts = [rev for rev, (rec, _) in revisions.items()
                                 if rec['acceptance_state'] == 'draft' and rev <= number and rev in revision_authors]
                 accepted_proposer = revision_authors.get(max(prior_drafts) if prior_drafts else number) or revision_authors.get(1)
+                prev_accepted = [rev for rev, (rec, _) in revisions.items()
+                                 if rec['acceptance_state'] in ('accepted', 'superseded') and rev < number]
+                prev_floor = max(prev_accepted) if prev_accepted else 0
+                for rev in sorted(revisions):
+                    if prev_floor < rev <= number and revisions[rev][0]['acceptance_state'] == 'draft':
+                        author = revision_authors.get(rev)
+                        if author and author not in accepted_draft_authors:
+                            accepted_draft_authors.append(author)
+                if not accepted_draft_authors and accepted_proposer:
+                    accepted_draft_authors.append(accepted_proposer)
                 view.update(record=record, record_comment_id=comment_id, state=record['acceptance_state'],
                             accepted_by=item['operator'], acceptor=item['operator'],
                             accepted_proposer=accepted_proposer, proposer=accepted_proposer,
+                            accepted_draft_authors=accepted_draft_authors,
+                            draft_authors=list(accepted_draft_authors),
                             acceptance=dict(item['decision'], record_sha256=item['record_sha256'],
                                             operator=item['operator'], at=item['at']))
             else:
@@ -1494,8 +1542,14 @@ class AnchoredKind:
                 newest_draft = max(drafts)
                 record, comment_id = revisions[newest_draft]
                 draft_author = revision_authors.get(newest_draft)
+                draft_authors = []
+                for rev in sorted(drafts):
+                    author = revision_authors.get(rev)
+                    if author and author not in draft_authors:
+                        draft_authors.append(author)
                 view.update(proposed=record, proposed_comment_id=comment_id,
-                            proposed_by=draft_author, proposer=draft_author)
+                            proposed_by=draft_author, proposer=draft_author,
+                            draft_authors=draft_authors)
             for kind, body, comment in extras:
                 self.extra_records[kind](view, body, comment)
         except (ValueError, TypeError, KeyError, AttributeError) as error:

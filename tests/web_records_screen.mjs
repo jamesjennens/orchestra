@@ -236,7 +236,7 @@ const capApp = {
     }),
     verifyCapability: async (_pid, _key, payload) => {
       verifiedCapPayload = payload;
-      return { verification_state: 'verified' };
+      return { verification_state: 'attested' };
     },
   },
 };
@@ -251,4 +251,9 @@ await verifyForm.dispatch('submit');
 assert.equal(verifiedCapPayload.revision, 2);
 assert.equal(verifiedCapPayload.record_sha256, '4'.repeat(64));
 assert.equal(verifiedCapPayload.commit, 'f'.repeat(40));
-
+assert.equal(verifiedCapPayload.results.length, 3);
+assert.deepEqual(verifiedCapPayload.results[0], {
+  pointer: 'http_service.py::ApiHandler.references_list',
+  resolved: true,
+  reason: null,
+});

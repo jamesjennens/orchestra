@@ -7485,10 +7485,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 or item.get('waiting_acceptance') or item.get('has_pending_draft')
                 else None)
         )
+        draft_authors = [a for a in (item.get('draft_authors') or []) if isinstance(a, str) and a]
+        if not draft_authors and isinstance(draft_proposer, str) and draft_proposer:
+            draft_authors = [draft_proposer]
         item['self_accept_blocked'] = bool(
-            can_coordinate and isinstance(draft_proposer, str) and draft_proposer
+            can_coordinate and draft_authors
             and (self.service.approval_by_another_party or by_agent)
-            and not self._independent_all(caller_names, [draft_proposer], pid, by_agent))
+            and not self._independent_all(caller_names, draft_authors, pid, by_agent))
         verify_proposer = (
             (item.get('accepted_proposer')
              or (item.get('acceptance') or {}).get('proposer')
@@ -7497,10 +7500,18 @@ class ApiHandler(BaseHTTPRequestHandler):
             if item.get('record') is not None
             else (item.get('proposed_by') or item.get('proposer'))
         )
+        verify_authors_raw = (
+            item.get('accepted_draft_authors')
+            if item.get('record') is not None
+            else item.get('draft_authors')
+        )
+        verify_authors = [a for a in (verify_authors_raw or []) if isinstance(a, str) and a]
+        if not verify_authors and isinstance(verify_proposer, str) and verify_proposer:
+            verify_authors = [verify_proposer]
         item['self_verify_blocked'] = bool(
-            can_coordinate and isinstance(verify_proposer, str) and verify_proposer
+            can_coordinate and verify_authors
             and (self.service.approval_by_another_party or by_agent)
-            and not self._independent_all(caller_names, [verify_proposer], pid, by_agent))
+            and not self._independent_all(caller_names, verify_authors, pid, by_agent))
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
@@ -7547,7 +7558,37 @@ class ApiHandler(BaseHTTPRequestHandler):
                     body['successor'] = body.pop('superseded_by')
                 else:
                     body.pop('superseded_by', None)
+            pid = ctx.params['pid']
             account_id = 'account:' + ctx.principal.user_id
+            with self.service.store.lock:
+                memberships = dict((self.service.state.get('memberships') or {}).get(pid) or {})
+            member_owners = [
+                'account:' + uid for uid, role in sorted(memberships.items())
+                if role in ('owner', 'coordinator')
+            ]
+            if account_id not in member_owners:
+                member_owners.append(account_id)
+            if ctx.principal.via == 'credential' and ctx.principal.actor:
+                agent_tag = 'agent:' + ctx.principal.actor
+                actual_approvers = [account_id, agent_tag]
+                actual_owners = member_owners + [agent_tag]
+                allowed_approvers = {account_id, ctx.principal.user_id, agent_tag, ctx.principal.actor}
+            else:
+                actual_approvers = [account_id]
+                actual_owners = member_owners
+                allowed_approvers = {account_id, ctx.principal.user_id}
+            allowed_owners = set(actual_owners) | set(memberships.keys()) | {'account:' + u for u in memberships}
+            acc_in = body.get('acceptance') if isinstance(body.get('acceptance'), dict) else {}
+            supplied_approvers = body.get('approvers') if 'approvers' in body else acc_in.get('approvers')
+            if supplied_approvers is not None:
+                if (not isinstance(supplied_approvers, list) or not supplied_approvers
+                        or not all(isinstance(x, str) and x in allowed_approvers for x in supplied_approvers)):
+                    raise invalid('approvers on the web may only name the authenticated principal performing this acceptance')
+            supplied_owners = body.get('owners') if 'owners' in body else acc_in.get('owners')
+            if supplied_owners is not None:
+                if (not isinstance(supplied_owners, list) or not supplied_owners
+                        or not all(isinstance(x, str) and x in allowed_owners for x in supplied_owners)):
+                    raise invalid('owners on the web must come from project membership')
             if 'acceptance' not in body:
                 ev = body.pop('evidence', None)
                 if ev is None:
@@ -7557,16 +7598,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 dec = body.pop('decision', None)
                 if ev is None and isinstance(dec, dict):
                     ev = dec.get('why_satisfied') or dec.get('checked')
-                owners = body.pop('owners', None) or [account_id]
-                approvers = body.pop('approvers', None) or list(owners)
+                body.pop('owners', None)
+                body.pop('approvers', None)
                 policy = body.pop('policy', None) or 'any-owner'
                 decision_id = body.pop('decision_id', None) or operation_id
                 body.pop('unverified_pointer_reason', None)
                 if ev is not None or dec is not None:
                     body['acceptance'] = {
                         'decision_id': decision_id,
-                        'owners': owners,
-                        'approvers': approvers,
+                        'owners': list(actual_owners),
+                        'approvers': list(actual_approvers),
                         'policy': policy,
                         'evidence': ev if ev is not None else '',
                     }
@@ -7580,8 +7621,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                         dec = acc.pop('decision')
                         if isinstance(dec, dict):
                             acc['evidence'] = dec.get('why_satisfied') or dec.get('checked') or ''
-                    acc.setdefault('owners', [account_id])
-                    acc.setdefault('approvers', list(acc['owners']) if isinstance(acc.get('owners'), list) else [account_id])
+                    acc['owners'] = list(actual_owners)
+                    acc['approvers'] = list(actual_approvers)
                     acc.setdefault('policy', 'any-owner')
                     acc.setdefault('decision_id', operation_id)
                     body['acceptance'] = acc
@@ -7642,7 +7683,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise invalid('waiting must be 1, 0, true or false')
         import reference_records
         try:
-            options = reference_records.parse_list_options(args)
+            options = reference_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('ref list: ', ''))
         result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options))
@@ -7729,7 +7770,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise invalid('waiting must be 1, 0, true or false')
         import capability_records
         try:
-            options = capability_records.parse_list_options(args)
+            options = capability_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('capability list: ', ''))
         result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options))

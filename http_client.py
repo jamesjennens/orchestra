@@ -610,13 +610,16 @@ class Client:
         return self._write_record('POST', '/v1/projects/%s/references/%s/retire'
                                   % (quote(project, safe=''), quote(ref_key, safe='')), body, key)
 
-    def list_capabilities(self, project, *, area=None, state=None, kind=None, maturity=None,
-                          verification=None, waiting=False, limit=None, cursor=None):
+    def list_capabilities(self, project, *, tag=None, owner=None, state=None,
+                          pointers=False, waiting=False, limit=None, cursor=None):
         params = {}
-        for name, val in (('area', area), ('state', state), ('kind', kind),
-                          ('maturity', maturity), ('verification', verification)):
+        if tag:
+            params['tag'] = ','.join(tag) if isinstance(tag, (list, tuple)) else str(tag)
+        for name, val in (('owner', owner), ('state', state)):
             if val:
                 params[name] = val
+        if pointers:
+            params['pointers'] = '1'
         if waiting:
             params['waiting'] = '1'
         if limit is not None:
@@ -759,11 +762,10 @@ def _build_parser():
         'propose-alias', 'reject-alias'))
     cap.add_argument('--key', dest='record_key', help='capability key')
     cap.add_argument('--q', help='search phrase for find')
-    cap.add_argument('--area')
+    cap.add_argument('--tag', action='append', default=[], help='filter by tag (repeatable)')
+    cap.add_argument('--owner')
     cap.add_argument('--state')
-    cap.add_argument('--kind')
-    cap.add_argument('--maturity')
-    cap.add_argument('--verification')
+    cap.add_argument('--pointers', action='store_true', help='include pointers in list output')
     cap.add_argument('--waiting', action='store_true', help='only records waiting to be accepted')
     cap.add_argument('--limit', type=int)
     cap.add_argument('--cursor')
@@ -877,9 +879,9 @@ def main(argv=None):
             op = args.operation
             if op == 'list':
                 result = client.list_capabilities(
-                    args.project, area=args.area, state=args.state, kind=args.kind,
-                    maturity=args.maturity, verification=args.verification,
-                    waiting=args.waiting, limit=args.limit, cursor=args.cursor)
+                    args.project, tag=args.tag, owner=args.owner, state=args.state,
+                    pointers=args.pointers, waiting=args.waiting,
+                    limit=args.limit, cursor=args.cursor)
             elif op == 'find':
                 if not args.q:
                     parser.error('find requires --q')

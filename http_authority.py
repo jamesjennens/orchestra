@@ -355,7 +355,8 @@ RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
 
 SCOPE_CAPABILITIES = {
     'read': frozenset({CAP_READ}),
-    'tasks': frozenset({CAP_TASKS, CAP_RECORDS}),
+    'tasks': frozenset({CAP_TASKS}),
+    'records': frozenset({CAP_RECORDS}),
     'checkpoints': frozenset({CAP_CHECKPOINTS}),
     'reviews': frozenset({CAP_REVIEWS}),
     'feedback': frozenset({CAP_FEEDBACK}),
@@ -378,7 +379,7 @@ ROLE_CAPABILITIES = {
                         CAP_PROJECT_ADMIN}),
 }
 #: What the coordinator grant adds to an agent's credential in the project of the grant.
-GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE})
+GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE, CAP_RECORDS})
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
                                                CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,
                                                CAP_AGENTS})

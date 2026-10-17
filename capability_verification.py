@@ -82,7 +82,7 @@ CAP_UNTRUSTED_REVISION = 20
 # back to one full export; a commit recorded by more tasks than this also falls back.
 NARROW_COMMITS = 3
 NARROW_TASKS = 5
-STATES = ('drifted', 'verified', 'reported', 'unverified', 'superseded-revision')
+STATES = ('drifted', 'verified', 'attested', 'reported', 'unverified', 'superseded-revision')
 
 
 # -- the record ---------------------------------------------------------------------------------
@@ -159,9 +159,16 @@ def parse(body):
         if not isinstance(submitter, dict) or set(submitter) != set(SUBMITTER_FIELDS):
             return None
         identifier(submitter['actor'])
-        if submitter['identity'] not in ('verified', 'unverified') or submitter['submitted_by_agent'] is not False:
-            return None
-        if (submitter['identity'] == 'verified') != isinstance(submitter['person'], str):
+        if submitter['identity'] == 'unverified':
+            if submitter['person'] is not None or submitter['submitted_by_agent'] is not False:
+                return None
+        elif submitter['identity'] == 'verified':
+            if not isinstance(submitter['person'], str) or submitter['submitted_by_agent'] is not False:
+                return None
+        elif submitter['identity'] == 'attested':
+            if not isinstance(submitter['person'], str) or type(submitter['submitted_by_agent']) is not bool:
+                return None
+        else:
             return None
         if content_hash(record) != record['sha256'] or canonical_bytes(record).decode('utf-8') != rest:
             return None
@@ -170,12 +177,18 @@ def parse(body):
     return record
 
 
-def build(payload, actor, verified, person=None):
-    """(record, body). `verified` is decided by the ROUTE, never by the actor's name."""
+def build(payload, actor, verified, person=None, attested=False):
+    """(record, body). `verified` / `attested` is decided by the ROUTE, never by the actor's name."""
     record = {name: payload[name] for name in PAYLOAD_FIELDS}
-    resolved_person = (person or ('operator:' + actor)) if verified else None
-    record['submitter'] = {'actor': actor, 'person': resolved_person,
-                           'identity': 'verified' if verified else 'unverified', 'submitted_by_agent': False}
+    if attested:
+        resolved_person = person or ('account:' + actor)
+        by_agent = bool(isinstance(actor, str) and actor.startswith('agent_'))
+        record['submitter'] = {'actor': actor, 'person': resolved_person,
+                               'identity': 'attested', 'submitted_by_agent': by_agent}
+    else:
+        resolved_person = (person or ('operator:' + actor)) if verified else None
+        record['submitter'] = {'actor': actor, 'person': resolved_person,
+                               'identity': 'verified' if verified else 'unverified', 'submitted_by_agent': False}
     record['sha256'] = content_hash(record)
     body = PREFIX + canonical_bytes(record).decode('utf-8')
     if parse(body) != record:
@@ -208,7 +221,14 @@ def is_trusted(item, trusted):
     record = item['record']
     author = item['author']
     return (record['submitter']['identity'] == 'verified' and author == record['submitter']['actor']
-            and (author in trusted or core.http_actor_id(author) is not None))
+            and author in trusted)
+
+
+def is_attested(item):
+    record = item['record']
+    author = item['author']
+    return (record['submitter']['identity'] == 'attested' and author == record['submitter']['actor']
+            and core.http_actor_id(author) is not None)
 
 
 def is_lifecycle_row(row):
@@ -337,11 +357,19 @@ class Integrated:
 
 def _report(item):
     record = item['record']
+    if item.get('trusted'):
+        identity = 'verified'
+        person = record['submitter']['person']
+    elif item.get('attested'):
+        identity = 'attested'
+        person = record['submitter']['person']
+    else:
+        identity = 'unverified'
+        person = None
     return {'commit': record['commit'], 'checked_at': record['checked_at'], 'passed': record['passed'],
             'source': record['source'], 'comment_id': item['comment_id'],
             'missing': [result['pointer'] for result in record['results'] if result['resolved'] is False][:10],
-            'submitter': {'person': record['submitter']['person'] if item.get('trusted') else None,
-                          'identity': 'verified' if item.get('trusted') else 'unverified'}}
+            'submitter': {'person': person, 'identity': identity}}
 
 
 def derive(records, revision, trusted, integrated):
@@ -355,7 +383,7 @@ def derive(records, revision, trusted, integrated):
              'report': None, 'drift': None, 'records': 0, 'open_failing': []}
     if revision is None:
         return block
-    mine = [dict(item, trusted=is_trusted(item, trusted)) for item in records
+    mine = [dict(item, trusted=is_trusted(item, trusted), attested=is_attested(item)) for item in records
             if item['record']['key'] == revision['key'] and item['record']['revision'] == revision['revision']
             and item['record']['record_sha256'] == revision['sha256']]
     block['records'] = len(mine)
@@ -367,17 +395,19 @@ def derive(records, revision, trusted, integrated):
     failing = [item for item in mine if not item['record']['passed']]
     cleared_at = -1
     if failing:
-        # The newest trusted pass at an integrated commit clears every failure before it.
+        # The newest trusted (or coordinator-attested) pass at an integrated commit clears every failure before it.
         for item in reversed(mine):
             if item['position'] < failing[0]['position']:
                 break
-            if item['trusted'] and item['record']['passed'] and integrated(item['record']['commit']):
+            if (item['trusted'] or item['attested']) and item['record']['passed'] and integrated(item['record']['commit']):
                 cleared_at = item['position']
                 break
     open_failing = [item for item in failing if item['position'] > cleared_at]
     block['open_failing'] = open_failing
     trusted_records = [item for item in mine if item['trusted']]
     newest_trusted = trusted_records[-1] if trusted_records else None
+    attested_records = [item for item in mine if item['attested']]
+    newest_attested = attested_records[-1] if attested_records else None
     if open_failing:
         block.update(state='drifted', drift=_report(open_failing[-1]))
     elif newest_trusted is not None and newest_trusted['record']['passed']:
@@ -385,6 +415,12 @@ def derive(records, revision, trusted, integrated):
         block.update(state='verified', verified_at={
             'commit': record['commit'], 'checked_at': record['checked_at'],
             'person': record['submitter']['person'], 'integrated': bool(integrated(record['commit']))})
+    elif newest_attested is not None and newest_attested['record']['passed']:
+        record = newest_attested['record']
+        block.update(state='attested', verified_at={
+            'commit': record['commit'], 'checked_at': record['checked_at'],
+            'person': record['submitter']['person'], 'actor': record['submitter']['actor'],
+            'attested': True, 'integrated': bool(integrated(record['commit']))})
     else:
         block['state'] = 'reported'
     block['report'] = _report(mine[-1])
@@ -407,14 +443,13 @@ def _same_check(record, payload):
 
 
 def verify(payload, actor, run, operators=None, verifiers=None, journal=None, operator=False,
-           web_coordinator=False, person=None, party_check=None):
+           web_coordinator=False, person=None, party_check=None, web_service=False):
     """Record one verification. The caller holds the project lock.
 
     `operator=False` is the endpoint route (`capability verify`): the record is written
     `unverified`, whatever actor the caller names. `operator=True` is the host route
-    (`admin.py capability-verify`) or web coordinator route (`web_coordinator=True`):
-    the actor must be on the operator allowlist or the verifiers list (or authorized as
-    a web coordinator), and the record is written `verified`.
+    (`admin.py capability-verify`, written `verified`) or web coordinator route
+    (`web_coordinator=True`, written `attested`).
 
     The record is bound to the revision a reader describes (the accepted revision, or
     the newest draft when none is accepted) by its exact `record_sha256`, and its
@@ -428,7 +463,6 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
     if operator and not web_coordinator and actor not in trusted:
         raise ValueError('Actor %s is not on the deployment operator allowlist or the verifiers list; only a '
                          'listed actor may record a verified capability check' % actor)
-    pre_rows = None
     if web_coordinator and isinstance(payload, dict):
         payload = dict(payload)
         payload.setdefault('schema_version', 1)
@@ -436,7 +470,6 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
         payload.setdefault('source', 'ast')
         payload.setdefault('graph_built_at_commit', None)
         payload.setdefault('tool', {'name': 'web-coordinator', 'version': '1'})
-        payload.setdefault('passed', True)
         if 'revision' not in payload and 'entry_revision' in payload:
             payload['revision'] = payload.pop('entry_revision')
         else:
@@ -448,41 +481,35 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
                 payload['record_sha256'] = payload.pop('expected_sha256')
         payload.pop('entry_sha256', None)
         payload.pop('expected_sha256', None)
-        if 'commit' not in payload and any(k in payload for k in ('summary', 'method', 'command', 'unverified_pointer_reason')):
-            payload['commit'] = '0' * 40
         for extra in ('summary', 'method', 'command', 'unverified_pointer_reason', 'operation', 'operation_id'):
             payload.pop(extra, None)
-        if 'results' not in payload and isinstance(payload.get('key'), str):
-            records.valid_key(payload['key'])
-            pre_rows = records.KIND.read_key_rows(run, payload['key'])
-            records.KIND.require_unique_key(pre_rows, payload['key'])
-            pre_entry = records.KIND.find_entry(pre_rows, payload['key'], operators, view=records.entry_view)
-            pre_rev = records._newest(pre_entry)
-            if isinstance(pre_rev, dict):
-                ptrs = sorted(set(list(pre_rev.get('code') or []) + list(pre_rev.get('tests') or [])
-                                  + list(pre_rev.get('anchors') or [])))
-                if ptrs and isinstance(payload.get('passed'), bool):
-                    resolved = bool(payload['passed'])
-                    reason = None if resolved else 'Reported unresolved over the web coordinator route'
-                    payload['results'] = [{'pointer': p, 'resolved': resolved, 'reason': reason} for p in ptrs]
-    validate_payload(payload)
+        if not isinstance(payload, dict) or 'key' not in payload:
+            validate_payload(payload)
+        records.valid_key(payload['key'])
+    else:
+        validate_payload(payload)
     key = payload['key']
-    rows = pre_rows if pre_rows is not None else records.KIND.read_key_rows(run, key)
+    rows = records.KIND.read_key_rows(run, key)
     records.KIND.require_unique_key(rows, key)
     entry = records.KIND.find_entry(rows, key, operators, view=records.entry_view)
     if entry['state'] in ('malformed', 'unsupported'):
         raise ValueError('Capability %s cannot be read (%s); it cannot be verified' % (key, entry['state']))
     if entry['state'] == 'superseded':
         raise ValueError('Capability %s is retired; verify its successor' % key)
-    revision = records._newest(entry)
-    if revision['revision'] != payload['revision'] or revision['sha256'] != payload['record_sha256']:
-        raise ValueError('The check does not match the current revision of capability %s (revision %d); run '
-                         'capability check again' % (key, revision['revision']))
     proposer = ((entry.get('accepted_proposer') or entry.get('proposed_by'))
                 if entry.get('record') is not None
                 else entry.get('proposed_by'))
     if party_check is not None:
         party_check(proposer)
+        for draft_author in ((entry.get('accepted_draft_authors') if entry.get('record') is not None
+                              else entry.get('draft_authors')) or ()):
+            party_check(draft_author)
+    if web_coordinator:
+        validate_payload(payload)
+    revision = records._newest(entry)
+    if revision['revision'] != payload['revision'] or revision['sha256'] != payload['record_sha256']:
+        raise ValueError('The check does not match the current revision of capability %s (revision %d); run '
+                         'capability check again' % (key, revision['revision']))
     pointers = list(revision['code']) + list(revision['tests']) + list(revision['anchors'])
     if not pointers:
         raise ValueError('Capability %s revision %d has no code, test or anchor pointer, so there is nothing to '
@@ -491,7 +518,7 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
         raise ValueError('results must name exactly the pointers of revision %d of capability %s'
                          % (revision['revision'], key))
     existing = entry.get('verification_records') or []
-    identity = 'verified' if operator else 'unverified'
+    identity = 'attested' if web_coordinator else ('verified' if operator else 'unverified')
     mine = [item for item in existing if item['record']['revision'] == revision['revision']
             and item['record']['record_sha256'] == revision['sha256']]
     for item in mine:
@@ -499,13 +526,25 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
         if record['commit'] == payload['commit'] and item['author'] == actor \
                 and record['submitter']['actor'] == actor and record['submitter']['identity'] == identity:
             if _same_check(record, payload):
-                v_state = 'verified' if (operator and record['passed']) else ('drifted' if not record['passed'] else 'reported')
-                return {'key': key, 'revision': record['revision'], 'commit': record['commit'],
-                        'passed': record['passed'], 'identity': identity, 'trusted': bool(operator),
-                        'verification_state': v_state, 'reconciled': True,
-                        'comment_id': item['comment_id'], 'proposer': proposer, 'verifier': actor,
-                        'pointers_validation': records.pointers_validation_of(
-                            revision, accepted=entry.get('record') is not None, verification_state=v_state)}
+                v_state = ('attested' if (web_coordinator and record['passed'])
+                           else 'verified' if (operator and record['passed'])
+                           else ('drifted' if not record['passed'] else 'reported'))
+                outcome = {'key': key, 'revision': record['revision'], 'commit': record['commit'],
+                           'passed': record['passed'], 'identity': identity, 'reconciled': True,
+                           'comment_id': item['comment_id']}
+                if web_coordinator or web_service:
+                    outcome.update(
+                        trusted=bool(operator and not web_coordinator),
+                        attested=bool(web_coordinator),
+                        verification_state=v_state,
+                        proposer=proposer, verifier=actor,
+                        results=record['results'],
+                        submitter=record['submitter'],
+                        pointers_validation=records.pointers_validation_of(
+                            revision, accepted=entry.get('record') is not None, verification_state=v_state,
+                            attested_by=(record['submitter'].get('person') or actor) if web_coordinator else None),
+                    )
+                return outcome
             raise ValueError('You already recorded a different result for capability %s revision %d at this '
                              'commit; check at a new commit' % (key, revision['revision']))
     if not operator:
@@ -520,15 +559,26 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
                                  'accepted' % (key, revision['revision'], CAP_UNTRUSTED_REVISION))
         else:
             _check_failing_caps(run, operators, trusted, journal)
-    record, body = build(payload, actor, operator, person=person)
+    record, body = build(payload, actor, operator and not web_coordinator, person=person, attested=web_coordinator)
     raw = run(['comments', 'add', entry['native_id'], body, '--json'])
-    v_state = 'verified' if (operator and record['passed']) else ('drifted' if not record['passed'] else 'reported')
-    return {'key': key, 'revision': record['revision'], 'commit': record['commit'], 'passed': record['passed'],
-            'identity': identity, 'trusted': bool(operator), 'verification_state': v_state,
-            'reconciled': False, 'comment_id': core._comment_id(raw),
-            'proposer': proposer, 'verifier': actor,
-            'pointers_validation': records.pointers_validation_of(
-                revision, accepted=entry.get('record') is not None, verification_state=v_state)}
+    v_state = ('attested' if (web_coordinator and record['passed'])
+               else 'verified' if (operator and record['passed'])
+               else ('drifted' if not record['passed'] else 'reported'))
+    outcome = {'key': key, 'revision': record['revision'], 'commit': record['commit'], 'passed': record['passed'],
+               'identity': identity, 'reconciled': False, 'comment_id': core._comment_id(raw)}
+    if web_coordinator or web_service:
+        outcome.update(
+            trusted=bool(operator and not web_coordinator),
+            attested=bool(web_coordinator),
+            verification_state=v_state,
+            proposer=proposer, verifier=actor,
+            results=record['results'],
+            submitter=record['submitter'],
+            pointers_validation=records.pointers_validation_of(
+                revision, accepted=entry.get('record') is not None, verification_state=v_state,
+                attested_by=(record['submitter'].get('person') or actor) if web_coordinator else None),
+        )
+    return outcome
 
 
 def _check_failing_caps(run, operators, trusted, journal):

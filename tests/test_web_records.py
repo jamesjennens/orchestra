@@ -5,30 +5,32 @@ Covers:
    - Reference and capability lookup (`GET .../{key}`), list (`GET ...` including `waiting=true`),
      and search (`GET .../find?q=...`).
    - Propose (`POST ...`) and revise (`PATCH .../{key}` and `POST .../{key}/revisions`) for
-     contributors, coordinators, owners, and agent credentials with `records` scope; viewer
-     and ungranted callers refused with 403.
+     contributors, coordinators, owners, and agent credentials with `records` scope (or a
+     per-project `coordinator` grant); viewer, ungranted `tasks`-only agents, and non-member
+     superusers refused with 403.
    - Capability alias proposal (`POST .../capabilities/{key}/aliases`) and account attribution
      (`account:<user_id>`).
 2. Coordinator operations (`CAP_COORDINATE`):
-   - Reference `accept` and `retire`; capability `accept`, `retire`, `verify` (`identity: 'verified'`),
+   - Reference `accept` and `retire`; capability `accept`, `retire`, `verify` (`identity: 'attested'`),
      and `aliases/reject`.
+   - Server-bound `acceptance.approvers` (forged approvers refused with 422) and `acceptance.owners`.
    - Allowed for project coordinator, project owner, and personal agent holding the per-project
      coordinator grant; refused (403) for contributors, viewers, ungranted agents, and worker credentials.
    - Role/grant revocation stops the next coordinator action immediately (403) while keeping previously
      recorded acceptances, retirements, and verifications live (`acceptance_inert: False`,
-     `verification_state: 'verified'`).
+     `verification_state: 'attested'`).
 3. Superuser without project membership:
-   - `decide()` is unchanged (`CAP_COORDINATE` / `CAP_RECORDS`), and `endpoint.py` refuses a superuser
-     who is not a member of the project with 403 on all record write routes until they add themselves
-     to the project.
-4. Self-acceptance and `approval_by_another_party`:
+   - `decide()` is unchanged (`CAP_COORDINATE` / `CAP_RECORDS`), and both `http_service.py` and
+     `endpoint.py` refuse a superuser who is not a member of the project with 403 on all record
+     write routes (even before payload validation) until they add themselves to the project.
+4. Self-acceptance, multi-revision draft chains, and `approval_by_another_party`:
    - With `approval_by_another_party = False` (default): a human coordinator or owner CAN accept or
      verify a draft they proposed themselves; both `proposer` and `acceptor`/`verifier` are recorded.
    - With `approval_by_another_party = True` (or installation `independent_approval = True`): a
-     coordinator or owner CANNOT accept or verify a draft proposed by themselves, their own account,
-     or one of their account's agents (403); a second independent coordinator CAN accept and verify it.
-   - A personal agent holding a coordinator grant CANNOT accept or verify a draft proposed by its own
-     party (itself, its owning account, or a sibling agent of the same account) even when
+     coordinator or owner CANNOT accept or verify a draft where any author in the unaccepted draft
+     revision chain belongs to their own party (403); an independent coordinator CAN accept and verify it.
+   - A personal agent holding a coordinator grant CANNOT accept or verify a draft where any author
+     in the unaccepted draft revision chain belongs to its own party even when
      `approval_by_another_party` is False.
 5. Two-step revise-then-accept of an already-accepted key:
    - Revising an accepted reference or capability leaves the accepted revision in force (`state: 'accepted'`,
@@ -36,12 +38,13 @@ Covers:
      in the waiting queue (`GET ...?waiting=true`).
    - Accepting the revised draft writes revision 4 (`acceptance_state: 'accepted'`) and new F3 acceptance
      evidence bound to revision 4.
-6. Explicit `pointers_validation` reporting:
+6. Explicit `pointers_validation` and web attestation (`attested`) reporting:
    - Reference and capability reads, acceptances, retirements, and verifications report `pointers_validation`
-     explicitly (`checkout_validated: False` on web acceptance because the web service has no repository
-     checkout; `checkout_validated: True` once a trusted verification is recorded).
+     explicitly (`checkout_validated: False` on web acceptance and web attestation because the web service
+     has no repository checkout; `verification_state: 'attested'`, `trusted: False`, `attested: True`).
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -52,6 +55,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(KIT), str(KIT / 'tests')]
 
 import http_authority
+import http_client
 import http_service
 import test_bd_label_aliases as fixture
 import test_http_review_fixes as fixes
@@ -89,6 +93,19 @@ def _valid_cap_propose(key='records.web-sync', name='Web Record Sync', summary='
     }
 
 
+def _valid_cap_results(passed=True):
+    pointers = [
+        'http_service.py::ApiHandler.references_list',
+        'endpoint.py::main',
+        'tests/test_web_records.py::StrictWebRecordsTests',
+        'docs/HTTP_DEPLOYMENT.md#records',
+    ]
+    return [
+        {'pointer': p, 'resolved': bool(passed), 'reason': None if passed else 'missing-pointer'}
+        for p in pointers
+    ]
+
+
 class _RecordsScenarioMixin:
     """Shared scenario assertions run against both the strict canonical endpoint and real bd."""
 
@@ -111,7 +128,7 @@ class _RecordsScenarioMixin:
         su_token, _, _ = harness.login('rec-nonmember-su', 'rec-password-1')
         people['nonmember_su'] = {'uid': su_uid, 'token': su_token}
 
-        # Create a personal agent owned by coord1
+        # Create a personal agent owned by coord1 (with tasks/proposals/reviews only; gets CAP_RECORDS via coordinator grant)
         agent_res = harness.request(
             'POST', '/v1/agents',
             {'name': 'Coord1 Agent', 'working_directory': '/tmp/coord1-agent',
@@ -149,6 +166,19 @@ class _RecordsScenarioMixin:
             'actor': agent3_res.data['agent']['actor'],
             'token': agent3_res.data['credential']['secret'],
         }
+
+        # Create a contributor agent with explicit 'records' scope
+        rec_agent_res = harness.request(
+            'POST', '/v1/agents',
+            {'name': 'Contrib Records Agent', 'working_directory': '/tmp/contrib-records-agent',
+             'projects': [self.pid], 'scopes': ['records']},
+            token=people['contrib']['token'])
+        self.assertEqual(rec_agent_res.status, 201, rec_agent_res.data)
+        people['contrib_records_agent'] = {
+            'id': rec_agent_res.data['agent']['id'],
+            'actor': rec_agent_res.data['agent']['actor'],
+            'token': rec_agent_res.data['credential']['secret'],
+        }
         return people
 
     def run_lifecycle_and_two_step_suite(self):
@@ -159,19 +189,46 @@ class _RecordsScenarioMixin:
         coord1 = people['coord1']['token']
         coord2 = people['coord2']['token']
         nonmember_su = people['nonmember_su']['token']
+        ungranted_tasks_agent = people['coord1_agent']
+        records_scoped_agent = people['contrib_records_agent']
 
-        # 1. Viewer and non-member superuser cannot propose a reference or capability (403)
+        # 1. Viewer, ungranted tasks-only agent, and non-member superuser cannot propose (403)
         ref_body = _valid_ref_propose('kit.guide')
         r_viewer = harness.request('POST', f'/v1/projects/{self.pid}/references', ref_body,
                                    token=viewer, key='viewer-ref-propose-1')
         self.assertEqual(r_viewer.status, 403, r_viewer.data)
+
+        # Ungranted agent with scopes=['tasks', 'proposals', 'reviews'] (no 'records' scope) is refused (403) (P7 / M1)
+        r_tasks_ag = harness.request('POST', f'/v1/projects/{self.pid}/references', ref_body,
+                                     token=ungranted_tasks_agent['token'], key='tasks-ag-ref-propose-fail')
+        self.assertEqual(r_tasks_ag.status, 403, r_tasks_ag.data)
+
+        # Direct endpoint invoke with ungranted coordinator-owned agent without 'records' scope is also refused (403)
+        with self.assertRaises(http_service.HttpError) as m3_ctx:
+            harness.backend.invoke(
+                'references.propose',
+                harness.service.authenticate(ungranted_tasks_agent['token']),
+                self.pid,
+                {
+                    'command': 'propose',
+                    'body': dict(_valid_ref_propose('direct.m3'), schema_version=1, operation_id='op-direct-m3'),
+                },
+                'direct-m3-key',
+                capability=http_service.CAP_RECORDS)
+        self.assertEqual(m3_ctx.exception.status, 403)
+
+        # Non-member superuser is refused with 403 at the HTTP membership layer even on unknown_field body before _proposal_body (M4)
+        r_su_malformed = harness.request('POST', f'/v1/projects/{self.pid}/references', {'unknown_field': 1},
+                                         token=nonmember_su, key='su-nonmember-ref-malformed')
+        self.assertEqual(r_su_malformed.status, 403, r_su_malformed.data)
+        self.assertIn('superuser without project membership', r_su_malformed.data['error']['message'])
 
         r_su = harness.request('POST', f'/v1/projects/{self.pid}/references', ref_body,
                                token=nonmember_su, key='su-nonmember-ref-propose-1')
         self.assertEqual(r_su.status, 403, r_su.data)
         self.assertIn('superuser without project membership', r_su.data['error']['message'])
 
-        # 2. Contributor proposes a reference record (revision 1, draft-only)
+        # 2. Contributor (and contributor's 'records'-scoped agent) proposes a reference record (revision 1, draft-only)
         r_prop = harness.request('POST', f'/v1/projects/{self.pid}/references', ref_body,
                                  token=contrib, key='contrib-ref-propose-1')
         self.assertEqual(r_prop.status, 201, r_prop.data)
@@ -190,7 +247,13 @@ class _RecordsScenarioMixin:
         self.assertTrue(r_wait.data['items'][0]['waiting_acceptance'])
         self.assertTrue(r_wait.data['can_coordinate'])
 
-        # Contributor cannot accept (403); non-member superuser cannot accept (403)
+        # Unauthenticated accept is refused (401); contributor cannot accept (403); non-member superuser cannot accept via HTTP (403) or direct backend invoke (M2)
+        r_unauth_acc = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references/kit.guide/accept',
+            {'expected_revision': 1, 'record_sha256': rev1_sha, 'evidence': 'Unauth.'},
+            token=None, key='unauth-ref-accept-1')
+        self.assertEqual(r_unauth_acc.status, 401, r_unauth_acc.data)
+
         r_c_acc = harness.request(
             'POST', f'/v1/projects/{self.pid}/references/kit.guide/accept',
             {'expected_revision': 1, 'record_sha256': rev1_sha, 'evidence': 'Checked docs/OPERATIONS.md.'},
@@ -203,6 +266,97 @@ class _RecordsScenarioMixin:
             token=nonmember_su, key='su-nonmember-ref-accept-1')
         self.assertEqual(r_su_acc.status, 403, r_su_acc.data)
         self.assertIn('superuser without project membership', r_su_acc.data['error']['message'])
+
+        with self.assertRaises(http_service.HttpError) as m2_ctx:
+            harness.backend.invoke(
+                'references.accept',
+                harness.service.authenticate(nonmember_su),
+                self.pid,
+                {
+                    'command': 'accept',
+                    'body': {
+                        'key': 'kit.guide',
+                        'revision': 1,
+                        'record_sha256': rev1_sha,
+                        'acceptance_state': 'accepted',
+                        'schema_version': 1,
+                        'operation_id': 'op-direct-m2',
+                        'acceptance': {
+                            'decision_id': 'op-direct-m2',
+                            'owners': ['account:' + people['coord1']['uid']],
+                            'approvers': ['account:' + people['nonmember_su']['uid']],
+                            'policy': 'any-owner',
+                            'evidence': 'Direct nonmember superuser accept attempt.',
+                        },
+                    },
+                },
+                'direct-m2-key',
+                capability=http_service.CAP_COORDINATE)
+        self.assertEqual(m2_ctx.exception.status, 403)
+
+        # Direct effect-time verified_web_authority check in endpoint.py when block_mismatch_denial is bypassed (M3)
+        if fixture.endpoint is not None and Path(harness.backend.endpoint).name == 'endpoint.py':
+            from unittest import mock
+            coord1_principal = harness.service.authenticate(coord1)
+            m3_req = {
+                'action': 'ref',
+                'project': self.pid,
+                'actor': coord1_principal.user_id,
+                'args': ['accept', '@attachment:0'],
+                'attachments': {'0': {'flag': '--file', 'text': json.dumps({
+                    'key': 'kit.guide',
+                    'revision': 1,
+                    'record_sha256': rev1_sha,
+                    'acceptance_state': 'accepted',
+                    'schema_version': 1,
+                    'operation_id': 'op-direct-m3-ep',
+                    'acceptance': {
+                        'decision_id': 'op-direct-m3-ep',
+                        'owners': ['account:' + people['coord1']['uid']],
+                        'approvers': ['account:' + people['coord1']['uid']],
+                        'policy': 'any-owner',
+                        'evidence': 'Mismatched capability descriptor.',
+                    },
+                })}},
+                'operation_id': 'op-direct-m3-ep',
+                'authority': http_authority.authority_request(
+                    coord1_principal, self.pid, http_authority.CAP_RECORDS,
+                    now=harness.service._expiry_now()),
+            }
+            auth_cfg = http_authority.AuthorityConfig(
+                harness.backend.authority_store, harness.backend.authority_lock,
+                harness.backend.actor_namespace)
+            with mock.patch.object(fixture.endpoint, 'block_mismatch_denial', return_value=None):
+                m3_ans = fixture.endpoint.execute(
+                    Path(harness.backend.root), m3_req,
+                    authority_config=auth_cfg, require_authority=True)
+            self.assertEqual(m3_ans.get('returncode'), 2, m3_ans)
+            self.assertEqual(m3_ans.get('records_status'), 403, m3_ans)
+            self.assertIn('Verified web authority required', m3_ans.get('stderr', ''))
+
+        # Accept without evidence/acceptance is refused with 422 (P7)
+        r_no_ev = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references/kit.guide/accept',
+            {'expected_revision': 1, 'record_sha256': rev1_sha},
+            token=coord1, key='coord1-no-evidence-fail')
+        self.assertEqual(r_no_ev.status, 422, r_no_ev.data)
+
+        # Forged acceptance.approvers (claiming another coordinator approved) is refused with 422 (P7b)
+        r_forged_app = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references/kit.guide/accept',
+            {
+                'expected_revision': 1,
+                'record_sha256': rev1_sha,
+                'acceptance': {
+                    'owners': ['account:' + people['coord1']['uid']],
+                    'approvers': ['account:' + people['coord2']['uid']],
+                    'policy': 'standard',
+                    'decision_id': None,
+                    'evidence': 'Forged approver.',
+                },
+            },
+            token=coord1, key='coord1-forged-approver-fail')
+        self.assertEqual(r_forged_app.status, 422, r_forged_app.data)
 
         # 3. Coordinator accepts revision 1 -> writes revision 2 (accepted) + F3 acceptance evidence
         r_acc = harness.request(
@@ -237,14 +391,14 @@ class _RecordsScenarioMixin:
             token=coord1, key='coord1-ref-stale-accept-fail')
         self.assertEqual(r_stale_acc.status, 409, r_stale_acc.data)
 
-        # Step 1: Member revises the accepted reference via PATCH -> creates draft revision 3
+        # Step 1: Member's 'records'-scoped agent revises the accepted reference via PATCH -> creates draft revision 3
         # while revision 2 stays the accepted record in force!
         rev_body = _valid_ref_propose('kit.guide', statement='Updated operational guide with web records.')
         rev_body.update(expected_revision=2, expected_sha256=rev2_sha)
         r_rev = harness.request(
             'PATCH', f'/v1/projects/{self.pid}/references/kit.guide',
             rev_body,
-            token=contrib, key='contrib-ref-revise-1')
+            token=records_scoped_agent['token'], key='contrib-agent-ref-revise-1')
         self.assertEqual(r_rev.status, 200, r_rev.data)
         self.assertEqual(r_rev.data['revision'], 3)
         self.assertEqual(r_rev.data['state'], 'draft')
@@ -337,16 +491,33 @@ class _RecordsScenarioMixin:
         self.assertEqual(c_get_mid.data['proposed']['revision'], 3)
         self.assertTrue(c_get_mid.data['waiting_acceptance'])
 
-        # Coordinator verifies active accepted revision (revision 2) while draft revision 3 is pending
-        c_ver = harness.request(
+        # Verify without explicit commit, results, or passed is refused with 422 (P12)
+        c_ver_no_results = harness.request(
             'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/verify',
             {'revision': 2, 'record_sha256': cap_rev2_sha, 'commit': 'a' * 40, 'passed': True},
+            token=coord1, key='coord1-cap-verify-missing-results')
+        self.assertEqual(c_ver_no_results.status, 422, c_ver_no_results.data)
+
+        c_ver_no_commit = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/verify',
+            {'revision': 2, 'record_sha256': cap_rev2_sha, 'passed': True, 'results': _valid_cap_results()},
+            token=coord1, key='coord1-cap-verify-missing-commit')
+        self.assertEqual(c_ver_no_commit.status, 422, c_ver_no_commit.data)
+
+        # Coordinator attests verification of active accepted revision (revision 2) while draft revision 3 is pending
+        c_ver = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/verify',
+            {'revision': 2, 'record_sha256': cap_rev2_sha, 'commit': 'a' * 40,
+             'passed': True, 'results': _valid_cap_results()},
             token=coord1, key='coord1-cap-verify-1')
         self.assertEqual(c_ver.status, 200, c_ver.data)
-        self.assertTrue(c_ver.data['trusted'])
-        self.assertEqual(c_ver.data['verification_state'], 'verified')
+        self.assertFalse(c_ver.data['trusted'])
+        self.assertTrue(c_ver.data['attested'])
+        self.assertEqual(c_ver.data['identity'], 'attested')
+        self.assertEqual(c_ver.data['verification_state'], 'attested')
         self.assertEqual(c_ver.data['proposer'], people['contrib']['uid'])
         self.assertEqual(c_ver.data['verifier'], people['coord1']['uid'])
+        self.assertFalse(c_ver.data['pointers_validation']['checkout_validated'])
 
         # Coordinator accepts draft revision 3 -> writes revision 4 (accepted)
         c_acc2 = harness.request(
@@ -358,26 +529,52 @@ class _RecordsScenarioMixin:
         self.assertEqual(c_acc2.data['state'], 'accepted')
         cap_rev4_sha = c_acc2.data['sha256']
 
-        # Verify revision 4 so the accepted revision itself is verified
+        # Attest verification of revision 4 so the accepted revision itself is attested
         c_ver2 = harness.request(
             'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/verify',
-            {'revision': 4, 'record_sha256': cap_rev4_sha, 'commit': 'b' * 40, 'passed': True},
+            {'revision': 4, 'record_sha256': cap_rev4_sha, 'commit': 'b' * 40,
+             'passed': True, 'results': _valid_cap_results()},
             token=coord1, key='coord1-cap-verify-2')
         self.assertEqual(c_ver2.status, 200, c_ver2.data)
-        self.assertEqual(c_ver2.data['verification_state'], 'verified')
-        self.assertTrue(c_ver2.data['pointers_validation']['checkout_validated'])
+        self.assertEqual(c_ver2.data['verification_state'], 'attested')
+        self.assertFalse(c_ver2.data['trusted'])
+        self.assertTrue(c_ver2.data['attested'])
+        self.assertFalse(c_ver2.data['pointers_validation']['checkout_validated'])
+        self.assertEqual(c_ver2.data['pointers_validation']['checked'], 'web-coordinator-attested')
 
-        # Demote coord1 to contributor: their next accept is refused (403),
-        # but the acceptances and verifications they already wrote stay live!
+        # Demote coord1 to contributor: their replay and next coordinator actions are refused (403),
+        # but the acceptances and verifications they already wrote stay live! (M8, M9)
         demote = harness.request('PUT', f'/v1/projects/{self.pid}/members/{people["coord1"]["uid"]}',
                                  {'role': 'contributor'}, token=self.owner_token)
         self.assertEqual(demote.status, 200, demote.data)
+
+        demoted_replay = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/accept',
+            {'expected_revision': 3, 'record_sha256': cap_rev3_sha, 'evidence': 'Accepted revised summary.'},
+            token=coord1, key='coord1-cap-accept-2')
+        self.assertEqual(demoted_replay.status, 403, demoted_replay.data)
+
+        demoted_verify = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/verify',
+            {'revision': 4, 'record_sha256': cap_rev4_sha, 'commit': 'b' * 40,
+             'passed': True, 'results': _valid_cap_results()},
+            token=coord1, key='coord1-demoted-verify-fail')
+        self.assertEqual(demoted_verify.status, 403, demoted_verify.data)
+
+        demoted_rej_alias = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/aliases/reject',
+            {'alias': 'web.records.legacy', 'reason': 'Demoted reject.'},
+            token=coord1, key='coord1-demoted-reject-alias-fail')
+        self.assertEqual(demoted_rej_alias.status, 403, demoted_rej_alias.data)
 
         c_check_live = harness.request('GET', f'/v1/projects/{self.pid}/capabilities/records.web-sync', token=viewer)
         self.assertEqual(c_check_live.status, 200, c_check_live.data)
         self.assertEqual(c_check_live.data['state'], 'accepted')
         self.assertFalse(c_check_live.data['acceptance_inert'])
-        self.assertEqual(c_check_live.data['verification_state'], 'verified')
+        self.assertEqual(c_check_live.data['verification_state'], 'attested')
+        self.assertEqual(c_check_live.data['verification']['state'], 'attested')
+        self.assertTrue(c_check_live.data['verification']['verified_at']['attested'])
+        self.assertFalse(c_check_live.data['pointers_validation']['checkout_validated'])
 
         r_check_live = harness.request('GET', f'/v1/projects/{self.pid}/references/kit.guide', token=viewer)
         self.assertEqual(r_check_live.status, 200, r_check_live.data)
@@ -409,6 +606,73 @@ class _RecordsScenarioMixin:
             token=coord2, key='coord2-cap-retire-1')
         self.assertEqual(c_ret.status, 200, c_ret.data)
         self.assertEqual(c_ret.data['state'], 'superseded')
+
+        # 6. Verify http_client.py round-trip and capability list filters (P13, P13b)
+        self._assert_http_client_methods_round_trip()
+
+    def _assert_http_client_methods_round_trip(self):
+        client = Client(f'http://127.0.0.1:{self.harness.port}')
+        client.token = self.owner_token
+        ref = client.propose_reference(self.pid, _valid_ref_propose('client.ref', title='Client Ref'), key='client-ref-1')
+        self.assertEqual(ref['key'], 'client.ref')
+        acc_ref = client.accept_reference(
+            self.pid, 'client.ref',
+            {'expected_revision': 1, 'record_sha256': ref['sha256'], 'evidence': 'Client checked.'},
+            key='client-ref-acc-1')
+        self.assertEqual(acc_ref['state'], 'accepted')
+        rev_body = _valid_ref_propose('client.ref', title='Client Ref', statement='Revised via client.')
+        rev_body.update(expected_revision=2, expected_sha256=acc_ref['sha256'])
+        rev_ref = client.revise_reference(
+            self.pid, 'client.ref', rev_body,
+            key='client-ref-rev-1')
+        self.assertEqual(rev_ref['revision'], 3)
+        acc_ref2 = client.accept_reference(
+            self.pid, 'client.ref',
+            {'expected_revision': 3, 'record_sha256': rev_ref['sha256'], 'evidence': 'Client re-accepted.'},
+            key='client-ref-acc-2')
+        self.assertEqual(acc_ref2['revision'], 4)
+        client.propose_reference(self.pid, _valid_ref_propose('client.ref-v2', title='Client Ref v2'), key='client-ref-succ')
+        ret_ref = client.retire_reference(
+            self.pid, 'client.ref',
+            {'expected_revision': 4, 'record_sha256': acc_ref2['sha256'],
+             'successor': 'client.ref-v2', 'reason': 'Client retired.'},
+            key='client-ref-ret-1')
+        self.assertEqual(ret_ref['state'], 'superseded')
+
+        cap_body = _valid_cap_propose('client.cap', name='Client Cap')
+        cap_body['aliases'] = ['client.cap.alias']
+        cap = client.propose_capability(self.pid, cap_body, key='client-cap-1')
+        self.assertEqual(cap['key'], 'client.cap')
+        acc_cap = client.accept_capability(
+            self.pid, 'client.cap',
+            {'expected_revision': 1, 'record_sha256': cap['sha256'], 'evidence': 'Client accepted cap.'},
+            key='client-cap-acc-1')
+        self.assertEqual(acc_cap['state'], 'accepted')
+        ver_cap = client.verify_capability(
+            self.pid, 'client.cap',
+            {'revision': 2, 'record_sha256': acc_cap['sha256'], 'commit': 'e' * 40,
+             'passed': True, 'results': _valid_cap_results()},
+            key='client-cap-ver-1')
+        self.assertEqual(ver_cap['verification_state'], 'attested')
+
+        # Exercise list_capabilities with tag, owner, state, pointers, waiting (P13, P13b)
+        listed = client.list_capabilities(
+            self.pid, tag='web', owner='person:maintainer', state='accepted', pointers=True, waiting=False)
+        keys = [item['key'] for item in listed['items']]
+        self.assertIn('client.cap', keys)
+        cap_item = next(item for item in listed['items'] if item['key'] == 'client.cap')
+        self.assertIn('code', cap_item)
+
+        parser = http_client._build_parser()
+        parsed = parser.parse_args([
+            'capability', self.pid, 'list', '--tag', 'web', '--owner', 'person:maintainer',
+            '--state', 'accepted', '--pointers', '--waiting',
+        ])
+        self.assertEqual(parsed.tag, ['web'])
+        self.assertEqual(parsed.owner, 'person:maintainer')
+        self.assertEqual(parsed.state, 'accepted')
+        self.assertTrue(parsed.pointers)
+        self.assertTrue(parsed.waiting)
 
     def run_self_acceptance_and_party_rules_suite(self):
         harness = self.harness
@@ -456,20 +720,44 @@ class _RecordsScenarioMixin:
 
         c_self_ver = harness.request(
             'POST', f'/v1/projects/{self.pid}/capabilities/self.human-cap/verify',
-            {'revision': 2, 'record_sha256': c_self_acc.data['sha256'], 'commit': 'c' * 40, 'passed': True},
+            {'revision': 2, 'record_sha256': c_self_acc.data['sha256'], 'commit': 'c' * 40,
+             'passed': True, 'results': _valid_cap_results()},
             token=coord1, key='self-human-cap-verify')
         self.assertEqual(c_self_ver.status, 200, c_self_ver.data)
         self.assertEqual(c_self_ver.data['proposer'], people['coord1']['uid'])
         self.assertEqual(c_self_ver.data['verifier'], people['coord1']['uid'])
 
+        # Direct backend invoke of capabilities.verify by agent1 (same party as coord1) is refused (403) (M7)
+        with self.assertRaises(http_service.HttpError) as m7_ctx:
+            harness.backend.invoke(
+                'capabilities.verify',
+                harness.service.authenticate(agent1['token']),
+                self.pid,
+                {
+                    'command': 'verify',
+                    'body': {
+                        'key': 'self.human-cap',
+                        'revision': 2,
+                        'record_sha256': c_self_acc.data['sha256'],
+                        'commit': 'c' * 40,
+                        'passed': True,
+                        'results': _valid_cap_results(),
+                        'schema_version': 1,
+                        'operation_id': 'op-direct-m7',
+                    },
+                },
+                'direct-m7-key',
+                capability=http_service.CAP_COORDINATE)
+        self.assertEqual(m7_ctx.exception.status, 403)
+
         # 2. Even when approval_by_another_party is OFF, a coordinator-granted AGENT may NOT
-        #    accept or verify a draft proposed by itself, its own human account, or a sibling agent!
+        #    accept or verify a draft proposed by itself, its own human account, or a sibling agent! (M5, M6)
         r_ag = harness.request('POST', f'/v1/projects/{self.pid}/references',
                                _valid_ref_propose('agent.party-ref', title='Agent Party Ref'),
                                token=coord1, key='coord1-for-agent-ref-propose')
         self.assertEqual(r_ag.status, 201, r_ag.data)
 
-        # Agent1 tries to accept its owner coord1's draft -> 403!
+        # Agent1 tries to accept its owner coord1's draft via HTTP -> 403 (M5)
         r_ag_acc_fail = harness.request(
             'POST', f'/v1/projects/{self.pid}/references/agent.party-ref/accept',
             {'expected_revision': 1, 'record_sha256': r_ag.data['sha256'],
@@ -477,6 +765,34 @@ class _RecordsScenarioMixin:
             token=agent1['token'], key='agent1-accept-owner-fail')
         self.assertEqual(r_ag_acc_fail.status, 403, r_ag_acc_fail.data)
         self.assertIn('own party', r_ag_acc_fail.data['error']['message'])
+
+        # Direct backend invoke of references.accept by agent1 (bypassing http_service precheck) is also refused (403) (M6)
+        with self.assertRaises(http_service.HttpError) as m6_ctx:
+            harness.backend.invoke(
+                'references.accept',
+                harness.service.authenticate(agent1['token']),
+                self.pid,
+                {
+                    'command': 'accept',
+                    'body': {
+                        'key': 'agent.party-ref',
+                        'revision': 1,
+                        'record_sha256': r_ag.data['sha256'],
+                        'acceptance_state': 'accepted',
+                        'schema_version': 1,
+                        'operation_id': 'op-direct-m6',
+                        'acceptance': {
+                            'decision_id': 'op-direct-m6',
+                            'owners': ['account:' + people['coord1']['uid'], 'agent:' + agent1['actor']],
+                            'approvers': ['account:' + people['coord1']['uid'], 'agent:' + agent1['actor']],
+                            'policy': 'any-owner',
+                            'evidence': 'Direct backend agent self-party accept attempt.',
+                        },
+                    },
+                },
+                'direct-m6-key',
+                capability=http_service.CAP_COORDINATE)
+        self.assertEqual(m6_ctx.exception.status, 403)
 
         # Agent3 (owned by coord2, a different party) CAN accept coord1's draft!
         r_ag3_acc = harness.request(
@@ -524,50 +840,71 @@ class _RecordsScenarioMixin:
         self.assertEqual(r_coord2_ok.data['proposer'], agent1['actor'])
         self.assertEqual(r_coord2_ok.data['acceptor'], people['coord2']['uid'])
 
-        # Same for capability accept and verify when approval_by_another_party is ON:
+        # 2. Multi-revision draft chain (P8, P8b):
+        # Coord1 proposes rev 1 of a capability, then Coord2 revises it to rev 2 before acceptance.
+        # Both Coord1 and Coord2 are authors in the unaccepted draft chain, so neither (nor their agents)
+        # may accept rev 2 or verify the resulting accepted rev 3! The project owner (a 3rd party) CAN.
         cap_other = _valid_cap_propose('another.party-cap', name='Another Party Cap')
         cap_other['aliases'] = ['another.party.alias']
         c_other = harness.request('POST', f'/v1/projects/{self.pid}/capabilities',
                                   cap_other, token=coord1, key='coord1-cap-propose-party')
         self.assertEqual(c_other.status, 201, c_other.data)
 
-        # Coord1 cannot accept its own capability draft when approval_by_another_party is ON -> 403
-        c_coord1_acc_fail = harness.request(
-            'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/accept',
-            {'expected_revision': 1, 'record_sha256': c_other.data['sha256'],
-             'evidence': 'Coord1 self-accept blocked.'},
-            token=coord1, key='coord1-cap-accept-fail')
-        self.assertEqual(c_coord1_acc_fail.status, 403, c_coord1_acc_fail.data)
-        self.assertIn('approval_by_another_party', c_coord1_acc_fail.data['error']['message'])
+        cap_other_rev2 = _valid_cap_propose('another.party-cap', name='Another Party Cap',
+                                            summary='Coord2 revised Coord1 draft before acceptance.')
+        cap_other_rev2['aliases'] = ['another.party.alias']
+        cap_other_rev2.update(expected_revision=1, expected_sha256=c_other.data['sha256'])
+        c_other_r2 = harness.request('PATCH', f'/v1/projects/{self.pid}/capabilities/another.party-cap',
+                                     cap_other_rev2, token=coord2, key='coord2-cap-revise-party')
+        self.assertEqual(c_other_r2.status, 200, c_other_r2.data)
+        self.assertEqual(c_other_r2.data['revision'], 2)
 
-        # Coord2 accepts it -> 200
-        c_coord2_acc_ok = harness.request(
-            'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/accept',
-            {'expected_revision': 1, 'record_sha256': c_other.data['sha256'],
-             'evidence': 'Coord2 accepts coord1 capability.'},
-            token=coord2, key='coord2-cap-accept-ok')
-        self.assertEqual(c_coord2_acc_ok.status, 200, c_coord2_acc_ok.data)
+        # Both coord1 and coord2 see self_accept_blocked == True and are refused (403) when accepting rev 2!
+        for label, tok in (('coord1', coord1), ('coord2', coord2),
+                           ('agent1', agent1['token']), ('agent3', agent3['token'])):
+            g_view = harness.request('GET', f'/v1/projects/{self.pid}/capabilities/another.party-cap', token=tok)
+            self.assertTrue(g_view.data['self_accept_blocked'], label)
+            c_acc_fail = harness.request(
+                'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/accept',
+                {'expected_revision': 2, 'record_sha256': c_other_r2.data['sha256'],
+                 'evidence': f'{label} self-accept blocked on multi-author draft chain.'},
+                token=tok, key=f'{label}-cap-accept-chain-fail')
+            self.assertEqual(c_acc_fail.status, 403, c_acc_fail.data)
 
-        # Coord1 (and its sibling agent2) still cannot verify revision 2 because coord1 was the proposer of that revision!
-        for label, tok in (('coord1', coord1), ('agent2', agent2['token'])):
+        # Project owner (independent 3rd party) accepts rev 2 -> writes accepted rev 3!
+        c_owner_acc_ok = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/accept',
+            {'expected_revision': 2, 'record_sha256': c_other_r2.data['sha256'],
+             'evidence': 'Independent owner accepts multi-author capability draft.'},
+            token=self.owner_token, key='owner-cap-accept-chain-ok')
+        self.assertEqual(c_owner_acc_ok.status, 200, c_owner_acc_ok.data)
+        self.assertEqual(c_owner_acc_ok.data['revision'], 3)
+
+        # Neither coord1 (rev 1 author) nor coord2 (rev 2 author) nor their agents can verify rev 3 (403)!
+        for label, tok in (('coord1', coord1), ('coord2', coord2),
+                           ('agent2', agent2['token']), ('agent3', agent3['token'])):
+            g_view = harness.request('GET', f'/v1/projects/{self.pid}/capabilities/another.party-cap', token=tok)
+            self.assertTrue(g_view.data['self_verify_blocked'], label)
             c_ver_fail = harness.request(
                 'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/verify',
-                {'revision': 2, 'record_sha256': c_coord2_acc_ok.data['sha256'], 'commit': 'd' * 40, 'passed': True},
-                token=tok, key=f'{label}-cap-verify-fail')
+                {'revision': 3, 'record_sha256': c_owner_acc_ok.data['sha256'], 'commit': 'd' * 40,
+                 'passed': True, 'results': _valid_cap_results()},
+                token=tok, key=f'{label}-cap-verify-chain-fail')
             self.assertEqual(c_ver_fail.status, 403, c_ver_fail.data)
 
-        # Coord2 CAN verify revision 2!
+        # Project owner CAN verify revision 3!
         c_ver_ok = harness.request(
             'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/verify',
-            {'revision': 2, 'record_sha256': c_coord2_acc_ok.data['sha256'], 'commit': 'd' * 40, 'passed': True},
-            token=coord2, key='coord2-cap-verify-ok')
+            {'revision': 3, 'record_sha256': c_owner_acc_ok.data['sha256'], 'commit': 'd' * 40,
+             'passed': True, 'results': _valid_cap_results()},
+            token=self.owner_token, key='owner-cap-verify-chain-ok')
         self.assertEqual(c_ver_ok.status, 200, c_ver_ok.data)
-        self.assertEqual(c_ver_ok.data['proposer'], people['coord1']['uid'])
-        self.assertEqual(c_ver_ok.data['verifier'], people['coord2']['uid'])
+        self.assertEqual(c_ver_ok.data['proposer'], people['coord2']['uid'])
 
 
+@unittest.skipUnless(os.name == 'nt', 'POSIX runs NativeWebRecordsTests against real endpoint.py and real bd')
 class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
-    """Runs against tools/strict_canonical_endpoint.py (cross-platform, including Windows)."""
+    """Runs against tools/strict_canonical_endpoint.py on Windows where fcntl/bd are unavailable."""
 
     def setUp(self):
         super().setUp()
@@ -597,50 +934,6 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
 
     def test_self_acceptance_and_approval_by_another_party(self):
         self.run_self_acceptance_and_party_rules_suite()
-
-    def test_http_client_methods_round_trip(self):
-        client = Client(f'http://127.0.0.1:{self.harness.port}')
-        client.token = self.owner_token
-        ref = client.propose_reference(self.pid, _valid_ref_propose('client.ref', title='Client Ref'), key='client-ref-1')
-        self.assertEqual(ref['key'], 'client.ref')
-        found_refs = client.find_references(self.pid, 'Operational guide')
-        self.assertFalse(found_refs['found'])
-        acc_ref = client.accept_reference(
-            self.pid, 'client.ref',
-            {'expected_revision': 1, 'record_sha256': ref['sha256'], 'evidence': 'Client checked.'},
-            key='client-ref-acc-1')
-        self.assertEqual(acc_ref['state'], 'accepted')
-        rev_body = _valid_ref_propose('client.ref', title='Client Ref', statement='Revised via client.')
-        rev_body.update(expected_revision=2, expected_sha256=acc_ref['sha256'])
-        rev_ref = client.revise_reference(
-            self.pid, 'client.ref', rev_body,
-            key='client-ref-rev-1')
-        self.assertEqual(rev_ref['revision'], 3)
-        acc_ref2 = client.accept_reference(
-            self.pid, 'client.ref',
-            {'expected_revision': 3, 'record_sha256': rev_ref['sha256'], 'evidence': 'Client re-accepted.'},
-            key='client-ref-acc-2')
-        self.assertEqual(acc_ref2['revision'], 4)
-        client.propose_reference(self.pid, _valid_ref_propose('client.ref-v2', title='Client Ref v2'), key='client-ref-succ')
-        ret_ref = client.retire_reference(
-            self.pid, 'client.ref',
-            {'expected_revision': 4, 'record_sha256': acc_ref2['sha256'],
-             'successor': 'client.ref-v2', 'reason': 'Client retired.'},
-            key='client-ref-ret-1')
-        self.assertEqual(ret_ref['state'], 'superseded')
-
-        cap = client.propose_capability(self.pid, _valid_cap_propose('client.cap', name='Client Cap'), key='client-cap-1')
-        self.assertEqual(cap['key'], 'client.cap')
-        acc_cap = client.accept_capability(
-            self.pid, 'client.cap',
-            {'expected_revision': 1, 'record_sha256': cap['sha256'], 'evidence': 'Client accepted cap.'},
-            key='client-cap-acc-1')
-        self.assertEqual(acc_cap['state'], 'accepted')
-        ver_cap = client.verify_capability(
-            self.pid, 'client.cap',
-            {'revision': 2, 'record_sha256': acc_cap['sha256'], 'commit': 'e' * 40, 'passed': True},
-            key='client-cap-ver-1')
-        self.assertEqual(ver_cap['verification_state'], 'verified')
 
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
@@ -690,3 +983,4 @@ class WebRecordsScreenTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
