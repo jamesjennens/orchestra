@@ -16,7 +16,7 @@ import * as how from './views/how.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
-  home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list,
+  home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list, agentSetup: agents.setupWizardPage,
   project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings, setup: setup.page, how: how.page,
   newTask: task.create, task: task.detail,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,

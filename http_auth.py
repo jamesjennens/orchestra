@@ -133,6 +133,8 @@ AGENT_MAX_CREDENTIALS = 20
 AGENT_DEAD_CREDENTIALS_KEPT = 5
 AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
+AGENT_GUIDE_PATH = '.orchestra/AGENT.md'
+AGENT_GITIGNORE_LINE = '.orchestra/'
 #: The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276). The
 #: default, the editable bounds and the wording live in ``claim_limit``, so the
 #: route, the owner's page and the gate cannot disagree about any of them.
@@ -3252,10 +3254,14 @@ class Service:
         # beside the setup text, never inside the commands, and nothing runs it.
         # Read once per project, as today's rule reads it: a stored value that no longer
         # passes is left out (kittrial-5bb.123).
-        readable = ((pid, self.stored_repository(self.state['projects'].get(pid))[0]) for pid in config['projects'])
-        repositories = [{'project': pid, 'repository': value} for pid, value in readable if value]
+        with self.store.lock:
+            readable = ((pid, self.stored_repository(self.state['projects'].get(pid))[0])
+                        for pid in config['projects'])
+            repositories = [{'project': pid, 'repository': value} for pid, value in readable if value]
         return {
             'config_path': AGENT_CONFIG_PATH,
+            'guide_path': AGENT_GUIDE_PATH,
+            'gitignore_line': AGENT_GITIGNORE_LINE,
             'config': config,
             'repositories': repositories,
             'repositories_note': self.REPOSITORY_NOTE,
@@ -3570,44 +3576,74 @@ class Service:
             return self.agent_view(agent, principal)
 
     def lower_own_claim_limit(self, principal, value):
-        """An agent credential lowers the claim limit on its OWN record (kittrial-5bb.302).
+        """An agent credential lowers the claim limit on its OWN record (kittrial-5bb.302)."""
+        return self.update_own_agent(principal, {'claim_limit': value})
 
-        Lowering only: ``value`` must be a whole number from 1 up to the CURRENT effective
-        limit. Raising it stays the owner's or a superuser's move, refused with a sentence
-        that names both and the My agents page. The caller is answered its own record plus
-        ``old_limit`` and ``new_limit``, so the route can record who changed what. The
-        identity is the credential's own agent; no target id is taken, so this cannot
-        reach another agent's record.
+    def update_own_agent(self, principal, payload):
+        """An agent credential updates allowed fields on its OWN record (kittrial-5bb.302, .329).
+
+        ``claim_limit`` may only be lowered (a whole number from 1 up to the CURRENT
+        effective limit; raising stays the owner's or a superuser's move, refused with a
+        sentence naming both and the My agents page). ``working_directory`` records the
+        folder the agent runs in, validated with :meth:`_agent_text` as 1 to
+        :data:`AGENT_DIRECTORY_MAX` printable characters. Every requested field is validated
+        before any is applied, so a refused field leaves the record untouched. The identity
+        is the credential's own agent; no target id is taken, so this cannot reach another
+        agent's record.
         """
         if principal is None or principal.via != 'credential' or not principal.agent_id:
-            raise forbidden('An agent credential is required to change its own claim limit')
+            raise forbidden('An agent credential is required to change its own record')
+        has_limit = 'claim_limit' in payload
+        has_dir = 'working_directory' in payload
+        new_dir = None
+        if has_dir:
+            new_dir = self._agent_text(payload.get('working_directory'),
+                                       'working_directory', AGENT_DIRECTORY_MAX)
+            if new_dir is None:
+                raise invalid('working_directory must be 1-%d printable characters'
+                              % AGENT_DIRECTORY_MAX)
         with self.store.lock:
             self._refresh_authority(principal)
             agent = self._agent(principal.agent_id)
             current = claim_limit.default_limit(agent)
-            try:
-                wanted = claim_limit.validate_limit(value)
-            except ValueError as error:
-                raise invalid(str(error)) from None
-            if wanted is None:
-                # The owner's route clears a value back to the default; on the agent's own
-                # route the body must be the number it will hold, never an absence. Name the
-                # field's own range (1..50), not the current value: a null is a malformed
-                # value, and the older sentence read "1 to <current>" (kittrial-5bb.303).
-                raise invalid('claim_limit: expected a whole number from %d to %d; an agent '
-                              'may only lower its own limit, so it must also be at most the '
-                              'current %d' % (claim_limit.LIMIT_MIN, claim_limit.LIMIT_MAX,
-                                              current))
-            if wanted > current:
-                raise forbidden(claim_limit.raise_refusal(current, wanted),
-                                {'claim_limit': current, 'requested': wanted,
-                                 'raise_by': claim_limit.RAISE_BY})
-            agent['claim_limit'] = wanted
+            wanted = None
+            if has_limit:
+                value = payload.get('claim_limit')
+                try:
+                    wanted = claim_limit.validate_limit(value)
+                except ValueError as error:
+                    raise invalid(str(error)) from None
+                if wanted is None:
+                    # The owner's route clears a value back to the default; on the agent's own
+                    # route the body must be the number it will hold, never an absence. Name the
+                    # field's own range (1..50), not the current value: a null is a malformed
+                    # value, and the older sentence read "1 to <current>" (kittrial-5bb.303).
+                    raise invalid('claim_limit: expected a whole number from %d to %d; an agent '
+                                  'may only lower its own limit, so it must also be at most the '
+                                  'current %d' % (claim_limit.LIMIT_MIN, claim_limit.LIMIT_MAX,
+                                                  current))
+                if wanted > current:
+                    raise forbidden(claim_limit.raise_refusal(current, wanted),
+                                    {'claim_limit': current, 'requested': wanted,
+                                     'raise_by': claim_limit.RAISE_BY})
+            old_dir = agent.get('working_directory')
+            if has_limit:
+                agent['claim_limit'] = wanted
+            if has_dir:
+                agent['working_directory'] = new_dir
             self.store.save()
-            return {'operation': 'agents.claim_limit.lower',
-                    'agent': self.agent_view(agent, principal),
-                    'old_limit': current, 'new_limit': wanted,
-                    'raise_by': claim_limit.RAISE_BY}
+            operation = ('agents.claim_limit.lower' if has_limit and not has_dir
+                         else 'agents.working_directory.set' if has_dir and not has_limit
+                         else 'agents.me.update')
+            result = {'operation': operation,
+                      'agent': self.agent_view(agent, principal)}
+            if has_limit:
+                result.update({'old_limit': current, 'new_limit': wanted,
+                               'raise_by': claim_limit.RAISE_BY})
+            if has_dir:
+                result.update({'old_working_directory': old_dir,
+                               'new_working_directory': new_dir})
+            return result
 
     def disable_agent(self, principal, agent_id):
         """Disable an agent and revoke every credential it holds, immediately."""
