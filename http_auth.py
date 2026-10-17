@@ -75,6 +75,21 @@ MIN_PASSWORD, MAX_PASSWORD = 8, 1024
 # at the Service boundary.
 SESSION_IDLE_SECONDS = 30 * 60
 SESSION_ABSOLUTE_SECONDS = 12 * 60 * 60
+#: The bounds of an installation's session limits (kittrial-5bb.330). The idle window is
+#: 5 minutes to 24 hours and the absolute limit 1 hour to 7 days, and the absolute limit is
+#: never shorter than the idle window. The settings are read in whole minutes and hours;
+#: the Service keeps and compares them in seconds. Nothing is clamped: a value outside the
+#: bounds is refused when the setting is read, and an installation that sets neither keeps
+#: the two defaults above exactly as they were.
+SESSION_IDLE_MIN_MINUTES, SESSION_IDLE_MAX_MINUTES = 5, 24 * 60
+SESSION_ABSOLUTE_MIN_HOURS, SESSION_ABSOLUTE_MAX_HOURS = 1, 7 * 24
+#: The one sentence both setting surfaces refuse with, so the web service's flags and the
+#: office configuration say the same thing and never clamp a value into the bounds.
+SESSION_LIMIT_SENTENCE = (
+    'Refusing the session limits: the idle limit must be a whole number of minutes from %d to '
+    '%d (5 minutes to 24 hours), the absolute limit a whole number of hours from %d to %d '
+    '(1 hour to 7 days), and the absolute limit must not be shorter than the idle limit '
+    '(got idle %r and absolute %r).')
 CREDENTIAL_TTL_SECONDS = 30 * 24 * 60 * 60
 AGENT_CREDENTIAL_DAYS_DEFAULT = 30
 #: The same ceiling the shared read cap applies (kittrial-5bb.294 item 4): one source.
@@ -945,6 +960,40 @@ def validate_agent_credential_days(value):
     return value
 
 
+def session_limit_refusal(idle_minutes=None, absolute_hours=None):
+    """The one sentence a refused session limit is refused with, naming what was given."""
+    return SESSION_LIMIT_SENTENCE % (SESSION_IDLE_MIN_MINUTES, SESSION_IDLE_MAX_MINUTES,
+                                     SESSION_ABSOLUTE_MIN_HOURS, SESSION_ABSOLUTE_MAX_HOURS,
+                                     idle_minutes, absolute_hours)
+
+
+def session_limit_seconds(idle_minutes=None, absolute_hours=None):
+    """The installation's session idle and absolute limits, in seconds (kittrial-5bb.330).
+
+    The surface of a setting is whole minutes for the idle window and whole hours for the
+    absolute limit; the ``Service`` keeps and compares them in seconds, which is what this
+    returns as ``(session_idle, session_absolute)``. ``None`` means the installation did not
+    set that limit, so the reviewed default applies unchanged.
+
+    A value outside its bounds, a value that is not a whole number, and an absolute limit
+    shorter than the idle window are all refused with the same one sentence
+    (:func:`session_limit_refusal`). Nothing is clamped: a caller that reads a setting
+    refuses it, and no state is opened or written before that refusal. Changing the limits
+    never rewrites a live session; a session issued before the change keeps the deadlines it
+    was stamped with, and the next log-in carries the new ones.
+    """
+    for value, low, high in ((idle_minutes, SESSION_IDLE_MIN_MINUTES, SESSION_IDLE_MAX_MINUTES),
+                             (absolute_hours, SESSION_ABSOLUTE_MIN_HOURS, SESSION_ABSOLUTE_MAX_HOURS)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                  or not low <= value <= high):
+            raise ValueError(session_limit_refusal(idle_minutes, absolute_hours))
+    session_idle = SESSION_IDLE_SECONDS if idle_minutes is None else idle_minutes * 60
+    session_absolute = SESSION_ABSOLUTE_SECONDS if absolute_hours is None else absolute_hours * 3600
+    if session_absolute < session_idle:
+        raise ValueError(session_limit_refusal(idle_minutes, absolute_hours))
+    return session_idle, session_absolute
+
+
 class Service:
     """The authenticated authorization boundary.
 
@@ -1801,6 +1850,38 @@ class Service:
         """Refresh live authority or raise; used by the backend write boundary."""
         with self.store.lock:
             return self._refresh_authority(principal)
+
+    def session_expiry_view(self, principal):
+        """The caller's own session window and deadlines, or ``None`` (kittrial-5bb.330).
+
+        The authenticated session read is the light touch a browser keeps an open set-up
+        wizard alive with, so it answers what that page needs: the idle window this
+        installation configured (``idle_seconds``) and the live deadlines of this session
+        (``idle_expires_at``, refreshed by every authenticated request, and
+        ``absolute_expires_at``, which no use extends). Nothing about another session is
+        read and no secret is included. A credential (a worker or agent key) has no browser
+        session, so it gets ``None`` and the read answers exactly what it did before.
+        """
+        if principal is None or principal.via != 'session' or not principal.session_hash:
+            return None
+        session = self.state['sessions'].get(principal.session_hash)
+        if not isinstance(session, dict):
+            return None
+        view = {'idle_seconds': self.session_idle, 'absolute_seconds': self.session_absolute}
+        for key, stored in (('idle_expires_at', 'idle_expires'),
+                            ('absolute_expires_at', 'absolute_expires')):
+            deadline = session.get(stored)
+            if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
+                    or not math.isfinite(deadline):
+                # A damaged deadline is not invented: the read says nothing about it rather
+                # than a time nobody can rely on. Authentication has already refused the
+                # session itself when its own deadline is unusable.
+                return None
+            try:
+                view[key] = now_iso(deadline)
+            except (ValueError, OverflowError, OSError):
+                return None
+        return view
 
     def logout(self, principal, request_id=None):
         if principal is None or principal.session_hash is None:

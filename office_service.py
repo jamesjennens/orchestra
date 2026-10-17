@@ -35,7 +35,7 @@ from urllib.request import urlopen
 import admin
 import record_json
 from version import report
-from http_auth import validate_agent_credential_days
+from http_auth import session_limit_seconds, validate_agent_credential_days
 
 
 def private_root(raw):
@@ -89,7 +89,8 @@ def service_config(path):
         raise ValueError('Office service configuration must have schema_version 1')
     allowed = {'schema_version', 'http_host', 'http_state', 'cert', 'key',
                'trusted_proxies', 'public_url', 'endpoint_timeout', 'connections_per_address', 'logins_per_address',
-               'approval_by_another_party', 'agent_credential_days', PLAINTEXT_SETTING, HSTS_SETTING}
+               'approval_by_another_party', 'agent_credential_days',
+               'session_idle_minutes', 'session_absolute_hours', PLAINTEXT_SETTING, HSTS_SETTING}
     if set(config) - allowed:
         raise ValueError('Unknown office service setting: ' + ', '.join(sorted(set(config)-allowed)))
     for setting in ('cert', 'key'):
@@ -120,6 +121,9 @@ def service_config(path):
         raise ValueError('approval_by_another_party must be true or false')
     if 'agent_credential_days' in config:
         validate_agent_credential_days(config['agent_credential_days'])
+    # The session idle and absolute limits (kittrial-5bb.330), refused by the same helper and
+    # the same one sentence as the web service's own flags. An omitted key keeps 30 min / 12 h.
+    session_limit_seconds(config.get('session_idle_minutes'), config.get('session_absolute_hours'))
     plain = config.get(PLAINTEXT_SETTING, False)
     if not isinstance(plain, bool):
         raise ValueError(PLAINTEXT_SETTING + ' must be true or false')
@@ -606,6 +610,12 @@ def web_command(settings, root, port, release_python, release_script):
         command.extend(['--logins-per-address', settings['logins_per_address']])
     if 'agent_credential_days' in settings:
         command.extend(['--agent-credential-days', validate_agent_credential_days(settings['agent_credential_days'])])
+    if 'session_idle_minutes' in settings or 'session_absolute_hours' in settings:
+        # Validated once as a pair, so the pair handed on is the pair that was checked: the
+        # absolute limit is never shorter than the idle window (kittrial-5bb.330).
+        idle, absolute = session_limit_seconds(settings.get('session_idle_minutes'),
+                                               settings.get('session_absolute_hours'))
+        command.extend(['--session-idle-minutes', idle // 60, '--session-absolute-hours', absolute // 3600])
     if settings.get('approval_by_another_party') is True:
         command.append('--approval-by-another-party')
     if settings.get(HSTS_SETTING) is True:
