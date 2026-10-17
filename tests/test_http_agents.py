@@ -157,6 +157,8 @@ class AgentRegistryTests(AgentHarness):
         self.assertEqual('GitHub Copilot in VS Code', data['agent']['tool'])
         setup = data['setup']
         self.assertEqual('.orchestra/agent.json', setup['config_path'])
+        self.assertEqual('.orchestra/AGENT.md', setup['guide_path'])
+        self.assertEqual('.orchestra/', setup['gitignore_line'])
         self.assertFalse(setup['config_contains_secret'])
         blob = json.dumps(setup)
         self.assertNotIn(secret, blob)
@@ -1163,6 +1165,12 @@ class AgentReadCostTests(AgentHarness):
         self.assertEqual(self.backend.read_calls, [], 'the polled whoami must make no snapshot read')
         self.assertEqual(self.backend.own_calls, [], 'the polled whoami must make no own-task read')
         self.assertEqual({'limit', 'raise_by'}, set(me.data['claim_limit']))
+        self.assertEqual('.orchestra/agent.json', me.data['setup']['config_path'])
+        self.assertEqual('.orchestra/AGENT.md', me.data['setup']['guide_path'])
+        self.assertEqual('.orchestra/', me.data['setup']['gitignore_line'])
+        self.assertFalse(me.data['setup']['config_contains_secret'])
+        self.assertEqual(agent_id, me.data['setup']['config']['agent_id'])
+        self.assertNotIn(secret, json.dumps(me.data['setup']))
         # The same request against the route that DOES own the counted view still reads.
         nxt = self.request('GET', '/v1/agents/me/next', token=secret)
         self.assertEqual(200, nxt.status, nxt.data)

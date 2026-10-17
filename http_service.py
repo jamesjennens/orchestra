@@ -4282,9 +4282,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                            'projects', 'scopes', 'owner', 'claim_limit')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
                            'projects', 'enabled', 'claim_limit')
-    #: The agent's OWN route (``PATCH /v1/agents/me``, kittrial-5bb.302) takes the one
-    #: field an agent may change on its own record: its claim limit, and only downward.
-    AGENT_ME_UPDATE_FIELDS = ('claim_limit',)
+    #: The agent's OWN route (``PATCH /v1/agents/me``, kittrial-5bb.302, .329) takes the
+    #: fields an agent may change on its own record: its claim limit (downward only) and
+    #: its working_directory (when the extension or agent records the open workspace folder).
+    AGENT_ME_UPDATE_FIELDS = ('claim_limit', 'working_directory')
     AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
     ACCOUNT_CREATE_FIELDS = ('username', 'display_name')
 
@@ -5820,8 +5821,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         # makes NO work read. The counted limit/held/available view needs the bounded
         # current-work snapshot, so it stays on ``/v1/agents/me/next``, which already
         # reads it; here the limit and who may raise it come from the record and one
-        # constant (kittrial-5bb.276/302).
+        # constant (kittrial-5bb.276/302). The secretless ``setup`` bundle (kittrial-5bb.329)
+        # is built from the in-memory record and project metadata only, so the VS Code
+        # extension can write ``.orchestra/agent.json``, ``.orchestra/AGENT.md`` and
+        # ``.gitignore`` into the open workspace folder directly from this route.
         body = {'agent': agent,
+                'setup': self.service.agent_setup(agent, None),
                 'claim_limit': self._agent_claim_limit_record_view(agent),
                 'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
                 'generated_at': now_iso(self.service._now())}
@@ -5838,28 +5843,40 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('PATCH', r'/v1/agents/me')
     def agents_me_update(self, ctx):
-        """The agent's own claim limit: it may LOWER it, never raise it (kittrial-5bb.302).
+        """The agent's own record updates (kittrial-5bb.302, .329).
 
-        One small body: ``claim_limit`` only, a whole number from 1 up to the value the
-        agent holds now. Raising it stays the owner's move, refused with a sentence that
-        names the owner's account or a superuser and the My agents page. The identity is
-        the caller's own credential, never a body field, so this route cannot touch
-        another agent's limit; the owner's route (``PATCH /v1/agents/{id}``) is unchanged.
+        Takes ``claim_limit`` (lowering only: a whole number from 1 up to the value the
+        agent holds now; raising it stays the owner's move, refused with a sentence that
+        names the owner's account or a superuser and the My agents page) and/or
+        ``working_directory`` (so the extension or agent can record or update the open
+        workspace folder). The identity is the caller's own credential, never a body
+        field, so this route cannot touch another agent's record; the owner's route
+        (``PATCH /v1/agents/{id}``) is unchanged.
         """
         payload = dict(ctx.payload or {})
-        refuse_unknown_fields(payload, self.AGENT_ME_UPDATE_FIELDS, 'An agent limit change')
-        if 'claim_limit' not in payload:
-            raise invalid('Nothing to change. An agent limit change takes: claim_limit')
-        value = payload.get('claim_limit')
+        refuse_unknown_fields(payload, self.AGENT_ME_UPDATE_FIELDS, 'An agent self-change')
+        if not any(field in payload for field in self.AGENT_ME_UPDATE_FIELDS):
+            raise invalid('Nothing to change. An agent self-change takes: %s'
+                          % ', '.join(self.AGENT_ME_UPDATE_FIELDS))
+        has_limit = 'claim_limit' in payload
+        has_dir = 'working_directory' in payload
+        action = ('agents.claim_limit.lower' if has_limit and not has_dir
+                  else 'agents.working_directory.set' if has_dir and not has_limit
+                  else 'agents.me.update')
         metadata = {}
 
-        def lower():
-            result = self.service.lower_own_claim_limit(ctx.principal, value)
-            # Who changed what, on the committed audit event (kittrial-5bb.302 item 4).
-            metadata.update({'agent': result['agent']['id'], 'actor': ctx.principal.actor,
-                             'old_limit': result['old_limit'], 'new_limit': result['new_limit']})
+        def update_self():
+            result = self.service.update_own_agent(ctx.principal, payload)
+            # Who changed what, on the committed audit event (kittrial-5bb.302 item 4, .329).
+            metadata.update({'agent': result['agent']['id'], 'actor': ctx.principal.actor})
+            if has_limit:
+                metadata.update({'old_limit': result['old_limit'],
+                                 'new_limit': result['new_limit']})
+            if has_dir:
+                metadata.update({'old_working_directory': result['old_working_directory'],
+                                 'new_working_directory': result['new_working_directory']})
             return result, result
-        return self._mutate(ctx, 'agents.claim_limit.lower', None, lower,
+        return self._mutate(ctx, action, None, update_self,
                             capability=CAP_AGENT_SELF, audit_metadata=metadata)
 
     @route('GET', r'/v1/agents/me/next')

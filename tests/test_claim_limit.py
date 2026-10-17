@@ -459,6 +459,49 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
         self.assertEqual(3, self.request('GET', '/v1/agents/%s' % agent_id,
                                          token=self.alex).data['claim_limit'])
 
+    def test_an_agent_updates_its_own_working_directory_with_audit_and_atomicity(self):
+        """kittrial-5bb.329: an agent credential updates its own working_directory via PATCH /v1/agents/me."""
+        agent_id, secret, _ = self.new_agent(claim_limit=3)
+        updated = self.request('PATCH', '/v1/agents/me',
+                               {'working_directory': '/workspace/kestrel-open'}, token=secret)
+        self.assertEqual(200, updated.status, updated.data)
+        self.assertEqual('/workspace/kestrel-open', updated.data['agent']['working_directory'])
+        self.assertEqual('/home/priya/work/kestrel', updated.data['old_working_directory'])
+        self.assertEqual('/workspace/kestrel-open', updated.data['new_working_directory'])
+        me = self.request('GET', '/v1/agents/me', token=secret).data
+        self.assertEqual('/workspace/kestrel-open', me['agent']['working_directory'])
+        self.assertEqual(agent_id, me['setup']['config']['agent_id'])
+        self.assertEqual('.orchestra/AGENT.md', me['setup']['guide_path'])
+        self.assertEqual('.orchestra/', me['setup']['gitignore_line'])
+        events = [event for event in self.service.state['audit']
+                  if event['action'] == 'agents.working_directory.set'
+                  and event['outcome'] == 'committed']
+        self.assertTrue(events, 'the working_directory update must be recorded in audit')
+        event = events[-1]
+        self.assertEqual(agent_id, event['agent'])
+        self.assertEqual('/home/priya/work/kestrel', event['old_working_directory'])
+        self.assertEqual('/workspace/kestrel-open', event['new_working_directory'])
+        self.assertTrue(event['credential_id'])
+        # Invalid working_directory or invalid companion claim_limit leaves both unchanged.
+        for bad_dir in ('', '   ', 42, 'x' * 5000, 'bad\x01dir'):
+            refused = self.request('PATCH', '/v1/agents/me',
+                                   {'working_directory': bad_dir, 'claim_limit': 2}, token=secret)
+            self.assertEqual(422, refused.status, (bad_dir, refused.data))
+        refused_raise = self.request('PATCH', '/v1/agents/me',
+                                     {'working_directory': '/workspace/other', 'claim_limit': 5},
+                                     token=secret)
+        self.assertEqual(403, refused_raise.status, refused_raise.data)
+        shown = self.request('GET', '/v1/agents/%s' % agent_id, token=self.alex).data
+        self.assertEqual('/workspace/kestrel-open', shown['working_directory'])
+        self.assertEqual(3, shown['claim_limit'])
+        # Both valid together commit atomically under agents.me.update.
+        both = self.request('PATCH', '/v1/agents/me',
+                            {'working_directory': 'C:\\Users\\alex\\kestrel', 'claim_limit': 2},
+                            token=secret)
+        self.assertEqual(200, both.status, both.data)
+        self.assertEqual('C:\\Users\\alex\\kestrel', both.data['new_working_directory'])
+        self.assertEqual(2, both.data['new_limit'])
+
     def test_a_person_and_a_worker_credential_may_not_use_the_agents_own_route(self):
         agent_id, secret, _ = self.new_agent()
         person = self.my_limit(1, self.alex)

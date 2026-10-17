@@ -123,3 +123,12 @@ another coordination database.
 ```
 
 For workers already connected, use the client `onboard` command in that prompt. The longer [worker prompt](../templates/WORKER_PROMPT.md) remains a reference, but no longer needs to be pasted into every new session.
+
+## Web personal-agent setup wizard
+
+For personal agents created on the website (`My agents` or `#/setup`, [design note](ONBOARDING_DESIGN.md) slice 4, `kittrial-5bb.329`), setup runs as a three-step wizard showing one step per screen (`Step 1 of 3: Store the secret`, `Step 2 of 3: Set up the folder`, `Step 3 of 3: Start the agent`) with `Back`, `Check connection`, `Next` and `Done`:
+
+- **Operating system selector first:** auto-detected (`Windows (PowerShell)`, `macOS`, `Linux`) and changeable at any step so only that system's paths and commands are shown.
+- **No placeholders in the primary Step 1 flow:** when the service has its own TLS certificate, the wizard explains that browsers strip the leading dot when saving `.orchestra-agent-<slug>.crt` to `Downloads` and provides a filled-in `Move-Item` / `mv` command to move it into the user profile as `.orchestra-agent-<slug>.crt`. The person saves the single `header = "Authorization: Bearer ..."` line and runs the filled-in rewrite command, which writes `# server = ...`, `# server certificate sha256 = ...` and `cacert = <real expanded user path>` without any `<your-name>` placeholder to edit. A self-check command inspects for `.curlrc.txt`, leftover `<your-name>`, or a certificate left in `Downloads` before calling `curl -fsS -K`.
+- **Check before Next and Step 3 Bridge 0.14+ vs older extension fallback:** `Next` checks `GET /v1/agents/{id}` (`last_seen_at`) to confirm the agent's credential reached Orchestra. Step 2 and Step 3 state plainly that **Orchestra Bridge 0.14 or later** writes `.orchestra/agent.json` and `.orchestra/AGENT.md` (and `.gitignore`) into the open VS Code workspace folder from `GET /v1/agents/me` when you run `Orchestra Bridge: Set up` (and compares `working_directory`, updatable via `PATCH /v1/agents/me`), while an older extension uses `Save to agent folder…` (which remembers the last folder picked) or the setup prompt. While Step 3 is open and visible, a 3-second check watches for the agent's first connection and stops on success.
+
