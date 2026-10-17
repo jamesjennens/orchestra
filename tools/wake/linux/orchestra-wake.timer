@@ -1,0 +1,14 @@
+[Unit]
+Description=Restart the Orchestra waker when it is not polling
+
+[Timer]
+# Start once shortly after login, then every five minutes after the last start
+# if the service is no longer running. systemd never starts a second copy of a
+# running oneshot, and the script's own lock covers cron and manual runs too.
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=orchestra-wake.service
+
+[Install]
+WantedBy=timers.target

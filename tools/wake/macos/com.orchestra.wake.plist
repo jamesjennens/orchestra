@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Orchestra poll-and-wake for one lane (tools/wake/macos/com.orchestra.wake.plist).
+
+  Copy this to ~/Library/LaunchAgents/ and replace REPLACE_HOME with your home
+  directory. launchd starts it at login (RunAtLoad) and every StartInterval
+  seconds; a second copy is not started while one is still polling, and wake.sh's
+  own lock covers a manual run. The wake command is in wake.env.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.orchestra.wake</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_HOME/.orchestra/wake/wake.sh</string>
+        <string>--env-file</string>
+        <string>REPLACE_HOME/.orchestra/wake/wake.env</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>REPLACE_HOME/.orchestra/wake/launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_HOME/.orchestra/wake/launchd.err</string>
+</dict>
+</plist>

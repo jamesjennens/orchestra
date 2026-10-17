@@ -636,7 +636,11 @@ def requirement_editor(state, project_id, request):
     * an agent credential whose agent holds the project's coordinator grant while the
       credential's own human account still holds ``coordinate`` there. The account named
       in the record stays that human account (the party owner decision 11(ii) settled);
-      the agent and its grant are recorded beside it in the service audit.
+      the agent and its grant are recorded beside it in the service audit. That account's
+      authority is read from its own membership, exactly as the session shape above reads
+      it: superuser is not membership of a project, so the agent of a superuser who is not
+      a member of this project is refused just as that superuser's own session is
+      (kittrial-5bb.318 item 3; slice 10 said "refuse both").
 
     Anything else is denied with :data:`REQUIREMENT_EDITOR_REFUSED`. No operator
     allowlist is read here: the host commands keep their own.
@@ -680,11 +684,15 @@ def requirement_editor(state, project_id, request):
     issuer = state.get('users', {}).get(credential.get('user_id'))
     if not isinstance(issuer, dict) or issuer.get('disabled'):
         raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
-    if issuer.get('superuser'):
-        held = ROLE_CAPABILITIES['owner']
-    else:
-        held = ROLE_CAPABILITIES.get(
-            state.get('memberships', {}).get(project_id, {}).get(issuer['id']), frozenset())
+    # The SAME membership rule as the session branch above (kittrial-5bb.318 item 3):
+    # accounts administration is not membership of this project, so a superuser's
+    # superuser flag does not stand in for it here either. An agent is its account's hand
+    # in this project, and the project refuses that account's own session when it is not a
+    # member; admitting the agent would give one principal two opposite answers about the
+    # same project. A superuser who owns or coordinates the project IS a member, so their
+    # agent keeps editing there.
+    held = ROLE_CAPABILITIES.get(
+        state.get('memberships', {}).get(project_id, {}).get(issuer['id']), frozenset())
     if CAP_COORDINATE not in held:
         raise deny(403, 'forbidden', REQUIREMENT_EDITOR_REFUSED)
     return {'account_id': credential['user_id'], 'agent_id': agent_id, 'grant': grant,

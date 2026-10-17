@@ -926,6 +926,141 @@ class IntegrationHoldStopsIntegrationTests(unittest.TestCase):
             lifecycle.apply_release(release_payload([target('trial-a')]), ACTOR, store.run)
         self.assertEqual(len(store.rows), before)
 
+    def broken_chain(self, task='trial-a', hold=True):
+        """A chain that carries a hold AND cannot be parsed (kittrial-5bb.297).
+
+        The chain() helper records contribute and approve (and a hold unless told
+        not to); a raw comment with the kit's own prefix but unparsable bytes then
+        breaks the read - a damaged write or a hostile edit is how such a history
+        comes to be."""
+        issue, contribution = chain(task, hold=hold)
+        issue['comments'].append(dict(id='broken-1', text=w.PREFIX + '{"broken": not json',
+                                      author=AUTHOR, created_at='2026-09-16T00:00:00Z'))
+        return issue, contribution
+
+    def test_reviewed_and_integrated_facts_refuse_a_task_whose_chain_cannot_be_read(self):
+        # kittrial-5bb.297: the fail-open - an unparseable chain read as unheld - closed
+        # on the fact gate: the refusal names the task and why it cannot be read.
+        from test_lifecycle_release import (ACTOR, MERGE_A, SOURCE_A, NativeStore,
+                                            payload as lifecycle_payload, scope as lifecycle_scope)
+        issue, _ = self.broken_chain()
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.rows[0]['comments'] = issue['comments']
+        before = len(store.rows)
+        for dimension in ('reviewed', 'integrated'):
+            with self.subTest(dimension=dimension):
+                with self.assertRaisesRegex(ValueError, 'cannot be read'):
+                    lifecycle.apply_native(
+                        lifecycle_payload('trial-a', dimension, 'passed',
+                                          operation='op-unreadable-' + dimension,
+                                          scope_value=lifecycle_scope(source=SOURCE_A,
+                                                                      integration=MERGE_A)),
+                        ACTOR, store.run, operators=[OPERATOR])
+        self.assertEqual(len(store.rows), before)
+
+    def test_the_release_selection_skips_a_target_whose_chain_cannot_be_read(self):
+        # kittrial-5bb.297: such a target is skipped with the reason, and the skipped
+        # list is the release audit's report of it. A task with NO chain at all is
+        # never flagged - it has no holds to hide.
+        from test_lifecycle_release import NativeStore, RELEASE_COMMIT
+        issue, _ = self.broken_chain()
+        plain = row('trial-b', assignee=AUTHOR)          # no chain comments at all
+        store = NativeStore(tasks=('trial-a', 'trial-b')).seed('trial-a').seed('trial-b')
+        store.rows[0]['comments'] = issue['comments']
+        store.rows[1]['comments'] = plain['comments']
+        self.assertIsNone(lifecycle.unreadable_hold_chain(plain))
+        self.assertIsNone(lifecycle.unreadable_hold_chain(None))
+        selection = lifecycle.release_selection(
+            store.rows,
+            {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+             'release_id': 'release-1', 'environment': 'production'},
+            lambda commit, release: True, operators=[OPERATOR])
+        # The unreadable task is never offered; the plain no-chain task may be.
+        self.assertNotIn('trial-a', [item['task'] for item in selection['targets']])
+        reasons = [item['reason'] for item in selection['skipped']]
+        self.assertTrue(any('unreadable hold chain' in reason and 'trial-a' in reason
+                            and 'cannot be read' in reason for reason in reasons), reasons)
+
+    def test_a_release_naming_a_task_whose_chain_cannot_be_read_is_refused(self):
+        from test_lifecycle_release import (ACTOR, NativeStore, release_payload, target)
+        issue, _ = self.broken_chain()
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.rows[0]['comments'] = issue['comments']
+        before = len(store.rows)
+        with self.assertRaisesRegex(ValueError,
+                                    'Refusing a release that names trial-a.*cannot be read'):
+            lifecycle.apply_release(release_payload([target('trial-a')]), ACTOR, store.run,
+                                    operators=[OPERATOR])
+        self.assertEqual(len(store.rows), before)
+
+    def test_one_operator_void_makes_every_surface_agree(self):
+        # kittrial-5bb.297 review item 'operators-on-every-surface': the repair the
+        # refusal names must be seen by every surface, so ONE operator void of the
+        # broken comment - read through the configured operators - releases them all:
+        # the merge slot acquires, the facts are accepted, the release selection no
+        # longer skips the task.
+        import recovery
+        from requirements import canonical_bytes
+        from test_lifecycle_release import (ACTOR, MERGE_A, SOURCE_A, NativeStore,
+                                            RELEASE_COMMIT, payload as lifecycle_payload,
+                                            scope as lifecycle_scope)
+        issue, _ = self.broken_chain(hold=False)
+        broken = next(comment for comment in issue['comments'] if comment['id'] == 'broken-1')
+        void = dict(schema_version=1, operation='void-record', operation_id='void-broken-1',
+                    task='trial-a', target='broken-1', target_kind='contribution-review',
+                    target_sha256=recovery.digest(broken['text']), original=broken['text'],
+                    reason='Repairing the damaged record', disposition='void', operator=OPERATOR)
+        issue['comments'].append(dict(id='void-broken', text=recovery.PREFIX + canonical_bytes(void).decode(),
+                                      author=OPERATOR, created_at='2026-09-16T00:01:00Z'))
+        run, calls = self.merge_run([issue])
+        with scratch() as tmp:
+            result = coordination.apply_native({'operation': 'merge-acquire', 'task': 'trial-a',
+                                                'target': 'refs/heads/main'},
+                                               OPERATOR, run, Path(tmp), review_writes=True,
+                                               operators=[OPERATOR])
+        self.assertTrue(result['acquired'])
+        self.assertIsNone(lifecycle.unreadable_hold_chain(issue, [OPERATOR]))
+        self.assertEqual(lifecycle.require_unheld_fact(issue, 'integrated', 'trial-a',
+                                                      operators=[OPERATOR]), None)
+        store = NativeStore(tasks=('trial-a',)).seed('trial-a')
+        store.rows[0]['comments'] = issue['comments']
+        selection = lifecycle.release_selection(
+            store.rows,
+            {'source_commit': '', 'integration_commit': RELEASE_COMMIT,
+             'release_id': 'release-1', 'environment': 'production'},
+            lambda commit, release: True, operators=[OPERATOR])
+        self.assertNotIn('unreadable hold chain',
+                         ' '.join(item['reason'] for item in selection['skipped']))
+
+    def test_merge_acquire_is_refused_for_a_malformed_task_row(self):
+        # kittrial-5bb.297 review item 4c: a malformed row used to give issue=None and
+        # the hold gate passed; the acquisition is refused until the row is repaired.
+        malformed = dict(row('trial-a'), malformed=True, error='JSON nested too deeply')
+        base_run, calls = self.merge_run([malformed])
+
+        def run(argv):
+            if argv[:1] == ['list']:
+                return '[]'                      # the malformed row's classify read
+            return base_run(argv)
+        with scratch() as tmp:
+            with self.assertRaisesRegex(w.CoordinatorRuleRefusal, 'is malformed'):
+                coordination.apply_native({'operation': 'merge-acquire', 'task': 'trial-a',
+                                           'target': 'refs/heads/main'},
+                                          OPERATOR, run, Path(tmp), review_writes=True)
+        self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'acquire']], [])
+
+    def test_merge_acquire_is_refused_for_a_task_whose_chain_cannot_be_read(self):
+        # kittrial-5bb.297: the merge slot fails closed too, before the slot is read.
+        issue, _ = self.broken_chain()
+        run, calls = self.merge_run([issue])
+        with scratch() as tmp:
+            with self.assertRaisesRegex(w.CoordinatorRuleRefusal, 'cannot be read'):
+                coordination.apply_native({'operation': 'merge-acquire', 'task': 'trial-a',
+                                           'target': 'refs/heads/main'},
+                                          OPERATOR, run, Path(tmp), review_writes=True)
+        self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'check']], [])
+        self.assertEqual([call for call in calls if call[:2] == ['merge-slot', 'acquire']], [])
+
 
 class BundleObservationTests(unittest.TestCase):
     """The kit's host observation of a delivered bundle (item 5)."""

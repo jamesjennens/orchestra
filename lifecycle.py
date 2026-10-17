@@ -1008,6 +1008,60 @@ def review_chain_state(row, operators=None, journal=None):
     except (ValueError,KeyError,TypeError):return None
 
 
+def unreadable_hold_chain(row, operators=None, journal=None):
+    """Why ``row``'s review chain cannot be read (kittrial-5bb.297, fail closed), or None.
+
+    The fail-open of the design review of kittrial-5bb.252 DELIVERY2 item 3: a chain that
+    EXISTS but cannot be parsed may carry a hold this read cannot see, and the hold exists
+    to stop release selection, so every surface that selects or integrates treats such a
+    task as not integration-ready, with this reason naming the task and why. A row with no
+    chain comments at all has no holds to hide and is never flagged; neither is a missing
+    or non-task row. Read through the SAME voids and journal as every canonical reader
+    (kittrial-5bb.272 review item 1); nothing here changes what is recorded.
+    """
+    if not isinstance(row,dict) or not isinstance(row.get('id'),str):return None
+    from coordination import is_merge_slot
+    if row.get('issue_type') in ('event','gate') or is_merge_slot(row):return None
+    import re
+    from review_workflow import PREFIX, project, applied_review_voids
+    # kittrial-5bb.297 review item 'family-prefix-dos': ONLY the reserved any-version
+    # pattern 'Kind: contribution-review-v<N>' followed by a newline counts as a chain
+    # record - an ordinary look-alike comment ('Kind: contribution-reviewer note...',
+    # 'Kind: contribution-review-v1 (quoting...)') is not reserved and must never let a
+    # contributor stop another task's release. And the operator voids are applied
+    # BEFORE deciding, so a voided bad record no longer flags - the repair the
+    # refusal names works here too. Both reads use the caller's operators, exactly as
+    # every canonical reader does.
+    reserved=re.compile(r'Kind: contribution-review-v[0-9]+\n')
+    try:
+        voided=set(applied_review_voids(row,operators)[0])
+    except (ValueError,KeyError,TypeError):
+        voided=set()
+    comments=row.get('comments') or []
+    chain_comments=[comment for comment in comments
+                    if isinstance(comment,dict) and isinstance(comment.get('text'),str)
+                    and reserved.match(comment['text'])
+                    and str(comment.get('id')) not in voided]
+    if not chain_comments:
+        return None                                     # no chain at all: no holds to hide
+    if any(not comment['text'].startswith(PREFIX) for comment in chain_comments):
+        # A chain record of a version this kit does not know (review item 4b): the
+        # chain reader keys on the exact version and never sees it, so a hold may
+        # hide in it - unreadable, never 'no chain at all'.
+        return ('the review chain of %s holds a record of a contribution-review version this kit '
+                'cannot read, so a hold it may carry cannot be seen; an operator on the host '
+                'removes that record (a void cannot: the void target must be a record of a version '
+                'this kit reads), and until then the task is not integration-ready'
+                %row.get('id'))
+    try:
+        project(row,operators,journal)
+        return None
+    except (ValueError,KeyError,TypeError) as error:
+        return ('the review chain of %s cannot be read (%s), so a hold it may carry cannot be seen; '
+                'an operator repairs the chain (voids reconcile it), and until then the task is not '
+                'integration-ready'%(row.get('id'),str(error)[:120]))
+
+
 def held_tasks(rows, operators=None, journal=None):
     """``{task: sentence}`` for tasks whose CURRENT contribution is held (kittrial-5bb.10).
 
@@ -1119,12 +1173,23 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
     # selection skips the task with the sentence naming the open hold (or the failed
     # attestation) and who can release it, instead of offering it as a target.
     held=held_tasks(rows,operators,journal)
+    # kittrial-5bb.297, fail closed: a chain that exists but cannot be parsed may carry a
+    # hold this read cannot see, so such a target is skipped with the reason naming the
+    # task - and the skipped list is the release audit's report of it. A task with no
+    # chain at all is never flagged (no holds to hide).
+    unreadable={}
+    for row in rows:
+        reason=unreadable_hold_chain(row,operators,journal)
+        if reason is not None:unreadable[row.get('id')]=reason
     targets=[];skipped=[];flags=[];verifying=[];restoring=[]
     for entry in scoped_evidence(rows,('integrated','deployed','live-verified',LIVE)):
         task=entry['id'];scopes=entry['scopes']
         if wanted is not None and task not in wanted:continue
         if task in held:
             skipped.append({'task':task,'reason':'held from integration: '+held[task]})
+            continue
+        if task in unreadable:
+            skipped.append({'task':task,'reason':'unreadable hold chain: '+unreadable[task]})
             continue
         chosen=None;reason=entry['untrusted'].get('integrated')
         for candidate in sorted(scopes,key=lambda c:((c.get('integrated') or {}).get('order') or -1,
@@ -1880,6 +1945,18 @@ def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_author
         raise ValueError('Refusing a release that names %s: %s. A held contribution is not integration-ready; '
                          'the hold must be released (or a corrected attestation recorded) first.'
                          %(', '.join(refused[:5]),'; '.join('%s: %s'%(task,held[task]) for task in refused[:5])))
+    # kittrial-5bb.297, fail closed: naming a task whose chain cannot be read is refused
+    # the same way - a hold it may carry cannot be seen, so it is not integration-ready.
+    issues={row.get('id'):row for row in rows if isinstance(row,dict)}
+    unreadable_named={}
+    for task in named:
+        reason=unreadable_hold_chain(issues.get(task),operators,journal)
+        if reason is not None:unreadable_named[task]=reason
+    if unreadable_named:
+        raise ValueError('Refusing a release that names %s: %s.'
+                         %(', '.join(sorted(unreadable_named)[:5]),
+                           '; '.join('%s: %s'%(task,unreadable_named[task])
+                                     for task in sorted(unreadable_named)[:5])))
     if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
     selected,plans,issues,evidence=_release_plan(rows,payload,operators,journal)
     superseded=_supersede_plan(rows,payload,issues,evidence)
@@ -2022,6 +2099,12 @@ def require_unheld_fact(issue, dimension, task, operators=None, journal=None):
             raise ValueError('Refusing to record %s for %s: %s. A held contribution is not '
                              'integration-ready; the hold must be released (or a corrected attestation '
                              'recorded) first.'%(dimension,task,sentence))
+        # kittrial-5bb.297, fail closed: a chain that exists but cannot be parsed may carry
+        # a hold this read cannot see, so the fact is refused with the reason naming the
+        # task and why. A task with no chain at all is not flagged.
+        unreadable=unreadable_hold_chain(issue,operators,journal)
+        if unreadable:
+            raise ValueError('Refusing to record %s for %s: %s.'%(dimension,task,unreadable))
 
 
 def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_authors=False,
@@ -2412,6 +2495,26 @@ def main():
             # caller-side journal. A dry run stays offline and views reverts locally
             # (pass --journal PROJECT for a host-accurate dry run).
             endpoint_reverts=None
+            # kittrial-5bb.297 review item 'operators-on-every-surface': the offline
+            # dry run consults the SAME configured operators the canonical readers
+            # use (from the config's runtime root), so an operator void that repairs
+            # an unreadable hold chain is seen here too. A config without a readable
+            # local root (a remote transport) degrades to no operators with a
+            # warning, exactly as an unreadable setting degrades elsewhere.
+            selection_operators=None
+            try:
+                # kittrial-5bb.297 review item (b): the name is admin.operators (an
+                # ImportError here was swallowed and left the operators silently
+                # unused). A malformed value or a config without a readable local
+                # root keeps the tolerance: no operators, with a warning.
+                from admin import ConfigurationUnreadable, operators as configured_operators
+                selection_operators=configured_operators(Path(config['root']))
+            except ConfigurationUnreadable as exc:
+                warnings.append('operator voids not applied: the configured operators are '
+                                'unreadable (%s)'%str(exc)[:120])
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                warnings.append('operator voids not applied: the configured operators could not be '
+                                'read from %s (%s)'%(config.get('root'),str(exc)[:80]))
             if not a.dry_run:
                 query=dict(data,dimension=RELEASE_QUERY,targets=[],live_verified=False,
                            operation_id=(data['operation_id'][:RELEASE_OPERATION_MAX-6]+'/query'))
@@ -2439,6 +2542,7 @@ def main():
             if data['rollback']:
                 selection=rollback_selection(rows,data['scope'],is_ancestor,
                                              reverted=endpoint_reverts,journal=journal,
+                                             operators=selection_operators,
                                              current_commits=current_contribution_commits(rows))
                 targets=selection['targets'];supersede=list(selection['supersede'])
                 # The scope-level list of what the rollback moves past (rev4 item 2):
@@ -2453,6 +2557,7 @@ def main():
                                             subset=set(subset) if subset else None,
                                             current_commits=current_contribution_commits(rows),
                                             live_verified=data['live_verified'],journal=journal,
+                                            operators=selection_operators,
                                             reverted=endpoint_reverts)
                 targets=selection['targets'];supersede=list(selection['supersede'])
                 supersede_scopes=[]
