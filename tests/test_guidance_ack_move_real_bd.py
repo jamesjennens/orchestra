@@ -171,14 +171,23 @@ class GuidanceAckMoveRealBdTests(unittest.TestCase):
         self.assertTrue(json.loads(steady.stdout)['timed_out'])
 
     # -- the HTTP agent route --------------------------------------------------
-    def test_the_http_agent_routes_carry_the_item_and_the_wait_fingerprint_moves(self):
+    def test_the_http_agent_routes_withhold_the_item_until_its_clear_routes_exist(self):
+        """kittrial-5bb.334: no HTTP guidance item while no HTTP route can clear it.
+
+        The same guidance version still reaches an SSH caller unchanged, and the item
+        returns on both HTTP agent routes the moment the guidance read and ack routes
+        are registered - which is what kittrial-5bb.212 will do.
+        """
+        import re
         import http_service
         import test_http_review_fixes as fixes
         root = self.root
+
         class HttpHarness(fixes.Harness):
             def make_backend(self):
                 return http_service.EndpointBackend(sys.executable, str(KIT / 'endpoint.py'),
                                                     str(root), service=self.service)
+
         harness = HttpHarness(methodName='runTest')
         harness.setUp()
         try:
@@ -189,45 +198,58 @@ class GuidanceAckMoveRealBdTests(unittest.TestCase):
             made = harness.request('POST', '/v1/agents',
                                    {'name': 'Kestrel', 'projects': ['pp']}, token=token)
             self.assertEqual(201, made.status, made.data)
-            agent_id = made.data['agent']['id']
             secret = made.data['credential']['secret']
-            record = harness.service.state['agents'][agent_id]
-            actor = harness.service.agent_actor(record)
             first = self.set_guidance()
+            # 1. Over HTTP there is no guidance read or ack route on this service yet, so
+            # the item is withheld and it is not a wake row either.
             nxt = harness.request('GET', '/v1/agents/me/next', token=secret)
             self.assertEqual(200, nxt.status, nxt.data)
-            action = nxt.data['next_actions'][0]
-            self.assertEqual('guidance', action['kind'], nxt.data)
-            self.assertEqual(first['version'], action['guidance_version'])
-            self.assertIn(first['version'], action['command'])
-            self.assertIn('guidance ack --version', action['command'])
-            self.assertNotIn(TEXT, json.dumps(nxt.data))
+            self.assertFalse([item for item in nxt.data['next_actions']
+                              if item.get('kind') == 'guidance'], nxt.data)
+            # The attention count is the guidance item's count: zero, not the word
+            # (the word is a legitimate key of the counts block).
+            self.assertEqual(0, nxt.data['attention']['counts'].get('guidance'), nxt.data)
             wait = harness.request('GET', '/v1/agents/me/wait', token=secret)
             self.assertEqual(200, wait.status, wait.data)
-            row = self.guidance_row(wait.data)
-            self.assertIsNotNone(row, wait.data)
-            self.assertEqual(first['version'], row['guidance_version'])
-            self.assertNotIn(TEXT, json.dumps(wait.data))
-            before = wait.data['fingerprint']
-            # The agent's own acknowledgement clears the action and moves the fingerprint.
-            # It is recorded with the guidance module directly: the canonical endpoint
-            # refuses an HTTP-shaped actor (agent_...) that is self-declared, and this
-            # fixture does not carry the HTTP authority configuration a deployed service
-            # has, so the write is the same one that authority path performs.
-            import guidance
-            guidance.acknowledge(self.project, actor, first['version'])
-            cleared = harness.request('GET', '/v1/agents/me/next', token=secret)
-            self.assertEqual(200, cleared.status, cleared.data)
-            self.assertFalse([item for item in cleared.data['next_actions']
-                              if item.get('kind') == 'guidance'], cleared.data)
-            after_ack = harness.request('GET', '/v1/agents/me/wait', token=secret)
-            self.assertIsNone(self.guidance_row(after_ack.data))
-            self.assertNotEqual(before, after_ack.data['fingerprint'])
-            # A new version wakes the web wait read too.
-            second = self.set_guidance('A second real-bd guidance text for the web route.')
-            woken = harness.request('GET', '/v1/agents/me/wait', token=secret)
-            self.assertEqual(second['version'], self.guidance_row(woken.data)['guidance_version'])
-            self.assertNotEqual(after_ack.data['fingerprint'], woken.data['fingerprint'])
+            self.assertIsNone(self.guidance_row(wait.data), wait.data)
+            steady = harness.request('GET', '/v1/agents/me/wait', token=secret)
+            self.assertEqual(wait.data['fingerprint'], steady.data['fingerprint'])
+            # 2. The SSH/endpoint reads are untouched by the switch: the same version is
+            # still the one item on work --mine and the endpoint wait projection.
+            ssh_actor = self.register()
+            self.assert_item(self.read('work', ['--mine', '--json'], ssh_actor)['guidance'],
+                             first['version'], 'SSH work --mine')
+            self.assertEqual(first['version'],
+                             self.guidance_row(self.wait_read(ssh_actor))['guidance_version'],
+                             'SSH wait')
+            # 3. Register the two routes the kit should serve (the .212 contract): the item
+            # returns on both HTTP agent routes, and the wait fingerprint moves for it.
+            routes = [
+                ('GET', re.compile('^/v1/projects/(?P<pid>[^/]+)/guidance$'),
+                 'project_guidance_read', False, True),
+                ('POST', re.compile('^/v1/projects/(?P<pid>[^/]+)/guidance/ack$'),
+                 'project_guidance_ack', False, True),
+            ]
+            for entry in routes:
+                http_service.ROUTES.append(entry)
+            try:
+                nxt_after = harness.request('GET', '/v1/agents/me/next', token=secret)
+                self.assertEqual(200, nxt_after.status, nxt_after.data)
+                action = nxt_after.data['next_actions'][0]
+                self.assertEqual('guidance', action['kind'], nxt_after.data)
+                self.assertEqual(first['version'], action['guidance_version'])
+                self.assertIn('guidance ack --version', action['command'])
+                self.assertNotIn(TEXT, json.dumps(nxt_after.data))
+                wait_after = harness.request('GET', '/v1/agents/me/wait', token=secret)
+                row = self.guidance_row(wait_after.data)
+                self.assertIsNotNone(row, wait_after.data)
+                self.assertEqual(first['version'], row['guidance_version'])
+                self.assertNotEqual(wait.data['fingerprint'], wait_after.data['fingerprint'])
+                self.assertNotIn(TEXT, json.dumps(wait_after.data))
+            finally:
+                for entry in routes:
+                    if entry in http_service.ROUTES:
+                        http_service.ROUTES.remove(entry)
         finally:
             harness._stop_server()
             harness.doCleanups()
