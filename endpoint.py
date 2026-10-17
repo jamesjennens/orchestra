@@ -1747,6 +1747,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         or (operation in ('create','force-release') and descriptor.get('via')!='session')):
                     denied_status.append(403)
                     raise SlotError(403,'Verified web authority required for this merge-slot operation in this project')
+            def hold_slot_operators(root, warnings):
+                # kittrial-5bb.297 review item (c): the web acquire reads the operator
+                # allowlist ALWAYS now, and a malformed value keeps the old tolerance
+                # (nobody, with a warning) instead of refusing an acquire that
+                # answered 200 before the fix.
+                try:
+                    return configured_operators(root)
+                except ConfigurationUnreadable as error:
+                    warnings.append('deployment operators unreadable, so operator voids are not '
+                                    'applied: '+str(error)[:160])
+                    return None
             def slot_identity():
                 slot_authority()
                 if operation=='acquire':
@@ -1755,15 +1766,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     rows=read_event_rows(runner)
                     issue=next((row for row in rows if row.get('id')==payload['task']),None)
                     try:
+                        # kittrial-5bb.297 review item 'operators-on-every-surface':
+                        # the configured operators ALWAYS, not only when
+                        # independent_approval is on - an operator void that repairs
+                        # the chain must be seen here exactly as the canonical
+                        # readers see it, or the acquire stays refused while the
+                        # coordinate route and the release accept.
                         require_unheld_merge_task(issue,payload['task'],
-                            configured_operators(root) if rules['independent_approval'] else None,path)
+                                                  hold_slot_operators(root,run_warnings),path)
                     except CoordinatorRuleRefusal:
                         denied_status.append(409)
                         raise
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             def slot_effect():
                 result=slot_apply(payload,actor,runner,path,request.get('operation_id'),
-                                  operators=(configured_operators(root) if rules['independent_approval'] else None),
+                                  operators=hold_slot_operators(root,run_warnings),
                                   coordinator_writes=rules['coordinator_writes'],
                                   independent_approval=rules['independent_approval'],
                                   owners=owner_loader(path,'independent_approval'),
@@ -1812,8 +1829,18 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # malformed `operators` value must not stop `coordinate`, and a damaged
         # registry must not stop the reads or a listed operator's operation
         # (kittrial-5bb.197 review request 01a12894, item 4).
-        coordinate_operators=(configured_operators(root)
-                              if (rules['coordinator_writes'] or rules['independent_approval']) else None)
+        # kittrial-5bb.297 review item 'operators-everywhere-really' (a): the operator
+        # allowlist is passed ALWAYS for the coordinate write's hold check (one
+        # operator void that repairs a chain is seen here exactly as the canonical
+        # readers see it), not only when a rule is on; the rules still gate what they
+        # gated. (c) A malformed value keeps the old tolerance: it reads as nobody
+        # WITH a warning, exactly as a malformed rules value does, so a broken
+        # setting never refuses a coordinate write that answered 200 before.
+        coordinate_operators=None
+        try:coordinate_operators=configured_operators(root)
+        except ConfigurationUnreadable as error:
+            run_warnings.append('deployment operators unreadable, so operator voids are not applied: '
+                               +str(error)[:160])
         def lifecycle_effect():
             if action=='lifecycle':result=apply_native(payload,actor,runner,
                                                        operators=configured_operators(root),journal=path,
@@ -1831,11 +1858,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            return guarded_write(root,request,journal_path(path),lifecycle_effect,
-                               authority_config=authority_config,
-                               require_authority=require_authority,runner=runner)
+        # kittrial-5bb.297 review item 'rc2-scope-and-test-order': ONLY the coordinate
+        # merge-acquire refusal answers rc 2 (the answer shape the web merge-slot
+        # route returns). Every other CoordinatorRuleRefusal - a lifecycle write's
+        # rule refusal included - keeps raising exactly as before: no contract
+        # change beyond the one the item asked for.
+        from review_workflow import MergeHoldRefusal
+        try:
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                return guarded_write(root,request,journal_path(path),lifecycle_effect,
+                                   authority_config=authority_config,
+                                   require_authority=require_authority,runner=runner)
+        except MergeHoldRefusal as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','refused':'coordinator-rule'}
     if action == 'feedback':
         from feedback import execute as feedback_execute
         args=request.get('args',[])

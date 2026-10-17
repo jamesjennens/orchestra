@@ -151,7 +151,18 @@ def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
     rows = lifecycle.read_event_rows(run)
     issue, state = task_state(rows, task)
     scope = state['scope']
-    _, review = review_state(issue, operators, project)
+    # kittrial-5bb.297, fail closed and still readable: a review chain that exists but
+    # cannot be parsed may carry a hold this read cannot see, so the page ANSWERS with
+    # that reason (in every affordance and hold refusal below) instead of erroring -
+    # an operator reading the page is how the chain gets repaired.
+    try:
+        _, review = review_state(issue, operators, project)
+    except ValueError as error:
+        review = None
+        unreadable = ('the review chain of this task cannot be read (%s), so a hold it may '
+                      'carry cannot be seen; an operator repairs the chain (voids reconcile '
+                      'it), and until then no fact and no integration is allowed'
+                      % str(error)[:120])
     facts = {dimension: dict(fact) for dimension, fact in state['facts'].items()}
     events = {row.get('id'): row for row in rows if isinstance(row, dict) and row.get('issue_type') == 'event'}
     for dimension, fact in facts.items():
@@ -168,6 +179,10 @@ def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
         held_slot(run, project, actor, task)
     except LifecycleError as error:
         reason = str(error)
+    except ValueError as error:
+        # kittrial-5bb.297: the standing-approval read shares the review chain; an
+        # unreadable chain is the same fail-closed reason, not a failed page.
+        reason = unreadable if review is None else str(error)
     mark_reason = None
     try:
         mark_admission(project, mark_writes)
@@ -175,6 +190,9 @@ def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
         mark_reason = str(error)
     hold_refusals = {}
     for dimension in ('reviewed', 'integrated'):
+        if review is None:
+            hold_refusals[dimension] = unreadable
+            continue
         try:
             # The same voids and journal the canonical readers use
             # (kittrial-5bb.272 review item 1): a voided release-hold reads held here too.
@@ -192,10 +210,13 @@ def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
         if why is None and scope is None:
             why = 'Set a lifecycle scope first'
         if why is None and dimension in ('reviewed', 'integrated'):
-            try:
-                lifecycle.require_unheld_fact(issue, dimension, task, operators=operators, journal=project)
-            except ValueError as error:
-                why = str(error)
+            if review is None:
+                why = unreadable
+            else:
+                try:
+                    lifecycle.require_unheld_fact(issue, dimension, task, operators=operators, journal=project)
+                except ValueError as error:
+                    why = str(error)
             if why is None:
                 why = reason
         affordances[dimension] = dict(allowed=why is None, reason=why)
@@ -203,7 +224,7 @@ def read(task, actor, run, project, *, coordinate=False, mark_writes=False,
             affordances[dimension]['passed'] = dict(allowed=why is None and mark_reason is None,
                                                     reason=why or mark_reason)
     return dict(task=task, scope=scope, scope_token=content_hash(scope) if scope is not None else None,
-                facts=facts, contribution=review.get('contribution'),
+                facts=facts, contribution=(review or {}).get('contribution'),
                 standing_approval=approval, approval_reason=reason, hold_refusals=hold_refusals,
                 scope_write=dict(allowed=coordinate, reason=None if coordinate else 'Current coordinate permission is required'),
                 affordances=affordances, mark_writer_enabled=mark_writes is True)
