@@ -2397,6 +2397,11 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   agent that holds 20 or more records (possible here: up to 20 that work and 5 that do
   not) cannot be renewed under the older kit until records are revoked and removed by
   hand; and the older kit gives the default four to every renewal from the page again.
+  Rolling back to a kit that predates the `'records'` scope (slice 5, kittrial-5bb.213)
+  makes that older kit treat a stored or credential `'records'` scope as an unrecognized
+  scope name and therefore read the agent's scopes as `unknown` (`scopes_source: "unknown"`,
+  `scopes: null`) until the owning account sets an explicit scope list recognized by that
+  older kit.
 
 The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its credential as a
@@ -3520,9 +3525,18 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
   written by a web coordinator (`usr_<16hex>` or `agent_<16hex>`) are recognized as live by
   `keyed_entries.evidence_is_live` and `capability_verification`. Lowering a coordinator to
   contributor or revoking an agent's coordinator grant stops their **next** `accept`, `retire`,
-  `verify` or `aliases/reject` immediately (`403`) and leaves the acceptances, retirements and
-  verifications they already recorded live (`acceptance_inert: false`,
-  `verification_state: "attested"`).
+  `verify` or `aliases/reject` immediately (`403`, including idempotent replays of an earlier
+  request) and leaves the acceptances, retirements and verifications they already recorded live
+  (`acceptance_inert: false`, `verification_state: "attested"`). Keeping an attestation's
+  `attested` label after its author is demoted or has their coordinator grant removed is
+  deliberate and safe: every reader surfaces it honestly as `attested` (`trusted: false`,
+  `attested: true`, `checkout_validated: false`), and an attestation never clears a failure
+  (`drifted`).
+- **Rolling back to an older kit.** A kit that predates the `'records'` scope does not include
+  `'records'` in `ALL_SCOPES`, so on rollback any agent whose stored `scopes` or working
+  credentials include `'records'` reads as `scopes_source: "unknown"` (`scopes: null`) on that
+  older kit until the agent's owning account issues a renewal with an explicit scope list
+  recognized by the older kit.
 
 ### Self-acceptance and `approval_by_another_party`
 
@@ -3561,8 +3575,9 @@ object:
   "verified_commit": null, "note": "..."}` naming both `capability check --repo <PATH>` and
   `POST /v1/projects/{id}/capabilities/{key}/verify` (or `admin.py capability-verify`).
 - On `POST /v1/projects/{id}/capabilities/{key}/verify`, the caller must supply explicit
-  40-hex `commit`, `revision`, `record_sha256`, `passed` (boolean), and non-empty per-pointer
-  `results` (missing any of `commit`, `passed`, or `results` is refused with `422`). Because the
+  non-zero 40-hex `commit` (an all-zero commit SHA is refused with `422`), `revision`,
+  `record_sha256`, `passed` (boolean), and non-empty per-pointer `results` (missing any of
+  `commit`, `passed`, or `results` is refused with `422`). Because the
   web coordinator attests to pointer checks without the server running `capability check`
   against a repository checkout, the endpoint records `Kind: capability-verification-v1` with
   `submitter.identity: "attested"`, `verification_state: "attested"`, `trusted: false`,
@@ -3571,4 +3586,10 @@ object:
   capability-verify --repo <PATH>` (where the host validates pointers against a real repository
   checkout) records `submitter.identity: "verified"`, `verification_state: "verified"`,
   `trusted: true`, and `pointers_validation.checkout_validated: true`.
+- **An attestation never clears a failure (`drifted`).** In `capability_verification.derive()`,
+  only a **trusted** host pass (`submitter.identity: "verified"`, `trusted: true`) at an
+  integrated commit clears an earlier failing check on that revision. A web coordinator's
+  `attested` pass sits beside the failure in `report` (as the newest check) while leaving
+  `open_failing` and `state: "drifted"` intact until a trusted host `capability-verify --repo`
+  at an integrated commit passes.
 

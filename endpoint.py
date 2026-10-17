@@ -1182,27 +1182,23 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 self.status=status
         def _records_http_context(coordinator,warnings):
             if not (authority_config is not None and require_authority):
-                return None,None,None,[]
+                return None,None,None
             from http_authority import actor_parties,CAP_COORDINATE,CAP_RECORDS,read_state
             from review_workflow import approval_owners,CoordinatorRuleRefusal,same_party
             needed=CAP_COORDINATE if coordinator else CAP_RECORDS
-            denied_status=[]
             authority=request.get('authority') if isinstance(request.get('authority'),dict) else {}
             user_id=authority.get('user_id') if isinstance(authority.get('user_id'),str) else None
             rules=configured_coordinator_rules(root,warnings=warnings)
             def identity_check():
                 if not verified_web_authority(request,authority_config,needed,name):
-                    denied_status.append(403)
                     raise RecordsRefusal(403,'Verified web authority required in this project')
                 state=read_state(authority_config.store)
                 role=((state.get('memberships') or {}).get(name) or {}).get(user_id) if user_id else None
                 if coordinator:
                     if role not in ('owner','coordinator'):
-                        denied_status.append(403)
                         raise RecordsRefusal(403,'Record coordination requires project membership as an owner or coordinator; '
                                                  'a superuser without project membership must add themselves to the project first.')
                 elif role not in ('contributor','coordinator','owner'):
-                    denied_status.append(403)
                     raise RecordsRefusal(403,'Record mutations require project membership; '
                                              'a superuser without project membership must add themselves to the project first.')
             def party_check(proposer):
@@ -1222,18 +1218,16 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     try:
                         owners=approval_owners(owner_loader(path,'independent_approval'))
                     except CoordinatorRuleRefusal as error:
-                        denied_status.append(409)
                         raise RecordsRefusal(409,str(error)) from None
                     same_session_owner=same_party(actor,proposer,owners)
                 if (not isinstance(proposer,str) or not proposer or actor==proposer
                         or bool(caller_parties & proposer_parties) or same_session_owner):
-                    denied_status.append(403)
                     if by_agent:
                         raise RecordsRefusal(403,'An agent holding a coordinator grant may not accept or verify a record '
                                                  'whose draft was proposed by its own party.')
                     raise RecordsRefusal(403,'A coordinator may not accept or verify a record whose draft was proposed '
                                              'by the same party while approval_by_another_party is enabled.')
-            return identity_check,(party_check if coordinator else None),user_id,denied_status
+            return identity_check,(party_check if coordinator else None),user_id
     if action=='ref':
         # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, find, help)
         # read their own key, or the catalog in two native reads (reference_records), take no
@@ -1276,7 +1270,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             elif looked_up is not None:counted(looked_up,True)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         coordinator=args[0] in reference_records.HTTP_WRITE_COMMANDS
-        identity_check,party_check,_,denied_status=_records_http_context(coordinator,run_warnings)
+        identity_check,party_check,_=_records_http_context(coordinator,run_warnings)
         payload=reference_records.write_payload(args,request.get('attachments',{}),commands=writes)
         runner=NativeRunner(run, project=path)
         def ref_effect():
@@ -1290,12 +1284,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            answer=guarded_write(root,request,journal_path(path),ref_effect,
+            return guarded_write(root,request,journal_path(path),ref_effect,
                                  authority_config=authority_config,
                                  require_authority=require_authority,runner=runner,
                                  identity_check=identity_check)
-            if denied_status and answer.get('returncode')==2:answer['records_status']=denied_status[-1]
-            return answer
     if action=='capability':
         # The capability index (.60 slices 1a and 1b, kittrial-5bb.67/.69). get, list, find
         # and help are reads (one label-filtered bd list plus bd show; no lock, not
@@ -1337,7 +1329,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 except Exception:pass
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         coordinator=args[0] in capability_records.HTTP_WRITE_COMMANDS
-        identity_check,party_check,user_id,denied_status=_records_http_context(coordinator,run_warnings)
+        identity_check,party_check,user_id=_records_http_context(coordinator,run_warnings)
         operators=configured_operators(root)
         runner=NativeRunner(run, project=path)
         def capability_effect():
@@ -1351,12 +1343,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            answer=guarded_write(root,request,journal_path(path),capability_effect,
+            return guarded_write(root,request,journal_path(path),capability_effect,
                                  authority_config=authority_config,
                                  require_authority=require_authority,runner=runner,
                                  identity_check=identity_check)
-            if denied_status and answer.get('returncode')==2:answer['records_status']=denied_status[-1]
-            return answer
     if action=='proposal':
         # Contributed requirement proposals (.58 slices 1a and 1b, kittrial-5bb.68/.70).
         # get, list, mine and help are reads (no lock, not run_guarded); submit and

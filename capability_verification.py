@@ -228,7 +228,7 @@ def is_attested(item):
     record = item['record']
     author = item['author']
     return (record['submitter']['identity'] == 'attested' and author == record['submitter']['actor']
-            and core.http_actor_id(author) is not None)
+            and core.http_actor_id(author) is not None and bool(record['commit'].strip('0')))
 
 
 def is_lifecycle_row(row):
@@ -395,11 +395,11 @@ def derive(records, revision, trusted, integrated):
     failing = [item for item in mine if not item['record']['passed']]
     cleared_at = -1
     if failing:
-        # The newest trusted (or coordinator-attested) pass at an integrated commit clears every failure before it.
+        # The newest trusted pass at an integrated commit clears every failure before it.
         for item in reversed(mine):
             if item['position'] < failing[0]['position']:
                 break
-            if (item['trusted'] or item['attested']) and item['record']['passed'] and integrated(item['record']['commit']):
+            if item['trusted'] and item['record']['passed'] and integrated(item['record']['commit']):
                 cleared_at = item['position']
                 break
     open_failing = [item for item in failing if item['position'] > cleared_at]
@@ -506,6 +506,8 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
             party_check(draft_author)
     if web_coordinator:
         validate_payload(payload)
+        if not payload['commit'].strip('0'):
+            raise ValueError('commit must be a real non-zero commit SHA')
     revision = records._newest(entry)
     if revision['revision'] != payload['revision'] or revision['sha256'] != payload['record_sha256']:
         raise ValueError('The check does not match the current revision of capability %s (revision %d); run '

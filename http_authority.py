@@ -2645,7 +2645,9 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             try:
                 identity_check()
             except ValueError as denied:
-                return _envelope(2, stderr=str(denied) + '\n')
+                status = getattr(denied, 'status', None)
+                return _envelope(2, stderr=str(denied) + '\n',
+                                 **({'records_status': status} if isinstance(status, int) else {}))
         journal = (OperationJournal(journal_path, **(journal_options or {}))
                    if operation_id else None)
         # The principal half of the identity comes from the request descriptor only

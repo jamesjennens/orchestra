@@ -491,7 +491,7 @@ class _RecordsScenarioMixin:
         self.assertEqual(c_get_mid.data['proposed']['revision'], 3)
         self.assertTrue(c_get_mid.data['waiting_acceptance'])
 
-        # Verify without explicit commit, results, or passed is refused with 422 (P12)
+        # Verify without explicit commit, results, or passed, or with an all-zero commit, is refused with 422 (P12, small-follow-ups)
         c_ver_no_results = harness.request(
             'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/verify',
             {'revision': 2, 'record_sha256': cap_rev2_sha, 'commit': 'a' * 40, 'passed': True},
@@ -503,6 +503,68 @@ class _RecordsScenarioMixin:
             {'revision': 2, 'record_sha256': cap_rev2_sha, 'passed': True, 'results': _valid_cap_results()},
             token=coord1, key='coord1-cap-verify-missing-commit')
         self.assertEqual(c_ver_no_commit.status, 422, c_ver_no_commit.data)
+
+        c_ver_zero_commit = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/verify',
+            {'revision': 2, 'record_sha256': cap_rev2_sha, 'commit': '0' * 40,
+             'passed': True, 'results': _valid_cap_results()},
+            token=coord1, key='coord1-cap-verify-zero-commit')
+        self.assertEqual(c_ver_zero_commit.status, 422, c_ver_zero_commit.data)
+        self.assertIn('non-zero commit SHA', c_ver_zero_commit.data['error']['message'])
+
+        # Worker credentials endpoint: ['tasks', 'reviews'] and ['tasks'] get 403 on propose and accept;
+        # ['records'] gets 201 on propose and 403 on accept (small-follow-ups)
+        wc_tr = harness.request(
+            'POST', f'/v1/projects/{self.pid}/worker-credentials',
+            {'actor': 'wc-tasks-reviews', 'scopes': ['tasks', 'reviews']},
+            token=self.owner_token, key='wc-issue-tasks-reviews')
+        self.assertEqual(wc_tr.status, 201, wc_tr.data)
+        wc_tr_tok = wc_tr.data['credential']['secret']
+        wc_tr_prop = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references',
+            _valid_ref_propose('wc.tr-ref', title='WC TR Ref'),
+            token=wc_tr_tok, key='wc-tr-propose-fail')
+        self.assertEqual(wc_tr_prop.status, 403, wc_tr_prop.data)
+        wc_tr_acc = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/accept',
+            {'expected_revision': 3, 'record_sha256': cap_rev3_sha, 'evidence': 'WC TR accept fail.'},
+            token=wc_tr_tok, key='wc-tr-accept-fail')
+        self.assertEqual(wc_tr_acc.status, 403, wc_tr_acc.data)
+
+        wc_t = harness.request(
+            'POST', f'/v1/projects/{self.pid}/worker-credentials',
+            {'actor': 'wc-tasks-only', 'scopes': ['tasks']},
+            token=self.owner_token, key='wc-issue-tasks-only')
+        self.assertEqual(wc_t.status, 201, wc_t.data)
+        wc_t_tok = wc_t.data['credential']['secret']
+        wc_t_prop = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references',
+            _valid_ref_propose('wc.t-ref', title='WC T Ref'),
+            token=wc_t_tok, key='wc-t-propose-fail')
+        self.assertEqual(wc_t_prop.status, 403, wc_t_prop.data)
+        wc_t_acc = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/accept',
+            {'expected_revision': 3, 'record_sha256': cap_rev3_sha, 'evidence': 'WC T accept fail.'},
+            token=wc_t_tok, key='wc-t-accept-fail')
+        self.assertEqual(wc_t_acc.status, 403, wc_t_acc.data)
+
+        wc_rec = harness.request(
+            'POST', f'/v1/projects/{self.pid}/worker-credentials',
+            {'actor': 'wc-records-only', 'scopes': ['records']},
+            token=self.owner_token, key='wc-issue-records-only')
+        self.assertEqual(wc_rec.status, 201, wc_rec.data)
+        wc_rec_tok = wc_rec.data['credential']['secret']
+        wc_rec_prop = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references',
+            _valid_ref_propose('wc.records-ref', title='WC Records Ref'),
+            token=wc_rec_tok, key='wc-rec-propose-ok')
+        self.assertEqual(wc_rec_prop.status, 201, wc_rec_prop.data)
+        self.assertEqual(wc_rec_prop.data['proposer'], 'wc-records-only')
+        wc_rec_acc = harness.request(
+            'POST', f'/v1/projects/{self.pid}/capabilities/records.web-sync/accept',
+            {'expected_revision': 3, 'record_sha256': cap_rev3_sha, 'evidence': 'WC records accept fail.'},
+            token=wc_rec_tok, key='wc-rec-accept-fail')
+        self.assertEqual(wc_rec_acc.status, 403, wc_rec_acc.data)
 
         # Coordinator attests verification of active accepted revision (revision 2) while draft revision 3 is pending
         c_ver = harness.request(
@@ -655,13 +717,44 @@ class _RecordsScenarioMixin:
             key='client-cap-ver-1')
         self.assertEqual(ver_cap['verification_state'], 'attested')
 
-        # Exercise list_capabilities with tag, owner, state, pointers, waiting (P13, P13b)
+        # Create non-matching capabilities to verify list_capabilities filters EXCLUDE non-matching items
+        nonmatch_tag_body = _valid_cap_propose('client.other-tag', name='Client Other Tag')
+        nonmatch_tag_body['aliases'] = ['client.other.tag']
+        nonmatch_tag_body['tags'] = ['cli-only']
+        nm_tag = client.propose_capability(self.pid, nonmatch_tag_body, key='client-nm-tag-1')
+        client.accept_capability(
+            self.pid, 'client.other-tag',
+            {'expected_revision': 1, 'record_sha256': nm_tag['sha256'], 'evidence': 'Accepted other-tag cap.'},
+            key='client-nm-tag-acc-1')
+
+        nonmatch_owner_body = _valid_cap_propose('client.other-owner', name='Client Other Owner')
+        nonmatch_owner_body['aliases'] = ['client.other.owner']
+        nonmatch_owner_body['owner'] = 'person:somebody-else'
+        nm_owner = client.propose_capability(self.pid, nonmatch_owner_body, key='client-nm-owner-1')
+        client.accept_capability(
+            self.pid, 'client.other-owner',
+            {'expected_revision': 1, 'record_sha256': nm_owner['sha256'], 'evidence': 'Accepted other-owner cap.'},
+            key='client-nm-owner-acc-1')
+
+        # Exercise list_capabilities with tag, owner, state, pointers, waiting (P13, P13b, small-follow-ups)
         listed = client.list_capabilities(
             self.pid, tag='web', owner='person:maintainer', state='accepted', pointers=True, waiting=False)
         keys = [item['key'] for item in listed['items']]
         self.assertIn('client.cap', keys)
+        self.assertNotIn('client.other-tag', keys)
+        self.assertNotIn('client.other-owner', keys)
+        self.assertNotIn('records.web-sync', keys)
+        self.assertNotIn('records.web-sync-v2', keys)
         cap_item = next(item for item in listed['items'] if item['key'] == 'client.cap')
         self.assertIn('code', cap_item)
+
+        listed_waiting = client.list_capabilities(self.pid, waiting=True)
+        waiting_keys = [item['key'] for item in listed_waiting['items']]
+        self.assertIn('records.web-sync-v2', waiting_keys)
+        self.assertNotIn('client.cap', waiting_keys)
+        self.assertNotIn('client.other-tag', waiting_keys)
+        self.assertNotIn('client.other-owner', waiting_keys)
+        self.assertNotIn('records.web-sync', waiting_keys)
 
         parser = http_client._build_parser()
         parsed = parser.parse_args([
@@ -803,6 +896,87 @@ class _RecordsScenarioMixin:
         self.assertEqual(r_ag3_acc.status, 200, r_ag3_acc.data)
         self.assertEqual(r_ag3_acc.data['proposer'], people['coord1']['uid'])
         self.assertEqual(r_ag3_acc.data['acceptor'], agent3['actor'])
+
+        # Removing a coordinator grant (DELETE /v1/projects/{id}/agents/{id}/coordinator) stops accept,
+        # stops propose (for an agent without the 'records' scope), and refuses idempotent replay of an
+        # earlier successful accept (small-follow-ups)
+        del_grant = harness.request(
+            'DELETE', f'/v1/projects/{self.pid}/agents/{agent3["id"]}/coordinator',
+            token=self.owner_token)
+        self.assertEqual(del_grant.status, 200, del_grant.data)
+        self.assertIsNone(del_grant.data['coordinator'])
+
+        r_ag3_replay_after_del = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references/agent.party-ref/accept',
+            {'expected_revision': 1, 'record_sha256': r_ag.data['sha256'],
+             'evidence': 'Independent agent3 accepts coord1 draft.'},
+            token=agent3['token'], key='agent3-accept-coord1-ok')
+        self.assertEqual(r_ag3_replay_after_del.status, 403, r_ag3_replay_after_del.data)
+
+        r_ag3_propose_after_del = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references',
+            _valid_ref_propose('agent3.after-del-ref', title='Agent3 After Del Ref'),
+            token=agent3['token'], key='agent3-propose-after-del-fail')
+        self.assertEqual(r_ag3_propose_after_del.status, 403, r_ag3_propose_after_del.data)
+
+        r_for_issuer = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references',
+            _valid_ref_propose('issuer.demote-ref', title='Issuer Demote Ref'),
+            token=people['contrib']['token'], key='contrib-for-issuer-demote-ref')
+        self.assertEqual(r_for_issuer.status, 201, r_for_issuer.data)
+
+        r_ag3_acc_after_del = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references/issuer.demote-ref/accept',
+            {'expected_revision': 1, 'record_sha256': r_for_issuer.data['sha256'],
+             'evidence': 'Agent3 accept after grant removal fail.'},
+            token=agent3['token'], key='agent3-accept-after-del-fail')
+        self.assertEqual(r_ag3_acc_after_del.status, 403, r_ag3_acc_after_del.data)
+
+        # Re-grant agent3 (owned by coord2), accept a draft with agent3, then demote agent3's
+        # issuer/owner coord2 to contributor while agent3 STILL holds its coordinator grant ->
+        # agent3 gets 403 on replay and 403 on fresh accept! (small-follow-ups)
+        regrant_ag3 = harness.request(
+            'PUT', f'/v1/projects/{self.pid}/agents/{agent3["id"]}/coordinator',
+            {}, token=self.owner_token)
+        self.assertEqual(regrant_ag3.status, 200, regrant_ag3.data)
+        self.assertTrue(regrant_ag3.data['coordinator']['effective'])
+
+        r_ag3_acc_before_demote = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references/issuer.demote-ref/accept',
+            {'expected_revision': 1, 'record_sha256': r_for_issuer.data['sha256'],
+             'evidence': 'Agent3 accepts before its issuer coord2 is demoted.'},
+            token=agent3['token'], key='agent3-accept-before-issuer-demote')
+        self.assertEqual(r_ag3_acc_before_demote.status, 200, r_ag3_acc_before_demote.data)
+
+        demote_coord2 = harness.request(
+            'PUT', f'/v1/projects/{self.pid}/members/{people["coord2"]["uid"]}',
+            {'role': 'contributor'}, token=self.owner_token)
+        self.assertEqual(demote_coord2.status, 200, demote_coord2.data)
+
+        # Replay of agent3's earlier accept after its issuer coord2 was demoted is refused (403)
+        r_ag3_replay_after_issuer_demote = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references/issuer.demote-ref/accept',
+            {'expected_revision': 1, 'record_sha256': r_for_issuer.data['sha256'],
+             'evidence': 'Agent3 accepts before its issuer coord2 is demoted.'},
+            token=agent3['token'], key='agent3-accept-before-issuer-demote')
+        self.assertEqual(r_ag3_replay_after_issuer_demote.status, 403, r_ag3_replay_after_issuer_demote.data)
+
+        # Fresh accept by granted agent3 while its issuer coord2 is demoted is also refused (403)
+        r_for_issuer2 = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references',
+            _valid_ref_propose('issuer.demote-ref-2', title='Issuer Demote Ref 2'),
+            token=people['contrib']['token'], key='contrib-for-issuer-demote-ref-2')
+        self.assertEqual(r_for_issuer2.status, 201, r_for_issuer2.data)
+        r_ag3_acc_issuer_demoted = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references/issuer.demote-ref-2/accept',
+            {'expected_revision': 1, 'record_sha256': r_for_issuer2.data['sha256'],
+             'evidence': 'Agent3 accept while issuer coord2 is demoted.'},
+            token=agent3['token'], key='agent3-accept-while-issuer-demoted-fail')
+        self.assertEqual(r_ag3_acc_issuer_demoted.status, 403, r_ag3_acc_issuer_demoted.data)
+
+        # Restore coord2 to coordinator for Case B
+        harness.request('PUT', f'/v1/projects/{self.pid}/members/{people["coord2"]["uid"]}',
+                        {'role': 'coordinator'}, token=self.owner_token)
 
         # Case B: Turn ON approval_by_another_party!
         with harness.service.store.lock:
@@ -966,6 +1140,103 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_self_acceptance_and_approval_by_another_party(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_self_acceptance_and_party_rules_suite()
+
+
+class DeriveAttestedVsTrustedTests(unittest.TestCase):
+    """Verifies capability_verification.derive: attested pass never clears a trusted failure (attested-clears-trusted)."""
+
+    def test_attested_pass_never_clears_trusted_failure_and_zero_commit_rejected(self):
+        import capability_verification as cv
+        revision = {
+            'key': 'records.web-sync',
+            'revision': 2,
+            'sha256': 'a' * 64,
+            'code': ['http_service.py#Server'],
+            'tests': ['tests/test_web_records.py#StrictWebRecordsTests'],
+            'anchors': ['docs/HTTP_DEPLOYMENT.md#reference-and-capability-records-over-http'],
+        }
+        trusted_fail = {
+            'comment_id': 'c-fail-1',
+            'author': 'ops',
+            'position': 1,
+            'record': {
+                'schema_version': 1,
+                'key': 'records.web-sync',
+                'revision': 2,
+                'record_sha256': 'a' * 64,
+                'commit': '1' * 40,
+                'checked_at': '2026-10-17T00:00:00Z',
+                'passed': False,
+                'source': 'host-verify',
+                'results': [
+                    {'pointer': 'http_service.py#Server', 'kind': 'code', 'resolved': False,
+                     'detail': 'symbol Server not found'},
+                ],
+                'submitter': {'actor': 'ops', 'person': 'person:ops', 'identity': 'verified'},
+                'operation_id': 'op-fail-1',
+            },
+        }
+        attested_pass = {
+            'comment_id': 'c-att-2',
+            'author': 'usr_0123456789abcdef',
+            'position': 2,
+            'record': {
+                'schema_version': 1,
+                'key': 'records.web-sync',
+                'revision': 2,
+                'record_sha256': 'a' * 64,
+                'commit': '2' * 40,
+                'checked_at': '2026-10-17T01:00:00Z',
+                'passed': True,
+                'source': 'endpoint',
+                'results': [
+                    {'pointer': 'http_service.py#Server', 'kind': 'code', 'resolved': True, 'detail': 'ok'},
+                ],
+                'submitter': {
+                    'actor': 'usr_0123456789abcdef',
+                    'person': 'account:usr_0123456789abcdef',
+                    'identity': 'attested',
+                },
+                'operation_id': 'op-att-2',
+            },
+        }
+        derived = cv.derive(
+            [trusted_fail, attested_pass], revision, trusted={'ops'}, integrated=lambda _c: True)
+        self.assertEqual(derived['state'], 'drifted')
+        self.assertEqual(len(derived['open_failing']), 1)
+        self.assertEqual(derived['drift']['commit'], '1' * 40)
+        self.assertEqual(derived['report']['commit'], '2' * 40)
+        self.assertEqual(derived['report']['submitter']['identity'], 'attested')
+
+        # Only a subsequent trusted pass at an integrated commit clears the failure
+        trusted_pass = {
+            'comment_id': 'c-pass-3',
+            'author': 'ops',
+            'position': 3,
+            'record': {
+                'schema_version': 1,
+                'key': 'records.web-sync',
+                'revision': 2,
+                'record_sha256': 'a' * 64,
+                'commit': '3' * 40,
+                'checked_at': '2026-10-17T02:00:00Z',
+                'passed': True,
+                'source': 'host-verify',
+                'results': [
+                    {'pointer': 'http_service.py#Server', 'kind': 'code', 'resolved': True, 'detail': 'ok'},
+                ],
+                'submitter': {'actor': 'ops', 'person': 'person:ops', 'identity': 'verified'},
+                'operation_id': 'op-pass-3',
+            },
+        }
+        derived_cleared = cv.derive(
+            [trusted_fail, attested_pass, trusted_pass], revision, trusted={'ops'}, integrated=lambda _c: True)
+        self.assertEqual(derived_cleared['state'], 'verified')
+        self.assertEqual(derived_cleared['open_failing'], [])
+
+        # All-zero commit is not recognized by is_attested
+        zero_att = dict(attested_pass, record=dict(attested_pass['record'], commit='0' * 40))
+        self.assertFalse(cv.is_attested(zero_att))
 
 
 class WebRecordsScreenTests(unittest.TestCase):

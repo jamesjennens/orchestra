@@ -2712,6 +2712,21 @@ from `bd export --all`, as in the scan above.
   up (kittrial-5bb.92 review `order-check-limits-and-rollback`). No sidecar path is
   added, so backups restore on either kit, and rolling forward restores the repair with
   nothing to clean up.
+- **Web coordinator acceptance and capability attestation (kittrial-5bb.213).**
+  Acceptance evidence (`Kind: reference-acceptance-v1`, `Kind: capability-acceptance-v1`)
+  and capability verification attestations (`Kind: capability-verification-v1` with
+  `submitter.identity: "attested"` and a non-zero 40-hex `commit`) recorded by a web
+  coordinator (`usr_<16hex>` or `agent_<16hex>`) stay live if that coordinator is later
+  demoted or has their agent's coordinator grant removed (`acceptance_inert: false`,
+  `verification_state: "attested"`), while their next coordinator write or replay is
+  refused (`403`). Keeping an attestation's `attested` label after author demotion or
+  grant removal is safe because it is honestly labelled `attested` (`trusted: false`,
+  `checkout_validated: false`) and never clears a trusted host failure (`drifted`): only a
+  trusted `admin.py capability-verify --repo <PATH>` pass (`submitter.identity:
+  "verified"`) at an integrated commit clears an open failure. On rollback to a kit before
+  kittrial-5bb.213, an agent whose stored `scopes` or working credentials include
+  `'records'` reads as `scopes_source: "unknown"` (`scopes: null`) on that older kit until
+  an explicit scope list recognized by the older kit is set.
 - **Limits.** A record of a version this kit does not read (`Kind: reference-entry-v4`,
   `Kind: capability-entry-v2`) or of an unknown kind of the family cannot be a void
   target: the target must claim a prefix this kit reads for the declared kind (v1, and

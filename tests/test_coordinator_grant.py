@@ -567,9 +567,9 @@ class NothingGrantedTests(Grants):
         self.assertEqual(caps, {'read', 'tasks.write', 'checkpoints.write', 'reviews.write', 'feedback.write'})
         self.assertEqual(200, self.grant().status)
         self.assertEqual(http_authority.credential_capabilities(state, credential, issuer, self.project) - caps,
-                         {'reviews.approve', 'coordinate'})
+                         {'records', 'reviews.approve', 'coordinate'})
         self.assertEqual(http_authority.credential_capabilities(state, credential, dict(issuer, superuser=True), self.project) - caps,
-                         {'reviews.approve', 'coordinate'})
+                         {'records', 'reviews.approve', 'coordinate'})
 
 
 class ProposalTests(test_http_proposals.ProposalHarness):
