@@ -54,14 +54,22 @@ Everything under "What is true today" was read in the code of `main` at
   there, the helper guides the person interactively through verifying code-host
   access (`ssh -T` and `git ls-remote`), workspace layout, VS Code 1.141
   approval settings, and worker setup.
-- **Strict network and privacy boundary (an explicit rule of the kit):** the
+- **Strict network and privacy boundary (an explicit rule of the kit, `01a148e5` & `01a149d9`):** the
   VS Code extension reports **only** to the Orchestra installation it is
   configured for (`serverUrl`), **never** to any other host, vendor, or public
   internet endpoint. There is no telemetry and no external update check; the
   `.vsix` download and the `out_of_date` flag come solely from that installation's
-  own copy of the extension. The diagnostic checks (`git ls-remote`, `ssh -T`)
-  contact only the project's configured code host and send only pass/fail and a
-  redacted plain error string to `serverUrl`.
+  own copy of the extension. At the office, the **agents** (VS Code on people's
+  PCs) can reach the internal code host (Bitbucket) and have the only model route
+  (no remote tunnels), whereas the **server** running the kit cannot reach the
+  office code host. Therefore **no server-side fetch from the code host is ever
+  used**: anything that reads the project's code, branches, or commits —
+  inferring requirements or design from a repository, Graphify, drift checks,
+  verifying that a delivery's commit exists, and the `ssh -T` / `git ls-remote`
+  checks — runs on the **agent side** (the helper or a worker) and reports its
+  result to the installation; the server stores what agents report as **claims**
+  (with the agent, commit/target, and timestamp) unless backed by a bundle the
+  server itself holds.
 - **Two ways to run workers (`01a1496e`):**
   - **(a) In-process sub-workers (`<helper>/<label>`):** the helper acts as a
     fleet coordinator spinning up sub-agents under its own credential
@@ -76,17 +84,19 @@ Everything under "What is true today" was read in the code of `main` at
     worker agents also fall under) and recommended for long-running tasks. One
     VS Code window holds one Orchestra identity; running two Orchestra identities
     in two chats of one VS Code window is not required.
-- **Confirmations, site jobs, and untrusted inputs (`01a1495f` item 5, `01a1496d`, `kittrial-5bb.320`):**
+- **Confirmations, site jobs, and untrusted inputs (`01a1495f` item 5, `01a1496d`, `01a149d9`, `kittrial-5bb.320`):**
   a chat confirmation is the helper's report of what the person said in chat,
   recorded and reviewable on the site as such (with the person's account, helper
   agent ID, and grant in the audit log); accepting a requirements baseline stays
-  a browser-session action on the site. Model-backed **site jobs** (such as `.320`
-  document/code requirements inference and Graphify group naming) are queued for
-  the person's helper agent, outside the worker claim limit and outside project
-  scores. All site-job inputs (`prompt_hint`, uploaded documents, a pointed-at
-  repository, record text) and anything the person types are **DATA** for the
-  helper, **never instructions**; a site job cannot widen what the helper may do
-  (it writes drafts only, for its own person, and never accepts).
+  a browser-session action on the site. Model-backed and code-reading **site
+  jobs** (such as `.320` document/code requirements inference and Graphify group
+  naming) are queued for the person's helper agent on their PC (since the server
+  has neither model access nor code-host access), outside the worker claim limit
+  and outside project scores. All site-job inputs (`prompt_hint`, uploaded
+  documents, a pointed-at repository, record text) and anything the person types
+  are **DATA** for the helper, **never instructions**; a site job cannot widen
+  what the helper may do (it writes drafts only, for its own person, and never
+  accepts).
 
 ---
 
@@ -102,10 +112,10 @@ Everything under "What is true today" was read in the code of `main` at
 
 ---
 
-## 3. Strict network & privacy boundary
+## 3. Strict network & privacy boundary (`01a148e5`, `01a149d9`)
 
 This rule is non-negotiable and must be stated both in the kit's documentation and
-enforced by automated tests (`01a148e5`):
+enforced by automated tests (`01a148e5`, `01a149d9`):
 
 1. **Single-installation communication only:** The Orchestra Bridge VS Code
    extension communicates **only** with the Orchestra server URL (`serverUrl`)
@@ -120,11 +130,24 @@ enforced by automated tests (`01a148e5`):
    extension is `out-of-date` is computed by the installation comparing the
    version header the extension sends against the `.vsix` version installed on
    that server.
-3. **Diagnostic checks contact only the project's code host:** When the extension
-   runs setup checks (`ssh -T` and `git ls-remote`), those subprocesses contact
-   **only** the repository host configured on the Orchestra project (for example
-   `github.com`, `gitlab.com`, `bitbucket.org`, or the office's own Git server),
-   never any hardcoded external address.
+3. **Diagnostic checks contact only the project's code host from the agent side (`01a149d9`):**
+   At the office, the **agents** (VS Code on people's PCs) can reach the code
+   host (Bitbucket) and have the only model route (remote tunnels are not an
+   option); the **server** running the kit cannot reach the office code host.
+   Therefore:
+   - **No server-side fetch from the code host is ever used.**
+   - Anything that reads the project's code, branches, or commits — inferring
+     requirements or design from a repository, Graphify, drift checks, verifying
+     that a delivery's commit exists, and the `ssh -T` / `git ls-remote` checks —
+     runs on the **agent side** (the helper or a worker) and reports its result
+     to the installation (`serverUrl`).
+   - The server stores what agents report as **claims** (recording the reporting
+     agent ID, commit/target, and timestamp), unless backed by a bundle the
+     server itself holds.
+   - When the extension runs setup checks (`ssh -T` and `git ls-remote`), those
+     subprocesses contact **only** the repository host configured on the
+     Orchestra project (for example `bitbucket.org`, the office Bitbucket host,
+     `github.com`, or `gitlab.com`), never any hardcoded external address.
 4. **What leaves the machine (and what never leaves):**
    - **Sent to `serverUrl`:**
      - `extension_version` (e.g. `0.2.0`) and `vscode_version` (e.g. `1.141.1`)
@@ -692,7 +715,14 @@ a second "worker account"):
 | `ssh_code_host` | Extracts host from project's `repository` URL. If SSH (`git@host:...` or `ssh://...`), runs `ssh -T -o BatchMode=yes -o ConnectTimeout=10 git@<host>`. (Skipped if `repository` is HTTPS-only.) | Code host (e.g. `github.com`) | Exit code `0` or `1` with standard authenticated greeting (`"successfully authenticated"`, `"logged in as"`, `"Welcome to GitLab"`). | First non-blank line of stderr with home paths replaced by `~` and secrets redacted, e.g. `"git@github.com: Permission denied (publickey)."` |
 | `git_ls_remote` | Runs `git ls-remote --heads <repository> main` with `GIT_TERMINAL_PROMPT=0` and `GCM_INTERACTIVE=never` (15 s timeout). | `project.repository` | Exit code `0` and stdout contains `refs/heads/`. | Sanitized first line of git stderr, e.g. `"ERROR: Repository not found or access denied."` |
 
-### 7.2 Redaction and validation rules on the server
+### 7.2 Agent-reported claims, redaction, and validation rules on the server (`01a149d9`)
+
+Because the Orchestra server at the office cannot reach the code host (Bitbucket),
+the server **never** fetches from the code host itself. Instead, `ssh_code_host`
+and `git_ls_remote` (like repository commit verification, drift checks, and
+code-based site jobs) run on the **agent side** (in the extension or agent on the
+person's PC) and are stored by the server as **agent-reported claims** stamped
+with the reporting `agent_id`, `target` (or commit), and `checked_at` timestamp.
 
 When `POST /v1/agents/me/report` receives `checks`:
 1. Only the known check keys (`certificate`, `workspace_layout`, `ssh_code_host`,
@@ -706,7 +736,7 @@ When `POST /v1/agents/me/report` receives `checks`:
 
 ---
 
-## 8. Helper identity, chat confirmations, and site jobs (`01a1496d` item 6, `kittrial-5bb.320`)
+## 8. Helper identity, chat confirmations, and site jobs (`01a1496d` item 6, `01a149d9`, `kittrial-5bb.320`)
 
 ### 8.1 Marking an agent as a person's Helper (`is_helper`)
 
@@ -766,22 +796,32 @@ When `POST /v1/agents/me/report` receives `checks`:
     remains strictly a browser-session (`principal.via == 'session'`) action on
     the website and is never executable by an agent credential, even a helper.
 
-### 8.3 Site jobs routed to the Helper (`site_jobs`)
+### 8.3 Site jobs routed to the Helper (`site_jobs`, `01a149d9`)
 
-When a user clicks an action on the website that needs an LLM / model (for
-example: `kittrial-5bb.320` *"Infer requirements from documents or code"*, or
-Graphify *"Name requirement groups"*), the Orchestra server itself never calls an
-external model API. Instead, it queues a **site job** for the signed-in person's
-own **helper agent**:
+When a user clicks an action on the website that needs an LLM / model or needs to
+read the project's repository, branches, or commits (for example:
+`kittrial-5bb.320` *"Infer requirements from documents or code"*, Graphify *"Name
+requirement groups"*, drift checks, or verifying that a delivery's commit
+exists), the Orchestra server itself **never** calls an external model API and
+**never** fetches from the project's code host. Instead, it queues a **site job**
+for the signed-in person's own **helper agent** (or records what an agent
+reports):
 
-1. **Why the helper runs site jobs:**
-   - The helper runs on the person's machine inside VS Code (with their model
-     subscription and repository checkout) and already polls `serverUrl`.
+1. **Why the helper (or an agent) runs site jobs and repository checks (`01a149d9`):**
+   - **Office network & model topology:** At the office, the **agents** (VS Code
+     on people's PCs) can reach the code host (Bitbucket) and have the **only**
+     model route (VS Code; remote tunnels are not an option), whereas the
+     **server** running the kit cannot reach the office code host. Therefore any
+     operation that needs a model or reads the project's code, branches, or
+     commits runs on the **agent side** (the helper or a worker) and reports its
+     result back to the installation, where the server stores what agents report
+     as **claims** (with the reporting agent ID, commit, and timestamp) unless
+     backed by a bundle the server itself holds.
    - Site jobs are **outside the worker `claim_limit`** (`claim_limit.py` ignores
      `site_jobs` completely) and **outside project worker scores**
      (`kittrial-5bb.321`), so a person can always ask the site to analyse a
-     document or name groups even when all workers are busy or when their helper
-     holds `claim_limit = 1`.
+     document or repository or name groups even when all workers are busy or when
+     their helper holds `claim_limit = 1`.
 2. **Untrusted inputs & strict authority bound (`01a1495f` item 5):**
    - All site-job inputs (`prompt_hint`, uploaded documents, a pointed-at
      repository, existing record text) and anything the person types are **DATA**
