@@ -108,7 +108,12 @@ def snapshot(rows,project,task,exclude=None):
     # checkpoint/snapshot distinguish edited entries and late backdated arrivals
     # that a whole-snapshot hash or timestamp filter cannot separate.
     digests={e['entry_id']:content_hash(e) for e in entries}
-    return {'project':project,'task':task,'state_sha256':content_hash(state),'entries':entries,'entry_digests':digests}
+    # kittrial-5bb.293 item 2 (rev3): field_sizes is NOT a key in the snapshot data at
+    # all -- the legacy whole-data cursor shape hashes every key, so excluding it in
+    # activity_cursor is not enough. It is computed beside the snapshot (the brief
+    # caller does it); state_sha256 already covers the three fields.
+    return {'project':project,'task':task,'state_sha256':content_hash(state),
+            'entries':entries,'entry_digests':digests}
 
 def entry_digests(data):
     """Digests for snapshots predating the embedded entry_digests field."""
@@ -118,7 +123,11 @@ def entry_digests(data):
 def activity_cursor(data):
     # entry_digests is derived entirely from entries, not extra activity. Keep
     # the released hash shape so staged writes remain fresh on older readers.
-    compatible={k:v for k,v in data.items() if k!='entry_digests'}
+    # kittrial-5bb.293 item 2 (rev2): field_sizes is NOT part of the hashed snapshot
+    # and NOT in the cursor token -- a cursor written by 0133e8e reads fresh on this
+    # kit and the other way round. The lengths ride beside the cursor (the brief's
+    # field_changes carries them); state_sha256 already covers the three fields.
+    compatible={k:v for k,v in data.items() if k not in ('entry_digests','field_sizes')}
     return token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(compatible)})
 
 #: A project name as ``admin.validate_name`` accepts it.
@@ -780,7 +789,37 @@ def retained_provenance(state,upto=None):
     return dict(latest,digests=exact,older=trunc,verifiable=len(exact)+len(trunc),
                 complete=not trunc and len(exact)>=latest['covered'])
 
-def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off'):
+def field_changes_since(recorded_fields, current_fields, only_if_unexplained=False):
+    """What changed in title/description/acceptance since a checkpoint (kittrial-5bb.293).
+
+    ``recorded_fields`` is the ``fields`` map a checkpoint's activity cursor carried
+    (name -> length at checkpoint time; ``None`` on an older cursor). ``current_fields``
+    is the same map from the live snapshot. A field whose length differs is reported
+    with its old and new length; an older cursor reports the field names only.
+    """
+    if not isinstance(current_fields, dict):
+        return []
+    if not isinstance(recorded_fields, dict):
+        # An older cursor carries no lengths: the caller reports a change ONLY when
+        # nothing else explains the stale flag, and then without old_length (rev2).
+        if not only_if_unexplained:
+            return []
+        # Never all three fields with old_length None: one summary entry instead
+        # (kittrial-5bb.293 item 2 rev2).
+        return [{'field': 'task_fields', 'old_length': None, 'new_length': None,
+                 'note': 'The task fields changed after this checkpoint; their lengths were not recorded.'}]
+    changed = []
+    for name in ('title', 'description', 'acceptance_criteria'):
+        old_len = recorded_fields.get(name)
+        new_len = current_fields.get(name)
+        if old_len is None and new_len is None:
+            continue
+        if old_len != new_len:
+            changed.append({'field': name, 'old_length': old_len, 'new_length': new_len})
+    return changed
+
+
+def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off',field_changes=None):
     """Bounded, per-entry view of activity the current checkpoint did not incorporate.
 
     `prov` is the checkpoint's normalized provenance, so edited entries (same ID,
@@ -819,6 +858,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
             'history':history,
             'history_new':'history '+data['task']+' --since '+utc_text(parse_moment(checkpoint_timestamp,'checkpoint timestamp')) if checkpoint_timestamp else history,
             'verify':'checkpoint '+data['task']+' --verify',
+            'field_changes':field_changes or [],
             'note':note}
     if direction_idx is not None:
         outstanding=unresolved_directions(data['entries'] if direction_data is None else direction_data,direction_idx,owner,counted)
@@ -939,7 +979,24 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         excluded_cursor=activity_cursor(excluded)
         stale=not cursor_matches(p['activity_cursor'],excluded,compatible=excluded_cursor)
         if stale:
-            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason)
+            # kittrial-5bb.293 item 2: a title/description/acceptance change is newer
+            # activity too. The checkpoint's cursor carries the field lengths it saw;
+            # the live snapshot carries the current ones.
+            try:
+                recorded=untoken(p['activity_cursor'])
+            except ValueError:
+                recorded=None
+            recorded_fields=(recorded or {}).get('fields') if isinstance(recorded,dict) else None
+            current_sizes={k:len(str(issue.get(k) or '')) for k in ('title','description','acceptance_criteria')}
+            changes=field_changes_since(recorded_fields, current_sizes)
+            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason,field_changes=changes)
+            if not recorded_fields and not changes and not newer.get('entries'):
+                # An older cursor carries no lengths and no entry explains the stale
+                # flag: the change is in the task fields (state_sha256). Report that
+                # without old_length, never all three fields with old_length None
+                # (kittrial-5bb.293 item 2 rev2).
+                changes=field_changes_since(None, current_sizes, only_if_unexplained=True)
+                newer['field_changes']=changes
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')
                 dir_note='' if not dirs else '; '+str(dirs['total'])+' outstanding direction(s) not yet resolved/superseded'
@@ -1034,6 +1091,17 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         # carries the current version; a direct library call with no project path
         # cannot read the guidance and omits the block.
         result['guidance']=brief_block(journal,actor)
+    # kittrial-5bb.293 item 1: when a compact field is cut, say how to read the whole
+    # over the route the caller uses. The endpoint names `show TASK`; the HTTP brief
+    # rewrites this to the GET route and carries the link. The block is present ONLY
+    # when a field was actually cut: an uncut brief then carries exactly the bytes it
+    # carried before this pointer existed, which is what keeps the long prior chain
+    # under the 6000-byte bound the follow-on test holds (kittrial-5bb.293 r6 item 2).
+    if (result.get('title') or {}).get('omitted_chars') or \
+            (result.get('intent') or {}).get('omitted_chars') or \
+            (result.get('acceptance') or {}).get('omitted_chars'):
+        result['read_whole'] = {'route': 'show %s' % task,
+                                'note': 'The complete text: show %s.' % task}
     if full:
         # The explicit fuller-context read (kittrial-5bb.8): the compact brief stays
         # compact, and a caller that needs the whole text asks for it and is told how

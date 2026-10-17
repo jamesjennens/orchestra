@@ -176,6 +176,10 @@ class WorkHelpContractTests(unittest.TestCase):
         self.assertLessEqual(BRIEF_FIELDS, set(result))
         self.assertEqual(set(result) - BRIEF_FIELDS, {'attention', 'attention_total', 'attention_more',
                                                       'reference_drafts_matching','newer','directions'})
+        # kittrial-5bb.293 item 1 (r6): `read_whole` is additive and is present ONLY
+        # when a compact field was actually cut, so an uncut brief keeps its exact
+        # pre-pointer size. `WorkerFeedbackBriefTests` pins the cut case.
+        self.assertNotIn('read_whole', result)
 
 
 class CheckpointErrorContractTests(unittest.TestCase):

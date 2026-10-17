@@ -28,7 +28,7 @@ import test_review_state as shared
 import test_work_queue
 import work
 from requirements import canonical_bytes
-from test_briefing import PROJECT, TASK, append_checkpoint, checkpoint, rows
+from test_briefing import PROJECT, TASK, append_checkpoint, checkpoint, rows, save_cp
 from test_http_agents import AgentHarness
 from test_lifecycle import NativeStore, payload, scope
 
@@ -607,6 +607,43 @@ class ReadyDropsInternalRecordsTests(unittest.TestCase):
         self.assertEqual(work.drop_internal_from_ready([slot]), [])
 
 
+class WorkerFeedbackBriefTests(unittest.TestCase):
+    """kittrial-5bb.293 items 1 and 2: the brief says how to read a cut field, and a
+    field change after a checkpoint is newer activity."""
+
+    def test_a_cut_field_says_how_to_read_the_whole(self):
+        data = rows()
+        data[0]['title'] = 'a very long title that will be cut because it exceeds the clip limit ' + 'x' * 300
+        data[0]['description'] = 'd' * 2000
+        _review, brief, _item = surfaces(data)
+        self.assertIsNotNone(brief.get('read_whole'), sorted(brief.keys()))
+        self.assertIn('show %s' % TASK, brief['read_whole']['route'])
+        self.assertIn('complete text', brief['read_whole']['note'])
+
+    def test_a_short_task_says_nothing_about_reading_the_whole(self):
+        _review, brief, _item = surfaces(rows())
+        self.assertIsNone(brief.get('read_whole'))
+
+    def test_a_field_change_after_the_checkpoint_is_newer_activity(self):
+        data = rows()
+        data[0]['description'] = 'original description'
+        # A checkpoint with provenance, so the comment itself is incorporated and the
+        # only thing left is the field change (kittrial-5bb.293 item 2 rev2).
+        save_cp(data, 'cp-1')
+        # Change the description: it must appear as newer activity with the lengths.
+        data[0]['description'] = 'a much longer replacement description'
+        _review, brief, _item = surfaces(data)
+        self.assertTrue((brief.get('checkpoint') or {}).get('newer_activity'), brief.get('checkpoint'))
+        changes = (brief.get('newer') or {}).get('field_changes') or []
+        # The checkpoint's cursor is written by this kit and carries no lengths
+        # (cursor compatibility): one summary entry, never all three fields with
+        # old_length None (kittrial-5bb.293 item 2 rev2).
+        self.assertEqual(len(changes), 1, changes)
+        self.assertEqual(changes[0]['field'], 'task_fields')
+        self.assertIsNone(changes[0]['old_length'])
+        self.assertIn('changed', changes[0].get('note') or '')
+
+
 class QueueItemClaimableCompatTests(unittest.TestCase):
     """An endpoint that does not state `claimable` keeps the older reading."""
 
@@ -702,6 +739,102 @@ class ClaimableHttpTests(AgentHarness):
         self.assertEqual([entry['task'] for entry in detail['candidates']], [second])
         # The candidate is advisory: the next claim is still atomic and succeeds.
         self.assertEqual(200, self.claim(self.blair_agent[1], second).status)
+
+    def test_a_task_blocked_by_an_open_dependency_is_not_claimable(self):
+        """kittrial-5bb.293 item 3: a bd dependency whose other end is still open
+        blocks the task. claimable() refuses it, the claim route refuses it with one
+        sentence naming the open dependency, and the agent list leaves it out."""
+        blocked = self.new('blocked work')
+        opener = self.new('open dependency')
+        self.backend.state['tasks'][blocked]['dependencies'] = [
+            {'depends_on_id': opener, 'type': 'blocks'}]
+        # claimable() refuses it.
+        from work import claimable, open_dependency_ids, open_dependency_sentence
+        row = self.backend.state['tasks'][blocked]
+        snapshot = list(self.backend.state['tasks'].values())
+        open_deps = open_dependency_ids(row, snapshot)
+        self.assertEqual(open_deps, [opener])
+        self.assertFalse(claimable(row.get('issue_type'), row.get('status'), row.get('assignee'),
+                                   None, 'none', labels=row.get('labels'),
+                                   open_dependencies=open_deps))
+        self.assertIn(opener, open_dependency_sentence(open_deps))
+        # The claim route refuses it with that sentence.
+        refused = self.claim(self.alex_agent[1], blocked)
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('open dependency', refused.data['error']['message'])
+        self.assertIn(opener, refused.data['error']['message'])
+        # The agent list leaves it out.
+        data = self.next_actions(self.alex_agent[1])
+        self.assertEqual(data['attention']['counts']['claimable'], 1)  # only the opener
+        self.assertEqual([a['task'] for a in data['next_actions']], [opener])
+
+    def test_the_endpoint_raw_claim_is_refused_for_an_open_dependency(self):
+        """kittrial-5bb.293 item 3a / mutant g6: the endpoint's own bd claim is gated."""
+        import endpoint as ep
+        blocked = self.new('blocked work')
+        opener = self.new('open dependency')
+        self.backend.state['tasks'][blocked]['dependencies'] = [
+            {'depends_on_id': opener, 'type': 'blocks'}]
+        # The guard is the one the endpoint runs before any native write.
+        row = dict(self.backend.state['tasks'][blocked])
+        snapshot = list(self.backend.state['tasks'].values())
+        from work import dependency_index, open_dependency_ids
+        open_deps = open_dependency_ids(row, snapshot, index=dependency_index(snapshot))
+        self.assertEqual(open_deps, [opener])
+        # The parsed-flag matcher sees only a real --claim, never a --notes text.
+        self.assertTrue(ep._claims_the_row(['update', blocked, '--claim', '--json']))
+        self.assertTrue(ep._claims_the_row(['update', blocked, '--status', 'in_progress', '--json']))
+        self.assertTrue(ep._claims_the_row(['update', blocked, '-s', 'in_progress', '--json']))
+        self.assertFalse(ep._claims_the_row(['update', blocked, '--notes', 'in_progress', '--json']))
+        self.assertFalse(ep._claims_the_row(['update', blocked, '--title', 'x', '--json']))
+
+    def test_the_web_claim_route_on_a_blocked_task_is_refused(self):
+        """kittrial-5bb.293 rev4 / mutant g4: the HTTP claim route is gated."""
+        blocked = self.new('blocked work')
+        opener = self.new('open dependency')
+        self.backend.state['tasks'][blocked]['dependencies'] = [
+            {'id': opener, 'dependency_type': 'blocks', 'status': 'open'}]
+        refused = self.claim(self.alex_agent[1], blocked)
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('open dependency', refused.data['error']['message'])
+        self.assertIn(opener, refused.data['error']['message'])
+
+    def test_work_claimable_leaves_out_a_blocked_task(self):
+        """kittrial-5bb.293 rev4 / mutant g5: the work queue's claimable is gated."""
+        blocked = self.new('blocked work')
+        opener = self.new('open dependency')
+        self.backend.state['tasks'][blocked]['dependencies'] = [
+            {'id': opener, 'dependency_type': 'blocks', 'status': 'open'}]
+        data = self.next_actions(self.alex_agent[1])
+        offered = [a['task'] for a in data['next_actions']]
+        self.assertNotIn(blocked, offered)
+        self.assertIn(opener, offered)
+
+    def test_only_the_blocking_dependency_type_blocks(self):
+        """kittrial-5bb.293 item 3b: a `related` dependency must not block a claim."""
+        task = self.new('related to something open')
+        opener = self.new('open neighbour')
+        self.backend.state['tasks'][task]['dependencies'] = [
+            {'depends_on_id': opener, 'type': 'related'}]
+        ok = self.claim(self.alex_agent[1], task)
+        self.assertEqual(200, ok.status, ok.data)
+
+    def test_a_parent_child_dependency_does_not_block_the_task(self):
+        task = self.new('child work')
+        parent = self.new('open parent')
+        self.backend.state['tasks'][task]['dependencies'] = [
+            {'depends_on_id': parent, 'type': 'parent-child'}]
+        ok = self.claim(self.alex_agent[1], task)
+        self.assertEqual(200, ok.status, ok.data)
+
+    def test_a_closed_dependency_does_not_block_the_task(self):
+        blocked = self.new('blocked work')
+        closed = self.new('closed dependency')
+        self.backend.state['tasks'][blocked]['dependencies'] = [
+            {'depends_on_id': closed, 'type': 'blocks'}]
+        self.backend.state['tasks'][closed]['status'] = 'closed'
+        ok = self.claim(self.alex_agent[1], blocked)
+        self.assertEqual(200, ok.status, ok.data)
 
     def test_a_refusal_with_nothing_to_fall_through_to_is_unchanged(self):
         only = self.new('only')
