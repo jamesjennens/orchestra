@@ -63,6 +63,18 @@ as `wait --coordinator`: run `wait --coordinator`; act on what it returns; run
 `wait --coordinator` again. An agent with a web credential reads the same worker form,
 one read, at `GET /v1/agents/me/wait`, and blocks in the loop of whatever runs it.
 
+An agent should not invent the next wait after an empty timeout. Pass `--idle-since TIME`
+(when the current idle spell began) and `--max-timeout SECONDS` (the longest single
+command the harness allows), and the timeout result carries `next_command`: run exactly
+that line, which names the same client, config, project and actor, the fingerprint, the
+same `--idle-since` and the backed-off `--timeout`. `next_timeout` starts at the base
+timeout, doubles after two empty returns in a row and is never above `--max-timeout`
+(3600 s by default), never below the base. `give_up` turns true after `--give-up-after`
+(12 h from `--idle-since` by default), and its `message` is `checkpoint and stop:
+nothing has been your move since TIME`: checkpoint the task and stop. A return with items
+is work and resets the schedule to the base timeout with a fresh `--idle-since`. A caller
+that passes none of the new flags sees the same output and exit codes as before.
+
 The wait logic is part of `client.py` itself: a `client.py` copied on its own, with no
 other kit file beside it, runs `wait` (only the `capability` commands also need
 `capabilities.py` from the same kit).

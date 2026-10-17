@@ -45,8 +45,10 @@ It is a library, imported by the client (``client.py wait``) and by the endpoint
 read; it has no ``__main__`` block and is never started as a program.
 """
 import argparse
+import datetime
 import hashlib
 import json
+import re
 import time
 
 #: The output schema. Additive fields may be added to it; a reader that does not know
@@ -64,6 +66,23 @@ MIN_INTERVAL = 60
 #: (kittrial-5bb.263); the same bounds ``lanes.py`` enforces.
 DEFAULT_IDLE_MINUTES = 15
 IDLE_MINUTES_MIN, IDLE_MINUTES_MAX = 1, 10080
+
+#: The backoff of kittrial-5bb.327. A wait that returns empty prints the wait to run next:
+#: the timeout starts at ``--timeout`` and doubles after two empty returns in a row, never
+#: above ``--max-timeout`` (whose default is the 3600 s cap) and never below the base
+#: ``--timeout``. After ``--give-up-after`` seconds of the idle spell the caller started at
+#: ``--idle-since`` (12 hours by default) the wait says to checkpoint and stop.
+DEFAULT_MAX_TIMEOUT = 3600
+DEFAULT_GIVE_UP_AFTER = 12 * 60 * 60
+DOUBLING_AFTER = 2
+
+#: An idle-since instant is ISO-8601 WITH an offset (``2026-10-17T15:00:00-04:00``, ``...Z``).
+#: A naive value is refused: it would need the caller's zone, which the server does not know.
+_INSTANT = re.compile(r'^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})'
+                      r'(?:\.(\d{1,6}))?(?:[Zz]|([+-])(\d{2}):?(\d{2}))$')
+_INSTANT_ADVICE = ('Invalid wait: --idle-since takes an ISO-8601 time with an offset '
+                   '(for example 2026-10-17T15:00:00-04:00)')
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 EXIT_WORK = 0
 EXIT_TIMEOUT = 1
@@ -177,6 +196,135 @@ def is_fingerprint(value):
                 and all(character in '0123456789abcdef' for character in value[len(FINGERPRINT):]))
 
 
+def parse_instant(text):
+    """The epoch seconds of an ISO-8601 instant that carries an offset.
+
+    Python 3.6 has no ``datetime.fromisoformat``, so the shape is parsed here once for
+    both copies of the wait (``waiting.py`` and the client's inlined copy). A value with
+    no offset is refused: an idle spell is measured against the caller's clock.
+    """
+    if not isinstance(text, str):
+        raise ValueError(_INSTANT_ADVICE)
+    match = _INSTANT.match(text.strip())
+    if match is None:
+        raise ValueError(_INSTANT_ADVICE)
+    if match.group(8) is not None:
+        hours, minutes = int(match.group(9)), int(match.group(10))
+        if hours > 23 or minutes > 59:
+            raise ValueError(_INSTANT_ADVICE)
+        offset = datetime.timedelta(hours=hours, minutes=minutes)
+        if match.group(8) == '-':
+            offset = -offset
+    else:
+        offset = datetime.timedelta(0)
+    fraction = match.group(7) or ''
+    micro = int((fraction + '000000')[:6])
+    try:
+        moment = datetime.datetime(int(match.group(1)), int(match.group(2)),
+                                   int(match.group(3)), int(match.group(4)),
+                                   int(match.group(5)), int(match.group(6)), micro,
+                                   tzinfo=datetime.timezone(offset))
+    except (ValueError, OverflowError):
+        raise ValueError(_INSTANT_ADVICE) from None
+    return (moment - _EPOCH).total_seconds()
+
+
+def format_instant(epoch):
+    """The ISO-8601 UTC spelling of an epoch (``2026-10-17T19:55:21Z``).
+
+    Seconds are the unit of the schedule; a fractional part is written only when it is
+    there, so an instant this kit prints is an instant this kit parses back exactly.
+    """
+    moment = _EPOCH + datetime.timedelta(seconds=float(epoch))
+    if moment.microsecond:
+        return moment.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    return moment.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _seconds(value):
+    """A duration as JSON and as command text: ``600`` rather than ``600.0`` when it is whole."""
+    value = float(value)
+    return int(value) if value.is_integer() else value
+
+
+def timeout_cap(base, max_timeout):
+    """The ceiling for one wait: ``--max-timeout`` when given, else the 3600 s default cap.
+
+    The base timeout is a floor as well as a start, so a smaller ``--max-timeout`` cannot
+    shorten the caller's own ``--timeout``.
+    """
+    cap = DEFAULT_MAX_TIMEOUT if max_timeout is None else max_timeout
+    return max(base, cap)
+
+
+def schedule_timeout(index, base, cap):
+    """The ``index``-th (1-based) wait's timeout in the schedule this kit prints.
+
+    The first two waits are the base timeout and every later wait doubles - that is what
+    "after two empty returns in a row" means - up to ``cap`` and never below ``base``.
+    """
+    if base <= 0:
+        return 0
+    if index <= DOUBLING_AFTER:
+        return base
+    if index - DOUBLING_AFTER > 62:
+        return cap
+    return min(base * float(2 ** (index - DOUBLING_AFTER)), cap)
+
+
+def empty_returns(elapsed, base, cap):
+    """How many empty returns an idle spell of ``elapsed`` seconds implies.
+
+    This is the stateless rule: the client has no memory of earlier invocations, so it
+    assumes the idle spell was spent in waits of the schedule's own durations and counts
+    how many of them fit in ``elapsed`` (the time since ``--idle-since``, including the
+    wait that just ended). A caller that runs each printed ``next_command`` walks the
+    schedule exactly: one completed wait gives the base, two give the base, the third
+    gives double, and so on.
+    """
+    if base <= 0:
+        return 0
+    remaining = max(0.0, float(elapsed))
+    count = 0
+    index = 1
+    while True:
+        step = schedule_timeout(index, base, cap)
+        if step >= cap:
+            if remaining >= step:
+                count += int(remaining // step)
+            return count
+        if remaining < step:
+            return count
+        remaining -= step
+        count += 1
+        index += 1
+
+
+def wait_command(prefix, fingerprint, idle_since, timeout, interval=DEFAULT_INTERVAL,
+                 form='worker', idle_minutes=DEFAULT_IDLE_MINUTES, max_timeout=None,
+                 give_up_after=DEFAULT_GIVE_UP_AFTER):
+    """The exact ``wait`` command to run next, as one line the caller can copy.
+
+    ``prefix`` is how the caller invokes the client (its config/project/actor part when
+    the client builds it); the flags echo everything this invocation was given, so the
+    next wait keeps the same form, cadence and bounds. ``--idle-since`` is the value the
+    schedule uses (unchanged after an empty return, fresh after work), and ``--since`` is
+    the fingerprint just printed.
+    """
+    parts = [prefix, 'wait']
+    if form == 'coordinator':
+        parts += ['--coordinator', '--idle-minutes', str(idle_minutes)]
+    parts += ['--interval', str(_seconds(interval))]
+    if fingerprint:
+        parts += ['--since', fingerprint]
+    parts += ['--idle-since', idle_since, '--timeout', str(_seconds(timeout))]
+    if max_timeout is not None:
+        parts += ['--max-timeout', str(_seconds(max_timeout))]
+    if give_up_after != DEFAULT_GIVE_UP_AFTER:
+        parts += ['--give-up-after', str(_seconds(give_up_after))]
+    return ' '.join(parts)
+
+
 def movement(items):
     """The rows whose move is the caller's, normalized and ordered."""
     return _sorted_rows([normalize_item(item) for item in items or []
@@ -277,6 +425,10 @@ def parse_client_args(args):
     parser.add_argument('--interval', type=int, default=DEFAULT_INTERVAL)
     parser.add_argument('--timeout', type=float, default=None)
     parser.add_argument('--since')
+    parser.add_argument('--idle-since')
+    parser.add_argument('--max-timeout', type=float, default=None, dest='max_timeout')
+    parser.add_argument('--give-up-after', type=float, default=DEFAULT_GIVE_UP_AFTER,
+                        dest='give_up_after')
     parser.add_argument('--json', action='store_true')  # the output is always JSON
     parsed = parser.parse_args(args)
     if parsed.interval < MIN_INTERVAL:
@@ -287,6 +439,12 @@ def parse_client_args(args):
     if parsed.since is not None and not is_fingerprint(parsed.since):
         raise ValueError('Invalid wait: --since takes a fingerprint this kit printed '
                          '(wait1:<64 hex>)')
+    if parsed.idle_since is not None:
+        parse_instant(parsed.idle_since)  # refuse a bad TIME before any read happens
+    if parsed.max_timeout is not None and parsed.max_timeout <= 0:
+        raise ValueError('Invalid wait: --max-timeout must be more than zero seconds')
+    if parsed.give_up_after <= 0:
+        raise ValueError('Invalid wait: --give-up-after must be more than zero seconds')
     if not IDLE_MINUTES_MIN <= parsed.idle_minutes <= IDLE_MINUTES_MAX:
         raise ValueError('Invalid wait: --idle-minutes must be %d..%d'
                          % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
@@ -307,7 +465,9 @@ def read_args(options):
 
 
 def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
-             clock=None, sleep=None, form=None):
+             clock=None, sleep=None, form=None, idle_since=None, max_timeout=None,
+             give_up_after=DEFAULT_GIVE_UP_AFTER, command_prefix='client.py',
+             idle_minutes=DEFAULT_IDLE_MINUTES, now=None):
     """Block, polling ``read`` every ``interval`` seconds, until something is the move.
 
     ``read`` is called once per poll and returns one view (the payload of
@@ -320,12 +480,63 @@ def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
     ``since`` is the fingerprint the caller already saw, or ``None`` to return at the
     first read that already has something for the caller. ``timeout`` bounds the WHOLE
     wait in seconds (``None`` waits without a bound). Returns ``(exit_code, view)``.
+
+    ``idle_since`` is the ISO-8601 instant at which the caller's current idle spell
+    began, and it turns the backoff of kittrial-5bb.327 ON: a timeout then carries
+    ``next_timeout``, ``next_command`` and ``give_up`` (and, on give-up, ``message``),
+    and a return with items resets the schedule. ``now`` is the epoch of this call's
+    start for tests; ``command_prefix`` is how the caller invokes the client. A caller
+    that passes neither ``idle_since`` nor ``timeout`` sees exactly the old view.
     """
     clock = time.monotonic if clock is None else clock
     sleep = time.sleep if sleep is None else sleep
     form = form or 'worker'
     started = clock()
     polls = 0
+    # The schedule is on only when the caller names the instant its idle spell began AND
+    # bounds this wait: an unbounded wait never returns empty, so there is no next command
+    # to print. Callers that pass neither new flag keep the old output exactly.
+    scheduled = idle_since is not None and timeout is not None
+    if scheduled:
+        idle_started = parse_instant(idle_since)
+        wall_now = time.time() if now is None else now
+        idle_before = max(0.0, wall_now - idle_started)
+        cap = timeout_cap(timeout, max_timeout)
+
+    def with_schedule(view, elapsed, reset):
+        """The view plus the backoff fields, when the caller asked for them."""
+        if not scheduled:
+            return view
+        fingerprint = view.get('fingerprint')
+        if reset:
+            # Work was returned: the next lone wait starts a fresh idle spell and the
+            # base timeout again. The fresh instant is this return, so the printed
+            # command is the exact one for the state the caller is in now.
+            fields = {
+                'next_timeout': _seconds(timeout),
+                'next_command': wait_command(command_prefix, fingerprint,
+                                             format_instant(wall_now + elapsed), timeout,
+                                             interval, form, idle_minutes,
+                                             max_timeout, give_up_after),
+                'give_up': False,
+            }
+            return dict(view, **fields)
+        idle_elapsed = idle_before + elapsed
+        done = empty_returns(idle_elapsed, timeout, cap)
+        upcoming = schedule_timeout(done + 1, timeout, cap)
+        give_up = idle_elapsed >= give_up_after
+        fields = {
+            'next_timeout': _seconds(upcoming),
+            'next_command': wait_command(command_prefix, fingerprint, idle_since, upcoming,
+                                         interval, form, idle_minutes, max_timeout,
+                                         give_up_after),
+            'give_up': give_up,
+        }
+        if give_up:
+            fields['message'] = ('checkpoint and stop: nothing has been your move since %s'
+                                 % idle_since)
+        return dict(view, **fields)
+
     while True:
         polls += 1
         try:
@@ -346,13 +557,19 @@ def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
                                       'polls': polls}
         if since is None:
             if view.get('items'):
-                return EXIT_WORK, dict(view, polls=polls)
+                return EXIT_WORK, with_schedule(dict(view, polls=polls),
+                                                clock() - started, reset=True)
         elif view.get('fingerprint') != since:
-            return EXIT_WORK, dict(view, polls=polls)
+            # Work resets the schedule; a change with no item for this caller is activity
+            # but not work, so the idle spell (and the backoff) continues.
+            return EXIT_WORK, with_schedule(dict(view, polls=polls), clock() - started,
+                                            reset=bool(view.get('items')))
         elapsed = clock() - started
         if timeout is not None and elapsed >= timeout:
-            return EXIT_TIMEOUT, dict(view, polls=polls, timed_out=True)
+            return EXIT_TIMEOUT, with_schedule(dict(view, polls=polls, timed_out=True),
+                                               elapsed, reset=False)
         nap = interval if timeout is None else min(interval, max(0.0, timeout - elapsed))
         if nap <= 0:
-            return EXIT_TIMEOUT, dict(view, polls=polls, timed_out=True)
+            return EXIT_TIMEOUT, with_schedule(dict(view, polls=polls, timed_out=True),
+                                               elapsed, reset=False)
         sleep(nap)

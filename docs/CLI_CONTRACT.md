@@ -230,6 +230,50 @@ unchanged).
 project, whose own work goes into tasks, comments and requirements. Changes requested on
 a delivery are a *review request*, never "feedback".
 
+## `wait`: block until it is your move, then print the next wait
+
+`wait` is a client-side command: the client blocks and polls the endpoint's cheap wait
+read once per `--interval` (300 s by default, never less than 60), and returns as soon
+as something is the caller's move. It never asks the endpoint for a blocking call.
+`--timeout SECONDS` bounds the whole wait (omitted: no bound); `--since FINGERPRINT` is
+the state the caller already acted on, so a restart that finds the same state keeps
+blocking instead of returning it twice.
+
+A waiting agent should not invent its next wait. With `--idle-since TIME` (an ISO-8601
+instant with an offset: when the caller's current idle spell began) and a bounded
+`--timeout`, the result of every timeout with the fingerprint unchanged carries:
+
+- `next_timeout`: the timeout of the next wait, in seconds. It starts at `--timeout`,
+  doubles after two empty returns in a row, is never above `--max-timeout` (the default
+  cap is 3600 s), and is never below the base `--timeout`.
+- `next_command`: the exact full wait command to run next - this client, config,
+  project and actor, `--since FINGERPRINT`, `--idle-since TIME`, the new `--timeout`,
+  and the form, cadence and bounds the caller used. Run that line; do not retype a wait.
+- `give_up`: `false` while the idle spell is inside `--give-up-after` (12 h by
+  default); `true` once it reaches the limit. Then `message` is exactly
+  `checkpoint and stop: nothing has been your move since TIME`. Checkpoint the task and
+  stop; do not run the printed wait again.
+
+A return with items (exit 0) is work: the schedule resets. Its `next_command` starts
+again at the base `--timeout`, with a fresh `--idle-since` (the return time) and the
+fingerprint just printed.
+
+**The stateless rule.** The client remembers nothing between runs, so "two empty returns
+in a row" is recomputed from the flags: it assumes the idle spell was spent in waits of
+the schedule's own durations (base, base, 2x, 4x, ... up to the cap), counts how many of
+them fit in the time between `--idle-since` and the moment this wait timed out (the wait
+that just ended included), and prints the next one. A caller that runs each printed
+`next_command` therefore sees the timeout double exactly after two empty returns in a
+row. Set `--idle-since` to the moment the spell began - not the moment the first wait
+started - so the count reflects the whole idle time.
+
+A caller that passes none of `--idle-since`, `--max-timeout` or `--give-up-after` gets
+the same fields, values and exit codes as before this change; `--max-timeout` and
+`--give-up-after` alone change nothing (the schedule needs `--idle-since` and a bounded
+`--timeout`). Exit codes are unchanged: 0 something is your move, 1 the timeout ran
+out, 2 the arguments or the endpoint refused the read, 3 the service could not be
+reached.
+
 ## `work`: list/queue shape
 
 `work` returns:

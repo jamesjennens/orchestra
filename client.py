@@ -16,6 +16,7 @@ if sys.version_info < (3, 10):
                      % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
     sys.exit(2)
 import argparse
+import datetime
 import difflib
 import hashlib
 import json
@@ -340,6 +341,14 @@ class _InlineWait:
     AWAITING_REVIEW_STATES = ('awaiting-review', 'legacy-review-ready')
     AWAITING_INTEGRATION_STATES = ('awaiting-integration', 'approved')
     FINGERPRINT = 'wait1:'
+    DEFAULT_MAX_TIMEOUT = 3600
+    DEFAULT_GIVE_UP_AFTER = 12 * 60 * 60
+    DOUBLING_AFTER = 2
+    _INSTANT = re.compile(r'^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})'
+                          r'(?:\.(\d{1,6}))?(?:[Zz]|([+-])(\d{2}):?(\d{2}))$')
+    _INSTANT_ADVICE = ('Invalid wait: --idle-since takes an ISO-8601 time with an offset '
+                       '(for example 2026-10-17T15:00:00-04:00)')
+    _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
     class Parser(argparse.ArgumentParser):
         def error(self, message):
@@ -407,6 +416,100 @@ class _InlineWait:
                     and value.startswith(_InlineWait.FINGERPRINT)
                     and all(character in '0123456789abcdef'
                             for character in value[len(_InlineWait.FINGERPRINT):]))
+
+    @staticmethod
+    def parse_instant(text):
+        """The epoch seconds of an ISO-8601 instant with an offset (Python 3.6 syntax)."""
+        if not isinstance(text, str):
+            raise ValueError(_InlineWait._INSTANT_ADVICE)
+        match = _InlineWait._INSTANT.match(text.strip())
+        if match is None:
+            raise ValueError(_InlineWait._INSTANT_ADVICE)
+        if match.group(8) is not None:
+            hours, minutes = int(match.group(9)), int(match.group(10))
+            if hours > 23 or minutes > 59:
+                raise ValueError(_InlineWait._INSTANT_ADVICE)
+            offset = datetime.timedelta(hours=hours, minutes=minutes)
+            if match.group(8) == '-':
+                offset = -offset
+        else:
+            offset = datetime.timedelta(0)
+        fraction = match.group(7) or ''
+        micro = int((fraction + '000000')[:6])
+        try:
+            moment = datetime.datetime(int(match.group(1)), int(match.group(2)),
+                                       int(match.group(3)), int(match.group(4)),
+                                       int(match.group(5)), int(match.group(6)), micro,
+                                       tzinfo=datetime.timezone(offset))
+        except (ValueError, OverflowError):
+            raise ValueError(_InlineWait._INSTANT_ADVICE) from None
+        return (moment - _InlineWait._EPOCH).total_seconds()
+
+    @staticmethod
+    def format_instant(epoch):
+        """The ISO-8601 UTC spelling of an epoch; fractional only when it is there."""
+        moment = _InlineWait._EPOCH + datetime.timedelta(seconds=float(epoch))
+        if moment.microsecond:
+            return moment.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        return moment.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    @staticmethod
+    def _seconds(value):
+        value = float(value)
+        return int(value) if value.is_integer() else value
+
+    @staticmethod
+    def timeout_cap(base, max_timeout):
+        cap = _InlineWait.DEFAULT_MAX_TIMEOUT if max_timeout is None else max_timeout
+        return max(base, cap)
+
+    @staticmethod
+    def schedule_timeout(index, base, cap):
+        if base <= 0:
+            return 0
+        if index <= _InlineWait.DOUBLING_AFTER:
+            return base
+        if index - _InlineWait.DOUBLING_AFTER > 62:
+            return cap
+        return min(base * float(2 ** (index - _InlineWait.DOUBLING_AFTER)), cap)
+
+    @staticmethod
+    def empty_returns(elapsed, base, cap):
+        if base <= 0:
+            return 0
+        remaining = max(0.0, float(elapsed))
+        count = 0
+        index = 1
+        while True:
+            step = _InlineWait.schedule_timeout(index, base, cap)
+            if step >= cap:
+                if remaining >= step:
+                    count += int(remaining // step)
+                return count
+            if remaining < step:
+                return count
+            remaining -= step
+            count += 1
+            index += 1
+
+    @staticmethod
+    def wait_command(prefix, fingerprint, idle_since, timeout,
+                     interval=DEFAULT_INTERVAL, form='worker',
+                     idle_minutes=DEFAULT_IDLE_MINUTES, max_timeout=None,
+                     give_up_after=DEFAULT_GIVE_UP_AFTER):
+        parts = [prefix, 'wait']
+        if form == 'coordinator':
+            parts += ['--coordinator', '--idle-minutes', str(idle_minutes)]
+        parts += ['--interval', str(_InlineWait._seconds(interval))]
+        if fingerprint:
+            parts += ['--since', fingerprint]
+        parts += ['--idle-since', idle_since, '--timeout',
+                  str(_InlineWait._seconds(timeout))]
+        if max_timeout is not None:
+            parts += ['--max-timeout', str(_InlineWait._seconds(max_timeout))]
+        if give_up_after != _InlineWait.DEFAULT_GIVE_UP_AFTER:
+            parts += ['--give-up-after', str(_InlineWait._seconds(give_up_after))]
+        return ' '.join(parts)
 
     @staticmethod
     def movement(items):
@@ -500,6 +603,10 @@ class _InlineWait:
         parser.add_argument('--interval', type=int, default=_InlineWait.DEFAULT_INTERVAL)
         parser.add_argument('--timeout', type=float, default=None)
         parser.add_argument('--since')
+        parser.add_argument('--idle-since')
+        parser.add_argument('--max-timeout', type=float, default=None, dest='max_timeout')
+        parser.add_argument('--give-up-after', type=float,
+                            default=_InlineWait.DEFAULT_GIVE_UP_AFTER, dest='give_up_after')
         parser.add_argument('--json', action='store_true')
         parsed = parser.parse_args(args)
         if parsed.interval < _InlineWait.MIN_INTERVAL:
@@ -510,6 +617,12 @@ class _InlineWait:
         if parsed.since is not None and not _InlineWait.is_fingerprint(parsed.since):
             raise ValueError('Invalid wait: --since takes a fingerprint this kit printed '
                              '(wait1:<64 hex>)')
+        if parsed.idle_since is not None:
+            _InlineWait.parse_instant(parsed.idle_since)
+        if parsed.max_timeout is not None and parsed.max_timeout <= 0:
+            raise ValueError('Invalid wait: --max-timeout must be more than zero seconds')
+        if parsed.give_up_after <= 0:
+            raise ValueError('Invalid wait: --give-up-after must be more than zero seconds')
         if not _InlineWait.IDLE_MINUTES_MIN <= parsed.idle_minutes <= _InlineWait.IDLE_MINUTES_MAX:
             raise ValueError('Invalid wait: --idle-minutes must be %d..%d'
                              % (_InlineWait.IDLE_MINUTES_MIN, _InlineWait.IDLE_MINUTES_MAX))
@@ -524,12 +637,50 @@ class _InlineWait:
 
     @staticmethod
     def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
-                 clock=None, sleep=None, form=None):
+                 clock=None, sleep=None, form=None, idle_since=None, max_timeout=None,
+                 give_up_after=DEFAULT_GIVE_UP_AFTER, command_prefix='client.py',
+                 idle_minutes=DEFAULT_IDLE_MINUTES, now=None):
         clock = time.monotonic if clock is None else clock
         sleep = time.sleep if sleep is None else sleep
         form = form or 'worker'
         started = clock()
         polls = 0
+        scheduled = idle_since is not None and timeout is not None
+        if scheduled:
+            idle_started = _InlineWait.parse_instant(idle_since)
+            wall_now = time.time() if now is None else now
+            idle_before = max(0.0, wall_now - idle_started)
+            cap = _InlineWait.timeout_cap(timeout, max_timeout)
+
+        def with_schedule(view, elapsed, reset):
+            if not scheduled:
+                return view
+            fingerprint = view.get('fingerprint')
+            if reset:
+                fields = {
+                    'next_timeout': _InlineWait._seconds(timeout),
+                    'next_command': _InlineWait.wait_command(
+                        command_prefix, fingerprint, _InlineWait.format_instant(wall_now + elapsed),
+                        timeout, interval, form, idle_minutes, max_timeout, give_up_after),
+                    'give_up': False,
+                }
+                return dict(view, **fields)
+            idle_elapsed = idle_before + elapsed
+            done = _InlineWait.empty_returns(idle_elapsed, timeout, cap)
+            upcoming = _InlineWait.schedule_timeout(done + 1, timeout, cap)
+            give_up = idle_elapsed >= give_up_after
+            fields = {
+                'next_timeout': _InlineWait._seconds(upcoming),
+                'next_command': _InlineWait.wait_command(
+                    command_prefix, fingerprint, idle_since, upcoming, interval, form,
+                    idle_minutes, max_timeout, give_up_after),
+                'give_up': give_up,
+            }
+            if give_up:
+                fields['message'] = ('checkpoint and stop: nothing has been your move since %s'
+                                     % idle_since)
+            return dict(view, **fields)
+
         while True:
             polls += 1
             try:
@@ -553,15 +704,20 @@ class _InlineWait:
                     'polls': polls}
             if since is None:
                 if view.get('items'):
-                    return _InlineWait.EXIT_WORK, dict(view, polls=polls)
+                    return _InlineWait.EXIT_WORK, with_schedule(
+                        dict(view, polls=polls), clock() - started, reset=True)
             elif view.get('fingerprint') != since:
-                return _InlineWait.EXIT_WORK, dict(view, polls=polls)
+                return _InlineWait.EXIT_WORK, with_schedule(
+                    dict(view, polls=polls), clock() - started,
+                    reset=bool(view.get('items')))
             elapsed = clock() - started
             if timeout is not None and elapsed >= timeout:
-                return _InlineWait.EXIT_TIMEOUT, dict(view, polls=polls, timed_out=True)
+                return _InlineWait.EXIT_TIMEOUT, with_schedule(
+                    dict(view, polls=polls, timed_out=True), elapsed, reset=False)
             nap = interval if timeout is None else min(interval, max(0.0, timeout - elapsed))
             if nap <= 0:
-                return _InlineWait.EXIT_TIMEOUT, dict(view, polls=polls, timed_out=True)
+                return _InlineWait.EXIT_TIMEOUT, with_schedule(
+                    dict(view, polls=polls, timed_out=True), elapsed, reset=False)
             sleep(nap)
 
 def _emit(code,stdout,stderr,out):
@@ -574,7 +730,25 @@ def _emit(code,stdout,stderr,out):
         sys.stderr.write(stderr);return code
     sys.stdout.write(stdout);sys.stderr.write(stderr);return code
 
-def _wait_command(args,config,project,actor,out):
+def _wait_client_prefix(config_path,project,actor):
+    """How this caller invokes the client, as the prefix of the printed ``next_command``.
+
+    ``wait`` runs on the worker's machine, so the command it prints must name the same
+    interpreter, client, config, project and actor this invocation used; otherwise an
+    agent copying the line would wait on the wrong project. Paths are shell-quoted for
+    POSIX, where the wait loop's examples live (a Windows wrapper is a process, not this
+    one line, on that platform).
+    """
+    tokens = [sys.executable or 'python3',str(Path(__file__).resolve())]
+    if config_path:
+        tokens += ['--config',str(config_path)]
+    if project:
+        tokens += ['--project',str(project)]
+    if actor:
+        tokens += ['--actor',str(actor)]
+    return ' '.join(shlex.quote(token) for token in tokens)
+
+def _wait_command(args,config,project,actor,out,config_path=None):
     """``client.py wait``: block until something is the caller's move (kittrial-5bb.285).
 
     The blocking is HERE, in the client, because the harness that wakes a model holds the
@@ -619,7 +793,12 @@ def _wait_command(args,config,project,actor,out):
 
     code,view = wait.run_wait(read,since=options.since,timeout=options.timeout,
                               interval=options.interval,
-                              form='coordinator' if options.coordinator else 'worker')
+                              form='coordinator' if options.coordinator else 'worker',
+                              idle_since=options.idle_since,
+                              max_timeout=options.max_timeout,
+                              give_up_after=options.give_up_after,
+                              command_prefix=_wait_client_prefix(config_path,project,actor),
+                              idle_minutes=options.idle_minutes)
     text = json.dumps(view,ensure_ascii=True,indent=2)+'\n'
     if out:
         # The wait result is a result at every exit code, so --out writes it too; a
@@ -1025,7 +1204,8 @@ def main():
     # the endpoint is therefore asked per poll, never for one blocking call, so an agent over
     # HTTP can use the same read.
     if args[0]=='wait':
-        return _wait_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out)
+        return _wait_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out,
+                             config_path=a.config)
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:

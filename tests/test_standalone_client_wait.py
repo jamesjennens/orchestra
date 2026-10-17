@@ -35,6 +35,7 @@ import client
 import waiting
 
 A = 'session-aaaaaaaa-1111-4111-8111-111111111111'
+IDLE = '2026-10-17T19:00:00Z'
 
 #: The stub endpoint the stand-alone CLI runs against. It answers the client's ``wait``
 #: action with the view in ``WAIT_STUB_PAYLOAD`` and, when ``WAIT_STUB_WIRE`` names a
@@ -138,7 +139,8 @@ class InlineAgreementTests(unittest.TestCase):
     def test_the_client_carries_an_inlined_copy_of_everything_the_wait_needs(self):
         for name in ('parse_client_args', 'parse_read_args', 'read_args', 'run_wait',
                      'normalize_item', 'digest', 'fingerprint', 'is_fingerprint', 'worker_view',
-                     'coordinator_view', 'movement'):
+                     'coordinator_view', 'movement', 'parse_instant', 'format_instant',
+                     'timeout_cap', 'schedule_timeout', 'empty_returns', 'wait_command'):
             self.assertTrue(callable(getattr(client._InlineWait, name)), name)
 
     def test_the_worker_view_and_fingerprint_agree_for_the_same_rows(self):
@@ -184,7 +186,15 @@ class InlineAgreementTests(unittest.TestCase):
                  ['--interval', '-1'], ['--timeout', '-1'], ['--timeout', '0'],
                  ['--since', waiting.fingerprint([])], ['--since', 'nonsense'],
                  ['--idle-minutes', '0'], ['--idle-minutes', '10081'],
-                 ['--coordinator', '--idle-minutes', '30', '--interval', '75'])
+                 ['--coordinator', '--idle-minutes', '30', '--interval', '75'],
+                 ['--timeout', '60', '--idle-since', IDLE],
+                 ['--idle-since', '2026-10-17T15:00:00-04:00'],
+                 ['--idle-since', '2026-10-17T15:00:00'],
+                 ['--idle-since', 'nonsense'], ['--max-timeout', '0'],
+                 ['--max-timeout', '-1'], ['--give-up-after', '0'],
+                 ['--give-up-after', '-1'],
+                 ['--timeout', '60', '--idle-since', IDLE, '--max-timeout', '120',
+                  '--give-up-after', '3600'])
         for args in cases:
             with self.subTest(args=args):
                 mine = self._parsed(client._InlineWait, args)
@@ -207,7 +217,8 @@ class InlineAgreementTests(unittest.TestCase):
         except ValueError as error:
             return ('refused', str(error))
         return ('accepted', options.coordinator, options.idle_minutes, options.interval,
-                options.timeout, options.since)
+                options.timeout, options.since, options.idle_since, options.max_timeout,
+                options.give_up_after)
 
     @staticmethod
     def _parsed_read(module, args):
@@ -222,8 +233,19 @@ class InlineAgreementTests(unittest.TestCase):
         work = waiting.worker_view([{'task': 't1', 'whose_move': 'you'}])
         later = waiting.worker_view([{'task': 't2', 'whose_move': 'you'}])
         base = {'interval': 60, 'timeout': 600}
+        # One fixed wall instant for the stateless schedule, so the two copies are driven
+        # by the same idle-since elapsed time and the same fake clock.
+        now = waiting.parse_instant(IDLE)
+        schedule = dict(base, idle_since=IDLE, now=now, command_prefix='client.py')
+        reset = dict(schedule, timeout=60)
+        capped = dict(schedule, timeout=60, max_timeout=120)
+        give_up = dict(schedule, timeout=60, give_up_after=600,
+                       now=now - 601)
 
         def scripts(module):
+            empty = waiting.worker_view([])
+            work = waiting.worker_view([{'task': 't1', 'whose_move': 'you'}])
+            later = waiting.worker_view([{'task': 't2', 'whose_move': 'you'}])
             return [
                 ([empty, work], base),
                 ([work], base),
@@ -233,6 +255,12 @@ class InlineAgreementTests(unittest.TestCase):
                 ([module.WaitUnreachable('Local endpoint failed (1)')], base),
                 ([module.WaitRefused('Invalid wait read')], base),
                 ([{'not': 'a view'}], base),
+                ([empty], dict(schedule, since=empty['fingerprint'])),
+                ([empty], dict(schedule, since=empty['fingerprint'], timeout=60)),
+                ([empty], dict(capped, since=empty['fingerprint'], timeout=60)),
+                ([empty], dict(give_up, since=empty['fingerprint'])),
+                ([work], reset),
+                ([later], dict(reset, since=empty['fingerprint'])),
             ]
 
         for index, (views, kwargs) in enumerate(scripts(waiting)):
@@ -240,6 +268,42 @@ class InlineAgreementTests(unittest.TestCase):
                 inline = scripts(client._InlineWait)[index][0]
                 self.assertEqual(drive(waiting, views, **kwargs),
                                  drive(client._InlineWait, inline, **kwargs))
+
+    def test_the_backoff_helpers_agree(self):
+        for text in (IDLE, '2026-10-17T15:00:00-04:00', '2026-10-17T19:00:00.250000Z',
+                     '2026-10-17T15:00:00', 'nonsense', '', None, 7):
+            with self.subTest(instant=repr(text)[:30]):
+                self.assertEqual(self._parsed_instant(waiting, text),
+                                 self._parsed_instant(client._InlineWait, text))
+        for epoch in (0, 1792263600, 1792263600.25, -1):
+            with self.subTest(epoch=epoch):
+                self.assertEqual(waiting.format_instant(epoch),
+                                 client._InlineWait.format_instant(epoch))
+        for base, cap, elapsed in ((60, 3600, 0), (60, 3600, 60), (60, 3600, 120),
+                                   (60, 3600, 240), (60, 120, 10000), (0, 3600, 100),
+                                   (7200, 7200, 10000), (1, 3600, 1000)):
+            with self.subTest(base=base, cap=cap, elapsed=elapsed):
+                self.assertEqual(waiting.empty_returns(elapsed, base, cap),
+                                 client._InlineWait.empty_returns(elapsed, base, cap))
+                for index in (1, 2, 3, 4, 10, 63, 65):
+                    self.assertEqual(waiting.schedule_timeout(index, base, cap),
+                                     client._InlineWait.schedule_timeout(index, base, cap))
+        for args in (('client.py', None, IDLE, 60), ('b --config c', 'wait1:' + '0' * 64,
+                                                      IDLE, 120)):
+            with self.subTest(args=args[:2]):
+                self.assertEqual(
+                    waiting.wait_command(args[0], args[1], args[2], args[3]),
+                    client._InlineWait.wait_command(args[0], args[1], args[2], args[3]))
+        for base, cap in ((60, 3600), (7200, None), (60, 120)):
+            self.assertEqual(waiting.timeout_cap(base, cap),
+                             client._InlineWait.timeout_cap(base, cap))
+
+    @staticmethod
+    def _parsed_instant(module, text):
+        try:
+            return ('accepted', module.parse_instant(text))
+        except ValueError as error:
+            return ('refused', str(error))
 
 
 class StandaloneFolderTests(unittest.TestCase):
@@ -345,6 +409,33 @@ class StandaloneFolderTests(unittest.TestCase):
                 self.assertEqual(alone.stdout, '')
                 self.assertNotIn('ModuleNotFoundError', alone.stderr)
                 self.assertEqual(alone.stderr, kit.stderr)
+
+    def test_standalone_wait_prints_the_same_backoff_as_the_kit(self):
+        """The inlined copy runs the new schedule end-to-end in a folder with no waiting.py."""
+        self.config_is_usable()
+        payload = waiting.worker_view([])
+        # A one-second bound: the subprocess really sleeps, and the schedule still saturates.
+        argv = ['wait', '--interval', '60', '--timeout', '1',
+                '--since', payload['fingerprint'], '--idle-since', '2020-01-01T00:00:00Z',
+                '--max-timeout', '3600', '--give-up-after', '999999999']
+        alone = self.run_client(self.alone / 'client.py', argv, payload)
+        kit = self.run_client(KIT / 'client.py', argv, payload)
+        self.assertEqual(alone.returncode, 1, alone.stderr)
+        self.assertNotIn('ModuleNotFoundError', alone.stderr)
+        self.assertEqual(kit.returncode, 1, kit.stderr)
+        body = json.loads(alone.stdout)
+        self.assertEqual(body['next_timeout'], 3600)              # the default cap
+        self.assertFalse(body['give_up'])                        # the raised idle limit
+        self.assertIn('--idle-since 2020-01-01T00:00:00Z', body['next_command'])
+        # The two clients' own paths differ; the wait arguments they print must not.
+        alone_wait = body['next_command'].split('wait', 1)[1]
+        self.assertEqual(alone_wait, json.loads(kit.stdout)['next_command'].split('wait', 1)[1])
+        self.assertTrue(body['next_command'].startswith(sys.executable))
+        self.assertIn(str(self.alone / 'client.py'), body['next_command'])
+        self.assertIn(str(KIT / 'client.py'), json.loads(kit.stdout)['next_command'])
+        for field in ('schema', 'form', 'items', 'fingerprint', 'polls', 'timed_out',
+                      'next_timeout', 'give_up'):
+            self.assertEqual(body[field], json.loads(kit.stdout)[field], field)
 
     def test_standalone_wait_sends_the_same_coordinator_read_as_the_kit(self):
         self.config_is_usable()

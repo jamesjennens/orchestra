@@ -33,6 +33,37 @@ If your prompt has grown, write its state into checkpoints now and replace it wi
 
 The same text is in the repository under `docs/` and `templates/`, where a clone lets you search it. A kit document is never returned in part: if `docs NAME` is refused, nothing was returned, and the refusal says what is wrong with the installation.
 
+## Wait without re-arming it by hand
+
+Do not invent the next wait after one times out with nothing to do. Give `wait` the
+instant your current idle spell began and the longest command your harness allows, and
+it prints the command to run next:
+
+```sh
+b wait --since FINGERPRINT --idle-since 2026-10-17T15:00:00-04:00 --timeout 300 --max-timeout 3600
+```
+
+On a timeout with nothing new, the JSON result carries `next_timeout`, `next_command`
+and `give_up`:
+
+- run `next_command` exactly as printed - it names this client, config, project and
+  actor, the fingerprint the wait just printed, the same `--idle-since` and the next
+  `--timeout`, so you never retype a wait;
+- `next_timeout` starts at your `--timeout`, doubles after two empty returns in a row,
+  is never above `--max-timeout` (default cap 3600 s), and never below your base
+  `--timeout`;
+- `give_up: true` means the idle limit is reached (`--give-up-after`, 12 h from
+  `--idle-since` by default): checkpoint the task and stop, and do not run the wait
+  again. The `message` is `checkpoint and stop: nothing has been your move since TIME`;
+- a return with items is work: the schedule resets, and its `next_command` starts again
+  at the base `--timeout` with a fresh `--idle-since`.
+
+The count is stateless on purpose: no state file and no daemon exist, so the client
+recomputes the number of empty returns your idle spell implies from `--idle-since` and
+the schedule's own durations. Set `--idle-since` to when the spell began (the moment you
+last had work or started waiting), not to the moment the first wait started. A caller
+that passes none of the new flags sees the same output and exit codes as before.
+
 ## Preflight before claiming implementation
 
 Read the prospective task first, then verify:
