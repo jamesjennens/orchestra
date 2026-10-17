@@ -9,6 +9,7 @@ import * as project from './views/project.js';
 import * as task from './views/task.js';
 import * as admin from './views/admin.js';
 import * as reqs from './views/requirements.js';
+import * as records from './views/records.js';
 import * as agents from './views/agents.js';
 import * as setup from './views/setup.js';
 import * as how from './views/how.js';
@@ -19,6 +20,7 @@ const VIEWS = {
   project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings, setup: setup.page, how: how.page,
   newTask: task.create, task: task.detail,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
+  records: records.page, referenceRecord: records.referencePage, capabilityRecord: records.capabilityPage,
   users: admin.users, account: admin.account,
 };
 
@@ -92,6 +94,7 @@ export async function start(root, options = {}) {
             link('/p/' + pid, 'Tasks'),
             link('/p/' + pid + '/reviews', 'Reviews'),
             ctx.features.requirements ? link('/p/' + pid + '/requirements', 'Requirements') : null,
+            link('/p/' + pid + '/records', 'Records'),
             ctx.features.records ? link('/p/' + pid + '/decisions', 'Decisions') : null,
             link('/p/' + pid + '/feedback', 'Orchestra feedback'),
             link('/p/' + pid + '/settings', 'Members & settings'),

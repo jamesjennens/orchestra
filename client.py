@@ -333,7 +333,7 @@ class _InlineWait:
     EXIT_UNREACHABLE = 3
     MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor',
                    'contribution_id', 'pending_review_items', 'open_items', 'blocking_items',
-                   'checkpoint_at', 'newer_activity', 'redelivered')
+                   'checkpoint_at', 'newer_activity', 'redelivered', 'guidance_version')
     COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
                             'checkpoint-to-coordinator', 'lane-quiet')
     LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')

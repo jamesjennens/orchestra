@@ -456,7 +456,7 @@ def entry_record(payload, revision, acceptance_state, origin=None):
 def check_decisions(payload, run):
     """Every cited decision resolves to an issue typed `decision` or labelled `decision`."""
     wanted = list(payload.get('decisions') or [])
-    if not wanted or payload['operation'] == 'accept':
+    if not wanted or payload['operation'] in ('accept', 'retire'):
         return
     # `bd list --id` returns only the rows that exist (an empty list when none do), so
     # an unknown link is this refusal and never a native failure.
@@ -485,7 +485,7 @@ def check_authority_decision(payload, run):
     an existing decision issue. Checked before the journal, so a refusal creates nothing.
     (An accept checks the reviewed draft's id in `acceptance_rules`.)"""
     authority = payload.get('authority')
-    if payload['operation'] == 'accept' or not isinstance(authority, dict) or authority.get('type') != 'decision':
+    if payload['operation'] in ('accept', 'retire') or not isinstance(authority, dict) or authority.get('type') != 'decision':
         return
     if not _decision_issue(run, authority['id']):
         raise ValueError('authority.id %s must name an existing issue of type decision or labelled decision'
@@ -569,6 +569,60 @@ def attestation_acceptance_rules(record, acceptance, run):
                          'decision for an attested entry: nothing else anchors an operational fact')
 
 
+def newest_revisions(rows, operators=None):
+    """key -> the newest revision record of every readable anchor, whatever its acceptance."""
+    from reserved_comments import is_record_anchor
+    newest = {}
+    for row in rows:
+        if not isinstance(row, dict) or TYPE_LABEL not in (row.get('labels') or []):
+            continue
+        row = KIND.live_row(row, operators)[0]
+        if not is_record_anchor(row):
+            continue
+        try:
+            revisions = KIND.existing_revisions(row)
+        except ValueError:
+            continue
+        if revisions:
+            record = revisions[max(revisions)]
+            newest[record['key']] = record
+    return newest
+
+
+def read_key_and_retired(run, key):
+    """One key's rows plus every retired reference: all a retirement needs."""
+    rows = KIND.read_key_rows(run, key)
+    seen = {row['id'] for row in rows}
+    retired = [task for task in KIND.listed_ids(run, ['--label', STATE_LABEL['superseded']]) if task not in seen]
+    return rows + KIND.shown(run, retired)
+
+
+def check_successor(key, successor, rows, operators=None):
+    """The successor is an existing reference, and following successors never returns to `key`."""
+    KIND.require_unique_key(rows, successor)
+    newest = newest_revisions(rows, operators)
+    if successor not in newest:
+        raise ValueError('Unknown successor reference %s' % successor)
+    seen, current = {key}, successor
+    for _ in range(64):
+        if current in seen:
+            raise ValueError('Retiring %s in favour of %s would create a retirement cycle' % (key, successor))
+        seen.add(current)
+        record = newest.get(current)
+        if record is None or record.get('acceptance_state') != 'superseded':
+            return
+        current = record['successor']
+    raise ValueError('The successor chain from %s is too long' % successor)
+
+
+def _pre_write(payload, run, operators=None):
+    check_decisions(payload, run)
+    check_authority_decision(payload, run)
+    if payload.get('operation') == 'retire':
+        check_successor(payload['key'], payload['successor'], read_key_and_retired(run, payload['successor']),
+                        operators)
+
+
 KIND = keyed_entries.AnchoredKind(
     noun='reference', title='Reference', command='ref', type_label=TYPE_LABEL, state_labels=STATE_LABEL,
     key_prefix=KEY_LABEL, family='reference-', entry_prefix=ENTRY_PREFIX, acceptance_prefix=ACCEPTANCE_PREFIX,
@@ -581,7 +635,7 @@ KIND = keyed_entries.AnchoredKind(
     entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
     validate_content=_validate_content, write_time_rules=lambda record: _write_time_rules(record),
     content_fields=CONTENT_FIELDS,
-    pre_write=lambda payload, run, operators: (check_decisions(payload, run), check_authority_decision(payload, run)),
+    pre_write=lambda payload, run, operators: _pre_write(payload, run, operators),
     entry_prefixes=tuple(ENTRY_PREFIXES.values()), entry_prefix_for=lambda record: entry_prefix_for(record),
     acceptance_rules=lambda record, acceptance, run: acceptance_rules(record, acceptance, run),
     unsupported_reason=lambda body, row=None: unsupported_reason(body, row),
@@ -600,20 +654,41 @@ acceptance_evidence = KIND.acceptance_evidence
 write_payload = KIND.write_payload
 
 
-def validate_payload(payload, operator=False):
-    return KIND.validate_payload(payload, operator=operator)
+def validate_payload(payload, operator=False, web_coordinator=False):
+    return KIND.validate_payload(payload, operator=operator, web_coordinator=web_coordinator)
 
 
-def apply_native(payload, actor, run, project, operator=False, operators=None):
+def apply_native(payload, actor, run, project, operator=False, operators=None,
+                 web_coordinator=False, party_check=None, web_service=False):
     """Caller holds the canonical project lock; run(argv) invokes pinned bd.
 
     The contributor route (`operator=False`) proposes and revises drafts. The operator
-    route (`admin.py reference-apply`) accepts the newest draft it reviewed, or writes
-    a direct accepted revision 1, with F3 evidence; `operators` is the deployment
-    allowlist, checked before any journal or native read on that route. On both routes
-    it decides which operator voids apply (the endpoint supplies it to contributors).
+    route (`admin.py reference-apply` or web coordinator) accepts the newest draft it
+    reviewed, or writes a direct accepted revision 1, with F3 evidence; `operators` is
+    the deployment allowlist, checked before any journal or native read on the host route.
+    On both routes it decides which operator voids apply (the endpoint supplies it to
+    contributors).
     """
-    return KIND.apply_native(payload, actor, run, project, operator=operator, operators=operators)
+    seen = {}
+    outcome = KIND.apply_native(payload, actor, run, project, operator=operator,
+                                operators=operators, web_coordinator=web_coordinator,
+                                party_check=party_check, seen=seen, web_service=web_service)
+    if web_coordinator or web_service:
+        op = payload.get('operation') if isinstance(payload, dict) else None
+        if op in ('accept', 'retire'):
+            rec = seen.get('record')
+            if rec is not None:
+                outcome['sha256'] = rec['sha256']
+                outcome['pointers_validation'] = pointers_validation_of(rec, accepted=(op == 'accept'))
+        elif op == 'draft':
+            rec = entry_record(payload, 1, 'accepted')
+            outcome['sha256'] = rec['sha256']
+            outcome['pointers_validation'] = pointers_validation_of(rec, accepted=True)
+        elif op in ('propose', 'revise'):
+            rec = entry_record(payload, outcome.get('revision', 1), 'draft')
+            outcome['sha256'] = rec['sha256']
+            outcome['pointers_validation'] = pointers_validation_of(rec, accepted=False)
+    return outcome
 
 
 def apply_batch(payload, actor, run, project, operators=None, lock=None):
@@ -666,6 +741,51 @@ def authority_kind(record):
     return AUTHORITY_KINDS.get(((record or {}).get('authority') or {}).get('type'))
 
 
+def pointers_validation_of(record, accepted=False):
+    """Explicit description of how `authority` (`points_to`) was validated when no repository checkout is present."""
+    if not isinstance(record, dict):
+        return None
+    auth = record.get('authority')
+    atype = auth.get('type') if isinstance(auth, dict) else None
+    if atype == 'repo-path':
+        return {
+            'authority_type': 'repo-path',
+            'checked': 'syntax-and-pinned-commit',
+            'checkout_validated': False,
+            'note': ("The web service has no checkout of the project's repository; repo-path syntax and pinned "
+                     "40-hex commit were validated, and the entry is accepted marked unvalidated against a checkout "
+                     "(run ref check --repo . in a checkout to verify the path and anchor)."
+                     if accepted else
+                     "The web service has no checkout of the project's repository; repo-path syntax and pinned "
+                     "40-hex commit were validated (run ref check --repo . in a checkout to verify the path and anchor).")
+        }
+    if atype == 'decision':
+        return {
+            'authority_type': 'decision',
+            'checked': 'tracker-decision-issue',
+            'tracker_validated': True,
+            'checkout_validated': None,
+            'note': 'Decision issue existence and open/closed status were validated against the live project tracker.'
+        }
+    if atype == 'attestation':
+        return {
+            'authority_type': 'attestation',
+            'checked': 'provenance-and-decision-ids',
+            'tracker_validated': True,
+            'checkout_validated': None,
+            'note': ('Attestation provenance fields and any linked decision issues were validated against the live '
+                     'project tracker; attestations cannot be checked against a repository checkout.')
+        }
+    if atype == 'url':
+        return {
+            'authority_type': 'url',
+            'checked': 'url-syntax-and-date',
+            'checkout_validated': None,
+            'note': 'HTTPS URL syntax and checked date were validated; external URLs are not fetched by the service.'
+        }
+    return None
+
+
 def authority_note(record, accepted, current=None):
     """The sentence every read shows beside an attestation or a decision authority, else None.
 
@@ -715,30 +835,44 @@ def _record_view(record, accepted=False, current=None):
     return view
 
 
-def get(rows, key, operators, current=None):
+def get(rows, key, operators, current=None, web_service=False):
     """`ref get KEY`: found through the lookup label, then the record's own key must match.
 
     A malformed or unsupported entry is returned with that state (its key is known only
     from the label); an anchor with no record yet, or an unknown key, is a refusal.
     """
     entry = KIND.find_entry(rows, key, operators, view=lambda row, operators: entry_view(row, operators, current))
-    return {'schema_version': 1, 'key': key, 'state': entry['state'], 'native_id': entry['native_id'],
-            'record': _record_view(entry['record'], accepted=True, current=current),
-            'record_comment_id': entry['record_comment_id'],
-            'acceptance': entry['acceptance'], 'acceptance_inert': entry['acceptance_inert'],
-            'inert_operator': entry['inert_operator'],
-            'replaces': [], 'proposed': _record_view(entry['proposed'], current=current),
-            'proposed_comment_id': entry['proposed_comment_id'],
-            'due': 'conflicted' if entry['state'] == 'conflicted' else entry['due'], 'resolved': None,
-            'warnings': entry['warnings'][:10],
-            'trust': 'conflicted' if entry['state'] == 'conflicted' else 'accepted' if entry['record'] else 'draft',
-            'anchors': entry.get('duplicate_anchors', []),
-            'coverage': 'newest accepted revision and its acceptance evidence; unresolved drafts are returned '
-                        'in proposed'}
+    active = entry['record'] or entry['proposed']
+    result = {'schema_version': 1, 'key': key, 'state': entry['state'], 'native_id': entry['native_id'],
+              'record': _record_view(entry['record'], accepted=True, current=current),
+              'record_comment_id': entry['record_comment_id'],
+              'acceptance': entry['acceptance'], 'acceptance_inert': entry['acceptance_inert'],
+              'inert_operator': entry['inert_operator'],
+              'replaces': [], 'proposed': _record_view(entry['proposed'], current=current),
+              'proposed_comment_id': entry['proposed_comment_id'],
+              'due': 'conflicted' if entry['state'] == 'conflicted' else entry['due'], 'resolved': None,
+              'warnings': entry['warnings'][:10],
+              'trust': 'conflicted' if entry['state'] == 'conflicted' else 'accepted' if entry['record'] else 'draft',
+              'anchors': entry.get('duplicate_anchors', []),
+              'coverage': 'newest accepted revision and its acceptance evidence; unresolved drafts are returned '
+                          'in proposed'}
+    if web_service:
+        result.update(
+            proposer=entry.get('proposer'), acceptor=entry.get('acceptor'),
+            proposed_by=entry.get('proposed_by'), accepted_by=entry.get('accepted_by'),
+            accepted_proposer=entry.get('accepted_proposer'),
+            draft_authors=entry.get('draft_authors', []),
+            accepted_draft_authors=entry.get('accepted_draft_authors', []),
+            revision_authors=entry.get('revision_authors', {}),
+            waiting_acceptance=entry['proposed'] is not None and entry['state'] in ('draft-only', 'accepted'),
+            pointers_validation=pointers_validation_of(active, accepted=entry['record'] is not None),
+        )
+    return result
 
 
-def _list_item(entry, current=None):
+def _list_item(entry, current=None, web_service=False):
     source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
+    waiting = entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')
     item = {'key': entry['key'], 'title': (source.get('title') or entry.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
             'owner': source.get('owner'), 'review_by': source.get('review_by') if entry['record'] else None,
             'proposed_review_by': (entry['proposed'] or {}).get('review_by'),
@@ -748,6 +882,19 @@ def _list_item(entry, current=None):
             # What kind of authority the listed revision carries, and whether that revision
             # is the accepted record: a draft attestation is never shown unmarked.
             'authority_kind': authority_kind(source) if source else None, 'authority_accepted': entry['record'] is not None}
+    if web_service:
+        item.update(
+            waiting_acceptance=waiting,
+            proposed_revision=(entry['proposed'] or {}).get('revision'),
+            proposed_sha256=(entry['proposed'] or {}).get('sha256'),
+            record_sha256=(entry['record'] or {}).get('sha256'),
+            proposer=entry.get('proposer'), acceptor=entry.get('acceptor'),
+            proposed_by=entry.get('proposed_by'), accepted_by=entry.get('accepted_by'),
+            accepted_proposer=entry.get('accepted_proposer'),
+            draft_authors=entry.get('draft_authors', []),
+            accepted_draft_authors=entry.get('accepted_draft_authors', []),
+            pointers_validation=pointers_validation_of(source or None, accepted=entry['record'] is not None),
+        )
     note = authority_note(source or None, entry['record'] is not None, current)
     if note is not None:
         item['authority_note'] = note
@@ -756,8 +903,12 @@ def _list_item(entry, current=None):
     return item
 
 
-def list_entries(rows, options, operators, current=None):
+def list_entries(rows, options, operators, current=None, web_service=False):
     entries, incomplete = catalog(rows, operators, current)
+    waiting_count = sum(
+        1 for entry in entries
+        if entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')
+    )
     state = options.get('state')
     if state == 'all':
         good = [entry for entry in entries if entry['state'] not in ('unsupported',)]
@@ -765,6 +916,9 @@ def list_entries(rows, options, operators, current=None):
         good = [entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')]
         if state is not None:
             good = [entry for entry in good if entry['state'] == state]
+    if options.get('waiting'):
+        good = [entry for entry in good
+                if entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')]
     if options.get('owner'):
         good = [entry for entry in good if (entry['record'] or entry['proposed'] or {}).get('owner')
                 == options['owner']]
@@ -779,11 +933,15 @@ def list_entries(rows, options, operators, current=None):
     good.sort(key=lambda entry: (DUE_ORDER.get(entry.get('due'), 9), entry['key'] or ''))
     offset, limit = options.get('offset', 0), options.get('limit', 20)
     page = good[offset:offset + limit]
-    return {'schema_version': 1, 'total': len(good), 'items': [_list_item(entry, current) for entry in page],
-            'next_offset': offset + limit if offset + limit < len(good) else None,
-            'coverage': _coverage(entries, incomplete,
-                                  'one row per key: newest accepted/superseded revision, or newest draft when no '
-                                  'revision is accepted')}
+    result = {'schema_version': 1, 'total': len(good),
+              'items': [_list_item(entry, current, web_service=web_service) for entry in page],
+              'next_offset': offset + limit if offset + limit < len(good) else None,
+              'coverage': _coverage(entries, incomplete,
+                                    'one row per key: newest accepted/superseded revision, or newest draft when no '
+                                    'revision is accepted')}
+    if web_service:
+        result['waiting_acceptance_count'] = waiting_count
+    return result
 
 
 # -- lookup by phrase (kittrial-5bb.98 delivery B) -------------------------------------------------
@@ -1175,7 +1333,7 @@ def help_payload():
                          '--reason TEXT', 'admin.py reference-misses-clear PROJECT']}
 
 
-def parse_list_options(args):
+def parse_list_options(args, web_service=False):
     options = {'tags': [], 'limit': 20, 'offset': 0}
     values = {'--tag': 'tag', '--owner': 'owner', '--state': 'state', '--due': 'due', '--limit': 'limit',
               '--offset': 'offset', '--authority': 'authority'}
@@ -1183,6 +1341,10 @@ def parse_list_options(args):
     while index < len(args):
         token = args[index]
         if token == '--json':
+            index += 1
+            continue
+        if token == '--waiting' and web_service:
+            options['waiting'] = True
             index += 1
             continue
         if token not in values or index + 1 >= len(args):
@@ -1211,7 +1373,10 @@ def parse_list_options(args):
     return options
 
 
-def read(args, run, operators):
+HTTP_WRITE_COMMANDS = ('accept', 'retire')
+
+
+def read(args, run, operators, web_service=False):
     """`ref get KEY` / `ref list ...` / `ref find PHRASE` / `ref --help`: read-only. `get`
     reads only its key (`read_key_rows`); `list` and `find` read the catalog (`read_rows`).
     `ref misses` is answered by the endpoint itself (it needs the project directory)."""
@@ -1223,9 +1388,10 @@ def read(args, run, operators):
         if len(rest) != 1:
             raise ValueError('ref get takes exactly one KEY')
         valid_key(rest[0])
-        return get(read_key_rows(run, rest[0]), rest[0], operators)
+        return get(read_key_rows(run, rest[0]), rest[0], operators, web_service=web_service)
     if command == 'list':
-        return list_entries(read_rows(run), parse_list_options(rest), operators)
+        return list_entries(read_rows(run), parse_list_options(rest, web_service=web_service), operators,
+                            web_service=web_service)
     if command == 'find':
         phrase, limit = parse_find_options(rest)
         return find(read_rows(run), phrase, operators, limit=limit)

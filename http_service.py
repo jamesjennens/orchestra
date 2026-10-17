@@ -55,7 +55,8 @@ from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_r
 from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
-                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS,
+                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
+                       CAP_RECORDS, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, unauthenticated,
@@ -134,8 +135,9 @@ ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 # hyphens and dots (``kittrial-5bb.19``), which the original ``[A-Za-z0-9_]+``
 # rejected. The first character must be alphanumeric, so ``.``/``..`` never match.
 ID = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}'
-# A reference catalog key (reference_records.KEY): lowercase and dotted.
+# A reference or capability catalog key (reference_records.KEY, capability_records.KEY): lowercase and dotted.
 REFERENCE_KEY = r'[a-z][a-z0-9]*(?:\.[a-z0-9][a-z0-9-]*)+'
+CAPABILITY_KEY = REFERENCE_KEY
 PROPOSAL_KEY = r'p-[0-9a-f]{12}'
 SAFE_ID = re.compile(r'^' + ID + r'$')
 REQUEST_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
@@ -475,6 +477,7 @@ class InProcessBackend:
     # Contributed requirement proposals are native records behind the canonical endpoint;
     # this service-local backend has no store for them (the routes answer 501).
     PROPOSALS = False
+    RECORDS = False
     # Everything here is service-local, so a project is created by the HTTP route itself.
     PROJECT_CREATE = 'create'
     #: This backend has no host tracker, so a credential's name is judged by its shape and the
@@ -502,6 +505,16 @@ class InProcessBackend:
         import actor_names
         service = (self.actor_namespace, actor_names.SERVICE_NAMESPACE)
         return {name: actor_names.collision(name, service=service) for name in names}
+
+    def guidance_state(self, project_id, actor):
+        """No guidance store in this backend: answer ``None``, never an error.
+
+        This service-local backend has no host project directory, so it cannot hold the
+        standing guidance at all. ``None`` means "not readable here" and the agent
+        routes add no guidance item; the canonical endpoint backend
+        (:meth:`EndpointBackend.guidance_state`) is the one that reads it.
+        """
+        return None
 
     @property
     def state(self):
@@ -1093,6 +1106,21 @@ class InProcessBackend:
     def reference(self, project_id, key):
         raise not_found('Reference not found')
 
+    def references_find(self, project_id, phrase, limit=5):
+        return {'schema_version': 1, 'phrase': phrase, 'total': 0, 'items': [],
+                'coverage': 'the in-process backend holds no native reference records'}
+
+    def capabilities(self, project_id, options):
+        return {'schema_version': 1, 'total': 0, 'items': [], 'next_offset': None,
+                'coverage': 'the in-process backend holds no native capability records'}
+
+    def capability(self, project_id, key):
+        raise not_found('Capability not found')
+
+    def capabilities_find(self, project_id, phrase, limit=5):
+        return {'schema_version': 1, 'phrase': phrase, 'total': 0, 'items': [],
+                'coverage': 'the in-process backend holds no native capability records'}
+
     def read_tasks(self, project_id):
         """One full canonical snapshot of every in-project row.
 
@@ -1557,8 +1585,13 @@ class EndpointBackend:
     flight is surfaced as an uncertain outcome, never as success.
     """
 
-    ROUTES = InProcessBackend.ROUTES + ('tasks.assign', 'tasks.release', 'merge-slot.acquire',
-                                      'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create')
+    ROUTES = InProcessBackend.ROUTES + (
+        'tasks.assign', 'tasks.release', 'merge-slot.acquire',
+        'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create',
+        'references.propose', 'references.revise', 'references.accept', 'references.retire',
+        'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
+        'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
+    )
     #: Routes with no canonical command yet, and why. Fails closed rather than
     #: pretending the service store is canonical.
     UNRESOLVED = {
@@ -1568,6 +1601,7 @@ class EndpointBackend:
         'list_feedback': 'the canonical feedback command ships with kittrial-5bb.13',
     }
     PROPOSALS = True
+    RECORDS = True
     #: The endpoint owns the project's tracker rows and reads them when asked to
     #: (kittrial-5bb.188 item 1): a credential issued through this backend records that the
     #: name was verified row-free, so its ordinary writes need no such read.
@@ -1838,13 +1872,25 @@ class EndpointBackend:
                               (reply.get('stderr') or 'Lifecycle state cannot be read').strip())
             error.nothing_done = True
             raise error
+        if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
+            status = reply['records_status']
+            text = (reply.get('stderr') or 'Record operation refused').strip().split('\n')[-1]
+            for prefix in ('ValueError: ', 'RecordsRefusal: '):
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                    break
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid'}.get(status, 'unavailable'),
+                              text)
+            error.nothing_done = True
+            raise error
         # Without a descriptor the service only reads (every write it sends carries one).
         return self._checked(reply, action, reading=authority is None)
 
     #: How much of a canonical refusal's last line is handed on. A checkpoint refusal lists
     #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
     DETAIL_LIMIT = 200
-    DETAIL_LIMITS = {'checkpoint': 6000}
+    DETAIL_LIMITS = {'checkpoint': 6000, 'ref': 600, 'capability': 600}
     #: The follow-on base refusal is handed on whole (kittrial-5bb.158): cut at 200 it lost the
     #: reason, the recorder's name and what an operator must do.
     BASE_REFUSAL_LIMIT = 1500
@@ -1972,6 +2018,23 @@ class EndpointBackend:
                 if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str) \
                         and detail.startswith('ValueError: '):
                     raise invalid(detail[len('ValueError: '):], detail)
+                if action in ('ref', 'capability') and isinstance(detail, str):
+                    clean = detail
+                    for prefix in ('ValueError: ', 'RecordsRefusal: '):
+                        if clean.startswith(prefix):
+                            clean = clean[len(prefix):]
+                            break
+                    if (clean.startswith(('Unknown reference key ', 'Unknown capability key '))
+                            or 'no revision record yet' in clean):
+                        raise not_found(clean)
+                    if any(token in clean for token in (
+                            'already exists', 'is not the newest', 'does not match',
+                            'is retired', 'already accepted', 'different result',
+                            'collides with', 'has no revision', 'No pending alias',
+                            'already carries', 'already matches', 'was rejected for',
+                            'has no proposed draft')):
+                        raise conflict(clean)
+                    raise invalid(clean, detail)
                 if reply.get('refused') == 'not-found':
                     # bd found no row of that name (bd_refusals): the thing asked about is not there.
                     raise not_found('Task not found')
@@ -2153,6 +2216,9 @@ class EndpointBackend:
             # re-check cannot revive an item expired by a backward step.
             authority = authority_request(principal, project_id, capability,
                                           now=self.service._expiry_now())
+            if self.service.approval_by_another_party and (
+                    route.startswith('references.') or route.startswith('capabilities.')):
+                authority['approval_by_another_party'] = True
         try:
             result = self._run(action, project, payload.get('actor') or self._actor(principal),
                                args, attachments, operation_id=operation_id,
@@ -2403,6 +2469,16 @@ class EndpointBackend:
                 raise invalid('Send an Idempotency-Key header or an operation_id')
             return ('proposal', project_id, [payload['command'], '@attachment:0'],
                     {'0': {'flag': '--file', 'text': json.dumps(body)}})
+        if route.startswith('references.') or route.startswith('capabilities.'):
+            body = dict(payload['body'])
+            body['operation_id'] = body.get('operation_id') or operation_id
+            if not body['operation_id']:
+                raise invalid('Send an Idempotency-Key header or an operation_id')
+            if isinstance(body.get('acceptance'), dict) and not body['acceptance'].get('decision_id'):
+                body['acceptance'] = dict(body['acceptance'], decision_id=body['operation_id'])
+            action_name = 'ref' if route.startswith('references.') else 'capability'
+            return (action_name, project_id, [payload['command'], '@attachment:0'],
+                    {'0': {'flag': '--file', 'text': json.dumps(body, ensure_ascii=False)}})
         raise invalid('Backend route is not implemented for the canonical endpoint: %s' % route)
 
     # -- reads (no canonical mutation) ----------------------------------------
@@ -2424,11 +2500,37 @@ class EndpointBackend:
         for name in ('owner', 'state', 'due', 'authority'):
             if options.get(name):
                 args += ['--' + name, caller_arg(options[name], name)]
+        if options.get('waiting'):
+            args.append('--waiting')
         return self._ref_read(project_id, args)
 
     def reference(self, project_id, key):
         """One entry through `ref get`; an unknown or unfinished key is a 404."""
         return self._ref_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
+
+    def references_find(self, project_id, phrase, limit=5):
+        return self._ref_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
+
+    def capabilities(self, project_id, options):
+        """One page of the capability catalog through the endpoint's read-only `capability list`."""
+        args = ['list', '--limit', str(options['limit']), '--offset', str(options['offset'])]
+        for tag in options.get('tags') or []:
+            args += ['--tag', caller_arg(tag, 'tag')]
+        for name in ('owner', 'state'):
+            if options.get(name):
+                args += ['--' + name, caller_arg(options[name], name)]
+        if options.get('pointers'):
+            args.append('--pointers')
+        if options.get('waiting'):
+            args.append('--waiting')
+        return self._capability_read(project_id, args)
+
+    def capability(self, project_id, key):
+        """One entry through `capability get`; an unknown or unfinished key is a 404."""
+        return self._capability_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
+
+    def capabilities_find(self, project_id, phrase, limit=5):
+        return self._capability_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
 
     def requirements_read(self, project_id, args):
         reply=self._endpoint('requirements',project_id,self.actor_namespace+'/read',args)
@@ -2493,9 +2595,24 @@ class EndpointBackend:
         if code == 2 and missing and ('Unknown reference key' in stderr
                                       or 'no revision record yet' in stderr):
             raise not_found('Reference not found')
-        payload = self._checked(reply)
+        payload = self._checked(reply, 'ref', reading=True)
         if not isinstance(payload, dict):
             raise uncertain('Canonical reference read returned an unexpected shape')
+        return payload
+
+    def _capability_read(self, project_id, args, missing=False):
+        reply = self._endpoint('capability', project_id, self.actor_namespace + '/read', args)
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
+        if code == 2 and 'Unknown action' in stderr:
+            raise not_implemented('The canonical endpoint is older than this HTTP service and has '
+                                  'no capability catalog; install the same kit for both')
+        if code == 2 and missing and ('Unknown capability key' in stderr
+                                      or 'no revision record yet' in stderr):
+            raise not_found('Capability not found')
+        payload = self._checked(reply, 'capability', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical capability read returned an unexpected shape')
         return payload
 
     def read_tasks(self, project_id):
@@ -3116,6 +3233,21 @@ class EndpointBackend:
         steps as not available on this server.
         """
         return self._run('setup-status', project_id, self.actor_namespace + '/read', [])
+
+    def guidance_state(self, project_id, actor):
+        """One actor's guidance version block (kittrial-5bb.325).
+
+        Read from the project's coordination sidecar under this service's runtime root
+        (``<root>/projects/<project>``), the same files the host's ``setup-status`` read
+        uses, with the same module the endpoint uses, so the web agent routes cannot
+        disagree with ``work``, ``brief`` or ``session resume`` about the current version,
+        this actor's acknowledgement, or the one move item. It costs no endpoint read, so
+        the one-cheap-read rule of the polled routes (kittrial-5bb.281/.285) still holds.
+        Version and command only: the guidance TEXT never enters an agent answer.
+        """
+        import guidance as guidance_module
+        project_path = Path(self.root) / 'projects' / project_id
+        return guidance_module.brief_block(project_path, actor)
 
     #: How long the host's session names of one project are reused (kittrial-5bb.198). A task
     #: list names its assignees on every read, and a session registered just now may show by
@@ -6030,6 +6162,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(ctx.principal, project_id):
                 continue
+            # The guidance acknowledgement is a move row too (kittrial-5bb.325), so a web
+            # agent's wait wakes for a new version and its fingerprint changes with it;
+            # the row is the same one /v1/agents/me/next shows as its first next_action.
+            item = self._agent_guidance_item(project_id, actor)
+            if item is not None:
+                rows.append(dict(item, project=project_id))
             read = self._agent_project_tasks(project_id)
             for task in read.get('tasks') or []:
                 if not isinstance(task, dict):
@@ -6752,6 +6890,42 @@ class ApiHandler(BaseHTTPRequestHandler):
                                   # its limit is still handed somewhere to go.
                                   'claim_limit_refusal': True})
 
+    def _agent_guidance_item(self, project_id, actor):
+        """This actor's guidance move item for one project, or None (kittrial-5bb.325).
+
+        A backend with no guidance store (the in-process test backend) or a guidance
+        read that fails answers None: a guidance read never turns another read into an
+        error, exactly as an unreadable guidance record keeps its own repaired shape.
+        The item carries the version and the command, never the guidance text.
+        """
+        reader = getattr(self.backend, 'guidance_state', None)
+        if reader is None:
+            return None
+        try:
+            block = reader(project_id, actor)
+        except Exception:
+            return None
+        item = block.get('item') if isinstance(block, dict) else None
+        return item if isinstance(item, dict) else None
+
+    @staticmethod
+    def _guidance_action(project_id, actor, item):
+        """The one guidance acknowledgement as the agent's first next_action.
+
+        Priority 0 puts it ahead of every task action: the coordinator cannot reach a run
+        prompt that never calls `guidance get`, so a changed guidance version is the
+        agent's own move on its queue (kittrial-5bb.325). It carries the version and the
+        command the endpoint's own item names, and no task link, because it is not a task.
+        """
+        return {'priority': 0, 'kind': 'guidance', 'project': project_id,
+                'task': item.get('task') or 'guidance',
+                'title': item.get('title'), 'status': None,
+                'review_state': item.get('review_state'),
+                'assignee': actor, 'reason': item.get('text'),
+                'command': item.get('command'),
+                'guidance_version': item.get('guidance_version'),
+                'links': {'project': '/v1/projects/%s' % project_id}}
+
     def _agent_attention(self, principal, agent, many=False):
         """Owner/agent-visible attention, computed at read time from bounded reads.
 
@@ -6783,13 +6957,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
                   'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
-                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0}
+                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0, 'guidance': 0}
         #: The rows that count against this agent's claim limit and hard cap, by the one
         #: rule the gate uses, so /v1/agents/me/next and the gate cannot disagree about
         #: held and available (kittrial-5bb.276 revision; hard cap in kittrial-5bb.300).
         claim_held = 0
         claim_blocked = 0
         own_actions = []
+        guidance_actions = []
         claimable_actions = []
         review_actions = []
         truncated = False
@@ -6797,6 +6972,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(principal, project_id):
                 continue
+            # The guidance acknowledgement (kittrial-5bb.325) is this agent's own move in
+            # every project it may read: one row per project whose current version this
+            # actor has not acknowledged. No guidance set means no row.
+            #
+            # Single-agent reads only: this item is the calling agent's own move, so the
+            # owner's multi-agent listing (``many``) does not pay one extra host read per
+            # agent per project for a row its reader cannot act on.
+            if not many:
+                item = self._agent_guidance_item(project_id, actor)
+                if item is not None:
+                    counts['guidance'] += 1
+                    guidance_actions.append(self._guidance_action(project_id, actor, item))
             try:
                 read = self._agent_project_tasks(project_id,many=many)
                 own = self._agent_own_tasks(project_id, actor, many=many)
@@ -6929,7 +7116,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if counts['review_recommended'] + counts['to_review'] > len(review_actions):
             truncated = True
             actions_truncated = True
-        actions = own_actions + review_actions + claimable_actions
+        actions = guidance_actions + own_actions + review_actions + claimable_actions
         actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0),
                                    0 if a['kind'] == 'in-progress' and a.get('newer_activity') is True else 1,
                                    a['project'], a['task']))
@@ -6957,19 +7144,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'unknown'
         else:
             state = 'idle'
-        return {'state': state, 'summary': self._agent_summary(
-                    state, counts, snapshot_truncated, own_tasks_truncated)
-                    + self._agent_review_summary(counts, snapshot_truncated)
-                    + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
-                        % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
-                       if counts['newer_activity'] else ''),
+        summary = (self._agent_summary(state, counts, snapshot_truncated, own_tasks_truncated)
+                   + self._agent_review_summary(counts, snapshot_truncated)
+                   + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
+                       % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
+                      if counts['newer_activity'] else ''))
+        if guidance_actions:
+            # A changed guidance version leads, because it changes what the agent should do
+            # next and no run prompt is guaranteed to run `guidance get` (kittrial-5bb.325).
+            summary = ('The project guidance changed since this agent last acknowledged it; read it and '
+                       'record the read before other work. ' + summary)
+        return {'state': state, 'summary': summary,
                 'counts': counts, 'claim_limit_held': claim_held,
                 'claim_limit_blocked': claim_blocked, 'actions': actions,
                 'truncated': truncated,
                 'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
                 'actions_truncated':actions_truncated,
                 'computed_at': now_iso(self.service._now())}
-
     @staticmethod
     def _agent_summary(state, counts, snapshot_truncated=False, own_tasks_truncated=False):
         claimable = ('at least ' if snapshot_truncated else '') + str(counts.get('claimable', 0))
@@ -7065,8 +7256,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         where = (' in %s' % directory) if directory else ''
         first = attention['actions'][0] if attention['actions'] else None
         if first:
-            what = ('Next: %s on %s in project %s.'
-                    % (first['kind'], first['task'], first['project']))
+            if first.get('kind') == 'guidance':
+                # The guidance row is not a task (kittrial-5bb.325): name the command.
+                what = ('Next: the project guidance changed; %s.'
+                        % (first.get('command') or 'run guidance get, then guidance ack --version VERSION'))
+            else:
+                what = ('Next: %s on %s in project %s.'
+                        % (first['kind'], first['task'], first['project']))
         else:
             what = 'There is nothing queued right now.'
         # kittrial-5bb.48: the secret never reaches curl's argv. curl reads the header
@@ -7454,15 +7650,306 @@ class ApiHandler(BaseHTTPRequestHandler):
                        'page (or requirement_records.py draft|revise), and an operator accepts it with '
                        'admin.py requirement-apply.' % label)
 
+    # -- reference and capability records over the web (kittrial-5bb.213) -----
+    REF_PROPOSE_FIELDS = ('key', 'revision', 'expected_sha256', 'title', 'statement', 'authority',
+                          'owner', 'review_by', 'tags', 'decisions')
+    REF_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'title', 'statement',
+                         'authority', 'owner', 'review_by', 'tags', 'decisions')
+    REF_ACCEPT_FIELDS = ('key', 'revision', 'expected_revision', 'record_sha256', 'expected_sha256',
+                         'acceptance_state', 'acceptance', 'decision', 'evidence', 'decision_id',
+                         'owners', 'approvers', 'policy', 'unverified_pointer_reason')
+    REF_RETIRE_FIELDS = ('key', 'revision', 'expected_revision', 'record_sha256', 'expected_sha256',
+                         'successor', 'superseded_by', 'acceptance_state', 'acceptance', 'decision',
+                         'evidence', 'reason', 'decision_id', 'owners', 'approvers', 'policy')
+
+    CAP_PROPOSE_FIELDS = ('key', 'revision', 'expected_sha256', 'name', 'aliases', 'summary',
+                          'requirements', 'anchors', 'code', 'tests', 'owner', 'tags')
+    CAP_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'name', 'aliases',
+                         'summary', 'requirements', 'anchors', 'code', 'tests', 'owner', 'tags')
+    CAP_ACCEPT_FIELDS = REF_ACCEPT_FIELDS
+    CAP_RETIRE_FIELDS = REF_RETIRE_FIELDS
+    CAP_VERIFY_FIELDS = ('key', 'revision', 'entry_revision', 'record_sha256', 'expected_sha256',
+                         'entry_sha256', 'commit', 'checked_at', 'source', 'graph_built_at_commit',
+                         'tool', 'results', 'passed', 'summary', 'method', 'command',
+                         'unverified_pointer_reason')
+    CAP_ALIAS_PROPOSE_FIELDS = ('key', 'alias', 'evidence')
+    CAP_ALIAS_REJECT_FIELDS = ('key', 'alias', 'reason')
+
+    def _records_backend(self):
+        if not getattr(self.backend, 'RECORDS', False):
+            raise not_implemented('Reference and capability mutations require the canonical endpoint backend')
+
+    def _require_record_membership(self, ctx, coordinator=False):
+        pid = ctx.params['pid']
+        role = self.service.state.get('memberships', {}).get(pid, {}).get(ctx.principal.user_id)
+        if coordinator:
+            if role not in ('owner', 'coordinator'):
+                raise forbidden('Record coordination requires project membership as an owner or coordinator; '
+                                'a superuser without project membership must add themselves to the project first.')
+        else:
+            if role not in ('contributor', 'coordinator', 'owner'):
+                raise forbidden('Record mutations require project membership; '
+                                'a superuser without project membership must add themselves to the project first.')
+
+    def _records_standing(self, ctx, pid, capabilities):
+        role = self.service.state.get('memberships', {}).get(pid, {}).get(ctx.principal.user_id)
+
+        def holds(cap):
+            if cap in capabilities:
+                return True
+            try:
+                self.service.check_authority(ctx.principal, pid, cap)
+                return True
+            except HttpError:
+                return False
+        can_propose = role in ('contributor', 'coordinator', 'owner') and holds(CAP_RECORDS)
+        can_coordinate = role in ('coordinator', 'owner') and holds(CAP_COORDINATE)
+        return can_propose, can_coordinate
+
+    def _enrich_record_view(self, ctx, pid, capabilities, item):
+        if not isinstance(item, dict):
+            return item
+        item = dict(item)
+        can_propose, can_coordinate = self._records_standing(ctx, pid, capabilities)
+        actors = [item.get('proposer'), item.get('acceptor'), item.get('proposed_by'),
+                  item.get('accepted_by'), item.get('accepted_proposer'), item.get('verifier')]
+        for block_name, field_names in (('draft', ('proposer',)),
+                                        ('acceptance', ('operator', 'proposer')),
+                                        ('retirement', ('operator',)),
+                                        ('verification', ('verifier',))):
+            block = item.get(block_name)
+            if isinstance(block, dict):
+                actors.extend(block.get(f) for f in field_names)
+        for alias_item in item.get('aliases_pending') or []:
+            if isinstance(alias_item, dict):
+                actors.append(alias_item.get('actor'))
+        names = self._actor_names(actors, pid)
+        for field in ('proposer', 'acceptor', 'proposed_by', 'accepted_by', 'accepted_proposer', 'verifier'):
+            val = item.get(field)
+            if isinstance(val, str) and val:
+                item[field + '_name'] = names.get(val, val)
+        if isinstance(item.get('draft'), dict):
+            draft = dict(item['draft'])
+            if isinstance(draft.get('proposer'), str):
+                draft['proposer_name'] = names.get(draft['proposer'], draft['proposer'])
+            item['draft'] = draft
+        if isinstance(item.get('acceptance'), dict):
+            acc = dict(item['acceptance'])
+            if isinstance(acc.get('operator'), str):
+                acc['operator_name'] = names.get(acc['operator'], acc['operator'])
+            if isinstance(acc.get('proposer'), str):
+                acc['proposer_name'] = names.get(acc['proposer'], acc['proposer'])
+            item['acceptance'] = acc
+        if isinstance(item.get('retirement'), dict):
+            ret = dict(item['retirement'])
+            if isinstance(ret.get('operator'), str):
+                ret['operator_name'] = names.get(ret['operator'], ret['operator'])
+            item['retirement'] = ret
+        if isinstance(item.get('verification'), dict):
+            ver = dict(item['verification'])
+            if isinstance(ver.get('verifier'), str):
+                ver['verifier_name'] = names.get(ver['verifier'], ver['verifier'])
+            item['verification'] = ver
+        if isinstance(item.get('aliases_pending'), list):
+            item['aliases_pending'] = [
+                dict(entry, actor_name=names.get(entry.get('actor'), entry.get('actor')))
+                if isinstance(entry, dict) else entry
+                for entry in item['aliases_pending']
+            ]
+        by_agent = ctx.principal.via == 'credential'
+        caller_names = [ctx.principal.actor or ctx.principal.user_id, ctx.principal.user_id]
+        draft_proposer = (
+            item.get('proposed_by')
+            or (item.get('draft') or {}).get('proposer')
+            or (item.get('proposer')
+                if item.get('state') in ('draft-only', 'draft', 'proposed')
+                or item.get('waiting_acceptance') or item.get('has_pending_draft')
+                else None)
+        )
+        draft_authors = [a for a in (item.get('draft_authors') or []) if isinstance(a, str) and a]
+        if not draft_authors and isinstance(draft_proposer, str) and draft_proposer:
+            draft_authors = [draft_proposer]
+        item['self_accept_blocked'] = bool(
+            can_coordinate and draft_authors
+            and (self.service.approval_by_another_party or by_agent)
+            and not self._independent_all(caller_names, draft_authors, pid, by_agent))
+        verify_proposer = (
+            (item.get('accepted_proposer')
+             or (item.get('acceptance') or {}).get('proposer')
+             or item.get('proposed_by')
+             or item.get('proposer'))
+            if item.get('record') is not None
+            else (item.get('proposed_by') or item.get('proposer'))
+        )
+        verify_authors_raw = (
+            item.get('accepted_draft_authors')
+            if item.get('record') is not None
+            else item.get('draft_authors')
+        )
+        verify_authors = [a for a in (verify_authors_raw or []) if isinstance(a, str) and a]
+        if not verify_authors and isinstance(verify_proposer, str) and verify_proposer:
+            verify_authors = [verify_proposer]
+        item['self_verify_blocked'] = bool(
+            can_coordinate and verify_authors
+            and (self.service.approval_by_another_party or by_agent)
+            and not self._independent_all(caller_names, verify_authors, pid, by_agent))
+        item['can_propose'] = can_propose
+        item['can_coordinate'] = can_coordinate
+        item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
+        return item
+
+    def _enrich_records_list(self, ctx, pid, result):
+        capabilities = self.service.capabilities_for(ctx.principal, pid)
+        can_propose, can_coordinate = self._records_standing(ctx, pid, capabilities)
+        result = dict(result)
+        for list_key in ('items', 'records', 'candidates'):
+            if isinstance(result.get(list_key), list):
+                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item)
+                                    for item in result[list_key]]
+        if 'items' not in result and isinstance(result.get('records'), list):
+            seen = {r.get('key') for r in result['records'] if isinstance(r, dict)}
+            extra = [c for c in (result.get('candidates') or [])
+                     if isinstance(c, dict) and c.get('key') not in seen]
+            result['items'] = list(result['records']) + extra
+        result['can_propose'] = can_propose
+        result['can_coordinate'] = can_coordinate
+        result['approval_by_another_party'] = bool(self.service.approval_by_another_party)
+        return result
+
+    def _normalize_record_payload(self, ctx, command, body, operation_id):
+        body = dict(body)
+        if command == 'revise':
+            if 'revision' not in body and 'expected_revision' in body:
+                er = body.pop('expected_revision')
+                body['revision'] = (er + 1) if (isinstance(er, int) and not isinstance(er, bool)) else er
+            else:
+                body.pop('expected_revision', None)
+        elif command in ('accept', 'retire'):
+            body.setdefault('acceptance_state', 'accepted' if command == 'accept' else 'superseded')
+            if 'revision' not in body and 'expected_revision' in body:
+                body['revision'] = body.pop('expected_revision')
+            else:
+                body.pop('expected_revision', None)
+            if 'record_sha256' not in body and 'expected_sha256' in body:
+                body['record_sha256'] = body.pop('expected_sha256')
+            else:
+                body.pop('expected_sha256', None)
+            if command == 'retire':
+                if 'successor' not in body and 'superseded_by' in body:
+                    body['successor'] = body.pop('superseded_by')
+                else:
+                    body.pop('superseded_by', None)
+            pid = ctx.params['pid']
+            account_id = 'account:' + ctx.principal.user_id
+            with self.service.store.lock:
+                memberships = dict((self.service.state.get('memberships') or {}).get(pid) or {})
+            member_owners = [
+                'account:' + uid for uid, role in sorted(memberships.items())
+                if role in ('owner', 'coordinator')
+            ]
+            if account_id not in member_owners:
+                member_owners.append(account_id)
+            if ctx.principal.via == 'credential' and ctx.principal.actor:
+                agent_tag = 'agent:' + ctx.principal.actor
+                actual_approvers = [account_id, agent_tag]
+                actual_owners = member_owners + [agent_tag]
+                allowed_approvers = {account_id, ctx.principal.user_id, agent_tag, ctx.principal.actor}
+            else:
+                actual_approvers = [account_id]
+                actual_owners = member_owners
+                allowed_approvers = {account_id, ctx.principal.user_id}
+            allowed_owners = set(actual_owners) | set(memberships.keys()) | {'account:' + u for u in memberships}
+            acc_in = body.get('acceptance') if isinstance(body.get('acceptance'), dict) else {}
+            supplied_approvers = body.get('approvers') if 'approvers' in body else acc_in.get('approvers')
+            if supplied_approvers is not None:
+                if (not isinstance(supplied_approvers, list) or not supplied_approvers
+                        or not all(isinstance(x, str) and x in allowed_approvers for x in supplied_approvers)):
+                    raise invalid('approvers on the web may only name the authenticated principal performing this acceptance')
+            supplied_owners = body.get('owners') if 'owners' in body else acc_in.get('owners')
+            if supplied_owners is not None:
+                if (not isinstance(supplied_owners, list) or not supplied_owners
+                        or not all(isinstance(x, str) and x in allowed_owners for x in supplied_owners)):
+                    raise invalid('owners on the web must come from project membership')
+            if 'acceptance' not in body:
+                ev = body.pop('evidence', None)
+                if ev is None:
+                    ev = body.pop('reason', None)
+                else:
+                    body.pop('reason', None)
+                dec = body.pop('decision', None)
+                if ev is None and isinstance(dec, dict):
+                    ev = dec.get('why_satisfied') or dec.get('checked')
+                body.pop('owners', None)
+                body.pop('approvers', None)
+                policy = body.pop('policy', None) or 'any-owner'
+                decision_id = body.pop('decision_id', None) or operation_id
+                body.pop('unverified_pointer_reason', None)
+                if ev is not None or dec is not None:
+                    body['acceptance'] = {
+                        'decision_id': decision_id,
+                        'owners': list(actual_owners),
+                        'approvers': list(actual_approvers),
+                        'policy': policy,
+                        'evidence': ev if ev is not None else '',
+                    }
+            else:
+                for extra in ('evidence', 'reason', 'decision', 'decision_id',
+                              'owners', 'approvers', 'policy', 'unverified_pointer_reason'):
+                    body.pop(extra, None)
+                if isinstance(body['acceptance'], dict):
+                    acc = dict(body['acceptance'])
+                    if 'decision' in acc and 'evidence' not in acc:
+                        dec = acc.pop('decision')
+                        if isinstance(dec, dict):
+                            acc['evidence'] = dec.get('why_satisfied') or dec.get('checked') or ''
+                    acc['owners'] = list(actual_owners)
+                    acc['approvers'] = list(actual_approvers)
+                    acc.setdefault('policy', 'any-owner')
+                    acc.setdefault('decision_id', operation_id)
+                    body['acceptance'] = acc
+        return body
+
+    def _records_write(self, ctx, route_name, command, allowed_fields, where, *,
+                       coordinator=False, key_param=True, status=200):
+        self._records_backend()
+        needed = CAP_COORDINATE if coordinator else CAP_RECORDS
+        self._project(ctx, needed)
+        self._require_record_membership(ctx, coordinator=coordinator)
+        fields, operation_id = self._proposal_body(ctx, allowed_fields, where)
+        pid = ctx.params['pid']
+        if key_param and 'key' in fields and fields['key'] != ctx.params['key']:
+            raise invalid('key in body must match the route key')
+        body = dict(fields, schema_version=1, operation_id=operation_id)
+        if key_param:
+            body['key'] = ctx.params['key']
+        body = self._normalize_record_payload(ctx, command, body, operation_id)
+
+        def mutate_record():
+            result = self.backend.invoke(route_name, ctx.principal, pid,
+                                         {'command': command, 'body': body},
+                                         ctx.idempotency_key,
+                                         target=ctx.route_target,
+                                         authorize=ctx.authorize,
+                                         capability=needed)
+            capabilities = self.service.capabilities_for(ctx.principal, pid)
+            if isinstance(result, dict):
+                result = self._enrich_record_view(ctx, pid, capabilities, result)
+            return result, result
+        return self._mutate(ctx, route_name, pid, mutate_record, status=status,
+                            capability=needed, serialize=False, canonical=True,
+                            reason='%s %s' % (command, body.get('key') or ''))
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):
-        """The reference catalog (.41 slice 1), read-only at CAP_READ.
+        """The reference catalog (.41 slice 1, .213 slice 5), read-only at CAP_READ.
 
         Query: `tag` (comma-separated, all must match), `owner`, `state`, `due`,
-        `authority` (repository, url or attested), `limit` and the page `cursor`. Statements are untrusted text: they are returned as data
+        `authority` (repository, url or attested), `waiting` (1/true), `limit` and the
+        page `cursor`. Statements are untrusted text: they are returned as data
         and never placed in an error body or an audit record.
         """
         self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
         limit, state = self._page(ctx, ctx.query)
         args = ['--limit', str(limit), '--offset', str(state['o'])]
         for tag in [t for t in (ctx.query.get('tag') or '').split(',') if t]:
@@ -7470,21 +7957,180 @@ class ApiHandler(BaseHTTPRequestHandler):
         for name in ('owner', 'state', 'due', 'authority'):
             if ctx.query.get(name):
                 args += ['--' + name, ctx.query[name]]
+        if 'waiting' in ctx.query:
+            if ctx.query['waiting'] in ('1', 'true'):
+                args.append('--waiting')
+            elif ctx.query['waiting'] not in ('0', 'false', ''):
+                raise invalid('waiting must be 1, 0, true or false')
         import reference_records
         try:
-            options = reference_records.parse_list_options(args)
+            options = reference_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('ref list: ', ''))
-        result = dict(self.backend.references(ctx.params['pid'], options))
-        result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
+        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options))
+        result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit)
                                  if result.get('next_offset') is not None else None)
         return 200, result
 
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references/find')
+    def references_find(self, ctx):
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        q = ctx.query.get('q')
+        if not isinstance(q, str) or not q.strip():
+            raise invalid('q is required')
+        caller_arg(q, 'q')
+        limit_raw = ctx.query.get('limit', '5')
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            raise invalid('limit must be an integer')
+        import reference_records
+        try:
+            phrase, parsed_limit = reference_records.parse_find_options([q, '--limit', str(limit)])
+        except ValueError as error:
+            raise invalid(str(error).replace('ref find: ', ''))
+        result = self.backend.references_find(pid, phrase, parsed_limit)
+        return 200, self._enrich_records_list(ctx, pid, result)
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')')
     def references_get(self, ctx):
         self._project(ctx, CAP_READ)
-        return 200, self.backend.reference(ctx.params['pid'], ctx.params['key'])
+        pid = ctx.params['pid']
+        capabilities = self.service.capabilities_for(ctx.principal, pid)
+        return 200, self._enrich_record_view(
+            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']))
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references')
+    def references_propose(self, ctx):
+        return self._records_write(ctx, 'references.propose', 'propose',
+                                   self.REF_PROPOSE_FIELDS, 'A reference proposal',
+                                   coordinator=False, key_param=False, status=201)
+
+    @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/revisions')
+    def references_revise(self, ctx):
+        return self._records_write(ctx, 'references.revise', 'revise',
+                                   self.REF_REVISE_FIELDS, 'A reference revision',
+                                   coordinator=False, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/accept')
+    def references_accept(self, ctx):
+        return self._records_write(ctx, 'references.accept', 'accept',
+                                   self.REF_ACCEPT_FIELDS, 'A reference acceptance',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/retire')
+    def references_retire(self, ctx):
+        return self._records_write(ctx, 'references.retire', 'retire',
+                                   self.REF_RETIRE_FIELDS, 'A reference retirement',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
+    def capabilities_list(self, ctx):
+        """The capability catalog (.56, .213 slice 5), read-only at CAP_READ."""
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        limit, state = self._page(ctx, ctx.query)
+        args = ['--limit', str(limit), '--offset', str(state['o'])]
+        for tag in [t for t in (ctx.query.get('tag') or '').split(',') if t]:
+            args += ['--tag', tag]
+        for name in ('owner', 'state'):
+            if ctx.query.get(name):
+                args += ['--' + name, ctx.query[name]]
+        if 'pointers' in ctx.query:
+            if ctx.query['pointers'] in ('1', 'true'):
+                args.append('--pointers')
+            elif ctx.query['pointers'] not in ('0', 'false', ''):
+                raise invalid('pointers must be 1, 0, true or false')
+        if 'waiting' in ctx.query:
+            if ctx.query['waiting'] in ('1', 'true'):
+                args.append('--waiting')
+            elif ctx.query['waiting'] not in ('0', 'false', ''):
+                raise invalid('waiting must be 1, 0, true or false')
+        import capability_records
+        try:
+            options = capability_records.parse_list_options(args, web_service=True)
+        except ValueError as error:
+            raise invalid(str(error).replace('capability list: ', ''))
+        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options))
+        result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
+                                             state['o'] + limit)
+                                 if result.get('next_offset') is not None else None)
+        return 200, result
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/find')
+    def capabilities_find(self, ctx):
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        q = ctx.query.get('q')
+        if not isinstance(q, str) or not q.strip():
+            raise invalid('q is required')
+        caller_arg(q, 'q')
+        limit_raw = ctx.query.get('limit', '5')
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            raise invalid('limit must be an integer')
+        import capability_records
+        try:
+            phrase, parsed_limit = capability_records.parse_find_options([q, '--limit', str(limit)])
+        except ValueError as error:
+            raise invalid(str(error).replace('capability find: ', ''))
+        result = self.backend.capabilities_find(pid, phrase, parsed_limit)
+        return 200, self._enrich_records_list(ctx, pid, result)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')')
+    def capabilities_get(self, ctx):
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        capabilities = self.service.capabilities_for(ctx.principal, pid)
+        return 200, self._enrich_record_view(
+            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']))
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
+    def capabilities_propose(self, ctx):
+        return self._records_write(ctx, 'capabilities.propose', 'propose',
+                                   self.CAP_PROPOSE_FIELDS, 'A capability proposal',
+                                   coordinator=False, key_param=False, status=201)
+
+    @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/revisions')
+    def capabilities_revise(self, ctx):
+        return self._records_write(ctx, 'capabilities.revise', 'revise',
+                                   self.CAP_REVISE_FIELDS, 'A capability revision',
+                                   coordinator=False, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/accept')
+    def capabilities_accept(self, ctx):
+        return self._records_write(ctx, 'capabilities.accept', 'accept',
+                                   self.CAP_ACCEPT_FIELDS, 'A capability acceptance',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/retire')
+    def capabilities_retire(self, ctx):
+        return self._records_write(ctx, 'capabilities.retire', 'retire',
+                                   self.CAP_RETIRE_FIELDS, 'A capability retirement',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/verify')
+    def capabilities_verify(self, ctx):
+        return self._records_write(ctx, 'capabilities.verify', 'web-verify',
+                                   self.CAP_VERIFY_FIELDS, 'A capability verification',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/aliases')
+    def capabilities_alias_propose(self, ctx):
+        return self._records_write(ctx, 'capabilities.alias.propose', 'propose-alias',
+                                   self.CAP_ALIAS_PROPOSE_FIELDS, 'A capability alias proposal',
+                                   coordinator=False, key_param=True, status=201)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/aliases/reject')
+    def capabilities_alias_reject(self, ctx):
+        return self._records_write(ctx, 'capabilities.alias.reject', 'reject-alias',
+                                   self.CAP_ALIAS_REJECT_FIELDS, 'A capability alias rejection',
+                                   coordinator=True, key_param=True, status=200)
 
     # -- direct owner requirements, slice A -------------------------------------
     def _requirements_backend(self):
