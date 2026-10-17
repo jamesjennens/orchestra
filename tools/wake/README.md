@@ -40,6 +40,12 @@ recorded, so one command is never attempted twice for the same fingerprint. Test
 the command once before trusting it (see the test-it-once checklist below and
 `docs finding-work`).
 
+A path from configuration is checked before anything is created or removed: a
+`--state`, `--lock` or `--log` that is empty, `/`, the home directory, or an
+existing directory where a file belongs is refused with a message on stderr and
+exit 1. On POSIX the lock is this waker's own directory and holds only its `pid`
+file; a directory that holds anything else is refused, not used or deleted.
+
 ## Files
 
     wake.sh                         POSIX sh waker; Linux and macOS
@@ -51,8 +57,9 @@ the command once before trusting it (see the test-it-once checklist below and
     macos/com.orchestra.wake.plist   launchd agent at login and every N minutes
 
 The core script is shared by Linux and macOS: POSIX sh, `mkdir` for the lock,
-`kill -0` for the pid check. The scheduler wiring differs, so it is in `linux/`
-and `macos/`.
+`kill -0` for the pid check, and `rm -f "$LOCK/pid"` then `rmdir "$LOCK"` to
+release the lock - never a recursive removal of a configured path. The scheduler
+wiring differs, so it is in `linux/` and `macos/`.
 
 ## Settings
 
@@ -206,13 +213,17 @@ string. The script requires PowerShell 5.1 or newer.
 
 - Nothing happens: run the script by hand with the same settings; a usage error
   (exit 2) names the missing setting. `client.py wait` exit 3 means the service
-  could not be reached, exit 2 that it refused the wait.
+  could not be reached, exit 2 that it refused the wait. A setting refused for
+  safety (empty, `/`, the home directory, or a wrong kind of path) exits 1 and
+  names the setting and the reason; nothing was created or removed.
 - The wake log stays empty: `wait` has not returned anything for this lane, or
   it keeps timing out. Check the state file: it changes only when a new
   fingerprint is seen, and no wake is due for a fingerprint already acted on.
 - A run died hard and left `wake.lock` (POSIX) or `wake.lock` (Windows): the
-  next run takes it over when the process id inside is gone. Remove it by hand
-  only if you are sure no waker is running.
+  next run takes it over when the process id inside is gone. On POSIX it removes
+  only the pid file and then the empty directory with `rmdir`; a lock directory
+  that holds anything else is refused for you to check by hand. Remove a lock by
+  hand only if you are sure no waker is running.
 - The wake command fails every time: it is attempted once per new fingerprint.
   Fix it, then wake the lane by hand or wait for the next new fingerprint; the
   failure is on stderr and in the scheduler's log.

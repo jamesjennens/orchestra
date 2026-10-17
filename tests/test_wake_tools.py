@@ -339,6 +339,20 @@ class LockTests(WakeCase):
         self.assertEqual(self.wake_lines(), [])
         self.assertTrue(self.lock.exists(), 'another run may be between its mkdir and its pid write')
 
+    def test_a_lock_that_gains_a_foreign_file_is_not_recursively_removed(self):
+        # The lock is released with rm -f of its pid file and rmdir of the directory.
+        # A directory that gained anything else must survive: rmdir refuses it. This is
+        # the direct guard against rm -rf on a configured path.
+        self.scenario_for(1)
+        intruder = self.lock / 'notes.txt'
+        script = ('echo one >> %s; printf x > %s'
+                  % (shlex.quote(str(self.wakes)), shlex.quote(str(intruder))))
+        done = self.run_wake(wake=script)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(intruder.exists(), 'release must not remove a lock directory that holds more than its pid file')
+        self.assertFalse((self.lock / 'pid').exists(), 'the run must still take its own pid file away')
+        self.assertEqual(self.wake_lines(), ['one'])
+
     def test_two_runs_started_together_wake_once(self):
         self.scenario_for(1, sleep=1)
         args = self.script_args()
@@ -351,6 +365,139 @@ class LockTests(WakeCase):
         self.assertEqual(self.wake_lines(), ['one'])
         self.assertEqual(len(self.log_lines()), 1)
         self.assertEqual(self.state_text(), self.fingerprint(1))
+
+
+SETTING_NAMES = (('--state', 'WAKE_STATE'), ('--lock', 'WAKE_LOCK'), ('--log', 'WAKE_LOG'))
+
+
+class UnsafePathTests(WakeCase):
+    """A configured path is refused before anything is created or removed.
+
+    The kit's rule is never to remove a path that came from configuration
+    recursively, least of all in a script people run on their own machines. wake.sh
+    therefore checks WAKE_STATE, WAKE_LOCK and WAKE_LOG first, and fails closed.
+    """
+
+    def refused(self, *arguments):
+        self.scenario_for(1)
+        done = self.run_wake(*arguments)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(self.calls_made(), [], 'a refused path must be refused before the poll')
+        self.assertEqual(self.wake_lines(), [])
+        self.assertFalse(self.state.exists(), 'a refused path must not create the state')
+        self.assertFalse(self.lock.exists(), 'a refused path must not create the lock')
+        self.assertFalse(self.log.exists(), 'a refused path must not create the log')
+        return done
+
+    def test_an_empty_state_lock_or_log_is_refused(self):
+        for setting, name in SETTING_NAMES:
+            with self.subTest(setting=setting):
+                done = self.refused(setting, '')
+                self.assertIn(name, done.stderr)
+                self.assertIn('is empty', done.stderr)
+
+    def test_an_empty_environment_value_is_refused_too(self):
+        # "Unset" takes the default; "set but empty" is a typo and must fail closed.
+        # The script is run from a copy in the test directory so that, if this ever
+        # regresses, the default paths it would fall back to are the test's own.
+        script = self.dir / 'wake.sh'
+        shutil.copy(str(SHELL), str(script))
+        for setting, name in SETTING_NAMES:
+            with self.subTest(setting=setting):
+                self.scenario_for(1)
+                command = self.script_args()
+                command[1] = str(script)
+                index = command.index(setting)
+                del command[index:index + 2]
+                environment = dict(self.env)
+                environment[name] = ''
+                done = subprocess.run(command, capture_output=True, text=True, timeout=60, env=environment)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIn(name, done.stderr)
+                self.assertIn('is empty', done.stderr)
+                self.assertEqual(self.calls_made(), [], 'the refusal must come before the poll')
+                self.assertFalse(self.lock.exists(), 'a refused path must not create the lock')
+
+    def test_the_filesystem_root_is_refused_for_state_lock_and_log(self):
+        for setting, name in SETTING_NAMES:
+            with self.subTest(setting=setting):
+                done = self.refused(setting, '/')
+                self.assertIn(name, done.stderr)
+                self.assertIn('filesystem root', done.stderr)
+
+    def test_the_home_directory_is_refused_for_state_lock_and_log(self):
+        home = os.environ.get('HOME') or str(Path.home())
+        if not home or not home.rstrip('/'):
+            self.skipTest('HOME is empty or the filesystem root on this host, so there is no home directory to compare')
+        for setting, name in SETTING_NAMES:
+            for form in (home, home.rstrip('/') + '/'):
+                with self.subTest(setting=setting, path=form):
+                    done = self.refused(setting, form)
+                    self.assertIn(name, done.stderr)
+                    self.assertIn('home directory', done.stderr)
+        self.assertTrue(Path(home).is_dir(), 'a refused home directory must not be touched')
+
+    def test_an_existing_directory_is_refused_where_a_file_is_expected(self):
+        foreign = self.dir / 'foreign'
+        foreign.mkdir()
+        (foreign / 'notes.txt').write_text('keep me\n', encoding='utf-8')
+        for setting, name in (('--state', 'WAKE_STATE'), ('--log', 'WAKE_LOG')):
+            with self.subTest(setting=setting):
+                done = self.refused(setting, str(foreign))
+                self.assertIn(name, done.stderr)
+                self.assertIn('it must name a file', done.stderr)
+                self.assertTrue((foreign / 'notes.txt').exists(),
+                                'a refused directory must be left exactly as it was')
+
+    def test_a_lock_directory_that_is_not_this_wakers_own_is_refused(self):
+        foreign = self.dir / 'foreign'
+        foreign.mkdir()
+        (foreign / 'notes.txt').write_text('keep me\n', encoding='utf-8')
+        done = self.refused('--lock', str(foreign))
+        self.assertIn('WAKE_LOCK', done.stderr)
+        self.assertIn("not this waker's lock", done.stderr)
+        self.assertTrue((foreign / 'notes.txt').exists(),
+                        'a foreign lock directory must not be used or removed')
+
+    def test_a_lock_that_is_a_file_is_refused(self):
+        file_lock = self.dir / 'lock.txt'
+        file_lock.write_text('not a lock\n', encoding='utf-8')
+        done = self.refused('--lock', str(file_lock))
+        self.assertIn('WAKE_LOCK', done.stderr)
+        self.assertIn('existing file', done.stderr)
+        self.assertTrue(file_lock.exists(), 'a refused lock file must not be removed')
+
+    def test_a_lock_that_is_a_symbolic_link_is_refused(self):
+        target = self.dir / 'target'
+        target.mkdir()
+        link = self.dir / 'link'
+        os.symlink(str(target), str(link))
+        done = self.refused('--lock', str(link))
+        self.assertIn('WAKE_LOCK', done.stderr)
+        self.assertIn('symbolic link', done.stderr)
+        self.assertTrue(target.is_dir() and link.is_symlink(),
+                        'a refused symbolic link and its target must be left alone')
+
+
+class RecursiveRemovalTests(unittest.TestCase):
+    """The kit never removes a configured path recursively; grep for it as a test."""
+
+    # Any rm invocation with an -r or -R flag (alone, combined, or spelled --recursive).
+    RECURSIVE_RM = re.compile(r'\brm\s+(?:--?[A-Za-z-]+\s+)*--?[A-Za-z-]*[rR][A-Za-z-]*')
+
+    def test_no_recursive_removal_remains_anywhere_in_the_wake_tools(self):
+        offenders = []
+        for path in sorted(WAKE.rglob('*')):
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding='utf-8')
+            except UnicodeDecodeError:
+                continue
+            for number, line in enumerate(text.splitlines(), 1):
+                if self.RECURSIVE_RM.search(line):
+                    offenders.append('%s:%d: %s' % (path.relative_to(KIT), number, line.strip()))
+        self.assertEqual(offenders, [], 'recursive rm on a configured path:\n' + '\n'.join(offenders))
 
 
 class WakeCommandTests(WakeCase):

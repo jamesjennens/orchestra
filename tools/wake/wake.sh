@@ -12,7 +12,10 @@
 #     BEFORE the wake command runs, so a crash, a restart or a second scheduler tick
 #     cannot run the command twice for the same fingerprint;
 #   * one instance at a time: a lock directory beside the state file, with the
-#     process id in it, so a cron line and a systemd timer can overlap safely;
+#     process id in it, so a cron line and a systemd timer can overlap safely; only
+#     that directory and its one pid file are ever removed, never a path recursively;
+#   * fail closed on a bad setting: an empty, root, home or foreign WAKE_STATE,
+#     WAKE_LOCK or WAKE_LOG is refused before anything is created or removed;
 #   * bounded: client.py wait is given --timeout, so one run ends by itself;
 #   * one log line per wake, and nothing else in the wake log;
 #   * it reads no secret: the client config is the only credential input, and the
@@ -108,9 +111,11 @@ ACTOR=${WAKE_ACTOR:-}
 WAKE=${WAKE_COMMAND:-}
 TIMEOUT=${WAKE_TIMEOUT:-3600}
 INTERVAL=${WAKE_INTERVAL:-}
-STATE=${WAKE_STATE:-$SCRIPT_DIR/wake.state}
-LOCK=${WAKE_LOCK:-$SCRIPT_DIR/wake.lock}
-LOG=${WAKE_LOG:-$SCRIPT_DIR/wake.log}
+# The three paths use "-" rather than ":-": an unset setting takes the default, while
+# a set but empty one is refused below instead of silently becoming the default.
+STATE=${WAKE_STATE-$SCRIPT_DIR/wake.state}
+LOCK=${WAKE_LOCK-$SCRIPT_DIR/wake.lock}
+LOG=${WAKE_LOG-$SCRIPT_DIR/wake.log}
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -157,6 +162,89 @@ if [ ! -f "$CONFIG" ]; then
     usage_error "no client config at $CONFIG"
 fi
 
+# A PATH FROM CONFIGURATION IS CHECKED BEFORE ANYTHING IS CREATED OR REMOVED. A typo
+# in WAKE_STATE, WAKE_LOCK or WAKE_LOG must fail closed: refusing an unsafe path is
+# always better than writing to, or removing, something that was not meant. The lock
+# is this waker's own directory; nothing else may ever be deleted, and nothing here is
+# removed recursively.
+trim_slashes() {
+    printf '%s' "$1" | sed 's:/*$::'
+}
+
+physical_path() {
+    # The physical path of an existing directory; empty when it is not one.
+    physical=$(CDPATH= cd -- "$1" 2>/dev/null && pwd -P) || physical=
+    printf '%s' "$physical"
+}
+
+home_setting=
+if [ -n "${HOME:-}" ]; then
+    home_setting=$(trim_slashes "$HOME")
+fi
+home_physical=
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+    home_physical=$(physical_path "$HOME")
+fi
+
+path_is_home() {
+    candidate=$1
+    if [ -n "$home_setting" ] && [ "$(trim_slashes "$candidate")" = "$home_setting" ]; then
+        return 0
+    fi
+    if [ -n "$home_physical" ] && [ -d "$candidate" ]; then
+        physical=$(physical_path "$candidate")
+        if [ -n "$physical" ] && [ "$physical" = "$home_physical" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+refuse_setting() {
+    printf 'wake.sh: %s\n' "$1" >&2
+    exit 1
+}
+
+check_setting_path() {
+    setting=$1
+    value=$2
+    expected=$3
+    if [ -z "$value" ]; then
+        refuse_setting "$setting is empty: it must name a path this lane owns"
+    fi
+    if [ -z "$(trim_slashes "$value")" ]; then
+        refuse_setting "$setting is $value, the filesystem root: refusing to create, write or remove it"
+    fi
+    if path_is_home "$value"; then
+        refuse_setting "$setting is $value, the home directory: refusing to create, write or remove it"
+    fi
+    if [ "$expected" = lock ] && [ -L "$value" ]; then
+        refuse_setting "$setting is $value, a symbolic link: refusing to follow or remove it"
+    fi
+    if [ -d "$value" ]; then
+        if [ "$expected" = file ]; then
+            refuse_setting "$setting is $value, an existing directory: it must name a file"
+        fi
+        # An existing lock directory is this waker's own only when it is empty or
+        # holds its one pid file. Anything else belongs to someone else.
+        for entry in "$value"/* "$value"/.[!.]* "$value"/..?*; do
+            if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
+                continue
+            fi
+            case ${entry##*/} in
+                pid) ;;
+                *) refuse_setting "$setting is $value, an existing directory that is not this waker's lock (it holds $entry): move it away" ;;
+            esac
+        done
+    elif [ "$expected" = lock ] && [ -e "$value" ]; then
+        refuse_setting "$setting is $value, an existing file: the lock must be a directory this waker owns"
+    fi
+}
+
+check_setting_path WAKE_STATE "$STATE" file
+check_setting_path WAKE_LOCK "$LOCK" lock
+check_setting_path WAKE_LOG "$LOG" file
+
 # A lane normally keeps the script, its state, its lock and its log in one private
 # directory of its own; create the parents so a first run does not fail silently.
 mkdir -p "$(dirname "$STATE")" "$(dirname "$LOCK")" "$(dirname "$LOG")"
@@ -166,7 +254,11 @@ lock_owned=0
 release() {
     rm -f "$err_file"
     if [ "$lock_owned" -eq 1 ]; then
-        rm -rf "$LOCK"
+        # The lock is a directory this waker made and holds one pid file in. Remove
+        # exactly that file, then the directory with rmdir, which refuses a directory
+        # that still holds anything: no recursive removal of a configured path, ever.
+        rm -f "$LOCK/pid"
+        rmdir "$LOCK" 2>/dev/null || true
     fi
 }
 trap 'release' EXIT
@@ -177,11 +269,11 @@ trap 'exit 143' TERM
 # ONE INSTANCE AT A TIME. mkdir is the atomic step; the pid inside lets a run that
 # died leave a lock that the next run can take. A lock directory with no pid yet is
 # left alone: another run may be between its mkdir and its write, and stealing it
-# there would let two runs poll at once. The EXIT trap removes the lock only when
-# this run owns it, so leaving another instance's lock alone is safe.
-if mkdir "$LOCK" 2>/dev/null; then
-    :
-else
+# there would let two runs poll at once. A stale lock is taken over by removing its
+# one pid file and then the empty directory with rmdir; rmdir refuses a directory
+# that holds anything else, so only this waker's own lock is ever removed. The EXIT
+# trap releases the lock only when this run owns it.
+if [ -d "$LOCK" ]; then
     held_pid=
     if [ -f "$LOCK/pid" ]; then
         held_pid=$(cat "$LOCK/pid" 2>/dev/null || true)
@@ -192,11 +284,19 @@ else
     if [ -z "$held_pid" ] || kill -0 "$held_pid" 2>/dev/null; then
         exit 0
     fi
-    rm -rf "$LOCK"
-    if ! mkdir "$LOCK" 2>/dev/null; then
-        printf 'wake.sh: cannot take the lock %s: another run is gone and the lock cannot be made\n' "$LOCK" >&2
+    rm -f "$LOCK/pid"
+    if ! rmdir "$LOCK" 2>/dev/null; then
+        printf 'wake.sh: cannot take the lock %s: it holds something other than its own pid file\n' "$LOCK" >&2
         exit 1
     fi
+fi
+if ! mkdir "$LOCK" 2>/dev/null; then
+    if [ -d "$LOCK" ]; then
+        # Another run made the lock between the check above and this mkdir.
+        exit 0
+    fi
+    printf 'wake.sh: cannot create the lock %s\n' "$LOCK" >&2
+    exit 1
 fi
 lock_owned=1
 printf '%s\n' "$$" > "$LOCK/pid"
