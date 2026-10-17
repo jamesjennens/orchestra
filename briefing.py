@@ -1674,6 +1674,10 @@ def format_brief(result):
             guidance.get('acknowledged'),guidance.get('attention')))
     if guidance and guidance.get('warning'):
         lines.append('Guidance warning: '+guidance['warning'])
+    if isinstance(guidance,dict) and isinstance(guidance.get('item'),dict):
+        # kittrial-5bb.325: the unacknowledged version is a MOVE, not only a flag, and the
+        # line names the version and the command. The text is still read through guidance get.
+        lines.append('Guidance action: '+guidance['item']['text'])
     cp=result['checkpoint']
     if cp:lines += [f'Checkpoint: {cp["comment_id"]} by {excerpt(cp["author"])} at {cp["timestamp"]}',f'Branch: {cp["branch"] or "unknown"} | Source commit: {cp["source_commit"] or "unknown"}',
                     'Newer/changed activity: '+str(cp['newer_activity']), 'Incorporated activity cursor: '+cp['incorporated_activity_cursor']]

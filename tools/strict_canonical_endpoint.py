@@ -406,45 +406,126 @@ def dispatch(canonical, request, tmp, run=None):
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action in ('ref', 'capability'):
         # endpoint.py's reference catalog (kittrial-5bb.66) and capability index
-        # (kittrial-5bb.67) reads over the emulated rows: `bd list --label` (no
-        # comments) and `bd show IDS --include-comments`.
+        # (kittrial-5bb.67) reads and writes over the emulated rows.
         try:
             import reference_records
             records = reference_records if action == 'ref' else __import__('capability_records')
         except ImportError:  # a revision that predates the catalog
             raise ValueError('Unknown action')
-        writes = reference_records.CONTRIBUTOR_OPERATIONS if action == 'ref' else records.WRITE_COMMANDS
-        if args and args[0] in writes:
-            raise ValueError('the canonical stub serves %s reads only' % action)
-        rows = [json.loads(line) for line in run(['export', '--all']).split('\n') if line.strip()]
+        config_file = canonical.root / 'deployment.private.json'
+        config_data = json.loads(config_file.read_text(encoding='utf-8')) if config_file.is_file() else {}
+        operators = config_data.get('operators') or []
+        verifiers = config_data.get('verifiers') or []
+        launched = canonical.authority_config is not None
+        by_service = launched and canonical.require_authority
+        base_writes = reference_records.CONTRIBUTOR_OPERATIONS if action == 'ref' else records.WRITE_COMMANDS
+        http_writes = getattr(records, 'HTTP_WRITE_COMMANDS', ()) if by_service else ()
+        writes = base_writes + http_writes
+        if not args or args[0] not in writes:
+            rows = [json.loads(line) for line in run(['export', '--all']).split('\n') if line.strip()]
 
-        def ref_run(argv):
-            if argv[0] == 'export':
-                return ''.join(json.dumps(row) + '\n' for row in rows)
-            if argv[0] == 'list':
-                listed = rows
-                for index, token in enumerate(argv):
-                    if token == '--label':
-                        listed = [row for row in listed if argv[index + 1] in (row.get('labels') or [])]
-                    elif token == '--label-any':
-                        wanted = argv[index + 1].split(',')
-                        listed = [row for row in listed
-                                  if any(label in (row.get('labels') or []) for label in wanted)]
-                    elif token == '--id':
-                        listed = [row for row in listed if row.get('id') in argv[index + 1].split(',')]
-                return json.dumps([{key: value for key, value in row.items() if key != 'comments'}
-                                   for row in listed])
-            if argv[0] == 'show':
-                ids = [token for token in argv[1:] if not token.startswith('--')]
-                found = [row for row in rows if row.get('id') in ids]
-                if not found:
-                    raise ValueError('no issues found matching the provided IDs')
-                return json.dumps(found)
-            raise ValueError('unsupported native read')
-        config = canonical.root / 'deployment.private.json'
-        operators = json.loads(config.read_text(encoding='utf-8')).get('operators') or [] \
-            if config.is_file() else []
-        result = records.read(args, ref_run, operators)
+            def ref_run(argv):
+                if argv[0] == 'export':
+                    return ''.join(json.dumps(row) + '\n' for row in rows)
+                if argv[0] == 'list':
+                    listed = rows
+                    for index, token in enumerate(argv):
+                        if token == '--label':
+                            listed = [row for row in listed if argv[index + 1] in (row.get('labels') or [])]
+                        elif token == '--label-any':
+                            wanted = argv[index + 1].split(',')
+                            listed = [row for row in listed
+                                      if any(label in (row.get('labels') or []) for label in wanted)]
+                        elif token == '--id':
+                            listed = [row for row in listed if row.get('id') in argv[index + 1].split(',')]
+                    return json.dumps([{key: value for key, value in row.items() if key != 'comments'}
+                                       for row in listed])
+                if argv[0] == 'show':
+                    ids = [token for token in argv[1:] if not token.startswith('--')]
+                    found = [row for row in rows if row.get('id') in ids]
+                    if not found:
+                        raise ValueError('no issues found matching the provided IDs')
+                    return json.dumps(found)
+                raise ValueError('unsupported native read')
+            if action == 'ref':
+                result = records.read(args, ref_run, operators, web_service=launched)
+            else:
+                result = records.read(args, ref_run, operators, verifiers=verifiers, journal=canonical.path,
+                                      web_service=launched)
+            return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+
+        class RecordsRefusal(ValueError):
+            def __init__(self, status, message):
+                super().__init__(message)
+                self.status = status
+
+        coordinator = args[0] in http_writes
+        user_id = None
+        party_check = None
+        try:
+            if by_service and http_authority is not None:
+                authority = request.get('authority') if isinstance(request.get('authority'), dict) else {}
+                user_id = authority.get('user_id') if isinstance(authority.get('user_id'), str) else None
+                needed = http_authority.CAP_COORDINATE if coordinator else http_authority.CAP_RECORDS
+                if not http_authority.verified_web_authority(request, canonical.authority_config, needed, project):
+                    raise RecordsRefusal(403, 'Verified web authority required in this project')
+                state = http_authority.read_state(canonical.authority_config.store)
+                role = ((state.get('memberships') or {}).get(project) or {}).get(user_id) if user_id else None
+                if coordinator:
+                    if role not in ('owner', 'coordinator'):
+                        raise RecordsRefusal(
+                            403,
+                            'Record coordination requires project membership as an owner or coordinator; '
+                            'a superuser without project membership must add themselves to the project first.')
+                elif role not in ('contributor', 'coordinator', 'owner'):
+                    raise RecordsRefusal(
+                        403,
+                        'Record mutations require project membership; '
+                        'a superuser without project membership must add themselves to the project first.')
+                if coordinator:
+                    from admin import coordinator_rules as configured_coordinator_rules
+                    rules = configured_coordinator_rules(canonical.root)
+
+                    def _party_check(proposer):
+                        live = http_authority.read_state(canonical.authority_config.store)
+                        by_agent = authority.get('via') == 'credential'
+                        settings_seen = live.get('settings_seen') if isinstance(live.get('settings_seen'), dict) else {}
+                        approval_by_another = bool(
+                            settings_seen.get('approval_by_another_party')
+                            or authority.get('approval_by_another_party')
+                            or rules.get('independent_approval'))
+                        if not by_agent and not approval_by_another:
+                            return
+                        caller_parties = set(http_authority.actor_parties(live, actor, project))
+                        if user_id:
+                            caller_parties.add(user_id)
+                        proposer_parties = (set(http_authority.actor_parties(live, proposer, project))
+                                            if isinstance(proposer, str) and proposer else set())
+                        if (not isinstance(proposer, str) or not proposer or actor == proposer
+                                or bool(caller_parties & proposer_parties)):
+                            if by_agent:
+                                raise RecordsRefusal(
+                                    403,
+                                    'An agent holding a coordinator grant may not accept or verify a record '
+                                    'whose draft was proposed by its own party.')
+                            raise RecordsRefusal(
+                                403,
+                                'A coordinator may not accept or verify a record whose draft was proposed '
+                                'by the same party while approval_by_another_party is enabled.')
+                    party_check = _party_check
+            if action == 'ref':
+                payload = reference_records.write_payload(args, attachments, commands=writes)
+                result = reference_records.apply_native(
+                    payload, actor, run, canonical.path, operator=coordinator,
+                    operators=operators, web_coordinator=coordinator, party_check=party_check,
+                    web_service=by_service)
+            else:
+                result = records.write(
+                    args, attachments, actor, run, canonical.path, operators,
+                    verifiers=verifiers, web_coordinator=coordinator,
+                    party_check=party_check, person=user_id, web_service=by_service)
+        except RecordsRefusal as error:
+            return envelope(2, stderr=str(error) + '\n', records_status=error.status)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action == 'proposal':
         # endpoint.py's proposal action (kittrial-5bb.68/.70), with the real
