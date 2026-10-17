@@ -27,6 +27,13 @@ account the record will name, the agent acting for it (if any), and the grant.
   (`coordinator_grants[project][agent]`, slice 1b) while the credential's own human
   account still holds `coordinate` in that project. The grant is read live on every
   request, so removing it ends the reach on the next one.
+* The agent's shape reads that human account's **membership** exactly as the person's
+  shape above does (kittrial-5bb.318 item 3): `superuser` is accounts administration, not
+  membership of a project, so the agent of a superuser who is not a member of the project
+  is refused exactly as that superuser's own session is. Slice 10 left the choice open
+  ("refuse both, or admit both and say why"); the pair is refused, because admitting the
+  superuser family would widen this one rule past the membership it has always required.
+  A superuser who owns or coordinates the project is a member, so their agent still edits.
 
 Everything else is refused, and the sentence names the rule:
 
@@ -44,7 +51,10 @@ The capability on every requirements route moved from `project.admin` to
 capability), by a coordinator (its role, slice 1b) and by an agent only through the
 grant (`GRANT_CAPABILITIES`). The endpoint action `owner-requirements` now names
 `coordinate` in `SERVICE_ACTIONS`, and is the one service action a credential
-descriptor may carry.
+descriptor may carry: `project_creation.CREDENTIAL_SERVICE_ACTIONS` is
+`frozenset({'owner-requirements'})` and a test pins it to exactly that, so widening it
+(for example to `set-onboarding`) fails a test rather than only surviving because the
+other action's own decision still refuses (kittrial-5bb.318 item 2).
 
 ### Effect time, not only at the door
 
