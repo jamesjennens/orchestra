@@ -405,16 +405,19 @@ def parse_alias(body):
     return record
 
 
-def submitter_for(actor, verified):
+def submitter_for(actor, verified, person=None):
     """The attribution block. `verified` is decided by the ROUTE, never by the actor's name:
-    only the operator shell route, after its allowlist check, passes True (review 01a0fc55)."""
-    return {'actor': actor, 'person': 'operator:' + actor if verified else None,
+    only the operator shell route, after its allowlist check, or the HTTP service after
+    live authority verification, passes True (review 01a0fc55)."""
+    resolved = (person if isinstance(person, str) and person
+                else core.http_actor_account(actor) or 'operator:' + actor) if verified else None
+    return {'actor': actor, 'person': resolved,
             'identity': 'verified' if verified else 'unverified', 'submitted_by_agent': False}
 
 
-def alias_record(key, alias, action, actor, verified, evidence=None, reason=None):
+def alias_record(key, alias, action, actor, verified, evidence=None, reason=None, person=None):
     record = {'schema_version': 1, 'key': key, 'alias': alias, 'normalized': normalize(alias), 'action': action,
-              'evidence': evidence, 'reason': reason, 'submitter': submitter_for(actor, verified),
+              'evidence': evidence, 'reason': reason, 'submitter': submitter_for(actor, verified, person=person),
               'at': core.now()}
     record['sha256'] = content_hash(record)
     body = ALIAS_PREFIX + canonical_bytes(record).decode('utf-8')
@@ -439,12 +442,13 @@ def alias_state(view, operators):
     A proposal is pending until a later reject record with the same normalised text, or
     until the accepted revision's `aliases` hold it (folded). A record counts as verified
     (and a reject takes effect) only when it says `identity: verified` AND its stored
-    native author is the record's actor AND that actor is on the operator allowlist. The
-    author alone is not enough: over SSH it is whatever actor the caller declared.
+    native author is the record's actor AND that actor is on the operator allowlist (or
+    is a verified HTTP actor). The author alone is not enough: over SSH it is whatever
+    actor the caller declared.
     """
     def trusted(record, author):
         return (record['submitter']['identity'] == 'verified' and author == record['submitter']['actor']
-                and author in allowlist)
+                and (author in allowlist or core.http_actor_account(author) is not None))
 
     allowlist = configured_operators(operators if operators is not None else ())
     accepted = {normalize(alias) for alias in ((view.get('record') or {}).get('aliases') or [])}
@@ -461,8 +465,10 @@ def alias_state(view, operators):
                 or record['normalized'] in pending:
             continue
         verified = trusted(record, author)
+        http_person = ((record['submitter'].get('person') or core.http_actor_account(author))
+                       if verified and author not in allowlist else None)
         pending[record['normalized']] = {'alias': record['alias'], 'normalized': record['normalized'],
-                                         'person': 'operator:' + author if verified else None,
+                                         'person': (http_person or 'operator:' + author) if verified else None,
                                          'identity': 'verified' if verified else 'unverified',
                                          'actor': author, 'comment_id': comment_id, 'evidence': record['evidence']}
     return list(pending.values()), rejected
@@ -495,10 +501,58 @@ entry_comment = KIND.entry_comment
 write_payload = KIND.write_payload
 
 
-def apply_native(payload, actor, run, project, operator=False, operators=None):
+def pointers_validation_of(record, accepted=False, verification_state=None):
+    """Explicit description of how capability pointers (`code`, `tests`, `anchors`, `requirements`) were validated."""
+    if not isinstance(record, dict):
+        return None
+    vstate = verification_state or 'unverified'
+    checkout_validated = (vstate == 'verified')
+    return {
+        'checked': 'syntax-and-requirements',
+        'requirements_validated': True,
+        'checkout_validated': checkout_validated,
+        'verification_state': vstate,
+        'note': (
+            "Pointer syntax (code, tests, anchors) and requirement links were validated, and a trusted verification "
+            "check against a repository checkout is recorded."
+            if checkout_validated else
+            "The web service has no checkout of the project's repository; pointer syntax (code, tests, anchors) and "
+            "requirement links were validated, and the accepted record is marked unverified until capability check "
+            "or POST .../verify records a check against a checkout."
+            if accepted else
+            "The web service has no checkout of the project's repository; pointer syntax (code, tests, anchors) and "
+            "requirement links were validated (unverified against a checkout)."
+        ),
+    }
+
+
+def apply_native(payload, actor, run, project, operator=False, operators=None,
+                 web_coordinator=False, party_check=None):
     """Caller holds the canonical project lock. Contributors propose and revise drafts;
-    the operator route writes a direct accepted revision 1 or retires a key."""
-    return KIND.apply_native(payload, actor, run, project, operator=operator, operators=operators)
+    the operator route (or web coordinator) accepts drafts, writes a direct accepted
+    revision 1, or retires a key."""
+    seen = {}
+    outcome = KIND.apply_native(payload, actor, run, project, operator=operator,
+                                operators=operators, web_coordinator=web_coordinator,
+                                party_check=party_check, seen=seen)
+    op = payload.get('operation') if isinstance(payload, dict) else None
+    if op in ('accept', 'retire'):
+        rec = seen.get('record')
+        if rec is not None:
+            outcome['sha256'] = rec['sha256']
+            outcome['pointers_validation'] = pointers_validation_of(
+                rec, accepted=(op == 'accept'), verification_state='unverified')
+    elif op == 'draft':
+        rec = entry_record(payload, 1, 'accepted')
+        outcome['sha256'] = rec['sha256']
+        outcome['pointers_validation'] = pointers_validation_of(
+            rec, accepted=True, verification_state='unverified')
+    elif op in ('propose', 'revise'):
+        rec = entry_record(payload, outcome.get('revision', 1), 'draft')
+        outcome['sha256'] = rec['sha256']
+        outcome['pointers_validation'] = pointers_validation_of(
+            rec, accepted=False, verification_state='unverified')
+    return outcome
 
 
 def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=None, operators=None):
@@ -524,12 +578,13 @@ def apply_batch(payload, actor, run, project, operators=None, lock=None):
 
 # -- aliases ---------------------------------------------------------------------------------------
 
-def propose_alias(key, alias, actor, run, operators, evidence=None, operator=False):
+def propose_alias(key, alias, actor, run, operators, evidence=None, operator=False, verified=False, person=None):
     """`capability propose-alias KEY "PHRASE" [--evidence POINTER]`: a capped candidate alias.
 
     `operator=True` is the operator shell route (`admin.py capability-alias-propose`):
-    the allowlist is checked first and the record is written `verified`. The endpoint
-    route never is, whatever actor name the caller declares.
+    the allowlist is checked first and the record is written `verified`. `verified=True`
+    is the HTTP service route after live authority verification. The SSH endpoint route
+    passes neither, whatever actor name the caller declares.
 
     Natively idempotent: the record itself is the receipt, so an identical pending
     proposal is returned instead of written twice. Refusals name the cap; none quotes
@@ -537,6 +592,7 @@ def propose_alias(key, alias, actor, run, operators, evidence=None, operator=Fal
     """
     if operator:
         core.require_configured_operator(actor, operators, 'propose a verified capability alias')
+    is_verified = bool(operator or verified)
     valid_key(key)
     valid_alias_text(alias)
     if evidence is not None:
@@ -566,12 +622,12 @@ def propose_alias(key, alias, actor, run, operators, evidence=None, operator=Fal
     if phrase in {normalize(item) for item in record.get('aliases') or []}:
         raise ValueError('Capability %s already carries that phrase in its newest revision' % key)
     pending = {item['normalized']: item for item in target['aliases_pending']}
+    submitter = submitter_for(actor, is_verified, person=person)
     if phrase in pending:
         return {'key': key, 'alias': pending[phrase]['alias'], 'state': 'proposed', 'reconciled': True,
-                'comment_id': pending[phrase]['comment_id']}
+                'comment_id': pending[phrase]['comment_id'], 'proposer_party': submitter.get('person')}
     if phrase in target['aliases_rejected']:
         raise ValueError('That alias was rejected for capability %s by an operator' % key)
-    submitter = submitter_for(actor, operator)
     mine = lambda item: (item['person'] == submitter['person']) if submitter['identity'] == 'verified' \
         else item['identity'] == 'unverified'
     on_target = [item for item in target['aliases_pending'] if mine(item)]
@@ -587,15 +643,17 @@ def propose_alias(key, alias, actor, run, operators, evidence=None, operator=Fal
         raise ValueError('The shared pool for unverified proposers is full (%d per capability, %d per project) '
                          'until an operator folds or rejects pending aliases; SSH attribution beyond operators '
                          'arrives with kittrial-5bb.68' % (CAP_UNVERIFIED_CAPABILITY, CAP_UNVERIFIED_PROJECT))
-    _, body = alias_record(key, alias, 'propose', actor, operator, evidence=evidence)
+    _, body = alias_record(key, alias, 'propose', actor, is_verified, evidence=evidence, person=person)
     raw = run(['comments', 'add', target['native_id'], body, '--json'])
     return {'key': key, 'alias': alias, 'state': 'proposed', 'reconciled': False,
-            'comment_id': core._comment_id(raw), 'identity': submitter['identity']}
+            'comment_id': core._comment_id(raw), 'identity': submitter['identity'],
+            'proposer_party': submitter.get('person')}
 
 
-def reject_alias(payload, actor, run, project, operators=None):
-    """`admin.py capability-alias-reject` (operator): lookup then ignores the proposal."""
-    core.require_configured_operator(actor, operators, 'reject a capability alias')
+def reject_alias(payload, actor, run, project, operators=None, web_coordinator=False, person=None):
+    """`admin.py capability-alias-reject` (operator or web coordinator): lookup then ignores the proposal."""
+    if not web_coordinator:
+        core.require_configured_operator(actor, operators, 'reject a capability alias')
     if not isinstance(payload, dict):
         raise ValueError('alias-reject payload must be an object')
     core.checked_fields(payload, {'schema_version', 'key', 'alias', 'reason'}, 'alias-reject payload')
@@ -615,7 +673,8 @@ def reject_alias(payload, actor, run, project, operators=None):
         return {'key': payload['key'], 'alias': payload['alias'], 'state': 'rejected', 'reconciled': True}
     if phrase not in {item['normalized'] for item in target['aliases_pending']}:
         raise ValueError('No pending alias with that text on capability %s' % payload['key'])
-    _, body = alias_record(payload['key'], payload['alias'], 'reject', actor, True, reason=payload['reason'])
+    _, body = alias_record(payload['key'], payload['alias'], 'reject', actor, True,
+                           reason=payload['reason'], person=person)
     raw = run(['comments', 'add', target['native_id'], body, '--json'])
     return {'key': payload['key'], 'alias': payload['alias'], 'state': 'rejected', 'reconciled': False,
             'comment_id': core._comment_id(raw)}
@@ -729,6 +788,8 @@ def get(rows, key, operators, trust=None):
     entries, _ = catalog(rows, operators)
     checked = verification.public(verification_of(entry, trust)) \
         if entry['state'] not in ('malformed', 'unsupported', 'conflicted') else None
+    vstate = (checked or {}).get('state') if isinstance(checked, dict) else 'unverified'
+    active = entry['record'] or entry['proposed']
     return {'schema_version': 1, 'key': key, 'state': entry['state'], 'native_id': entry['native_id'],
             'trust': 'conflicted' if entry['state'] == 'conflicted' else 'accepted' if entry['record'] else 'draft',
             'anchors': entry.get('duplicate_anchors', []),
@@ -736,9 +797,17 @@ def get(rows, key, operators, trust=None):
             'acceptance': entry['acceptance'], 'acceptance_inert': entry['acceptance_inert'],
             'inert_operator': entry['inert_operator'], 'proposed': _record_view(entry['proposed']),
             'proposed_comment_id': entry['proposed_comment_id'], 'aliases_pending': _pending_view(entry),
+            'proposer': entry.get('proposer'), 'acceptor': entry.get('acceptor'),
+            'proposed_by': entry.get('proposed_by'), 'accepted_by': entry.get('accepted_by'),
+            'accepted_proposer': entry.get('accepted_proposer'),
+            'revision_authors': entry.get('revision_authors', {}),
+            'waiting_acceptance': entry['proposed'] is not None and entry['state'] in ('draft-only', 'accepted'),
+            'pointers_validation': pointers_validation_of(
+                active, accepted=entry['record'] is not None, verification_state=vstate),
             'replaces': _replaces(entries, key),
             'resolved': (entry['record'] or {}).get('successor') if entry['state'] == 'superseded' else None,
             'verification': checked,
+            'verification_state': vstate,
             'warnings': entry['warnings'][:10],
             'coverage': 'newest accepted revision and its acceptance evidence; the newest draft after it is in '
                         'proposed; verification describes the accepted revision, or the newest draft when none '
@@ -747,12 +816,24 @@ def get(rows, key, operators, trust=None):
 
 def _list_item(entry, trust=None, pointers=False):
     source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
+    vstate = ('conflicted' if entry['state'] == 'conflicted'
+              else verification_of(entry, trust)['state'] if entry['state'] != 'malformed' else None)
+    waiting = entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')
     item = {'key': entry['key'], 'name': (source.get('name') or entry.get('name') or '')[:NAME_MAX], 'state': entry['state'],
             'trust': 'conflicted' if entry['state'] == 'conflicted' else 'accepted' if entry['record'] else 'draft',
             'owner': source.get('owner'),
             'tags': source.get('tags') or [], 'revision': source.get('revision'), 'native_id': entry['native_id'],
             'aliases_pending': len(entry.get('aliases_pending') or ()), 'acceptance_inert': entry.get('acceptance_inert', False),
-            'verification': 'conflicted' if entry['state'] == 'conflicted' else verification_of(entry, trust)['state'] if entry['state'] != 'malformed' else None}
+            'waiting_acceptance': waiting,
+            'proposed_revision': (entry['proposed'] or {}).get('revision'),
+            'proposed_sha256': (entry['proposed'] or {}).get('sha256'),
+            'record_sha256': (entry['record'] or {}).get('sha256') or source.get('sha256'),
+            'proposer': entry.get('proposer'), 'acceptor': entry.get('acceptor'),
+            'proposed_by': entry.get('proposed_by'), 'accepted_by': entry.get('accepted_by'),
+            'accepted_proposer': entry.get('accepted_proposer'),
+            'pointers_validation': pointers_validation_of(
+                source or None, accepted=entry['record'] is not None, verification_state=vstate),
+            'verification': vstate}
     if entry['state'] == 'conflicted':
         item['anchor_trust'] = entry['anchor_trust']
     if pointers:
@@ -765,6 +846,10 @@ def _list_item(entry, trust=None, pointers=False):
 
 def list_entries(rows, options, operators, trust=None):
     entries, incomplete = catalog(rows, operators)
+    waiting_count = sum(
+        1 for entry in entries
+        if entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')
+    )
     state = options.get('state')
     if state == 'all':
         good = [entry for entry in entries if entry['state'] not in ('unsupported',)]
@@ -772,6 +857,9 @@ def list_entries(rows, options, operators, trust=None):
         good = [entry for entry in entries if entry['state'] not in ('malformed', 'unsupported')]
         if state is not None:
             good = [entry for entry in good if entry['state'] == state]
+    if options.get('waiting'):
+        good = [entry for entry in good
+                if entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')]
     if options.get('owner'):
         good = [entry for entry in good if (_newest(entry) or {}).get('owner') == options['owner']]
     for tag in options.get('tags') or []:
@@ -779,6 +867,7 @@ def list_entries(rows, options, operators, trust=None):
     good.sort(key=lambda entry: entry['key'] or '')
     offset, limit = options.get('offset', 0), options.get('limit', 20)
     return {'schema_version': 1, 'total': len(good),
+            'waiting_acceptance_count': waiting_count,
             'items': [_list_item(entry, trust, options.get('pointers', False))
                       for entry in good[offset:offset + limit]],
             'next_offset': offset + limit if offset + limit < len(good) else None,
@@ -1229,8 +1318,8 @@ def _options(args, allowed):
         if token == '--json':
             index += 1
             continue
-        if token == '--pointers' and token in allowed:
-            options['pointers'] = True
+        if token in ('--pointers', '--waiting') and token in allowed:
+            options[allowed[token]] = True
             index += 1
             continue
         if token not in allowed or index + 1 >= len(args):
@@ -1249,8 +1338,32 @@ def _options(args, allowed):
     return options
 
 
+def parse_list_options(args):
+    options = _options(args, {'--tag': 'tag', '--owner': 'owner', '--state': 'state', '--limit': 'limit',
+                              '--offset': 'offset', '--pointers': 'pointers', '--waiting': 'waiting'})
+    if not 1 <= options['limit'] <= LIST_LIMIT_MAX:
+        raise ValueError('capability list: --limit must be 1..%d' % LIST_LIMIT_MAX)
+    if options.get('state', 'all') not in ('draft-only', 'accepted', 'superseded', 'all'):
+        raise ValueError('capability list: --state must be draft-only, accepted, superseded or all')
+    if options.get('owner') is not None:
+        valid_owner(options['owner'], required=True)
+    return options
+
+
+def parse_find_options(args):
+    rest = [token for token in args if token != '--json']
+    if not rest or rest[0].startswith('--'):
+        raise ValueError('capability find takes a PHRASE')
+    phrase, options = rest[0], _options(rest[1:], {'--limit': 'limit'})
+    limit = options['limit'] if '--limit' in rest else 5
+    if not FIND_LIMIT[0] <= limit <= FIND_LIMIT[1]:
+        raise ValueError('capability find: --limit must be %d..%d' % FIND_LIMIT)
+    return phrase, limit
+
+
 READ_COMMANDS = ('get', 'list', 'find')
 WRITE_COMMANDS = CONTRIBUTOR_OPERATIONS + ('propose-alias', 'verify')
+HTTP_WRITE_COMMANDS = ('accept', 'retire', 'reject-alias', 'web-verify')
 
 
 def read(args, run, operators, verifiers=None, journal=None):
@@ -1275,37 +1388,60 @@ def read(args, run, operators, verifiers=None, journal=None):
         valid_key(rest[0])
         return get(read_key_and_retired(run, rest[0]), rest[0], operators, trust)
     if command == 'list':
-        options = _options(rest, {'--tag': 'tag', '--owner': 'owner', '--state': 'state', '--limit': 'limit',
-                                  '--offset': 'offset', '--pointers': 'pointers'})
-        if not 1 <= options['limit'] <= LIST_LIMIT_MAX:
-            raise ValueError('capability list: --limit must be 1..%d' % LIST_LIMIT_MAX)
-        if options.get('state', 'all') not in ('draft-only', 'accepted', 'superseded', 'all'):
-            raise ValueError('capability list: --state must be draft-only, accepted, superseded or all')
-        if options.get('owner') is not None:
-            valid_owner(options['owner'], required=True)
+        options = parse_list_options(rest)
         rows, lifecycle = read_catalog(run)
         return list_entries(rows, options, operators, Trust(run, operators, verifiers, journal, lifecycle))
     if command == 'find':
-        if not rest or rest[0].startswith('--'):
-            raise ValueError('capability find takes a PHRASE')
-        phrase, options = rest[0], _options(rest[1:], {'--limit': 'limit'})
+        phrase, limit = parse_find_options(rest)
         rows, lifecycle = read_catalog(run)
-        return find(rows, phrase, operators, limit=options['limit'] if '--limit' in rest else 5,
+        return find(rows, phrase, operators, limit=limit,
                     trust=Trust(run, operators, verifiers, journal, lifecycle))
     raise ValueError('capability: unknown command %s; use get, list, find, misses, propose, revise, '
                      'propose-alias or verify' % command)
 
 
-def write(args, attachments, actor, run, project, operators, verifiers=None):
+def write(args, attachments, actor, run, project, operators, verifiers=None,
+          web_coordinator=False, party_check=None, person=None):
     """`capability propose|revise --file`, `capability propose-alias` and `capability
-    verify --file`: contributor writes. A verification written here is always
-    `unverified` (see capability_verification)."""
-    if args[0] == 'verify':
-        payload = write_payload(args, attachments, commands=('verify',))
+    verify --file`: contributor writes. With `web_coordinator=True` (the HTTP service
+    with verified live coordinate authority) also `accept`, `retire`, `reject-alias`
+    and `web-verify`."""
+    cmd = args[0]
+    person_id = ('account:' + person if isinstance(person, str) and person
+                 and not person.startswith(('account:', 'person:', 'operator:'))
+                 else person)
+    if cmd in ('verify', 'web-verify'):
+        if cmd == 'web-verify' and not web_coordinator:
+            raise ValueError('capability web-verify is available only through the web service with coordinate authority')
+        payload = write_payload(args, attachments, commands=(cmd,))
         payload.pop('operation', None)
-        return verification.verify(payload, actor, run, operators=operators, verifiers=verifiers, journal=project)
-    if args[0] == 'propose-alias':
+        payload.pop('operation_id', None)
+        return verification.verify(payload, actor, run,
+                                   operator=(cmd == 'web-verify' and web_coordinator),
+                                   operators=operators,
+                                   verifiers=verifiers, journal=project,
+                                   web_coordinator=(cmd == 'web-verify' and web_coordinator),
+                                   person=person_id, party_check=party_check)
+    if cmd == 'reject-alias':
+        if not web_coordinator:
+            raise ValueError('capability reject-alias is available only through the web service with coordinate authority')
+        payload = write_payload(args, attachments, commands=('reject-alias',))
+        payload.pop('operation', None)
+        payload.pop('operation_id', None)
+        return reject_alias(payload, actor, run, project, operators=operators,
+                            web_coordinator=True, person=person_id)
+    if cmd == 'propose-alias':
         rest = [token for token in args[1:] if token != '--json']
+        if len(rest) == 1 and rest[0].startswith('@attachment:'):
+            payload = write_payload(args, attachments, commands=('propose-alias',))
+            payload.pop('operation', None)
+            payload.pop('operation_id', None)
+            core.checked_fields(payload, {'schema_version', 'key', 'alias', 'evidence'}, 'alias-propose payload')
+            if type(payload.get('schema_version', 1)) is not int or payload.get('schema_version', 1) != 1:
+                raise ValueError('schema_version must be the integer 1')
+            return propose_alias(payload.get('key'), payload.get('alias'), actor, run, operators,
+                                 evidence=payload.get('evidence'),
+                                 verified=bool(person_id), person=person_id)
         evidence = None
         if '--evidence' in rest:
             position = rest.index('--evidence')
@@ -1315,6 +1451,13 @@ def write(args, attachments, actor, run, project, operators, verifiers=None):
             del rest[position:position + 2]
         if len(rest) != 2:
             raise ValueError('use capability propose-alias KEY "PHRASE" [--evidence POINTER]')
-        return propose_alias(rest[0], rest[1], actor, run, operators, evidence=evidence)
+        return propose_alias(rest[0], rest[1], actor, run, operators, evidence=evidence,
+                             verified=bool(person_id), person=person_id)
+    if cmd in ('accept', 'retire'):
+        if not web_coordinator:
+            raise ValueError('capability %s is available only through the web service with coordinate authority' % cmd)
+        payload = write_payload(args, attachments, commands=('accept', 'retire'))
+        return apply_native(payload, actor, run, project, operator=True, operators=operators,
+                            web_coordinator=True, party_check=party_check)
     payload = write_payload(args, attachments)
     return apply_native(payload, actor, run, project, operators=operators)

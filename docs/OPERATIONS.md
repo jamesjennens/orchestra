@@ -2180,18 +2180,23 @@ At deploy time, list the projects that already use an `open-item` label: `python
   - Re-adding the operator restores both. There is no other repair yet: `void-record` accepts reference and capability records (kittrial-5bb.74), but not proposal or settings records. Until then the submitter can submit a new proposal that supersedes the stuck one.
 - **After a restore,** re-check `operators list` and `proposal-settings` before recording anything: both the allowlist and the actor map decide what counts.
 
-**Acceptance evidence trusts the comment's native author.** A reference entry reads
-accepted when its acceptance evidence comment was written by an actor on the operator
-allowlist. Over SSH a comment's author is the actor the caller declared, so what stops
-a contributor writing such a comment is the reserved-prefix guard (the shared slice 0),
-not the author field.
+**Acceptance evidence trusts the comment's native author.** A reference or capability entry
+reads accepted (or superseded) when its acceptance evidence comment was written by an actor on
+the operator allowlist, or through the web service by a member holding `coordinate` (`usr_<16hex>`
+or `agent_<16hex>`, see [HTTP deployment](HTTP_DEPLOYMENT.md#reference-and-capability-records-over-http)).
+Over SSH a comment's author is the actor the caller declared, so what stops a contributor
+writing such a comment is the reserved-prefix guard (the shared slice 0) and the endpoint's
+refusal of the `usr_`/`agent_` actor namespace without a verified web authority block, not the
+author field alone.
 
 - **Residual risk.** A `Kind: reference-acceptance-v1` comment written on a kit older
   than the shared slice 0, or during a rollback below it, under an operator's actor
   name, would read as a real acceptance. The same applies to the other record kinds.
 - **Why acceptance is not bound to the host receipt.** Reading an accepted entry must
   not depend on a local journal: a restore may lose `.reference-requests/`, and the
-  evidence comment has to remain the authority.
+  evidence comment has to remain the authority. Likewise, an acceptance, retirement or
+  capability verification written by a web coordinator stays live if that member's role or
+  agent grant is later removed; removing the role or grant stops their next write (`403`).
 - **Before the first use of the catalog on an installation,** and after any rollback
   below the shared slice 0, scan each project for record comments that no writer of
   this kit made. Save `bd export --all` for the project as `export.jsonl`, then run:

@@ -170,10 +170,11 @@ def parse(body):
     return record
 
 
-def build(payload, actor, verified):
+def build(payload, actor, verified, person=None):
     """(record, body). `verified` is decided by the ROUTE, never by the actor's name."""
     record = {name: payload[name] for name in PAYLOAD_FIELDS}
-    record['submitter'] = {'actor': actor, 'person': 'operator:' + actor if verified else None,
+    resolved_person = (person or ('operator:' + actor)) if verified else None
+    record['submitter'] = {'actor': actor, 'person': resolved_person,
                            'identity': 'verified' if verified else 'unverified', 'submitted_by_agent': False}
     record['sha256'] = content_hash(record)
     body = PREFIX + canonical_bytes(record).decode('utf-8')
@@ -205,8 +206,9 @@ def trusted_actors(operators, verifiers):
 
 def is_trusted(item, trusted):
     record = item['record']
-    return (record['submitter']['identity'] == 'verified' and item['author'] == record['submitter']['actor']
-            and item['author'] in trusted)
+    author = item['author']
+    return (record['submitter']['identity'] == 'verified' and author == record['submitter']['actor']
+            and (author in trusted or core.http_actor_id(author) is not None))
 
 
 def is_lifecycle_row(row):
@@ -404,13 +406,15 @@ def _same_check(record, payload):
     return record['passed'] == payload['passed'] and record['results'] == payload['results']
 
 
-def verify(payload, actor, run, operators=None, verifiers=None, journal=None, operator=False):
+def verify(payload, actor, run, operators=None, verifiers=None, journal=None, operator=False,
+           web_coordinator=False, person=None, party_check=None):
     """Record one verification. The caller holds the project lock.
 
     `operator=False` is the endpoint route (`capability verify`): the record is written
     `unverified`, whatever actor the caller names. `operator=True` is the host route
-    (`admin.py capability-verify`): the actor must be on the operator allowlist or the
-    verifiers list, and the record is written `verified`.
+    (`admin.py capability-verify`) or web coordinator route (`web_coordinator=True`):
+    the actor must be on the operator allowlist or the verifiers list (or authorized as
+    a web coordinator), and the record is written `verified`.
 
     The record is bound to the revision a reader describes (the accepted revision, or
     the newest draft when none is accepted) by its exact `record_sha256`, and its
@@ -419,13 +423,51 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
     record, a different result under the same tuple is refused.
     """
     import capability_records as records
+    from datetime import datetime, timezone
     trusted = trusted_actors(operators, verifiers)
-    if operator and actor not in trusted:
+    if operator and not web_coordinator and actor not in trusted:
         raise ValueError('Actor %s is not on the deployment operator allowlist or the verifiers list; only a '
                          'listed actor may record a verified capability check' % actor)
+    pre_rows = None
+    if web_coordinator and isinstance(payload, dict):
+        payload = dict(payload)
+        payload.setdefault('schema_version', 1)
+        payload.setdefault('checked_at', datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+        payload.setdefault('source', 'ast')
+        payload.setdefault('graph_built_at_commit', None)
+        payload.setdefault('tool', {'name': 'web-coordinator', 'version': '1'})
+        payload.setdefault('passed', True)
+        if 'revision' not in payload and 'entry_revision' in payload:
+            payload['revision'] = payload.pop('entry_revision')
+        else:
+            payload.pop('entry_revision', None)
+        if 'record_sha256' not in payload:
+            if 'entry_sha256' in payload:
+                payload['record_sha256'] = payload.pop('entry_sha256')
+            elif 'expected_sha256' in payload:
+                payload['record_sha256'] = payload.pop('expected_sha256')
+        payload.pop('entry_sha256', None)
+        payload.pop('expected_sha256', None)
+        if 'commit' not in payload and any(k in payload for k in ('summary', 'method', 'command', 'unverified_pointer_reason')):
+            payload['commit'] = '0' * 40
+        for extra in ('summary', 'method', 'command', 'unverified_pointer_reason', 'operation', 'operation_id'):
+            payload.pop(extra, None)
+        if 'results' not in payload and isinstance(payload.get('key'), str):
+            records.valid_key(payload['key'])
+            pre_rows = records.KIND.read_key_rows(run, payload['key'])
+            records.KIND.require_unique_key(pre_rows, payload['key'])
+            pre_entry = records.KIND.find_entry(pre_rows, payload['key'], operators, view=records.entry_view)
+            pre_rev = records._newest(pre_entry)
+            if isinstance(pre_rev, dict):
+                ptrs = sorted(set(list(pre_rev.get('code') or []) + list(pre_rev.get('tests') or [])
+                                  + list(pre_rev.get('anchors') or [])))
+                if ptrs and isinstance(payload.get('passed'), bool):
+                    resolved = bool(payload['passed'])
+                    reason = None if resolved else 'Reported unresolved over the web coordinator route'
+                    payload['results'] = [{'pointer': p, 'resolved': resolved, 'reason': reason} for p in ptrs]
     validate_payload(payload)
     key = payload['key']
-    rows = records.KIND.read_key_rows(run, key)
+    rows = pre_rows if pre_rows is not None else records.KIND.read_key_rows(run, key)
     records.KIND.require_unique_key(rows, key)
     entry = records.KIND.find_entry(rows, key, operators, view=records.entry_view)
     if entry['state'] in ('malformed', 'unsupported'):
@@ -436,6 +478,11 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
     if revision['revision'] != payload['revision'] or revision['sha256'] != payload['record_sha256']:
         raise ValueError('The check does not match the current revision of capability %s (revision %d); run '
                          'capability check again' % (key, revision['revision']))
+    proposer = ((entry.get('accepted_proposer') or entry.get('proposed_by'))
+                if entry.get('record') is not None
+                else entry.get('proposed_by'))
+    if party_check is not None:
+        party_check(proposer)
     pointers = list(revision['code']) + list(revision['tests']) + list(revision['anchors'])
     if not pointers:
         raise ValueError('Capability %s revision %d has no code, test or anchor pointer, so there is nothing to '
@@ -452,9 +499,13 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
         if record['commit'] == payload['commit'] and item['author'] == actor \
                 and record['submitter']['actor'] == actor and record['submitter']['identity'] == identity:
             if _same_check(record, payload):
+                v_state = 'verified' if (operator and record['passed']) else ('drifted' if not record['passed'] else 'reported')
                 return {'key': key, 'revision': record['revision'], 'commit': record['commit'],
-                        'passed': record['passed'], 'identity': identity, 'reconciled': True,
-                        'comment_id': item['comment_id']}
+                        'passed': record['passed'], 'identity': identity, 'trusted': bool(operator),
+                        'verification_state': v_state, 'reconciled': True,
+                        'comment_id': item['comment_id'], 'proposer': proposer, 'verifier': actor,
+                        'pointers_validation': records.pointers_validation_of(
+                            revision, accepted=entry.get('record') is not None, verification_state=v_state)}
             raise ValueError('You already recorded a different result for capability %s revision %d at this '
                              'commit; check at a new commit' % (key, revision['revision']))
     if not operator:
@@ -469,10 +520,15 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
                                  'accepted' % (key, revision['revision'], CAP_UNTRUSTED_REVISION))
         else:
             _check_failing_caps(run, operators, trusted, journal)
-    record, body = build(payload, actor, operator)
+    record, body = build(payload, actor, operator, person=person)
     raw = run(['comments', 'add', entry['native_id'], body, '--json'])
+    v_state = 'verified' if (operator and record['passed']) else ('drifted' if not record['passed'] else 'reported')
     return {'key': key, 'revision': record['revision'], 'commit': record['commit'], 'passed': record['passed'],
-            'identity': identity, 'reconciled': False, 'comment_id': core._comment_id(raw)}
+            'identity': identity, 'trusted': bool(operator), 'verification_state': v_state,
+            'reconciled': False, 'comment_id': core._comment_id(raw),
+            'proposer': proposer, 'verifier': actor,
+            'pointers_validation': records.pointers_validation_of(
+                revision, accepted=entry.get('record') is not None, verification_state=v_state)}
 
 
 def _check_failing_caps(run, operators, trusted, journal):
