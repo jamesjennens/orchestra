@@ -308,8 +308,10 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     "ambiguous ID" on stderr, and no row has exactly ``p-ab``, so the create proceeds as it
     did before kittrial-5bb.135; any other non-zero exit still fails closed. The object means
     absent only at exactly rc 1 and only when ``resolver_absence`` asks for it: rc 0 with an
-    error object is a failed read, and no other guard read reads the object as absence
-    (kittrial-5bb.138 items ``rc0`` and ``absence-pins``).
+    error object is a failed read. A strict guard read also reads the object at rc 1 as an
+    absence (kittrial-5bb.260 F1), only so that its refusal can name the token: every strict
+    caller turns an absence into a refusal, so no write follows from it (kittrial-5bb.138
+    items ``rc0`` and ``absence-pins``).
     """
     try:
         p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
