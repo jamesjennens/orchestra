@@ -1291,6 +1291,23 @@ class InProcessBackend:
                 'omitted': max(0, len(remaining) - NEWER_MAX),
                 'note': 'Event history has no per-entry digests. Reading clears nothing; reconcile with task history.'}
 
+    def lanes_read(self, project_id, args, actor, scope='own'):
+        """One page of the lanes board over this backend's own rows (kittrial-5bb.263).
+
+        The board's aging and its three flags live in ``lanes.py`` only, so this backend
+        feeds that ONE read with its own rows and computes neither itself. It keeps no
+        session registry, so every lane is keyed by its assignee actor -- exactly how the
+        read treats a task that has no registered lane -- and an actor's lane therefore
+        carries the same name and id.
+        """
+        from lanes import read as lanes_read
+        rows = [dict(task, issue_type=task.get('issue_type') or 'task',
+                     labels=task.get('labels') or [], dependencies=task.get('dependencies') or [],
+                     comments=task.get('comments') or [])
+                for task in self._project_rows(project_id)]
+        return lanes_read(rows, actor, {'schema_version': 1, 'records': {}}, list(args),
+                          journal=None, scope=scope)
+
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
 
@@ -2429,6 +2446,25 @@ class EndpointBackend:
     def reference(self, project_id, key):
         """One entry through `ref get`; an unknown or unfinished key is a 404."""
         return self._ref_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
+
+    def lanes_read(self, project_id, args, actor, scope):
+        """One page of the lanes board through the endpoint's ``work lanes`` action.
+
+        ``args`` are the read's own arguments -- ``--idle-minutes``, ``--limit``,
+        ``--offset`` -- handed on unchanged, so the threshold the page asked for is the
+        threshold the ONE read of the board ages and flags by (kittrial-5bb.263; there is no
+        second implementation of either on this side). ``scope`` is the ROUTE's isolation,
+        not the transport's: this service calls the endpoint without a bound key, so the
+        endpoint would answer ``'all'`` for it, and the request's ``lanes_scope`` asks for
+        ``'own'`` instead. The endpoint honours only that narrowing, and its own routes keep
+        computing their scope themselves.
+        """
+        reply = self._endpoint('work', project_id, actor, ['lanes'] + list(args),
+                               extra={'lanes_scope': scope})
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('The canonical lanes read returned an unexpected shape')
+        return payload
 
     def requirements_read(self, project_id, args):
         reply=self._endpoint('requirements',project_id,self.actor_namespace+'/read',args)
@@ -8550,6 +8586,100 @@ class ApiHandler(BaseHTTPRequestHandler):
                            generated_at=now_iso(self.service._now()))
         body['items'] = self._task_views(body['items'], ctx.params['pid'])
         return 200, body
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/lanes')
+    def project_lanes(self, ctx):
+        """Who holds what, who is free, and the three flags of the lane board.
+
+        Readable by any project member (``CAP_READ``); a non-member or a member of another
+        project is refused by ``_project`` before anything is read, exactly as the queue
+        route refuses them. The aging and the flags are computed in ONE place, the
+        canonical ``work lanes`` read (``lanes.py``), which this route only pages and
+        scopes: the threshold (``idle_minutes``, 1..10080, default 15) is an argument of the
+        page and reaches that read unchanged, and it is never an installation setting.
+
+        ``offset`` is taken from the page's cursor, as the neighbouring reads take the
+        cursor's offset, but the page itself is cut by the read (its own ``next_offset``),
+        so the cursor the answer carries is minted from that, never from a second cut here.
+        """
+        self._project(ctx, CAP_READ)
+        limit, state = self._page(ctx, ctx.query)
+        idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        scope = self._lanes_scope(ctx.principal, ctx.params['pid'])
+        read = self.backend.lanes_read(
+            ctx.params['pid'],
+            ['--idle-minutes', str(idle_minutes), '--limit', str(limit), '--offset', str(state['o'])],
+            self._lanes_actor(ctx.principal), scope)
+        body = dict(read)
+        continuation = body.get('next_offset')
+        body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation)
+                               if type(continuation) is int and continuation > state['o'] else None)
+        return 200, body
+
+    def _lanes_idle_minutes(self, raw):
+        """The page's threshold argument, or the refusal that names the read's own range.
+
+        A bad threshold is a malformed request (400), not an unprocessable payload: it names
+        the ONE read's own range, so the page cannot ask for a value the read would refuse.
+        """
+        from lanes import DEFAULT_IDLE_MINUTES, IDLE_MINUTES_MIN, IDLE_MINUTES_MAX
+        if raw is None or raw == '':
+            return DEFAULT_IDLE_MINUTES
+        try:
+            minutes = int(raw)
+        except (TypeError, ValueError):
+            raise HttpError(400, 'invalid_request',
+                            'idle_minutes must be a whole number of minutes, %d to %d'
+                            % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
+        if not IDLE_MINUTES_MIN <= minutes <= IDLE_MINUTES_MAX:
+            raise HttpError(400, 'invalid_request',
+                            'idle_minutes must be %d to %d (one minute to seven days)'
+                            % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
+        return minutes
+
+    @staticmethod
+    def _lanes_actor(principal):
+        """The actor the board is read as: the caller's own canonical attribution label.
+
+        The same value ``Service.bind_actor`` accepts on a claim, so a task a person claimed
+        from this page is in the lane ``scope='own'`` finds for them.
+        """
+        return principal.actor or principal.user_id
+
+    def _lanes_scope(self, principal, project_id):
+        """The lanes panel's own isolation of the read (kittrial-5bb.263, design section 4).
+
+        This service calls the endpoint WITHOUT a bound key, so the endpoint's own
+        ``lanes_scope_for`` answers ``'all'`` for it. That is a property of the transport,
+        not an authority the page may inherit, so the route decides for its own viewer:
+        an owner or coordinator reads every lane, and everybody else is scoped to their
+        own agents' lanes -- the contributor route's rule, ``scope='own'`` in ``lanes.read``.
+
+        "Owner or coordinator" is the kit's ONE operator definition,
+        ``review_workflow.listed_operator_actor``, given the same inputs the endpoint itself
+        uses: the installation's operator allowlist and the project's actor -> principal
+        map, both read from the host through the read-only ``host-coordination`` action. A
+        host that cannot answer is not an operator list, so the read is then SCOPED: this
+        falls back to the narrower view, never to the wider one.
+        """
+        from review_workflow import listed_operator_actor
+        actor = self._lanes_actor(principal)
+        read = getattr(self.backend, 'host_coordination', None)
+        document = {}
+        if read is not None:
+            try:
+                document = read(project_id) or {}
+            except HttpError:
+                document = {}
+        operators = [name for name in (document.get('operators') or []) if isinstance(name, str)]
+        owners = {item.get('actor'): item.get('principal')
+                  for item in (document.get('sessions') or [])
+                  if isinstance(item, dict) and isinstance(item.get('principal'), str)}
+        try:
+            allowed = listed_operator_actor(actor, operators, owners)
+        except (ValueError, OSError):
+            allowed = actor in set(operators)
+        return 'all' if allowed else 'own'
 
     @route('GET', r'/v1/me/work')
     def me_work(self, ctx):
