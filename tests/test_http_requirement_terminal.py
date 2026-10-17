@@ -135,7 +135,11 @@ class TerminalHttpTests(EndpointCase):
         self.assertEqual(result.status,422,result.data);self.assertEqual(len(self.backend.native.writes()),before)
 
     def test_recovery_route_and_adapter_refuse_nonowner_superuser_governed_and_stale_hash(self):
-        from http_authority import AuthorityConfig, NativeRunner, authority_request, run_guarded, CAP_PROJECT_ADMIN
+        # kittrial-5bb.278 moved this gate from `project.admin` to `coordinate` (a project's
+        # coordinator may finish a transition it may also start), so the adapter is called
+        # with that capability and refuses a contributor and a membership-less superuser
+        # with the sentence naming the rule. The old sentence is deliberately gone.
+        from http_authority import AuthorityConfig, NativeRunner, authority_request, run_guarded, CAP_COORDINATE
         item=self.accepted();self.backend.native.fail_comment_prefix=owner.STATE_PREFIX
         self.assertEqual(self.transition(item).status,503)
         self.backend.native.fail_comment_prefix=None
@@ -150,7 +154,7 @@ class TerminalHttpTests(EndpointCase):
             principal=self.service.authenticate(token)
             request=dict(project=self.project,actor=principal.user_id,action='owner-requirements',
                 args=[action,item['id']],attachments={'payload':{'flag':'--file','text':json.dumps(body)}},
-                operation_id=key,authority=authority_request(principal,self.project,CAP_PROJECT_ADMIN,now=self.service._expiry_now()),
+                operation_id=key,authority=authority_request(principal,self.project,CAP_COORDINATE,now=self.service._expiry_now()),
                 route='requirements.'+action)
             def guarded(root,built,journal,effect,**options):return run_guarded(built,journal,effect,**options)
             return http.web_action(Path(self.canonical_root),self.path,self.project,request,
@@ -160,7 +164,7 @@ class TerminalHttpTests(EndpointCase):
             if action=='abandon':fields['reason']='Synthetic absence decision'
             for index,token in enumerate((outsider_token,admin)):
                 self.assertEqual(self.recover_transition(item,pending,action,token=token,key='route-denied-'+action+str(index)).status,403)
-                with self.assertRaisesRegex(ValueError,'signed-in project owner'):
+                with self.assertRaisesRegex(ValueError,'needs its owner or a coordinator'):
                     adapter(token,action,fields,'adapter-denied-'+action+str(index))
             stale=dict(fields,expected_receipt_sha256='0'*64)
             denied=self.request('POST',self.base+'/requirements/'+item['id']+'/transition/'+action,stale,

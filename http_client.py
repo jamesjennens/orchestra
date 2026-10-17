@@ -407,6 +407,61 @@ class Client:
                             % (quote(project, safe=''), quote(credential_id, safe='')),
                             key=key)
 
+    # -- the project's own requirements (kittrial-5bb.278; WEB_COORDINATOR_DESIGN slice 10)
+    #
+    # An agent holding the project's coordinator grant does everything its owner does to
+    # requirements through these: create, revise, accept, withdraw, supersede and batch
+    # accept, and read the BRD. The accepting party stays the agent's own human account;
+    # the agent and its grant are recorded in the service audit. Every write takes an
+    # ``expected_revision`` + ``expected_sha256`` pair from the read that produced it.
+    def list_requirements(self, project):
+        return self.request('GET', '/v1/projects/%s/requirements' % quote(project, safe=''))
+
+    def get_requirement(self, project, requirement):
+        return self.request('GET', '/v1/projects/%s/requirements/%s'
+                            % (quote(project, safe=''), quote(requirement, safe='')))
+
+    def brd(self, project):
+        """The generated BRD: the project's narrative sections and accepted requirements."""
+        return self.request('GET', '/v1/projects/%s/brd' % quote(project, safe=''))
+
+    def create_requirement(self, project, body, key=None):
+        return self.request('POST', '/v1/projects/%s/requirements' % quote(project, safe=''),
+                            body, key=key)
+
+    def revise_requirement(self, project, requirement, body, key=None):
+        return self.request('PATCH', '/v1/projects/%s/requirements/%s'
+                            % (quote(project, safe=''), quote(requirement, safe='')), body, key=key)
+
+    def accept_requirement(self, project, requirement, body, key=None):
+        return self.request('POST', '/v1/projects/%s/requirements/%s/accept'
+                            % (quote(project, safe=''), quote(requirement, safe='')), body, key=key)
+
+    def withdraw_requirement(self, project, requirement, body, key=None):
+        return self.request('POST', '/v1/projects/%s/requirements/%s/withdraw'
+                            % (quote(project, safe=''), quote(requirement, safe='')), body, key=key)
+
+    def supersede_requirement(self, project, requirement, body, key=None):
+        return self.request('POST', '/v1/projects/%s/requirements/%s/supersede'
+                            % (quote(project, safe=''), quote(requirement, safe='')), body, key=key)
+
+    def accept_requirements(self, project, items, stop_on_error=False, key=None):
+        """Accept many requirements in one action (the plan's ``accept_batch``).
+
+        ``items`` is a list of ``{'id', 'expected_revision', 'expected_sha256'}``. The
+        answer lists ``accepted`` and ``refused`` (a reason each) plus a ``summary``; one
+        refused item changes nothing and does not roll back the rest. ``key`` matters: an
+        exact replay accepts nothing twice.
+        """
+        return self.request('POST', '/v1/projects/%s/requirements/accept-batch'
+                            % quote(project, safe=''),
+                            {'items': items, 'stop_on_error': bool(stop_on_error)}, key=key)
+
+    def requirements_recoveries(self, project):
+        """Failed creations this caller may clear; editing is a coordinator's, so is this."""
+        return self.request('GET', '/v1/projects/%s/requirements/recoveries'
+                            % quote(project, safe=''))
+
     # -- tasks, checkpoints, reviews, history ---------------------------------
     def create_task(self, project, title, description=None, attachments=None, key=None):
         return self.request('POST', '/v1/projects/%s/tasks' % quote(project, safe=''),

@@ -18,6 +18,7 @@ import requirement_records as records
 import requirement_terminal as terminal
 import record_json
 from coordination import atomic, identifier
+from http_authority import REQUIREMENT_EDITOR_REFUSED
 from requirements import canonical_bytes, content_hash, load_json
 
 JOURNAL = '.requirement-owner-requests'
@@ -39,6 +40,7 @@ RECOVERY_PUBLIC_ERRORS = {
     'This failed creation needs host operator reconciliation.',
     'This project uses governed requirements. Ask its owner to enable simple editing.',
     'Owner recovery receipts need host operator repair',
+    REQUIREMENT_EDITOR_REFUSED,
     'Requirements editing needs the signed-in project owner',
     'Unsupported requirements fields or action',
     'Requirements action needs its attached content',
@@ -307,34 +309,49 @@ class OwnerContext:
     account_id: str
     governance: dict
     terminal_window: dict = None
+    #: The agent acting for ``account_id`` through its credential, or None for a person
+    #: (kittrial-5bb.278). The record keeps naming the human account; the agent and its
+    #: grant are recorded in the service audit.
+    agent_id: str = None
+    grant: dict = None
+    role: str = 'owner'
 
 
 def owner_context(project_path, project, request, authority_config, simple=True):
-    """Check server-bound session AND current project membership, at effect time.
+    """Check the live requirement editor on this project, at effect time.
 
-    Called under run_guarded's authority lock. A preflight may call it too, but
-    that cannot replace this effect-time check. Never use caller store/lock paths.
+    Called under run_guarded's authority lock. A preflight may call it too, but that
+    cannot replace this effect-time check. Never use caller store/lock paths.
+
+    A project's coordinator edits requirements exactly as its owner does, and an agent
+    holding that project's coordinator grant edits through its own credential
+    (kittrial-5bb.278); :func:`http_authority.requirement_editor` is the one rule for both
+    the web service and this endpoint. The account the record names is always the human
+    account, so every stored receipt and evidence record keeps its existing schema.
     """
-    from http_authority import file_lock, read_state
+    from http_authority import AuthorityDenied, file_lock, read_state, requirement_editor
     from project_creation import service_descriptor
     descriptor = service_descriptor(request, authority_config, 'owner-requirements')
-    if (descriptor.get('project') != project or descriptor.get('credential_id') is not None
-            or not owner_records.HUMAN.fullmatch(request['actor'])):
-        raise ValueError('Requirements editing needs the signed-in project owner')
+    if descriptor.get('project') != project or not owner_records.HUMAN.fullmatch(request['actor']):
+        raise ValueError(REQUIREMENT_EDITOR_REFUSED)
     # The preflight runs before run_guarded takes this lock. On Windows an
     # open authority reader prevents the service's atomic state replacement.
     # Share its existing lock; effect-time calls already hold it re-entrantly.
     with file_lock(authority_config.lock):
         state = read_state(authority_config.store)
-    account = descriptor['user_id']
-    if state.get('memberships', {}).get(project, {}).get(account) != 'owner':
-        raise ValueError('Requirements editing needs the signed-in project owner')
+    try:
+        editor = requirement_editor(state, project, descriptor)
+    except AuthorityDenied as denied:
+        # The refusal is a plain sentence here: the endpoint answers rc 2 with it.
+        raise ValueError(denied.message) from None
+    account = editor['account_id']
     current = governance.current(project_path, project)
     if simple and current['mode'] != 'simple':
         raise ValueError('This project uses governed requirements. Ask its owner to enable simple editing.')
     from requirement_terminal import write_window
     return OwnerContext(project, account, current, write_window(
-        descriptor.get('now'), authority_config.terminal_endpoint_timeout))
+        descriptor.get('now'), authority_config.terminal_endpoint_timeout),
+        agent_id=editor['agent_id'], grant=editor['grant'], role=editor['role'])
 
 
 def checked_body(body, action):
@@ -459,7 +476,8 @@ def _spec(context, body, action, operation_id, prior=None, run=None):
         label = 'owner-requirement-decision:' + identity
         title = 'Accept requirement ' + task
         description = ('## Decision\nAccept the exact requirement content.\n\n## Rationale\n'
-                       'The project owner accepted this content in simple mode.\n\n'
+                       'The project owner or a project coordinator accepted this content in '
+                       'simple mode.\n\n'
                        '## Alternatives Considered\nLeave it as a draft.\n\n'
                        'Requirement: %s revision %d sha256 %s\n' % (task, revision, record['sha256']))
         saved = read_owner_receipt(receipt)
@@ -645,14 +663,27 @@ def _web_action(root, project_path, project, request, authority_config, runner, 
     identifier(operation_id)
     # Service-only session shape and ordinary refusals precede reservation. The
     # membership check is repeated inside the effect under the authority lock.
-    owner_context(project_path, project, request, authority_config, simple=action != 'governance')
+    def editor_context():
+        """The live editor for this action, or a refusal naming the rule.
+
+        The governance-mode switch stays the OWNER's (owner decision 11(i) of
+        kittrial-5bb.278): it changes the rules, not a requirement's text, so a
+        coordinator - or an agent acting for one - is refused here as well as at the
+        route, even if some other caller reached this adapter directly.
+        """
+        context = owner_context(project_path, project, request, authority_config,
+                                simple=action != 'governance')
+        if action == 'governance' and (context.role != 'owner' or context.agent_id is not None):
+            raise ValueError('Switching requirements governance needs the signed-in project owner')
+        return context
+    editor_context()
     def identity_check():
         # Check current owner membership under the authority lock even when a
         # journal replay returns without calling the effect.
-        return owner_context(project_path, project, request, authority_config, simple=action != 'governance')
+        return editor_context()
 
     def effect():
-        context = owner_context(project_path, project, request, authority_config, simple=action != 'governance')
+        context = editor_context()
         if action == 'governance':
             result = governance.set_mode(project_path, project, body.get('mode'), context.account_id,
                                          operation_id, body['expected_revision'], body['expected_sha256'])
@@ -680,8 +711,7 @@ def _web_action(root, project_path, project, request, authority_config, runner, 
     # This preserves normal journal uncertainty everywhere else; no auth policy
     # or generic run_guarded retry rule changes. The caller holds the project lock.
     def reconcile():
-        context = owner_context(project_path, project, request, authority_config,
-                                simple=action != 'governance')
+        context = editor_context()
         entry = journal.lookup(operation_id)
         if (entry is None or entry.get('state') not in ('unknown', 'in_progress')
                 or journal.expired(entry)

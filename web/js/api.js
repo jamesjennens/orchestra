@@ -290,6 +290,9 @@ export function createApi(transport) {
     createRequirement: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements`, body),
     reviseRequirement: (pid, rid, body) => mutate('PATCH', `/v1/projects/${pid}/requirements/${rid}`, body),
     acceptRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/accept`, body),
+    // Many requirements in one action (slice 10). Per item on the server: a refused
+    // item changes nothing and does not roll back the rest, and the answer says which.
+    acceptRequirements: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements/accept-batch`, body),
     withdrawRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/withdraw`, body),
     supersedeRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/supersede`, body),
     finishRequirementTransition: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/transition/finish`, body),
