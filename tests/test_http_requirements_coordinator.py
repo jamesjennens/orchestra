@@ -263,6 +263,120 @@ class CoordinatorTests(owner_fixture.OwnerHttpTests):
         self.assertIn(removed.status, (403, 422), removed.data)
         self.assertEqual(len(self.backend.native.writes()), before)
 
+    # -- the two surviving mutants, and the superuser answer (kittrial-5bb.318) -----
+    def test_a_granted_agent_is_refused_once_its_account_loses_coordinate(self):
+        """Mutant Q2 (kittrial-5bb.318 item 1): the agent branch's own coordinate check.
+
+        The web route refuses this request anyway: ``http_authority.decide`` reads the
+        issuer's role when it decides the credential's ``coordinate``, and the route
+        reports every 403 with the same sentence. A pin that only went through the route
+        would therefore pass with the check deleted - which is how the mutant survived.
+        The second half calls the canonical adapter DIRECTLY with the agent's own live
+        descriptor: nothing in front of ``requirement_editor`` decides the capability
+        there, so only that check can stand between this request and the write.
+        """
+        first = self.create()                 # a draft: an accepted request would write
+        # alex - the owner, and this agent's own human account - keeps the agent's grant
+        # and loses the role. The account is a contributor now; the agent is not an editor.
+        self.service.state['memberships'][self.project][self.account] = 'contributor'
+        self.service.store.save()
+        before = len(self.backend.native.writes())
+        refused = self.accept(first, token=self.agent_secret, key='demoted-issuer-route')
+        self.assertEqual(403, refused.status, refused.data)
+        self.assertEqual(REQUIREMENT_EDITOR_REFUSED, refused.data['error']['message'])
+        # The adapter, reached directly with the agent's own descriptor.
+        from http_authority import (AuthorityConfig, CAP_COORDINATE, NativeRunner,
+                                    authority_request, run_guarded)
+        principal = self.service.authenticate(self.agent_secret)
+        built = dict(project=self.project, actor=principal.user_id, action='owner-requirements',
+                     args=['accept', first['id']],
+                     attachments={'payload': {'flag': '--file',
+                                              'text': json.dumps(self.expected(first))}},
+                     operation_id='adapter-demoted-issuer-agent',
+                     authority=authority_request(principal, self.project, CAP_COORDINATE,
+                                                 now=self.service._expiry_now()),
+                     route='requirements.accept')
+
+        def guarded(root, request, journal, effect, **options):
+            return run_guarded(request, journal, effect, **options)
+        with self.assertRaisesRegex(ValueError, 'needs its owner or a coordinator'):
+            requirements.web_action(Path(self.canonical_root), self.path, self.project, built,
+                                    AuthorityConfig(str(self.service.store.path)),
+                                    NativeRunner(self.backend.native), guarded)
+        self.assertEqual(len(self.backend.native.writes()), before)
+
+    def test_the_credential_service_allowlist_is_exactly_owner_requirements(self):
+        """Mutant Q6 (kittrial-5bb.318 item 2): the credential allowlist is pinned.
+
+        ``project_creation.CREDENTIAL_SERVICE_ACTIONS`` is what lets an agent's credential
+        reach a service action at all. Widening it (here: adding ``set-onboarding``) was
+        refused only by that other action's own ``project.admin`` decision, so nothing in
+        the suite noticed the widening. Both halves below fail when the set grows: the
+        constant itself, and the descriptor check that reads it.
+        """
+        import project_creation
+        from http_authority import AuthorityConfig, CAP_COORDINATE, authority_request
+        self.assertEqual(frozenset({'owner-requirements'}),
+                         project_creation.CREDENTIAL_SERVICE_ACTIONS)
+        config = AuthorityConfig(str(self.service.store.path))
+        principal = self.service.authenticate(self.agent_secret)
+        for action, capability in sorted(project_creation.SERVICE_ACTIONS.items()):
+            with self.subTest(action=action):
+                request = {'actor': principal.user_id,
+                           'authority': authority_request(principal, self.project, capability,
+                                                          now=self.service._expiry_now())}
+                if action == 'owner-requirements':
+                    # The one action a granted agent's credential may carry.
+                    self.assertEqual(principal.user_id,
+                                     project_creation.service_descriptor(request, config, action)['user_id'])
+                else:
+                    with self.assertRaisesRegex(ValueError, 'needs a session descriptor for'):
+                        project_creation.service_descriptor(request, config, action)
+
+    def test_a_non_member_superusers_agent_is_refused_like_the_superusers_own_session(self):
+        """kittrial-5bb.318 item 3: refuse both, and say why.
+
+        The requirements editor rule is the project's own membership. A superuser who is
+        not a member keeps the project's own answer on their session, and before this item
+        their granted agent was admitted, because the agent branch read the superuser flag
+        as the owner role. Both are refused now with the same sentence: superuser is
+        accounts administration, not membership of this project, and admitting the pair
+        would widen slice 10's membership rule. A superuser who IS a member (owner here)
+        keeps editing through their agent.
+        """
+        first = self.create()
+        admin = self.admin_token()
+        admin_id = self.service.authenticate(admin).user_id
+        self.service.state['memberships'][self.project].pop(admin_id)   # not a member
+        self.service.store.save()
+        made = self.request('POST', '/v1/agents', {
+            'name': 'Superuser helper', 'working_directory': '/tmp/synthetic-superuser-helper',
+            'projects': [self.project]}, token=admin)
+        self.assertEqual(201, made.status, made.data)
+        helper_secret = made.data['credential']['secret']
+        granted = self.request('PUT', self.base + '/agents/%s/coordinator' % made.data['agent']['id'],
+                               {}, token=admin)
+        self.assertEqual(200, granted.status, granted.data)
+        before = len(self.backend.native.writes())
+        for label, token in (('the superuser session', admin),
+                             ('the superuser agent', helper_secret)):
+            with self.subTest(principal=label):
+                refused = self.request('POST', self.base + '/requirements/%s/accept' % first['id'],
+                                       self.expected(first), token=token,
+                                       key='superuser-' + secrets.token_hex(4))
+                self.assertEqual(403, refused.status, refused.data)
+                self.assertEqual(REQUIREMENT_EDITOR_REFUSED, refused.data['error']['message'])
+        self.assertEqual(len(self.backend.native.writes()), before)
+        # A superuser who owns this project is a member, so their agent still edits: the
+        # rule is the membership, not the flag.
+        self.service.state['memberships'][self.project][admin_id] = 'owner'
+        self.service.store.save()
+        accepted = self.accept(first, token=helper_secret, key='superuser-owner-agent-accept')
+        self.assertEqual(200, accepted.status, accepted.data)
+        evidence = owner_records.existing_acceptances(
+            self.backend.native.row(first['id']))[accepted.data['revision']]
+        self.assertEqual(evidence['account_id'], admin_id)
+
     # -- batch acceptance -----------------------------------------------------
     def batch(self, items, token=None, key=None, stop=None):
         body = {'items': items}
