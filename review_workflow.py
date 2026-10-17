@@ -472,6 +472,13 @@ class CoordinatorRuleRefusal(ValueError):
     """A rule refused before any effect; the endpoint marks this for HTTP callers."""
 
 
+class MergeHoldRefusal(CoordinatorRuleRefusal):
+    """The merge-acquire hold-gate refusal (kittrial-5bb.297): a held or unreadable
+    contribution. On the endpoint's coordinate route this one refusal answers rc 2
+    (the shape the web merge-slot route returns); every other CoordinatorRuleRefusal
+    keeps raising exactly as before - no contract change beyond it."""
+
+
 def approval_owners(owners):
     """Load ownership before an independent-approval write; never guess on failure."""
     try:

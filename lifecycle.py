@@ -1049,8 +1049,9 @@ def unreadable_hold_chain(row, operators=None, journal=None):
         # chain reader keys on the exact version and never sees it, so a hold may
         # hide in it - unreadable, never 'no chain at all'.
         return ('the review chain of %s holds a record of a contribution-review version this kit '
-                'cannot read, so a hold it may carry cannot be seen; an operator repairs the chain '
-                '(voids reconcile it), and until then the task is not integration-ready'
+                'cannot read, so a hold it may carry cannot be seen; an operator on the host '
+                'removes that record (a void cannot: the void target must be a record of a version '
+                'this kit reads), and until then the task is not integration-ready'
                 %row.get('id'))
     try:
         project(row,operators,journal)

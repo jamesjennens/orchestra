@@ -325,6 +325,17 @@ class NativeHoldWebTests(RulesHelpers, unittest.TestCase):
         import recovery
         from requirements import canonical_bytes
         harness, token = self.web()
+        # kittrial-5bb.297 review item 'rc2-scope-and-test-order': the slot is the
+        # project's ONE, so this test starts from a free slot (an earlier module
+        # test may leave it held) and releases what it takes.
+        standing = harness.request('GET', '/v1/projects/pp/merge-slot', token=token)
+        self.assertEqual(200, standing.status, standing.data)
+        if not standing.data.get('available'):
+            freed = harness.request('POST', '/v1/projects/pp/merge-slot/force-release',
+                                    {'expected_holder': standing.data.get('holder'),
+                                     'reason': 'test setup: this test needs a free slot'},
+                                    token=token, key='coord-setup-release')
+            self.assertEqual(200, freed.status, freed.data)
         # Every rule key popped: coordinator_writes, independent_approval and
         # lifecycle_authors are all OFF; only the operator allowlist is configured.
         self.deployment(operators=['ops'], review_workflow_writes=True)

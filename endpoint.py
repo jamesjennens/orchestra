@@ -1842,18 +1842,19 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
-        # A coordinator rule refusal (a held or unreadable contribution under
-        # merge-acquire, a writes-switch rule) is the operation's answer, not a
-        # failed request: the same shape the web merge-slot route returns
-        # (kittrial-5bb.297 review item 'operators-everywhere-really').
-        from review_workflow import CoordinatorRuleRefusal as CoordinateRefusal
+        # kittrial-5bb.297 review item 'rc2-scope-and-test-order': ONLY the coordinate
+        # merge-acquire refusal answers rc 2 (the answer shape the web merge-slot
+        # route returns). Every other CoordinatorRuleRefusal - a lifecycle write's
+        # rule refusal included - keeps raising exactly as before: no contract
+        # change beyond the one the item asked for.
+        from review_workflow import MergeHoldRefusal
         try:
             with (path/'.coordination.lock').open('a') as lock:
                 fcntl.flock(lock,fcntl.LOCK_EX)
                 return guarded_write(root,request,journal_path(path),lifecycle_effect,
                                    authority_config=authority_config,
                                    require_authority=require_authority,runner=runner)
-        except CoordinateRefusal as error:
+        except MergeHoldRefusal as error:
             return {'returncode':2,'stdout':'','stderr':str(error)+'\n','refused':'coordinator-rule'}
     if action == 'feedback':
         from feedback import execute as feedback_execute
