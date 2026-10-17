@@ -182,6 +182,78 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(self.run_bd(args)['returncode'], 0, args)
                 self.assertEqual(self.bd.writes, [], args)
 
+    def test_the_endpoint_raw_claim_on_a_blocked_task_is_refused(self):
+        """kittrial-5bb.293 rev4 / mutant g6: the ENDPOINT's own bd claim is gated.
+
+        Drives endpoint.execute with the real guard (and real bd via FakeBd) so the
+        check that runs before any native write is the one under test. Remove the
+        guard and this test fails."""
+        from work import dependency_ref
+        opener = 'pp-open-dep'
+        blocked = 'pp-blocked-work'
+        base = {'issue_type': 'task', 'status': 'open', 'labels': [], 'comments': [],
+                'title': 'a task', 'description': ''}
+        self.bd.rows = [
+            dict(base, id=opener, title='open dependency'),
+            dict(base, id=blocked, title='blocked work',
+                 dependencies=[{'id': opener, 'dependency_type': 'blocks', 'status': 'open'}]),
+        ]
+        said = self.refused(['update', blocked, '--claim', '--json'])
+        self.assertIn('open dependency', said)
+        self.assertIn(opener, said)
+        # A legitimate change is still allowed.
+        ok = self.run_bd(['update', opener, '--title', 'renamed', '--json'])
+        self.assertEqual(0, ok.get('returncode'), ok)
+
+    def test_the_endpoint_claim_succeeds_with_non_blocking_dependencies(self):
+        """kittrial-5bb.293 r5 / unpack-three: the guard must unpack ALL THREE values
+        dependency_ref returns (other id, type, other status).
+
+        It unpacked two, so every endpoint claim or in_progress update of a task with
+        ANY dependency -- a related one, a parent-child one, a closed one; every child
+        of an epic -- died with "too many values to unpack (expected 2)" before bd was
+        asked. None of these blocks a claim, in either native dependency shape."""
+        base = {'issue_type': 'task', 'status': 'open', 'labels': [], 'comments': [],
+                'title': 'a task', 'description': ''}
+        claimant, neighbour, parent, closed = 'pp-claimant', 'pp-neighbour', 'pp-parent', 'pp-closed-dep'
+        cases = (
+            ('related', ['update', claimant, '--claim', '--json'],
+             {'depends_on_id': neighbour, 'type': 'related'}),
+            ('parent-child', ['update', claimant, '--status', 'in_progress', '--json'],
+             {'id': parent, 'dependency_type': 'parent-child', 'status': 'open'}),
+            ('closed-blocking', ['update', claimant, '--claim', '--json'],
+             {'depends_on_id': closed, 'type': 'blocks'}),
+        )
+        for kind, args, dependency in cases:
+            with self.subTest(kind=kind):
+                self.bd.rows = [
+                    dict(base, id=claimant, title='claim me', dependencies=[dependency]),
+                    dict(base, id=neighbour, title='open neighbour'),
+                    dict(base, id=parent, title='open parent'),
+                    dict(base, id=closed, title='closed dependency', status='closed'),
+                ]
+                self.bd.writes = []
+                answer = self.run_bd(args)
+                self.assertEqual(0, answer.get('returncode'), answer)
+                self.assertTrue(self.bd.writes, 'the claim reached bd: %r' % (answer,))
+
+    def test_the_endpoint_claim_on_an_export_shape_open_block_is_refused(self):
+        """kittrial-5bb.293 r5 / unpack-three: bd export's dependency shape carries no
+        status, so the guard reads the other end with `bd show` and refuses with the
+        sentence naming the one open blocking dependency."""
+        base = {'issue_type': 'task', 'status': 'open', 'labels': [], 'comments': [],
+                'title': 'a task', 'description': ''}
+        opener, blocked = 'pp-open-dep', 'pp-blocked-work'
+        self.bd.rows = [
+            dict(base, id=opener, title='open dependency'),
+            dict(base, id=blocked, title='blocked work',
+                 dependencies=[{'depends_on_id': opener, 'type': 'blocks'}]),
+        ]
+        said = self.refused(['update', blocked, '--claim', '--json'])
+        self.assertIn('open dependency', said)
+        self.assertIn(opener, said)
+        self.assertEqual(self.bd.writes, [])
+
     def test_ready_json_leaves_the_merge_slot_out(self):
         """kittrial-5bb.290: ready agrees with work --claimable on the merge slot."""
         slot = {'id': 'pp-merge-slot', 'title': 'merge slot', 'status': 'open',

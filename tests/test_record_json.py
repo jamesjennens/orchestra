@@ -205,8 +205,11 @@ class NoUnguardedParseTests(unittest.TestCase):
                          'wait command\'s own read of the config file (both the same kind of text as the other ten, '
                          "and neither is a record comment or a caller's payload)"),
         'coordination.py': (7, 'bd output'),
-        'endpoint.py': (5, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
-                           'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own)'),
+        'endpoint.py': (6, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
+                           'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own); the sixth '
+                           'is the claim guard\'s read of the other ends of a blocking dependency '
+                           '(kittrial-5bb.293 rev5), parsed inside a try that turns unreadable bd output '
+                           'into fail-closed refusal rather than a crash'),
         'export_requirements.py': (3, 'offline native export rows are first parsed through the row guard '
                                   '(750 levels), then reparsed with duplicate-field refusal; syntax checking '
                                   'of a malformed row runs only within the same bound and catches parser '
