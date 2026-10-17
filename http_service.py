@@ -58,7 +58,7 @@ from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, 
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
-                       not_implemented, now_iso, request_hash, unauthenticated,
+                       not_implemented, now_iso, request_hash, session_limit_seconds, unauthenticated,
                        uncertain, unsupported, validate_agent_credential_days, validate_claim_limit)
 from version import report as version_report
 
@@ -4692,6 +4692,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             expiry = self._credential_expiry_view(principal)
             if expiry is not None:
                 body['credential_expiry'] = expiry
+        # Additive (kittrial-5bb.330): a browser session also reads the installation's idle
+        # window and this session's deadlines here. This read is the light authenticated
+        # touch the agent set-up wizard keeps the session alive with, and the deadline is
+        # what it warns before. A credential has no browser session and adds nothing.
+        session_expiry = self.service.session_expiry_view(principal)
+        if session_expiry is not None:
+            body.update(session_expiry)
         # Additive (kittrial-5bb.118 part 2): whether this account may create a project
         # on the host from here, with its limit and how many it has. Only where the
         # backend has a host.
@@ -9328,6 +9335,12 @@ def main(argv=None):
                                                         Service.LOGINS_AT_ONCE))
     parser.add_argument('--agent-credential-days', type=int, default=30, metavar='DAYS',
                         help='future agent credential lifetime: 1 to 366 whole days (default 30; office may choose 90)')
+    parser.add_argument('--session-idle-minutes', type=int, default=None, metavar='MINUTES',
+                        help='session idle limit: 5 to 1440 whole minutes (default 30). A session unused for '
+                             'this long signs out')
+    parser.add_argument('--session-absolute-hours', type=int, default=None, metavar='HOURS',
+                        help='session absolute limit: 1 to 168 whole hours (default 12), never shorter than '
+                             '--session-idle-minutes. No use extends it')
     parser.add_argument('--approval-by-another-party', action='store_true',
                         help='nobody approves (or recommends) work of their own party: an account, its agents '
                              'and the worker credentials it issued. Off unless given')
@@ -9350,6 +9363,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         validate_agent_credential_days(args.agent_credential_days)
+        # Refused here, before the state store is opened: a limit that is out of bounds, not
+        # a whole number, or shorter than the idle window is one sentence and a non-zero exit,
+        # never a clamped value (kittrial-5bb.330). An omitted flag keeps 30 min / 12 h.
+        session_idle, session_absolute = session_limit_seconds(args.session_idle_minutes,
+                                                               args.session_absolute_hours)
     except ValueError as error:
         parser.error(str(error))
 
@@ -9424,7 +9442,8 @@ def main(argv=None):
     if args.trust_proxy and 'localhost' not in trusted:
         trusted.append('localhost')
     service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party,
-                      agent_credential_days=args.agent_credential_days)
+                      agent_credential_days=args.agent_credential_days,
+                      session_idle=session_idle, session_absolute=session_absolute)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):

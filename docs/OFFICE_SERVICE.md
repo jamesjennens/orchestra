@@ -787,3 +787,24 @@ kit by the coordinator; this contribution does not change it. Upgrade the kit be
 adding the key: an older `office_service.py` refuses an unknown setting. 90 is the
 office choice, not a special value in the implementation. Existing credentials are
 not rewritten when configuration changes.
+
+## Session idle and absolute limit configuration
+
+The same private office JSON accepts the browser session's two limits, and
+`office_service.py` forwards each as the web service's own flag:
+
+| JSON key | Flag | Value | Default |
+| --- | --- | --- | --- |
+| `session_idle_minutes` | `--session-idle-minutes` | whole minutes, 5 to 1440 (5 minutes to 24 hours) | 30 |
+| `session_absolute_hours` | `--session-absolute-hours` | whole hours, 1 to 168 (1 hour to 7 days) | 12 |
+
+Omission of both keeps 30 minutes and 12 hours, exactly as before the setting existed. The
+absolute limit must not be shorter than the idle window, including when only one key is
+given (the other keeps its default). A value outside its bounds, a value that is not a whole
+number, and an inverted pair are refused by `service_config` with one sentence before
+anything is started, the same sentence the web service's flags refuse with; nothing is
+clamped. Upgrade the kit before adding either key: an older `office_service.py` refuses an
+unknown setting. Changing a limit rewrites no session that is already signed in; the next
+sign-in carries the new one. See docs/HTTP_DEPLOYMENT.md ("Session idle and absolute
+limits") for the deadlines and the page's keep-alive.
+

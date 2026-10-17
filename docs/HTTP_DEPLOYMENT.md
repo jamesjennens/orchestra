@@ -3385,6 +3385,45 @@ original comments remain in task history. The assignment-roster read uses shared
 project and authority locks so concurrent readers do not queue behind an exclusive
 read lock; assignment effects retain their exclusive guards.
 
+## Session idle and absolute limits
+
+An installation sets how long a browser session may sit unused before it signs out, and
+how long it may live at all. The web service takes two flags, and the private office JSON
+takes the two settings `office_service.py` forwards as those flags:
+
+| Limit | Flag | Private office JSON | Bounds | Default |
+| --- | --- | --- | --- | --- |
+| idle window | `--session-idle-minutes MINUTES` | `"session_idle_minutes": N` | 5 to 1440 whole minutes (5 minutes to 24 hours) | 30 |
+| absolute limit | `--session-absolute-hours HOURS` | `"session_absolute_hours": N` | 1 to 168 whole hours (1 hour to 7 days) | 12 |
+
+The absolute limit must not be shorter than the idle window. A value outside its bounds, a
+value that is not a whole number, and an absolute limit shorter than the idle window are
+refused at startup: one sentence naming the bounds and what was given, a non-zero exit
+before the state document is opened, and nothing written or clamped. An installation that
+sets neither keeps 30 minutes and 12 hours exactly as they were before this setting
+existed.
+
+To change them, edit the private office JSON named by `--config` (or, where the web service
+is run by a unit of its own, the two flags in its `ExecStart`) and restart the service. A
+session that is already signed in is not rewritten: it keeps the deadlines it was issued
+with, and the next sign-in carries the new ones. The idle deadline is refreshed by every
+authenticated request; the absolute deadline is never extended by use.
+
+`GET /v1/sessions/current` answers a browser session with the window and its own deadlines:
+`idle_seconds`, `absolute_seconds`, `idle_expires_at` (the idle window from this session's
+last authenticated request) and `absolute_expires_at` (which no use extends). A worker or
+agent credential has no browser session and the answer carries none of those fields, exactly
+as before.
+
+The page keeps a long task alive with `web/js/api.js`: `keepAlive()` is one authenticated
+session read, and `keepAliveWhileVisible({intervalMs, warnMs})` repeats it only while
+`document.visibilityState === 'visible'` (a hidden tab makes no request), stops on a
+sign-out and on an expired session's `401`, and dispatches `orchestra:session-idle-warning`
+(a `CustomEvent` on the document, with `idleSeconds`, `idleExpiresAt` and `remainingSeconds`)
+shortly before the idle deadline it last heard about. That warning is for the case where the
+touches stop reaching the service; while they do arrive, the session simply stays alive. The
+agent set-up wizard is what uses it (kittrial-5bb.329).
+
 ## Agent credential lifetime
 
 The installation option `--agent-credential-days DAYS` sets future personal-agent
