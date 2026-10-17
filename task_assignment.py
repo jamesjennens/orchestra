@@ -188,6 +188,15 @@ def check_change(payload, row, review, slot, target_is_eligible, *, refuse_deliv
         _actor(current, 'native assignee', nullable=True)
     except ValueError as exc:
         raise AssignmentError(503, 'The native assignee is unreadable; nothing was changed.') from exc
+    if refuse_delivered and row['status'] == 'closed':
+        # A release is for an undelivered claim, never for finished work: a holder must not
+        # clear its own name from a closed task (kittrial-5bb.305, from finding 2 of the
+        # kittrial-5bb.301 r2 review). The delivered check below deliberately skips closed
+        # rows, so without this a closed task with an approved contribution released with
+        # 200. This refuses ANY closed task, before the review and slot reads and before any
+        # write, so the answer does not depend on the state of the delivered chain.
+        raise AssignmentError(409, 'This task is closed; a finished task cannot be released '
+                              'and nothing was changed.')
     if current != payload['expected_assignee']:
         raise AssignmentError(409, 'The task assignee changed; refresh the task before assigning it.')
     if payload['assignee'] is not None:

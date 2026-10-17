@@ -343,7 +343,10 @@ class AgentRestContractTests(AgentHarness):
         self.assertEqual(200, me.status, me.data)
         self.assertEqual(self.agent_id, me.data['agent']['id'])
         self.assertEqual('/home/priya/work/kestrel', me.data['agent']['working_directory'])
-        self.assertIn('attention', me.data)
+        # The polled whoami answers from the agent record only (kittrial-5bb.303): no
+        # attention and no counted held/available, both of which need a work read.
+        self.assertNotIn('attention', me.data)
+        self.assertEqual({'limit', 'raise_by'}, set(me.data['claim_limit']))
         # API use stamps last_seen_at and persists it.
         self.assertIsNotNone(me.data['agent']['last_seen_at'])
         owner_view = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.alex)
@@ -1144,6 +1147,28 @@ class AgentReadCostTests(AgentHarness):
         # One owner-filtered own-task read per project, naming this agent's actor.
         actor = nxt.data['agent']['actor']
         self.assertEqual(sorted(self.backend.own_calls), sorted((project, actor) for project in self.projects))
+
+    def test_the_polled_whoami_makes_no_work_read(self):
+        # kittrial-5bb.303: /v1/agents/me is polled by the bridge extension. It reports
+        # the record's own limit; the counted held/available view stays on /next, the
+        # route that already reads the snapshot, so this call costs no canonical read.
+        agent_id, secret, _ = self.agent_secret(self.alex, projects=list(self.projects))
+        self.assertTrue(agent_id)
+        self.backend.list_calls = []
+        self.backend.read_calls = []
+        self.backend.own_calls = []
+        me = self.request('GET', '/v1/agents/me', token=secret)
+        self.assertEqual(200, me.status, me.data)
+        self.assertEqual(self.backend.list_calls, [], 'the polled whoami must make no task read')
+        self.assertEqual(self.backend.read_calls, [], 'the polled whoami must make no snapshot read')
+        self.assertEqual(self.backend.own_calls, [], 'the polled whoami must make no own-task read')
+        self.assertEqual({'limit', 'raise_by'}, set(me.data['claim_limit']))
+        # The same request against the route that DOES own the counted view still reads.
+        nxt = self.request('GET', '/v1/agents/me/next', token=secret)
+        self.assertEqual(200, nxt.status, nxt.data)
+        self.assertEqual(5, len(self.backend.read_calls))
+        self.assertEqual({'limit', 'held', 'available', 'counts_task', 'raise_by'},
+                         set(nxt.data['claim_limit']))
 
     def test_a_project_bigger_than_one_page_still_costs_one_read(self):
         # 130 tasks in one project: the page walk used to cost one full read per

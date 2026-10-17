@@ -95,6 +95,10 @@ class ClaimLimitUnitTests(unittest.TestCase):
         self.assertIn('superuser', sentence)
         self.assertIn('My agents', sentence)
         self.assertIn(claim_limit.RAISE_BY, sentence)
+        # kittrial-5bb.303: one clean sentence. The older wording ended
+        # "..., on the My agents page raises it".
+        self.assertTrue(sentence.endswith('may raise it.'), sentence)
+        self.assertNotIn('page raises it', sentence)
 
 
 class ClaimLimitTests(test_http_agents.AgentHarness):
@@ -312,6 +316,12 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
         # ``null`` is the OWNER's way to clear a setting; the agent route takes the number.
         refused = self.my_limit(None, secret)
         self.assertEqual(422, refused.status, refused.data)
+        # kittrial-5bb.303: the null refusal names the field's own range, not the current
+        # value as if it were a bound.
+        message = refused.data['error']['message']
+        self.assertIn('from %d to %d' % (claim_limit.LIMIT_MIN, claim_limit.LIMIT_MAX),
+                      message)
+        self.assertIn('at most the current 4', message)
 
     def test_the_agents_own_route_takes_only_claim_limit(self):
         agent_id, secret, _ = self.new_agent(claim_limit=3)
@@ -386,19 +396,22 @@ class ClaimLimitTests(test_http_agents.AgentHarness):
         self.assertEqual(2, event['new_limit'])
         self.assertTrue(event['credential_id'], 'who: the credential that made the change')
 
-    def test_both_of_the_agents_own_reads_report_the_limit_and_who_may_raise_it(self):
+    def test_the_agents_own_reads_report_the_limit_and_who_may_raise_it(self):
         agent_id, secret, _ = self.new_agent(claim_limit=2)
         me = self.request('GET', '/v1/agents/me', token=secret)
         self.assertEqual(200, me.status, me.data)
-        self.assertEqual({'limit': 2, 'held': 0, 'available': 2, 'counts_task': 0,
-                          'raise_by': claim_limit.RAISE_BY}, me.data['claim_limit'])
+        # kittrial-5bb.303: the polled whoami answers from the record only. It makes no
+        # work read, so it carries no counted held/available and no attention.
+        self.assertEqual({'limit': 2, 'raise_by': claim_limit.RAISE_BY}, me.data['claim_limit'])
+        self.assertNotIn('attention', me.data)
         self.assertEqual(200, self.claim(self.tasks[0], secret).status)
         held = self.next_of(secret)['claim_limit']
         self.assertEqual((2, 1, 1), (held['limit'], held['held'], held['available']))
         self.assertEqual(claim_limit.RAISE_BY, held['raise_by'])
         again = self.request('GET', '/v1/agents/me', token=secret).data['claim_limit']
-        self.assertEqual((2, 1, 1), (again['limit'], again['held'], again['available']))
-        self.assertEqual(claim_limit.RAISE_BY, again['raise_by'])
+        # Still the record's own limit, whatever the agent now holds: the counted view is
+        # read from /v1/agents/me/next.
+        self.assertEqual({'limit': 2, 'raise_by': claim_limit.RAISE_BY}, again)
 
     # -- what the agent reads --------------------------------------------------
     def test_the_agent_is_told_its_limit_and_what_holds_it(self):
@@ -664,6 +677,37 @@ class ClaimReleaseDeliveredWorkUnitTests(unittest.TestCase):
             self.check(self.review('none', None), slot=self.slot('agent-x', context))
         self.assertEqual(409, caught.exception.status)
         self.assertIn('merge slot', str(caught.exception).lower())
+
+    def test_a_closed_task_with_no_contribution_cannot_be_released(self):
+        """A holder must not clear its own name from finished work (kittrial-5bb.305)."""
+        with self.assertRaises(task_assignment.AssignmentError) as caught:
+            task_assignment.check_change(self.payload('agent-x'),
+                                         self.row('agent-x', status='closed'),
+                                         self.review('none', None), self.slot(),
+                                         lambda target: True, refuse_delivered=True)
+        self.assertEqual(409, caught.exception.status)
+        self.assertIn('closed', str(caught.exception).lower())
+        self.assertIn('nothing was changed', str(caught.exception))
+
+    def test_a_closed_task_with_an_approved_contribution_cannot_be_released(self):
+        """The delivered check skips closed rows, so the closed refusal must come first."""
+        contribution = {'comment_id': '01a00000-0000-7000-8000-000000000000'}
+        with self.assertRaises(task_assignment.AssignmentError) as caught:
+            task_assignment.check_change(self.payload('agent-x'),
+                                         self.row('agent-x', status='closed'),
+                                         self.review('awaiting-integration', contribution),
+                                         self.slot(), lambda target: True,
+                                         refuse_delivered=True)
+        self.assertEqual(409, caught.exception.status)
+        self.assertIn('closed', str(caught.exception).lower())
+
+    def test_a_closed_task_is_still_assignable_because_the_refusal_is_release_only(self):
+        change = task_assignment.check_change(
+            dict(self.payload('agent-x'), assignee='agent-y'),
+            self.row('agent-x', status='closed'), self.review('none', None), self.slot(),
+            lambda target: True)
+        self.assertTrue(change['changed'])
+        self.assertEqual('agent-y', change['assignee'])
 
     def test_a_self_release_notice_says_the_holder_released_it(self):
         notice = task_assignment.make_notice(self.payload(), project='pp',

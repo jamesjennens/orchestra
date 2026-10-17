@@ -533,6 +533,8 @@ The local commands:
 The client loads `capabilities.py` from its own directory by path. A standalone
 client copied without that file refuses with exit `2`; copy `capabilities.py` from
 the same kit next to it. The module also runs on its own as `python capabilities.py ...`.
+This is the only companion file a client-side command needs: a stand-alone `client.py`,
+with no other kit file beside it, runs `wait` and the rest of the local commands on its own.
 
 `capabilities.py` is **not** covered by `provenance.json`: `--version` and onboarding
 parity vouch for `client.py`, `version.py` and `VERSION` only. Whoever can write the

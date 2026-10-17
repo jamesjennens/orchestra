@@ -71,6 +71,10 @@ as `wait --coordinator`: run `wait --coordinator`; act on what it returns; run
 `wait --coordinator` again. An agent with a web credential reads the same worker form,
 one read, at `GET /v1/agents/me/wait`, and blocks in the loop of whatever runs it.
 
+The wait logic is part of `client.py` itself: a `client.py` copied on its own, with no
+other kit file beside it, runs `wait` (only the `capability` commands also need
+`capabilities.py` from the same kit).
+
 A task of yours with changes requested is your work until you deliver a revision, whatever
 else has or has not changed. Each item of `work --mine` carries `whose_move` and one plain
 sentence `next` saying whose move it is, and the tasks where the move is yours come first,

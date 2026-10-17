@@ -3045,10 +3045,13 @@ line separately and unconfined.
   explicit choice, not the agent taking work. An AGENT assigning a task to itself
   through that same route is a claim and takes the limit, because that IS the agent
   taking work.
-  `GET /v1/agents/me` and `GET /v1/agents/me/next` report the limit, how many it holds,
-  how many are left and `raise_by` (who may raise it: the owner's account or a superuser,
-  on the My agents page); each agent record carries the limit. All of it comes from the
-  same one counted-held rule the gate applies, so the two answers cannot disagree. The
+  `GET /v1/agents/me/next` reports the limit, how many it holds,
+  how many are left and `raise_by` (who may raise it: the owner's account or a superuser
+  on the My agents page), from the same one counted-held rule the gate applies, so the
+  answer cannot disagree with the claim route. `GET /v1/agents/me` is a polled whoami
+  and stays cheap: it answers from the agent record only (identity, `claim_limit`,
+  `raise_by`, the calling credential's expiry) and makes no work read, so held and
+  available are read from `/v1/agents/me/next`; each agent record carries the limit. The
   held set is read from the same bounded `work`
   snapshot attention already reads, across every project the agent is granted, and it
   fails closed: a held

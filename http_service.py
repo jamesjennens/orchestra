@@ -5895,12 +5895,14 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
-        # The same bounded attention read ``/v1/agents/me/next`` makes, so this route can
-        # report the agent's own claim limit, what holds it and who may raise it
-        # (kittrial-5bb.302) from the one counted-held rule the claim gate applies.
-        attention = self._agent_attention(ctx.principal, agent)
-        body = {'agent': agent, 'attention': self._agent_attention_view(agent, attention),
-                'claim_limit': self._agent_claim_limit_view(agent, attention),
+        # The agent record only (kittrial-5bb.303): this route is a polled whoami, so it
+        # makes NO work read. The counted limit/held/available view needs the bounded
+        # current-work snapshot, so it stays on ``/v1/agents/me/next``, which already
+        # reads it; here the limit and who may raise it come from the record and one
+        # constant (kittrial-5bb.276/302).
+        body = {'agent': agent,
+                'claim_limit': self._agent_claim_limit_record_view(agent),
+                'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
                 'generated_at': now_iso(self.service._now())}
         # The calling credential's OWN expiry, in exactly the shape /v1/sessions/current
         # answers (kittrial-5bb.294 item 1): the agent set-up prompt and the bridge
@@ -6939,6 +6941,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         return ('Idle: %s claimable task(s), nothing in flight.' % claimable)
 
     @staticmethod
+    def _agent_claim_limit_record_view(agent):
+        """The limit and who may raise it, from the agent record only (kittrial-5bb.303).
+
+        No work read: ``claim_limit`` is on the record and ``raise_by`` is one constant.
+        The counted ``held``/``available`` view needs the bounded current-work snapshot,
+        so it is answered only where that snapshot is already read, on
+        ``GET /v1/agents/me/next`` (:meth:`_agent_claim_limit_view`).
+        """
+        from claim_limit import RAISE_BY, default_limit
+        return {'limit': default_limit(agent), 'raise_by': RAISE_BY}
+
+    @staticmethod
     def _agent_claim_limit_view(agent, attention):
         """The per-agent claim limit and what holds it (kittrial-5bb.276).
 
@@ -6952,7 +6966,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         exactly as the gate refuses, rather than reading as "no limit".
 
         ``raise_by`` names who may RAISE the limit (kittrial-5bb.302): the owner's account
-        or a superuser, on the My agents page. An agent can only lower it itself, so a
+        or a superuser on the My agents page. An agent can only lower it itself, so a
         client that follows the server shows the same names and page the refusal sentence
         does.
         """
