@@ -665,6 +665,37 @@ class ClaimReleaseDeliveredWorkUnitTests(unittest.TestCase):
         self.assertEqual(409, caught.exception.status)
         self.assertIn('merge slot', str(caught.exception).lower())
 
+    def test_a_closed_task_with_no_contribution_cannot_be_released(self):
+        """A holder must not clear its own name from finished work (kittrial-5bb.305)."""
+        with self.assertRaises(task_assignment.AssignmentError) as caught:
+            task_assignment.check_change(self.payload('agent-x'),
+                                         self.row('agent-x', status='closed'),
+                                         self.review('none', None), self.slot(),
+                                         lambda target: True, refuse_delivered=True)
+        self.assertEqual(409, caught.exception.status)
+        self.assertIn('closed', str(caught.exception).lower())
+        self.assertIn('nothing was changed', str(caught.exception))
+
+    def test_a_closed_task_with_an_approved_contribution_cannot_be_released(self):
+        """The delivered check skips closed rows, so the closed refusal must come first."""
+        contribution = {'comment_id': '01a00000-0000-7000-8000-000000000000'}
+        with self.assertRaises(task_assignment.AssignmentError) as caught:
+            task_assignment.check_change(self.payload('agent-x'),
+                                         self.row('agent-x', status='closed'),
+                                         self.review('awaiting-integration', contribution),
+                                         self.slot(), lambda target: True,
+                                         refuse_delivered=True)
+        self.assertEqual(409, caught.exception.status)
+        self.assertIn('closed', str(caught.exception).lower())
+
+    def test_a_closed_task_is_still_assignable_because_the_refusal_is_release_only(self):
+        change = task_assignment.check_change(
+            dict(self.payload('agent-x'), assignee='agent-y'),
+            self.row('agent-x', status='closed'), self.review('none', None), self.slot(),
+            lambda target: True)
+        self.assertTrue(change['changed'])
+        self.assertEqual('agent-y', change['assignee'])
+
     def test_a_self_release_notice_says_the_holder_released_it(self):
         notice = task_assignment.make_notice(self.payload(), project='pp',
                                              assigned_by='agent-x', at='2026-10-16T19:00:00Z')
