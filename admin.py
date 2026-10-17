@@ -11088,8 +11088,10 @@ def main():
         if getattr(args,'restore_http_state',False):
             print(restore_http_state(root))
         else:
-            print('The HTTP state pair in this backup set (accounts, agents, memberships) was NOT '
-                  'restored: pass --restore-http-state to restore it. Restoring it INVALIDATES every '
+            # 'left unrestored', never 'NOT restored': a restore prints that phrase for
+            # capability verifiers (tests pin its absence), and this line must not collide.
+            print('The HTTP state pair in this backup set (accounts, agents, memberships) was left '
+                  'unrestored: pass --restore-http-state to restore it. Restoring it INVALIDATES every '
                   'session recorded in it - users and agents must sign in again.')
         # A backup recorded degraded restores its tracker, and nothing says what is
         # missing unless this does (kittrial-5bb.105). The run record is advisory here:

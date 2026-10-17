@@ -1030,5 +1030,5 @@ class HttpStateBackupTests(unittest.TestCase):
             body = body[:nxt]
         self.assertIn("if getattr(args,'restore_http_state',False):", body)
         self.assertIn('print(restore_http_state(root))', body)
-        self.assertIn('was NOT ', body)
+        self.assertIn('was left ', body)
         self.assertEqual(body.count('restore_http_state(root)'), 1)
