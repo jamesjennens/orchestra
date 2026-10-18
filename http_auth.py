@@ -44,6 +44,7 @@ from contextlib import closing
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 import claim_limit
@@ -133,6 +134,8 @@ AGENT_MAX_CREDENTIALS = 20
 AGENT_DEAD_CREDENTIALS_KEPT = 5
 AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
+AGENT_GUIDE_PATH = '.orchestra/AGENT.md'
+AGENT_GITIGNORE_LINE = '.orchestra/'
 #: The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276). The
 #: default, the editable bounds and the wording live in ``claim_limit``, so the
 #: route, the owner's page and the gate cannot disagree about any of them.
@@ -939,6 +942,9 @@ class Store:
 
 
 # --------------------------------------------------------------------------- service
+AGENT_ROLES = ('worker', 'reviewer')
+
+
 def validate_claim_limit(value):
     """The stored form of one owner-supplied per-agent claim limit.
 
@@ -951,6 +957,17 @@ def validate_claim_limit(value):
         return claim_limit.validate_limit(value)
     except ValueError as error:
         raise invalid(str(error)) from None
+
+
+def validate_agent_role(value):
+    """The stored form of an agent's role ('worker' or 'reviewer', or None to clear)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        clean = value.strip()
+        if clean in AGENT_ROLES:
+            return clean
+    raise invalid("role must be 'worker' or 'reviewer'")
 
 
 def validate_agent_credential_days(value):
@@ -2745,16 +2762,70 @@ class Service:
                      'secret_file': agent_secret_file(name)['name']})
 
     @staticmethod
-    def _agent_text(value, field, limit):
+    def _has_forbidden_text_char(value):
+        for c in value:
+            code = ord(c)
+            if code < 32 or 0x7f <= code <= 0x9f or not c.isprintable():
+                return True
+            if unicodedata.category(c) in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp'):
+                return True
+        return False
+
+    @classmethod
+    def _agent_text(cls, value, field, limit):
         if value is None:
             return None
         if not isinstance(value, str):
             raise invalid('%s must be text' % field)
+        if cls._has_forbidden_text_char(value):
+            raise invalid('%s must be at most %d printable characters' % (field, limit))
         text = value.strip()
         if not text:
             return None
-        if len(text) > limit or any(ord(c) < 32 for c in text):
+        if len(text) > limit:
             raise invalid('%s must be at most %d printable characters' % (field, limit))
+        return text
+
+    #: Bounded Windows/POSIX path root: POSIX `/`, home `~` (`~` or `~/...`), Windows drive
+    #: `[A-Za-z]:\` / `[A-Za-z]:/`, or UNC `\\host\share`.
+    _WORKING_DIR_ROOT = re.compile(
+        r'^(?:[A-Za-z]:[\\/]+|\\\\[A-Za-z0-9._-]+[\\/]+[A-Za-z0-9._$-]+(?:[\\/]+|$)|~(?:[\\/]+|$)|/+)'
+    )
+    #: Bounded folder segment: letters, digits, `.`, `_`, `-`, and single internal spaces,
+    #: never ending in `.`, never containing `..` or `. ` (sentence punctuation), and at most
+    #: 3 spaces per segment so prose sentences cannot masquerade as a folder path.
+    _WORKING_DIR_SEGMENT = re.compile(r'^[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+){0,3}$')
+
+    @classmethod
+    def _agent_working_directory(cls, value, *, allow_empty=True):
+        if value is None:
+            if allow_empty:
+                return None
+            raise invalid('working_directory must be a valid Windows or POSIX folder path (1-%d characters)'
+                          % AGENT_DIRECTORY_MAX)
+        if not isinstance(value, str):
+            raise invalid('working_directory must be text')
+        if cls._has_forbidden_text_char(value):
+            raise invalid('working_directory must not contain control, non-printable, or bidi characters')
+        text = value.strip()
+        if not text:
+            if allow_empty:
+                return None
+            raise invalid('working_directory must be a valid Windows or POSIX folder path (1-%d characters)'
+                          % AGENT_DIRECTORY_MAX)
+        if len(text) > AGENT_DIRECTORY_MAX:
+            raise invalid('working_directory must be at most %d printable characters' % AGENT_DIRECTORY_MAX)
+        match = cls._WORKING_DIR_ROOT.match(text)
+        if not match:
+            raise invalid('working_directory must be an absolute or home-relative Windows or POSIX path')
+        rest = text[match.end():].rstrip('/\\')
+        if rest:
+            segments = re.split(r'[\\/]+', rest)
+            for seg in segments:
+                if (not seg or len(seg) > 128 or seg in ('.', '..')
+                        or '..' in seg or '. ' in seg or seg.endswith('.')
+                        or not cls._WORKING_DIR_SEGMENT.fullmatch(seg)):
+                    raise invalid('working_directory must be a valid Windows or POSIX folder path, not prose')
         return text
 
     def _agent_projects(self, principal, projects, owner_id=None):
@@ -2956,6 +3027,8 @@ class Service:
         if agent.get('created_by'):
             view['created_by'] = agent['created_by']
             view['created_by_display_name'] = self._owner_name(agent['created_by'])
+        if agent.get('role') in AGENT_ROLES:
+            view['role'] = agent['role']
         if owner_sees_path:
             view['working_directory'] = agent.get('working_directory')
         else:
@@ -3252,10 +3325,14 @@ class Service:
         # beside the setup text, never inside the commands, and nothing runs it.
         # Read once per project, as today's rule reads it: a stored value that no longer
         # passes is left out (kittrial-5bb.123).
-        readable = ((pid, self.stored_repository(self.state['projects'].get(pid))[0]) for pid in config['projects'])
-        repositories = [{'project': pid, 'repository': value} for pid, value in readable if value]
+        with self.store.lock:
+            readable = ((pid, self.stored_repository(self.state['projects'].get(pid))[0])
+                        for pid in config['projects'])
+            repositories = [{'project': pid, 'repository': value} for pid, value in readable if value]
         return {
             'config_path': AGENT_CONFIG_PATH,
+            'guide_path': AGENT_GUIDE_PATH,
+            'gitignore_line': AGENT_GITIGNORE_LINE,
             'config': config,
             'repositories': repositories,
             'repositories_note': self.REPOSITORY_NOTE,
@@ -3434,16 +3511,16 @@ class Service:
 
     def create_agent(self, principal, *, name, tool=None, working_directory=None,
                      machine=None, notes=None, projects=None, scopes=None,
-                     request_id=None, owner=None, claim_limit=None):
+                     request_id=None, owner=None, claim_limit=None, role=None):
         """Create an owner-bound agent and its first (one-time) credential."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to create an agent')
         clean_name = self._agent_name(name)
         tool = self._agent_text(tool, 'tool', AGENT_TOOL_MAX)
-        working_directory = self._agent_text(working_directory, 'working_directory',
-                                             AGENT_DIRECTORY_MAX)
+        working_directory = self._agent_working_directory(working_directory, allow_empty=True)
         machine = self._agent_text(machine, 'machine', AGENT_MACHINE_MAX)
         notes = self._agent_text(notes, 'notes', AGENT_NOTES_MAX)
+        clean_role = validate_agent_role(role)
         with self.store.lock:
             self._refresh_authority(principal)
             owner_id = self.agent_creation_owner(principal, principal.user_id if owner is None else owner)
@@ -3471,6 +3548,8 @@ class Service:
                 'last_seen_at': None,
                 'scopes': list(made_with), 'scopes_source': 'set',
             }
+            if clean_role is not None:
+                agent['role'] = clean_role
             self.state['agents'][agent_id] = agent
             credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry)
             self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
@@ -3534,6 +3613,8 @@ class Service:
             # The limit is judged with the other fields, before any of them is applied.
             if 'claim_limit' in payload:
                 validate_claim_limit(payload.get('claim_limit'))
+            if 'role' in payload:
+                validate_agent_role(payload.get('role'))
             # Validate every field first and apply nothing until all of them pass, so a
             # refused change (an ungranted project, an over-long field, a clashing name)
             # leaves the live record exactly as it was. A rename in particular must not
@@ -3544,10 +3625,12 @@ class Service:
                 self._check_agent_file_name(agent['owner'], new_name, exclude_id=agent['id'])
                 changes['name'] = new_name
             for field, limit in (('tool', AGENT_TOOL_MAX), ('machine', AGENT_MACHINE_MAX),
-                                 ('notes', AGENT_NOTES_MAX),
-                                 ('working_directory', AGENT_DIRECTORY_MAX)):
+                                 ('notes', AGENT_NOTES_MAX)):
                 if field in payload:
                     changes[field] = self._agent_text(payload.get(field), field, limit)
+            if 'working_directory' in payload:
+                changes['working_directory'] = self._agent_working_directory(
+                    payload.get('working_directory'), allow_empty=True)
             if 'projects' in payload:
                 changes['projects'] = self._agent_projects(
                     principal, payload.get('projects'), owner_id=agent['owner'])
@@ -3559,6 +3642,12 @@ class Service:
                 changes['claim_limit'] = validate_claim_limit(payload.get('claim_limit'))
             left = [pid for pid in (agent.get('projects') or []) if pid not in changes.get('projects', agent.get('projects') or [])]
             agent.update(changes)
+            if 'role' in payload:
+                clean_role = validate_agent_role(payload.get('role'))
+                if clean_role is None:
+                    agent.pop('role', None)
+                else:
+                    agent['role'] = clean_role
             # An agent that leaves a project by THIS route leaves its coordinators too (review of
             # kittrial-5bb.209): the grant stayed in the state, unseen by the project's owner, and
             # took effect again when the project was put back, with no owner's decision.
@@ -3570,44 +3659,86 @@ class Service:
             return self.agent_view(agent, principal)
 
     def lower_own_claim_limit(self, principal, value):
-        """An agent credential lowers the claim limit on its OWN record (kittrial-5bb.302).
+        """An agent credential lowers the claim limit on its OWN record (kittrial-5bb.302)."""
+        return self.update_own_agent(principal, {'claim_limit': value})
 
-        Lowering only: ``value`` must be a whole number from 1 up to the CURRENT effective
-        limit. Raising it stays the owner's or a superuser's move, refused with a sentence
-        that names both and the My agents page. The caller is answered its own record plus
-        ``old_limit`` and ``new_limit``, so the route can record who changed what. The
-        identity is the credential's own agent; no target id is taken, so this cannot
-        reach another agent's record.
+    def update_own_agent(self, principal, payload):
+        """An agent credential updates allowed fields on its OWN record (kittrial-5bb.302, .329).
+
+        ``claim_limit`` may only be lowered (a whole number from 1 up to the CURRENT
+        effective limit; raising stays the owner's or a superuser's move, refused with a
+        sentence naming both and the My agents page). ``working_directory`` records the
+        folder the agent runs in, validated with :meth:`_agent_working_directory` as a
+        bounded Windows or POSIX folder path (1 to :data:`AGENT_DIRECTORY_MAX` characters,
+        no control/bidi characters or prose). ``role`` records whether the
+        agent runs as ``'worker'`` or ``'reviewer'``. Every requested field is validated
+        before any is applied, so a refused field leaves the record untouched. The identity
+        is the credential's own agent; no target id is taken, so this cannot reach another
+        agent's record.
         """
         if principal is None or principal.via != 'credential' or not principal.agent_id:
-            raise forbidden('An agent credential is required to change its own claim limit')
+            raise forbidden('An agent credential is required to change its own record')
+        has_limit = 'claim_limit' in payload
+        has_dir = 'working_directory' in payload
+        has_role = 'role' in payload
+        new_dir = None
+        if has_dir:
+            new_dir = self._agent_working_directory(payload.get('working_directory'),
+                                                    allow_empty=False)
+        new_role = None
+        if has_role:
+            new_role = validate_agent_role(payload.get('role'))
         with self.store.lock:
             self._refresh_authority(principal)
             agent = self._agent(principal.agent_id)
             current = claim_limit.default_limit(agent)
-            try:
-                wanted = claim_limit.validate_limit(value)
-            except ValueError as error:
-                raise invalid(str(error)) from None
-            if wanted is None:
-                # The owner's route clears a value back to the default; on the agent's own
-                # route the body must be the number it will hold, never an absence. Name the
-                # field's own range (1..50), not the current value: a null is a malformed
-                # value, and the older sentence read "1 to <current>" (kittrial-5bb.303).
-                raise invalid('claim_limit: expected a whole number from %d to %d; an agent '
-                              'may only lower its own limit, so it must also be at most the '
-                              'current %d' % (claim_limit.LIMIT_MIN, claim_limit.LIMIT_MAX,
-                                              current))
-            if wanted > current:
-                raise forbidden(claim_limit.raise_refusal(current, wanted),
-                                {'claim_limit': current, 'requested': wanted,
-                                 'raise_by': claim_limit.RAISE_BY})
-            agent['claim_limit'] = wanted
+            wanted = None
+            if has_limit:
+                value = payload.get('claim_limit')
+                try:
+                    wanted = claim_limit.validate_limit(value)
+                except ValueError as error:
+                    raise invalid(str(error)) from None
+                if wanted is None:
+                    # The owner's route clears a value back to the default; on the agent's own
+                    # route the body must be the number it will hold, never an absence. Name the
+                    # field's own range (1..50), not the current value: a null is a malformed
+                    # value, and the older sentence read "1 to <current>" (kittrial-5bb.303).
+                    raise invalid('claim_limit: expected a whole number from %d to %d; an agent '
+                                  'may only lower its own limit, so it must also be at most the '
+                                  'current %d' % (claim_limit.LIMIT_MIN, claim_limit.LIMIT_MAX,
+                                                  current))
+                if wanted > current:
+                    raise forbidden(claim_limit.raise_refusal(current, wanted),
+                                    {'claim_limit': current, 'requested': wanted,
+                                     'raise_by': claim_limit.RAISE_BY})
+            old_dir = agent.get('working_directory')
+            old_role = agent.get('role')
+            if has_limit:
+                agent['claim_limit'] = wanted
+            if has_dir:
+                agent['working_directory'] = new_dir
+            if has_role:
+                if new_role is None:
+                    agent.pop('role', None)
+                else:
+                    agent['role'] = new_role
             self.store.save()
-            return {'operation': 'agents.claim_limit.lower',
-                    'agent': self.agent_view(agent, principal),
-                    'old_limit': current, 'new_limit': wanted,
-                    'raise_by': claim_limit.RAISE_BY}
+            operation = ('agents.claim_limit.lower' if has_limit and not has_dir and not has_role
+                         else 'agents.working_directory.set' if has_dir and not has_limit and not has_role
+                         else 'agents.role.set' if has_role and not has_limit and not has_dir
+                         else 'agents.me.update')
+            result = {'operation': operation,
+                      'agent': self.agent_view(agent, principal)}
+            if has_limit:
+                result.update({'old_limit': current, 'new_limit': wanted,
+                               'raise_by': claim_limit.RAISE_BY})
+            if has_dir:
+                result.update({'old_working_directory': old_dir,
+                               'new_working_directory': new_dir})
+            if has_role:
+                result.update({'old_role': old_role, 'new_role': new_role})
+            return result
 
     def disable_agent(self, principal, agent_id):
         """Disable an agent and revoke every credential it holds, immediately."""

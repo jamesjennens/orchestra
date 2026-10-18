@@ -2289,6 +2289,41 @@ own set-up. What the person still does once is said in the dialog: install the e
 "Orchestra Bridge: Set up" (and compare the fingerprint it shows), reload the window, click the
 first wake.
 
+**Step-by-step setup wizard (`kittrial-5bb.329`, slice 4 of `docs/ONBOARDING_DESIGN.md`).** The setup
+dialog and standalone `#/setup` route present the three steps (`Step 1 of 3: Store the secret`,
+`Step 2 of 3: Set up the folder`, `Step 3 of 3: Start the agent`) one screen at a time with `Back`,
+`Check connection`, `Next` and `Done` controls, a `"What you will see when it worked"` callout on
+every step, and secretless `sessionStorage` state (`orchestra.agentSetup.v1`) so reloading the page
+resumes at the current step and operating system without ever storing a secret. An **Operating
+system** selector (`Windows (PowerShell)`, `macOS`, `Linux`, auto-detected from `navigator`) is
+chosen first and hides commands and paths for other systems (`data-os="windows"` vs
+`data-os="posix"`). In Step 1, when the service serves its own certificate, the wizard explains
+that browsers strip the leading dot when saving `.orchestra-agent-<slug>.crt` into `Downloads`
+(saving `orchestra-agent-<slug>.crt`) and gives a filled-in `Move-Item` / `mv` command to move it
+into the user profile with the leading dot restored. The primary Step 1 flow has **zero `<your-name>`
+placeholders**: the person saves the single `header = "Authorization: Bearer ..."` line and runs the
+filled-in rewrite command (`credentialFileCommand`), which expands the real user profile path on
+that machine (`[Environment]::GetFolderPath('UserProfile')` on Windows, `$HOME` on macOS/Linux) and
+writes `# server = ...`, `# server certificate sha256 = ...` and `cacert = ...` automatically (the
+manual `<your-name>` Notepad body is tucked into a collapsed fallback `<details>`). A filled-in
+self-check command (`checkCommands`) inspects the credential file for `.curlrc.txt`, leftover
+`<your-name>` placeholders, or a certificate still sitting in `Downloads/orchestra-agent-<slug>.crt`
+before running `curl -fsS -K`, and `CURL_ERROR_LINES` covers `curl` exit codes `2`, `26`, `35`, `60`
+and `HTTP 401`. Clicking `Next` checks `GET /v1/service/certificate` (when applicable) and
+`GET /v1/agents/{id}` (`last_seen_at`), advancing when the agent has reached the service or showing a
+one-sentence remedy (with a secondary `Continue without checking` button). On Step 2 and Step 3, the
+wizard states plainly that **Orchestra Bridge 0.14 or later** writes `.orchestra/agent.json`
+(`config_path`) and `.orchestra/AGENT.md` (`guide_path`) and adds `.orchestra/` (`gitignore_line`)
+to `.gitignore` directly into the open VS Code workspace folder from `GET /v1/agents/me` (which now
+includes the secretless `setup` bundle alongside `agent` with zero canonical work reads) and
+compares the open workspace folder against `working_directory` (offering to record it via
+`PATCH /v1/agents/me` with `{"working_directory": "..."}` when they differ), **and with an older
+extension** (before 0.14) shows the fallback (**Save to agent folder…**, which passes the last
+chosen directory handle as `startIn` to `showDirectoryPicker`, or **Or let the agent do it**). While
+Step 3 is open and `document.visibilityState === 'visible'`, a 3-second check polls
+`GET /v1/agents/{id}` and stops immediately once `last_seen_at` is set, or when leaving Step 3,
+hiding the tab, or closing the dialog.
+
 **What an agent may do is kept on the agent, and a new credential carries exactly that**
 (kittrial-5bb.208). The agent record holds its `scopes`: written when the agent is made
 (the list asked for, or the default four) and changed only by a renewal that sends a

@@ -321,6 +321,7 @@ export function createApi(transport) {
       try { await call('DELETE', '/v1/sessions/current'); } finally {
         csrf = null;
         if (lifecycleActor) { try { sessionStorage.removeItem(lifecycleStorageKey()); } catch {} }
+        try { sessionStorage.removeItem('orchestra.agentSetup.v1'); } catch {}
         lifecycleActor = null; lifecycleKeys = new Map();
       }
     },
