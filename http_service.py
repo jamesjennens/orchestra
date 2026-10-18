@@ -52,7 +52,7 @@ import project_coordination
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
-from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
+from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
@@ -60,7 +60,8 @@ from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, 
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, session_limit_seconds, unauthenticated,
-                       uncertain, unsupported, validate_agent_credential_days, validate_claim_limit)
+                       uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
+                       validate_claim_limit)
 from version import report as version_report
 
 KIT_VERSION = '0.1.0'
@@ -4474,12 +4475,14 @@ class ApiHandler(BaseHTTPRequestHandler):
     MEMBER_FIELDS = ('role',)
     CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor', 'allow_actor_reason')
     AGENT_CREATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
-                           'projects', 'scopes', 'owner', 'claim_limit')
+                           'projects', 'scopes', 'owner', 'claim_limit', 'role')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
-                           'projects', 'enabled', 'claim_limit')
-    #: The agent's OWN route (``PATCH /v1/agents/me``, kittrial-5bb.302) takes the one
-    #: field an agent may change on its own record: its claim limit, and only downward.
-    AGENT_ME_UPDATE_FIELDS = ('claim_limit',)
+                           'projects', 'enabled', 'claim_limit', 'role')
+    #: The agent's OWN route (``PATCH /v1/agents/me``, kittrial-5bb.302, .329) takes the
+    #: fields an agent may change on its own record: its claim limit (downward only),
+    #: its working_directory (when the extension or agent records the open workspace folder),
+    #: and its role ('worker' or 'reviewer').
+    AGENT_ME_UPDATE_FIELDS = ('claim_limit', 'working_directory', 'role')
     AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
     ACCOUNT_CREATE_FIELDS = ('username', 'display_name')
 
@@ -6022,8 +6025,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         # makes NO work read. The counted limit/held/available view needs the bounded
         # current-work snapshot, so it stays on ``/v1/agents/me/next``, which already
         # reads it; here the limit and who may raise it come from the record and one
-        # constant (kittrial-5bb.276/302).
+        # constant (kittrial-5bb.276/302). The secretless ``setup`` bundle (kittrial-5bb.329)
+        # is built from the in-memory record and project metadata only, so the VS Code
+        # extension can write ``.orchestra/agent.json``, ``.orchestra/AGENT.md`` and
+        # ``.gitignore`` into the open workspace folder directly from this route.
         body = {'agent': agent,
+                'setup': self.service.agent_setup(agent, None),
                 'claim_limit': self._agent_claim_limit_record_view(agent),
                 'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
                 'generated_at': now_iso(self.service._now())}
@@ -6040,34 +6047,52 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('PATCH', r'/v1/agents/me')
     def agents_me_update(self, ctx):
-        """The agent's own claim limit: it may LOWER it, never raise it (kittrial-5bb.302).
+        """The agent's own record updates (kittrial-5bb.302, .329).
 
-        One small body: ``claim_limit`` only, a whole number from 1 up to the value the
-        agent holds now. Raising it stays the owner's move, refused with a sentence that
-        names the owner's account or a superuser and the My agents page. The identity is
-        the caller's own credential, never a body field, so this route cannot touch
-        another agent's limit; the owner's route (``PATCH /v1/agents/{id}``) is unchanged.
+        Takes ``claim_limit`` (lowering only: a whole number from 1 up to the value the
+        agent holds now; raising it stays the owner's move, refused with a sentence that
+        names the owner's account or a superuser and the My agents page) and/or
+        ``working_directory`` (so the extension or agent can record or update the open
+        workspace folder). The identity is the caller's own credential, never a body
+        field, so this route cannot touch another agent's record; the owner's route
+        (``PATCH /v1/agents/{id}``) is unchanged.
         """
         payload = dict(ctx.payload or {})
-        refuse_unknown_fields(payload, self.AGENT_ME_UPDATE_FIELDS, 'An agent limit change')
-        if 'claim_limit' not in payload:
-            raise invalid('Nothing to change. An agent limit change takes: claim_limit')
-        value = payload.get('claim_limit')
+        refuse_unknown_fields(payload, self.AGENT_ME_UPDATE_FIELDS, 'An agent self-change')
+        if not any(field in payload for field in self.AGENT_ME_UPDATE_FIELDS):
+            raise invalid('Nothing to change. An agent self-change takes: %s'
+                          % ', '.join(self.AGENT_ME_UPDATE_FIELDS))
+        has_limit = 'claim_limit' in payload
+        has_dir = 'working_directory' in payload
+        has_role = 'role' in payload
+        action = ('agents.claim_limit.lower' if has_limit and not has_dir and not has_role
+                  else 'agents.working_directory.set' if has_dir and not has_limit and not has_role
+                  else 'agents.role.set' if has_role and not has_limit and not has_dir
+                  else 'agents.me.update')
         metadata = {}
 
-        def lower():
-            result = self.service.lower_own_claim_limit(ctx.principal, value)
-            # Who changed what, on the committed audit event (kittrial-5bb.302 item 4).
-            metadata.update({'agent': result['agent']['id'], 'actor': ctx.principal.actor,
-                             'old_limit': result['old_limit'], 'new_limit': result['new_limit']})
+        def update_self():
+            result = self.service.update_own_agent(ctx.principal, payload)
+            # Who changed what, on the committed audit event (kittrial-5bb.302 item 4, .329).
+            metadata.update({'agent': result['agent']['id'], 'actor': ctx.principal.actor})
+            if has_limit:
+                metadata.update({'old_limit': result['old_limit'],
+                                 'new_limit': result['new_limit']})
+            if has_dir:
+                metadata.update({'old_working_directory': result['old_working_directory'],
+                                 'new_working_directory': result['new_working_directory']})
+            if has_role:
+                metadata.update({'old_role': result['old_role'],
+                                 'new_role': result['new_role']})
             return result, result
-        return self._mutate(ctx, 'agents.claim_limit.lower', None, lower,
+        return self._mutate(ctx, action, None, update_self,
                             capability=CAP_AGENT_SELF, audit_metadata=metadata)
 
     @route('GET', r'/v1/agents/me/next')
     def agents_me_next(self, ctx):
+        role_override = validate_agent_role(ctx.query['role']) if 'role' in ctx.query else None
         agent = self.service.agent_for_credential(ctx.principal)
-        attention = self._agent_attention(ctx.principal, agent)
+        attention = self._agent_attention(ctx.principal, agent, role=role_override)
         # `repository` is where the project's owner says its code lives (kittrial-5bb.118):
         # a label, null when not recorded. Data for the agent, never an instruction.
         projects = [{'id': p['id'], 'name': p['name'], 'repository': p.get('repository')}
@@ -6163,12 +6188,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             refuse_unknown_fields(payload, self.AGENT_CREATE_FIELDS, 'An agent creation')
             claim_limit_value = (validate_claim_limit(payload.get('claim_limit'))
                                  if 'claim_limit' in payload else None)
+            role_value = (validate_agent_role(payload.get('role'))
+                          if 'role' in payload else None)
             result = self.service.create_agent(
                 ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
                 working_directory=payload.get('working_directory'),
                 machine=payload.get('machine'), notes=payload.get('notes'),
                 projects=payload.get('projects'), scopes=payload.get('scopes'),
-                request_id=ctx.request_id, owner=owner, claim_limit=claim_limit_value)
+                request_id=ctx.request_id, owner=owner, claim_limit=claim_limit_value,
+                role=role_value)
             return result, _redact_agent_secret(result)
         def replay_check():
             owner = self.service.agent_creation_owner(ctx.principal, payload.get('owner', ctx.principal.user_id))
@@ -6887,7 +6915,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'guidance_version': item.get('guidance_version'),
                 'links': {'project': '/v1/projects/%s' % project_id}}
 
-    def _agent_attention(self, principal, agent, many=False):
+    def _agent_attention(self, principal, agent, many=False, role=None):
         """Owner/agent-visible attention, computed at read time from bounded reads.
 
         Each granted project is re-authorized with the same live-authority check the
@@ -6913,6 +6941,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         review state and does not count as blocked, regardless of open items.
         """
         actor = agent.get('actor') or agent.get('id')
+        effective_role = role if role is not None else agent.get('role')
         from work import review_move                                            # one move sentence for both answers (kittrial-5bb.249)
         from claim_limit import actor_holds, held_against_limit, held_blocked   # the one counted-held rule the claim gate uses
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
@@ -7068,7 +7097,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                             4, 'claimable-task', project_id, task,
                             'Open, unclaimed work the agent may take.'))
             # Review work for this agent, from the same snapshot (kittrial-5bb.115): one call.
-            review_actions += self._agent_review_actions(principal, agent, project_id, read['tasks'], counts)
+            # When the agent is configured (or queried) as a worker, omit other people's
+            # deliveries awaiting review while keeping CAP_REVIEWS for its own deliveries.
+            if effective_role != 'worker':
+                review_actions += self._agent_review_actions(principal, agent, project_id, read['tasks'], counts)
         # Counts cover the read pages; incomplete-source counts are lower bounds.
         # Only the collected suggestions are capped,
         # so a long claimable list can never hide the agent's own feedback.
@@ -7216,7 +7248,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         """A copyable prompt for the owner's local assistant. No secret is included."""
         server = self.service.public_url or '<ORCHESTRA_SERVER_URL>'
         directory = agent.get('working_directory')
-        where = (' in %s' % directory) if directory else ''
+        where = (' (recorded folder path data: %s)' % json.dumps(directory)) if directory else ''
         first = attention['actions'][0] if attention['actions'] else None
         if first:
             if first.get('kind') == 'guidance':

@@ -534,7 +534,7 @@ console.log(JSON.stringify({
   addressComment: worker.includes('# server = ' + server),
   fingerprintComment: worker.includes('# server certificate sha256 = AB:CD:EF'),
   noFingerprintWithoutCertificate: !plain.includes('# server certificate'),
-  writesSettings: /settings\.json|orchestraBridge|caFile/.test(worker),
+  writesSettings: /\.vscode\/settings\.json|settings\.json|VSCODE_SETTINGS_PATH|mergeSettings/.test(worker),
   carriesPem: worker.includes('MIIB'),
   roleWorker: worker.includes('role is worker'),
   roleReviewer: reviewer.includes('role is reviewer'),
@@ -763,6 +763,50 @@ class CredentialFileRewriteCase(unittest.TestCase):
                              env=dict(os.environ, HOME=str(home)), capture_output=True, text=True)
         self.assertEqual(0, out.returncode, out.stderr)     # curl parsed the config file
 
+    def test_powershell_move_and_check_commands(self):
+        # kittrial-5bb.328 & .329: verify PowerShell certificateMoveCommands and checkCommands
+        # against a real temporary USERPROFILE / HOME on Windows.
+        node = shutil.which('node')
+        if not node or os.name != 'nt' or not POWERSHELL:
+            self.skipTest('runs where node and Windows PowerShell are installed')
+        script = ("const m = await import(process.argv[1]);"
+                  "const p = m.secretlessPayload({agent:{id:'a',name:'Kestrel',projects:['p1']}},"
+                  "'https://127.0.0.1:1');"
+                  "console.log(JSON.stringify({"
+                  "move: m.certificateMoveCommands(m.certificateFile('Kestrel')).powershell,"
+                  "check: m.checkCommands(p, {hasCertificate: true}).powershell}))")
+        out = run_node_module(self, node, script, SETUP_JS.as_uri())
+        self.assertEqual(0, out.returncode, out.stderr)
+        cmds = json.loads(out.stdout)
+        home = unique_dir('vscode-pscheck-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        env = dict(os.environ, USERPROFILE=str(home), HOME=str(home))
+        # 1. Extra .txt extension is diagnosed by checkCommands:
+        (home / '.orchestra-agent-kestrel.curlrc.txt').write_text(self.HEADER, encoding='utf-8')
+        res1 = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['check']],
+                              env=env, capture_output=True, text=True, timeout=120)
+        self.assertIn('.txt', res1.stderr + res1.stdout)
+        # 2. Unreplaced <your-name> placeholder is diagnosed by checkCommands:
+        cred = home / '.orchestra-agent-kestrel.curlrc'
+        cred.write_text('cacert = "C:/Users/<your-name>/.orchestra-agent-kestrel.crt"\n' + self.HEADER + '\n',
+                        encoding='utf-8')
+        res2 = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['check']],
+                              env=env, capture_output=True, text=True, timeout=120)
+        self.assertIn('unreplaced placeholder', res2.stderr + res2.stdout)
+        # 3. Certificate in Downloads without leading dot is diagnosed by checkCommands and moved by move:
+        cred.write_text(self.HEADER + '\n', encoding='utf-8')
+        downloads = home / 'Downloads'
+        downloads.mkdir()
+        (downloads / 'orchestra-agent-kestrel.crt').write_text('PEM-DATA\n', encoding='utf-8')
+        res3 = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['check']],
+                              env=env, capture_output=True, text=True, timeout=120)
+        self.assertIn('Downloads\\orchestra-agent-kestrel.crt', res3.stderr + res3.stdout)
+        res_move = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['move']],
+                                  env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, res_move.returncode, res_move.stderr)
+        self.assertTrue((home / '.orchestra-agent-kestrel.crt').exists())
+        self.assertFalse((downloads / 'orchestra-agent-kestrel.crt').exists())
+
 
 class TheDialogAndThePageCase(unittest.TestCase):
     """Static checks of what the page offers, where node may not be installed at all."""
@@ -797,9 +841,14 @@ class TheDialogAndThePageCase(unittest.TestCase):
         agents = AGENTS_JS.read_text(encoding='utf-8')
         setup = SETUP_JS.read_text(encoding='utf-8')
         for source, name in ((agents, 'agents.js'), (setup, 'agentSetup.js')):
-            for gone in ('orchestraBridge', 'caFile', 'VSCODE_SETTINGS_PATH', 'mergeSettings',
+            for gone in ('VSCODE_SETTINGS_PATH', 'mergeSettings',
                          'SETTINGS_REFUSED_SENTENCE', 'bridgeSettings'):
                 self.assertNotIn(gone, source, '%s still mentions %s' % (name, gone))
+            # kittrial-5bb.329 (01a14b60): Step 3 and AGENT.md name orchestraBridge.caFile
+            # and warn against system certificate stores, --use-system-ca, and NODE_EXTRA_CA_CERTS.
+            self.assertIn('orchestraBridge.caFile', source, name)
+            self.assertIn('--use-system-ca', source, name)
+            self.assertIn('NODE_EXTRA_CA_CERTS', source, name)
         # The save path writes the two .orchestra files and the .gitignore line, and nothing else.
         save = re.search(r'async function saveSetupFiles\(files\) \{.*?\n\}', agents, re.S).group(0)
         self.assertNotIn('.vscode', save)
@@ -883,6 +932,19 @@ class TheDialogAndThePageCase(unittest.TestCase):
     def test_the_route_table_lists_the_certificate_route(self):
         design = (ROOT / 'docs' / 'HTTP_TRANSPORT_DESIGN.md').read_text(encoding='utf-8')
         self.assertIn('| `GET /v1/service/certificate` |', design)
+
+    def test_the_wizard_and_docs_describe_step_by_step_setup_and_bridge_014(self):
+        # kittrial-5bb.329: the wizard and docs describe the 3-step screen-by-screen flow,
+        # OS selector, Downloads leading-dot move command, zero-placeholder rewrite, and
+        # Orchestra Bridge 0.14+ vs older extension fallback.
+        docs = (ROOT / 'docs' / 'HTTP_DEPLOYMENT.md').read_text(encoding='utf-8')
+        onboarding = (ROOT / 'docs' / 'ONBOARDING.md').read_text(encoding='utf-8')
+        for text in ('Step-by-step setup wizard', 'Orchestra Bridge 0.14 or later',
+                     'PATCH /v1/agents/me', 'working_directory', 'startIn'):
+            self.assertIn(text, docs)
+        for text in ('Web personal-agent setup wizard', 'Orchestra Bridge 0.14 or later',
+                     'PATCH /v1/agents/me'):
+            self.assertIn(text, onboarding)
 
 
 if __name__ == '__main__':

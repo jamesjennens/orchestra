@@ -5,6 +5,7 @@ import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
 import { pageHead, empty, field, setFieldError, formValues, act, errorState } from '../ui.js';
 import * as setupText from '../agentSetup.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
+import { SESSION_IDLE_WARNING_EVENT } from '../api.js';
 
 export const ATTENTION = {
   feedback: ['Has feedback to act on', 'warn'],
@@ -70,8 +71,8 @@ function manages(ctx, raw) {
 export const CLAIM_LIMIT_MIN = 1;
 export const CLAIM_LIMIT_MAX = 50;
 
-export const SCOPES = [['read', 'Read'], ['tasks', 'Claim and change tasks'], ['checkpoints', 'Write checkpoints'],
-  ['reviews', 'Deliver and review'], ['feedback', 'Send feedback'], ['proposals', 'Propose requirements']];
+export const SCOPES = [['read', 'Read (every agent can read)'], ['tasks', 'Claim and change tasks'], ['checkpoints', 'Write checkpoints'],
+  ['reviews', 'Deliver and review (needed to deliver at all)'], ['feedback', 'Send feedback'], ['proposals', 'Propose requirements']];
 const scopeNames = (scopes) => (Array.isArray(scopes) && scopes.length ? scopes.join(', ') : 'nothing beyond reading');
 const sameScopes = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((s) => b.includes(s));
 const credentialsOf = (raw) => (Array.isArray(raw.credentials) ? raw.credentials.filter((c) => c && typeof c === 'object') : []);
@@ -249,21 +250,21 @@ export async function list(ctx) {
       } }, 'Revoke'));
       return row;
     });
-    // Ticked: what it has; with nothing known, reading alone. Only its own account may give it more.
-    const ticked = new Set(known ? has : ['read']);
+    // Ticked: what it has; every agent can read. Only its own account may give it more.
+    const ticked = new Set(known ? ['read', ...has] : ['read']);
     const form = h('form', { class: 'form', novalidate: true },
       h('fieldset', { class: 'checks' }, h('legend', null, 'What it may do'),
         SCOPES.map(([scope, label]) => h('label', { class: 'check', for: `sc-${agent.id}-${scope}` },
           h('input', { type: 'checkbox', id: `sc-${agent.id}-${scope}`, name: 'scope', value: scope, checked: ticked.has(scope) ? true : null,
-            disabled: !own && !has.includes(scope) ? true : null }), label)),
-        h('p', { class: 'small muted' }, own ? inferredWarning + 'Saving issues a new secret that carries exactly these, and a later new secret carries them too. A credential it already has keeps what it allows until you revoke it above.' :
-          'Only the agent’s own account may give it more than it has; you may take something away. Saving issues a new secret.')),
+            disabled: scope === 'read' || (!own && !has.includes(scope)) ? true : null }), label)),
+        h('p', { class: 'small muted' }, own ? inferredWarning + 'Every agent can read. Keep “Deliver and review” ticked so the agent can deliver its own work (whether it also reviews other people’s deliveries is set by its worker/reviewer role, not by removing this scope). To remove a scope from an existing agent, untick it, click “Save and issue a new secret”, and click “Revoke” on the older credential above. Saving issues a new secret that carries exactly these, and a later new secret carries them too. A credential it already has keeps what it allows until you revoke it above.' :
+          'Only the agent’s own account may give it more than it has; you may take something away (except Read, which every agent has). To remove a scope, untick it, click “Save and issue a new secret”, and click “Revoke” on the older credential above. Saving issues a new secret.')),
       h('p', { class: 'error', role: 'alert', hidden: true }),
       h('div', null, h('button', { type: 'submit' }, 'Save and issue a new secret')));
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const problem = form.querySelector('p[role=alert]');
-      const chosen = [...form.querySelectorAll('input')].filter((i) => i.getAttribute('name') === 'scope' && i.checked && !i.disabled).map((i) => i.value);
+      const chosen = [...form.querySelectorAll('input')].filter((i) => i.getAttribute('name') === 'scope' && i.checked && (i.value === 'read' ? (own || !known || has.includes('read')) : !i.disabled)).map((i) => i.value);
       problem.hidden = chosen.length > 0;
       problem.textContent = chosen.length ? '' : 'Tick at least one.';
       if (!chosen.length) return;
@@ -347,6 +348,9 @@ export const SETUP_WRITES_LINE = 'The prompt writes .orchestra/agent.json and .o
 export const SETUP_ONCE_LINE = 'What is still yours, once: install the Orchestra Bridge extension in VS Code, run “Orchestra Bridge: Set up” in the agent’s folder (it writes the workspace settings from your credential file’s address line and shows the server certificate’s fingerprint when the service has one — compare it), reload the window, and click the first wake. Nothing is typed into a chat before you do.';
 
 const canSaveToFolder = () => typeof window.showDirectoryPicker === 'function' && Boolean(window.isSecureContext);
+let lastAgentFolderHandle = null;
+const PAYLOAD_META = new WeakMap();
+export const WIZARD_STORAGE_KEY = 'orchestra.agentSetup.v1';
 
 // The service's own certificate, when it has one: the route is served only by an https service
 // that was given a certificate, so a plain-http install or the first-install tunnel simply has
@@ -373,15 +377,21 @@ function saveCertificate(certificate, file) {
 // .orchestra/ to an EXISTING .gitignore that lacks it. Creates or rewrites nothing else: the VS
 // Code workspace settings are the extension's own "Orchestra Bridge: Set up" command's work since
 // extension 0.9.0 (kittrial-5bb.203 review 01a12408, item 2). `files` is [[name, text], ...] built
-// from the secretless payload.
+// from the secretless payload. Remembers the last picked folder handle so subsequent saves start
+// in the same directory instead of resetting to Documents (kittrial-5bb.329).
 async function saveSetupFiles(files) {
   let root;
   try {
-    root = await window.showDirectoryPicker({ id: 'orchestra-agent', mode: 'readwrite' });
+    root = await window.showDirectoryPicker({
+      id: 'orchestra-agent',
+      mode: 'readwrite',
+      ...(lastAgentFolderHandle ? { startIn: lastAgentFolderHandle } : {}),
+    });
   } catch (error) {
     if (error && error.name === 'AbortError') return { cancelled: true };
     throw error;
   }
+  lastAgentFolderHandle = root;
   if (root.queryPermission && (await root.queryPermission({ mode: 'readwrite' })) !== 'granted') {
     const granted = root.requestPermission ? await root.requestPermission({ mode: 'readwrite' }) : 'denied';
     if (granted !== 'granted') throw Object.assign(new Error('Write permission was not granted'), { name: 'NotAllowedError' });
@@ -442,15 +452,16 @@ function fileBlock(title, text, folder, relative) {
 }
 
 // A copyable one-liner: label, the text in <code>, and a Copy button.
-function copyLine(label, text, { ariaLabel, what, note } = {}) {
-  return h('div', { class: 'setup-line' },
+function copyLine(label, text, { ariaLabel, what, note, os } = {}) {
+  return h('div', { class: 'setup-line' + (os ? ' setup-os' : ''), ...(os ? { 'data-os': os } : {}) },
     h('div', { class: 'copy-row' }, h('span', { class: 'small' }, label), copyButton('Copy', text, { ariaLabel: ariaLabel || 'Copy: ' + label, what: what || label })),
     h('code', { class: 'path' }, text),
     note ? h('p', { class: 'small muted' }, note) : null);
 }
 
-// One line per curl error the person may see when the test fails (kittrial-5bb.275).
+// One line per curl error the person may see when the test fails (kittrial-5bb.275 & .328).
 export const CURL_ERROR_LINES = Object.freeze({
+  2: 'curl exit 2 / cacert does not exist: either <your-name> was left in the credential file (run the rewrite command above so the real path is written automatically) or the certificate is still in Downloads without its leading dot (run the move command above).',
   60: 'curl exit 60: the certificate is not in this machine’s trust store — save the service’s certificate and keep the cacert line in the credential file.',
   35: 'curl exit 35: the TLS handshake failed (wrong address or a proxy speaking plain HTTP to the https port).',
   26: 'curl exit 26: cannot read the config file — the file name is wrong or Notepad added .txt.',
@@ -458,37 +469,95 @@ export const CURL_ERROR_LINES = Object.freeze({
 });
 
 // Step 1's numbered instructions. `secretValue` is the real secret (only from
-// secretSection) or the placeholder. When the service has its own certificate, the
-// pasted body also carries the curl options (cacert, and ssl-no-revoke for Windows
-// curl.exe) and the person must save the certificate BEFORE the test
-// (kittrial-5bb.275).
+// secretSection) or the placeholder.
+//
+// kittrial-5bb.328 & .329:
+// - Each OS-specific block carries data-os="windows" or data-os="posix" so the wizard's OS
+//   selector shows only the chosen system's commands and paths.
+// - Primary flow has ZERO <your-name> placeholders: the person pastes the single header line
+//   and runs the filled-in rewrite command (which writes # server = ..., # server certificate
+//   sha256 = ..., cacert = <real expanded path>, and ssl-no-revoke automatically).
+// - When hasCertificate is true, explains why browsers strip the leading dot when saving to
+//   Downloads and provides the filled-in Move-Item / mv command to move the .crt into the user
+//   profile with its leading dot restored.
+// - The manual Notepad/editor full-file body (with <your-name>) is tucked inside a collapsed
+//   <details data-fallback="manual-body"> for environments where the shell rewrite cannot run.
 function secretSteps(payload, secretValue, { withSecret, hasCertificate = false }) {
   const file = payload.secretFile;
   const test = setupText.testCommands(payload);
+  const check = setupText.checkCommands(payload, { hasCertificate });
+  const meta = PAYLOAD_META.get(payload) || {};
+  const address = meta.bridgeServer || payload.server;
+  const fingerprint = (meta.certificate && meta.certificate.sha256) || null;
+  const comments = setupText.credentialCommentLines(address, fingerprint);
+  const rewrite = setupText.credentialFileCommand(file, comments, {
+    certFile: payload.certificateFile,
+    hasCertificate,
+  });
+  const moveCert = setupText.certificateMoveCommands(payload.certificateFile);
   const value = secretValue || setupText.SECRET_PLACEHOLDER;
+  const singleHeader = setupText.headerLine(value);
   const bodyWindows = hasCertificate
     ? setupText.credentialFileBody(value, payload.certificateFile, { windows: true, hasCertificate: true }).trimEnd()
-    : setupText.headerLine(value);
+    : singleHeader;
   const bodyPosix = hasCertificate
     ? setupText.credentialFileBody(value, payload.certificateFile, { windows: false, hasCertificate: true }).trimEnd()
     : null;
   return h('ol', { class: 'setup-substeps' },
-    hasCertificate ? h('li', null, 'Save the service’s certificate FIRST (the “Save certificate” button above), as ', h('code', { class: 'path' }, payload.certificateFile.windows), ' (macOS/Linux ', h('code', { class: 'path' }, payload.certificateFile.posix), '). Every curl below needs that file.') : null,
-    h('li', null, 'Open Notepad (on macOS or Linux, a text editor).'),
-    h('li', null, copyLine(withSecret ? 'Paste this (it contains the secret):' : 'Paste this, with your secret in place of <your secret>:', bodyWindows,
-      { ariaLabel: withSecret ? 'Copy the credential file text with the secret' : 'Copy the credential file template', what: 'Credential file text', note: hasCertificate ? 'Type your own full path in place of <your-name> (PowerShell: echo $env:USERPROFILE; macOS/Linux: echo $HOME). The set-up rewrite writes the real expanded path for you.' : null })),
-    bodyPosix ? h('li', null, copyLine('On macOS or Linux the body is this instead:', bodyPosix,
-      { ariaLabel: 'Copy the macOS/Linux credential file text', what: 'Credential file text' })) : null,
+    hasCertificate ? h('li', null,
+      'Save the service’s certificate FIRST (the “Save certificate” button above), as ',
+      h('code', { class: 'path setup-os', 'data-os': 'windows' }, payload.certificateFile.windows),
+      h('span', { class: 'setup-os', 'data-os': 'posix' }, ' (macOS/Linux ', h('code', { class: 'path' }, payload.certificateFile.posix), ')'),
+      '. Every curl below needs that file.',
+      h('p', { class: 'small muted' }, moveCert.note),
+      copyLine('Move the downloaded certificate into your user profile (PowerShell):', moveCert.powershell,
+        { ariaLabel: 'Copy the PowerShell certificate move command', what: 'Certificate move command', os: 'windows' }),
+      copyLine('Move the downloaded certificate into your user profile (macOS/Linux):', moveCert.posix,
+        { ariaLabel: 'Copy the macOS/Linux certificate move command', what: 'Certificate move command', os: 'posix' })) : null,
+    h('li', null,
+      h('span', { class: 'setup-os', 'data-os': 'windows' }, 'Open Notepad.'),
+      h('span', { class: 'setup-os', 'data-os': 'posix' }, 'Open a text editor (on macOS or Linux).')),
+    h('li', null,
+      copyLine(withSecret ? 'Paste this line (it contains the secret):' : 'Paste this line, with your secret in place of <your secret>:', singleHeader,
+        { ariaLabel: withSecret ? 'Copy the credential file text with the secret' : 'Copy the credential file template', what: 'Credential file text',
+          note: 'No placeholders to edit: the rewrite command in the next step adds the server address and the real expanded certificate path automatically.' })),
     h('li', null,
       copyLine('File > Save As, set “Save as type” to “All files (*.*)”, and use this file name:', file.windows,
-        { ariaLabel: 'Copy the Windows secret file name', what: 'File name', note: 'Windows file dialogs understand %USERPROFILE%. Keep the name exactly, with no .txt at the end.' }),
-      copyLine('On macOS or Linux, save it as this file instead, then restrict it:', file.posix, { ariaLabel: 'Copy the macOS/Linux secret file name', what: 'File name' }),
-      copyLine('…and run:', test.posixChmod, { ariaLabel: 'Copy the chmod command', what: 'Command' })),
+        { ariaLabel: 'Copy the Windows secret file name', what: 'File name', os: 'windows',
+          note: 'Windows file dialogs understand %USERPROFILE%. Keep the name exactly, with no .txt at the end.' }),
+      copyLine('On macOS or Linux, save it as this file instead, then restrict it:', file.posix,
+        { ariaLabel: 'Copy the macOS/Linux secret file name', what: 'File name', os: 'posix' }),
+      copyLine('…and run:', test.posixChmod,
+        { ariaLabel: 'Copy the chmod command', what: 'Command', os: 'posix' })),
     h('li', null,
-      copyLine('Test it in PowerShell:', test.powershell, { ariaLabel: 'Copy the PowerShell test command', what: 'Command' }),
-      copyLine('On macOS or Linux:', test.posix, { ariaLabel: 'Copy the macOS/Linux test command', what: 'Command' }),
+      copyLine('Write the server address and real certificate path into the credential file (PowerShell):', rewrite.powershell,
+        { ariaLabel: 'Copy the PowerShell credential file rewrite command', what: 'Command', os: 'windows',
+          note: 'Rewrites the file in place so cacert uses your real user profile path (no placeholder to edit) and adds the # server = line for Orchestra Bridge.' }),
+      copyLine('Write the server address and real certificate path into the credential file (macOS/Linux):', rewrite.posix,
+        { ariaLabel: 'Copy the macOS/Linux credential file rewrite command', what: 'Command', os: 'posix',
+          note: 'Rewrites the file in place under mode 600 so cacert uses your real $HOME path (no placeholder to edit) and adds the # server = line for Orchestra Bridge.' }),
+      hasCertificate ? h('details', { class: 'small', 'data-fallback': 'manual-body' },
+        h('summary', null, 'Manual text-editor body (only if you cannot run the rewrite command above)'),
+        h('p', { class: 'small muted' }, 'Type your own full path in place of <your-name> (PowerShell: echo $env:USERPROFILE; macOS/Linux: echo $HOME). Leaving <your-name> literally in the file causes curl exit 2 (cacert file does not exist).'),
+        copyLine('Full Windows credential file body (replace <your-name>):', bodyWindows,
+          { ariaLabel: 'Copy the manual Windows credential file text', what: 'Credential file text', os: 'windows' }),
+        bodyPosix ? copyLine('On macOS or Linux the body is this instead:', bodyPosix,
+          { ariaLabel: 'Copy the macOS/Linux credential file text', what: 'Credential file text', os: 'posix' }) : null) : null),
+    h('li', null,
+      copyLine('Self-check and test in PowerShell (checks for common mistakes, then calls Orchestra):', check.powershell,
+        { ariaLabel: 'Copy the PowerShell self-check command', what: 'Command', os: 'windows' }),
+      copyLine('Test it in PowerShell:', test.powershell,
+        { ariaLabel: 'Copy the PowerShell test command', what: 'Command', os: 'windows' }),
+      copyLine('Self-check and test on macOS or Linux (checks for common mistakes, then calls Orchestra):', check.posix,
+        { ariaLabel: 'Copy the macOS/Linux self-check command', what: 'Command', os: 'posix' }),
+      copyLine('On macOS or Linux:', test.posix,
+        { ariaLabel: 'Copy the macOS/Linux test command', what: 'Command', os: 'posix' }),
       h('p', { class: 'small muted' }, 'Success prints the agent’s details as JSON (its id and name).'),
-      ...Object.entries(CURL_ERROR_LINES).map(([code, text]) => h('p', { class: 'small muted', 'data-curl-error': code }, text))),
+      ...Object.entries(CURL_ERROR_LINES).map(([code, text]) => (code === '26'
+        ? h('p', { class: 'small muted', 'data-curl-error': code },
+            h('span', { class: 'setup-os', 'data-os': 'windows' }, text),
+            h('span', { class: 'setup-os', 'data-os': 'posix' }, 'curl exit 26: cannot read the config file — the file name is wrong or an extra .txt extension was added.'))
+        : h('p', { class: 'small muted', 'data-curl-error': code }, text)))),
     h('li', null, 'Never put the secret on a command line, in the agent folder, in agent.json, in AGENT.md or in the setup prompt. Those only name the file above.'));
 }
 
@@ -535,6 +604,7 @@ function reissueSection(ctx, agent, payload, { hasCertificate = false } = {}) {
     section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload, { hasCertificate }),
       h('p', { class: 'small', 'data-scopes': (credential.scopes || []).join(' ') }, 'This credential carries' + (scopeList(credential.scopes) || ': nothing beyond reading') + '.'),
       olderCredentials(ctx, agent, credential.id));
+    if (typeof section.onReissued === 'function') section.onReissued();
   } }, 'Issue a new secret');
   section.append(
     h('p', { class: 'small muted' }, 'The secret was shown once, when the agent’s credential was issued, and cannot be shown again. If you stored it as below, nothing more is needed here. If it is lost, issue a new one.'),
@@ -568,6 +638,462 @@ async function reopenSetup(ctx, agentId, button) {
   setupDialog(ctx, { agent }, { secret: null, certificate: await agentCertificate(ctx) });
 }
 
+function walkElements(node, fn) {
+  if (!node || !node.childNodes) return;
+  for (const child of node.childNodes) {
+    if (child && child.tagName) {
+      fn(child);
+      walkElements(child, fn);
+    }
+  }
+}
+
+function readWizardStorage() {
+  try {
+    if (typeof sessionStorage === 'undefined') return null;
+    const raw = sessionStorage.getItem(WIZARD_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function writeWizardStorage(state) {
+  try {
+    if (typeof sessionStorage === 'undefined') return;
+    sessionStorage.setItem(WIZARD_STORAGE_KEY, JSON.stringify({
+      agentId: state.agentId,
+      step: state.step,
+      os: state.os,
+      role: state.role || 'worker',
+    }));
+  } catch { /* ignore storage errors */ }
+}
+
+export function clearWizardStorage() {
+  try {
+    if (typeof sessionStorage === 'undefined') return;
+    sessionStorage.removeItem(WIZARD_STORAGE_KEY);
+  } catch { /* ignore storage errors */ }
+}
+
+// Turns the three setup steps into a step-by-step wizard (kittrial-5bb.329):
+// - One step screen visible at a time (Step 1 of 3, Step 2 of 3, Step 3 of 3) with Next and Back.
+// - OS selector chosen first (auto-detected from navigator, changeable at any step) that hides
+//   commands and paths for other operating systems.
+// - A connection check before Next (GET /v1/service/certificate when hasCertificate, plus
+//   GET /v1/agents/{id} checking last_seen_at newer than the step's start), with a one-sentence
+//   remedy if not yet seen.
+// - On Step 3, states plainly what Orchestra Bridge 0.14+ writes (.orchestra/agent.json and
+//   .orchestra/AGENT.md into the open workspace folder from GET /v1/agents/me, plus comparing
+//   working_directory) and shows the fallback for older extensions (Save to agent folder…
+//   remembering the last folder, or let the agent do it).
+// - Runs a 3-second online check ONLY while Step 3 is open and document.visibilityState === 'visible',
+//   stopping immediately on success, when leaving Step 3, hiding the page, or closing the dialog.
+function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode = false, initialStep = 1, initialOs = null, initialLastSeenAt = null, keepAliveOptions = null } = {}) {
+  const saved = readWizardStorage();
+  const sameAgent = saved && saved.agentId === payload.agentId;
+  let currentOs = initialOs || (sameAgent && saved.os) || setupText.detectOs();
+  if (!setupText.OS_CHOICES.some(([v]) => v === currentOs)) currentOs = 'windows';
+  let currentStep = initialStep || 1;
+  let checkVerified = false;
+  let lastKeepAliveAt = 0;
+  let stepStartedAt = Date.now();
+  let baselineLastSeen = initialLastSeenAt || null;
+
+  const idleWarningBanner = h('div', {
+    class: 'small banner warn copy-row',
+    role: 'status',
+    'data-wizard-idle-warning': 'true',
+    hidden: true,
+  });
+  function showIdleWarning(detail) {
+    const raw = typeof detail === 'number' ? detail : (detail && detail.remainingSeconds);
+    const secs = typeof raw === 'number' && raw > 0 ? raw : 120;
+    const mins = Math.max(1, Math.round(secs / 60));
+    idleWarningBanner.replaceChildren(
+      h('span', null, `Your session will expire in about ${mins} min (${secs}s) from inactivity — continue set-up to stay signed in.`),
+      h('button', {
+        type: 'button',
+        'data-action': 'wizard-keep-alive',
+        onclick: async () => {
+          await touchKeepAlive({ force: true });
+          idleWarningBanner.hidden = true;
+        },
+      }, 'Keep session open'),
+    );
+    idleWarningBanner.hidden = false;
+  }
+  const onIdleWarningEvent = (event) => showIdleWarning(event && event.detail);
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener(SESSION_IDLE_WARNING_EVENT, onIdleWarningEvent);
+  }
+  let keepAliveHandle = null;
+  if (ctx && ctx.api && typeof ctx.api.keepAliveWhileVisible === 'function') {
+    keepAliveHandle = ctx.api.keepAliveWhileVisible({
+      ...(keepAliveOptions || {}),
+      onWarning: showIdleWarning,
+    });
+  }
+  function stopKeepAlive() {
+    if (keepAliveHandle && typeof keepAliveHandle.stop === 'function') {
+      try { keepAliveHandle.stop(); } catch { /* ignore */ }
+    }
+    keepAliveHandle = null;
+    if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener(SESSION_IDLE_WARNING_EVENT, onIdleWarningEvent);
+    }
+  }
+
+  async function touchKeepAlive({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && now - lastKeepAliveAt < 60000) return;
+    lastKeepAliveAt = now;
+    try {
+      if (ctx && typeof ctx.keepSessionAlive === 'function') await ctx.keepSessionAlive();
+      else if (ctx && ctx.api && typeof ctx.api.keepAlive === 'function') await ctx.api.keepAlive().catch(() => {});
+      else if (ctx && ctx.api && typeof ctx.api.current === 'function') await ctx.api.current().catch(() => {});
+    } catch { /* ignore */ }
+  }
+
+  const stepNodes = [];
+  let bodyNode = null;
+  let footNode = null;
+  let roleSelect = null;
+  const cls = (el) => el.className || el.getAttribute('class') || '';
+  walkElements(container, (el) => {
+    if (cls(el) === 'dialog-body') bodyNode = el;
+    if (cls(el) === 'dialog-foot') footNode = el;
+    if (el.getAttribute('id') === 'setup-role') roleSelect = el;
+    if (cls(el) === 'setup-step') stepNodes.push(el);
+    if (typeof el.onReissued !== 'undefined' || (cls(el) === 'setup-block' && el.parentNode)) {
+      el.onReissued = () => {
+        stepStartedAt = Date.now();
+        applyOsFilter();
+      };
+    }
+  });
+
+  const stepTitles = ['Store the secret', 'Set up the folder', 'Start the agent'];
+  const whenWorkedTexts = [
+    `What you will see when it worked: Running the test command prints this agent’s JSON ("id": "${payload.agentId}", "name": "${payload.name}") with no curl error, and Check & Next confirms the connection.`,
+    'What you will see when it worked: With Orchestra Bridge 0.14 or later in VS Code, Step 3’s “Orchestra Bridge: Set up” writes .orchestra/agent.json and .orchestra/AGENT.md (and .gitignore) directly into the open workspace folder from GET /v1/agents/me. With an older extension, “Save to agent folder…” (or the setup prompt) writes both files into the folder.',
+    `What you will see when it worked: In VS Code, “Orchestra Bridge: Set up” walks you through choosing the agent, confirming the server, trusting the certificate by fingerprint, testing the connection, writing .orchestra/agent.json and .orchestra/AGENT.md into the open workspace folder, checking working_directory, and turning watching on; the connection status below changes to Connected.`,
+  ];
+
+  // Add step-specific Bridge 0.14+ vs older extension guidance and "What you will see when it worked".
+  stepNodes.forEach((stepNode, idx) => {
+    const stepNum = idx + 1;
+    stepNode.setAttribute('data-wizard-step', String(stepNum));
+    if (stepNum === 1) {
+      walkElements(stepNode, (el) => {
+        if (el.tagName === 'CODE' && el.textContent === payload.secretFile.windows && !el.getAttribute('data-os')) {
+          el.setAttribute('data-os-path', 'secret');
+        }
+        if (cls(el) === 'setup-block') {
+          el.onReissued = () => {
+            stepStartedAt = Date.now();
+            applyOsFilter();
+          };
+        }
+      });
+    }
+    if (stepNum === 2) {
+      const bridgeStep2 = h('div', { class: 'banner info', role: 'note', 'data-bridge-note': 'step2' },
+        'Orchestra Bridge 0.14 or later writes ', h('code', null, setupText.CONFIG_PATH), ' and ', h('code', null, setupText.GUIDE_PATH),
+        ' (and ', h('code', null, setupText.GITIGNORE_LINE), ' in .gitignore) into the open VS Code workspace folder for you when you run “Orchestra Bridge: Set up” in Step 3. With an older Orchestra Bridge extension (before 0.14), use “Save to agent folder…” below (it remembers the last folder you picked) or “Or let the agent do it” to write those two files now.');
+      stepNode.append(bridgeStep2);
+    }
+    if (stepNum === 3) {
+      const bridgeStep3 = h('div', { class: 'setup-block', 'data-bridge-note': 'step3' },
+        h('p', { class: 'small' },
+          h('strong', null, 'Orchestra Bridge 0.14 or later: '),
+          'open this folder in VS Code and run “Orchestra Bridge: Set up” (',
+          h('kbd', { 'data-os-shortcut': 'palette' }, currentOs === 'macos' ? 'Cmd+Shift+P' : 'Ctrl+Shift+P'),
+          '); it walks you through the rest — chooses the agent from the credential files found, confirms the server, trusts the certificate by fingerprint (and reads the certificate from the setup bundle), tests the connection, writes ',
+          h('code', null, setupText.CONFIG_PATH), ' and ', h('code', null, setupText.GUIDE_PATH),
+          ' (and adds ', h('code', null, setupText.GITIGNORE_LINE),
+          ' to an existing .gitignore) directly into the open workspace folder from GET /v1/agents/me, compares the open workspace folder with this agent’s recorded working_directory (offering to record the open folder via PATCH /v1/agents/me if they differ), and turns watching on.'),
+        h('p', { class: 'small muted' },
+          h('strong', null, 'Older Orchestra Bridge extension (before 0.14): '),
+          'update the extension first (this site serves it), or use the fallback: an older installed extension writes only the VS Code workspace settings and does not write ',
+          h('code', null, setupText.CONFIG_PATH), ' or ', h('code', null, setupText.GUIDE_PATH),
+          ' — click “Back” to return to Step 2 and click “Save to agent folder…” (which remembers the last folder you picked) or “Or let the agent do it” to write those two files.'));
+      stepNode.append(bridgeStep3);
+    }
+    stepNode.append(h('p', { class: 'small banner info', 'data-when-worked': String(stepNum) }, whenWorkedTexts[idx]));
+  });
+
+  const onlineStatus = h('p', {
+    class: 'small banner',
+    role: 'status',
+    'data-online-status': 'true',
+    'data-online-state': 'waiting',
+  }, `Waiting for ${payload.name} to connect from VS Code or curl…`);
+  if (stepNodes[2]) {
+    stepNodes[2].append(onlineStatus);
+  }
+
+  const progressBadge = h('span', { class: 'chip accent', 'data-wizard-progress': String(currentStep) },
+    `Step ${currentStep} of 3: ${stepTitles[currentStep - 1]}`);
+  const pills = h('div', { class: 'seg', 'data-wizard-pills': 'true' },
+    stepTitles.map((title, idx) => {
+      const n = idx + 1;
+      return h('button', {
+        type: 'button',
+        'data-step-pill': String(n),
+        'aria-pressed': String(n === currentStep),
+        onclick: () => showStep(n),
+      }, `${n}. ${title}`);
+    }));
+  const osSelect = h('select', {
+    id: 'setup-os',
+    'data-os-select': 'true',
+    'aria-label': 'Your operating system',
+    onchange: (event) => {
+      currentOs = event.target.value;
+      applyOsFilter();
+      persistState();
+    },
+  }, setupText.OS_CHOICES.map(([val, label]) => h('option', { value: val, selected: val === currentOs ? true : null }, label)));
+  osSelect.value = currentOs;
+
+  const wizardBar = h('div', { class: 'copy-row', 'data-wizard-bar': 'true' },
+    progressBadge,
+    pills,
+    h('label', { class: 'small', for: 'setup-os' }, 'Operating system: ', osSelect));
+
+  if (bodyNode) {
+    const existingChildren = bodyNode.childNodes.slice();
+    bodyNode.replaceChildren(
+      existingChildren[0] || null,
+      wizardBar,
+      idleWarningBanner,
+      ...existingChildren.slice(1),
+    );
+  }
+
+  const checkStatus = h('p', {
+    class: 'small banner',
+    role: 'status',
+    'data-wizard-check-status': 'true',
+    'data-check-state': 'idle',
+    hidden: true,
+  });
+  const skipBtn = h('button', {
+    type: 'button',
+    'data-action': 'skip-check',
+    hidden: true,
+    onclick: () => {
+      checkStatus.hidden = true;
+      skipBtn.hidden = true;
+      if (currentStep < 3) showStep(currentStep + 1);
+    },
+  }, 'Continue without checking');
+  const backBtn = h('button', {
+    type: 'button',
+    'data-action': 'wizard-back',
+    hidden: currentStep === 1,
+    onclick: () => {
+      if (currentStep > 1) showStep(currentStep - 1);
+    },
+  }, 'Back');
+  const checkBtn = h('button', {
+    type: 'button',
+    'data-action': 'wizard-check',
+    onclick: () => runCheckBeforeNext({ advanceOnPass: false }),
+  }, 'Check connection');
+  const nextBtn = h('button', {
+    type: 'button',
+    class: 'primary',
+    'data-action': 'wizard-next',
+    onclick: () => {
+      if (currentStep === 1) {
+        return runCheckBeforeNext({ advanceOnPass: true });
+      }
+      if (currentStep === 2) {
+        if (checkVerified) { showStep(3); return true; }
+        return runCheckBeforeNext({ advanceOnPass: true });
+      }
+      return false;
+    },
+  }, 'Next');
+  const doneBtn = h('button', {
+    type: 'button',
+    class: currentStep === 3 ? 'primary' : '',
+    'data-action': 'wizard-done',
+    onclick: () => {
+      stopStep3Poll();
+      stopKeepAlive();
+      if (pageMode && ctx && typeof ctx.go === 'function') ctx.go('/agents');
+      else { container.close(); container.remove(); }
+    },
+  }, 'Done');
+
+  if (footNode) {
+    footNode.replaceChildren(checkStatus, skipBtn, backBtn, checkBtn, nextBtn, doneBtn);
+  }
+
+  function persistState() {
+    touchKeepAlive();
+    writeWizardStorage({
+      agentId: payload.agentId,
+      step: currentStep,
+      os: currentOs,
+      role: (roleSelect && roleSelect.value) || 'worker',
+    });
+  }
+
+  function applyOsFilter() {
+    const kind = setupText.osKind(currentOs);
+    walkElements(container, (el) => {
+      const targetOs = el.getAttribute('data-os');
+      if (targetOs) {
+        el.hidden = !(targetOs === currentOs || targetOs === kind);
+      }
+      const pathKind = el.getAttribute('data-os-path');
+      if (pathKind === 'secret') {
+        el.textContent = setupText.osSecretFile(payload.secretFile, currentOs);
+      } else if (pathKind === 'certificate') {
+        el.textContent = setupText.osCertificateFile(payload.certificateFile, currentOs);
+      }
+      if (el.getAttribute('data-os-shortcut') === 'palette') {
+        el.textContent = currentOs === 'macos' ? 'Cmd+Shift+P' : 'Ctrl+Shift+P';
+      }
+    });
+  }
+
+  function isNewerThanStart(lastSeen) {
+    if (!lastSeen) return false;
+    const seenStr = String(lastSeen);
+    if (baselineLastSeen && seenStr === String(baselineLastSeen)) return false;
+    const seenMs = Date.parse(seenStr);
+    if (Number.isNaN(seenMs) || seenMs < stepStartedAt) return false;
+    if (baselineLastSeen) {
+      const baseMs = Date.parse(String(baselineLastSeen));
+      if (!Number.isNaN(baseMs) && seenMs <= baseMs) return false;
+    }
+    return true;
+  }
+
+  async function runCheckBeforeNext({ advanceOnPass = false } = {}) {
+    touchKeepAlive();
+    if (hasCertificate && ctx && ctx.api && typeof ctx.api.certificate === 'function') {
+      try { await ctx.api.certificate(); } catch { /* ignore */ }
+    }
+    let latest = null;
+    if (ctx && ctx.api && typeof ctx.api.agent === 'function' && payload.agentId) {
+      try { latest = await ctx.api.agent(payload.agentId); } catch { latest = null; }
+    }
+    const seen = latest && latest.last_seen_at ? String(latest.last_seen_at) : null;
+    if (isNewerThanStart(seen)) {
+      checkVerified = true;
+      checkStatus.textContent = `Connected: ${payload.name} reached Orchestra during this step (last seen ${seen}).`;
+      checkStatus.setAttribute('data-check-state', 'passed');
+      checkStatus.hidden = false;
+      skipBtn.hidden = true;
+      onlineStatus.setAttribute('data-online-state', 'connected');
+      onlineStatus.textContent = `Connected: ${payload.name} has reached Orchestra (last active ${seen}).`;
+      if (advanceOnPass && currentStep < 3) {
+        showStep(currentStep + 1);
+      }
+      return true;
+    }
+    checkStatus.textContent = seen
+      ? `Orchestra has not seen a new request from ${payload.name} since this step started (last seen earlier at ${seen}). Run the self-check or test command in Step 1 now, then click Next again — or click Continue without checking.`
+      : `Orchestra has not seen a request from ${payload.name} yet. Run the self-check or test command in Step 1 first, then click Next again — or click Continue without checking.`;
+    checkStatus.setAttribute('data-check-state', 'pending');
+    checkStatus.hidden = false;
+    skipBtn.hidden = false;
+    return false;
+  }
+
+  // 3-second online check: runs ONLY while Step 3 is open and document.visibilityState === 'visible',
+  // and stops immediately on success, when leaving Step 3, hiding the page, or closing the dialog.
+  let pollTimer = null;
+  let pollStopped = false;
+  const isVisible = () => typeof document === 'undefined' || document.visibilityState === undefined || document.visibilityState === 'visible';
+
+  function stopStep3Poll() {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  async function pollStep3Once() {
+    if (pollStopped || currentStep !== 3 || !isVisible() || (!pageMode && !container.open)) {
+      stopStep3Poll();
+      return false;
+    }
+    if (!ctx || !ctx.api || typeof ctx.api.agent !== 'function' || !payload.agentId) return false;
+    try {
+      const latest = await ctx.api.agent(payload.agentId);
+      if (latest && latest.last_seen_at && isNewerThanStart(latest.last_seen_at)) {
+        pollStopped = true;
+        checkVerified = true;
+        stopStep3Poll();
+        onlineStatus.setAttribute('data-online-state', 'connected');
+        onlineStatus.textContent = `Connected: ${payload.name} has reached Orchestra (last active ${latest.last_seen_at}).`;
+        return true;
+      }
+    } catch { /* ignore transient error */ }
+    return false;
+  }
+
+  function syncStep3Poll() {
+    if (pollStopped || currentStep !== 3 || !isVisible() || (!pageMode && !container.open)) {
+      stopStep3Poll();
+      return;
+    }
+    if (pollTimer === null) {
+      pollStep3Once();
+      pollTimer = setInterval(pollStep3Once, 3000);
+    }
+  }
+
+  const onVisibilityChange = () => syncStep3Poll();
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', onVisibilityChange);
+  }
+  container.addEventListener('close', () => {
+    stopStep3Poll();
+    stopKeepAlive();
+    if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    }
+  });
+
+  function showStep(stepNumber) {
+    currentStep = Math.max(1, Math.min(3, Number(stepNumber) || 1));
+    container.setAttribute('data-active-step', String(currentStep));
+    progressBadge.setAttribute('data-wizard-progress', String(currentStep));
+    progressBadge.textContent = `Step ${currentStep} of 3: ${stepTitles[currentStep - 1]}`;
+    stepNodes.forEach((node, idx) => {
+      const active = idx + 1 === currentStep;
+      node.hidden = !active;
+      node.setAttribute('data-active', String(active));
+    });
+    walkElements(pills, (btn) => {
+      const n = Number(btn.getAttribute('data-step-pill'));
+      if (n) btn.setAttribute('aria-pressed', String(n === currentStep));
+    });
+    backBtn.hidden = currentStep === 1;
+    checkBtn.hidden = currentStep === 3;
+    nextBtn.hidden = currentStep === 3;
+    doneBtn.className = currentStep === 3 ? 'primary' : '';
+    checkStatus.hidden = true;
+    skipBtn.hidden = true;
+    persistState();
+    syncStep3Poll();
+  }
+
+  if (roleSelect) {
+    roleSelect.addEventListener('change', () => persistState());
+  }
+  applyOsFilter();
+  showStep(currentStep);
+  return { showStep, applyOsFilter, stopStep3Poll, syncStep3Poll, stopKeepAlive };
+}
+
 // `source` is the create response ({agent, setup, ...}) or {agent} from GET
 // /v1/agents/{id}; `secret` is present only straight after creation; `certificate` is the
 // service's own certificate (GET /v1/service/certificate) or null when it has none.
@@ -580,7 +1106,8 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   // The address the extension must use is the one this page is connected to, not the configured
   // public address, which may be a name that does not resolve from this person's network.
   const bridgeServer = location.origin;
-  let role = 'worker';
+  PAYLOAD_META.set(payload, { certificate, bridgeServer });
+  let role = (source && source.agent && source.agent.role === 'reviewer') ? 'reviewer' : 'worker';
   const prompt = setupText.setupPrompt(payload, { role, certificate, bridgeServer });
   const promptText = (chosen) => setupText.setupPrompt(payload, { role: chosen, certificate, bridgeServer });
 
@@ -589,7 +1116,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   if (canSaveToFolder()) {
     save = h('div', { class: 'copy-row' },
       h('button', { type: 'button', class: 'primary', 'aria-describedby': 'setup-save-hint', onclick: async (event) => {
-        const button = event.currentTarget;
+        const button = event.currentTarget || event.target;
         button.disabled = true;
         status.hidden = true;
         try {
@@ -620,10 +1147,41 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   // The role this window's agent takes (the extension's worker or reviewer: the prompt names it so
   // the person chooses the same in the extension's own set-up), and — when the service has its own
   // certificate — its fingerprint with a Save button and what comparing it does and does not prove.
-  const roleChoice = h('label', { class: 'small', for: 'setup-role' }, 'What this agent does in this window: ',
-    h('select', { id: 'setup-role', onchange: (event) => { role = event.target.value; drawPrompt(promptText(role)); } },
-      h('option', { value: 'worker' }, 'works on tasks and answers reviews'),
-      h('option', { value: 'reviewer' }, 'reviews other agents’ deliveries')));
+  const roleStatus = h('p', { class: 'small', role: 'status', 'data-role-status': 'true', hidden: true });
+  const roleSelectEl = h('select', { id: 'setup-role', onchange: async (event) => {
+    role = event.target.value;
+    drawPrompt(promptText(role));
+    roleStatus.hidden = true;
+    if (ctx && ctx.api && typeof ctx.api.updateAgent === 'function' && payload.agentId) {
+      try {
+        await ctx.api.updateAgent(payload.agentId, { role });
+        roleStatus.className = 'small muted';
+        roleStatus.setAttribute('role', 'status');
+        roleStatus.textContent = `Saved ${payload.name}’s stored role on Orchestra as ${role}.`;
+        roleStatus.hidden = false;
+      } catch (error) {
+        roleStatus.className = 'small error-text';
+        roleStatus.setAttribute('role', 'alert');
+        roleStatus.textContent = `Could not save ${payload.name}’s stored role on Orchestra: ${(error && error.message) || 'request failed'}.`;
+        roleStatus.hidden = false;
+      }
+    }
+  } },
+    h('option', { value: 'worker' }, 'works on tasks and answers reviews'),
+    h('option', { value: 'reviewer' }, 'reviews other agents’ deliveries'));
+  for (const opt of roleSelectEl.childNodes || []) {
+    if (opt && opt.getAttribute && opt.getAttribute('value') === role) {
+      opt.selected = true;
+      opt.setAttribute('selected', '');
+    }
+  }
+  roleSelectEl.value = role;
+  const roleChoice = h('div', { class: 'stack' },
+    h('label', { class: 'small', for: 'setup-role' }, 'What this agent does in this window: (also saves ', payload.name, '’s stored role on Orchestra) ',
+      roleSelectEl),
+    roleStatus,
+    h('p', { class: 'small muted', 'data-role-note': 'true' },
+      'Changing this picker updates both the setup prompt for this window and this agent’s stored role on Orchestra. A worker keeps the “Deliver and review” scope (needed to deliver its own work and answer review items on its own tasks), while its /v1/agents/me/next and wake omit other people’s deliveries awaiting review (to-review and review-recommended). Choose reviewer when this window should also be offered other people’s deliveries to review.'));
   const certificateBlock = certificate ? h('section', { class: 'setup-block', 'aria-label': 'The service’s own certificate' },
     h('div', { class: 'copy-row' }, h('h4', { class: 'small' }, 'The service’s own certificate'),
       copyButton('Copy', certificate.sha256, { ariaLabel: 'Copy the certificate fingerprint', what: 'Fingerprint' }),
@@ -667,12 +1225,86 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
           fileBlock(setupText.GUIDE_PATH, files[1][1], folder, setupText.GUIDE_PATH),
           source.setup && source.setup.setup_snippet ? h('details', null, h('summary', null, 'Shell commands instead (optional)'), h('pre', { class: 'json' }, source.setup.setup_snippet)) : null),
         step(3, 'Start the agent',
-          h('p', { class: 'small' }, 'Open ', where, ' in VS Code (File > Open Folder…), open the agent’s chat, and paste the resume prompt. Do this after steps 1 and 2.'),
+          h('p', { class: 'small' }, 'Open ', where, ' in VS Code (File > Open Folder…) and run “Orchestra Bridge: Set up”; it walks you through the rest (chooses this agent from your credential file, confirms the server, trusts the certificate by fingerprint, tests the connection, writes .orchestra/agent.json and .orchestra/AGENT.md, and turns watching on). Then open the agent’s chat and paste the resume prompt.'),
           h('p', { class: 'small', 'data-once': 'true' }, SETUP_ONCE_LINE),
+          h('p', { class: 'small muted', 'data-screen-reader-tip': 'true' },
+            'Tip: if VS Code makes sounds while the agent works, click the screen reader button in the bottom right of VS Code to switch it off.'),
           folder ? copyLine('Folder:', folder, { ariaLabel: 'Copy the agent folder path', what: 'Folder path' }) : null,
+          copyLine('VS Code command:', 'Orchestra Bridge: Set up', { ariaLabel: 'Copy the Orchestra Bridge Set up command', what: 'VS Code command' }),
+          hasCertificate ? h('div', { class: 'setup-block', 'data-bridge-cafile': 'true' },
+            h('p', { class: 'small' },
+              'Certificate trust before prompting the agent: Orchestra Bridge 0.14 or later reads the certificate from the site’s setup bundle during “Orchestra Bridge: Set up” so no setting is needed. With an older extension (before 0.14), BEFORE prompting the agent, either run “Orchestra Bridge: Check now” and compare the fingerprint, or set ',
+              h('code', null, 'orchestraBridge.caFile'),
+              ' in VS Code to the same certificate path your credential file uses (never install the certificate in system certificate stores, launch VS Code with --use-system-ca, or set NODE_EXTRA_CA_CERTS):'),
+            copyLine('orchestraBridge.caFile (Windows):', payload.certificateFile.windows,
+              { ariaLabel: 'Copy the Windows orchestraBridge.caFile path', what: 'orchestraBridge.caFile path', os: 'windows' }),
+            copyLine('orchestraBridge.caFile (macOS/Linux):', payload.certificateFile.posix,
+              { ariaLabel: 'Copy the macOS/Linux orchestraBridge.caFile path', what: 'orchestraBridge.caFile path', os: 'posix' })) : null,
           copyLine('Resume prompt:', resume, { ariaLabel: 'Copy the resume prompt', what: 'Resume prompt' })))),
     h('div', { class: 'dialog-foot' }, h('button', { type: 'button', class: 'primary', onclick: () => { dialog.close(); dialog.remove(); } }, 'Done')));
   dialog.addEventListener('close', () => dialog.remove());
   document.body.appendChild(dialog);
   dialog.showModal();
+  dialog.wizard = wireWizard(ctx, dialog, payload, {
+    hasCertificate,
+    initialLastSeenAt: (source && source.agent && source.agent.last_seen_at) || null,
+    keepAliveOptions: (ctx && ctx.keepAliveOptions) || null,
+  });
+  return dialog;
+}
+
+// Standalone #/setup wizard view: resumes the active agent's setup wizard across reloads
+// or session re-login using secretless sessionStorage state (kittrial-5bb.329 & .330).
+// When no agent is specified in the URL or sessionStorage, asks which agent to set up
+// without opening a modal on its own.
+export async function setupWizardPage(ctx) {
+  const saved = readWizardStorage();
+  const requestedId = (ctx.query && typeof ctx.query.get === 'function' && ctx.query.get('agent')) || (saved && saved.agentId) || null;
+  let agent = null;
+  if (requestedId) {
+    try { agent = await ctx.api.agent(requestedId); } catch { agent = null; }
+  }
+  if (!agent) {
+    let items = [];
+    try {
+      const listed = ctx.api && typeof ctx.api.agents === 'function' ? await ctx.api.agents({ limit: 20 }) : null;
+      items = (listed && listed.items) || [];
+    } catch { items = []; }
+    if (items.length) {
+      return h('div', { class: 'stack', 'data-view': 'agent-setup-chooser', 'data-agent-chooser': 'true' },
+        pageHead({ title: 'Set up an agent', lede: 'Choose which agent to set up in the three-step wizard.' }),
+        h('div', { class: 'panel' },
+          h('div', { class: 'panel-body stack' },
+            h('p', { class: 'small' }, 'Which agent do you want to set up?'),
+            h('ul', { class: 'open-items' }, items.map((a) => h('li', { class: 'copy-row', 'data-choose-agent': a.id },
+              h('strong', null, a.display_name || a.name),
+              h('button', {
+                type: 'button',
+                class: 'primary',
+                onclick: (e) => {
+                  if (ctx && typeof ctx.go === 'function') ctx.go(`/setup?agent=${encodeURIComponent(a.id)}`);
+                  else reopenSetup(ctx, a.id, e.currentTarget);
+                },
+              }, `Set up ${a.display_name || a.name}`)))),
+            h('div', { class: 'copy-row' }, h('a', { class: 'btn', href: ctx.href('/agents') }, 'Back to My agents')))));
+    }
+    return h('div', { class: 'stack' },
+      pageHead({ title: 'Set up an agent', lede: 'Create an agent on My agents first, then follow the three-step wizard.' }),
+      h('div', { class: 'panel' },
+        empty('No agent selected', 'Go to My agents to add an agent and start the step-by-step setup wizard.'),
+        h('div', { class: 'panel-body' }, h('a', { class: 'btn primary', href: ctx.href('/agents') }, 'Go to My agents'))));
+  }
+  const certificate = await agentCertificate(ctx);
+  const dialog = setupDialog(ctx, { agent }, { secret: null, certificate });
+  if (dialog.wizard && saved && saved.agentId === agent.id && saved.step) {
+    dialog.wizard.showStep(saved.step);
+  }
+  return h('div', { class: 'stack', 'data-view': 'agent-setup-wizard' },
+    pageHead({ title: `Set up ${agent.display_name || agent.name}`, lede: 'Step-by-step agent setup wizard.' }),
+    h('div', { class: 'panel' },
+      h('div', { class: 'panel-body' },
+        h('p', { class: 'small' }, 'The step-by-step setup wizard is open for ', h('strong', null, agent.display_name || agent.name), '.'),
+        h('div', { class: 'copy-row' },
+          h('button', { type: 'button', class: 'primary', onclick: (e) => reopenSetup(ctx, agent.id, e.currentTarget) }, 'Reopen setup wizard'),
+          h('a', { class: 'btn', href: ctx.href('/agents') }, 'Back to My agents')))));
 }

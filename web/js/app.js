@@ -16,7 +16,7 @@ import * as how from './views/how.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
-  home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list,
+  home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list, agentSetup: agents.setupWizardPage,
   project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings, setup: setup.page, how: how.page,
   newTask: task.create, task: task.detail,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
@@ -56,10 +56,15 @@ export async function start(root, options = {}) {
   };
   ctx.signOut = async () => {
     try { await api.logout(); } catch { /* the session is gone either way */ }
+    agents.clearWizardStorage();
     ctx.me = null; ctx.projects = [];
     showLogin();
   };
-  ctx.sessionLost = () => { ctx.me = null; showLogin('Your session has ended. Sign in again to continue.'); };
+  ctx.sessionLost = () => {
+    agents.clearWizardStorage();
+    ctx.me = null;
+    showLogin('Your session has ended. Sign in again to continue.');
+  };
 
   function showLogin(message) {
     mount(root, auth.login(ctx, message));
