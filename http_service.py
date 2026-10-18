@@ -3816,6 +3816,33 @@ def route(method, pattern, *, anonymous=False, csrf=True):
     return register
 
 
+#: What an HTTP agent needs before a guidance item is a move it can actually make: a
+#: read of the project's guidance and an acknowledgement of a version
+#: (kittrial-5bb.212). The probes below are matched against this service's own route
+#: table, so the item returns BY ITSELF the day those routes ship and cannot come back
+#: before (kittrial-5bb.334). One place to extend if .212 chooses another ack path.
+GUIDANCE_READ_PROBE = '/v1/projects/probe/guidance'
+GUIDANCE_ACK_PROBES = ('/v1/projects/probe/guidance/ack',
+                       '/v1/projects/probe/guidance/acknowledge')
+
+
+def serves_web_guidance(routes=None):
+    """(read, ack): does this service serve both agent guidance routes over HTTP?
+
+    The registered route table is the authority, not a hand-kept flag: an installation
+    whose kit serves the two routes shows the item exactly as kittrial-5bb.325 made it,
+    and one that does not is spared an item its web agents cannot clear. ``routes`` is
+    for tests and defaults to the table this module has registered.
+    """
+    read = ack = False
+    for verb, pattern, _name, _anonymous, _csrf in (ROUTES if routes is None else routes):
+        if verb == 'GET' and pattern.match(GUIDANCE_READ_PROBE):
+            read = True
+        elif verb == 'POST' and any(pattern.match(probe) for probe in GUIDANCE_ACK_PROBES):
+            ack = True
+    return read, ack
+
+
 class ApiHandler(BaseHTTPRequestHandler):
     """One request per call. Class attributes are supplied by :func:`build_handler`."""
 
@@ -6089,6 +6116,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             # The guidance acknowledgement is a move row too (kittrial-5bb.325), so a web
             # agent's wait wakes for a new version and its fingerprint changes with it;
             # the row is the same one /v1/agents/me/next shows as its first next_action.
+            # Withheld while this service has no HTTP guidance read/ack route to clear it
+            # (kittrial-5bb.334): a row that cannot be acted on must not be a wake.
             item = self._agent_guidance_item(project_id, actor)
             if item is not None:
                 rows.append(dict(item, project=project_id))
@@ -6817,11 +6846,19 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _agent_guidance_item(self, project_id, actor):
         """This actor's guidance move item for one project, or None (kittrial-5bb.325).
 
+        Only when this service serves BOTH routes a web agent needs to clear it - reading
+        the guidance and acknowledging a version over HTTP (:func:`serves_web_guidance`,
+        kittrial-5bb.212). Until then the item is withheld: .325 made a web agent stop and
+        ask, correctly, because over HTTP there is nothing it can run to clear the item
+        (kittrial-5bb.334). The SSH/endpoint reads keep it unchanged.
+
         A backend with no guidance store (the in-process test backend) or a guidance
         read that fails answers None: a guidance read never turns another read into an
         error, exactly as an unreadable guidance record keeps its own repaired shape.
         The item carries the version and the command, never the guidance text.
         """
+        if not all(serves_web_guidance()):
+            return None
         reader = getattr(self.backend, 'guidance_state', None)
         if reader is None:
             return None
@@ -6898,7 +6935,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 continue
             # The guidance acknowledgement (kittrial-5bb.325) is this agent's own move in
             # every project it may read: one row per project whose current version this
-            # actor has not acknowledged. No guidance set means no row.
+            # actor has not acknowledged. No guidance set means no row, and no row while
+            # this service has no HTTP guidance read/ack route to clear it
+            # (kittrial-5bb.334, one gate in _agent_guidance_item).
             #
             # Single-agent reads only: this item is the calling agent's own move, so the
             # owner's multi-agent listing (``many``) does not pay one extra host read per
