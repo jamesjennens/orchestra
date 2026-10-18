@@ -780,7 +780,8 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     return result
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
-          reference_attention=False, verifiers=None,independent_approval=False,owners=None,provenance_writes=True):
+          reference_attention=False, verifiers=None,independent_approval=False,owners=None,provenance_writes=True,
+          identity_names=None):
     """One page of the work queue.
 
     ``reverts`` and ``scopes`` are PER TASK: each is a mapping of task id to that
@@ -1085,11 +1086,18 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             hold_sentence=integration_hold_sentence(review)
             if hold_sentence and hold_sentence not in move_text:
                 move_text=move_text+' Integration hold: '+hold_sentence+'.'
+        # DISPLAY ONLY (kittrial-5bb.333): the stored assignee is the actor id and is NOT
+        # interpreted here. `owner_name` is the actor's display name, added so a reader sees
+        # NAME (ACTOR id) now that an assignment stores the actor id; it never feeds an
+        # ownership or move decision.
+        row_owner=row.get('assignee')
+        owner_name=(identity_names or {}).get(row_owner) if isinstance(row_owner,str) and row_owner else None
         items.append({**({'assignment_notices':notices} if notices['total'] else {}),
                       'open_items':open_items,'blocking_items':blocking_items,
                       'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
-                      'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
+                      'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row_owner,'status':row.get('status'),'review_state':state,
+                      **({'owner_name':owner_name} if owner_name and owner_name!=row_owner else {}),
                       'whose_move':move,'next':move_text,
                       # Additive selection facts (kittrial-5bb.6), all from the one shared
                       # projection: the next-action ROLE (never the assignee field), the
@@ -1261,7 +1269,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
             independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False,
-            lanes_scope='all',provenance_writes=True):
+            lanes_scope='all',provenance_writes=True,identity_names=None):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
@@ -1304,12 +1312,14 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                 queue_payload=queue(rows,actor,['--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
                                     operators=operators,journal=path,reference_attention=False,
                                     verifiers=verifiers,independent_approval=independent_approval,
-                                    owners=owners,provenance_writes=provenance_writes)
+                                    owners=owners,provenance_writes=provenance_writes,
+                                    identity_names=identity_names)
                 return coordinator_view(queue_payload.get('items') or [],lanes_payload)
             queue_payload=queue(rows,actor,['--mine','--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
                                 operators=operators,journal=path,reference_attention=False,
                                 verifiers=verifiers,independent_approval=independent_approval,
-                                owners=owners,provenance_writes=provenance_writes)
+                                owners=owners,provenance_writes=provenance_writes,
+                                identity_names=identity_names)
             # The guidance acknowledgement is the caller's move too (kittrial-5bb.325): the
             # shared block carries the one item, and it joins the rows this projection
             # filters, so a worker waiting on `wait` WAKES for a new guidance version and
@@ -1331,7 +1341,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers,
                      independent_approval=independent_approval,owners=owners,
-                     provenance_writes=provenance_writes)
+                     provenance_writes=provenance_writes,identity_names=identity_names)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
@@ -1371,7 +1381,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     result=review(rows,task,actor,payload,run, operators=operators, journal=path,
                   review_writes=review_writes, independent_approval=independent_approval,
                   coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
-                  verifiers=verifiers)
+                  verifiers=verifiers, identity_names=identity_names)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])
