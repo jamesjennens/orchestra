@@ -5,6 +5,7 @@ import { h, time, toast, copyText, copyButton, confirmDialog } from '../dom.js';
 import { pageHead, empty, field, setFieldError, formValues, act, errorState } from '../ui.js';
 import * as setupText from '../agentSetup.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
+import { SESSION_IDLE_WARNING_EVENT } from '../api.js';
 
 export const ATTENTION = {
   feedback: ['Has feedback to act on', 'warn'],
@@ -552,7 +553,11 @@ function secretSteps(payload, secretValue, { withSecret, hasCertificate = false 
       copyLine('On macOS or Linux:', test.posix,
         { ariaLabel: 'Copy the macOS/Linux test command', what: 'Command', os: 'posix' }),
       h('p', { class: 'small muted' }, 'Success prints the agent’s details as JSON (its id and name).'),
-      ...Object.entries(CURL_ERROR_LINES).map(([code, text]) => h('p', { class: 'small muted', 'data-curl-error': code }, text))),
+      ...Object.entries(CURL_ERROR_LINES).map(([code, text]) => (code === '26'
+        ? h('p', { class: 'small muted', 'data-curl-error': code },
+            h('span', { class: 'setup-os', 'data-os': 'windows' }, text),
+            h('span', { class: 'setup-os', 'data-os': 'posix' }, 'curl exit 26: cannot read the config file — the file name is wrong or an extra .txt extension was added.'))
+        : h('p', { class: 'small muted', 'data-curl-error': code }, text)))),
     h('li', null, 'Never put the secret on a command line, in the agent folder, in agent.json, in AGENT.md or in the setup prompt. Those only name the file above.'));
 }
 
@@ -663,19 +668,27 @@ function writeWizardStorage(state) {
   } catch { /* ignore storage errors */ }
 }
 
+export function clearWizardStorage() {
+  try {
+    if (typeof sessionStorage === 'undefined') return;
+    sessionStorage.removeItem(WIZARD_STORAGE_KEY);
+  } catch { /* ignore storage errors */ }
+}
+
 // Turns the three setup steps into a step-by-step wizard (kittrial-5bb.329):
 // - One step screen visible at a time (Step 1 of 3, Step 2 of 3, Step 3 of 3) with Next and Back.
 // - OS selector chosen first (auto-detected from navigator, changeable at any step) that hides
 //   commands and paths for other operating systems.
 // - A connection check before Next (GET /v1/service/certificate when hasCertificate, plus
-//   GET /v1/agents/{id} checking last_seen_at), with a one-sentence remedy if not yet seen.
+//   GET /v1/agents/{id} checking last_seen_at newer than the step's start), with a one-sentence
+//   remedy if not yet seen.
 // - On Step 3, states plainly what Orchestra Bridge 0.14+ writes (.orchestra/agent.json and
 //   .orchestra/AGENT.md into the open workspace folder from GET /v1/agents/me, plus comparing
 //   working_directory) and shows the fallback for older extensions (Save to agent folder…
 //   remembering the last folder, or let the agent do it).
 // - Runs a 3-second online check ONLY while Step 3 is open and document.visibilityState === 'visible',
 //   stopping immediately on success, when leaving Step 3, hiding the page, or closing the dialog.
-function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode = false, initialStep = 1, initialOs = null } = {}) {
+function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode = false, initialStep = 1, initialOs = null, initialLastSeenAt = null, keepAliveOptions = null } = {}) {
   const saved = readWizardStorage();
   const sameAgent = saved && saved.agentId === payload.agentId;
   let currentOs = initialOs || (sameAgent && saved.os) || setupText.detectOs();
@@ -683,23 +696,41 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
   let currentStep = initialStep || 1;
   let checkVerified = false;
   let lastKeepAliveAt = 0;
+  let stepStartedAt = Date.now();
+  let baselineLastSeen = initialLastSeenAt || null;
 
-  const idleWarningBanner = h('p', {
-    class: 'small banner warn',
+  const idleWarningBanner = h('div', {
+    class: 'small banner warn copy-row',
     role: 'status',
     'data-wizard-idle-warning': 'true',
     hidden: true,
   });
+  function showIdleWarning(detail) {
+    const raw = typeof detail === 'number' ? detail : (detail && detail.remainingSeconds);
+    const secs = typeof raw === 'number' && raw > 0 ? raw : 120;
+    const mins = Math.max(1, Math.round(secs / 60));
+    idleWarningBanner.replaceChildren(
+      h('span', null, `Your session will expire in about ${mins} min (${secs}s) from inactivity — continue set-up to stay signed in.`),
+      h('button', {
+        type: 'button',
+        'data-action': 'wizard-keep-alive',
+        onclick: async () => {
+          await touchKeepAlive({ force: true });
+          idleWarningBanner.hidden = true;
+        },
+      }, 'Keep session open'),
+    );
+    idleWarningBanner.hidden = false;
+  }
+  const onIdleWarningEvent = (event) => showIdleWarning(event && event.detail);
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener(SESSION_IDLE_WARNING_EVENT, onIdleWarningEvent);
+  }
   let keepAliveHandle = null;
   if (ctx && ctx.api && typeof ctx.api.keepAliveWhileVisible === 'function') {
     keepAliveHandle = ctx.api.keepAliveWhileVisible({
-      onWarning(detail) {
-        const raw = typeof detail === 'number' ? detail : (detail && detail.remainingSeconds);
-        const secs = typeof raw === 'number' && raw > 0 ? raw : 120;
-        const mins = Math.max(1, Math.round(secs / 60));
-        idleWarningBanner.textContent = `Your session will expire in about ${mins} minute(s) from inactivity — continue set-up to stay signed in.`;
-        idleWarningBanner.hidden = false;
-      },
+      ...(keepAliveOptions || {}),
+      onWarning: showIdleWarning,
     });
   }
   function stopKeepAlive() {
@@ -707,16 +738,19 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
       try { keepAliveHandle.stop(); } catch { /* ignore */ }
     }
     keepAliveHandle = null;
+    if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener(SESSION_IDLE_WARNING_EVENT, onIdleWarningEvent);
+    }
   }
 
-  function touchKeepAlive() {
+  async function touchKeepAlive({ force = false } = {}) {
     const now = Date.now();
-    if (now - lastKeepAliveAt < 60000) return;
+    if (!force && now - lastKeepAliveAt < 60000) return;
     lastKeepAliveAt = now;
     try {
-      if (ctx && typeof ctx.keepSessionAlive === 'function') ctx.keepSessionAlive();
-      else if (ctx && ctx.api && typeof ctx.api.keepAlive === 'function') ctx.api.keepAlive();
-      else if (ctx && ctx.api && typeof ctx.api.current === 'function') ctx.api.current().catch(() => {});
+      if (ctx && typeof ctx.keepSessionAlive === 'function') await ctx.keepSessionAlive();
+      else if (ctx && ctx.api && typeof ctx.api.keepAlive === 'function') await ctx.api.keepAlive().catch(() => {});
+      else if (ctx && ctx.api && typeof ctx.api.current === 'function') await ctx.api.current().catch(() => {});
     } catch { /* ignore */ }
   }
 
@@ -731,7 +765,10 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
     if (el.getAttribute('id') === 'setup-role') roleSelect = el;
     if (cls(el) === 'setup-step') stepNodes.push(el);
     if (typeof el.onReissued !== 'undefined' || (cls(el) === 'setup-block' && el.parentNode)) {
-      el.onReissued = () => applyOsFilter();
+      el.onReissued = () => {
+        stepStartedAt = Date.now();
+        applyOsFilter();
+      };
     }
   });
 
@@ -752,7 +789,10 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
           el.setAttribute('data-os-path', 'secret');
         }
         if (cls(el) === 'setup-block') {
-          el.onReissued = () => applyOsFilter();
+          el.onReissued = () => {
+            stepStartedAt = Date.now();
+            applyOsFilter();
+          };
         }
       });
     }
@@ -867,11 +907,13 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
     'data-action': 'wizard-next',
     onclick: () => {
       if (currentStep === 1) {
-        runCheckBeforeNext({ advanceOnPass: true });
-      } else if (currentStep === 2) {
-        if (checkVerified) showStep(3);
-        else runCheckBeforeNext({ advanceOnPass: true });
+        return runCheckBeforeNext({ advanceOnPass: true });
       }
+      if (currentStep === 2) {
+        if (checkVerified) { showStep(3); return true; }
+        return runCheckBeforeNext({ advanceOnPass: true });
+      }
+      return false;
     },
   }, 'Next');
   const doneBtn = h('button', {
@@ -919,6 +961,19 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
     });
   }
 
+  function isNewerThanStart(lastSeen) {
+    if (!lastSeen) return false;
+    const seenStr = String(lastSeen);
+    if (baselineLastSeen && seenStr === String(baselineLastSeen)) return false;
+    const seenMs = Date.parse(seenStr);
+    if (Number.isNaN(seenMs) || seenMs < stepStartedAt) return false;
+    if (baselineLastSeen) {
+      const baseMs = Date.parse(String(baselineLastSeen));
+      if (!Number.isNaN(baseMs) && seenMs <= baseMs) return false;
+    }
+    return true;
+  }
+
   async function runCheckBeforeNext({ advanceOnPass = false } = {}) {
     touchKeepAlive();
     if (hasCertificate && ctx && ctx.api && typeof ctx.api.certificate === 'function') {
@@ -928,20 +983,23 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
     if (ctx && ctx.api && typeof ctx.api.agent === 'function' && payload.agentId) {
       try { latest = await ctx.api.agent(payload.agentId); } catch { latest = null; }
     }
-    if (latest && latest.last_seen_at) {
+    const seen = latest && latest.last_seen_at ? String(latest.last_seen_at) : null;
+    if (isNewerThanStart(seen)) {
       checkVerified = true;
-      checkStatus.textContent = `Connected: ${payload.name} reached Orchestra (last seen ${latest.last_seen_at}).`;
+      checkStatus.textContent = `Connected: ${payload.name} reached Orchestra during this step (last seen ${seen}).`;
       checkStatus.setAttribute('data-check-state', 'passed');
       checkStatus.hidden = false;
       skipBtn.hidden = true;
       onlineStatus.setAttribute('data-online-state', 'connected');
-      onlineStatus.textContent = `Connected: ${payload.name} has reached Orchestra (last active ${latest.last_seen_at}).`;
+      onlineStatus.textContent = `Connected: ${payload.name} has reached Orchestra (last active ${seen}).`;
       if (advanceOnPass && currentStep < 3) {
         showStep(currentStep + 1);
       }
       return true;
     }
-    checkStatus.textContent = `Orchestra has not seen a request from ${payload.name} yet. Run the self-check or test command in Step 1 first, then click Next again — or click Continue without checking.`;
+    checkStatus.textContent = seen
+      ? `Orchestra has not seen a new request from ${payload.name} since this step started (last seen earlier at ${seen}). Run the self-check or test command in Step 1 now, then click Next again — or click Continue without checking.`
+      : `Orchestra has not seen a request from ${payload.name} yet. Run the self-check or test command in Step 1 first, then click Next again — or click Continue without checking.`;
     checkStatus.setAttribute('data-check-state', 'pending');
     checkStatus.hidden = false;
     skipBtn.hidden = false;
@@ -969,7 +1027,7 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
     if (!ctx || !ctx.api || typeof ctx.api.agent !== 'function' || !payload.agentId) return false;
     try {
       const latest = await ctx.api.agent(payload.agentId);
-      if (latest && latest.last_seen_at) {
+      if (latest && latest.last_seen_at && isNewerThanStart(latest.last_seen_at)) {
         pollStopped = true;
         checkVerified = true;
         stopStep3Poll();
@@ -1089,19 +1147,41 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   // The role this window's agent takes (the extension's worker or reviewer: the prompt names it so
   // the person chooses the same in the extension's own set-up), and — when the service has its own
   // certificate — its fingerprint with a Save button and what comparing it does and does not prove.
+  const roleStatus = h('p', { class: 'small', role: 'status', 'data-role-status': 'true', hidden: true });
+  const roleSelectEl = h('select', { id: 'setup-role', onchange: async (event) => {
+    role = event.target.value;
+    drawPrompt(promptText(role));
+    roleStatus.hidden = true;
+    if (ctx && ctx.api && typeof ctx.api.updateAgent === 'function' && payload.agentId) {
+      try {
+        await ctx.api.updateAgent(payload.agentId, { role });
+        roleStatus.className = 'small muted';
+        roleStatus.setAttribute('role', 'status');
+        roleStatus.textContent = `Saved ${payload.name}’s stored role on Orchestra as ${role}.`;
+        roleStatus.hidden = false;
+      } catch (error) {
+        roleStatus.className = 'small error-text';
+        roleStatus.setAttribute('role', 'alert');
+        roleStatus.textContent = `Could not save ${payload.name}’s stored role on Orchestra: ${(error && error.message) || 'request failed'}.`;
+        roleStatus.hidden = false;
+      }
+    }
+  } },
+    h('option', { value: 'worker' }, 'works on tasks and answers reviews'),
+    h('option', { value: 'reviewer' }, 'reviews other agents’ deliveries'));
+  for (const opt of roleSelectEl.childNodes || []) {
+    if (opt && opt.getAttribute && opt.getAttribute('value') === role) {
+      opt.selected = true;
+      opt.setAttribute('selected', '');
+    }
+  }
+  roleSelectEl.value = role;
   const roleChoice = h('div', { class: 'stack' },
-    h('label', { class: 'small', for: 'setup-role' }, 'What this agent does in this window: ',
-      h('select', { id: 'setup-role', value: role, onchange: (event) => {
-        role = event.target.value;
-        drawPrompt(promptText(role));
-        if (ctx && ctx.api && typeof ctx.api.updateAgent === 'function' && payload.agentId) {
-          ctx.api.updateAgent(payload.agentId, { role }).catch(() => {});
-        }
-      } },
-        h('option', { value: 'worker' }, 'works on tasks and answers reviews'),
-        h('option', { value: 'reviewer' }, 'reviews other agents’ deliveries'))),
+    h('label', { class: 'small', for: 'setup-role' }, 'What this agent does in this window: (also saves ', payload.name, '’s stored role on Orchestra) ',
+      roleSelectEl),
+    roleStatus,
     h('p', { class: 'small muted', 'data-role-note': 'true' },
-      'A worker keeps the “Deliver and review” scope (needed to deliver its own work and answer review items on its own tasks), while its /v1/agents/me/next and wake omit other people’s deliveries awaiting review (to-review and review-recommended). Choose reviewer when this window should also be offered other people’s deliveries to review.'));
+      'Changing this picker updates both the setup prompt for this window and this agent’s stored role on Orchestra. A worker keeps the “Deliver and review” scope (needed to deliver its own work and answer review items on its own tasks), while its /v1/agents/me/next and wake omit other people’s deliveries awaiting review (to-review and review-recommended). Choose reviewer when this window should also be offered other people’s deliveries to review.'));
   const certificateBlock = certificate ? h('section', { class: 'setup-block', 'aria-label': 'The service’s own certificate' },
     h('div', { class: 'copy-row' }, h('h4', { class: 'small' }, 'The service’s own certificate'),
       copyButton('Copy', certificate.sha256, { ariaLabel: 'Copy the certificate fingerprint', what: 'Fingerprint' }),
@@ -1165,12 +1245,18 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   dialog.addEventListener('close', () => dialog.remove());
   document.body.appendChild(dialog);
   dialog.showModal();
-  dialog.wizard = wireWizard(ctx, dialog, payload, { hasCertificate });
+  dialog.wizard = wireWizard(ctx, dialog, payload, {
+    hasCertificate,
+    initialLastSeenAt: (source && source.agent && source.agent.last_seen_at) || null,
+    keepAliveOptions: (ctx && ctx.keepAliveOptions) || null,
+  });
   return dialog;
 }
 
 // Standalone #/setup wizard view: resumes the active agent's setup wizard across reloads
 // or session re-login using secretless sessionStorage state (kittrial-5bb.329 & .330).
+// When no agent is specified in the URL or sessionStorage, asks which agent to set up
+// without opening a modal on its own.
 export async function setupWizardPage(ctx) {
   const saved = readWizardStorage();
   const requestedId = (ctx.query && typeof ctx.query.get === 'function' && ctx.query.get('agent')) || (saved && saved.agentId) || null;
@@ -1179,12 +1265,29 @@ export async function setupWizardPage(ctx) {
     try { agent = await ctx.api.agent(requestedId); } catch { agent = null; }
   }
   if (!agent) {
+    let items = [];
     try {
-      const listed = await ctx.api.agents({ limit: 20 });
-      agent = (listed && listed.items && listed.items[0]) || null;
-    } catch { agent = null; }
-  }
-  if (!agent) {
+      const listed = ctx.api && typeof ctx.api.agents === 'function' ? await ctx.api.agents({ limit: 20 }) : null;
+      items = (listed && listed.items) || [];
+    } catch { items = []; }
+    if (items.length) {
+      return h('div', { class: 'stack', 'data-view': 'agent-setup-chooser', 'data-agent-chooser': 'true' },
+        pageHead({ title: 'Set up an agent', lede: 'Choose which agent to set up in the three-step wizard.' }),
+        h('div', { class: 'panel' },
+          h('div', { class: 'panel-body stack' },
+            h('p', { class: 'small' }, 'Which agent do you want to set up?'),
+            h('ul', { class: 'open-items' }, items.map((a) => h('li', { class: 'copy-row', 'data-choose-agent': a.id },
+              h('strong', null, a.display_name || a.name),
+              h('button', {
+                type: 'button',
+                class: 'primary',
+                onclick: (e) => {
+                  if (ctx && typeof ctx.go === 'function') ctx.go(`/setup?agent=${encodeURIComponent(a.id)}`);
+                  else reopenSetup(ctx, a.id, e.currentTarget);
+                },
+              }, `Set up ${a.display_name || a.name}`)))),
+            h('div', { class: 'copy-row' }, h('a', { class: 'btn', href: ctx.href('/agents') }, 'Back to My agents')))));
+    }
     return h('div', { class: 'stack' },
       pageHead({ title: 'Set up an agent', lede: 'Create an agent on My agents first, then follow the three-step wizard.' }),
       h('div', { class: 'panel' },

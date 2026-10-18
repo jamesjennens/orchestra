@@ -56,10 +56,15 @@ export async function start(root, options = {}) {
   };
   ctx.signOut = async () => {
     try { await api.logout(); } catch { /* the session is gone either way */ }
+    agents.clearWizardStorage();
     ctx.me = null; ctx.projects = [];
     showLogin();
   };
-  ctx.sessionLost = () => { ctx.me = null; showLogin('Your session has ended. Sign in again to continue.'); };
+  ctx.sessionLost = () => {
+    agents.clearWizardStorage();
+    ctx.me = null;
+    showLogin('Your session has ended. Sign in again to continue.');
+  };
 
   function showLogin(message) {
     mount(root, auth.login(ctx, message));

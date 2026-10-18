@@ -44,6 +44,7 @@ from contextlib import closing
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 import claim_limit
@@ -960,7 +961,7 @@ def validate_claim_limit(value):
 
 def validate_agent_role(value):
     """The stored form of an agent's role ('worker' or 'reviewer', or None to clear)."""
-    if value is None or value == '':
+    if value is None:
         return None
     if isinstance(value, str):
         clean = value.strip()
@@ -2761,16 +2762,70 @@ class Service:
                      'secret_file': agent_secret_file(name)['name']})
 
     @staticmethod
-    def _agent_text(value, field, limit):
+    def _has_forbidden_text_char(value):
+        for c in value:
+            code = ord(c)
+            if code < 32 or 0x7f <= code <= 0x9f or not c.isprintable():
+                return True
+            if unicodedata.category(c) in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp'):
+                return True
+        return False
+
+    @classmethod
+    def _agent_text(cls, value, field, limit):
         if value is None:
             return None
         if not isinstance(value, str):
             raise invalid('%s must be text' % field)
+        if cls._has_forbidden_text_char(value):
+            raise invalid('%s must be at most %d printable characters' % (field, limit))
         text = value.strip()
         if not text:
             return None
-        if len(text) > limit or any(ord(c) < 32 for c in text):
+        if len(text) > limit:
             raise invalid('%s must be at most %d printable characters' % (field, limit))
+        return text
+
+    #: Bounded Windows/POSIX path root: POSIX `/`, home `~` (`~` or `~/...`), Windows drive
+    #: `[A-Za-z]:\` / `[A-Za-z]:/`, or UNC `\\host\share`.
+    _WORKING_DIR_ROOT = re.compile(
+        r'^(?:[A-Za-z]:[\\/]+|\\\\[A-Za-z0-9._-]+[\\/]+[A-Za-z0-9._$-]+(?:[\\/]+|$)|~(?:[\\/]+|$)|/+)'
+    )
+    #: Bounded folder segment: letters, digits, `.`, `_`, `-`, and single internal spaces,
+    #: never ending in `.`, never containing `..` or `. ` (sentence punctuation), and at most
+    #: 3 spaces per segment so prose sentences cannot masquerade as a folder path.
+    _WORKING_DIR_SEGMENT = re.compile(r'^[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+){0,3}$')
+
+    @classmethod
+    def _agent_working_directory(cls, value, *, allow_empty=True):
+        if value is None:
+            if allow_empty:
+                return None
+            raise invalid('working_directory must be a valid Windows or POSIX folder path (1-%d characters)'
+                          % AGENT_DIRECTORY_MAX)
+        if not isinstance(value, str):
+            raise invalid('working_directory must be text')
+        if cls._has_forbidden_text_char(value):
+            raise invalid('working_directory must not contain control, non-printable, or bidi characters')
+        text = value.strip()
+        if not text:
+            if allow_empty:
+                return None
+            raise invalid('working_directory must be a valid Windows or POSIX folder path (1-%d characters)'
+                          % AGENT_DIRECTORY_MAX)
+        if len(text) > AGENT_DIRECTORY_MAX:
+            raise invalid('working_directory must be at most %d printable characters' % AGENT_DIRECTORY_MAX)
+        match = cls._WORKING_DIR_ROOT.match(text)
+        if not match:
+            raise invalid('working_directory must be an absolute or home-relative Windows or POSIX path')
+        rest = text[match.end():].rstrip('/\\')
+        if rest:
+            segments = re.split(r'[\\/]+', rest)
+            for seg in segments:
+                if (not seg or len(seg) > 128 or seg in ('.', '..')
+                        or '..' in seg or '. ' in seg or seg.endswith('.')
+                        or not cls._WORKING_DIR_SEGMENT.fullmatch(seg)):
+                    raise invalid('working_directory must be a valid Windows or POSIX folder path, not prose')
         return text
 
     def _agent_projects(self, principal, projects, owner_id=None):
@@ -3462,8 +3517,7 @@ class Service:
             raise forbidden('Session authority required to create an agent')
         clean_name = self._agent_name(name)
         tool = self._agent_text(tool, 'tool', AGENT_TOOL_MAX)
-        working_directory = self._agent_text(working_directory, 'working_directory',
-                                             AGENT_DIRECTORY_MAX)
+        working_directory = self._agent_working_directory(working_directory, allow_empty=True)
         machine = self._agent_text(machine, 'machine', AGENT_MACHINE_MAX)
         notes = self._agent_text(notes, 'notes', AGENT_NOTES_MAX)
         clean_role = validate_agent_role(role)
@@ -3571,10 +3625,12 @@ class Service:
                 self._check_agent_file_name(agent['owner'], new_name, exclude_id=agent['id'])
                 changes['name'] = new_name
             for field, limit in (('tool', AGENT_TOOL_MAX), ('machine', AGENT_MACHINE_MAX),
-                                 ('notes', AGENT_NOTES_MAX),
-                                 ('working_directory', AGENT_DIRECTORY_MAX)):
+                                 ('notes', AGENT_NOTES_MAX)):
                 if field in payload:
                     changes[field] = self._agent_text(payload.get(field), field, limit)
+            if 'working_directory' in payload:
+                changes['working_directory'] = self._agent_working_directory(
+                    payload.get('working_directory'), allow_empty=True)
             if 'projects' in payload:
                 changes['projects'] = self._agent_projects(
                     principal, payload.get('projects'), owner_id=agent['owner'])
@@ -3612,8 +3668,9 @@ class Service:
         ``claim_limit`` may only be lowered (a whole number from 1 up to the CURRENT
         effective limit; raising stays the owner's or a superuser's move, refused with a
         sentence naming both and the My agents page). ``working_directory`` records the
-        folder the agent runs in, validated with :meth:`_agent_text` as 1 to
-        :data:`AGENT_DIRECTORY_MAX` printable characters. ``role`` records whether the
+        folder the agent runs in, validated with :meth:`_agent_working_directory` as a
+        bounded Windows or POSIX folder path (1 to :data:`AGENT_DIRECTORY_MAX` characters,
+        no control/bidi characters or prose). ``role`` records whether the
         agent runs as ``'worker'`` or ``'reviewer'``. Every requested field is validated
         before any is applied, so a refused field leaves the record untouched. The identity
         is the credential's own agent; no target id is taken, so this cannot reach another
@@ -3626,11 +3683,8 @@ class Service:
         has_role = 'role' in payload
         new_dir = None
         if has_dir:
-            new_dir = self._agent_text(payload.get('working_directory'),
-                                       'working_directory', AGENT_DIRECTORY_MAX)
-            if new_dir is None:
-                raise invalid('working_directory must be 1-%d printable characters'
-                              % AGENT_DIRECTORY_MAX)
+            new_dir = self._agent_working_directory(payload.get('working_directory'),
+                                                    allow_empty=False)
         new_role = None
         if has_role:
             new_role = validate_agent_role(payload.get('role'))

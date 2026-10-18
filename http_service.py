@@ -7209,7 +7209,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         """A copyable prompt for the owner's local assistant. No secret is included."""
         server = self.service.public_url or '<ORCHESTRA_SERVER_URL>'
         directory = agent.get('working_directory')
-        where = (' in %s' % directory) if directory else ''
+        where = (' (recorded folder path data: %s)' % json.dumps(directory)) if directory else ''
         first = attention['actions'][0] if attention['actions'] else None
         if first:
             if first.get('kind') == 'guidance':
