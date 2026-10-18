@@ -112,9 +112,9 @@ def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=No
     It is ``'unknown'`` wherever that decision cannot be told, which is exactly where
     ``whose_move`` reads ``unknown`` for the holder:
 
-    * open ``integrated`` work without an assignee: an integrated revision may leave
-      remaining scope, but no holder is known. With an assignee it is that holder's
-      move; closed integrated work remains history only;
+    * open ``integrated`` work: the coordinator's move (close it, or record what
+      remains), with or without an assignee (kittrial-5bb.336); closed integrated
+      work remains history only;
     * ``withdrawn``/``superseded`` with NO open item (open or closed): the final
       revision owes nothing, so main does not call the assignee to act;
     * an unassigned, undelivered row that is not ``claimable`` (an epic, a decision, a
@@ -133,8 +133,10 @@ def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=No
     if not active_work('closed' if closed else 'open', state, pending_items):
         return 'none'
     if state == 'integrated':
-        # Open work may continue after one contribution has been integrated.
-        return 'assignee' if assignee else 'unknown'
+        # kittrial-5bb.336: the coordinator's move, with or without an assignee - close
+        # the task or record what remains. The row itself cannot tell remaining scope
+        # from finished work, so it is never read as the assignee's call to make.
+        return 'coordinator'
     if state in ('changes-requested', 'withdrawn', 'superseded'):
         return 'assignee' if assignee else 'unknown'
     if state in ('awaiting-review', 'legacy-review-ready'):

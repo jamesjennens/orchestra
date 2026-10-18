@@ -3676,7 +3676,9 @@ def next_action(task):
         # rather than invite a claim or delivery on work that may be under review.
         return None
     if state == 'integrated':
-        return {'who': 'owner', 'text': 'Follow the release workflow for the integrated work'}
+        # kittrial-5bb.336: the coordinator's move - close the task or record what
+        # remains - never the agent's own action list.
+        return {'who': 'owner', 'text': 'The contribution is integrated; close the task or record what remains'}
     if state in ('awaiting-review', 'legacy-review-ready'):
         return {'who': 'owner', 'text': 'Review the delivered contribution'}
     if state == 'changes-requested':
