@@ -1,9 +1,9 @@
 // Actual HTTP + DOM controls. Output contains observations, never credentials.
 const [shimUrl, apiUrl, agentsUrl, projectUrl, base, pid, aid, cid, ownerId, ownerToken, adminId, adminToken] = process.argv.slice(2);
-const { Element } = await import(shimUrl);
+const { Element, nodeList } = await import(shimUrl);
 const originalQueryAll = Element.prototype.querySelectorAll;
 Element.prototype.querySelectorAll = function (selector) {
-  if (selector === 'input[name=project]:checked') return this.all((e) => e.tagName === 'INPUT' && e.attributes.name === 'project' && e.checked);
+  if (selector === 'input[name=project]:checked') return nodeList(this.all((e) => e.tagName === 'INPUT' && e.attributes.name === 'project' && e.checked));
   return originalQueryAll.call(this, selector);
 };
 Element.prototype.showModal = function () { this.open = true; };

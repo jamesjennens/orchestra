@@ -2274,18 +2274,23 @@ dialog and standalone `#/setup` route present the three steps (`Step 1 of 3: Sto
 `Step 2 of 3: Set up the folder`, `Step 3 of 3: Start the agent`) one screen at a time with `Back`,
 `Check connection`, `Next` and `Done` controls, a `"What you will see when it worked"` callout on
 every step, and secretless `sessionStorage` state (`orchestra.agentSetup.v1`) so reloading the page
-resumes at the current step and operating system without ever storing a secret. An **Operating
+resumes at the current step and operating system without ever storing a secret. The progress badge
+is the step's one title; the step list carries no numbered heading repeating it (kittrial-5bb.342). An **Operating
 system** selector (`Windows (PowerShell)`, `macOS`, `Linux`, auto-detected from `navigator`) is
 chosen first and hides commands and paths for other systems (`data-os="windows"` vs
 `data-os="posix"`). In Step 1, when the service serves its own certificate, the wizard explains
 that browsers strip the leading dot when saving `.orchestra-agent-<slug>.crt` into `Downloads`
 (saving `orchestra-agent-<slug>.crt`) and gives a filled-in `Move-Item` / `mv` command to move it
-into the user profile with the leading dot restored. The primary Step 1 flow has **zero `<your-name>`
+into the user profile with the leading dot restored. **Save certificate** is a primary action and
+one line says it downloads the file that move command places; the move command checks first and,
+with nothing in `Downloads`, prints one plain sentence (`Click Save certificate in step 1 first,
+then run this again.`) instead of a raw shell error. The primary Step 1 flow has **zero `<your-name>`
 placeholders**: the person saves the single `header = "Authorization: Bearer ..."` line and runs the
 filled-in rewrite command (`credentialFileCommand`), which expands the real user profile path on
 that machine (`[Environment]::GetFolderPath('UserProfile')` on Windows, `$HOME` on macOS/Linux) and
 writes `# server = ...`, `# server certificate sha256 = ...` and `cacert = ...` automatically (the
-manual `<your-name>` Notepad body is tucked into a collapsed fallback `<details>`). A filled-in
+manual `<your-name>` Notepad body is tucked into a collapsed fallback `<details>`); if the credential
+file is missing, that command says what to save first instead of printing a raw error. A filled-in
 self-check command (`checkCommands`) inspects the credential file for `.curlrc.txt`, leftover
 `<your-name>` placeholders, or a certificate still sitting in `Downloads/orchestra-agent-<slug>.crt`
 before running `curl -fsS -K`, and `CURL_ERROR_LINES` covers `curl` exit codes `2`, `26`, `35`, `60`

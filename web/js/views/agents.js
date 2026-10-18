@@ -863,8 +863,11 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
 
   if (bodyNode) {
     const existingChildren = Array.from(bodyNode.childNodes);
+    // A browser inserts the text "null" for a null child, so keep the heading explicitly:
+    // a null first child showed the word "null" when the body was empty
+    // (kittrial-5bb.342 review item static-lists-and-null).
     bodyNode.replaceChildren(
-      existingChildren[0] || null,
+      ...(existingChildren[0] ? [existingChildren[0]] : []),
       wizardBar,
       idleWarningBanner,
       ...existingChildren.slice(1),
@@ -1185,7 +1188,10 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   const certificateBlock = certificate ? h('section', { class: 'setup-block', 'aria-label': 'The service’s own certificate' },
     h('div', { class: 'copy-row' }, h('h4', { class: 'small' }, 'The service’s own certificate'),
       copyButton('Copy', certificate.sha256, { ariaLabel: 'Copy the certificate fingerprint', what: 'Fingerprint' }),
-      h('button', { type: 'button', onclick: () => saveCertificate(certificate, payload.certificateFile) }, 'Save certificate')),
+      h('button', { type: 'button', class: 'primary', onclick: () => saveCertificate(certificate, payload.certificateFile) }, 'Save certificate')),
+    // The button used to blend into the text, and the next command then failed with a raw
+    // error because nothing had been downloaded (James, 2026-10-18; kittrial-5bb.342).
+    h('p', { class: 'small', 'data-save-certificate-line': 'true' }, 'Save certificate downloads the certificate file to your Downloads folder; the move command in step 1 below puts it in your user profile.'),
     h('p', { class: 'small' }, 'SHA-256 fingerprint: ', h('code', { class: 'path', 'data-fingerprint': certificate.sha256 }, certificate.sha256)),
     h('p', { class: 'small muted' }, 'In VS Code run “Orchestra Bridge: Set up”: it will show this fingerprint when it first reaches the server — compare it before you trust it.'),
     h('p', { class: 'small muted' }, 'What that comparison proves: the extension reached the same endpoint this page did. What it does not: this page and this string came over the same connection, so anyone who can serve this page can serve his own certificate and his own fingerprint. The independent source is you, on the server: run openssl x509 -in <the certificate file> -noout -fingerprint -sha256 there and compare that value.')) : null;
@@ -1199,8 +1205,10 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   const promptSection = h('section', { class: 'setup-block', 'aria-label': 'Setup prompt' }, promptBody);
 
   const resume = setupText.resumePrompt(payload.name);
-  const step = (number, title, ...body) => h('li', { class: 'setup-step', 'aria-label': `Step ${number}: ${title}` },
-    h('h3', { class: 'small' }, `${number}. ${title}`), ...body);
+  // The wizard bar's progress badge is the step's title ("Step 1 of 3: Store the secret"). A
+  // numbered heading here repeated "1. Store the secret" inside the step list, so James saw
+  // "step 1" twice; leaving the badge as the one title (kittrial-5bb.342).
+  const step = (number, title, ...body) => h('li', { class: 'setup-step', 'aria-label': `Step ${number}: ${title}` }, ...body);
   const dialog = h('dialog', { class: 'dialog-wide', 'aria-labelledby': 'setup-title' });
   dialog.append(
     h('div', { class: 'dialog-body' },

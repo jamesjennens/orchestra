@@ -5,13 +5,10 @@
 // argv: shim URL, api.js URL, agents.js URL, base URL, project id, then name=userId=token triples.
 const [shimUrl, apiUrl, agentsUrl, base, project, ...people] = process.argv.slice(2);
 const { Element } = await import(shimUrl);
-// What the page's dialogs need beyond the shim: a dialog opens, closes and can be replaced.
+// What the page's dialogs need beyond the shim: a dialog opens and closes. The shim itself
+// already provides ChildNode.replaceWith, so this file no longer patches it onto Element.
 Element.prototype.showModal = function showModal() { this.open = true; };
 Element.prototype.close = function close() { this.open = false; return this.dispatch('close'); };
-Element.prototype.replaceWith = function replaceWith(other) {
-  const parent = this.parentNode;
-  if (parent) { parent.childNodes = parent.childNodes.map((c) => (c === this ? other : c)); other.parentNode = parent; this.parentNode = null; }
-};
 globalThis.window = globalThis.window || { isSecureContext: false };
 globalThis.location = globalThis.location || { origin: base };
 const { createApi } = await import(apiUrl);

@@ -3,7 +3,7 @@ const [shimUrl, apiUrl, viewUrl, base, project, token] = process.argv.slice(2);
 const { Element } = await import(shimUrl);
 Element.prototype.close = function () {};
 Element.prototype.showModal = function () {
-  queueMicrotask(() => this.querySelectorAll('button').at(-1).dispatch('click'));
+  queueMicrotask(() => Array.from(this.querySelectorAll('button')).at(-1).dispatch('click'));
 };
 const { createApi } = await import(apiUrl);
 const { mergeSlotPanel } = await import(viewUrl);
@@ -21,7 +21,7 @@ const api = createApi(async (method, path, headers, body) => {
 });
 const panel = mergeSlotPanel({ api }, { id: project, role: 'superuser', archived: false });
 document.body.append(panel);
-const button = (label) => panel.querySelectorAll('button').find((node) => node.textContent === label);
+const button = (label) => Array.from(panel.querySelectorAll('button')).find((node) => node.textContent === label);
 for (let i = 0; i < 1000 && !button('Create or repair slot'); i++) await new Promise((resolve) => setTimeout(resolve, 20));
 assert.ok(button('Create or repair slot'), 'Missing slot has an explicit owner repair');
 await button('Create or repair slot').dispatch('click');
@@ -41,7 +41,7 @@ const races = mergeSlotPanel({ api: { mergeSlot: async () => {
   return new Promise((resolve) => waiting.push(resolve));
 } } }, { id: project });
 document.body.append(races);await new Promise((resolve) => setTimeout(resolve, 0));
-const refresh = () => races.querySelectorAll('button').find((node) => node.textContent === 'Refresh');
+const refresh = () => Array.from(races.querySelectorAll('button')).find((node) => node.textContent === 'Refresh');
 const first = refresh().dispatch('click');const second = refresh().dispatch('click');
 waiting[1]({ available: false, holder: 'newer-holder' });await second;
 waiting[0]({ available: true });await first;

@@ -17,11 +17,11 @@ let data = await coordinator.api.requirements(pid);
 assert.equal(data.can_edit, true, 'a coordinator may edit this page');
 let page = await view.brd(coordinator, { pid }, {}, data);
 assert.ok(page.textContent.includes('Accept several at once'), page.textContent);
-const panel = page.querySelectorAll('details').find((d) => d.textContent.includes('Accept several at once'));
+const panel = Array.from(page.querySelectorAll('details')).find((d) => d.textContent.includes('Accept several at once'));
 const boxes = panel.querySelectorAll('input');
 assert.equal(boxes.length, 2, panel.textContent);
 for (const box of boxes) { box.checked = true; await box.dispatch('change'); }
-await panel.querySelectorAll('button').find((b) => b.textContent === 'Accept selected').dispatch('click');
+await Array.from(panel.querySelectorAll('button')).find((b) => b.textContent === 'Accept selected').dispatch('click');
 assert.equal(coordinator.destination, `/p/${pid}/requirements`, panel.textContent);
 const after = await coordinator.api.requirements(pid);
 assert.equal(after.items.filter((item) => item.current.acceptance_state === 'accepted').length, 2,
