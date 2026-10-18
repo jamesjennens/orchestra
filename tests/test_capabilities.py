@@ -1349,7 +1349,7 @@ class IndexBudgetTests(Checkout):
             code, result, stdout, stderr = call('lookup', 'Engine', '--repo', str(self.root))
         self.assertEqual((code, result, stdout), (2, None, ''))
         self.assertTrue(stderr.startswith('ValueError: capability lookup stopped after 60 s:'), stderr)
-        self.assertIn('building the code index under %s' % self.root, stderr)
+        self.assertIn('building the code index under %s' % Path(self.root).resolve(), stderr)
         self.assertIn('file(s)', stderr)
         self.assertIn('--repo <path>', stderr)
         self.assertIn('--source graphify', stderr)
@@ -1360,7 +1360,7 @@ class IndexBudgetTests(Checkout):
                 patch.object(capabilities, '_now', lambda: 1.0):
             code, result, stdout, stderr = call('lookup', 'Engine', '--repo', str(self.root))
         self.assertEqual((code, result, stdout), (2, None, ''))
-        self.assertIn('reading the checkout under %s' % self.root, stderr)
+        self.assertIn('reading the checkout under %s' % Path(self.root).resolve(), stderr)
         self.assertIn('run it in one checkout with --repo <path>', stderr)
 
     def test_the_default_budget_does_not_stop_a_normal_lookup(self):
