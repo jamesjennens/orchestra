@@ -16,7 +16,9 @@ DOCUMENTS = {
     'briefings': 'docs/BRIEFINGS.md',
     'cli-contract': 'docs/CLI_CONTRACT.md',
     'operations': 'docs/OPERATIONAL_WORKFLOW.md',
-    'checkpoint-template': 'templates/CHECKPOINT.json',
+    # The served template is the page that states the limits and the lane_state shape;
+    # the bare payload it embeds stays in templates/CHECKPOINT.json (kittrial-5bb.341).
+    'checkpoint-template': 'templates/CHECKPOINT.md',
     'task-template': 'templates/TASK.md',
     'report-template': 'templates/REPORT.md',
     'decision-template': 'templates/DECISION.md',
