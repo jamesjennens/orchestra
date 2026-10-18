@@ -259,6 +259,8 @@ Create an operator-owned mode-0600 JSON file outside source control:
 
 ```json
 {"schema_version":1,"http_host":"127.0.0.1","http_state":"<RUNTIME_ROOT>/http-state.json","trusted_proxies":["127.0.0.1"],"public_url":"https://<APPROVED_HOST>"}
+
+The `http_state` path and its `.records.sqlite3` beside it are backed up with EVERY `admin.py backup` run (mode 0600; the records file through a consistent SQLite copy) and carried by `backup-copy` - a lost disk keeps every task AND every account and agent. The office server runs Python 3.6, which lacks `Connection.backup`, so the consistent copy uses the `sqlite3` CLI when installed - install it, or every backup of this runtime is recorded degraded and incomplete. The pair comes back ONLY through `restore-new --restore-http-state`, which invalidates every session in the restored state (users and agents sign in again). Record the same path in `deployment.private.json` as `http_state` so backups find it without the flag (kittrial-5bb.331).
 ```
 
 By default the HTTP listener is loopback only, and a separately approved

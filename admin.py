@@ -5082,8 +5082,13 @@ def backup_pair_state(root,name):
         return False,'coordination sidecar status is %r, not complete'%(data.get('status'),)
     return True,None
 
-def backup_status_record(results,scope,generated_at):
-    """Build the schema-1 status record for one run (see validate_backup_status)."""
+def backup_status_record(results,scope,generated_at,http_state=None):
+    """Build the schema-1 status record for one run (see validate_backup_status).
+
+    ``http_state`` (kittrial-5bb.331) is this run's HTTP-state entry; a copy that is
+    neither complete nor absent makes the whole run incomplete - the accounts and
+    agents are exactly what a lost disk must not lose.
+    """
     projects=[]
     for item in results:
         entry={'name':item['name'],'status':item['status']}
@@ -5096,9 +5101,15 @@ def backup_status_record(results,scope,generated_at):
         else:
             entry['reason']=item['reason']
         projects.append(entry)
-    return {'schema_version':1,'scope':scope,'generated_at':generated_at,
-            'status':'complete' if projects and all(p['status']=='complete' for p in projects) else 'incomplete',
+    complete=bool(projects) and all(p['status']=='complete' for p in projects)
+    if http_state is not None and http_state.get('status') not in (None,'complete','absent'):
+        complete=False
+    record={'schema_version':1,'scope':scope,'generated_at':generated_at,
+            'status':'complete' if complete else 'incomplete',
             'projects':projects}
+    if http_state is not None:
+        record['http_state']=http_state
+    return record
 
 def validate_backup_status(record):
     """Validate a scheduled-backup status record (schema 1).
@@ -5151,6 +5162,20 @@ def validate_backup_status(record):
             if 'degraded' in entry:
                 raise ValueError('Incomplete backup status for %s must not carry a degraded message'%name)
     expected='complete' if complete==len(projects) else 'incomplete'
+    http_state=record.get('http_state')
+    if http_state is not None:
+        if not isinstance(http_state,dict) or http_state.get('status') not in ('complete','absent','degraded'):
+            raise ValueError('Backup status http_state must be complete, absent or degraded')
+        if http_state['status']=='complete':
+            if not isinstance(http_state.get('files'),list) or not http_state['files']:
+                raise ValueError('A complete http_state entry must name the files it copied')
+            if not isinstance(http_state.get('path'),str) or not http_state['path'].strip():
+                raise ValueError('A complete http_state entry must name the live path it copied')
+        if http_state['status']=='degraded' and (not isinstance(http_state.get('reason'),str)
+                                                 or not http_state['reason'].strip()):
+            raise ValueError('A degraded http_state entry must say why')
+        if http_state['status'] in ('complete','degraded') and expected=='complete':
+            expected='complete' if http_state['status'] in ('complete','absent') else 'incomplete'
     if record.get('status')!=expected:
         raise ValueError('Backup status run status must be %s for its project entries'%expected)
 
@@ -5840,6 +5865,20 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
             if journal_staged is not None:
                 print('Copied %s journal snapshot: %s -> %s'%(
                     name,journal_snapshot_path(root,name),destination/journal_staged.name))
+        # kittrial-5bb.331: the HTTP-state pair joins every copy that publishes the
+        # completeness record - the off-machine copy is what survives the lost disk,
+        # and the accounts and agents are exactly what it must not lose. Copied
+        # through the same staging rename, mode 0600, and named per file.
+        http_state_copied=[]
+        for name in (HTTP_STATE_JSON,HTTP_STATE_RECORDS):
+            source=backups/name
+            if source.is_file():
+                staged_file=staging/('.http-'+name)
+                _atomic_copy(source,staged_file)
+                os.chmod(str(staged_file),0o600)
+                _replace_with(staged_file,destination/name)
+                http_state_copied.append({'name':name,'bytes':source.stat().st_size})
+                print('Copied the HTTP state: %s -> %s'%(source,destination/name))
         if not skipped:
             _atomic_copy(backups/BACKUP_STATUS_NAME,staging/BACKUP_STATUS_NAME)
             _replace_with(staging/BACKUP_STATUS_NAME,target_status)
@@ -5857,6 +5896,7 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
             run_record=backup_copy_run_record(backup_copy_full_record(target_status),copied_meta,
                                               [{'name':name,'reason':reason} for name,reason in skipped],
                                               all_or_nothing,generated_at)
+            run_record['http_state']=http_state_copied
             validate_backup_copy_run(run_record)
             _atomic_write_bytes(staging/BACKUP_COPY_RUN_NAME,
                                 (json.dumps(run_record,sort_keys=True,indent=2)+'\n').encode('utf-8'))
@@ -5905,7 +5945,179 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
           %(len(copied),journals,len(initialized_projects(root)),destination))
     return copied
 
-def backup_projects(root,names,all_projects=False):
+#: The runtime-level HTTP/web-service state, backed up with every run (kittrial-5bb.331).
+#: The live files are the service's JSON state and, beside it, its SQLite records file
+#: (users and password hashes, agents and credential hashes, memberships, sessions,
+#: audit); the office default is <RUNTIME_ROOT>/http-state.json (office_service.py).
+HTTP_STATE_JSON='http-state.json'
+HTTP_STATE_RECORDS='http-state.json.records.sqlite3'
+
+def resolve_http_state_path(root, named=None):
+    """(path, where-from) of the runtime's live HTTP state file, or (None, None).
+
+    In order: an explicit --http-state PATH; an optional ``http_state`` path in
+    deployment.private.json (the office config is operator-private and has no fixed
+    home, so the deployment records the same path for the backup); the office default
+    ``<root>/http-state.json`` when that file exists. A runtime with none of these has
+    no web state to back up (kittrial-5bb.331).
+    """
+    if named is not None:
+        if not isinstance(named,str) or not named.strip():
+            raise ValueError('--http-state must be a path to the live HTTP state file')
+        return Path(named),'flag'
+    try:
+        value=config(root).get('http_state')
+    except (ValueError,OSError):
+        value=None
+    if isinstance(value,str) and value.strip():
+        return Path(value),'deployment'
+    default=root/HTTP_STATE_JSON
+    if default.is_file():
+        return default,'default'
+    return None,None
+
+def copy_sqlite_consistently(source, destination):
+    """Copy a SQLite database consistently while others may use it; None or the reason.
+
+    The sqlite3 CLI's ``.backup`` first (independent of the Python version), then
+    ``sqlite3.Connection.backup`` (Python 3.7+; the office server runs 3.6). A host
+    with neither answers a reason instead of taking a torn file silently
+    (kittrial-5bb.331).
+    """
+    import shutil
+    cli=shutil.which('sqlite3')
+    if cli is not None:
+        try:
+            done=subprocess.run([cli,str(source),'.backup '+str(destination)],
+                                capture_output=True,text=True,timeout=120)
+        except (OSError,subprocess.SubprocessError) as error:
+            return 'the sqlite3 CLI could not run: %s'%str(error)[:120]
+        if done.returncode==0 and destination.is_file():
+            return None
+        return 'the sqlite3 CLI could not copy the records file: %s'%((done.stderr or done.stdout or '').strip()[:120])
+    import sqlite3
+    if hasattr(sqlite3.Connection,'backup'):
+        # kittrial-5bb.331 review item 'windows-sqlite-handle': EVERY connection is
+        # closed in finally - an open handle keeps the file locked on Windows, long
+        # after this function returns, failing the caller's clean-up with WinError 32.
+        holder=sqlite3.connect(str(source))
+        try:
+            target=sqlite3.connect(str(destination))
+            try:
+                holder.backup(target)
+            finally:
+                target.close()
+        except sqlite3.Error as error:
+            return 'the consistent SQLite copy failed: %s'%str(error)[:120]
+        finally:
+            holder.close()
+        return None
+    return ('no consistent SQLite copy is available on this host: no sqlite3 CLI and this '
+            'Python lacks Connection.backup (the office server runs Python 3.6)')
+
+def backup_http_state(root, named=None):
+    """The runtime's HTTP state into backups/, mode 0600; the status entry for the report.
+
+    The JSON is copied as written; the records file through the consistent copy. Both
+    are written to a temporary name and renamed, so a reader never sees a half copy.
+    ``absent`` means the runtime has no web state to back up - not an error
+    (kittrial-5bb.331).
+    """
+    backups=root/'backups'
+    backups.mkdir(exist_ok=True)
+    source,origin=resolve_http_state_path(root,named)
+    if source is None:
+        return {'status':'absent'}
+    entry={'status':'absent','path':str(source)}
+    if not source.is_file():
+        return entry
+    if source.is_symlink():
+        raise ValueError('The HTTP state file %s must not be a symlink'%source)
+    import shutil
+    import tempfile
+    json_target=backups/HTTP_STATE_JSON
+    handle,temp=tempfile.mkstemp(dir=str(backups),prefix='.http-state-')
+    os.close(handle)
+    os.unlink(temp)
+    try:
+        shutil.copyfile(str(source),temp)
+        os.chmod(temp,0o600)
+        os.replace(temp,str(json_target))
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+    files=[{'name':HTTP_STATE_JSON,'bytes':json_target.stat().st_size}]
+    records=Path(str(source)+'.records.sqlite3')
+    if records.is_file():
+        if records.is_symlink():
+            raise ValueError('The HTTP state records file %s must not be a symlink'%records)
+        records_target=backups/HTTP_STATE_RECORDS
+        handle,temp=tempfile.mkstemp(dir=str(backups),prefix='.http-state-records-')
+        os.close(handle)
+        os.unlink(temp)
+        try:
+            reason=copy_sqlite_consistently(records,Path(temp))
+            if reason is None:
+                os.chmod(temp,0o600)
+                os.replace(temp,str(records_target))
+                files.append({'name':HTTP_STATE_RECORDS,'bytes':records_target.stat().st_size})
+            else:
+                entry.update(status='degraded',reason=reason,files=files)
+                return entry
+        finally:
+            if os.path.exists(temp):os.unlink(temp)
+    entry.update(status='complete',files=files,origin=origin)
+    return entry
+
+def restore_http_state(root, named=None):
+    """Restore the backed-up HTTP state pair to the live path; the sentence to print.
+
+    The ONLY caller is ``restore-new --restore-http-state`` (kittrial-5bb.331): the
+    accounts, agents and memberships come back with their password and credential
+    hashes, and every SESSION in the restored state is invalidated - the hashes
+    return, the sign-ins do not survive the restore. Mode 0600, copied to a temporary
+    name and renamed, never by default.
+    """
+    backups=root/'backups'
+    source_json=backups/HTTP_STATE_JSON
+    if not source_json.is_file():
+        raise ValueError('This backup set has no HTTP state pair to restore (no %s in %s); '
+                         'nothing was changed'%(HTTP_STATE_JSON,backups))
+    live,origin=resolve_http_state_path(root,named)
+    if live is None:
+        # The disaster this restores from is exactly the live file being GONE, so the
+        # office default is the target even when nothing exists there yet: the service
+        # will look for it there (kittrial-5bb.331).
+        live=root/HTTP_STATE_JSON
+    live.parent.mkdir(parents=True,exist_ok=True)
+    import shutil
+    import tempfile
+    handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-restore-')
+    os.close(handle);os.unlink(temp)
+    try:
+        shutil.copyfile(str(source_json),temp)
+        os.chmod(temp,0o600)
+        os.replace(temp,str(live))
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+    restored=[HTTP_STATE_JSON]
+    records=backups/HTTP_STATE_RECORDS
+    if records.is_file():
+        records_live=Path(str(live)+'.records.sqlite3')
+        handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-records-restore-')
+        os.close(handle);os.unlink(temp)
+        try:
+            shutil.copyfile(str(records),temp)
+            os.chmod(temp,0o600)
+            os.replace(temp,str(records_live))
+            restored.append(HTTP_STATE_RECORDS)
+        finally:
+            if os.path.exists(temp):os.unlink(temp)
+    return ('Restored the HTTP state pair (%s) to %s (mode 0600). Every session in it is '
+            'INVALIDATED: users and agents must sign in again; password and credential hashes '
+            'are back as they were at the backup.'%(', '.join(restored),live))
+
+
+def backup_projects(root,names,all_projects=False,named_http_state=None):
     """Back up one or more projects in one run and publish the run's status file.
 
     ``admin.py backup PROJECT`` keeps its existing output and exit behaviour: the
@@ -5960,20 +6172,47 @@ def backup_projects(root,names,all_projects=False):
         else:
             results.append({'name':name,'status':'failed','reason':reason})
             incomplete.append(name)
-    write_backup_status(root,merged_backup_status(root,backup_status_record(results,scope,generated_at)))
+    # kittrial-5bb.331: the runtime's HTTP state joins EVERY backup run (named or
+    # --all); a copy that is neither complete nor absent makes the run incomplete.
+    try:
+        http_state=backup_http_state(root,named_http_state)
+    except Exception as error:
+        http_state={'status':'degraded','reason':failure_reason(error)}
+    write_backup_status(root,merged_backup_status(root,backup_status_record(
+        results,scope,generated_at,http_state=http_state)))
     for entry in results:
         if entry['status']!='complete':
             print('backup %s for %s: %s'%(entry['status'],entry['name'],entry['reason']),file=sys.stderr)
+    if http_state.get('status')=='degraded':
+        print('backup of the HTTP state is degraded: %s'%http_state.get('reason'),file=sys.stderr)
     degraded=[(entry['name'],entry['degraded']) for entry in results if entry.get('degraded')]
+    # kittrial-5bb.331: the summary NAMES the HTTP state, so a run that skipped or
+    # degraded it never reads like a clean one.
+    http_note=''
+    if http_state.get('status')=='complete':
+        http_note='; http-state complete (%s)'%http_state.get('path')
+    elif http_state.get('status')=='absent':
+        http_note='; no http-state to back up'
+    else:
+        http_note='; http-state %s'%http_state.get('status')
     if len(targets)>1:
         # The count of degraded projects is IN the summary line: a run that is complete
         # and degraded used to read exactly like a clean one (kittrial-5bb.105).
-        print('Backed up %d of %d project(s)%s; %s is %s.'%(
+        print('Backed up %d of %d project(s)%s%s; %s is %s.'%(
             len(targets)-len(incomplete),len(targets),
-            ', '+degraded_summary(degraded) if degraded else '',root/'backups'/BACKUP_STATUS_NAME,
-            'complete' if not incomplete else 'incomplete'))
-    elif degraded:
-        print('Backup of %s is complete but degraded: %s'%degraded[0])
+            ', '+degraded_summary(degraded) if degraded else '',http_note,
+            root/'backups'/BACKUP_STATUS_NAME,
+            'complete' if not incomplete and http_state.get('status') in (None,'complete','absent') else 'incomplete'))
+    else:
+        # kittrial-5bb.331: the single-project form keeps its single stdout line; the
+        # HTTP state rides it only when it was actually copied or needs attention
+        # (absent stays silent - a runtime without the web service changed nothing).
+        if http_state.get('status')=='complete':
+            print('Backup of %s; http-state complete (%s).'%(targets[0],http_state.get('path')))
+        elif http_state.get('status')=='degraded':
+            print('Backup of %s; http-state degraded: %s'%(targets[0],http_state.get('reason')))
+        elif degraded:
+            print('Backup of %s is complete but degraded: %s'%(degraded[0][0],degraded[0][1]))
     if incomplete:
         raise SystemExit('backup incomplete for: '+' '.join(incomplete)+
                          ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME)+unfinished_creation_hint(root,incomplete))
@@ -9758,6 +9997,11 @@ def main():
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
+    a.add_argument('--http-state',default=None,metavar='PATH',action=_OnceFlag,
+                   help='the live HTTP/web-service state file to back up with this run (the JSON and its '
+                        'SQLite records file, copied consistently, mode 0600); without it the http_state '
+                        'path recorded in deployment.private.json is used, then the office default '
+                        '<RUNTIME_ROOT>/http-state.json when that file exists (kittrial-5bb.331)')
     a=sub.add_parser('backup-schedule',help='record, as an operator, that this runtime\'s backups are scheduled '
                                              'elsewhere (the project setup step then reads done; a systemd user '
                                              'unit that covers the project still wins) (operator allowlist)')
@@ -9821,6 +10065,11 @@ def main():
                    help='restore only the native tracker data of a backup whose coordination sidecar exists but '
                         'cannot be used (restore-new refuses such a backup without this flag); its sessions, '
                         'handoffs, requests, merge context and recorded operators and verifiers are not restored')
+    a.add_argument('--restore-http-state',action='store_true',dest='restore_http_state',
+                   help='ALSO restore the runtime HTTP state pair this backup set carries (accounts, agents, '
+                        'memberships; mode 0600). The ONLY way it comes back: without the flag a restore never '
+                        'touches the live HTTP state. Restoring it INVALIDATES every session recorded in it - '
+                        'users and agents must sign in again (kittrial-5bb.331)')
     a.epilog=('Exit status: 0 restored; 3 restored, but --restore-operators/--restore-verifiers could not '
               're-grant (another change held the deployment lock, or the authority-changes audit is damaged): '
               'the last lines say what, with the commands to re-grant it; 1 failed. --actor OPERATOR and '
@@ -10634,7 +10883,8 @@ def main():
               'now, with the operator and reason recorded on it%s. The reader says: %s'
               %('' if kept is None else '; the history this replaced was kept beside the runtime as %s'%kept.name,
                 note),file=sys.stderr)
-    elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
+    elif args.command=='backup':backup_projects(root,args.projects,args.all_projects,
+                                                   getattr(args,'http_state',None))
     elif args.command=='backup-schedule':
         from keyed_records import require_configured_operator
         require_configured_operator(args.actor,operators(root,strict=True),'record a backup schedule note')
@@ -10839,6 +11089,15 @@ def main():
             finally:
                 restoring.close()
         print('Restored only into the newly created project; retained original issue IDs. Never use this clone as a second live tracker.')
+        # kittrial-5bb.331: the HTTP state pair comes back ONLY on the explicit request.
+        if getattr(args,'restore_http_state',False):
+            print(restore_http_state(root))
+        else:
+            # 'left unrestored', never 'NOT restored': a restore prints that phrase for
+            # capability verifiers (tests pin its absence), and this line must not collide.
+            print('The HTTP state pair in this backup set (accounts, agents, memberships) was left '
+                  'unrestored: pass --restore-http-state to restore it. Restoring it INVALIDATES every '
+                  'session recorded in it - users and agents must sign in again.')
         # A backup recorded degraded restores its tracker, and nothing says what is
         # missing unless this does (kittrial-5bb.105). The run record is advisory here:
         # an unreadable one must not fail a restore that has already succeeded.
