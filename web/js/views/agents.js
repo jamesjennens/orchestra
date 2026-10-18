@@ -863,8 +863,11 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
 
   if (bodyNode) {
     const existingChildren = Array.from(bodyNode.childNodes);
+    // A browser inserts the text "null" for a null child, so keep the heading explicitly:
+    // a null first child showed the word "null" when the body was empty
+    // (kittrial-5bb.342 review item static-lists-and-null).
     bodyNode.replaceChildren(
-      existingChildren[0] || null,
+      ...(existingChildren[0] ? [existingChildren[0]] : []),
       wizardBar,
       idleWarningBanner,
       ...existingChildren.slice(1),

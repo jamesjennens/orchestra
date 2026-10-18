@@ -40,6 +40,14 @@ function liveCollection(items, { forEach = false } = {}) {
   return view;
 }
 
+// querySelectorAll returns a STATIC NodeList in a browser: a snapshot with index, length,
+// item(), forEach and iteration, and no array methods. A plain Array here let a page call
+// querySelectorAll(...).map(...) pass under Node and throw in a browser (kittrial-5bb.342
+// review item static-lists-and-null). Copy first: Array.from(node.querySelectorAll(sel)).
+function nodeList(items) {
+  return liveCollection(items.slice(), { forEach: true });
+}
+
 class Node {
   constructor() { this._childNodes = []; this.parentNode = null; }
   get childNodes() { return liveCollection(this._childNodes, { forEach: true }); }
@@ -54,16 +62,17 @@ class Node {
   }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   // The ChildNode.replaceWith the screen tests used to patch onto Element; a browser has it.
+  // Like append, a non-Node argument becomes its string ("null" included).
   replaceWith(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    const replacement = nodes.map((node) => (typeof node === 'string' ? new Text(node) : node));
-    for (const node of replacement) if (node && node.parentNode) node.parentNode.removeChild(node);
+    const replacement = nodes.map((node) => (node instanceof Node ? node : new Text(String(node))));
+    for (const node of replacement) if (node.parentNode) node.parentNode.removeChild(node);
     const index = parent._childNodes.indexOf(this);
     if (index === -1) return;
     this.parentNode = null;
-    parent._childNodes.splice(index, 1, ...replacement.filter((node) => node != null));
-    for (const node of replacement) if (node) node.parentNode = parent;
+    parent._childNodes.splice(index, 1, ...replacement);
+    for (const node of replacement) node.parentNode = parent;
   }
   get firstChild() { return this._childNodes[0] || null; }
   get textContent() { return this._childNodes.map((c) => c.textContent).join(''); }
@@ -95,7 +104,9 @@ class Element extends Node {
     const event = { type, target: this, preventDefault() {} };
     for (const handler of this.listeners[type] || []) await handler(event);
   }
-  append(...children) { for (const c of children) { if (c === null || c === undefined || c === false) continue; this.appendChild(typeof c === 'string' ? new Text(c) : c); } }
+  // A browser converts a non-Node argument with String(), so append(null) inserts the text
+  // "null" and append(undefined) inserts "undefined"; it does not skip them.
+  append(...children) { for (const child of children) this.appendChild(child instanceof Node ? child : new Text(String(child))); }
   replaceChildren(...children) { this._childNodes.length = 0; this.append(...children); }
   focus() {}
   all(test, out = []) {
@@ -103,7 +114,7 @@ class Element extends Node {
     return out;
   }
   querySelector(selector) { return this.all(matcher(selector))[0] || null; }
-  querySelectorAll(selector) { return this.all(matcher(selector)); }
+  querySelectorAll(selector) { return nodeList(this.all(matcher(selector))); }
   get value() {
     if (this.tagName === 'SELECT') {
       if (this.chosen !== undefined) return this.chosen;
@@ -128,4 +139,4 @@ globalThis.FormData = FormData;
 globalThis.document = { createElement: (tag) => new Element(tag), createTextNode: (text) => new Text(text),
   createElementNS: (_, tag) => new Element(tag), body: new Element('body') };
 
-export { Node, Text, Element, FormData, liveCollection };
+export { Node, Text, Element, FormData, liveCollection, nodeList };

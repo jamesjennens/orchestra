@@ -20,13 +20,13 @@ await api.setRequirementsGovernance(pid, { expected_revision: data.governance.re
 data = await api.requirement(pid, finishId);
 page = await view.requirement(ctx, { pid, rid: finishId }, {}, data);
 assert.ok(page.textContent.includes('Open requirements to enable simple editing'));
-assert.equal(page.querySelectorAll('button').find((button) => button.textContent === 'Finish transition').disabled, true);
-assert.equal(page.querySelectorAll('button').find((button) => button.textContent === 'Abandon transition').disabled, true);
+assert.equal(Array.from(page.querySelectorAll('button')).find((button) => button.textContent === 'Finish transition').disabled, true);
+assert.equal(Array.from(page.querySelectorAll('button')).find((button) => button.textContent === 'Abandon transition').disabled, true);
 await api.setRequirementsGovernance(pid, { expected_revision: data.governance.revision,
   expected_sha256: data.governance.sha256, mode: 'simple' });
 data = await api.requirement(pid, finishId);
 page = await view.requirement(ctx, { pid, rid: finishId }, {}, data);
-const buttons = page.querySelectorAll('button');
+const buttons = Array.from(page.querySelectorAll('button'));
 assert.equal(buttons.find((button) => button.textContent === 'Abandon transition').disabled, true);
 const finishButton = buttons.find((button) => button.textContent === 'Finish transition');
 assert.equal(finishButton.disabled, true);
@@ -53,9 +53,9 @@ assert.ok(page.textContent.includes('Finished by ' + data.completion_author_name
 assert.ok(!page.textContent.includes('Finish transition'));
 data = await api.requirement(pid, abandonId);
 page = await view.requirement(ctx, { pid, rid: abandonId }, {}, data);
-assert.equal(page.querySelectorAll('button').find((button) => button.textContent === 'Abandon transition').disabled, false);
+assert.equal(Array.from(page.querySelectorAll('button')).find((button) => button.textContent === 'Abandon transition').disabled, false);
 page.querySelector('textarea').value = 'No state was written; abandon this saved attempt.';
-await page.querySelectorAll('button').find((button) => button.textContent === 'Abandon transition').dispatch('click');
+await Array.from(page.querySelectorAll('button')).find((button) => button.textContent === 'Abandon transition').dispatch('click');
 assert.equal((await api.requirement(pid, abandonId)).pending_transition, null);
 data = await api.requirement(pid, editId);
 page = await view.requirement(ctx, { pid, rid: editId }, {}, data);

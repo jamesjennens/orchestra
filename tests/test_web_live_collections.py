@@ -61,7 +61,13 @@ class LiveCollectionTests(unittest.TestCase):
 
 
 class ShimCollectionContractTests(unittest.TestCase):
-    """tests/web_dom_shim.mjs must hand out browser collections, not arrays (kittrial-5bb.342)."""
+    """tests/web_dom_shim.mjs must hand out browser collections and browser child conversion.
+
+    Two mutations this catches: returning a plain Array from querySelectorAll (so a page's
+    .map passes under Node and throws in a browser), and silently dropping null in append /
+    replaceChildren where a browser inserts the text "null" (kittrial-5bb.342 review item
+    static-lists-and-null).
+    """
 
     SCRIPT = r"""
 const { Element } = await import(process.argv[1]);
@@ -97,6 +103,33 @@ out.sliceThrows = false;
 try { held.slice(1); } catch { out.sliceThrows = true; }
 out.childrenForEachThrows = false;
 try { root.children.forEach(() => {}); } catch { out.childrenForEachThrows = true; }
+
+// querySelectorAll: a STATIC NodeList, never an Array.
+const found = root.querySelectorAll('span');
+out.qsa = {
+  isArray: Array.isArray(found), length: found.length, index: found[0] === first,
+  item: found.item(0) === first, itemPastEnd: found.item(9),
+  forEach: typeof found.forEach, map: typeof found.map, find: typeof found.find,
+  some: typeof found.some, at: typeof found.at, slice: typeof found.slice,
+  spread: [...found].length, from: Array.from(found).length,
+};
+out.qsaMapThrows = false;
+try { root.querySelectorAll('b').map((n) => n); } catch { out.qsaMapThrows = true; }
+root.appendChild(new Element('span'));
+out.qsaStaticLength = found.length;   // a querySelectorAll list does not grow
+
+// append / replaceChildren convert a non-Node with String(), so null is the text "null".
+const host = new Element('p');
+host.append(null);
+out.appendNull = host.textContent;
+host.replaceChildren('a', null, undefined, false);
+out.replaceNull = host.textContent;
+host.replaceChildren(null);
+out.replaceOnlyNull = host.textContent;
+const replaced = new Element('em');
+host.replaceChildren(replaced);
+replaced.replaceWith(null);
+out.replaceWithNull = host.textContent;
 console.log(JSON.stringify(out));
 """
 
@@ -127,6 +160,24 @@ console.log(JSON.stringify(out));
         self.assertEqual(['0:true', '1:true', '2:true'], data['forEachSeen'])
         self.assertTrue(data['sliceThrows'], 'the shipped childNodes.slice() call must now fail')
         self.assertTrue(data['childrenForEachThrows'])
+        # querySelectorAll: NodeList-shaped, static, no array methods (the second mutation).
+        self.assertFalse(data['qsa']['isArray'], 'querySelectorAll still returns an Array')
+        self.assertEqual(1, data['qsa']['length'])
+        self.assertTrue(data['qsa']['index'])
+        self.assertTrue(data['qsa']['item'])
+        self.assertIsNone(data['qsa']['itemPastEnd'])
+        self.assertEqual('function', data['qsa']['forEach'])
+        for method in ('map', 'find', 'some', 'at', 'slice'):
+            self.assertEqual('undefined', data['qsa'][method], 'querySelectorAll().%s exists' % method)
+        self.assertEqual(1, data['qsa']['spread'])
+        self.assertEqual(1, data['qsa']['from'])
+        self.assertTrue(data['qsaMapThrows'], 'a page .map on querySelectorAll would pass under Node')
+        self.assertEqual(1, data['qsaStaticLength'], 'a querySelectorAll list must be a snapshot')
+        # append / replaceChildren: null is inserted as the text "null" (the third mutation).
+        self.assertEqual('null', data['appendNull'])
+        self.assertEqual('anullundefinedfalse', data['replaceNull'])
+        self.assertEqual('null', data['replaceOnlyNull'])
+        self.assertEqual('null', data['replaceWithNull'])
 
 
 if __name__ == '__main__':

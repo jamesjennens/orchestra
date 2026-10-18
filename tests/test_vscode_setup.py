@@ -886,6 +886,14 @@ class TheDialogAndThePageCase(unittest.TestCase):
         setup = SETUP_JS.read_text(encoding='utf-8')
         self.assertIn("export const BRIDGE_ROLES = Object.freeze(['worker', 'reviewer']);", setup)
 
+    def test_the_wizard_does_not_pass_null_as_a_child(self):
+        # A browser inserts the text "null" for a null child; the wizard used to pass
+        # existingChildren[0] || null to replaceChildren (kittrial-5bb.342 review
+        # item static-lists-and-null).
+        agents = AGENTS_JS.read_text(encoding='utf-8')
+        self.assertNotIn('existingChildren[0] || null', agents)
+        self.assertIn('...(existingChildren[0] ? [existingChildren[0]] : [])', agents)
+
     def test_the_page_writes_no_settings_and_no_ca_file(self):
         agents = AGENTS_JS.read_text(encoding='utf-8')
         setup = SETUP_JS.read_text(encoding='utf-8')

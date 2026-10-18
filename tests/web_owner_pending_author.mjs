@@ -5,7 +5,7 @@ const { requirement } = await import(url);
 const data = JSON.parse(raw);
 const ctx = { href: p => '#' + p, api: {}, setDirty() {}, go() {} };
 const page = await requirement(ctx, { pid: 'alpha', rid: data.id }, {}, data);
-const button = page.querySelectorAll('button').find(b => b.textContent === 'Accept draft');
+const button = Array.from(page.querySelectorAll('button')).find(b => b.textContent === 'Accept draft');
 assert.ok(button, page.textContent);
 assert.ok(button.parentNode.textContent.includes('written by a contributor who gave the name <contributor>[U+202E]usr_aaaaaaaaaaaaaaaa (not verified)'));
 assert.ok(button.parentNode.textContent.includes('Recorded 2026-09-25T00:00:00Z'));
