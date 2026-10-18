@@ -695,6 +695,18 @@ def lanes_scope_for(actor,operators,key_principal,owners=None):
         allowed=actor in set(operators or ())
     return 'all' if allowed else 'own'
 
+def lanes_scope_requested(scope,requested):
+    """``scope``, narrowed to ``'own'`` when the request asks for it (kittrial-5bb.263).
+
+    A caller that already holds the cross-lane view may ask for the CONTRIBUTOR view of it:
+    the web service calls this endpoint without a bound key, so its own route asks for
+    ``'own'`` explicitly when its viewer is neither an owner nor a coordinator. Only the
+    narrowing is honoured -- ``'all'``, a missing field or anything else leaves the scope
+    this endpoint computed for its own caller alone -- so no request data can widen a bound
+    key's view of the board.
+    """
+    return 'own' if requested=='own' else scope
+
 def key_principal_refusal(request,path,key_principal):
     """Refuse, for a key bound to a principal, a request whose actor that principal does not own.
 
@@ -1065,6 +1077,13 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 return sessions.owners(path)
             lanes_owners=load_lanes_owners
         lanes_scope=lanes_scope_for(actor,operators,key_principal,lanes_owners)
+        # A caller may ASK for the contributor view of the lanes board (kittrial-5bb.263
+        # section 4): the web service calls this endpoint without a bound key, so its own
+        # route asks for `own` explicitly when its viewer is neither an owner nor a
+        # coordinator. Only the narrowing is honoured (see `lanes_scope_requested`), so the
+        # scope this endpoint computed for its own callers stays authoritative for them.
+        lanes_scope=lanes_scope_requested(
+            lanes_scope,request.get('lanes_scope') if isinstance(request,dict) else None)
         def work_effect():
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,

@@ -40,6 +40,135 @@ export function unusableBanner(project) {
     ' Nothing that grants access is accepted on it; removing a member, revoking a credential and archiving still work.') : null;
 }
 
+// -- the lanes board (kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md section 4) -------------
+// ONE read answers this panel: the canonical `work lanes` read, through
+// GET /v1/projects/<pid>/lanes. No age and no flag is computed here -- not the state age,
+// not the last-write age, not waiting_too_long/expect_by_passed/your_move_idle -- because
+// a second implementation of either on this side is exactly what the design forbids. The
+// threshold below is an argument of THIS page: it travels with every read, and it is not a
+// setting the page could inherit.
+export const LANES_PAGE = 10;
+export const LANES_DEFAULT_IDLE_MINUTES = 15;
+export const LANES_IDLE_MINUTES_MIN = 1;
+export const LANES_IDLE_MINUTES_MAX = 10080;
+const LANE_FLAGS = [
+  ['waiting_too_long', 'Waiting too long'],
+  ['expect_by_passed', 'Expect-by passed'],
+  ['your_move_idle', "Holder's move idle"],
+];
+
+// The server's ages are whole seconds; said as a rough span, never re-derived from a clock.
+export function ageText(seconds) {
+  if (seconds === null || seconds === undefined) return 'unknown';
+  if (seconds < 60) return 'under a minute';
+  if (seconds < 3600) return Math.floor(seconds / 60) + ' min';
+  if (seconds < 86400) return Math.floor(seconds / 3600) + ' h';
+  const days = Math.floor(seconds / 86400);
+  return days + (days === 1 ? ' day' : ' days');
+}
+
+export function lanesPanel(ctx, project) {
+  const panel = h('section', { class: 'panel', 'data-panel': 'lanes', 'aria-label': 'Lanes' });
+  const state = { idle_minutes: LANES_DEFAULT_IDLE_MINUTES, cursor: null, stack: [] };
+  const minutes = h('input', { type: 'number', id: 'lanes-idle-minutes', min: LANES_IDLE_MINUTES_MIN,
+    max: LANES_IDLE_MINUTES_MAX, value: String(LANES_DEFAULT_IDLE_MINUTES),
+    'aria-label': 'Idle minutes (1 to 10080)' });
+  const message = h('span', { class: 'small muted', role: 'status' });
+  // The threshold is the page's argument: changing it reads the board again from its first
+  // page, because a cursor belongs to the query (limit and threshold) that minted it.
+  function readAgain(value) {
+    const chosen = Number(value);
+    if (!Number.isInteger(chosen) || chosen < LANES_IDLE_MINUTES_MIN || chosen > LANES_IDLE_MINUTES_MAX) {
+      message.textContent = `Idle minutes must be a whole number from ${LANES_IDLE_MINUTES_MIN} to ${LANES_IDLE_MINUTES_MAX}.`;
+      return;
+    }
+    message.textContent = '';
+    state.idle_minutes = chosen; state.cursor = null; state.stack = [];
+    draw();
+  }
+  const apply = h('button', { type: 'button', onclick: () => readAgain(minutes.value) }, 'Read with this threshold');
+  const head = () => h('div', { class: 'panel-head' },
+    h('h2', { class: 'small' }, 'Lanes'),
+    h('span', { class: 'small muted hide-narrow' }, 'Who holds what, who is free, how long each has been that way, and the three flags: all of it from one board read on the server.'));
+  const threshold = () => h('div', { class: 'toolbar' },
+    h('label', { class: 'check', for: 'lanes-idle-minutes' }, 'Idle minutes'), minutes, apply, message);
+
+  function taskLine(entry) {
+    const flags = LANE_FLAGS.filter(([key]) => (entry.flags || []).includes(key));
+    return h('li', { class: 'lane-task', 'data-task': entry.task, 'data-inferred': entry.inferred ? 'true' : null },
+      h('a', { class: 'title', href: ctx.href(`/p/${project.id}/t/${entry.task}`) }, entry.title || entry.task),
+      h('div', { class: 'sub' }, h('span', { class: 'mono' }, entry.task),
+        ' · review ', h('span', { class: 'mono' }, entry.review_state || 'none'),
+        ' · whose move ', h('span', { class: 'mono' }, entry.whose_move || 'unknown'),
+        ' · next ', h('span', { class: 'mono' }, entry.next_actor || 'unknown')),
+      h('div', { class: 'sub' },
+        'State ', entry.state ? h('span', { class: 'mono' }, entry.state) : h('span', { class: 'muted' }, 'not declared'),
+        entry.waiting_on ? [' · waiting on ', h('span', { class: 'mono' }, entry.waiting_on)] : null,
+        entry.expect_by ? [' · expect by ', h('span', { class: 'mono' }, entry.expect_by)] : null,
+        ' · in that state ', ageText(entry.state_age_seconds),
+        ' · holder last wrote ', ageText(entry.holder_last_write_seconds)),
+      // A row the read could not declare is GUESSED from the checkpoint text, and says so.
+      entry.inferred ? h('div', { class: 'small', 'data-inferred': 'true' },
+        h('span', { class: 'chip plain', title: 'The state is guessed from the checkpoint text, not declared by a lane-state record' }, 'Guessed')) : null,
+      flags.length ? h('div', { class: 'small' }, flags.map(([key, label]) =>
+        h('span', { class: 'chip warn', 'data-flag': key }, label))) : null);
+  }
+
+  function laneBlock(lane) {
+    const held = lane.held || [];
+    const raised = LANE_FLAGS.filter(([key]) => lane[key]);
+    return h('div', { class: 'lane', 'data-lane': lane.lane, 'data-actor': lane.actor,
+      'data-inferred': lane.inferred ? 'true' : null },
+      h('div', { class: 'event-head' },
+        h('strong', null, lane.lane), ' ', h('span', { class: 'mono small muted' }, lane.actor),
+        ' ',
+        lane.idle ? h('span', { class: 'chip', 'data-idle': 'true', title: 'This lane holds nothing' }, 'Free')
+          : h('span', { class: 'chip plain' }, held.length === 1 ? '1 task held' : held.length + ' tasks held'),
+        lane.inferred ? h('span', { class: 'chip plain', 'data-inferred': 'true', title: 'Guessed, not declared' }, 'Guessed') : null,
+        h('span', { class: 'small muted' }, ' last write ', ageText(lane.last_write_age_seconds))),
+      // Raised flags, each naming the tasks the read put under it (`flag_tasks`).
+      raised.length ? h('div', { class: 'small' }, raised.map(([key, label]) => h('span', { class: 'chip warn', 'data-flag': key },
+        label, (lane.flag_tasks && lane.flag_tasks[key] ? ': ' + lane.flag_tasks[key].join(', ') : '')))) : null,
+      held.length ? h('ul', { class: 'lane-tasks' }, held.map((entry) => taskLine(entry))) : null,
+      lane.idle ? h('p', { class: 'small muted' }, 'Holds nothing; free to take work. Last write ', ageText(lane.last_write_age_seconds), ' ago.') : null);
+  }
+
+  function pager(data) {
+    const shown = (data.items || []).length;
+    return h('div', { class: 'pager' },
+      h('span', { class: 'num' }, data.total ? `${shown} of ${data.total} lane${data.total === 1 ? '' : 's'} on this page` : ''),
+      h('div', { class: 'actions' },
+        h('button', { type: 'button', disabled: !state.stack.length, onclick: () => { state.cursor = state.stack.pop() || null; draw(); } }, 'Previous'),
+        h('button', { type: 'button', disabled: !data.next_cursor, onclick: () => { state.stack.push(state.cursor); state.cursor = data.next_cursor; draw(); } }, 'Next')));
+  }
+
+  async function draw() {
+    panel.setAttribute('aria-busy', 'true');
+    let data;
+    try {
+      data = await ctx.api.lanes(project.id, { idle_minutes: state.idle_minutes, limit: LANES_PAGE, cursor: state.cursor });
+    } catch (error) {
+      // A refused read says why and offers to read again, as the neighbouring panels do.
+      // A server older than this route answers 404/501: the panel then simply is not there.
+      if ([404, 501].includes(error.status)) { panel.replaceChildren(); return; }
+      panel.replaceChildren(head(), threshold(), errorState(error, draw));
+      return;
+    } finally { panel.removeAttribute('aria-busy'); }
+    const lanes = data.items || [];
+    const counts = data.flags || {};
+    panel.replaceChildren(head(), threshold(),
+      h('p', { class: 'small muted', role: 'note' },
+        'Reading with ', String(data.idle_minutes), ' idle minutes: ',
+        LANE_FLAGS.map(([key, label]) => `${counts[key] || 0} ${label.toLowerCase()}`).join(' · '),
+        data.scope === 'own' ? '. You see your own lanes; owners and coordinators see every lane.' : '.'),
+      lanes.length ? h('div', { class: 'stack' }, lanes.map(laneBlock))
+        : empty('No lanes to show', 'No session holds work in this project right now.'),
+      pager(data));
+  }
+  draw();
+  return panel;
+}
+
 export async function overview(ctx, { pid }) {
   const project = await load(ctx, pid);
   if (project.usable === false) {
@@ -155,6 +284,10 @@ export async function overview(ctx, { pid }) {
     setupLine,
     mergeSlotPanel(ctx, project),
     guidancePanel(ctx, project),
+    // The lane board (kittrial-5bb.263). Every member sees it: the route scopes a viewer
+    // who is not an owner or coordinator to their own agents' lanes, so a lane always sees
+    // its own row here, and the cross-lane view is never inherited from the transport.
+    lanesPanel(ctx, project),
     strip,
     h('div', { class: 'toolbar' }, search, statusSeg, reviewSel, requirementToggle),
     tableHost);

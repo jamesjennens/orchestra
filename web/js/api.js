@@ -25,6 +25,19 @@ function query(params) {
   return entries.length ? '?' + new URLSearchParams(entries).toString() : '';
 }
 
+// Keeping an open page's session alive (kittrial-5bb.330). The service refreshes a session's
+// idle deadline on every authenticated read and answers the window it is kept by, so one
+// light session read is the whole touch. A page that keeps a long task open — the agent
+// set-up wizard — touches only while it is visible: a hidden tab polls nothing. Shortly
+// before the idle deadline this loop last heard about, it warns the page, which is what the
+// wizard shows before the session would sign the owner out mid set-up.
+export const SESSION_IDLE_WARNING_EVENT = 'orchestra:session-idle-warning';
+export const KEEP_ALIVE_INTERVAL_MS = 4 * 60 * 1000;
+export const KEEP_ALIVE_WARN_MS = 2 * 60 * 1000;
+
+function later(callback, ms) { return globalThis.setTimeout(callback, ms); }
+function cancel(handle) { if (handle !== null && handle !== undefined) globalThis.clearTimeout(handle); }
+
 export function createApi(transport) {
   let csrf = null;
 
@@ -161,6 +174,126 @@ export function createApi(transport) {
     }
   }
 
+  // The authenticated session read. It is also the keep-alive touch: the service refreshes
+  // the caller's idle deadline on every authenticated read and answers the window it is kept
+  // by and this session's deadlines (kittrial-5bb.330), so no second route is needed.
+  async function readSession() {
+    const result = await call('GET', '/v1/sessions/current');
+    if (result && result.csrf_token) csrf = result.csrf_token;
+    return result;
+  }
+
+  // Every loop this page started, so a sign-out stops them all: nothing touches a session
+  // that is being deleted on the way out (kittrial-5bb.330).
+  const keepAliveStops = new Set();
+
+  function keepAliveWhileVisible(options) {
+    const settings = options || {};
+    const doc = globalThis.document;
+    const intervalMs = settings.intervalMs === undefined ? KEEP_ALIVE_INTERVAL_MS : settings.intervalMs;
+    const warnMs = settings.warnMs === undefined ? KEEP_ALIVE_WARN_MS : settings.warnMs;
+    const onWarning = settings.onWarning;
+    let stopped = false;
+    let touchTimer = null;
+    let warnTimer = null;
+    let inFlight = false;
+    let idleMs = null;              // the idle window the service last answered, in ms
+    let deadline = null;            // this session's idle deadline, ms since the epoch
+
+    function visible() { return !doc || doc.visibilityState === 'visible'; }
+
+    function stop() {
+      if (stopped) return;
+      stopped = true;
+      cancel(touchTimer); cancel(warnTimer);
+      touchTimer = warnTimer = null;
+      if (doc && doc.removeEventListener) doc.removeEventListener('visibilitychange', onVisibility);
+      keepAliveStops.delete(stop);
+    }
+
+    function warn() {
+      warnTimer = null;
+      if (stopped) return;
+      const detail = {
+        idleSeconds: idleMs === null ? null : Math.round(idleMs / 1000),
+        idleExpiresAt: deadline === null ? null : new Date(deadline).toISOString(),
+        warnMs,
+        remainingSeconds: deadline === null ? null : Math.round((deadline - Date.now()) / 1000),
+      };
+      if (typeof onWarning === 'function') {
+        try { onWarning(detail); } catch { /* a page's own handler never stops the loop */ }
+      }
+      if (!doc || typeof doc.dispatchEvent !== 'function') return;
+      let event;
+      try { event = new globalThis.CustomEvent(SESSION_IDLE_WARNING_EVENT, { detail }); }
+      catch { event = { type: SESSION_IDLE_WARNING_EVENT, detail }; }
+      try { doc.dispatchEvent(event); } catch { /* a listener never stops the loop */ }
+    }
+
+    // The answer names the idle window and this session's deadline; both drive the next touch
+    // and the warning. A page told neither (an older service) falls back to the interval.
+    function remember(result) {
+      if (!result || typeof result !== 'object') return;
+      idleMs = typeof result.idle_seconds === 'number' && result.idle_seconds > 0 ? result.idle_seconds * 1000 : null;
+      const stated = typeof result.idle_expires_at === 'string' ? Date.parse(result.idle_expires_at) : NaN;
+      deadline = Number.isNaN(stated) ? (idleMs === null ? null : Date.now() + idleMs) : stated;
+    }
+
+    function scheduleWarning() {
+      cancel(warnTimer); warnTimer = null;
+      if (stopped || deadline === null) return;
+      const delay = deadline - Math.max(0, warnMs) - Date.now();
+      // No room for a warning before this deadline: it was just refreshed by the touch that
+      // armed it, so there is nothing to warn about until a touch stops refreshing it.
+      if (delay <= 0) return;
+      warnTimer = later(warn, delay);
+    }
+
+    function schedule() {
+      if (stopped) return;
+      const every = Number.isFinite(intervalMs) && intervalMs > 0 ? intervalMs : KEEP_ALIVE_INTERVAL_MS;
+      // Never wait longer than half the window the service answered, so a 5-minute
+      // installation is kept alive as reliably as a 12-hour one.
+      const wait = idleMs === null ? every : Math.min(every, Math.max(1000, Math.floor(idleMs / 2)));
+      touchTimer = later(touch, wait);
+    }
+
+    async function touch() {
+      touchTimer = null;
+      if (stopped || inFlight || !visible()) return;
+      inFlight = true;
+      try {
+        remember(await readSession());
+        scheduleWarning();
+      } catch (error) {
+        // A signed-out or expired session ends the loop. Any other failure (a lost network,
+        // a 5xx) keeps it: the next interval tries again and the warning still fires before
+        // the deadline this loop last heard about.
+        if (error instanceof ApiError && error.status === 401) { stop(); return; }
+      } finally {
+        inFlight = false;
+      }
+      schedule();
+    }
+
+    function onVisibility() {
+      if (stopped) return;
+      if (!visible()) {
+        // Hidden: nothing polls and nothing is scheduled until the page is visible again.
+        cancel(touchTimer); cancel(warnTimer);
+        touchTimer = warnTimer = null;
+        return;
+      }
+      cancel(touchTimer); touchTimer = null;
+      touch();
+    }
+
+    if (doc && doc.addEventListener) doc.addEventListener('visibilitychange', onVisibility);
+    keepAliveStops.add(stop);
+    if (visible()) touch();
+    return { stop };
+  }
+
   return {
     // session
     async login(username, password) {
@@ -171,18 +304,26 @@ export function createApi(transport) {
       return result.user;
     },
     async current() {
-      const result = await call('GET', '/v1/sessions/current');
-      if (result && result.csrf_token) csrf = result.csrf_token;
-      return result;
+      return readSession();
     },
+    // One light authenticated touch (kittrial-5bb.330): the same read, named for what the
+    // agent set-up wizard uses it for while it is open.
+    async keepAlive() {
+      return readSession();
+    },
+    keepAliveWhileVisible,
     hasCsrf: () => Boolean(csrf),
     assignmentRoster: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/assignment-roster`, { params }),
     assignTask: (pid, tid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/assign`, body),
-    async logout() { try { await call('DELETE', '/v1/sessions/current'); } finally {
-      csrf = null;
-      if (lifecycleActor) { try { sessionStorage.removeItem(lifecycleStorageKey()); } catch {} }
-      lifecycleActor = null; lifecycleKeys = new Map();
-    } },
+    async logout() {
+      // A page that is signing out stops its keep-alive loops first (kittrial-5bb.330).
+      for (const stop of [...keepAliveStops]) stop();
+      try { await call('DELETE', '/v1/sessions/current'); } finally {
+        csrf = null;
+        if (lifecycleActor) { try { sessionStorage.removeItem(lifecycleStorageKey()); } catch {} }
+        lifecycleActor = null; lifecycleKeys = new Map();
+      }
+    },
     redeemReset: (uid, reset_value, new_password) => call('POST', `/v1/accounts/${uid}/reset/redeem`, { body: { reset_value, new_password }, key: newKey() }),
     changePassword: (uid, current_password, new_password) => mutate('POST', `/v1/accounts/${uid}/password`, { current_password, new_password }),
 
@@ -258,6 +399,9 @@ export function createApi(transport) {
     checkpoint: (pid, tid, body) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/checkpoints`, body),
     review: (pid, tid, body) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/reviews`, body),
     queue: (pid, params) => call('GET', `/v1/projects/${pid}/queue`, { params }),
+    // The lane board (kittrial-5bb.263): one server read of who holds what, who is free and
+    // the three flags. `idle_minutes` is this page's argument, `limit`/`cursor` page it.
+    lanes: (pid, params) => call('GET', `/v1/projects/${pid}/lanes`, { params }),
     myWork: () => call('GET', '/v1/me/work'),
     agents: (params) => call('GET', '/v1/agents', { params }),
     // A document of the installed kit, as the client's `docs NAME` serves it (kittrial-5bb.226).
