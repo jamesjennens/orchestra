@@ -411,20 +411,26 @@ class WaitTests(Held):
         self.assertEqual(self.service.LOGINS_PER_ADDRESS, 4)
         barrier, results, waits, most = threading.Barrier(10), [], [], []
         # What is asserted is the wait of the service, its real two seconds, and the share. The
-        # password check is given a fixed length, a quarter of a second each, in place of a hash
-        # whose length is the machine's: on a starved machine ten real hashes, four at a time,
-        # outlasted the two seconds and the tenth person was sent away (seen once on Windows
-        # beside other suites, kittrial-5bb.191). The same answer as the real check gives.
-        real = http_auth.verify_password
+        # length of a check is the test's, not the machine's: every check is held on this event
+        # until all six over-share log-ins are parked, then answered at once. A fixed quarter of
+        # a second each (kittrial-5bb.191) needed six checks before the tenth could start and so
+        # left only 0.5 s of the 2 s wait for wakeups and timer overshoot; a loaded runner
+        # occasionally expired the tenth deadline and answered 503 (kittrial-5bb.338, CI
+        # 39108345361). The handoff of a freed place is what this test is for, and it no longer
+        # depends on how long the runner takes to run a check. The same answer as the real check.
+        release = threading.Event()
+        self.addCleanup(release.set)
+        verifier = self.service.state['users'][self.admin_user['id']]['password']
         known = {}
+        self.assertIs(http_auth.verify_password(verifier, PASSWORD), True)
+        known[(verifier, PASSWORD)] = True
 
-        def a_quarter_of_a_second(verifier, password):
-            if (verifier, password) not in known:
-                known[(verifier, password)] = real(verifier, password)
-            time.sleep(0.25)
-            return known[(verifier, password)]
-        self.assertIs(a_quarter_of_a_second(self.service.state['users'][self.admin_user['id']]['password'], PASSWORD), True)
-        patched = mock.patch.object(http_auth, 'verify_password', a_quarter_of_a_second)
+        def held_until_the_waiters_are_parked(checked_verifier, password):
+            release.wait(30)
+            if (checked_verifier, password) not in known:
+                known[(checked_verifier, password)] = http_auth.verify_password(checked_verifier, password)
+            return known[(checked_verifier, password)]
+        patched = mock.patch.object(http_auth, 'verify_password', held_until_the_waiters_are_parked)
         patched.start()
         self.addCleanup(patched.stop)
 
@@ -439,9 +445,26 @@ class WaitTests(Held):
         people = [threading.Thread(target=person) for _ in range(10)]
         for one in people:
             one.start()
-        while any(one.is_alive() for one in people):
+        # Every check is held, so the four places stay taken: four log-ins in flight and the
+        # other six waiting. A place is freed only after that state is seen, which is the handoff.
+        until, parked = time.monotonic() + 10, None
+        while time.monotonic() < until:
+            most.append((self.service._logins_by_address.get(self.ONE, 0), self.service._logins_waiting.get(self.ONE, 0)))
+            observed = (self.service._logins, self.service._logins_by_address.get(self.ONE),
+                        self.service._logins_waiting.get(self.ONE))
+            if observed == (4, 4, 6):
+                parked = observed
+                release.set()                                 # at once, so no waiter's 2 s runs out here
+                break
+            time.sleep(0.002)
+        self.assertEqual(parked, (4, 4, 6))                    # four checks held, all six waiters parked
+        begun = time.monotonic()
+        while any(one.is_alive() for one in people) and time.monotonic() - begun < 30:
             most.append((self.service._logins_by_address.get(self.ONE, 0), self.service._logins_waiting.get(self.ONE, 0)))
             time.sleep(0.002)
+        for one in people:
+            one.join(30)
+        self.assertFalse(any(one.is_alive() for one in people), 'not every log-in finished')
         self.assertEqual(results, [ADMIN] * 10)
         self.assertLessEqual(max(in_flight for in_flight, _ in most), 4)                # the share held throughout
         self.assertLess(max(waits), http_auth.Service.LOGIN_WAIT_SECONDS + 1.5)
