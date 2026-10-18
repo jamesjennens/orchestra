@@ -862,7 +862,7 @@ function wireWizard(ctx, container, payload, { hasCertificate = false, pageMode 
     h('label', { class: 'small', for: 'setup-os' }, 'Operating system: ', osSelect));
 
   if (bodyNode) {
-    const existingChildren = bodyNode.childNodes.slice();
+    const existingChildren = Array.from(bodyNode.childNodes);
     bodyNode.replaceChildren(
       existingChildren[0] || null,
       wizardBar,
