@@ -304,10 +304,17 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
                        'Read %s and deliver a new contribution that answers each item.'
                        % (items, plural, back))
     if state == 'integrated':
-        # An integrated revision does not finish a task deliberately kept open.
-        return 'you', ('This task stays open after its contribution was integrated. '
-                       'Read %s; continue the task\'s remaining scope if any, otherwise checkpoint '
-                       'that nothing remains for you. Deployment or verification may be the coordinator\'s move.' % back)
+        # kittrial-5bb.336: an integrated contribution on a task still open is NOT the
+        # assignee's move - it is the coordinator's (close the task, or record what
+        # remains). The old 'continue the remaining scope' answer put every
+        # integrated-but-open row in the worker's own queue, burying its real work, and
+        # nothing on the row can tell remaining scope from finished work - that judgement
+        # is the coordinator's, who closed 11 such rows on jjbp while each worker read
+        # them as its own.
+        return 'coordinator', ('Nothing is for you to do: this contribution is integrated; '
+                               'the coordinator closes the task or records what remains of it. '
+                               'Read %s; if scope you owe remains, say so in a checkpoint and the '
+                               'coordinator records it.' % back)
     if state in (None, 'none'):
         return 'you', ('This is your work: no contribution has been delivered yet. Read %s '
                        'for its current state and deliver one.' % back)

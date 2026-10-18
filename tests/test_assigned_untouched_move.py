@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import http_service
+import review_state
 import work
 from test_briefing import PROJECT, TASK, append_checkpoint, blocker, checkpoint, rows
 from test_lanes import A, B, board, comment, entry_of, task
@@ -88,22 +89,34 @@ class WorkAssignedUntouchedTests(unittest.TestCase):
         self.assertIn('You recorded a blocker or dependency in your own checkpoint', item['next'])
         self.assertEqual(page['your_move']['count'], 1)
 
-    def test_integrated_but_open_follows_kittrial_5bb_211(self):
-        # kittrial-5bb.211 amendment (3): a task whose first contribution is integrated
-        # but which stays open reads the assignee's move; it is NOT finished by integration.
+    def test_integrated_but_open_is_the_coordinators_move(self):
+        # kittrial-5bb.336: an integrated contribution on a task still open is the
+        # COORDINATOR's move (close the task, or record what remains) - never the
+        # assignee's; .211's 'the assignee continues' answer buried every real task a
+        # worker held beside integrated-but-open rows.
         store = integrated_open()
         page = owner_read(store.rows, 'alice/session', caller='coordinator/lane')
         item = row_of(page)
         self.assertEqual((item['review_state'], item['whose_move'], item['next_actor']),
-                         ('integrated', 'you', 'assignee'))
-        self.assertIn('stays open after its contribution was integrated', item['next'])
-        self.assertEqual(page['your_move']['count'], 1)
-        # A different caller still cannot tell the move, but the ROLE is the assignee's.
+                         ('integrated', 'coordinator', 'coordinator'))
+        self.assertIn('the coordinator closes the task or records what remains', item['next'])
+        self.assertEqual(page['your_move']['count'], 0)
+        # A different caller cannot tell the caller-relative move (it is not theirs),
+        # but the ROLE the row names is the coordinator's for everyone.
         other = work.queue(store.rows, 'someone/else', [])
         self.assertEqual((row_of(other)['whose_move'], row_of(other)['next_actor']),
-                         ('unknown', 'assignee'))
-        self.assertEqual(work.move_decision('integrated', TASK, True, assignee='alice/session')[0], 'you')
-        self.assertEqual(work.move_decision('integrated', TASK, False, assignee='alice/session')[0], 'unknown')
+                         ('unknown', 'coordinator'))
+        self.assertEqual(work.move_decision('integrated', TASK, True, assignee='alice/session')[0],
+                         'coordinator')
+        self.assertEqual(review_state.next_actor('integrated'), 'coordinator')
+        self.assertEqual(review_state.next_actor('integrated', assignee='alice/session'), 'coordinator')
+        # A CLOSED integrated row remains history only: it leaves active work, so the
+        # queue drops it and the projection names no mover.
+        closed = integrated_open()
+        for row in closed.rows:
+            row['status'] = 'closed'
+        self.assertEqual(review_state.next_actor('integrated', closed=True), 'none')
+        self.assertEqual(owner_read(closed.rows, 'alice/session')['items'], [])
 
     def test_mine_answers_for_the_caller_and_an_unfiltered_scan_stays_caller_relative(self):
         data = rows()

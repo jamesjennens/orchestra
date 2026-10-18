@@ -59,6 +59,16 @@ class ClaimLimitUnitTests(unittest.TestCase):
         ]
         self.assertEqual(['a', 'b', 'c'], [row['id'] for row in claim_limit.held_undelivered(rows)])
 
+    def test_an_integrated_but_open_row_does_not_count(self):
+        # kittrial-5bb.336: a row whose contribution is integrated while the task stays
+        # open is the coordinator's move to close, never undelivered work of the
+        # holder's - the gate must not count it against the claim limit.
+        rows = [
+            {'id': 'held-open', 'status': 'open', 'review_state': 'none'},
+            {'id': 'integrated-open', 'status': 'in_progress', 'review_state': 'integrated'},
+        ]
+        self.assertEqual(['held-open'], [row['id'] for row in claim_limit.held_undelivered(rows)])
+
     def test_a_blocked_task_does_not_count_but_an_unknown_count_is_not_blocked(self):
         rows = [
             {'id': 'a', 'status': 'in_progress', 'review_state': None, 'blocking_items': 0},
@@ -1258,3 +1268,60 @@ class RealStackClaimReleaseTests(held_stack.RealStackTests):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def only_its_own_tests(cls):
+    for base in (held_stack.RealStackTests,):
+        for name in dir(base):
+            if name.startswith('test_') and name not in cls.__dict__:
+                setattr(cls, name, None)
+    return cls
+
+
+@only_its_own_tests
+class IntegratedNotCountedRealStackTests(held_stack.RealStackTests):
+    """kittrial-5bb.336 on the real web service: an integrated-but-open row in the
+    agent's held set is not counted against its claim limit, and /v1/agents/me/next
+    names it the owner's (coordinator's) move, not the agent's own."""
+
+    def new_agent(self, name):
+        body = {'name': name, 'working_directory': '/home/x/' + name.lower().replace(' ', '-'),
+                'projects': ['pp']}
+        made = self.request('POST', '/v1/agents', body, token=self.tokens['alex'])
+        self.assertEqual(201, made.status, made.data)
+        return made.data['agent']['id'], made.data['credential']['secret']
+
+    def test_a_claim_succeeds_beside_an_integrated_but_open_row(self):
+        agent_id, secret = self.new_agent('Keeper')
+        integrated = self.new('integrated but open')
+        # The row reaches the gate as the agent's own, integrated, still open.
+        original = self.backend.agent_tasks
+
+        def with_an_integrated_row(project_id, actor=None, queue=None):
+            answer = original(project_id, actor=actor, queue=queue)
+            if actor == agent_id:
+                for item in answer['tasks']:
+                    if item['id'] == integrated:
+                        item['review_state'] = 'integrated'
+            return answer
+
+        self.backend.agent_tasks = with_an_integrated_row
+        try:
+            first = self.request(
+                'POST', '/v1/projects/pp/tasks/%s/claim' % integrated, {}, token=secret)
+            self.assertEqual(200, first.status, first.data)
+            second = self.new('a second task')
+            answer = self.request('POST', '/v1/projects/pp/tasks/%s/claim' % second, {},
+                                  token=secret)
+            self.assertEqual(200, answer.status, answer.data)
+            # And /me/next reports the integrated row as the owner's to close, with the
+            # kittrial-5bb.336 sentence, never as the agent's own action.
+            import re as _re
+            listing = self.request('GET', '/v1/agents/me/next', token=secret)
+            self.assertEqual(200, listing.status, listing.data)
+            action = next(item for item in listing.data['next_actions']
+                          if item['task'] == integrated)
+            self.assertEqual(action['who'], 'owner')
+            self.assertIn('close the task or record what remains', action['reason'])
+        finally:
+            self.backend.agent_tasks = original
