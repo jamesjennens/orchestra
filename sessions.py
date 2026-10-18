@@ -255,6 +255,18 @@ def execute(path, project, args, export, *, actor=None, principal=None):
         return dict(project=project,session=old,reconciled=True,principal=owner_map(data).get(old['actor']))
     rows=record_json.loads_rows(export())
     occupied=used_actors(rows)|{r['actor'] for r in data['records'].values()}
+    # kittrial-5bb.333: a session name is a DISPLAY NAME, and the assignment-time resolver
+    # maps it to the one identity carrying it. A name that is an actor id that has ever
+    # acted here (a stored assignee/author/created_by, or a registry actor) is refused:
+    # otherwise a newcomer could register the name of an existing actor and be chosen for
+    # a NEW assignment -- the review's P1/P5 attacks started exactly that way. Two sessions
+    # MAY still share a readable name (long-standing, documented behaviour): such a name is
+    # ambiguous only when someone assigns BY it, and the assignment-time rule refuses that
+    # before any native write, so the name itself is not restricted here.
+    if a.name in occupied:
+        raise ValueError('The session name %r is already an actor id in this project; a session '
+                         'name must not be an actor id, so choose another name. Nothing was registered.'
+                         % a.name)
     for _ in range(20):
         actor='session-'+str(uuid.uuid4())
         if actor not in occupied:break

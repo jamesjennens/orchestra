@@ -870,11 +870,16 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     return result
 
 def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
-          independent_approval=False,owners=None,provenance_writes=True):
+          independent_approval=False,owners=None,provenance_writes=True,identity_names=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
-    if issue.get('issue_type')=='event':raise ValueError('Use history/show for an event; brief requires a task or job')
+    # DISPLAY ONLY (kittrial-5bb.333): the stored assignee is the actor id and `owner` stays
+    # exactly that value. `owner_name`/`assigned_to` are labels built from an actor id the
+    # caller already knows; they never turn a stored name into an actor.
+    owner_raw=issue.get('assignee')
+    owner_name=(identity_names or {}).get(owner_raw) if isinstance(owner_raw,str) and owner_raw else None
+    assigned_to='%s (%s)' % (owner_name,owner_raw) if owner_name and owner_name!=owner_raw else (owner_raw or 'unassigned')
     data=snapshot(rows,project,task);p,c=current if current else (None,None)
     facts=next(r for r in project_facts(rows) if r['id']==task)
     items=p['open_items'] if p else []
@@ -1049,7 +1054,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     from task_assignment import notices as assignment_notices
     notice_block=assignment_notices(issue,project,actor)
     notice_records=assignment_notices(issue,project,None,limit=20)
-    result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
+    result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(owner_raw or 'unassigned',96),**({'owner_name':clip(owner_name,96),'assigned_to':clip(assigned_to,200)} if owner_name and owner_name!=owner_raw else {}),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
             'newer':newer,
@@ -1927,7 +1932,7 @@ def latest_checkpoint_read(rows,project,task,include_provenance=False):
             'evidence':{'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id'])}}
 
 def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None,
-            independent_approval=False,owners=None):
+            independent_approval=False,owners=None,identity_names=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
     from work import help_payload,help_requested
     if help_requested(args):
@@ -1985,7 +1990,8 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
                          verifiers=verifiers,actor=actor,full=a.full,
                          independent_approval=independent_approval,owners=owners,
-                         provenance_writes=checkpoint_writes_enabled(root))
+                         provenance_writes=checkpoint_writes_enabled(root),
+                         identity_names=identity_names)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

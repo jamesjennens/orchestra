@@ -2545,7 +2545,7 @@ def open_review_requests_by(rows, actor, operators=None, journal=None):
 
 def execute(rows, task, actor, payload, run, operators=None, journal=None, review_writes=None,
             independent_approval=False, coordinator_writes=False, owners=None, verified_web_authority=False,
-            verifiers=None):
+            verifiers=None, identity_names=None):
     """Validate, CAS and append once; return receipt and projected review state.
 
     ``journal`` is the project directory holding the host-issued
@@ -2627,8 +2627,18 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     if payload['previous'] != state['latest_comment_id']:
         raise StaleReviewPrevious(task, payload['previous'],
                                   state['latest_comment_id'], effective_state)
+    # EXACT comparison only (kittrial-5bb.333): a stored assignee is never interpreted as a
+    # display name at effect time. The message may LABEL an actor id with its display name --
+    # actor -> name cannot move the right to another actor.
     if payload['operation'] in ('contribute', 'respond') and (not issue.get('assignee') or actor != issue['assignee']):
-        raise ValueError('Only the current assigned owner may contribute/respond; resume or handoff first')
+        assigned=issue.get('assignee')
+        shown=assigned
+        if isinstance(assigned,str) and assigned and identity_names:
+            name=identity_names.get(assigned)
+            if isinstance(name,str) and name and name!=assigned:
+                shown='%s (%s)' % (name,assigned)
+        raise ValueError('Only the current assigned owner may contribute/respond%s; resume or '
+                         'handoff first' % ('; this task is assigned to '+shown if shown else ''))
     if payload['operation'] in ('request-changes', 'request-review', 'decline-review') and closed:
         raise ValueError('Reopen the closed task explicitly before requesting changes or a review')
     if payload['operation'] == 'withdraw':

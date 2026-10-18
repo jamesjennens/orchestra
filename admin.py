@@ -4915,6 +4915,76 @@ def merge_slot_report(root,names=None):
              'not_healthy':sorted(groups['missing']+groups['damaged']+groups['unknown'])},
             bool(report) and not groups['missing'] and not groups['damaged'] and not groups['unknown'])
 
+def assignee_name_report(root,names=None,state=None):
+    """Read-only check: rows whose assignee is not an exact actor id (kittrial-5bb.333).
+
+    An assignee is an actor id; a tracker row that stores a display name is undeliverable
+    by the agent that owns it because every ownership check compares the actor id. This
+    report lists every such row for a PERSON to decide, with ``candidates``: the actor ids
+    that currently carry that display name (empty when no identity does).
+
+    It deliberately does NOT emit a single resolved actor or recommend writing it back. A
+    display name can be claimed by a newly registered session or agent that has never
+    acted, so the candidate list is evidence, not an answer; the task's review showed that
+    a write-back recommendation would make such a takeover permanent. It also never writes.
+
+    ``state`` is the web service's live authority document (default
+    ``root/http-state.json``); the accounts, agents and worker credentials there are what
+    make an agent's display name visible. A project whose metadata does not record the Dolt
+    server coordinates is not read at all, as in ``open-item-label-check``. Returns
+    ``(report, clean)``; ``clean`` is true only when every project was read and no row was
+    listed. No lock, no write.
+    """
+    import endpoint
+    import assignee_names
+    state_path=Path(state) if state is not None else (root/'http-state.json')
+    class _Store:
+        store=str(state_path)
+    authority=_Store() if state_path.is_file() else None
+    report={}
+    for name in (names or initialized_projects(root)):
+        path=project_dir(root,name)
+        try:
+            metadata=project_metadata_state(root,name)
+        except (ValueError,OSError):metadata='absent'
+        if metadata=='absent':
+            report[name]={'error':'unknown or uninitialized project'};continue
+        if metadata!='server':
+            report[name]={'error':'.beads/metadata.json does not record the Dolt server coordinates, so bd '
+                                   'was not run (it would create an embedded database here and list nothing)'}
+            continue
+        try:
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
+            if not isinstance(rows,list) or any(not isinstance(row,dict) or row.get('malformed') for row in rows):
+                raise ValueError('the project rows could not be read completely')
+            # The IDENTITY roster only (sessions, accounts, agents, worker credentials). The
+            # assignment-time writer additionally treats any stored assignee/author as exact;
+            # this report deliberately does not, because its job is to surface a value that
+            # is not a registered identity for a person to judge.
+            found=endpoint.assignee_identities(root,path,authority)
+            index=assignee_names.index(found['entries'])
+            index['complete']=found['complete']
+        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError) as error:
+            report[name]={'error':'could not read the project: %s'%type(error).__name__};continue
+        exact=[];listed=[]
+        for row in rows:
+            if not isinstance(row,dict):continue
+            assignee=row.get('assignee')
+            if not isinstance(assignee,str) or not assignee:continue
+            if assignee in index['by_actor']:
+                exact.append(assignee);continue
+            listed.append({'id':row.get('id'),'assignee':assignee,
+                           'candidates':list(index['by_name'].get(assignee) or []),
+                           'needs_decision':True})
+        report[name]={'rows':listed,
+                      'with_candidates':[item for item in listed if item['candidates']],
+                      'no_candidate':[item for item in listed if not item['candidates']],
+                      'exact_actor_rows':len(exact),
+                      'roster_complete':bool(index.get('complete'))}
+    listed=sorted(name for name,entry in report.items() if entry.get('rows'))
+    unreadable=sorted(name for name,entry in report.items() if 'error' in entry)
+    return ({'schema_version':1,'projects':report,'not_actor':listed,'unreadable':unreadable},not listed and not unreadable)
+
 def _revoked_list(found,limit):
     """One revocation list: the first `limit` entries, or every entry when limit is None.
 
@@ -10023,6 +10093,12 @@ def main():
     a=sub.add_parser('merge-slot-report',help='read only: the projects whose merge slot is missing, damaged or cannot '
                                               'be read, with the merge-create repair (exit 1 when any is not healthy)')
     a.add_argument('projects',nargs='*',metavar='project')
+    a=sub.add_parser('assignee-names',help='read only: rows whose assignee is not an exact actor id, with the '
+                                           'identity candidates that currently carry that name (exit 1 when any '
+                                           'is listed; a person decides the repair)')
+    a.add_argument('projects',nargs='*',metavar='project')
+    a.add_argument('--state',default=None,
+                   help='the web service live authority document (default: ROOT/http-state.json)')
     a=sub.add_parser('backup-status')
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
                    help='exit non-zero unless the last run covered every project (--all) and every initialized '
@@ -10931,6 +11007,22 @@ def main():
                 print('The merge slot of %s could not be read at all, and no merge-create run mends that: check '
                       'the project\'s database, its Dolt server coordinates and the name itself first.'
                       %', '.join(report['unreadable']),file=sys.stderr)
+            raise SystemExit(1)
+    elif args.command=='assignee-names':
+        report,clean=assignee_name_report(root,args.projects,args.state)
+        print(json.dumps(report,sort_keys=True))
+        if not clean:
+            names=report['not_actor']
+            print('assignee-names: %d project(s) have rows whose assignee is not an exact actor id: %s.'
+                  %(len(names),', '.join(names)),file=sys.stderr)
+            if names:
+                print('These rows are listed for a person to decide; this report does NOT recommend a rewrite. '
+                      '`candidates` are the actor ids that currently carry that display name, and a name can be '
+                      'claimed by a newly registered identity that has never acted, so confirm the right owner '
+                      'before any `bd update TASK --assignee ACTOR`.',file=sys.stderr)
+            if report['unreadable']:
+                print('The project(s) %s could not be read at all; check the database, the Dolt server coordinates '
+                      'and the name first.'%', '.join(report['unreadable']),file=sys.stderr)
             raise SystemExit(1)
     elif args.command=='backup-status':
         record=read_backup_status(root)

@@ -645,6 +645,189 @@ def reserved_actors(root,path,rows=False,own=()):
         names['authors']=sorted(tracker_actors(root,path,None if rows is True else rows,own))
     return names
 
+def assignee_identities(root,path,authority_config=None,web_state=True):
+    """The identities an assignee display name may be resolved against (kittrial-5bb.333).
+
+    ``{'entries': [{'actor', 'name', 'kind'}, ...], 'complete': bool}``. The project's
+    session registry is always read. When ``web_state`` is true and the live authority
+    document is readable -- the service store the HTTP service already passes, else the
+    installation's default ``http-state.json`` -- the accounts, agents and worker
+    credentials of this project are added. This list is consulted ONLY when a new
+    assignment is written, never to interpret a stored row.
+    """
+    entries=[]
+    try:
+        from sessions import read_registry
+        registry=read_registry(path)
+    except (ValueError,OSError):
+        registry=None
+    for record in ((registry or {}).get('records') or {}).values():
+        if isinstance(record,dict):
+            entries.append({'actor':record.get('actor'),'name':record.get('name'),'kind':'session'})
+    state=None
+    if web_state:
+        store=authority_config.store if authority_config is not None else (root/'http-state.json')
+        try:
+            import http_authority
+            state=http_authority.read_state(store)
+        except Exception:                # absent, unreadable or unsupported: sessions only
+            state=None
+    complete=isinstance(state,dict)
+    if complete:
+        project=path.name
+        members=(state.get('memberships') or {}).get(project) or {}
+        for user_id,user in (state.get('users') or {}).items():
+            if isinstance(user,dict) and (user_id in members or user.get('superuser')):
+                entries.append({'actor':user_id,
+                                'name':user.get('display_name') or user.get('username'),
+                                'kind':'account'})
+        for agent_id,agent in (state.get('agents') or {}).items():
+            if not isinstance(agent,dict):
+                continue
+            if agent.get('enabled',True) and (agent.get('owner') in members
+                                              or project in (agent.get('projects') or [])):
+                entries.append({'actor':agent_id,'name':agent.get('name'),'kind':'agent'})
+        for credential in (state.get('credentials') or {}).values():
+            if not isinstance(credential,dict) or credential.get('agent_id'):
+                continue
+            if credential.get('project_id')!=project or credential.get('revoked'):
+                continue
+            entries.append({'actor':credential.get('actor') or credential.get('user_id'),
+                            'name':credential.get('name'),'kind':'worker'})
+    return {'entries':entries,'complete':complete}
+
+def assignee_display_names(root,path,authority_config=None):
+    """``{actor id: display name}`` for LABELS only (kittrial-5bb.333).
+
+    Actor -> name. It is used to render ``NAME (ACTOR id)`` now that an assignment stores
+    the actor id; it is never consulted for an ownership, claim or move decision. No
+    tracker read: the identities come from the registry and the live authority document.
+    """
+    found=assignee_identities(root,path,authority_config)
+    return {entry['actor']:entry['name'] for entry in found['entries']
+            if isinstance(entry.get('actor'),str) and entry.get('actor')
+            and isinstance(entry.get('name'),str) and entry.get('name')}
+
+def _assignee_export_rows(root,path):
+    """One COMPLETE read of the project's tracker rows, or a refusal.
+
+    The "has ever acted" set is built from these rows, so a partial read is a refusal:
+    a row that cannot be parsed might be the one that carries the requested value as its
+    assignee or author, and resolving past it could rename an actor that has acted here.
+    """
+    from admin import run_bd
+    try:
+        text=run_bd(root,path.name,['export','--all'])
+        rows=record_json.loads_rows(text)
+    except (subprocess.SubprocessError,OSError,ValueError,RecursionError) as error:
+        raise ValueError('the project rows could not be read (%s)' % type(error).__name__) from None
+    if not isinstance(rows,list) or any(not isinstance(row,dict) or row.get('malformed') for row in rows):
+        raise ValueError('the project rows could not be read completely')
+    return rows
+
+def assignee_name_index(root,path,authority_config=None,rows=None,web_state=True):
+    """The one assignment-time resolver index.
+
+    Every actor that has ever acted in the project -- anything stored as an assignee, an
+    author or a ``created_by``, plus every registry actor -- is added as an EXACT actor
+    id, so a display name that spells one of them can never rename it. This index is used
+    only to resolve a value that is about to be WRITTEN; no reader of a stored assignee
+    consults it.
+    """
+    import assignee_names
+    found=assignee_identities(root,path,authority_config,web_state)
+    if rows is None:
+        rows=_assignee_export_rows(root,path)
+    from sessions import used_actors
+    actors={entry.get('actor') for entry in found['entries'] if entry.get('actor')}
+    for row in rows:
+        actors.update(used_actors(row))
+    index=assignee_names.index(found['entries'],actors)
+    index['complete']=found['complete']
+    return index
+
+def _listed_operator(actor,root,path):
+    """Whether ``actor`` is a listed operator of this installation (the host assignment case)."""
+    from review_workflow import listed_operator_actor, operator_owners
+    try:
+        return bool(listed_operator_actor(actor,configured_operators(root),operator_owners(path)))
+    except (ValueError,OSError):
+        return False
+
+def _resolved_bd_assignee(root,path,actor,authority_config,args):
+    """Resolve one raw ``create``/``update --assignee NAME`` at assignment time, or refuse.
+
+    Returns ``(argv, note)``. Only the long ``--assignee VALUE`` and ``--assignee=VALUE``
+    spellings are recognised; the short ``-a`` is left to bd. An exact actor id is stored
+    unchanged (that is what stops P5, a listed operator's ``--assignee w1`` being
+    redirected to a session that later registers the name ``w1``); a display name that
+    exactly one identity of this project carries is stored as that identity's actor id.
+
+    Strictness follows the review of kittrial-5bb.333: the web route and a LISTED
+    OPERATOR refuse a value that is neither a known actor nor exactly one identity's
+    display name, before the native write. Any other host caller keeps the pre-.333
+    pass-through: the value is written exactly as given and no roster is read first, so
+    a plain host reassignment costs no extra native call. A value that is a known actor
+    is never rewritten, whoever writes it.
+    """
+    if not args or args[0] not in ('create','update'):
+        return args,None
+    if not any(token=='--assignee' or token.startswith('--assignee=') for token in args):
+        return args,None
+    import assignee_names
+    strict=authority_config is not None or _listed_operator(actor,root,path)
+    if not strict:
+        # Other host callers keep the pre-.333 pass-through: the assignment is written
+        # exactly as given, and no roster is read before a plain host reassignment (the
+        # kit-wide endpoint guard counts one native call per mutation; .333 r3).
+        return args,None
+    try:
+        index=assignee_name_index(root,path,authority_config)
+    except ValueError as error:
+        if not strict:
+            # The old host behaviour is the safe answer when the rows cannot be read: do
+            # not guess a rewrite, and do not block a write that never needed the read.
+            return args,None
+        raise ValueError('The assignee cannot be checked against the actors that have acted '
+                         'in this project: %s. Nothing was written; write one exact actor id, '
+                         'or retry when the project can be read.' % error) from None
+    rewritten=list(args)
+    notes=[]
+    position=1
+    while position<len(rewritten):
+        token=rewritten[position]
+        if token=='--':
+            break
+        value=None
+        slot=None
+        if token=='--assignee':
+            if position+1>=len(rewritten):
+                break
+            value=rewritten[position+1]
+            slot=position+1
+        elif token.startswith('--assignee='):
+            value=token.partition('=')[2]
+            slot=position
+        if value not in (None,''):
+            picked=None
+            if value in index.get('by_actor',{}):
+                pass                                   # a known actor: never rewritten
+            else:
+                try:
+                    picked=assignee_names.resolve(value,index)
+                except assignee_names.NameRefusal:
+                    # An ambiguous name is refused for anyone: two identities carrying it
+                    # can never be told apart. A miss is refused only where the review
+                    # asked for the strict rule.
+                    if strict or len((index.get('by_name') or {}).get(value) or [])>1:
+                        raise
+                    picked=None
+                if picked is not None and picked['resolved']:
+                    rewritten[slot]=('--assignee='+picked['actor']) if slot==position else picked['actor']
+                    notes.append(picked['sentence'])
+        position+=2 if token=='--assignee' else 1
+    return rewritten,(' '.join(notes) if notes else None)
+
 #: The actions that exist only for the web service: they name no existing project.
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
@@ -1094,7 +1277,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                 coordinator_writes=rules['coordinator_writes'],
                                 owners=owners,
                                 verified_web_authority=verified_web_authority(request,authority_config,CAP_APPROVE,name),
-                                lanes_scope=lanes_scope)
+                                lanes_scope=lanes_scope,
+                                identity_names=assignee_display_names(root,path,authority_config))
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
@@ -1677,7 +1861,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                                              verifiers=configured_verifiers(root),
                                                              independent_approval=rules['independent_approval'],
                                                              owners=owner_loader(path,'independent_approval')
-                                                             if rules['independent_approval'] else None),'stderr':''.join(run_warnings)}
+                                                             if rules['independent_approval'] else None,
+                                                             identity_names=assignee_display_names(root,path,authority_config)),'stderr':''.join(run_warnings)}
         with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
@@ -1768,9 +1953,30 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             runner=NativeRunner(assignment_run,project=path)
             def effect():
                 actors={item['actor'] for item in roster()}
-                result=assignment_apply(payload,actor,runner,path,eligible=lambda target:target in actors,
+                # kittrial-5bb.333: the ONLY place a requested assignee is resolved is here,
+                # when the assignment is written. A value that is already an actor that has
+                # acted in the project is stored unchanged; a display name carried by exactly
+                # one identity is stored as its actor id; zero or several matches are refused
+                # before the native write. A stored row is never resolved again.
+                fields=dict(payload);resolution=None
+                if fields.get('assignee') is not None:
+                    import assignee_names
+                    try:
+                        picked=assignee_names.resolve(
+                            fields['assignee'],assignee_name_index(root,path,authority_config))
+                    except assignee_names.NameRefusal as error:
+                        raise AssignmentError(409,str(error)) from None
+                    except ValueError as error:
+                        raise AssignmentError(503,'The assignee cannot be checked against the '
+                                              'actors that have acted in this project: %s. '
+                                              'Nothing was assigned.' % error) from None
+                    if picked['resolved']:
+                        fields['assignee']=picked['actor'];resolution=picked['sentence']
+                result=assignment_apply(fields,actor,runner,path,eligible=lambda target:target in actors,
                                         operators=configured_operators(root),at=server_time(),
                                         refuse_delivered=(action=='task-release'))
+                if resolution:
+                    result=dict(result,requested_assignee=payload['assignee'],resolution=resolution)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(warnings)}
             with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
                 if action=='assignment-roster':
@@ -2128,6 +2334,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 final.extend([item['flag'],str(dest)])
             else: final.append(a)
         with held_coordination_lock(path,shared=coordination_lock_shared(request,'bd',args)):
+            # kittrial-5bb.333: a NEW assignment's display name is resolved to the actor id
+            # before bd sees it, and only here. A value that is already an actor that has
+            # acted in this project is left exactly as it is (P5: an operator's
+            # `--assignee w1` must keep w1, not a session that later registers the name w1).
+            final,assignment_note=_resolved_bd_assignee(root,path,actor,authority_config,final)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
             from review_workflow import listed_operator_actor, operator_owners
@@ -2199,7 +2410,12 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         stdout=json.dumps(rows)+'\n'
                 return {'returncode':p.returncode,'stdout':stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch, project=path)
-            def bd_effect():return runner(final)
+            def bd_effect():
+                answer=runner(final)
+                if assignment_note and isinstance(answer,dict):
+                    answer=dict(answer)
+                    answer['stderr']=(answer.get('stderr') or '')+assignment_note+'\n'
+                return answer
             return guarded_write(root,request,journal_path(path),bd_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
