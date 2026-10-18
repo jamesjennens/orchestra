@@ -2,7 +2,8 @@
 
 This page is `docs checkpoint-template`. The payload to send is the JSON block at the end;
 copy it to `checkpoint.json`, replace `example-task`, `previous`, `activity_cursor` and the
-four texts, then send it with:
+four texts, fill `source_commit` and `branch` when they are known (otherwise leave them
+empty), then send it with:
 
 ```sh
 b checkpoint TASK --file checkpoint.json
@@ -64,8 +65,8 @@ unparseable one is refused.
   "task": "example-task",
   "previous": null,
   "activity_cursor": "COPY_CURRENT_ACTIVITY_CURSOR_FROM_BRIEF",
-  "source_commit": "The base commit, or empty (at most 128 characters).",
-  "branch": "The branch, or empty (at most 200 characters).",
+  "source_commit": "",
+  "branch": "",
   "intent": "Describe the intended outcome (at most 600 characters).",
   "acceptance": "Describe the acceptance criteria (at most 1000 characters).",
   "summary": "Describe the current verified position (at most 1000 characters).",

@@ -69,10 +69,18 @@ class CheckpointTemplateLimitTests(unittest.TestCase):
         self.assertGreaterEqual(len(blocks), 2, 'the page needs a lane_state example and the payload')
         payload = json.loads(blocks[-1])
         self.assertEqual(payload, json.loads(PAYLOAD.read_text(encoding='utf-8')))
-        # The bare template states the same six limits in its own placeholders.
+        # source_commit and branch are optional and stay empty in the copyable payload:
+        # a worker who fills only the prose fields must not submit a limit sentence as
+        # its commit or branch. Their limits are stated in the Field limits table, not
+        # in the payload placeholders.
+        self.assertEqual((payload['source_commit'], payload['branch']), ('', ''))
+        # The bare template states the four prose-field limits in its own placeholders.
         for field, limit in briefing.CHECKPOINT_FIELD_LIMITS:
-            self.assertIn(str(limit), payload[field],
-                          'templates/CHECKPOINT.json does not state the %s limit' % field)
+            if field in ('source_commit', 'branch'):
+                continue
+            with self.subTest(field=field):
+                self.assertIn(str(limit), payload[field],
+                              'templates/CHECKPOINT.json does not state the %s limit' % field)
         self.assertEqual(set(payload), {'schema_version', 'task', 'previous', 'activity_cursor',
                                         'source_commit', 'branch', 'intent', 'acceptance', 'summary',
                                         'next_action', 'open_items', 'resolved', 'lane_state'})
