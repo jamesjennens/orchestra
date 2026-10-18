@@ -2158,10 +2158,8 @@ const [, shimUri, apiUri, agentsUri] = process.argv;
 const { Element } = await import(shimUri);
 Element.prototype.showModal = function showModal() { this.open = true; };
 Element.prototype.close = function close() { this.open = false; return this.dispatch('close'); };
-Element.prototype.replaceWith = function replaceWith(other) {
-  const parent = this.parentNode;
-  if (parent) { parent.childNodes = parent.childNodes.map((c) => (c === this ? other : c)); other.parentNode = parent; this.parentNode = null; }
-};
+// Element.replaceWith now comes from the shim itself (kittrial-5bb.342); childNodes is a
+// NodeList-like live collection, so copy before using array methods.
 const store = new Map();
 globalThis.sessionStorage = {
   getItem: (k) => (store.has(k) ? store.get(k) : null),
@@ -2350,6 +2348,13 @@ const statusEl = firstAttr(dialog, 'data-wizard-check-status', 'true');
 
 const initialStepHidden = steps.map((s) => s.hidden);
 const initialProgress = progress.textContent;
+// kittrial-5bb.342 item 4: the progress badge is the step's one title. The old numbered
+// heading inside the step list said "1. Store the secret" under "Step 1 of 3: Store the secret".
+const step1Headings = steps[0].all((e) => e.tagName === 'H3').map((e) => e.textContent);
+// kittrial-5bb.342 item 2: Save certificate is a primary action, and one line says it downloads
+// the file the move command below places.
+const saveCertBtn = steps[0].all((e) => e.tagName === 'BUTTON' && e.textContent === 'Save certificate')[0];
+const saveCertLine = firstAttr(steps[0], 'data-save-certificate-line', 'true');
 const initialBackHidden = backBtn.hidden;
 const initialOs = osSelect.value;
 
@@ -2360,10 +2365,10 @@ function visibleText(node) {
   if (!(node instanceof Element)) return String(node.textContent || '');
   if (node.hidden) return '';
   if (node.tagName === 'DETAILS' && !('open' in node.attributes)) {
-    const sum = (node.childNodes || []).find((c) => c instanceof Element && c.tagName === 'SUMMARY');
+    const sum = Array.from(node.childNodes).find((c) => c instanceof Element && c.tagName === 'SUMMARY');
     return sum ? visibleText(sum) : '';
   }
-  return (node.childNodes || []).map(visibleText).join(' ');
+  return Array.from(node.childNodes).map(visibleText).join(' ');
 }
 const winVisibility = {
   winHidden: byAttr(steps[0], 'data-os', 'windows').some((e) => e.hidden),
@@ -2385,7 +2390,7 @@ const fallbackDetails = firstAttr(steps[0], 'data-fallback', 'manual-body');
 const insideFallback = new Set(fallbackDetails ? [fallbackDetails, ...fallbackDetails.all(() => true)] : []);
 const placeholderOutsideFallback = steps[0].all((e) => !insideFallback.has(e)
   && !e.attributes['data-curl-error']
-  && e.childNodes.some((c) => !(c instanceof Element) && String(c.textContent || '').includes('<your-name>'))).length;
+  && Array.from(e.childNodes).some((c) => !(c instanceof Element) && String(c.textContent || '').includes('<your-name>'))).length;
 
 // Verify every step has a "What you will see when it worked" block:
 const workedBlocks = [1, 2, 3].map((n) => Boolean(firstAttr(steps[n - 1], 'data-when-worked', String(n))));
@@ -2500,7 +2505,9 @@ const savedStateAfterLogout = globalThis.sessionStorage.getItem('orchestra.agent
 console.log(JSON.stringify({
   chooser: { chooserPresent, dialogsDuringChooser },
   scopes: views.SCOPES,
-  initialStepHidden, initialProgress, initialBackHidden, initialOs,
+  initialStepHidden, initialProgress, initialBackHidden, initialOs, step1Headings,
+  saveCertificate: { primary: Boolean(saveCertBtn) && saveCertBtn.className === 'primary',
+    line: saveCertLine ? saveCertLine.textContent : null },
   winVisibility, linuxVisibility, placeholderOutsideFallback, workedBlocks,
   afterFailedNext, onStep2,
   pickerStartInFirst: Boolean(pickerCalls[0] && pickerCalls[0].startIn),
@@ -2532,6 +2539,11 @@ console.log(JSON.stringify({
         self.assertIn(['reviews', 'Deliver and review (needed to deliver at all)'], res['scopes'])
         self.assertEqual([False, True, True], res['initialStepHidden'])
         self.assertEqual('Step 1 of 3: Store the secret', res['initialProgress'])
+        # One title: the step list carries no numbered heading repeating "step 1" (item 4).
+        self.assertEqual([], res['step1Headings'])
+        # Save certificate is a visible primary action with the one line explaining it (item 2).
+        self.assertTrue(res['saveCertificate']['primary'], 'Save certificate must be a primary action')
+        self.assertIn('downloads the certificate file', res['saveCertificate']['line'])
         self.assertTrue(res['initialBackHidden'])
         self.assertEqual('windows', res['initialOs'])
         self.assertEqual({'winHidden': False, 'posixAllHidden': True}, res['winVisibility'])

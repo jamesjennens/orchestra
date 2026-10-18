@@ -707,13 +707,39 @@ class CredentialFileRewriteCase(unittest.TestCase):
                 self.assertLessEqual(candidate.stat().st_mode & 0o777, 0o600, candidate.name)
 
     def test_the_command_leaves_a_missing_credential_file_alone(self):
+        # kittrial-5bb.342: reading a file that is not there must print one plain sentence,
+        # not a raw grep/PowerShell error, and must leave nothing half-written.
         command = self.prompt_posix_command()
         home = unique_dir('vscode-home-')
         self.addCleanup(shutil.rmtree, home, ignore_errors=True)
         path = home / '.orchestra-agent-kestrel.curlrc'
-        self.run_command(command, home)
+        proc = subprocess.run([BASH, '-c', command], env=dict(os.environ, HOME=str(home)),
+                              capture_output=True, text=True)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual('Save the header line in step 1 first, then run this again.', proc.stdout.strip())
+        self.assertEqual('', proc.stderr.strip(), 'a raw shell error leaked to the person')
         self.assertFalse(path.exists())                     # nothing half-written
         self.assertFalse((home / '.orchestra-agent-kestrel.curlrc.new').exists())
+
+    def test_the_certificate_move_says_what_to_click_when_nothing_was_downloaded(self):
+        # James had not clicked Save certificate, so the move command failed with a raw
+        # PowerShell/mv error instead of saying what to do (kittrial-5bb.342 item 3).
+        node = shutil.which('node')
+        if not node or os.name != 'posix' or not BASH:
+            self.skipTest('needs node and a POSIX shell with a real HOME; runs only in the ubuntu CI jobs')
+        script = ("const m = await import(process.argv[1]);"
+                  "console.log(m.certificateMoveCommands(m.certificateFile('Kestrel')).posix)")
+        out = run_node_module(self, node, script, SETUP_JS.as_uri())
+        self.assertEqual(0, out.returncode, out.stderr)
+        command = out.stdout.strip()
+        home = unique_dir('vscode-move-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / 'Downloads').mkdir()
+        proc = subprocess.run([BASH, '-c', command], env=dict(os.environ, HOME=str(home)),
+                              capture_output=True, text=True)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual('Click Save certificate in step 1 first, then run this again.', proc.stdout.strip())
+        self.assertEqual('', proc.stderr.strip(), 'a raw mv error leaked to the person')
 
     @unittest.skipUnless(os.name == 'posix', 'the temporary file\'s mode is a POSIX property')
     def test_the_temporary_file_is_never_group_or_world_readable(self):
@@ -749,6 +775,20 @@ class CredentialFileRewriteCase(unittest.TestCase):
                                      env=env, capture_output=True, text=True, timeout=120)
                 self.assertEqual(0, out.returncode, out.stderr)
                 self.assert_file_shape(path)
+
+    def test_the_powershell_command_says_what_to_save_when_the_file_is_missing(self):
+        # kittrial-5bb.342: the rewrite reads the credential file; when it is absent the
+        # person gets one plain sentence instead of a raw .NET/PowerShell error.
+        command = self.prompt_powershell_command()
+        home = unique_dir('vscode-psmissing-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        env = dict(os.environ, USERPROFILE=str(home))
+        out = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', command],
+                             env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, out.returncode, out.stderr)
+        self.assertIn('Save the header line in step 1 first, then run this again.', out.stdout)
+        self.assertNotIn('Exception', out.stderr)
+        self.assertFalse((home / '.orchestra-agent-kestrel.curlrc').exists())
 
     def test_curl_reads_the_file_the_command_wrote(self):
         if not shutil.which('curl'):
@@ -806,6 +846,15 @@ class CredentialFileRewriteCase(unittest.TestCase):
         self.assertEqual(0, res_move.returncode, res_move.stderr)
         self.assertTrue((home / '.orchestra-agent-kestrel.crt').exists())
         self.assertFalse((downloads / 'orchestra-agent-kestrel.crt').exists())
+        # 4. Nothing in Downloads (Save certificate never clicked): one plain sentence, no raw
+        # PowerShell error (kittrial-5bb.342 item 3).
+        (home / '.orchestra-agent-kestrel.crt').unlink()
+        res_move2 = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['move']],
+                                   env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, res_move2.returncode, res_move2.stderr)
+        self.assertIn('Click Save certificate in step 1 first, then run this again.', res_move2.stdout)
+        self.assertNotIn('ItemNotFoundException', res_move2.stderr)
+        self.assertNotIn('Cannot find path', res_move2.stderr)
 
 
 class TheDialogAndThePageCase(unittest.TestCase):
