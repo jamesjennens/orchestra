@@ -773,6 +773,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.request('POST','/v1/projects/%s/tasks/%s/claim'%(self.project,task),token=self.secret)
         row=dict(id=task,title='held',status='in_progress',assignee=actor,
                  contribution_id='delivery',open_items=0,pending_change_requests=[])
+        texts = {'integrated': 'close the task or record what remains'}  # kittrial-5bb.336
         for state,who in [('legacy-review-ready','owner'),('integrated','owner'),
                           ('withdrawn','assignee'),('superseded','assignee'),
                           ('future-state','owner'),('error','operator')]:
@@ -781,6 +782,8 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
                 action=next(x for x in self.next()['next_actions'] if x['task']==task)
                 self.assertEqual((action['review_state'],action['who']),(state,who))
                 self.assertIn(state,action['reason'])
+                if state in texts:
+                    self.assertIn(texts[state], action['reason'])
 
     def test_independent_counts_and_work_before_waiting(self):
         actor=self.next()['agent']['actor']

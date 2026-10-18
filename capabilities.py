@@ -52,6 +52,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tokenize
 import unicodedata
 from pathlib import Path
@@ -77,6 +78,13 @@ GRAPH_STALE = ('results from it may be out of date. Regenerate %s, or delete it 
                % DEFAULT_GRAPH)
 FILES_MAX = 20_000
 FILE_BYTES_MAX = 2_000_000
+# Overall wall-clock budget for building the local code index (kittrial-5bb.335). The
+# builder already caps one file, the file count and the total bytes, but it had no
+# wall-clock bound: with `--repo` defaulting to `.`, a lane that runs the command from a
+# directory that is not a checkout walks every checkout nested under it (7,025 files,
+# >5 minutes on Windows), printing nothing, which is indistinguishable from a hang.
+# Tests patch this constant; the refusal names the stage and the way out.
+INDEX_SECONDS = 60
 PARSE_STACK_BYTES = (512 * 1024 * 1024, 255 * 1024 * 1024)  # Windows refuses 256 MB and above
 PARSE_STACK_BYTES_PER_LEVEL = 512
 NESTING_MAX_BIG_STACK = 50_000
@@ -123,6 +131,46 @@ FENCE = re.compile(r' {0,3}(`{3,}|~{3,})')
 LINK = re.compile(r'\[([^\]]*)\]\([^)]*\)')
 WORD = re.compile(r'[^\W_]+')
 _TRY = tuple(node for node in (getattr(ast, 'Try', None), getattr(ast, 'TryStar', None)) if node)
+
+# The one running budget (see INDEX_SECONDS). `run` clears it after every command; a
+# direct `execute` call starts a fresh one. `_now` is a seam the tests drive.
+_budget = {'deadline': None, 'seconds': None, 'command': 'capability lookup'}
+
+
+def _now():
+    return time.monotonic()
+
+
+def _start_budget(command='capability lookup', seconds=None):
+    seconds = INDEX_SECONDS if seconds is None else seconds
+    _budget.update(deadline=_now() + seconds, seconds=seconds, command=command)
+
+
+def _end_budget():
+    _budget['deadline'] = None
+
+
+def _check_budget(stage, root=None, files=None, total=None):
+    """The one-sentence refusal when the index budget is spent; a no-op otherwise.
+
+    Called from every stage that can run for an unbounded time: the checkout reads, the
+    non-git directory walk, the per-file read/parse loop and the graph load. The sentence
+    must say what was slow (stage, tree, work done) and what to do about it.
+    """
+    deadline = _budget['deadline']
+    if deadline is None or _now() < deadline:
+        return
+    detail = stage
+    if root is not None:
+        detail += ' under %s' % root
+    if files is not None:
+        detail += ' reached %d file(s)' % files
+    if total is not None:
+        detail += ' (%d MB read)' % (total // 1_000_000)
+    raise ValueError(
+        '%s stopped after %g s: %s and did not finish, so it was stopped; '
+        'run it in one checkout with --repo <path> (or use --source graphify) to search a smaller tree.'
+        % (_budget['command'], _budget['seconds'], detail))
 
 
 class _Parser(argparse.ArgumentParser):
@@ -240,11 +288,14 @@ def open_repo(path):
         raise ValueError('--repo: expected an existing directory')
     start = start.resolve()
     top = _git(start, ['rev-parse', '--show-toplevel'])
+    _check_budget('reading the checkout', start)
     root = Path(top.decode('utf-8', 'replace').strip()).resolve() if top else start
     head = _git(root, ['rev-parse', 'HEAD']) if top else None
+    _check_budget('reading the checkout', start)
     commit = head.decode('ascii', 'replace').strip() if head else None
     commit = commit if commit and COMMIT.fullmatch(commit) else None
     status = _git(root, ['status', '--porcelain', '--untracked-files=no']) if commit else None
+    _check_budget('reading the checkout', start)
     return {'root': root, 'git': top is not None, 'commit': commit,
             'dirty': None if status is None else bool(status.strip())}
 
@@ -258,10 +309,15 @@ def list_files(repo, suffixes):
             names = [name for name in listed.decode('utf-8', 'replace').split('\0') if name]
     if names is None:
         names = []
+        seen_dirs = 0
         for directory, dirnames, filenames in os.walk(root):
+            seen_dirs += 1
+            if not seen_dirs % 512:
+                _check_budget('walking the checkout', root, len(names))
             dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith('.'))
             for filename in filenames:
                 names.append(Path(directory, filename).relative_to(root).as_posix())
+    _check_budget('listing the checkout', root, len(names))
     return [name for name in sorted(set(names))
             if name.endswith(suffixes) and not any(part in SKIP_DIRS for part in name.split('/')[:-1])]
 
@@ -325,6 +381,7 @@ def read_files(repo, names, index):
     total = 0
     root = repo['root']
     for position, rel in enumerate(names):
+        _check_budget('building the code index', root, position, total)
         if position >= FILES_MAX:
             index.skip('file-limit', len(names) - position)
             index.warnings.append('indexed the first %d files only' % FILES_MAX)
@@ -1089,7 +1146,9 @@ def index_graph(nodes, links, index):
     reader cannot open is noise, or a stale or planted pointer)."""
     present = {}
     raw = {}
-    for node in nodes:
+    for position, node in enumerate(nodes):
+        if not position % 5_000:
+            _check_budget('indexing graph.json')
         if not isinstance(node, dict):
             index.skip('graph-node-shape')
             continue
@@ -1104,7 +1163,9 @@ def index_graph(nodes, links, index):
             continue
         raw[graph_id] = node
     parents, rationale, edges = {}, {}, []
-    for link in links:
+    for position, link in enumerate(links):
+        if not position % 5_000:
+            _check_budget('indexing graph.json')
         if not isinstance(link, dict):
             index.skip('graph-link-shape')
             continue
@@ -1207,6 +1268,7 @@ def load_graph_index(repo, index, graph_arg, source, max_mb):
             index.warnings.append('%s; %s' % (exc, GRAPH_FALLBACK))
             return False
         raise
+    _check_budget('reading graph.json', root)
     try:
         shown = path.resolve().relative_to(root).as_posix()
     except (OSError, ValueError):
@@ -1241,6 +1303,7 @@ def build_index(repo, source='auto', graph_arg=None, max_mb=GRAPH_MB_DEFAULT):
     index = Index(repo)
     use_graph = source != 'ast' and load_graph_index(repo, index, graph_arg, source, max_mb)
     names = list_files(repo, ('.md',) if use_graph else ('.py', '.md'))
+    _check_budget('building the code index', repo['root'], len(names))
     facts = {'files': {}, 'defs': []}
     for rel, data in read_files(repo, names, index):
         if rel.endswith('.py'):
@@ -1248,6 +1311,7 @@ def build_index(repo, source='auto', graph_arg=None, max_mb=GRAPH_MB_DEFAULT):
         else:
             index_markdown(rel, data, index)
     if not use_graph:
+        _check_budget('linking the code index', repo['root'], len(names))
         link_python(index, facts)
     index.warnings.extend(parse_warnings(index.skipped))
     return index
@@ -1565,6 +1629,7 @@ def execute(args):
         raise ValueError('--limit: expected %d..%d' % (LIMIT_MIN, LIMIT_MAX))
     if options.command == 'resolve' and len(options.pointers) > POINTERS_MAX:
         raise ValueError('resolve: expected 1..%d pointers' % POINTERS_MAX)
+    _start_budget('capability %s' % options.command)
     repo = open_repo(options.repo)
     if options.command == 'resolve':
         index = None
@@ -1573,7 +1638,10 @@ def execute(args):
         graph_available = source == 'graphify' or contained_file(repo['root'], DEFAULT_GRAPH) is not None
         if needs_graph and source != 'ast' and graph_available:
             index = build_index(repo, source, options.graph, options.max_graph_mb)
-        results = [resolve_pointer(repo, pointer, index) for pointer in options.pointers]
+        results = []
+        for position, pointer in enumerate(options.pointers):
+            _check_budget('resolving pointers', repo['root'], position)
+            results.append(resolve_pointer(repo, pointer, index))
         summary = {'resolved': sum(1 for row in results if row['resolved'] is True),
                    'missing': sum(1 for row in results if row['resolved'] is False),
                    'unknown': sum(1 for row in results if row['resolved'] is None)}
@@ -1611,12 +1679,14 @@ def run(args):
     """(returncode, stdout, stderr) in the CLI contract's shape: JSON on stdout only on
     success; a refusal is `ValueError: ...` on stderr with exit code 2."""
     _reset_parse_state()
+    _end_budget()
     try:
         payload, warnings = with_parse_stack(lambda: execute(list(args)))
     except ValueError as exc:
         return 2, '', 'ValueError: %s\n' % exc
     finally:
         _reset_parse_state()
+        _end_budget()
     stderr = ''.join('warning: %s\n' % warning for warning in warnings)
     # ASCII JSON: every non-ASCII character, including the line and paragraph separators
     # some readers treat as line breaks, travels as a \u escape.

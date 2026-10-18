@@ -91,9 +91,10 @@ class NextActorUnitTests(unittest.TestCase):
         self.assertEqual(review_state.next_actor('awaiting-review', 'alice/session'), 'reviewer')
         self.assertEqual(review_state.next_actor('legacy-review-ready', None), 'reviewer')
         self.assertEqual(review_state.next_actor('awaiting-integration', 'alice/session'), 'coordinator')
-        # Open integrated work leaves the remaining scope with its assignee.
-        self.assertEqual(review_state.next_actor('integrated', 'alice/session'), 'assignee')
-        self.assertEqual(review_state.next_actor('integrated', None), 'unknown')
+        # kittrial-5bb.336: open integrated work is the coordinator's to close or
+        # record, with or without an assignee - never the assignee's guess.
+        self.assertEqual(review_state.next_actor('integrated', 'alice/session'), 'coordinator')
+        self.assertEqual(review_state.next_actor('integrated', None), 'coordinator')
         self.assertEqual(review_state.next_actor('error', 'alice/session'), 'operator')
         self.assertEqual(review_state.next_actor('reconciliation-needed', 'alice/session'), 'operator')
         self.assertEqual(review_state.next_actor('none', 'alice/session'), 'assignee')
@@ -122,7 +123,7 @@ class NextActorUnitTests(unittest.TestCase):
         self.assertEqual(review_state.next_actor('awaiting-review', 'alice/session',
                                                  pending_items=0, claimable=False), 'reviewer')
         self.assertEqual(review_state.next_actor('integrated', 'alice/session',
-                                                 pending_items=0, claimable=False), 'assignee')
+                                                 pending_items=0, claimable=False), 'coordinator')
 
     def test_a_closed_settled_task_has_no_next_actor_but_active_review_does(self):
         self.assertEqual(review_state.next_actor('integrated', 'alice/session', closed=True), 'none')
@@ -151,13 +152,15 @@ class SharedNextActorTests(unittest.TestCase):
         # The assignee field is still exactly the assignee and is untouched by the new field.
         self.assertEqual(item['owner'], 'alice/session')
 
-    def test_open_integrated_work_names_assignee_and_free_work_anyone(self):
+    def test_open_integrated_work_is_the_coordinators_and_free_work_anyone(self):
         store = shared.reviewed()
         review, brief, item = surfaces(store.rows)
-        # Integration of one revision leaves open remaining work with the holder.
-        self.assertEqual(item['whose_move'], 'you')
+        # kittrial-5bb.336: integration of one revision leaves the OPEN task the
+        # coordinator's to close or record, on every surface alike.
+        self.assertEqual(item['whose_move'], 'coordinator')
+        self.assertIn('the coordinator closes the task or records what remains', item['next'])
         self.assertEqual([review['next_actor'], brief['review']['next_actor'],
-                          item['next_actor']], ['assignee'] * 3)
+                          item['next_actor']], ['coordinator'] * 3)
         free = rows()
         free[0].update(assignee=None, status='open', comments=[])
         review, brief, item = surfaces(free)
@@ -250,9 +253,9 @@ class ReconciliationTests(unittest.TestCase):
         self.assertNotIn('reconciliation_reasons', brief)
         self.assertTrue(any(w.startswith('Integration fact disagreement') for w in item['integration_warnings']))
         # Item 2 (next-actor-from-work-state): the role follows the REVIEW state the row
-        # shows, never the reconciliation `work_state`. The open integrated task's
-        # assignee still owns its remaining work; the mismatch remains visible.
-        self.assertEqual([review['next_actor'], item['next_actor']], ['assignee'] * 2)
+        # shows, never the reconciliation `work_state`. The open integrated task is the
+        # coordinator's to close (kittrial-5bb.336); the mismatch remains visible.
+        self.assertEqual([review['next_actor'], item['next_actor']], ['coordinator'] * 2)
 
     def test_a_lagging_lifecycle_scope_names_both_commits(self):
         store = self.lagging()

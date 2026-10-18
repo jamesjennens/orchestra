@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1324,6 +1325,55 @@ class EntryCapTests(Checkout):
         self.assertEqual(result['index']['entries'], 12)
         self.assertGreater(result['index']['skipped']['entry-limit'], 0)
         self.assertEqual(result['warnings'], ['indexed the first 12 entries only'])
+
+
+class IndexBudgetTests(Checkout):
+    """A slow index build is bounded and says why (kittrial-5bb.335).
+
+    The unbounded stage was the local AST index build: `--repo` defaults to `.`, and a
+    lane's working directory is not a checkout, so the walk included every nested
+    checkout (7,025 files) and printed nothing for minutes.
+    """
+
+    def test_a_slow_index_stage_ends_with_one_sentence(self):
+        clock = {'t': 0.0}
+        real_index = capabilities.index_python
+
+        def slow_index(rel, data, index, facts):
+            clock['t'] = 100.0
+            return real_index(rel, data, index, facts)
+
+        with patch.object(capabilities, 'INDEX_SECONDS', 60), \
+                patch.object(capabilities, '_now', lambda: clock['t']), \
+                patch.object(capabilities, 'index_python', slow_index):
+            code, result, stdout, stderr = call('lookup', 'Engine', '--repo', str(self.root))
+        self.assertEqual((code, result, stdout), (2, None, ''))
+        self.assertTrue(stderr.startswith('ValueError: capability lookup stopped after 60 s:'), stderr)
+        self.assertIn('building the code index under %s' % Path(self.root).resolve(), stderr)
+        self.assertIn('file(s)', stderr)
+        self.assertIn('--repo <path>', stderr)
+        self.assertIn('--source graphify', stderr)
+        self.assertNotIn('Traceback', stderr)
+
+    def test_the_budget_names_the_checkout_that_was_too_large(self):
+        with patch.object(capabilities, 'INDEX_SECONDS', 0), \
+                patch.object(capabilities, '_now', lambda: 1.0):
+            code, result, stdout, stderr = call('lookup', 'Engine', '--repo', str(self.root))
+        self.assertEqual((code, result, stdout), (2, None, ''))
+        self.assertIn('reading the checkout under %s' % Path(self.root).resolve(), stderr)
+        self.assertIn('run it in one checkout with --repo <path>', stderr)
+
+    def test_the_default_budget_does_not_stop_a_normal_lookup(self):
+        code, result, _, stderr = call('lookup', 'Engine', '--repo', str(self.root))
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(result['found'])
+
+    def test_the_command_name_is_not_hard_coded_as_lookup(self):
+        with patch.object(capabilities, 'INDEX_SECONDS', 0), \
+                patch.object(capabilities, '_now', lambda: 1.0):
+            code, result, stdout, stderr = call('index', '--repo', str(self.root), '--source', 'ast')
+        self.assertEqual((code, result, stdout), (2, None, ''))
+        self.assertIn('capability index stopped after 0 s:', stderr)
 
 
 @unittest.skipUnless(GIT, 'git is not installed')

@@ -1872,6 +1872,7 @@ it by failing.
 | `capability resolve` | pointers | 1..100, each <= 400 characters |
 | `capability` | `--max-graph-mb` | 1..512 (default 64); at most 500,000 nodes and 2,000,000 links |
 | `capability` | indexed files | first 20,000 files; files over 2 MB skipped; 256 MB in total |
+| `capability` | index build time | 60 seconds overall; on expiry the command stops with one sentence naming the tree and the work reached, and suggests `--repo <path>` (one checkout) or `--source graphify` |
 | `capability` | entries | 200,000 in total; 2,000 headings per Markdown file and 5,000 definitions per Python file (the rest counted as `entry-limit`, `heading-limit`, `definition-limit`, each with a warning); `resolve` still reads a whole file |
 | `capability` | Python nesting | source decoded with its declared encoding (UTF-7 cookie cannot hide operators); parsed on a 512 MB (Windows: 255 MB) worker stack, trusted to at most 50,000 levels, retrying 255 MB if the 512 MB thread cannot start; a flat or statement-dense file over 300,000 expression tokens (operators, brackets, commas, NAME tokens and depth-zero statement separators) is `too-complex`; fallback guard 5,000 levels per logical line (Windows: 2,000) with a 16 MB per-run tokenize budget (`too-complex`); `parse-error` skips warn with counts |
 | `capability` | Markdown | heading lines over 1,000 characters are text; a summary is looked for in the 40 lines after its heading |

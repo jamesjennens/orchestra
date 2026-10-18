@@ -493,3 +493,34 @@ class HttpAgentWaitTests(test_http_agents.AgentHarness):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class IntegratedNotTheWorkersMoveTests(unittest.TestCase):
+    """kittrial-5bb.336: an integrated-but-open row never wakes a worker.
+
+    The worker form counts rows whose whose_move is 'you'; with the move fixed the
+    row reads coordinator, so the wait times out (or stays asleep) instead of
+    waking the worker for work that is the coordinator's to close."""
+
+    def test_an_integrated_row_does_not_wake_the_worker(self):
+        clock = FakeClock()
+        read = scripted([worker({'task': 't-old', 'whose_move': 'coordinator',
+                                 'review_state': 'integrated', 'next_actor': 'coordinator'}),
+                         worker({'task': 't-old', 'whose_move': 'coordinator',
+                                 'review_state': 'integrated', 'next_actor': 'coordinator'})])
+        code, view = waiting.run_wait(read, interval=60, timeout=120,
+                                      clock=clock.clock, sleep=clock.sleep)
+        self.assertEqual(code, waiting.EXIT_TIMEOUT)
+        self.assertEqual(view['items'], [])
+        self.assertTrue(view['timed_out'])
+
+    def test_a_real_move_still_wakes_beside_integrated_rows(self):
+        clock = FakeClock()
+        read = scripted([worker({'task': 't-old', 'whose_move': 'coordinator',
+                                 'review_state': 'integrated', 'next_actor': 'coordinator'}),
+                         worker({'task': 't-new', 'whose_move': 'you',
+                                 'review_state': 'changes-requested', 'pending_review_items': 1})])
+        code, view = waiting.run_wait(read, interval=60, timeout=600,
+                                      clock=clock.clock, sleep=clock.sleep)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual([row['task'] for row in view['items']], ['t-new'])
