@@ -185,11 +185,11 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
     psParts.push('"ssl-no-revoke`r`n"');
   }
   const psPrefix = psParts.join(' + ');
-  const powershell = '& { $p="' + file.powershell + '"; $c=[IO.File]::ReadAllText($p); '
+  const powershell = '& { $p="' + file.powershell + '"; if (-not (Test-Path $p)) { Write-Output \'Save the header line in step 1 first, then run this again.\'; return }; $c=[IO.File]::ReadAllText($p); '
     + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_MANAGED_PATTERN + ",''); "
     + 'if ($c -and -not $c.EndsWith("`n")) { $c = $c + "`r`n" } '
     + '[IO.File]::WriteAllText($p, (' + psPrefix + ') + $c) }';
-  const posix = `( umask 077; rm -f ${file.posix}.new; printf '%s\\n' ${quoted} > ${file.posix}.new && `
+  const posix = `( umask 077; [ -f ${file.posix} ] || { echo 'Save the header line in step 1 first, then run this again.'; exit 0; }; rm -f ${file.posix}.new; printf '%s\\n' ${quoted} > ${file.posix}.new && `
     + `grep -vE ${CREDENTIAL_MANAGED_PATTERN} ${file.posix} >> ${file.posix}.new && `
     + `chmod 600 ${file.posix}.new && mv ${file.posix}.new ${file.posix} || rm -f ${file.posix}.new )`;
   return Object.freeze({ powershell, posix });
@@ -212,8 +212,9 @@ export function certificateMoveCommands(certFile) {
   if (!certFile) return Object.freeze({ strippedName: '', powershell: '', posix: '', note: '' });
   const name = certFile.name;
   const strippedName = name.replace(/^\.+/, '');
-  const powershell = `& { $d = Join-Path $HOME 'Downloads'; $s = if (Test-Path (Join-Path $d '${strippedName}')) { Join-Path $d '${strippedName}' } else { Join-Path $d '${name}' }; Move-Item -Force $s "${certFile.powershell}" }`;
-  const posix = `if [ -f "$HOME/Downloads/${strippedName}" ]; then mv -f "$HOME/Downloads/${strippedName}" ${certFile.posix}; else mv -f "$HOME/Downloads/${name}" ${certFile.posix}; fi`;
+  const missing = 'Click Save certificate in step 1 first, then run this again.';
+  const powershell = `& { $d = Join-Path $HOME 'Downloads'; $s = if (Test-Path (Join-Path $d '${strippedName}')) { Join-Path $d '${strippedName}' } else { Join-Path $d '${name}' }; if (-not (Test-Path $s)) { Write-Output '${missing}'; return }; Move-Item -Force $s "${certFile.powershell}" }`;
+  const posix = `if [ -f "$HOME/Downloads/${strippedName}" ]; then mv -f "$HOME/Downloads/${strippedName}" ${certFile.posix}; elif [ -f "$HOME/Downloads/${name}" ]; then mv -f "$HOME/Downloads/${name}" ${certFile.posix}; else echo '${missing}'; fi`;
   const note = `Browsers strip the leading dot when saving to Downloads (saving ${strippedName} instead of ${name}). Run this command to move it from Downloads into your user profile with its leading dot restored:`;
   return Object.freeze({ strippedName, powershell, posix, note });
 }

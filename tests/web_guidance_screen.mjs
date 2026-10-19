@@ -7,7 +7,7 @@ Element.prototype.dispatch = async function (type) {
   for (const handler of this.listeners[type] || []) await handler(event);
 };
 Element.prototype.close = function () {};
-Element.prototype.showModal = function () { queueMicrotask(() => this.querySelectorAll('button').at(-1).dispatch('click')); };
+Element.prototype.showModal = function () { queueMicrotask(() => Array.from(this.querySelectorAll('button')).at(-1).dispatch('click')); };
 const { createApi } = await import(apiUrl);
 const { guidancePanel } = await import(viewUrl);
 const calls = []; let inFlight = 0, loseAck = true;
@@ -38,7 +38,7 @@ assert.equal(initialWrites, 0, 'Opening guidance must not write or acknowledge')
 const textareas = panel.querySelectorAll('textarea');
 if (textareas.length !== 2) throw new Error('Server-authorized coordinator controls missing');
 textareas[0].value = 'Unsaved guidance draft'; textareas[1].value = 'Unsaved onboarding draft';
-const button = name => panel.querySelectorAll('button').find(node => node.textContent === name);
+const button = name => Array.from(panel.querySelectorAll('button')).find(node => node.textContent === name);
 await button('Acknowledge displayed version').dispatch('click'); await settle();
 const uncertain = panel.textContent;
 await button('Retry the same request').dispatch('click'); await settle();

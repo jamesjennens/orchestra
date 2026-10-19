@@ -101,7 +101,7 @@ async function settle() {
 }
 
 const lanesCalls = () => calls.filter((c) => c.startsWith('GET /v1/projects/alpha/lanes'));
-const button = (node, label) => node.querySelectorAll('button').find((b) => b.textContent === label);
+const button = (node, label) => Array.from(node.querySelectorAll('button')).find((b) => b.textContent === label);
 
 // 1. The panel on its own, as the overview composes it.
 const panel = view.lanesPanel(ctx, PROJECT);

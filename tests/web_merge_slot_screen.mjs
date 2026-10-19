@@ -2,7 +2,7 @@ const [shimUrl, apiUrl, viewUrl, base, project, token, task] = process.argv.slic
 const { Element } = await import(shimUrl);
 Element.prototype.close = function () {};
 Element.prototype.showModal = function () {
-  queueMicrotask(() => this.querySelectorAll('button').at(-1).dispatch('click'));
+  queueMicrotask(() => Array.from(this.querySelectorAll('button')).at(-1).dispatch('click'));
 };
 const { createApi } = await import(apiUrl);
 const { mergeSlotPanel } = await import(viewUrl);
@@ -27,7 +27,7 @@ const panel = mergeSlotPanel({ api }, { id: project, role: 'superuser', archived
 document.body.append(panel);await settle();
 const before = panel.textContent;
 const inputs = panel.querySelectorAll('input');inputs[0].value = task;inputs[1].value = '<img src=x onerror=throw-new-Error()>';
-const button = (name) => panel.querySelectorAll('button').find((node) => node.textContent === name);
+const button = (name) => Array.from(panel.querySelectorAll('button')).find((node) => node.textContent === name);
 await button('Take slot').dispatch('click');await settle();
 const held = panel.textContent;
 const escaped = !panel.querySelector('img');
