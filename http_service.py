@@ -2353,7 +2353,7 @@ class EndpointBackend:
             # lock, so only the operation, the caller's text/reason and the route's
             # own task/target travel.
             operation = route.split('.', 1)[1]
-            body = {'operation': operation, 'task': payload['task_id']}
+            body = {'schema_version': 1, 'operation': operation, 'task': payload['task_id']}
             if operation == 'record':
                 body['text'] = payload['text']
             else:
@@ -3008,6 +3008,9 @@ class EndpointBackend:
                 # checkpoint from the brief alone (kittrial-5bb.113).
                 'next_action': data.get('next_action'),
                 'activity_cursor': data.get('activity_cursor'),
+                # The coordinator's recorded hand-back (kittrial-5bb.343), the same
+                # additive block a work row carries.
+                'followon': data.get('followon'),
                 # kittrial-5bb.293 item 1: the pointer block built above is carried
                 # only when a field was actually cut.
                 **({'read_whole': read_whole} if read_whole else {}),

@@ -463,8 +463,9 @@ def evaluate(issue, review, scopes, host=None, project=None, dispositions=True):
       record that is the newest valid one;
     * ``invalid`` names the journal files that failed validation.
 
-    ``host`` is the already-read journal triple for a caller that evaluates many
-    tasks on one page; without it the journal is read fresh here.
+    ``host`` is the already-read ``(entries, invalid)`` journal pair for a caller
+    that evaluates many tasks on one page; without it the journal is read fresh
+    here, from the project directory only.
     """
     task = issue.get('id')
     if host is None:
@@ -587,7 +588,7 @@ def next_text(block, checkpoint_available=True):
 # THIS one pair of functions, so the two authority gates cannot drift apart.
 
 def _rows(run, project):
-    from lifecycle import host_snapshot, read_event_rows
+    from lifecycle import read_event_rows
     return read_event_rows(run)
 
 

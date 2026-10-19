@@ -1731,6 +1731,7 @@ is not sent to `bd`.
 | `proposal-review --file FILE` | `admin.py proposal-review` |
 | `proposal-decide --file FILE` | `admin.py proposal-decide` |
 | `handoff --file FILE` | `admin.py handoff` (the operator's transfer) |
+| `followon --file FILE` | the coordinator's recorded hand-back (`followon.py`): `record` with task and text, or `withdraw` with the follow-on and reason |
 | `set-onboarding --file FILE` | `admin.py set-onboarding` |
 
 **Authority.** The action is refused unless all of these hold: the request arrives over a key
@@ -1766,7 +1767,25 @@ coordination lock, as the host command does. A `capability-verify` whose every i
 recorded wrote nothing and carries no `server_time`.
 
 **Refusals.** An unknown subcommand, or a host-only command named here, is refused with
-"Unknown coordinator command" and the list of the ten. A refused operation changes nothing.
+"Unknown coordinator command" and the list of the eleven. A refused operation changes nothing.
+
+**`followon` (kittrial-5bb.343).** Records the coordinator's hand-back of an
+integrated-but-open task to its assignee, or withdraws one. The payload is one JSON
+object: `{"schema_version":1,"operation":"record","task":"TASK","text":"..."}` or
+`{"schema_version":1,"operation":"withdraw","target":"FOLLOWON_COMMENT_ID","reason":"..."}`.
+The caller supplies only those facts; the server derives the current contribution, the
+native integration record it cites and that record's order under the project
+coordination lock, and refuses unless the contribution currently reads integrated, the
+task is open, the text is within 600 characters, and no other hand-back is open. The
+native comment is paired with a host journal entry in
+`<project>/.assignee-followons/<sha256>.json`; without it the comment is inert. The
+recorded text is quoted once (escaped as checkpoint wait text is) in `work`/`brief`
+`next` while the hand-back applies. It ends when the assignee disposes it in a
+checkpoint's `directions` (where `checkpoint_provenance_writes` is on), the coordinator
+withdraws it, a new contribution becomes current, or the task closes. The web route is
+`POST /v1/projects/{pid}/tasks/{tid}/assignee-followon` (body `text`) and
+`POST .../assignee-followon/{fid}/withdraw` (body `reason`), both gated on
+`CAP_COORDINATE`. Every refusal ends "Nothing was written."
 
 ## `docs` and `onboard`: the installed documents
 

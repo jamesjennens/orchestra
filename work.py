@@ -994,6 +994,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             state='error';error='Malformed handoff journal: '+json.dumps(journal_errors[:10],sort_keys=True)
             review=dict(review,work_state='error',next_actor='operator',
                         reconciliation_needed=False,reconciliation_reasons=[])
+            # An error row does not claim a hand-back's move (kittrial-5bb.343):
+            # the malformed journal makes the whole row an operator's to repair.
+            task_followon=None
+            review.pop('followon',None)
         if state=='error' and not review.get('next_actor'):
             # A malformed contribution-review chain (the ValueError above) reads error
             # too, and error is an operator's to repair: next_actor is never null
