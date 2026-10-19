@@ -14,7 +14,12 @@ The rules these tests pin:
 - the mode assertions run on POSIX only (review B3: Windows has no POSIX modes);
 - everything unexpected - no Dolt server coordinates, an unreadable key, a corrupt
   or foreign file - fails OPEN to today's behaviour: a fresh export, nothing
-  cached, and a planted cache is never served when the key cannot be read (S4).
+  cached, and a planted cache is never served when the key cannot be read (S4);
+- a file a power loss leaves TORN fails the reader's compare and falls back to a
+  fresh export that repairs it - the reason the write may drop its fsync - and
+  five concurrent misses refresh ONCE (the first holds the cache directory's
+  flock; the others wait briefly and serve what it wrote, and a loser whose wait
+  runs out answers from its own export and writes nothing) (kittrial-5bb.346).
 """
 import json
 import os
@@ -220,6 +225,133 @@ class ReadCacheTests(unittest.TestCase):
         served, run = self.serve([row()])
         self.assertEqual(run.exports, 1)
         self.assertEqual([item['id'] for item in served], ['t-1'])
+
+    def test_a_torn_cache_file_falls_back_and_is_repaired(self):
+        # kittrial-5bb.346: the cache write carries no fsync - the rename is
+        # atomic, and a file a power loss leaves SHORT fails the reader's parse
+        # and/or the key compare inside the file, so it falls back to a fresh
+        # export. That fallback is the whole reason dropping the fsync is safe;
+        # this pins it on the torn shape itself and that the next miss REPAIRS
+        # the cache (the file is whole again and the read after it serves).
+        self.serve([row()])
+        whole = self.cached_file().read_bytes()
+        self.cached_file().write_bytes(whole[:len(whole) // 2])   # torn mid-payload
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)                 # not served: fresh export
+        self.assertEqual([item['id'] for item in served], ['t-1'])
+        json.loads(self.cached_file().read_text(encoding='utf-8'))   # repaired
+        again, rerun = self.serve([row()])
+        self.assertEqual(rerun.exports, 0)               # and serving again
+
+    def test_five_concurrent_misses_refresh_once(self):
+        # kittrial-5bb.346: the five reads a page fires right after a write all
+        # miss together, and the export server runs their exports one at a time.
+        # The first miss to hold the cache directory's flock refreshes; the
+        # others WAIT briefly and serve what it wrote - one export, one write,
+        # five answers. The barrier releases all five misses into the lock
+        # together while the winner's write is held open, which is the window
+        # the live page actually spends its time in.
+        import threading
+        gate = threading.Barrier(5, timeout=5)
+        real_cached = read_cache._cached_rows
+        real_write = read_cache._write_one_file
+        writes = []
+        run = FakeRun([row()])
+
+        def gated_cached(cache, key):
+            if not (cache / read_cache.FILE_NAME).exists():
+                try:
+                    gate.wait()
+                except threading.BrokenBarrierError:
+                    pass                # a straggler missed the window: proceed
+            return real_cached(cache, key)
+
+        def slow_write(cache, payload):
+            import time
+            time.sleep(1.0)             # the winner holds the lock, losers wait
+            writes.append(payload)
+            real_write(cache, payload)
+
+        answers = [None] * 5
+        errors = []
+        def miss(index):
+            try:
+                answers[index] = read_cache.cached_export_rows(
+                    self.root, self.project, run)
+            except BaseException as error:      # pragma: no cover - reported below
+                errors.append(error)
+
+        # The patches are opened ONCE, from the test thread: five threads each
+        # entering mock.patch on the same attribute restore whatever they SAW on
+        # enter, and interleave into leaving a mock installed for later tests.
+        with mock.patch.object(read_cache, 'project_generation',
+                               return_value='a' * 32), \
+                mock.patch.object(read_cache, '_cached_rows', gated_cached), \
+                mock.patch.object(read_cache, '_write_one_file', slow_write):
+            threads = [threading.Thread(target=miss, args=(index,)) for index in range(5)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(run.exports, 1)                # ONE export served all five
+        self.assertEqual(len(writes), 1)                # and ONE cache write
+        for answer in answers:
+            self.assertEqual([item['id'] for item in answer], ['t-1'])
+
+    def test_a_loser_whose_wait_runs_out_answers_from_its_own_export(self):
+        # The other half of the .346 rule: a miss whose wait runs out - the
+        # refresher is wedged, or this project simply will not cache fast
+        # enough - answers from its OWN export and writes NOTHING, so waits can
+        # never stack writes behind a stuck one. The winner's write outlives
+        # the losers' whole wait budget here, deterministically.
+        import threading
+        import time
+        gate = threading.Barrier(5, timeout=5)
+        real_cached = read_cache._cached_rows
+        real_write = read_cache._write_one_file
+        writes = []
+        run = FakeRun([row()])
+
+        def gated_cached(cache, key):
+            if not (cache / read_cache.FILE_NAME).exists():
+                try:
+                    gate.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            return real_cached(cache, key)
+
+        def stuck_write(cache, payload):
+            time.sleep(1.0)             # still held when every loser gives up
+            writes.append(payload)
+            real_write(cache, payload)
+
+        answers = [None] * 5
+        errors = []
+        def miss(index):
+            try:
+                answers[index] = read_cache.cached_export_rows(
+                    self.root, self.project, run)
+            except BaseException as error:      # pragma: no cover - reported below
+                errors.append(error)
+
+        with mock.patch.object(read_cache, 'project_generation',
+                               return_value='a' * 32), \
+                mock.patch.object(read_cache, '_cached_rows', gated_cached), \
+                mock.patch.object(read_cache, '_write_one_file', stuck_write), \
+                mock.patch.object(read_cache, '_REFRESH_WAIT_SECONDS', 0.2):
+            threads = [threading.Thread(target=miss, args=(index,)) for index in range(5)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(run.exports, 5)                # the winner plus four own
+        self.assertEqual(len(writes), 1)                # still exactly one write
+        for answer in answers:
+            self.assertEqual([item['id'] for item in answer], ['t-1'])
 
     def test_each_call_returns_a_freshly_parsed_list(self):
         self.serve([row()])

@@ -23,6 +23,15 @@ symlink or not a directory is refused, and the file is opened with ``O_NOFOLLOW`
 key, a file this kit cannot read - answers TODAY's behaviour: a fresh export,
 nothing cached. The cache is derived state only; the tracker is never touched.
 
+Refreshing is ONCE per generation, across processes (kittrial-5bb.346): a miss
+holds the cache directory's flock for the whole refresh, so the five reads a
+web page fires right after a write share one export instead of queueing five
+on the server - the others poll briefly and serve what the refresher wrote,
+and a wait that runs out answers from its own export and writes nothing. The
+directory itself is the lock, so the cache stays one file, and the write
+carries no fsync: the rename is atomic, and a file a power loss leaves short
+fails the reader's compare and falls back to a fresh export.
+
 One limit, stated rather than hidden (review S3): the key is the committed HEAD,
 while ``bd export`` reads the working set. A change made OUTSIDE the kit by direct
 SQL - an operator's ``UPDATE`` without a commit - does not move the key and is not
@@ -180,13 +189,16 @@ def _write_one_file(cache, payload):
 
     A write that fails leaves NO temp file behind (kittrial-5bb.345 item 4): the
     name is removed in a finally, so a project that can never cache does not grow
-    a new `.read-cache-XXXX` file per read."""
+    a new `.read-cache-XXXX` file per read. There is deliberately NO fsync
+    (kittrial-5bb.346): the rename is atomic against every reader, and a file a
+    power loss leaves short is DETECTED - the reader compares the key stored
+    inside and a torn or short read falls back to a fresh export - so waiting
+    for the disk serves no correctness the format does not already have."""
     import tempfile
     handle, temp = tempfile.mkstemp(dir=str(cache), prefix='.read-cache-')
     try:
         try:
             os.write(handle, payload)
-            os.fsync(handle)
         finally:
             os.close(handle)
         os.chmod(temp, 0o600)
@@ -197,6 +209,88 @@ def _write_one_file(cache, payload):
         except OSError:
             pass
         raise
+
+
+#: How long a miss that finds another refresh already running waits for it to
+#: land before answering from its own export (kittrial-5bb.346). One miss of the
+#: largest live project is ~20 s end to end, so waiting half a minute longer
+#: than that still beats a queue of five exports the server runs one at a time;
+#: a refresher that is merely slow is waited out, and one that DIED releases
+#: its lock - the kernel closes the directory when the process goes - so the
+#: waiter stops waiting and refreshes itself.
+_REFRESH_WAIT_SECONDS = 45.0
+_REFRESH_POLL_SECONDS = 0.05
+
+
+def _refresh_lock(cache):
+    """Take the cache DIRECTORY's exclusive flock, or find it held.
+
+    Locking the directory - not a lock FILE - keeps the cache at one file
+    (review B1's shape is unchanged: there is nothing to clean up, and the open
+    carries the same O_NOFOLLOW refusal as every other cache path), and it
+    coordinates PROCESSES, not just threads: a web page's concurrent reads are
+    concurrent endpoint processes, and every caller opens the directory itself,
+    so two calls in one process conflict exactly like two endpoints. Returns
+    (fd, 'held'), (None, 'busy') when another reader is refreshing this project
+    right now, or (None, 'posix') on a kit without POSIX locks, where the write
+    falls back to today's behaviour (every miss refreshes, each still one file
+    and one rename). An unreadable directory is answered 'busy': standing down
+    from the cache is the fail-open answer everywhere else here too."""
+    try:
+        import fcntl
+    except ImportError:
+        return None, 'posix'
+    try:
+        fd = os.open(str(cache), os.O_RDONLY | os.O_CLOEXEC
+                     | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError:
+        return None, 'busy'
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None, 'busy'
+    return fd, 'held'
+
+
+def _refresh(cache, key, run):
+    """Refresh under the directory lock, or wait briefly for the one in flight.
+
+    This is the whole of kittrial-5bb.346's second half. The lock is held
+    across the ENTIRE refresh - export, parse, serialize, write - because the
+    export is the part worth sharing: five concurrent misses for one tracker
+    are five endpoint processes the export server would run one at a time, so
+    the first miss to take the lock exports once and the others poll until it
+    lands, then serve what it wrote. A poll that acquires re-checks the cache
+    before exporting (the refresh it waited out may have been for another key,
+    or may have failed); a wait that runs out answers from the caller's own
+    export and writes nothing, so a wedged refresher is waited out and never
+    queued behind. A kit without POSIX locks (no fcntl) keeps today's
+    behaviour: every miss refreshes, each write still one file, one rename.
+    """
+    import time
+    deadline = time.monotonic() + _REFRESH_WAIT_SECONDS
+    while True:
+        fd, state = _refresh_lock(cache)
+        if fd is None and state == 'busy':
+            if time.monotonic() >= deadline:
+                return None                     # waited out: caller exports, no write
+            time.sleep(_REFRESH_POLL_SECONDS)
+            continue
+        try:
+            served = _cached_rows(cache, key)   # the waited-out refresh landed
+            if served is not None:
+                return served
+            import record_json
+            rows = record_json.loads_rows(run(['export', '--all']))
+            try:
+                _write_one_file(cache, _serialize(rows, key))
+            except OSError:
+                pass        # the cache is an optimization, never a requirement
+            return rows
+        finally:
+            if fd is not None:
+                os.close(fd)
 
 
 def cached_export_rows(root, path, run, name=None):
@@ -218,13 +312,26 @@ def cached_export_rows(root, path, run, name=None):
         rows = _cached_rows(cache, key)
         if rows is not None:
             return rows
+    return _miss(path, key, run)
+
+
+def _miss(path, key, run):
+    """A read whose generation the cache does not hold (kittrial-5bb.346).
+
+    The generation was read BEFORE the export (the .339 ordering: a write that
+    lands mid-read is missed, never half-seen); everything past that point -
+    the one-refresher lock held across the whole refresh, the brief wait for a
+    refresh already in flight, the fallback that answers from the caller's own
+    export when the wait runs out - is _refresh's."""
     import record_json
-    rows = record_json.loads_rows(run(['export', '--all']))
     try:
         (path / CACHE_DIR).mkdir(mode=0o700, exist_ok=True)
-        cache = _cache_directory(path)              # a symlink won the race: skip
-        if cache is not None:
-            _write_one_file(cache, _serialize(rows, key))
     except OSError:
-        pass                      # the cache is an optimization, never a requirement
-    return rows
+        return record_json.loads_rows(run(['export', '--all']))
+    cache = _cache_directory(path)          # a symlink won the race: skip caching
+    if cache is None:
+        return record_json.loads_rows(run(['export', '--all']))
+    served = _refresh(cache, key, run)
+    if served is not None:
+        return served
+    return record_json.loads_rows(run(['export', '--all']))
