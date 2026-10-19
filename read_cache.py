@@ -45,6 +45,16 @@ FILE_NAME = 'export.json'
 #: kit fall back to a fresh export after an upgrade.
 FORMAT = 2
 
+#: What FORMAT guards, in bytes (kittrial-5bb.345 item 3, review item: the
+#: computed digest was circular - after a real change to the parse it would be
+#: recomputed and still match): a LITERAL hex constant, the digest of the source
+#: of record_json.loads_rows, loads_row and _make_malformed_row at the time FORMAT
+#: was last set. The TEST computes the live digest the same way and compares it
+#: with this literal; a parse change without FORMAT rising fails it, telling the
+#: editor to raise FORMAT and update the constant. No source is read at import
+#: (compiled-only installs pay nothing and never fail here).
+FORMAT_DIGEST = 'd98ed175e4d422068d2989218d8a2241f73d5cf8d1e839027f217f64ec5b200a'
+
 #: The database-name rule admin.sql itself applies.
 _DATABASE = re.compile(r'[A-Za-z0-9_]{1,64}')
 
@@ -166,16 +176,27 @@ def _serialize(rows, key):
 
 
 def _write_one_file(cache, payload):
-    """Write the whole cache as ONE privately-modeled file, one rename (review B1)."""
+    """Write the whole cache as ONE privately-modeled file, one rename (review B1).
+
+    A write that fails leaves NO temp file behind (kittrial-5bb.345 item 4): the
+    name is removed in a finally, so a project that can never cache does not grow
+    a new `.read-cache-XXXX` file per read."""
     import tempfile
     handle, temp = tempfile.mkstemp(dir=str(cache), prefix='.read-cache-')
     try:
-        os.write(handle, payload)
-        os.fsync(handle)
-    finally:
-        os.close(handle)
-    os.chmod(temp, 0o600)
-    os.replace(temp, str(cache / FILE_NAME))
+        try:
+            os.write(handle, payload)
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+        os.chmod(temp, 0o600)
+        os.replace(temp, str(cache / FILE_NAME))
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
 
 
 def cached_export_rows(root, path, run, name=None):

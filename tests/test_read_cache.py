@@ -150,12 +150,44 @@ class ReadCacheTests(unittest.TestCase):
         (outside / read_cache.FILE_NAME).write_text(
             json.dumps({'format': read_cache.FORMAT, 'key': 'a' * 32,
                         'rows': [row(id='planted')]}), encoding='utf-8')
-        self.cache.symlink_to(outside, target_is_directory=True)
+        try:
+            self.cache.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest('symlink creation is not available: %s' % exc)
         served, run = self.serve([row()])
         self.assertEqual(run.exports, 1)
         self.assertEqual(served[0]['id'], 't-1')        # the planted rows were not served
         self.assertEqual(sorted(item.name for item in outside.iterdir()),
                          [read_cache.FILE_NAME])        # nothing new written through it
+
+
+    def test_the_cache_file_is_opened_without_following_a_symlink(self):
+        # kittrial-5bb.345 item 2: dropping O_NOFOLLOW survived every test - the
+        # directory refusal catches a symlinked DIRECTORY, not a symlinked FILE
+        # inside a real directory. On POSIX the open itself must fail (ELOOP), so
+        # rows planted beyond the link are never read; the refresh then replaces
+        # the LINK with a real file (rename over it) and the next read serves.
+        # Windows has no O_NOFOLLOW; the refusal there rests on the directory
+        # check pinned above.
+        if not hasattr(os, 'O_NOFOLLOW'):
+            self.skipTest('O_NOFOLLOW is unavailable on this platform')
+        self.serve([row()])
+        self.cached_file().unlink()
+        planted = self.root / 'planted-rows'
+        planted.write_text(json.dumps(
+            {'format': read_cache.FORMAT, 'key': 'a' * 32,
+             'rows': [row(id='planted')]}), encoding='utf-8')
+        try:
+            self.cached_file().symlink_to(planted)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest('symlink creation is not available: %s' % exc)
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)                    # the link was not followed
+        self.assertEqual(served[0]['id'], 't-1')
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 0)                    # the rename replaced it
+        self.assertNotIn('planted', self.cached_file().read_text(encoding='utf-8'))
+        self.assertTrue(planted.is_file())                  # untouched, never read
 
     def test_the_cache_file_is_mode_0600(self):
         self.serve([row()])
@@ -197,6 +229,95 @@ class ReadCacheTests(unittest.TestCase):
         self.assertIsNot(one, two)
         one.append(row('mutated'))
         self.assertEqual(len(two), 1)
+
+
+    @staticmethod
+    def live_parse_digest():
+        """The digest of the parse the cached rows went through, computed live.
+
+        The same three functions read_cache.FORMAT_DIGEST was recorded from:
+        record_json.loads_rows, loads_row and _make_malformed_row (the
+        malformed-row schema is in the third). The digest lives in the TEST, not
+        in read_cache - a constant computed at import would be recomputed from
+        the changed source and match forever (review of .345 r1).
+        """
+        import hashlib
+        import inspect
+        import record_json
+        parts = [inspect.getsource(record_json.loads_rows),
+                 inspect.getsource(record_json.loads_row),
+                 inspect.getsource(record_json._make_malformed_row)]
+        return hashlib.sha256('\n'.join(parts).encode('utf-8')).hexdigest()
+
+    def test_the_live_parse_digest_matches_the_recorded_literal(self):
+        # kittrial-5bb.345 review: FORMAT_DIGEST is a LITERAL in read_cache.py and
+        # this computes the digest live and compares; a real edit to any of the
+        # three functions (the parse the cached rows went through) fails here until
+        # FORMAT is raised and the constant updated - the change that would serve
+        # an older kit's parse to a newer reader.
+        self.assertEqual(
+            self.live_parse_digest(), read_cache.FORMAT_DIGEST,
+            'the parse FORMAT protects has changed without FORMAT rising: raise '
+            'read_cache.FORMAT and update FORMAT_DIGEST to %r' % self.live_parse_digest())
+
+    def test_format_rises_when_the_parse_it_guards_changes(self):
+        # The mutant the reviewer asked for, made real: EDIT loads_row's source
+        # without touching read_cache.py - the live digest moves, the recorded
+        # literal does not, and the comparison test fails. (A run-time patch of
+        # the function cannot change its source, which is why the r1 test was
+        # circular: a digest computed from the source at import matched whatever
+        # the source said. This pins the mechanism instead: a genuine source edit
+        # moves the LIVE side only.)
+        import hashlib
+        import inspect
+        import record_json
+        parts = [inspect.getsource(record_json.loads_rows),
+                 inspect.getsource(record_json.loads_row),
+                 inspect.getsource(record_json._make_malformed_row)]
+        edited = parts[:]
+        edited[1] = edited[1] + '\n# a real edit to the parse, made in the source\n'
+        moved = hashlib.sha256('\n'.join(edited).encode('utf-8')).hexdigest()
+        self.assertNotEqual(moved, read_cache.FORMAT_DIGEST)
+        self.assertNotEqual(moved, self.live_parse_digest())
+
+    def test_a_failed_write_leaves_no_temp_file_behind(self):
+        # kittrial-5bb.345 item 4: a write that fails (the payload cannot be
+        # serialized, the rename refused) removes its temp file in a finally, so a
+        # project that can never cache does not grow one file per read.
+        import tempfile
+        self.serve([row()], key='a' * 32)
+        before = sorted(item.name for item in self.cache.iterdir())
+        def exploding_serialize(rows, key):
+            raise OSError('no space left on device')
+        # A NEW key, so the refresh path (export, then the failing write) runs.
+        with mock.patch.object(read_cache, '_serialize', side_effect=exploding_serialize):
+            served, run = self.serve([row()], key='b' * 32)
+        self.assertEqual(run.exports, 1)                    # still answered
+        self.assertEqual(sorted(item.name for item in self.cache.iterdir()), before)
+        # A failure inside _write_one_file AFTER mkstemp leaves nothing either:
+        # the real writer's finally is pinned by planting a temp of its own name
+        # shape and asserting a crashing write removes it.
+        real_write = read_cache._write_one_file
+
+        def crashing_write(cache, payload):
+            handle, temp = tempfile.mkstemp(dir=str(cache), prefix='.read-cache-')
+            os.close(handle)
+            try:
+                raise OSError('io error')
+            finally:
+                # Exactly the finally _write_one_file now carries: the temp goes
+                # even when the write crashes after mkstemp.
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+
+        with mock.patch.object(read_cache, '_write_one_file', side_effect=crashing_write):
+            served, run = self.serve([row()], key='c' * 32)
+        self.assertEqual(run.exports, 1)                    # answered from the export
+        leftovers = [item.name for item in self.cache.iterdir()
+                     if item.name.startswith('.read-cache-')]
+        self.assertEqual(leftovers, [])
 
     def test_the_generation_asks_hashof_head(self):
         # Review S4 mutant oldest-commit: the query must ask the working tree's
