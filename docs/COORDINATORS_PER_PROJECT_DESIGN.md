@@ -470,7 +470,10 @@ safe than before. The order is the one the review recommended.
    actor on the operator list, in its own project, one contribution per family:
    (a) guidance: set, clear, status; (b) accepting reference and capability
    records; (c) proposal review and decision; (d) the operator's handoff and
-   `set-onboarding`. Each is a check that exists and is unreachable today only
+   `set-onboarding`; (e) the coordinator's recorded hand-back of an integrated
+   task to its assignee (`coordinator followon`, kittrial-5bb.343; its journal is
+   `<project>/.assignee-followons/`, described in `docs/REVIEWS.md`). Each is a
+   check that exists and is unreachable today only
    because the actor is self-declared (`endpoint.py` 675-681); with a bound key
    it is not. Without this slice James runs every acceptance for three
    projects, so it comes straight after rule 2.

@@ -4092,7 +4092,7 @@ OWNER_ANSWERS_JOURNAL='.owner-answers'
 #: private ``mode=`` form (``.web-lifecycle-marks``) is named too; its fixed
 #: ``<name>.tmp`` does not match the sweep's shape, so sweeping it is a no-op.
 ATOMIC_SWEEP_DIRECTORIES=('.',)+RESERVATION_JOURNALS+( '.handoffs','.handoff-recoveries',
-    '.requirement-backfills','.integration-reverts','.lifecycle-voids',
+    '.requirement-backfills','.integration-reverts','.assignee-followons','.lifecycle-voids',
     '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL)
 
 def sweep_project_temporaries(root,name,*,dry_run=False,min_age_seconds=None):
@@ -4149,7 +4149,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
         if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
@@ -4187,6 +4187,14 @@ def validate_coordination_files(files):
         if name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])
+        if name.startswith('.assignee-followons/'):
+            # The host-issued assignee follow-on journal (kittrial-5bb.343). Its
+            # record shape and its <sha256>.json path/hash binding are validated by
+            # the reader's own validator, so a backup can never carry an entry the
+            # reader would have to guess about; a restore that dropped it would
+            # silently make every recorded hand-back inert.
+            from followon import validate_entry as validate_followon_entry
+            validate_followon_entry(record,name.partition('/')[2])
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
         if name=='GUIDANCE.md':
             from guidance import validate_text
@@ -4690,6 +4698,15 @@ def backup_project(root,name):
         for record in revert_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Integration revert journal entry must not be a symlink')
             files['.integration-reverts/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The host-issued assignee follow-on journal (kittrial-5bb.343). It is the
+        # proof a hand-back was recorded on this host, so a restore that dropped it
+        # would silently make every recorded hand-back inert: it is backed up,
+        # validated and restored exactly like the revert journal.
+        followon_journal=path/'.assignee-followons'
+        if followon_journal.is_symlink():raise ValueError('Assignee follow-on journal must not be a symlink')
+        for record in followon_journal.glob('*.json'):
+            if record.is_symlink():raise ValueError('Assignee follow-on journal entry must not be a symlink')
+            files['.assignee-followons/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
         # The owner answers journal (kittrial-5bb.126): written by no kit yet, collected
         # only when present, so a backup of a runtime with open-item writes off is
         # byte-for-byte what the previous kit takes.
@@ -6661,6 +6678,12 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name.startswith('.integration-reverts/'):
             from review_workflow import validate_revert_journal_entry
             validate_revert_journal_entry(record,name.partition('/')[2])
+        elif name.startswith('.assignee-followons/'):
+            # The host-issued assignee follow-on journal (kittrial-5bb.343): validate
+            # every entry BEFORE the first write, so a bad entry refuses the whole
+            # restore rather than silently making an open hand-back inert.
+            from followon import validate_entry as validate_followon_entry
+            validate_followon_entry(record,name.partition('/')[2])
         elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])

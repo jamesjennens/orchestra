@@ -724,10 +724,14 @@ def unresolved_directions(entries,direction_idx,owner,counted=True):
     outstanding direction that no reader could ever resolve.
     """
     if not counted:return []
+    import followon
     outstanding=[]
     for e in entries:
         if e['kind']!='comment' or e['author']==owner:continue
         if str(e.get('body','')).startswith(('Kind: task-checkpoint-v1','Kind: contribution-review-v1')):continue
+        # A follow-on WITHDRAWAL record is the coordinator's own "superseded"
+        # disposition of the direction, not a direction of its own (kittrial-5bb.343).
+        if followon.withdrawal_text(str(e.get('body',''))):continue
         d=direction_idx.get(e['entry_id'])
         if d is None or d['state'] not in RESOLUTION_STATES or d.get('digest')!=content_hash(e):
             outstanding.append(e)
@@ -869,6 +873,19 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
         if not counted:result['unresolved_directions']['check']=directions_check_state(directions_reason)
     return result
 
+def compact_integration(value):
+    """One integration block without the two additive native-identity keys.
+
+    ``review_state.integration`` gained ``record_id``/``order`` for the recorded
+    hand-back's write gate and reader (kittrial-5bb.343). The compact brief is a
+    bounded projection (its long-chain size is held below 6000 bytes), so it drops
+    exactly those two keys; every key the brief already carried stays.
+    """
+    if not isinstance(value,dict):
+        return value
+    return {key:item for key,item in value.items() if key not in ('record_id','order')}
+
+
 def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
           independent_approval=False,owners=None,provenance_writes=True,identity_names=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
@@ -889,7 +906,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     from review_state import RECONCILIATION_WARNING_PREFIX, is_integration_warning, scopes_for
     from guidance import brief_block
     review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal,
-                    actor=actor,independent_approval=independent_approval,owners=owners)
+                    actor=actor,independent_approval=independent_approval,owners=owners,
+                    provenance_writes=provenance_writes)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
     # answer is additive as `review.integration.matches_contribution`.
@@ -914,6 +932,13 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # says whether a replaced revision is integrated without re-reading review TASK.
     bounded_priors=[{key:c[key] for key in ('comment_id','commit','relation','timestamp','integration')}
                     for c in priors[-PRIOR_BRIEF_LIMIT:]]
+    # The compact brief keeps its released size bound (kittrial-5bb.6 item 2a and the
+    # long-chain test). The additive integration record identity/order (kittrial-
+    # 5bb.343) is carried by `review TASK` and `work` rows, where the follow-on write
+    # gate and the reader need it; the compact brief's bounded prior slice drops those
+    # two keys so a long chain does not grow past 6000 bytes.
+    for entry in bounded_priors:
+        entry['integration']=compact_integration(entry.get('integration'))
     review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record a review request or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
@@ -1045,8 +1070,21 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                       prior_contributions=bounded_priors,prior_contributions_total=len(priors),
                       prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None,
                       reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
-                      reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None)
+                      reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None,
+                      integration=compact_integration(review.get('integration')))
     brief_review.pop('reconciliation_needed',None)
+    # The coordinator's recorded hand-back (kittrial-5bb.343): the same additive
+    # block a work row carries. An APPLYING one is the assignee's move, so `next`
+    # quotes the recorded text once and the shared review block names the role.
+    followon_block=review.get('followon')
+    if followon_block is not None:
+        result_followon=followon_block
+    else:
+        result_followon=None
+    if isinstance(followon_block,dict) and followon_block.get('applies'):
+        import followon as followon_records
+        next_action=followon_records.next_text(followon_block,checkpoint_available=provenance_writes)
+        brief_review['next_actor']='assignee'
     # Avoid adding off-state bytes to compact long-chain briefs. The setting
     # is carried only when ON; absence means false, including older endpoints.
     if not brief_review.get('approval_requires_other_party'):
@@ -1064,6 +1102,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'next_action':next_action,
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
             'review':brief_review,
+            **({'followon':result_followon} if result_followon is not None else {}),
             'lifecycle_matches_contribution':matches_contribution,
             'deployed_delivery':deployed_delivery,
             'deployed_delivery_is_current_contribution':deployed_current,
