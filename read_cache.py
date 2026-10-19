@@ -45,6 +45,26 @@ FILE_NAME = 'export.json'
 #: kit fall back to a fresh export after an upgrade.
 FORMAT = 2
 
+#: What FORMAT guards, in bytes (kittrial-5bb.345 item 3): a digest of the parse
+#: the cached rows went through - record_json.loads_rows' own source and the row
+#: schema its malformed fallback builds. The test fails when either changes while
+#: FORMAT stays, which is exactly the change that would serve an older kit's
+#: parse to a newer reader.
+import hashlib as _hashlib
+import inspect as _inspect
+
+
+def _protected_parse_digest():
+    import record_json
+    parts = [_inspect.getsource(record_json.loads_rows),
+             _inspect.getsource(record_json.loads_row),
+             _inspect.getsource(record_json._make_malformed_row)]
+    return _hashlib.sha256('\n'.join(parts).encode('utf-8')).hexdigest()
+
+
+#: The digest FORMAT was last raised against. Raise FORMAT whenever this changes.
+FORMAT_DIGEST = _protected_parse_digest()
+
 #: The database-name rule admin.sql itself applies.
 _DATABASE = re.compile(r'[A-Za-z0-9_]{1,64}')
 
@@ -166,16 +186,27 @@ def _serialize(rows, key):
 
 
 def _write_one_file(cache, payload):
-    """Write the whole cache as ONE privately-modeled file, one rename (review B1)."""
+    """Write the whole cache as ONE privately-modeled file, one rename (review B1).
+
+    A write that fails leaves NO temp file behind (kittrial-5bb.345 item 4): the
+    name is removed in a finally, so a project that can never cache does not grow
+    a new `.read-cache-XXXX` file per read."""
     import tempfile
     handle, temp = tempfile.mkstemp(dir=str(cache), prefix='.read-cache-')
     try:
-        os.write(handle, payload)
-        os.fsync(handle)
-    finally:
-        os.close(handle)
-    os.chmod(temp, 0o600)
-    os.replace(temp, str(cache / FILE_NAME))
+        try:
+            os.write(handle, payload)
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+        os.chmod(temp, 0o600)
+        os.replace(temp, str(cache / FILE_NAME))
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
 
 
 def cached_export_rows(root, path, run, name=None):
