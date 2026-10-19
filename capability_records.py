@@ -54,7 +54,17 @@ import capability_verification as verification
 import keyed_entries
 import keyed_records as core
 import record_json
-from capabilities import normalized as normalize, safe_relpath, split_pointer, stems, words
+from capabilities import (
+    CANDIDATE_FLOOR,
+    PENDING_ALIAS_LIFT,
+    bm25_document,
+    bm25_scores,
+    normalized as normalize,
+    safe_relpath,
+    split_pointer,
+    stems,
+    words,
+)
 from coordination import atomic, identifier
 from export_requirements import parse_json
 from keyed_entries import (BATCH_FIELDS, BATCH_MAX, BATCH_YIELD_SECONDS, CONTRIBUTOR_OPERATIONS, ITEM_FIELDS,
@@ -965,28 +975,37 @@ def find(rows, phrase, operators, limit=5, trust=None):
     if not FIND_LIMIT[0] <= limit <= FIND_LIMIT[1]:
         raise ValueError('--limit: expected %d..%d' % FIND_LIMIT)
     key = normalize(text)
-    wanted = stems(text)
     entries, incomplete = catalog(rows, operators)
-    exact, conflicted, scored = [], [], []
+    exact, conflicted, candidates, documents = [], [], [], []
     for entry in entries:
         if entry['state'] in ('malformed', 'unsupported') or entry['key'] is None:
             continue
         record = entry.get('candidate') or _newest(entry) or {}
+        identity_parts = ([entry['key'], record.get('name') or '']
+                          + list(record.get('aliases') or [])
+                          + [item['alias'] for item in entry.get('aliases_pending') or []])
+        context_parts = ([record.get('summary') or '']
+                         + list(record.get('tags') or [])
+                         + list(record.get('code') or [])
+                         + list(record.get('anchors') or [])
+                         + list(record.get('tests') or [])
+                         + [link['key'] for link in (record.get('requirements') or [])
+                            if isinstance(link, dict) and link.get('key')])
+        documents.append(bm25_document(entry['native_id'], identity_parts, context_parts))
         names, accepted_aliases = _exact_phrases(entry)
         if text == entry['key'] or key in names | accepted_aliases:
             (conflicted if entry['state'] == 'conflicted' else exact).append(entry)
             continue
+        candidates.append((entry, record, accepted_aliases))
+    bm25 = bm25_scores(documents, text)
+    scored = []
+    for entry, record, accepted_aliases in candidates:
         pending = {item['normalized'] for item in entry['aliases_pending']}
         draft_aliases = {normalize(item) for item in record.get('aliases') or []} - accepted_aliases
-        vocabulary = stems(' '.join([entry['key'].replace('.', ' ').replace('-', ' '), record.get('name') or '',
-                                     ' '.join(record.get('aliases') or [])] + [item['alias'] for item in
-                                                                             entry['aliases_pending']]))
-        overlap = len(wanted & vocabulary) / len(wanted) if wanted else 0.0
-        summary_overlap = len(wanted & stems(record.get('summary') or '')) / len(wanted) if wanted else 0.0
-        score = max(overlap, 0.5 * summary_overlap)
+        score = bm25.get(entry['native_id'], 0.0)
         if key in pending or key in draft_aliases:
-            score = max(score, 0.95)   # a candidate lift, never an exact match
-        if score >= 0.2:
+            score = max(score, PENDING_ALIAS_LIFT)   # a candidate lift, never an exact match
+        if score >= CANDIDATE_FLOOR:
             scored.append((score, entry))
     exact.sort(key=lambda entry: (entry['record'] is None, entry['key']))
     groups = {tuple(anchor['native_id'] for anchor in entry['duplicate_anchors']) for entry in conflicted}

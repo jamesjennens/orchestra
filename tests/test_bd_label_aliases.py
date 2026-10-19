@@ -55,6 +55,13 @@ def _bd_binary():
 
 BD = _bd_binary()
 
+#: kittrial-5bb.344: bounds for every native call. Module level as well as class
+#: defaults because fixtures that borrow these methods method-by-method
+#: (test_credential_actor) are not subclasses and do not copy class constants.
+DEFAULT_BD_TIMEOUT = 120
+DEFAULT_INIT_TIMEOUT = 300
+DEFAULT_SQL_TIMEOUT = 30
+
 RESERVED_VALUES = ('requirement', 'requirement:draft', 'requirement:accepted',
                    'brd-section', 'request:' + 'a' * 64,
                    'request-content:' + 'b' * 64)
@@ -88,6 +95,13 @@ class RealBdLabelAliasTests(unittest.TestCase):
     #: The scratch deployment password, matching the one the fixture puts on the Dolt root.
     PASSWORD = 'x'
     READY_TRIES, READY_PAUSE = 120, 0.5
+    #: kittrial-5bb.344: every native call is bounded. A bd that stops answering must
+    #: fail its test with the command it was running, not block the module until the
+    #: runner is killed. These scratch trackers answer in ~0.4 s, so these bounds are
+    #: far above a legitimate call and below any useful suite deadline.
+    BD_TIMEOUT = DEFAULT_BD_TIMEOUT
+    INIT_TIMEOUT = DEFAULT_INIT_TIMEOUT
+    SQL_TIMEOUT = DEFAULT_SQL_TIMEOUT
 
     @classmethod
     def _free_port(cls):
@@ -136,25 +150,32 @@ class RealBdLabelAliasTests(unittest.TestCase):
 
     @classmethod
     def _await_server(cls):
-        """Wait until the scratch Dolt server answers; connect with the fresh root's empty password."""
+        """Wait until the scratch Dolt server answers; connect with the fresh root's empty password.
+
+        Each probe is bounded too (kittrial-5bb.344): the old unbounded ``admin.sql``
+        could wait forever on a Dolt client that never returned.
+        """
         for _ in range(cls.READY_TRIES):
             try:
-                admin.sql(cls.root, 'SELECT 1;', password='')
+                admin.sql(cls.root, 'SELECT 1;', password='',
+                          timeout=getattr(cls, 'SQL_TIMEOUT', DEFAULT_SQL_TIMEOUT))
                 return
-            except (subprocess.CalledProcessError, OSError):
+            except (subprocess.SubprocessError, OSError):
                 time.sleep(cls.READY_PAUSE)
         raise unittest.SkipTest('the scratch Dolt server did not become ready')
 
     @classmethod
     def _set_root_password(cls):
         """Give the scratch server the same root password `admin.environment` will send."""
-        users = admin.sql(cls.root, 'SELECT User,Host FROM mysql.user;', password='')
+        users = admin.sql(cls.root, 'SELECT User,Host FROM mysql.user;', password='',
+                          timeout=getattr(cls, 'SQL_TIMEOUT', DEFAULT_SQL_TIMEOUT))
         changes = ["ALTER USER '%s'@'%s' IDENTIFIED BY '%s';"
                    % (row['User'].replace("'", "''"), row['Host'].replace("'", "''"), cls.PASSWORD)
                    for row in csv.DictReader(io.StringIO(users)) if row.get('User') == 'root']
         if not changes:
             raise unittest.SkipTest('the scratch Dolt server has no root account')
-        admin.sql(cls.root, '\n'.join(changes), password='')
+        admin.sql(cls.root, '\n'.join(changes), password='',
+                  timeout=getattr(cls, 'SQL_TIMEOUT', DEFAULT_SQL_TIMEOUT))
 
     @classmethod
     def setUpClass(cls):
@@ -192,11 +213,18 @@ class RealBdLabelAliasTests(unittest.TestCase):
         try:
             cls._await_server()
             cls._set_root_password()
-            init = subprocess.run(
-                [str(cls.bd_path), 'init', '--server', '--external', '--server-host', '127.0.0.1',
-                 '--server-port', str(cls.port), '--server-user', 'root', '--prefix', 'pp',
-                 '--database', 'pp', '--skip-agents', '--skip-hooks', '--non-interactive'],
-                cwd=str(cls.project), env=admin.environment(cls.root), capture_output=True, text=True)
+            init_command = [
+                str(cls.bd_path), 'init', '--server', '--external', '--server-host', '127.0.0.1',
+                '--server-port', str(cls.port), '--server-user', 'root', '--prefix', 'pp',
+                '--database', 'pp', '--skip-agents', '--skip-hooks', '--non-interactive']
+            init_timeout = getattr(cls, 'INIT_TIMEOUT', DEFAULT_INIT_TIMEOUT)
+            try:
+                init = subprocess.run(
+                    init_command, cwd=str(cls.project), env=admin.environment(cls.root),
+                    capture_output=True, text=True, timeout=init_timeout)
+            except subprocess.TimeoutExpired:
+                raise AssertionError('bd init did not finish within %ss: %s'
+                                     % (init_timeout, ' '.join(init_command)))
             if init.returncode:
                 raise unittest.SkipTest('bd server-mode init failed: %s'
                                         % (init.stderr or init.stdout).strip()[:200])
@@ -214,15 +242,42 @@ class RealBdLabelAliasTests(unittest.TestCase):
         remove_scratch(cls._tmp)
 
     def bd(self, *args, actor='op'):
-        return subprocess.run(
-            [str(self.bd_path), '--directory', str(self.project), '--sandbox', '--actor', actor, *args],
-            env=admin.environment(self.root), capture_output=True, text=True)
+        """Run one native bd command with a bound, failing clearly if it hangs.
+
+        kittrial-5bb.344: this used to be an unbounded ``subprocess.run``, so a bd that
+        stopped answering (the reported "the module hangs but the test alone passes")
+        blocked forever inside ``communicate``; only killing the whole runner ended it
+        and nothing said which command was stuck.
+        """
+        command = [str(self.bd_path), '--directory', str(self.project), '--sandbox',
+                   '--actor', actor, *args]
+        timeout = getattr(self, 'BD_TIMEOUT', DEFAULT_BD_TIMEOUT)
+        try:
+            return subprocess.run(command, env=admin.environment(self.root),
+                                  capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as expired:
+            self.fail('native bd did not finish within %ss: %s (stderr so far: %r)'
+                      % (timeout, ' '.join(command), expired.stderr))
 
     def export_rows(self):
         result = self.bd('export', '--all')
         self.assertEqual(result.returncode, 0, result.stderr)
         return [json.loads(line) for line in result.stdout.split('\n')
                 if line.strip()]
+
+    def test_a_native_call_that_never_answers_fails_with_its_command(self):
+        """kittrial-5bb.344: the reported hang was an unbounded native call.
+
+        A bd that never answers used to block ``bd()`` inside ``communicate`` forever,
+        so the module looked hung and no message named the command. The bound now fails
+        the test in place; this pins that with a deadline no process can meet.
+        """
+        original = self.BD_TIMEOUT
+        self.BD_TIMEOUT = 0.001
+        self.addCleanup(setattr, self, 'BD_TIMEOUT', original)
+        with self.assertRaisesRegex(AssertionError,
+                                    'native bd did not finish within 0.001s: .* export --all'):
+            self.bd('export', '--all')
 
     def reserved_labels(self):
         found = []

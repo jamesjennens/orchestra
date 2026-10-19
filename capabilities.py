@@ -47,6 +47,7 @@ import ast
 import difflib
 import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -112,7 +113,37 @@ SUMMARY_LIMIT = 200
 ALIASES_SHOWN = 8
 TESTS_SHOWN = 8
 RELATED_SHOWN = 8
-CANDIDATE_FLOOR = 0.2
+BM25_K1 = 1.2
+BM25_B = 0.75
+IDENTITY_WEIGHT = 2
+CONTEXT_WEIGHT = 1
+FIELD_TF_CAP = 2
+CANDIDATE_FLOOR = 0.25
+PENDING_ALIAS_LIFT = 0.95
+TEST_DISCOUNT = 0.85
+
+STOP_WORDS = frozenset({
+    'a', 'about', 'after', 'also', 'am', 'an', 'and', 'are', 'as', 'at',
+    'be', 'because', 'been', 'before', 'being', 'between', 'but', 'by',
+    'can', 'could', 'did', 'do', 'does', 'doing', 'during',
+    'for', 'from',
+    'had', 'has', 'have', 'having', 'he', 'her', 'here', 'hers', 'herself', 'him',
+    'himself', 'his', 'how',
+    'i', 'if', 'in', 'into', 'is', 'it', 'its', 'itself',
+    'just',
+    'may', 'me', 'might', 'must', 'my', 'myself',
+    'nor',
+    'of', 'on', 'onto', 'or', 'our', 'ours', 'ourselves',
+    'please',
+    'shall', 'she', 'should', 'so', 'such',
+    'than', 'that', 'the', 'their', 'theirs', 'them', 'themselves', 'then',
+    'there', 'these', 'they', 'this', 'those', 'through', 'to', 'too',
+    'until', 'upon', 'us',
+    'very', 'via',
+    'was', 'we', 'were', 'what', 'when', 'where', 'whether', 'which', 'while',
+    'who', 'whom', 'whose', 'why', 'will', 'with', 'within', 'without', 'would',
+    'you', 'your', 'yours', 'yourself', 'yourselves',
+})
 
 SKIP_DIRS = frozenset({'.git', '.hg', '.svn', '__pycache__', 'node_modules', '.venv', 'venv',
                        '.tox', '.nox', '.mypy_cache', '.pytest_cache', '.ruff_cache',
@@ -213,12 +244,201 @@ def stem(word):
     return word
 
 
+def _vocab_stem(word, vocab_stems):
+    """Stem ``word``, applying ``-ied``/``-ies`` -> ``-y`` only when the ``-y`` singular is in ``vocab_stems``."""
+    for suffix in ('ied', 'ies'):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 2:
+            y_form = word[:-3] + 'y'
+            if y_form in vocab_stems:
+                return y_form
+    base = stem(word)
+    if base in vocab_stems:
+        return base
+    if word.endswith('y') and len(word) >= 4:
+        i_form = word[:-1] + 'i'
+        if i_form in vocab_stems:
+            return i_form
+    return base
+
+
 def normalized(text):
     return ' '.join(words(text))
 
 
 def stems(text):
     return {stem(word) for word in words(text)}
+
+
+def content_words(text):
+    """Lowercase word tokens with function stop words removed; falls back to all
+    word tokens when stripping leaves nothing."""
+    tokens = words(text)
+    filtered = [word for word in tokens if word not in STOP_WORDS]
+    return filtered if filtered else tokens
+
+
+def content_stems(text):
+    """Stemmed non-stop words in order, for prose context fields."""
+    return [stem(word) for word in words(text) if word not in STOP_WORDS]
+
+
+def _capped_counts(tokens):
+    counts = {}
+    for token in tokens:
+        current = counts.get(token, 0)
+        if current < FIELD_TF_CAP:
+            counts[token] = current + 1
+    return counts
+
+
+def bm25_document(doc_id, identity_parts, context_parts=()):
+    """Build a two-zone (identity + context) BM25 document representation.
+
+    Identity fields are never stripped of stop words. Every distinct identity part
+    (``key``, ``name``, ``symbol``, and each ``alias``) is stored as its own candidate
+    BM25 part with its own token length so each part is length-normalized by its own
+    length and scored by the single best matching part, without summing across parts
+    or diluting honest aliases.
+    """
+    id_tf = {}
+    id_parts = []
+    seen_part_tuples = set()
+    for part in identity_parts or ():
+        if not part:
+            continue
+        raw_words = words(part)
+        tokens = [stem(word) for word in raw_words]
+        if not tokens:
+            continue
+        for token in tokens:
+            id_tf[token] = 1
+        token_tuple = tuple(tokens)
+        if token_tuple in seen_part_tuples:
+            continue
+        seen_part_tuples.add(token_tuple)
+        nonstop_len = max(1, sum(1 for word in raw_words if word not in STOP_WORDS))
+        full_len = len(tokens)
+        id_parts.append((frozenset(tokens), nonstop_len, full_len))
+    ctx_tokens = []
+    for part in context_parts or ():
+        if part:
+            ctx_tokens.extend(content_stems(part))
+    ctx_tf = _capped_counts(ctx_tokens)
+    return {
+        'id': doc_id,
+        'id_tf': id_tf,
+        'id_parts': tuple(id_parts),
+        'id_len': id_parts[0][1] if id_parts else 0,
+        'ctx_tf': ctx_tf,
+        'ctx_len': len(ctx_tokens),
+        'terms': frozenset(id_tf) | frozenset(ctx_tf),
+    }
+
+
+def _idf(df, total_docs):
+    return math.log(1.0 + (total_docs - df + 0.5) / (df + 0.5))
+
+
+def _normalize_score(ratio):
+    if ratio <= 0.0:
+        return 0.0
+    if ratio <= 0.8:
+        return ratio
+    excess = ratio - 0.8
+    return 0.8 + 0.14 * (excess / (excess + 0.4))
+
+
+def bm25_scores(documents, query_words, check_budget=None):
+    """Score ``documents`` against ``query_words`` (phrase text or unstemmed word list) with BM25.
+
+    Returns ``{doc_id: score}`` with scores normalized to ``(0.0, 0.94)`` so that
+    matching more query terms, rarer query terms, or identity fields strictly increases
+    the score while reserving ``>= 0.95`` for the pending/draft alias exact-phrase lift.
+    """
+    if not documents:
+        return {}
+    if isinstance(query_words, str):
+        tokens = words(query_words)
+    else:
+        tokens = [word for word in (query_words or ()) if word]
+    filtered = [word for word in tokens if word not in STOP_WORDS]
+    raw_words = filtered if filtered else tokens
+    if not raw_words:
+        return {}
+    vocab_stems = set()
+    for doc in documents:
+        vocab_stems.update(doc['terms'])
+    seen = set()
+    wanted = []
+    for word in raw_words:
+        stemmed = _vocab_stem(word, vocab_stems)
+        if stemmed and stemmed not in seen:
+            seen.add(stemmed)
+            wanted.append(stemmed)
+    if not wanted:
+        return {}
+    total_docs = len(documents)
+    avg_id_len = sum(doc['id_len'] for doc in documents) / float(total_docs) or 1.0
+    avg_ctx_len = sum(doc['ctx_len'] for doc in documents) / float(total_docs) or 1.0
+    df = {term: 0 for term in wanted}
+    for index, doc in enumerate(documents):
+        if check_budget is not None and index % 256 == 0:
+            check_budget()
+        terms = doc['terms']
+        for term in wanted:
+            if term in terms:
+                df[term] += 1
+    if not any(df.values()):
+        return {}
+    matched_idfs = [_idf(df[term], total_docs) for term in wanted if df[term] > 0]
+    unmatched_scale = 0.5 if filtered else 1.0
+    unmatched_idf = unmatched_scale * (sum(matched_idfs) / float(len(matched_idfs)))
+    idf = {term: (_idf(df[term], total_docs) if df[term] > 0 else unmatched_idf) for term in wanted}
+    ideal = sum(idf[term] * IDENTITY_WEIGHT for term in wanted)
+    if ideal <= 0.0:
+        return {}
+    scores = {}
+    for index, doc in enumerate(documents):
+        if check_budget is not None and index % 256 == 0:
+            check_budget()
+        terms = doc['terms']
+        if not any(term in terms for term in wanted):
+            continue
+        id_tf = doc['id_tf']
+        ctx_tf = doc['ctx_tf']
+        ctx_ratio = max(1.0, doc['ctx_len'] / avg_ctx_len) if avg_ctx_len > 0 else 1.0
+        ctx_norm = 1.0 - BM25_B + BM25_B * ctx_ratio
+        ctx_bm25 = {}
+        for term in wanted:
+            tf_c = ctx_tf.get(term, 0)
+            if tf_c:
+                ctx_bm25[term] = (tf_c * (BM25_K1 + 1.0)) / (tf_c + BM25_K1 * ctx_norm)
+        id_parts = doc.get('id_parts')
+        if id_parts is None:
+            id_parts = ((frozenset(id_tf), doc['id_len'], doc['id_len']),) if id_tf else ()
+        part_scores = []
+        for part_tokens, nonstop_len, full_len in id_parts:
+            hits = [term for term in wanted if term in part_tokens]
+            if not hits:
+                continue
+            part_len = nonstop_len if filtered else full_len
+            id_ratio = max(1.0, part_len / avg_id_len) if avg_id_len > 0 else 1.0
+            id_norm = 1.0 - BM25_B + BM25_B * id_ratio
+            bm25_i = (BM25_K1 + 1.0) / (1.0 + BM25_K1 * id_norm)
+            part_score = sum(idf[term] * IDENTITY_WEIGHT * bm25_i for term in hits)
+            for term, bm25_c in ctx_bm25.items():
+                if term in part_tokens:
+                    part_score += idf[term] * (0.1 * CONTEXT_WEIGHT * bm25_c)
+                else:
+                    part_score += idf[term] * (CONTEXT_WEIGHT * min(1.0, bm25_c))
+            part_scores.append(part_score)
+        if part_scores:
+            raw = max(part_scores)
+        else:
+            raw = sum(idf[term] * (CONTEXT_WEIGHT * min(1.0, bm25_c)) for term, bm25_c in ctx_bm25.items())
+        if raw > 0.0:
+            scores[doc['id']] = _normalize_score(raw / ideal)
+    return scores
 
 
 def safe_relpath(value):
@@ -1445,50 +1665,56 @@ def lookup(index, phrase, limit=LIMIT_DEFAULT):
     if exact:
         result['matches'] = [view(item) for item in exact[:limit]]
         return result
-    vocabulary, names_of = set(), {}
-    for item in index.entries:
-        names = set()
-        for alias in item['aliases'][:3]:
-            tokens = words(alias)
-            vocabulary.update(tokens)
-            names.update(stem(token) for token in tokens)
-        names_of[item['id']] = names
-    # A phrase word that no name uses is read as the closest word that one does
-    # ("refrsh" -> "refresh"), and the correction is reported.
+    vocabulary = set()
+    documents = []
+    for position, item in enumerate(index.entries):
+        if not position % 256:
+            _check_budget('ranking candidates')
+        identity_parts = [item['name'], item.get('symbol') or '']
+        for alias in item['aliases']:
+            vocabulary.update(word for word in words(alias) if word not in STOP_WORDS)
+            identity_parts.append(alias)
+        if item.get('module'):
+            vocabulary.update(word for word in words(item['module']) if word not in STOP_WORDS)
+        documents.append(bm25_document(
+            item['id'],
+            identity_parts,
+            [item['file'], item.get('summary') or ''],
+        ))
+    vocabulary_stems = {stem(word) for word in vocabulary}
+    sorted_vocabulary = sorted(vocabulary)
+    # A content word that no name uses is read as the closest word that one does
+    # ("refrsh" -> "refresh"), and the correction is reported. Stop words and words
+    # whose stem is already in the vocabulary are not typo-corrected.
     corrected = []
-    for word in words(text):
-        if word not in vocabulary and len(word) >= 4:
-            close = difflib.get_close_matches(word, vocabulary, n=1, cutoff=0.8)
+    for word in content_words(text):
+        if (word not in STOP_WORDS and word not in vocabulary
+                and _vocab_stem(word, vocabulary_stems) not in vocabulary_stems and len(word) >= 4):
+            close = difflib.get_close_matches(word, sorted_vocabulary, n=1, cutoff=0.8)
             if close:
                 result['corrections'][word] = close[0]
                 word = close[0]
         corrected.append(word)
-    wanted = {stem(word) for word in corrected}
-    scores = {}
-    for item in index.entries if wanted else ():
-        names = names_of[item['id']]
-        context = stems(item['file']) | (stems(item['summary']) if item['summary'] else set())
-        name_hits = len(wanted & names)
-        context_hits = len(wanted & (names | context))
-        if not context_hits:
-            continue
-        scores[item['id']] = (0.6 * name_hits / len(wanted)
-                              + 0.25 * (name_hits / len(names) if names else 0)
-                              + 0.15 * context_hits / len(wanted))
+    scores = bm25_scores(
+        documents,
+        corrected,
+        check_budget=lambda: _check_budget('ranking candidates'),
+    ) if corrected else {}
     fuzzy_key = ' '.join(corrected)
-    if fuzzy_key:
+    if fuzzy_key and len(corrected) <= 3:
         by_key = {}
         for item in index.entries:
             for candidate_key in keys[item['id']]:
-                by_key.setdefault(candidate_key, []).append(item)
-        for close in difflib.get_close_matches(fuzzy_key, list(by_key), n=limit * 4, cutoff=0.75):
+                if content_words(candidate_key):
+                    by_key.setdefault(candidate_key, []).append(item)
+        for close in difflib.get_close_matches(fuzzy_key, sorted(by_key), n=limit * 4, cutoff=0.75):
             ratio = difflib.SequenceMatcher(None, fuzzy_key, close).ratio()
             for item in by_key[close]:
                 scores[item['id']] = max(scores.get(item['id'], 0), 0.9 * ratio)
     ranked = []
     for item_id, score in scores.items():
         item = index.by_id[item_id]
-        score = score * (0.85 if item['test'] else 1.0)
+        score = score * (TEST_DISCOUNT if item['test'] else 1.0)
         if score >= CANDIDATE_FLOOR:
             ranked.append((-score, _order(item), item))
     ranked.sort(key=lambda row: (row[0], row[1]))

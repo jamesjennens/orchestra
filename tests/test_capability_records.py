@@ -595,5 +595,357 @@ class ListAndIsolationTests(CapabilityCase):
         self.assertEqual(self.read('--help')['action'], 'capability')
 
 
+class BM25FindTests(CapabilityCase):
+    """BM25 ranking for free-form questions and adversarial inputs in capability find (kittrial-5bb.337)."""
+
+    def setUp(self):
+        super().setUp()
+        from bm25_before_after import FIND_CATALOG
+        items = []
+        for op_id, key, name, aliases, summary, tags, anchors, code, tests in FIND_CATALOG:
+            self.propose(operation_id=op_id, key=key, name=name, aliases=aliases,
+                         summary=summary, tags=tags, anchors=anchors, code=code, tests=tests,
+                         owner='person:james')
+            items.append(self.item(key))
+        self.batch(items, operation_id='accept-catalog')
+
+    def test_ten_free_form_questions_and_short_phrases_find_target_capabilities_in_top_three(self):
+        from bm25_before_after import FIND_QUERIES
+        for question, expected_key in FIND_QUERIES[:-5]:
+            with self.subTest(question=question):
+                found = self.read('find', question)
+                self.assertFalse(found['found'], question)
+                top_three = [row['key'] for row in found['candidates'][:3]]
+                self.assertIn(expected_key, top_three,
+                              '%r not in top 3 %r for %r' % (expected_key, top_three, question))
+                self.assertEqual(top_three[0], expected_key)
+        # Short alias-like phrases still hit as exact matches or top candidates.
+        for phrase, expected_key in FIND_QUERIES[-5:-1]:
+            exact = self.read('find', phrase)
+            self.assertTrue(exact['found'], phrase)
+            self.assertEqual(exact['records'][0]['key'], expected_key)
+        near_short = self.read('find', 'structured review')
+        self.assertEqual(near_short['candidates'][0]['key'], 'review.structured-contribution')
+
+    def test_adding_aliases_never_dilutes_existing_name_or_alias_bm25_score(self):
+        before = self.read('find', 'how do I acquire a merge slot')['candidates'][0]
+        self.assertEqual(before['key'], 'merge.slot')
+        self.native.actor = 'alice'
+        cr.apply_native(
+            entry(operation='revise', operation_id='many-aliases', key='merge.slot', name='Merge slot',
+                  aliases=['integration lock', 'exclusive branch queue', 'serial branch lander',
+                           'single writer gate', 'serialized landing token', 'concurrency barrier'],
+                  summary='One integrator at a time.',
+                  anchors=['docs/DESIGN.md#merge-slots'],
+                  code=['coordination.py::merge_acquire'],
+                  tests=['tests/test_coordination.py'],
+                  tags=['coordination'], revision=3, expected_sha256=self.sha(2, 'merge.slot')),
+            'alice', self.native, self.project)
+        self.batch([self.item('merge.slot', 3)], operation_id='accept-many-aliases')
+        after = self.read('find', 'how do I acquire a merge slot')['candidates'][0]
+        self.assertEqual(after['key'], 'merge.slot')
+        self.assertEqual(after['score'], before['score'])
+
+    def test_stop_word_only_questions_and_stop_word_overlap_return_no_candidates(self):
+        self.propose(operation_id='cap-stop', key='misc.stopwords', name='General note',
+                     aliases=[], summary='How we can do this for every case in the project.', tags=[])
+        for query in ('how do I do it', 'what is in the', 'where should they be', 'why are we here'):
+            with self.subTest(query=query):
+                result = self.read('find', query)
+                self.assertFalse(result['found'])
+                self.assertEqual(result['candidates'], [])
+        # Adversarial: shares only stop words ("how", "can", "we", "do", "this", "for") with
+        # misc.stopwords plus an unmatched content word ("xylophone").
+        adversarial = self.read('find', 'how can we do this for xylophone')
+        self.assertFalse(adversarial['found'])
+        self.assertEqual(adversarial['candidates'], [])
+        # Review B1: domain words ("get", "work") and stop-word identity fields are preserved.
+        self.propose(operation_id='cap-get-work', key='work.get-item', name='Get work',
+                     aliases=['fetch queue item'], summary='Return the next work item.', tags=['work'])
+        self.propose(operation_id='cap-before-after', key='before.after', name='Before after',
+                     aliases=[], summary='Compare snapshots.', tags=['diff'])
+        self.assertTrue(self.read('find', 'get work')['found'])
+        for phrase in ('getting work', 'get the work', 'how do I get work'):
+            with self.subTest(phrase=phrase):
+                near = self.read('find', phrase)
+                self.assertEqual(near['candidates'][0]['key'], 'work.get-item')
+        stop_id = self.read('find', 'before or after')
+        self.assertEqual(stop_id['candidates'][0]['key'], 'before.after')
+
+    def test_find_is_deterministic_and_enforces_candidate_floor(self):
+        self.propose(operation_id='cap-tie-a', key='tie.alpha', name='Verify token badge',
+                     aliases=[], summary='Validate session token badge.', tags=['auth'])
+        self.propose(operation_id='cap-tie-b', key='tie.beta', name='Verify token check',
+                     aliases=[], summary='Validate session token check.', tags=['auth'])
+        self.batch([self.item('tie.alpha'), self.item('tie.beta')], operation_id='accept-ties')
+        first = self.read('find', 'how do we verify the session token')
+        for _ in range(3):
+            again = self.read('find', 'how do we verify the session token')
+            self.assertEqual(again['candidates'], first['candidates'])
+        self.native.rows.reverse()
+        try:
+            reversed_out = self.read('find', 'how do we verify the session token')
+        finally:
+            self.native.rows.reverse()
+        self.assertEqual(reversed_out['candidates'], first['candidates'])
+        self.assertEqual(
+            [row['key'] for row in first['candidates'][:2]],
+            ['tie.alpha', 'tie.beta'])
+        # Candidate floor (0.25): a 7-content-word query matching only 1 word in context returns [].
+        weak = self.read('find', 'snapshot alpha2 beta2 gamma2 delta2 epsilon2 zeta2')
+        self.assertFalse(weak['found'])
+        self.assertEqual(weak['candidates'], [])
+
+    def test_short_and_stuffed_aliases_cannot_outrank_primary_key_and_name_match(self):
+        # Review S1 & identity-best-single-part: every identity part (key, name, each alias)
+        # is scored as its own BM25 document normalized by its own length, and a record's
+        # identity score is the BEST SINGLE PART (no summing across parts).
+        self.propose(operation_id='cap-spam-one', key='spam.one', name='Spam one',
+                     aliases=['first helper'], summary='merge slot ' * 5, tags=['coordination'])
+        self.propose(operation_id='cap-spam-two', key='spam.two', name='Spam two',
+                     aliases=['merge', 'slot', 'merge slot thing', 'slot merge', 'slots'],
+                     summary='Unrelated helper.', tags=['coordination'])
+        # 1. When spam.two is a contributor draft:
+        draft_res = self.read('find', 'how do I take the merge slot')
+        draft_scores = {row['key']: row['score'] for row in draft_res['candidates']}
+        self.assertEqual(
+            [row['key'] for row in draft_res['candidates'][:3]],
+            ['merge.slot', 'spam.two', 'spam.one'])
+        self.assertGreater(draft_scores['merge.slot'], draft_scores['spam.two'])
+        self.assertGreater(draft_scores['spam.two'], draft_scores['spam.one'])
+        # 2. When both spam.one and spam.two are accepted:
+        self.batch([self.item('spam.one'), self.item('spam.two')], operation_id='accept-spam')
+        accepted_res = self.read('find', 'how do I take the merge slot')
+        accepted_scores = {row['key']: row['score'] for row in accepted_res['candidates']}
+        self.assertEqual(
+            [row['key'] for row in accepted_res['candidates'][:3]],
+            ['merge.slot', 'spam.two', 'spam.one'])
+        self.assertGreater(accepted_scores['merge.slot'], accepted_scores['spam.two'])
+        self.assertGreater(accepted_scores['spam.two'], accepted_scores['spam.one'])
+        # 3. Clean 3-record catalog where merge.slot's summary does NOT contain "merge" or "slot":
+        #    (a) 5 stuffed aliases (including 2-word 'slot merge') -> merge.slot (0.800) ties spam.two (0.800)
+        #        and wins by tie-break (accepted before draft, then key); any summing mutant gives
+        #        spam.two > 0.800 and fails.
+        #    (b) 1-word and 3-word stuffed aliases ['merge', 'slot', 'merge slot thing', 'slots'] ->
+        #        merge.slot (0.800) > spam.two (0.664) > spam.one (0.400); summing mutant fails.
+        #    (c) 1-word aliases ['merge', 'slot', 'slots'] -> many 1-word aliases cannot add up to beat
+        #        a 2-word match: merge.slot (0.800) > spam.one (0.400) == spam.two (0.400), ordered
+        #        ['merge.slot', 'spam.one', 'spam.two']; any summing/union mutant gives spam.two >= 0.800 and fails.
+        for idx, (alias_list, expected_order, strictly_greater) in enumerate((
+            (['merge', 'slot', 'merge slot thing', 'slot merge', 'slots'],
+             ['merge.slot', 'spam.two', 'spam.one'], False),
+            (['merge', 'slot', 'merge slot thing', 'slots'],
+             ['merge.slot', 'spam.two', 'spam.one'], True),
+            (['merge', 'slot', 'slots'],
+             ['merge.slot', 'spam.one', 'spam.two'], True),
+        )):
+            temp = tempfile.TemporaryDirectory()
+            self.addCleanup(temp.cleanup)
+            self.project = Path(temp.name)
+            self.native = CapabilityNative()
+            self.propose(operation_id='s1-merge-%d' % idx, key='merge.slot', name='Merge slot',
+                         aliases=['integration lock'], summary='One integrator at a time.',
+                         tags=['coordination'])
+            self.propose(operation_id='s1-s1-%d' % idx, key='spam.one', name='Spam one',
+                         aliases=[], summary='merge slot ' * 5, tags=['coordination'])
+            self.propose(operation_id='s1-s2-%d' % idx, key='spam.two', name='Spam two',
+                         aliases=alias_list, summary='Unrelated.', tags=['coordination'])
+            # Check draft tie-breaking (accepted before draft) before accepting spam.two:
+            self.batch([self.item('merge.slot'), self.item('spam.one')],
+                       operation_id='s1-accept-honest-%d' % idx)
+            draft_check = self.read('find', 'how do I take the merge slot')
+            self.assertEqual([row['key'] for row in draft_check['candidates']], expected_order)
+            # Check accepted tie-breaking (by key):
+            self.batch([self.item('spam.two')], operation_id='s1-accept-spam-%d' % idx)
+            res = self.read('find', 'how do I take the merge slot')
+            scores = {row['key']: row['score'] for row in res['candidates']}
+            self.assertEqual([row['key'] for row in res['candidates']], expected_order)
+            self.assertGreaterEqual(scores['merge.slot'], scores['spam.two'])
+            self.assertGreater(scores['merge.slot'], scores['spam.one'])
+            if strictly_greater:
+                self.assertGreater(scores['merge.slot'], scores['spam.two'])
+
+    def test_honest_aliases_not_diluted_by_alias_count_up_to_eight_aliases(self):
+        # Follow-up review N1 (s1-alias-dilution & identity-best-single-part): adding 1..8 honest
+        # aliases (ALIASES_SHOWN = 8) must never dilute any single alias, and the 8th alias
+        # ("release gate") must beat a partial primary hit ("worker.gate").
+        honest_aliases = [
+            'integration lock',
+            'single integrator',
+            'serial merge',
+            'merge queue',
+            'landing slot',
+            'merge token',
+            'integrator turn',
+            'release gate',
+        ]
+        scores_please = {}
+        scores_take = {}
+        for n in range(1, len(honest_aliases) + 1):
+            temp = tempfile.TemporaryDirectory()
+            self.addCleanup(temp.cleanup)
+            self.project = Path(temp.name)
+            self.native = CapabilityNative()
+            self.propose(operation_id='n1-merge-%d' % n, key='merge.slot', name='Merge slot',
+                         aliases=honest_aliases[:n], summary='Coordinate serial integration.',
+                         tags=['coordination'])
+            self.propose(operation_id='n1-review-%d' % n, key='review.flow', name='Review flow',
+                         aliases=[], summary='Review contributions.', tags=['review'])
+            self.propose(operation_id='n1-gate-%d' % n, key='worker.gate', name='Worker gate',
+                         aliases=[], summary='Check worker plan before work.', tags=['worker'])
+            self.batch([self.item('merge.slot'), self.item('review.flow'), self.item('worker.gate')],
+                       operation_id='n1-accept-%d' % n)
+            please = self.read('find', 'integration lock please')
+            self.assertFalse(please['found'])
+            self.assertEqual(please['candidates'][0]['key'], 'merge.slot')
+            scores_please[n] = please['candidates'][0]['score']
+            self.assertGreaterEqual(scores_please[n], 0.8)
+            take = self.read('find', 'how do I take the integration lock')
+            self.assertFalse(take['found'])
+            self.assertEqual(take['candidates'][0]['key'], 'merge.slot')
+            scores_take[n] = take['candidates'][0]['score']
+            self.assertGreaterEqual(scores_take[n], 0.65)
+        # Scores across n=1..8 must be identical (no alias-count dilution):
+        for n in range(2, len(honest_aliases) + 1):
+            self.assertEqual(scores_please[n], scores_please[1])
+            self.assertEqual(scores_take[n], scores_take[1])
+        # At n=8, "where is the release gate" finds merge.slot (via its 8th alias) first, ahead of worker.gate:
+        rel_gate = self.read('find', 'where is the release gate')
+        self.assertFalse(rel_gate['found'])
+        self.assertEqual(rel_gate['candidates'][0]['key'], 'merge.slot')
+        rel_scores = {row['key']: row['score'] for row in rel_gate['candidates']}
+        self.assertGreater(rel_scores['merge.slot'], rel_scores.get('worker.gate', 0.0))
+
+    def test_honest_aliases_sharing_a_word_stay_first_at_four_and_six_aliases(self):
+        # Follow-up review N1 (identity-best-single-part): honest aliases that share a word
+        # ("approval") must not dilute each other at n=1, 2, 3, 4, 6; review.flow must rank
+        # first ahead of a summary-only mention (export.thing) at every n.
+        approval_aliases = [
+            'code approval',
+            'approval request',
+            'approval flow',
+            'merge approval',
+            'approval vote',
+            'approval record',
+        ]
+        please_scores = {}
+        get_scores = {}
+        for n in (1, 2, 3, 4, 6):
+            temp = tempfile.TemporaryDirectory()
+            self.addCleanup(temp.cleanup)
+            self.project = Path(temp.name)
+            self.native = CapabilityNative()
+            self.propose(operation_id='app-review-%d' % n, key='review.flow', name='Review flow',
+                         aliases=approval_aliases[:n], summary='Coordinate review.',
+                         tags=['review'])
+            self.propose(operation_id='app-export-%d' % n, key='export.thing', name='Export thing',
+                         aliases=['snapshot'], summary='Needs approval before export.',
+                         tags=['export'])
+            self.propose(operation_id='app-gate-%d' % n, key='worker.gate', name='Worker gate',
+                         aliases=[], summary='Check worker plan before work.',
+                         tags=['worker'])
+            self.batch([self.item('review.flow'), self.item('export.thing'), self.item('worker.gate')],
+                       operation_id='app-accept-%d' % n)
+            please = self.read('find', 'approval please')
+            self.assertFalse(please['found'])
+            self.assertEqual(please['candidates'][0]['key'], 'review.flow')
+            p_map = {row['key']: row['score'] for row in please['candidates']}
+            self.assertGreater(p_map['review.flow'], p_map['export.thing'])
+            please_scores[n] = p_map['review.flow']
+
+            get_q = self.read('find', 'how do I get an approval')
+            self.assertFalse(get_q['found'])
+            self.assertEqual(get_q['candidates'][0]['key'], 'review.flow')
+            g_map = {row['key']: row['score'] for row in get_q['candidates']}
+            self.assertGreater(g_map['review.flow'], g_map['export.thing'])
+            get_scores[n] = g_map['review.flow']
+        for n in (2, 3, 4, 6):
+            self.assertEqual(please_scores[n], please_scores[1])
+            self.assertEqual(get_scores[n], get_scores[1])
+
+    def test_find_pins_normalize_score_cap_tf_cap_and_pending_alias_identity_indexing(self):
+        # 1. _normalize_score keeps BM25 < PENDING_ALIAS_LIFT (0.95) even when a record matches
+        # all query stems in both primary identity and context (raw / ideal > 1.0).
+        self.propose(operation_id='cap-norm', key='zeta.bm25-hit', name='Launch checking',
+                     aliases=['gate helper'], summary='Launch checking helper.', tags=['gate'])
+        self.batch([self.item('zeta.bm25-hit')], operation_id='accept-norm')
+        self.alias('worker.plan-gate', 'launch check')
+        norm_res = self.read('find', 'launch check')
+        norm_scores = {row['key']: row['score'] for row in norm_res['candidates']}
+        self.assertEqual(norm_res['candidates'][0]['key'], 'worker.plan-gate')
+        self.assertEqual(norm_scores['worker.plan-gate'], 0.95)
+        self.assertLess(norm_scores['zeta.bm25-hit'], 0.95)
+        self.assertGreater(norm_scores['worker.plan-gate'], norm_scores['zeta.bm25-hit'])
+        # 2. FIELD_TF_CAP (2): concise summary scores strictly higher than keyword-stuffed summary.
+        self.propose(operation_id='cap-tok-concise', key='auth.concise', name='Helper one',
+                     aliases=[], summary='Validate token.', tags=['auth'],
+                     anchors=['docs/a.md#a'], code=['a.py::f'], tests=['tests/test_a.py'])
+        self.propose(operation_id='cap-tok-stuffed', key='auth.stuffed', name='Helper two',
+                     aliases=[],
+                     summary='Validate ' + ('token ' * 12) + 'alpha beta gamma delta epsilon zeta eta theta iota kappa.',
+                     tags=['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta'],
+                     anchors=['docs/a.md#one', 'docs/b.md#two', 'docs/c.md#three', 'docs/d.md#four'],
+                     code=['pkg/a.py::one', 'pkg/b.py::two', 'pkg/c.py::three', 'pkg/d.py::four'],
+                     tests=['tests/test_a.py', 'tests/test_b.py', 'tests/test_c.py'])
+        self.batch([self.item('auth.concise'), self.item('auth.stuffed')], operation_id='accept-tok')
+        tok_res = self.read('find', 'token', '--limit', '10')
+        tok_scores = {row['key']: row['score'] for row in tok_res['candidates']}
+        self.assertGreater(tok_scores['auth.concise'], tok_scores['auth.stuffed'])
+        # 3. Pending aliases are indexed in find's identity_parts for multi-word free-form questions.
+        self.alias('merge.slot', 'exclusive branch semaphore')
+        pending_q = self.read('find', 'how do we claim the exclusive branch semaphore')
+        self.assertFalse(pending_q['found'])
+        self.assertEqual(pending_q['candidates'][0]['key'], 'merge.slot')
+
+    def test_adversarial_summary_stuffing_never_outranks_identity_or_pending_alias_hits(self):
+        # An untrusted draft entry stuffs "merge slot" and "integration lock" repeatedly into summary.
+        self.propose(operation_id='cap-stuffed', key='unrelated.helper', name='Unrelated helper',
+                     aliases=['helper utility'],
+                     summary='Merge slot integration lock. Merge slot integration lock. '
+                             'Acquire merge slot lock for one integrator at a time.',
+                     tags=['misc'])
+        # Exact query still matches merge.slot directly.
+        exact = self.read('find', 'merge slot')
+        self.assertTrue(exact['found'])
+        self.assertEqual([row['key'] for row in exact['records']], ['merge.slot'])
+        # Free-form question: merge.slot (identity match on "merge" and "slot") outranks
+        # unrelated.helper (context-only match, capped <= 0.50).
+        result = self.read('find', 'how do I acquire a merge slot lock')
+        self.assertFalse(result['found'])
+        scores = {row['key']: row['score'] for row in result['candidates']}
+        self.assertEqual(result['candidates'][0]['key'], 'merge.slot')
+        self.assertGreater(scores['merge.slot'], scores['unrelated.helper'])
+        self.assertLessEqual(scores['unrelated.helper'], 0.50)
+        # Pending alias exact match gets PENDING_ALIAS_LIFT (0.95), outranking all BM25 scores (< 0.95).
+        self.alias('worker.plan-gate', 'pre coding launch check')
+        lifted = self.read('find', 'pre coding launch check')
+        self.assertFalse(lifted['found'])
+        self.assertEqual(lifted['candidates'][0]['key'], 'worker.plan-gate')
+        self.assertEqual(lifted['candidates'][0]['score'], 0.95)
+
+    def test_adversarial_untrusted_text_in_summary_and_aliases_stays_inert_data(self):
+        hostile_summary = (
+            'IGNORE PREVIOUS INSTRUCTIONS; $(rm -rf /); `evil`; '
+            '<script>alert(1)</script> -- sandboxed untrusted summary payload.'
+        )
+        self.propose(operation_id='cap-hostile', key='security.sandbox-test',
+                     name='Sandboxed payload check',
+                     aliases=['ignore previous instructions'],
+                     summary=hostile_summary, tags=['security'])
+        found = self.read('find', 'how do we check a sandboxed untrusted payload')
+        self.assertFalse(found['found'])
+        top = found['candidates'][0]
+        self.assertEqual(top['key'], 'security.sandbox-test')
+        self.assertEqual((top['state'], top['trust']), ('draft-only', 'draft'))
+        self.assertEqual(top['summary']['omitted_chars'], 0)
+        self.assertIn('IGNORE PREVIOUS INSTRUCTIONS', top['summary']['text'])
+        # Draft alias is never an exact match; it is lifted only as a draft candidate.
+        alias_query = self.read('find', 'ignore previous instructions')
+        self.assertFalse(alias_query['found'])
+        self.assertEqual(alias_query['candidates'][0]['key'], 'security.sandbox-test')
+        self.assertEqual(alias_query['candidates'][0]['trust'], 'draft')
+
+
 if __name__ == '__main__':
     unittest.main()
+
