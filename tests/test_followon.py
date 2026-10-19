@@ -119,6 +119,37 @@ class FollowonValidationTests(unittest.TestCase):
             followon.request_payload({'schema_version': 1, 'operation': 'withdraw',
                                       'target': 'fo1', 'reason': 'r', 'targets': 'x'})
 
+    def test_the_recorded_text_limit_is_600_characters(self):
+        # The ceiling is a bound on the RECORDED text, not on the escaped display form
+        # (the module docstring says so). Exactly 600 is accepted at the request gate and
+        # in a journal payload; 601 is refused at both, and the display form of a plain
+        # 600-character text stays at 600.
+        self.assertEqual(followon.TEXT_LIMIT, 600)
+        at_limit = 'x' * 600
+        request = {'schema_version': 1, 'operation': 'record', 'task': TASK, 'text': at_limit}
+        self.assertEqual(followon.request_payload(dict(request))['text'], at_limit)
+        self.assertEqual(followon._payload(payload(text=at_limit))['text'], at_limit)
+        self.assertEqual(len(followon.view_text(at_limit)), 600)
+        too_long = 'x' * 601
+        with self.assertRaisesRegex(ValueError, 'limited to 600 characters'):
+            followon.request_payload(dict(request, text=too_long))
+        with self.assertRaisesRegex(ValueError, 'limited to 600 characters'):
+            followon._payload(payload(text=too_long))
+
+    def test_the_reserved_prefix_guard_refuses_a_raw_handback_record(self):
+        # The raw `comments add` transport may not plant the reserved body (kittrial-
+        # 5bb.343). This is the guard's own test: it fails if the prefix is dropped from
+        # RESERVED, independently of the web route's CAP_COORDINATE gate.
+        import reserved_comments
+        self.assertIsNotNone(reserved_comments.reserved_match(followon.body(payload())))
+        with self.assertRaisesRegex(ValueError, 'reserved assignee follow-on record write'):
+            reserved_comments.check_raw_request(
+                ['comments', 'add', TASK, followon.body(payload())], {}, actor='mallory/session9')
+        # Ordinary prose that merely mentions the kind remains valid.
+        reserved_comments.check_raw_request(
+            ['comments', 'add', TASK, 'A note about Kind: assignee-followon-v1\n'], {},
+            actor='mallory/session9')
+
     def test_every_refusal_says_nothing_was_written(self):
         for call in (lambda: followon.request_payload(None),
                      lambda: followon.request_payload({}),
@@ -130,6 +161,37 @@ class FollowonValidationTests(unittest.TestCase):
                     call()
                 self.assertTrue(str(refused.exception).endswith('Nothing was written.'),
                                 str(refused.exception))
+
+
+class FollowonWebAuthorityTests(unittest.TestCase):
+    """The web route's OWN coordinator gate, independent of the raw-prefix guard.
+
+    Removing the `assignee-followon` row from ``http_authority.BLOCK_CAPABILITIES`` (or
+    binding either operation to anything but ``CAP_COORDINATE``) makes these assertions
+    fail. The real-bd web test drives the same gate through a contributor's 403; this
+    one pins the table itself, so neither test substitutes for the other.
+    """
+
+    def test_the_web_action_needs_coordinate_for_both_operations(self):
+        from http_authority import BLOCK_CAPABILITIES, CAP_COORDINATE, required_capability
+        self.assertEqual(BLOCK_CAPABILITIES['assignee-followon'],
+                         {'record': CAP_COORDINATE, 'withdraw': CAP_COORDINATE})
+        for body in ({'schema_version': 1, 'operation': 'record', 'task': TASK, 'text': 'x'},
+                     {'schema_version': 1, 'operation': 'withdraw', 'task': TASK,
+                      'target': 'fo1', 'reason': 'r'}):
+            request = {'project': 'pp', 'action': 'assignee-followon',
+                       'args': [json.dumps(body)]}
+            self.assertEqual(required_capability(request), CAP_COORDINATE)
+
+    def test_an_unknown_operation_has_no_weaker_fallback_capability(self):
+        from http_authority import BLOCK_CAPABILITIES, required_capability
+        # No `None` entry and no default: an unlisted operation resolves to no
+        # capability at all, and the endpoint refuses it rather than choosing a
+        # weaker one.
+        self.assertIsNone(BLOCK_CAPABILITIES['assignee-followon'].get(None))
+        request = {'project': 'pp', 'action': 'assignee-followon',
+                   'args': [json.dumps({'schema_version': 1, 'operation': 'other'})]}
+        self.assertIsNone(required_capability(request))
 
 
 class FollowonJournalTests(unittest.TestCase):
@@ -155,11 +217,30 @@ class FollowonJournalTests(unittest.TestCase):
     def test_a_missing_or_symlinked_journal_trusts_nothing(self):
         self.assertEqual(followon.host_journal(self.project), ({}, []))
         self.assertEqual(followon.host_journal(None), ({}, []))
+        # The link points at a directory that HOLDS a valid-looking entry: a symlinked
+        # journal is refused by its own shape, not merely because its target is empty.
+        outside = Path(self.temp.name) / 'planted-journal'
+        outside.mkdir()
+        entry = followon.journal_entry(payload(), 'fo1', COORD, 0)
+        (outside / (entry['sha256'] + '.json')).write_text(json.dumps(entry), encoding='utf-8')
         try:
-            (self.project / followon.JOURNAL_DIR).symlink_to(self.temp.name, target_is_directory=True)
+            (self.project / followon.JOURNAL_DIR).symlink_to(outside, target_is_directory=True)
         except OSError as exc:
             self.skipTest('Symlink privilege unavailable: ' + str(exc))
         self.assertEqual(followon.host_journal(self.project), ({}, []))
+        # And the record it would prove stays inert: fail-closed, never honoured.
+        result = followon.evaluate(issue([record_comment()]), review(), scopes(), project=self.project)
+        self.assertFalse(result['applies'])
+        self.assertEqual(result['block']['state'], 'ignored')
+
+    def test_the_planted_entry_is_valid_so_only_the_symlink_refuses_it(self):
+        # Proof the previous test is about the link, not a malformed entry: the same
+        # bytes in a REAL journal directory are honoured.
+        entry = followon.journal_entry(payload(), 'fo1', COORD, 0)
+        followon.publish(self.project, entry)
+        result = followon.evaluate(issue([record_comment()]), review(), scopes(), project=self.project)
+        self.assertTrue(result['applies'])
+        self.assertEqual(result['block']['id'], 'fo1')
 
     def test_an_invalid_entry_is_reported_without_failing_the_read(self):
         value = payload()
@@ -369,6 +450,48 @@ class FollowonMoveTests(unittest.TestCase):
 
 class FollowonBackupRestoreTests(unittest.TestCase):
     """The journal round-trips through admin backup/restore (coordinator addition 2)."""
+
+    #: The fixed coordination-sidecar whitelist of the kit BEFORE this change (admin.py
+    #: at 120ef93, the base of this revision). `.assignee-followons/` is deliberately
+    #: absent: its `validate_coordination_files` raises exactly
+    #: ``Invalid coordination backup path`` for it, so its `restore-new` refuses the
+    #: whole backup before writing anything. Frozen here because the older kit is not a
+    #: runnable checkout in CI; the sentence below is the one it emits.
+    PREVIOUS_KIT_NAMES = frozenset({
+        '.merge-context.json', 'ONBOARDING.md', 'GUIDANCE.md', '.guidance.json',
+        '.guidance-clear.json', '.sessions.json', '.feedback.jsonl',
+        '.requirements-governance.json', '.requirements-governance-source.json',
+        '.lifecycle-voids-manifest.json', '.web-lifecycle-marks-manifest.json',
+        '.lifecycle-void-abandons.json'})
+    PREVIOUS_KIT_JOURNALS = (
+        '.coordination-requests', '.handoffs', '.handoff-requests', '.handoff-recoveries',
+        '.requirement-requests', '.requirement-owner-requests', '.requirement-backfills',
+        '.integration-reverts', '.lifecycle-voids', '.web-lifecycle-marks',
+        '.reference-requests', '.proposal-requests', '.capability-requests',
+        '.open-item-requests', '.owner-answers')
+
+    def _previous_kit_refusal(self, name):
+        """The pre-followon kit's sidecar-path decision: None, or its exact refusal."""
+        import re
+        journal = isinstance(name, str) and re.fullmatch(
+            r'(?:' + '|'.join(re.escape(entry) for entry in self.PREVIOUS_KIT_JOURNALS)
+            + r')/[a-f0-9]{64}\.json', name)
+        if name in self.PREVIOUS_KIT_NAMES or journal:
+            return None
+        raise ValueError('Invalid coordination backup path')
+
+    def test_an_older_kit_refuses_a_backup_holding_the_journal(self):
+        entry = followon.journal_entry(payload(), 'fo1', COORD, 0)
+        name = followon.JOURNAL_DIR + '/' + entry['sha256'] + '.json'
+        # This kit validates and accepts the same sidecar entry ...
+        import admin
+        admin.validate_coordination_files({name: entry})
+        # ... while the pre-followon kit refuses the whole sidecar with ITS sentence,
+        # before writing anything. That is the rollback limit OPERATIONS.md documents.
+        with self.assertRaisesRegex(ValueError, '^Invalid coordination backup path$'):
+            self._previous_kit_refusal(name)
+        # Positive control: a path that kit knows passes, so the refusal is the journal.
+        self.assertIsNone(self._previous_kit_refusal('.sessions.json'))
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

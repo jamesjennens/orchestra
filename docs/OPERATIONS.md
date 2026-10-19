@@ -333,6 +333,29 @@ with the capable kit and restore procedure. Older readers ignore marks, so they
 cannot recognize marked integrations as acceptable later bases. Perform recovery
 with the mark-capable kit and honor the renamed-destination warning above.
 
+### Assignee hand-backs: restore and rollback
+
+`admin.py backup` collects `<project>/.assignee-followons/` with the rest of the
+coordination sidecar and `restore-new` validates and restores it, so a restored
+project still honours an open hand-back. The journal is OUTSIDE the tracker: a
+backup taken by an older kit while the deployment is rolled back silently omits
+it, and every recorded hand-back then reads inert (the `.336` coordinator move
+stands) until it is re-recorded.
+
+**An older kit refuses to restore a backup that holds `.assignee-followons/`.**
+Its fixed coordination-sidecar path whitelist does not know the journal, so its
+`restore-new` fails for the whole project with
+`ValueError: Invalid coordination backup path` and leaves nothing behind.
+`--without-coordination` does not get around it: the older kit reads the sidecar
+as usable and refuses that flag, and the same path validation still fails. To restore
+such a backup into an older kit, either **restore with this kit or a newer one**
+(`admin.py` from a checkout is enough: it can restore while the deployment still
+serves the older kit), or **remove `.assignee-followons/` from a COPY of the
+backup** first and restore that copy — the hand-backs are then absent (inert),
+not silently half-applied. Before rolling back, take and retain a complete
+backup with this kit; after rolling forward, restore that sidecar or re-record
+the hand-backs.
+
 ## Install on Linux
 
 Use an ordinary service account with a writable home, Python 3.10+, user systemd, and HTTPS access to GitHub release assets. Copy this kit to `/home/beads/beads-team-kit` in this example. Each deployment needs its own root, port and service name. Installation refuses unmanaged binaries or an existing service with the same name.

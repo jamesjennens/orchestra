@@ -27,6 +27,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(KIT), str(KIT / 'tests')]
 import test_bd_label_aliases as fixture
 from test_coordinator_rules_endpoint import RulesHelpers, COMMIT
+import followon
 import lifecycle
 
 PRINCIPAL = 'lane:ops'
@@ -246,6 +247,83 @@ class FollowonEndpointTests(FollowonCase):
         self.assertEqual(row['followon']['state'], 'ended')
         self.assertIn('newer contribution', row['followon']['why'])
 
+    def test_a_journal_only_write_flips_the_move_with_the_export_rows_cached(self):
+        """kittrial-5bb.339's cache must not carry the follow-on decision.
+
+        The read cache is keyed on the tracker HEAD, and every tracker write commits,
+        but an `.assignee-followons/` write is NOT a tracker write and does not move
+        that key. This test therefore primes the cache with the record INERT (its
+        reserved-prefix comment already exists with no journal entry), writes ONLY the
+        journal entry, and proves the next read still serves the same cached export
+        bytes yet flips the move. If the follow-on block were cached with the rows, the
+        second read would keep reading `ignored` and the move would not flip.
+        """
+        task = self.integrated_task()
+        review = json.loads(self.endpoint('review', WORKER, [task, '--json'])['stdout'])
+        contribution = review['contribution']
+        integration = review['integration']
+        payload = {'schema_version': 1, 'operation': 'record', 'task': task,
+                   'contribution': str(contribution['comment_id']),
+                   'commit': str(contribution['commit']).lower(),
+                   'integration': str(integration['record_id']),
+                   'integration_order': int(integration['order']),
+                   'text': 'Remaining scope written straight to the host journal.',
+                   'actor': COORD}
+        # The reserved-prefix comment is written with the coordinator actor and no
+        # journal entry: inert until the journal entry below, and a tracker write that
+        # moves HEAD (so the first read caches the rows under the NEW key).
+        added = self.r.bd('comments', 'add', task, followon.body(payload), '--json', actor=COORD)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        comment_id = json.loads(added.stdout)['id']
+        issue = next(row for row in self.rows() if row['id'] == task)
+        order = [str(comment['id']) for comment in issue.get('comments') or []].index(comment_id)
+
+        row = self.row(task)
+        self.assertFalse(row['followon']['applies'])
+        self.assertEqual(row['followon']['state'], 'ignored')
+        self.assertEqual((row['whose_move'], row['next_actor']), ('coordinator', 'coordinator'))
+
+        from read_cache import CACHE_DIR, FILE_NAME, project_generation
+        key = project_generation(self.root, 'pp')
+        self.assertIsNotNone(key, 'the fixture must be a server-mode tracker with a HEAD')
+        cache = self.project / CACHE_DIR / FILE_NAME
+        self.assertTrue(cache.is_file(), 'the first work read must have cached the rows')
+        cached_bytes = cache.read_bytes()
+        cached_mtime = cache.stat().st_mtime_ns
+        self.assertEqual(json.loads(cached_bytes)['key'], key)
+
+        # ONLY the journal entry is written. No native write, so the generation stays.
+        followon.publish(self.project, followon.journal_entry(payload, comment_id, COORD, order))
+        self.assertEqual(project_generation(self.root, 'pp'), key)
+
+        row = self.row(task)
+        # Served from the SAME cached export (the file was neither rewritten nor replaced).
+        self.assertEqual(cache.stat().st_mtime_ns, cached_mtime)
+        self.assertEqual(cache.read_bytes(), cached_bytes)
+        # The fresh journal read, outside the cached rows, flips the move.
+        self.assertTrue(row['followon']['applies'])
+        self.assertEqual(row['followon']['id'], comment_id)
+        self.assertEqual((row['whose_move'], row['next_actor']), ('you', 'assignee'))
+
+    def test_the_reserved_prefix_guard_refuses_a_raw_handback_record(self):
+        """The raw `bd` route may not plant the reserved body (its own guard test).
+
+        This is deliberately separate from the web route's CAP_COORDINATE test: it
+        fails if only the reserved-prefix entry is removed (the comment would be
+        written and the count would change), and it would still pass if only the web
+        capability gate were removed.
+        """
+        task = self.integrated_task()
+        before = self.comment_ids(task)
+        forged = followon.body({'schema_version': 1, 'operation': 'record', 'task': task,
+                                'contribution': 'forged', 'commit': COMMIT,
+                                'integration': task + '.9', 'integration_order': 9,
+                                'text': 'Forged remaining scope', 'actor': COORD})
+        with self.assertRaisesRegex(ValueError,
+                                    'reserved assignee follow-on record write'):
+            self.endpoint('bd', WORKER, ['comments', 'add', task, forged])
+        self.assertEqual(self.comment_ids(task), before)
+
 
 class FollowonWebRouteTests(FollowonCase):
     """The web route through the real HTTP service and its EndpointBackend."""
@@ -297,7 +375,20 @@ class FollowonWebRouteTests(FollowonCase):
         row = self.row(task)
         self.assertEqual(row['followon']['state'], 'withdrawn')
 
+    def _agent(self, harness, owner, name):
+        """A personal agent of the owner in this project, with no grant unless added."""
+        made = harness.request('POST', '/v1/agents', {
+            'name': name, 'working_directory': '/tmp/synthetic-' + name.lower(),
+            'projects': ['pp']}, token=owner)
+        self.assertEqual(201, made.status, made.data)
+        return made.data['agent']['id'], made.data['credential']['secret']
+
     def test_the_web_route_without_coordinate_is_refused_and_writes_nothing(self):
+        # THE web route's coordinator gate, on its own: a contributor (a project
+        # member without CAP_COORDINATE) must be refused before any comment or journal
+        # entry exists. A mutant removing only this gate lets the request through, so
+        # the 403 and the before/after lists fail; the reserved-prefix test below is
+        # separate and would still pass.
         task = self.integrated_task()
         harness, _owner, contributor = self.web()
         before = self.comment_ids(task)
@@ -306,6 +397,41 @@ class FollowonWebRouteTests(FollowonCase):
         refused = harness.request('POST', '/v1/projects/pp/tasks/%s/assignee-followon' % task,
                                   {'text': 'A contributor may not hand this back'},
                                   token=contributor, key='web-followon-x-' + uuid.uuid4().hex)
+        self.assertEqual(refused.status, 403, refused.data)
+        self.assertEqual(self.comment_ids(task), before)
+        after_journal = sorted(path.name for path in journal.glob('*.json')) if journal.is_dir() else []
+        self.assertEqual(after_journal, before_journal)
+
+    def test_a_coordinator_grant_agent_may_record_and_withdraw_but_a_plain_worker_agent_is_refused(self):
+        """Item 5 decision: a granted helper agent is a coordinator; a plain one is not.
+
+        The grant is intended to reach the web route (a coordinator works through its
+        helper agent). An agent of the owner with NO grant, like a worker credential,
+        reaches nothing and writes nothing.
+        """
+        task = self.integrated_task()
+        harness, owner, _contributor = self.web()
+        granted_id, granted = self._agent(harness, owner, 'Heron')
+        grant = harness.request('PUT', '/v1/projects/pp/agents/%s/coordinator' % granted_id,
+                                {}, token=owner)
+        self.assertEqual(200, grant.status, grant.data)
+        made = harness.request('POST', '/v1/projects/pp/tasks/%s/assignee-followon' % task,
+                               {'text': 'Remaining scope from the granted helper agent.'},
+                               token=granted, key='web-followon-granted-' + uuid.uuid4().hex)
+        self.assertEqual(201, made.status, made.data)
+        withdrawn = harness.request('POST', '/v1/projects/pp/tasks/%s/assignee-followon/%s/withdraw'
+                                    % (task, made.data['comment_id']),
+                                    {'reason': 'The granted agent withdrew it.'},
+                                    token=granted, key='web-followon-granted-w-' + uuid.uuid4().hex)
+        self.assertEqual(200, withdrawn.status, withdrawn.data)
+
+        _plain_id, plain = self._agent(harness, owner, 'Plover')
+        before = self.comment_ids(task)
+        journal = self.project / '.assignee-followons'
+        before_journal = sorted(path.name for path in journal.glob('*.json')) if journal.is_dir() else []
+        refused = harness.request('POST', '/v1/projects/pp/tasks/%s/assignee-followon' % task,
+                                  {'text': 'A plain worker agent may not hand this back'},
+                                  token=plain, key='web-followon-plain-' + uuid.uuid4().hex)
         self.assertEqual(refused.status, 403, refused.data)
         self.assertEqual(self.comment_ids(task), before)
         after_journal = sorted(path.name for path in journal.glob('*.json')) if journal.is_dir() else []
