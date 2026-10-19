@@ -2,6 +2,7 @@
 import json
 import errno
 import itertools
+import os
 import subprocess
 import unittest
 import uuid
@@ -64,6 +65,33 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
                                                  args=[target, '--json']))
         self.assertEqual(brief['returncode'], 0, brief)
 
+    def _raw_matrix_orders(self, permitted, forbidden):
+        """Orders that cover the whole input space of the staged-conversion refusal.
+
+        kittrial-5bb.344: the guard's answer is a function of the row's CURRENT field
+        set, not of the path that produced it, so the old 120-permutation matrix spent
+        ~2500 native bd processes (~27 minutes) revisiting the same 32 reachable states.
+        This drives every reachable set of permitted fields and then every forbidden
+        field (so each forbidden write is refused in every state), plus every ORDER of
+        the permitted writes (3! for a task, 2! for an event), which is the order
+        sensitivity the test exists for. Set ORCHESTRA_RAW_MATRIX=full to run the
+        exhaustive permutation matrix instead.
+        """
+        orders, seen = [], set()
+        for size in range(len(permitted) + 1):
+            for subset in itertools.combinations(permitted, size):
+                order = list(subset) + list(forbidden)
+                key = tuple(name for name, _ in order)
+                if key not in seen:
+                    seen.add(key)
+                    orders.append(order)
+        for order in itertools.permutations(permitted):
+            key = tuple(name for name, _ in order)
+            if key not in seen:
+                seen.add(key)
+                orders.append(list(order))
+        return orders
+
     def test_every_staged_conversion_order_without_scoped_parent(self):
         parent = self.target()
         self.assertFalse(next(r for r in self.export_rows() if r['id']==parent).get('labels'))
@@ -71,15 +99,23 @@ class NativeLifecycleTests(fixture.RealBdLabelAliasTests):
                   ('description', ['--description=Set reviewed to passed']),
                   ('type', ['--type=event']), ('parent', ['--parent', parent]),
                   ('labels', ['--add-label=reviewed:passed'])]
-        # Every permutation is attempted one scalar write at a time. Each refusal
-        # gets its own export equality and native-writer trace assertion.
+        # Every reachable field state is attempted with every forbidden write, and every
+        # native bd write is still one scalar write at a time with its own export equality
+        # and native-writer trace assertion (kittrial-5bb.344; see _raw_matrix_orders).
+        full = os.environ.get('ORCHESTRA_RAW_MATRIX') == 'full'
         for initial_type in ('event', 'task'):
-            for order in itertools.permutations(fields):
+            def forbidden(name, initial_type=initial_type):
+                return (name=='labels' or (initial_type=='event' and name in ('title', 'description'))
+                        or (initial_type=='task' and name=='type'))
+            permitted = [field for field in fields if not forbidden(field[0])]
+            refusable = [field for field in fields if forbidden(field[0])]
+            orders = (itertools.permutations(fields) if full
+                      else self._raw_matrix_orders(permitted, refusable))
+            for order in orders:
                 event = json.loads(self.bd('create', 'ordinary staged row', '-t'+initial_type, '--json').stdout)['id']
                 for name, flags in order:
                     with self.subTest(initial_type=initial_type, order=[x[0] for x in order], step=name):
-                        forbidden = name=='labels' or (initial_type=='event' and name in ('title', 'description')) or (initial_type=='task' and name=='type')
-                        if forbidden:
+                        if forbidden(name):
                             self.no_write(['update', event, *flags, '--json'])
                         else:
                             answer = self.raw(['update', event, *flags, '--json'])
