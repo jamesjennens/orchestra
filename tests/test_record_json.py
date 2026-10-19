@@ -308,8 +308,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # crashing the copy out of the guard.
             'admin.py': 9,
             # kittrial-5bb.339: read_cache parses the kit's own cached export rows
-            # through the guard (corrupt = a miss and a fresh export).
-            'read_cache.py': 1,
+            # through the guard (corrupt = a miss and a fresh export). The second
+            # (kittrial-5bb.346 r2/r4) is the cache file's HEADER line, read by both
+            # the serving parse and the waiter's header-only compare: a planted or
+            # deeply nested header reads as no header, never a traceback.
+            'read_cache.py': 2,
             # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.

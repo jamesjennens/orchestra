@@ -19,8 +19,9 @@ is a HEADER LINE then the export's own bytes verbatim: nothing is re-serialised
 on a refresh, and the key compare reads the header alone, so a miss with a stale
 file present pays neither the container parse nor the re-dump that made the
 first read after a write slower than the kit before the cache. The header carries
-the payload's length, and a reader refuses a file whose payload does not match
-it - a torn file is never served as fewer rows. A ``.read-cache`` that is a
+the payload's length and its sha256, and a reader refuses a file whose payload
+matches neither - a torn file is never served as fewer rows, and a power loss
+that leaves a right-length block of zeros is never served at all. A ``.read-cache`` that is a
 symlink or not a directory is refused, and the file is opened with ``O_NOFOLLOW``
 (review S1). Everything unexpected - no Dolt server coordinates, an unreadable
 key, a file this kit cannot read - answers TODAY's behaviour: a fresh export,
@@ -43,6 +44,7 @@ commits, including with bd's auto-commit off and through the endpoint; the kit's
 only working-set-over-SQL writer, ``DOLT_BACKUP('restore')``, replaces the
 database and follows its HEAD.
 """
+import errno
 import json
 import os
 import re
@@ -174,6 +176,12 @@ def _cached_rows(cache, key):
         return None
     if not isinstance(head.get('bytes'), int) or head['bytes'] != len(payload):
         return None                       # torn or foreign: fall back, never serve
+    digest = head.get('sha256')
+    if not isinstance(digest, str):
+        return None
+    import hashlib
+    if digest != hashlib.sha256(payload).hexdigest():
+        return None                       # zero-filled or flipped: never serve it
     return record_json.loads_rows(payload.decode('utf-8', 'replace'))
 
 
@@ -183,13 +191,17 @@ def _raw_payload(text, key):
     Nothing is re-serialised - the bytes bd printed are the payload, so a 58-66 MB
     refresh writes a byte copy instead of a json.dumps of the parsed rows (the
     serialize stage the .339 container form paid on every miss). The header
-    carries the length of the payload that follows: the reader refuses a file
-    whose payload is shorter (a torn file a dropped fsync can leave), so
-    truncation can never be served as fewer rows. Rows the export prints one per
-    line need no special form any more - the payload IS one row per line."""
-    header = json.dumps({'format': FORMAT, 'key': key,
-                         'bytes': len(text.encode('utf-8'))})
-    return header.encode('utf-8') + b'\n' + text.encode('utf-8')
+    carries the length and the sha256 of the payload that follows: the reader
+    refuses a file whose payload is shorter (a torn file a dropped fsync can
+    leave) or whose digest differs (the same power loss can leave a right-length
+    block of zeros), so truncation and zero-fill can never be served as rows.
+    Rows the export prints one per line need no special form any more - the
+    payload IS one row per line."""
+    payload = text.encode('utf-8')
+    import hashlib
+    header = json.dumps({'format': FORMAT, 'key': key, 'bytes': len(payload),
+                         'sha256': hashlib.sha256(payload).hexdigest()})
+    return header.encode('utf-8') + b'\n' + payload
 
 
 def _write_one_file(cache, payload):
@@ -239,11 +251,14 @@ def _refresh_lock(cache):
     coordinates PROCESSES, not just threads: a web page's concurrent reads are
     concurrent endpoint processes, and every caller opens the directory itself,
     so two calls in one process conflict exactly like two endpoints. Returns
-    (fd, 'held'), (None, 'busy') when another reader is refreshing this project
-    right now, or (None, 'posix') on a kit without POSIX locks, where the write
-    falls back to today's behaviour (every miss refreshes, each still one file
-    and one rename). An unreadable directory is answered 'busy': standing down
-    from the cache is the fail-open answer everywhere else here too."""
+    (fd, 'held'); (None, 'busy') ONLY when flock says the lock is held
+    (EWOULDBLOCK/EAGAIN - nothing else: review B2 of .346 r3, where every error
+    read as busy made a filesystem without flock wait the whole 45 s per miss,
+    past the endpoint's timeout); (None, 'posix') when locking is unavailable -
+    no fcntl, ENOLCK - and the read refreshes without waiting, exactly as a
+    Windows kit does; or (None, 'refuse') when the directory cannot even be
+    opened (a symlink won the race, permissions): no cache for this read at all.
+    """
     try:
         import fcntl
     except ImportError:
@@ -252,54 +267,110 @@ def _refresh_lock(cache):
         fd = os.open(str(cache), os.O_RDONLY | os.O_CLOEXEC
                      | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0))
     except OSError:
-        return None, 'busy'
+        return None, 'refuse'
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as error:
         os.close(fd)
-        return None, 'busy'
+        if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None, 'busy'           # ONLY the held-lock answer means wait
+        return None, 'posix'              # ENOLCK, EINVAL: no locking here
     return fd, 'held'
+
+
+def _header_key(cache):
+    """The key named in the file's header line, or ``None`` - the HEADER ONLY.
+
+    A waiter that has just acquired the lock answers with a compare that must
+    not read (let alone parse) the whole payload: on a 66 MB payload that is the
+    difference between five waiters parsing one at a time under the lock and
+    five parsing in parallel after it (review S of .346 r3, where the queue made
+    five concurrent reads SLOWER than the kit before the cache). The header is
+    one short line by construction; a first chunk without a newline in it is not
+    this format's file and answers ``None``."""
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+    try:
+        descriptor = os.open(str(cache / FILE_NAME), flags)
+    except OSError:
+        return None
+    try:
+        chunk = os.read(descriptor, 4096)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    if b'\n' not in chunk:
+        return None
+    import record_json
+    try:
+        head = record_json.loads(chunk.partition(b'\n')[0].decode('utf-8', 'replace'))
+    except ValueError:
+        return None
+    if not isinstance(head, dict):
+        return None
+    if head.get('format') != FORMAT:           # a foreign format never serves,
+        return None                            # not even as a waiter's fast path
+    key = head.get('key')
+    return key if isinstance(key, str) else None
+
+
+def _full_refresh(cache, key, run):
+    """Export, parse and write the raw payload - the CALLER holds the lock (or
+    there is none to hold). A failed write still answers the fresh rows."""
+    import record_json
+    text = run(['export', '--all'])
+    rows = record_json.loads_rows(text)
+    try:
+        _write_one_file(cache, _raw_payload(text, key))
+    except OSError:
+        pass        # the cache is an optimization, never a requirement
+    return rows
 
 
 def _refresh(cache, key, run):
     """Refresh under the directory lock, or wait briefly for the one in flight.
 
     This is the whole of kittrial-5bb.346's second half. The lock is held
-    across the ENTIRE refresh - export, parse, serialize, write - because the
-    export is the part worth sharing: five concurrent misses for one tracker
+    across the ENTIRE refresh - export, parse, payload build, write - because
+    the export is the part worth sharing: five concurrent misses for one tracker
     are five endpoint processes the export server would run one at a time, so
     the first miss to take the lock exports once and the others poll until it
-    lands, then serve what it wrote. A poll that acquires re-checks the cache
-    before exporting (the refresh it waited out may have been for another key,
-    or may have failed); a wait that runs out answers from the caller's own
-    export and writes nothing, so a wedged refresher is waited out and never
-    queued behind. A kit without POSIX locks (no fcntl) keeps today's
-    behaviour: every miss refreshes, each write still one file, one rename.
+    lands, then serve what it wrote. A poll that acquires re-checks only the
+    file's HEADER before exporting (the refresh it waited out may have been for
+    another key, or may have failed) and releases the lock BEFORE the payload is
+    parsed, so waiters parse in parallel instead of one at a time under the lock
+    (review S of .346 r3, where that queue made five concurrent reads slower
+    than the kit before the cache). A header that names our key but does not
+    serve it - torn, zero-filled, a foreign format - forces the refresh, which
+    is also what repairs such a file. A wait that runs out answers from the
+    caller's own export and writes nothing. A kit without POSIX locks (no
+    fcntl, ENOLCK) keeps today's behaviour: every miss refreshes, each write
+    still one file, one rename.
     """
     import time
     deadline = time.monotonic() + _REFRESH_WAIT_SECONDS
+    force = False
     while True:
         fd, state = _refresh_lock(cache)
-        if fd is None and state == 'busy':
-            if time.monotonic() >= deadline:
-                return None                     # waited out: caller exports, no write
-            time.sleep(_REFRESH_POLL_SECONDS)
-            continue
+        if fd is None:
+            if state == 'refuse':
+                return None                     # the directory cannot be opened
+            if state == 'busy':
+                if time.monotonic() >= deadline:
+                    return None                 # waited out: caller exports, no write
+                time.sleep(_REFRESH_POLL_SECONDS)
+                continue
+            # 'posix': no locking here - refresh without waiting (Windows shape)
         try:
-            served = _cached_rows(cache, key)   # the waited-out refresh landed
-            if served is not None:
-                return served
-            import record_json
-            text = run(['export', '--all'])
-            rows = record_json.loads_rows(text)
-            try:
-                _write_one_file(cache, _raw_payload(text, key))
-            except OSError:
-                pass        # the cache is an optimization, never a requirement
-            return rows
+            if force or _header_key(cache) != key:
+                return _full_refresh(cache, key, run)   # under the lock
         finally:
             if fd is not None:
                 os.close(fd)
+        served = _cached_rows(cache, key)       # OUTSIDE the lock: waiters parse
+        if served is not None:                  # in parallel, not one at a time
+            return served
+        force = True    # names our key but does not serve it: repair it now
 
 
 def cached_export_rows(root, path, run, name=None):
