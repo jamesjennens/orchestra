@@ -65,6 +65,12 @@ class FindTests(LookupCase):
         self.assertEqual(item['title'], {'text': 'Office server check', 'omitted_chars': 0})
         self.assertIn('accepted by an operator', item['authority_note'])
         self.assertNotIn('score', item)
+        self.propose(**attested(operation_id='cookie-op', key='session.cookie',
+                                title='Session cookie movie series', statement='Cookie policy.'))
+        for phrase in ('session cookies', 'cookies movies', 'movie series'):
+            with self.subTest(phrase=phrase):
+                matched = self.find(phrase)
+                self.assertEqual((matched['found'], matched['records'][0]['key']), (True, 'session.cookie'))
 
     def test_a_phrase_that_names_two_entries_lists_the_accepted_one_first(self):
         result = self.find('office server')
