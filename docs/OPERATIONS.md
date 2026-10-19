@@ -1086,6 +1086,8 @@ owner.
 
 ## Operator commands
 
+**The read cache behind `work` and `wait` (kittrial-5bb.339).** A `work` or `wait` read on a project with Dolt server coordinates serves the previously parsed export from `.read-cache/` under the project when the tracker's HEAD hash has not moved, and re-exports when it has: one file holding the format version, the key and the rows, replaced by a single rename, mode 0600. Every kit write commits, so a write is visible to the next read by construction. The generation key is the COMMITTED HEAD: a change made outside the kit by direct SQL - an operator's `UPDATE` without a commit - does not move it and is not seen until the next kit write commits it (the kit's own working-set-over-SQL writer, `DOLT_BACKUP('restore')`, replaces the database and follows its HEAD).
+
 A few coordination actions are host shell commands rather than contributor-client
 actions. Run them as the service account on the coordination host; the client and
 the endpoint do not expose them, and a worker or agent lane must not be asked to

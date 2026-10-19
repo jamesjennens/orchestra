@@ -518,10 +518,10 @@ def trusted_payloads(rows,events=None):
     return trusted
 
 
-def project_facts(rows):
-    events=events_by_dimension(rows)
+def project_facts(rows,events=None):
+    if events is None:events=events_by_dimension(rows)
     trusted=trusted_payloads(rows,events)
-    history={entry['id']:entry['scopes'] for entry in scoped_evidence(rows,('deployed',LIVE))}
+    history={entry['id']:entry['scopes'] for entry in scoped_evidence(rows,('deployed',LIVE),events=events)}
     result=[]
     for row in rows:
         if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
@@ -601,7 +601,7 @@ def untrusted_reason(dim,labels,found,scope_trusted,orders):
     return None
 
 
-def scoped_evidence(rows,dimensions=('integrated',)):
+def scoped_evidence(rows,dimensions=('integrated',),events=None):
     """Per-scope trusted values for the named dimensions, newest scope first.
 
     ``project_facts`` reports only the newest scope and treats older evidence as
@@ -620,7 +620,7 @@ def scoped_evidence(rows,dimensions=('integrated',)):
     token is kept, so a recurring token cannot resurrect an older position.
     """
     dims=tuple(dimensions)
-    events=events_by_dimension(rows)
+    if events is None:events=events_by_dimension(rows)
     result=[]
     for row in rows:
         if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
@@ -757,7 +757,7 @@ def environment_liveness(scopes,environment):
     return (newest[1],newest[2]) if newest is not None else (None,None)
 
 
-def integration_evidence(rows):
+def integration_evidence(rows,events=None):
     """Per-scope ``integrated`` evidence, newest recorded scope first.
 
     Thin wrapper over ``scoped_evidence`` so every existing reader keeps exactly
@@ -765,7 +765,7 @@ def integration_evidence(rows):
     as integrated when ANY scope whose ``source_commit`` equals its full commit
     records ``integrated=passed``, regardless of scope order.
     """
-    return scoped_evidence(rows,('integrated',))
+    return scoped_evidence(rows,('integrated',),events=events)
 
 
 def evidence_owed(rows):

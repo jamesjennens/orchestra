@@ -2816,6 +2816,21 @@ class CanonicalReadCostCase(EndpointCase):
         self.assertIn(created, [t['id'] for t in fresh['items']])
         self.assertEqual(['bd', 'work'], self.backend.calls)
 
+    def test_a_work_read_without_dolt_coordinates_never_builds_a_read_cache(self):
+        # kittrial-5bb.339: the export cache is keyed by the tracker's dolt commit;
+        # the canonical stub has no server coordinates, so the read fails OPEN (a
+        # fresh export every time, exactly as before) and no cache directory is
+        # created under the project.
+        import shutil
+        alex, project = self.setup_project()
+        for index in range(2):
+            self.create_task(alex, project, 'task %d' % index)
+        self.backend.calls = []
+        work = self.request('GET', '/v1/me/work', token=alex)
+        self.assertEqual(200, work.status, work.data)
+        cache = self.canonical_root / 'projects' / project / '.read-cache'
+        self.assertFalse(cache.exists(), 'no read cache for a project without dolt coordinates')
+
     def test_my_work_and_prompts_fill_ids_waits_and_blocked_from_the_brief(self):
         alex, project = self.setup_project()
         admin = self.admin_token()
