@@ -1453,7 +1453,7 @@ def queue_order(item):
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
                integration_warnings=None, attention=None, recommended_by=None, contribution_author=None,
-               claimable=None):
+               claimable=None, followon=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -1490,6 +1490,10 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             # the request-changes record ids, and the latest checkpoint's open items,
             # time and whether anything is newer. None where the backend does not say.
             'attention': attention,
+            # Additive (kittrial-5bb.343): the newest recorded hand-back block from the
+            # canonical `work` row, so a web queue row says why the move is the
+            # assignee's (or why an inert record does not move it).
+            'followon': followon,
             # Additive (kittrial-5bb.115): reviewers who recommend approving the current
             # contribution while nobody has decided. Never an approval.
             'recommended': bool(recommended_by),
@@ -1606,6 +1610,10 @@ class EndpointBackend:
     ROUTES = InProcessBackend.ROUTES + (
         'tasks.assign', 'tasks.release', 'merge-slot.acquire',
         'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create',
+        # The coordinator's recorded hand-back (kittrial-5bb.343). Both operations run
+        # the one canonical `assignee-followon` action, which calls the same library
+        # function as `coordinator followon`.
+        'followons.record', 'followons.withdraw',
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
         'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
@@ -2339,6 +2347,19 @@ class EndpointBackend:
                       if key in payload}
             fields.update(operation=operation, task=payload['task_id'])
             return 'web-lifecycle', project_id, [json.dumps(fields)], {}
+        if route.startswith('followons.'):
+            # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
+            # `assignee-followon` action derives every record fact under the project
+            # lock, so only the operation, the caller's text/reason and the route's
+            # own task/target travel.
+            operation = route.split('.', 1)[1]
+            body = {'operation': operation, 'task': payload['task_id']}
+            if operation == 'record':
+                body['text'] = payload['text']
+            else:
+                body['target'] = payload['target']
+                body['reason'] = payload['reason']
+            return 'assignee-followon', project_id, [json.dumps(body, ensure_ascii=False)], {}
         if route.startswith('merge-slot.'):
 
             operation = route.split('.', 1)[1]
@@ -2834,6 +2855,10 @@ class EndpointBackend:
                 'id': current.get('comment_id'), 'commit': current.get('commit'),
                 'revision': (review.get('prior_contributions_total') or 0) + 1,
                 'at': current.get('timestamp')}
+        # The coordinator's recorded hand-back (kittrial-5bb.343) travels with the
+        # brief's review projection; My work merges it onto the queue row.
+        if isinstance(data.get('followon'), dict):
+            detail['followon'] = data['followon']
         return detail
 
     def task_brief(self, project_id, task_id):
@@ -3447,7 +3472,9 @@ class EndpointBackend:
                                         contribution_author=row.get('contribution_author')
                                         if isinstance(row.get('contribution_author'), str) else None,
                                         claimable=row.get('claimable')
-                                        if isinstance(row.get('claimable'), bool) else None))
+                                        if isinstance(row.get('claimable'), bool) else None,
+                                        followon=row.get('followon')
+                                        if isinstance(row.get('followon'), dict) else None))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -5707,6 +5734,63 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'merge-slot.' + operation, ctx.params['pid'], write,
                             capability=capability, serialize=False, canonical=True,
                             audit_success=False, replay_check=replay_check)
+
+    def _followon_write(self, ctx, operation):
+        """Record or withdraw the coordinator's hand-back (kittrial-5bb.343).
+
+        Both routes take the SAME ``CAP_COORDINATE`` gate as every other coordinator
+        write and both call the canonical `assignee-followon` action, which runs the
+        one library function the confined coordinator command runs. The record's
+        authority is its host journal entry, so a plain comment posted by any other
+        route stays inert even if it carries the reserved prefix.
+
+        ``record`` takes exactly ``text``; ``withdraw`` takes exactly ``reason`` and
+        names the follow-on in the path. The server derives the contribution, the
+        integration record it cites and the native order under the project lock; the
+        caller never supplies those.
+        """
+        pid = ctx.params['pid']
+        if operation == 'record':
+            route_name = 'followons.record'
+            fields = ('text',)
+            status = 201
+            where = 'A hand-back'
+        else:
+            route_name = 'followons.withdraw'
+            fields = ('reason',)
+            status = 200
+            where = 'A hand-back withdrawal'
+        if not hasattr(self.backend, 'ROUTES') or route_name not in self.backend.ROUTES:
+            raise not_implemented('Recording a hand-back is unavailable on this server')
+        self._project(ctx, CAP_COORDINATE)
+
+        def write():
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request '
+                              'after an uncertain outcome')
+            payload = dict(ctx.payload or {})
+            refuse_unknown_fields(payload, fields, where)
+            if set(payload) != set(fields):
+                raise invalid('Supply exactly ' + ', '.join(fields))
+            body = {'task_id': ctx.params['tid'], fields[0]: payload[fields[0]]}
+            if operation == 'withdraw':
+                body['target'] = ctx.params['fid']
+            result = self.backend.invoke(route_name, ctx.principal, pid, body,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_COORDINATE)
+            return result, result
+        return self._mutate(ctx, route_name, pid, write, capability=CAP_COORDINATE,
+                            status=status, serialize=False, canonical=True)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID
+                  + r')/assignee-followon')
+    def task_followon_record(self, ctx):
+        return self._followon_write(ctx, 'record')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID
+                  + r')/assignee-followon/(?P<fid>' + ID + r')/withdraw')
+    def task_followon_withdraw(self, ctx):
+        return self._followon_write(ctx, 'withdraw')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/merge-slot/acquire')
     def merge_slot_acquire(self, ctx):

@@ -833,7 +833,7 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle',
-                      'host-coordination','host-projects','assignment-roster','task-assign','task-release')
+                      'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -921,7 +921,7 @@ def key_principal_refusal(request,path,key_principal):
 #: deliberately absent (James's answer to question 5, 2026-10-07).
 COORDINATOR_COMMANDS=('guidance-set','guidance-clear','guidance-status','reference-apply',
                       'capability-apply','capability-verify','proposal-review','proposal-decide',
-                      'handoff','set-onboarding')
+                      'handoff','set-onboarding','followon')
 #: The coordinator commands that only read (no journal, no server time; the read takes the
 #: project's coordination lock, exactly as the host command does).
 COORDINATOR_READS=('guidance-status',)
@@ -1129,7 +1129,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','task-assign','assignment-roster','task-release'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','assignee-followon','task-assign','assignment-roster','task-release'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1780,6 +1780,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             elif command=='handoff':
                 from handoff import execute as handoff_execute
                 result=handoff_execute(path,actor,payload,runner,operator=True)
+            elif command=='followon':
+                # The confined coordinator's recorded hand-back (kittrial-5bb.343). The
+                # operator gate above has already run; this is the SAME library call the
+                # web action makes, so the two authority gates cannot drift apart. The
+                # library derives the contribution, integration evidence and native order
+                # under this lock and writes the native comment plus its host journal entry.
+                import followon
+                result=followon.apply(payload,actor,runner,path,operators=operators)
             elif command=='reference-apply':
                 import reference_records
                 if isinstance(payload,dict) and 'items' in payload:
@@ -2161,6 +2169,43 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     'merge_slot_status':409,'refused':'coordinator-rule'}
         except SlotError as error:
             return {'returncode':2,'stdout':'','stderr':str(error)+'\n','merge_slot_status':error.status}
+    if action=='assignee-followon':
+        # The web route's recorded hand-back (kittrial-5bb.343). It runs through the same
+        # live-authority boundary every canonical web write uses, and then calls the SAME
+        # library function as `coordinator followon`, so the two gates cannot drift apart.
+        import followon
+        args=request.get('args',[])
+        run_warnings=[]
+        def followon_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(followon_run, project=path)
+        if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+            raise ValueError('Expected one hand-back JSON payload. Nothing was written.')
+        try:
+            body=record_json.loads(args[0])
+        except ValueError:
+            raise ValueError('The hand-back payload is not valid JSON; supply one JSON object. '
+                             'Nothing was written.') from None
+        if not isinstance(body,dict):
+            raise ValueError('The hand-back payload must be a JSON object. Nothing was written.')
+        capability=required_capability(request)
+        if capability is None:
+            raise ValueError('This hand-back operation has no endpoint capability binding. '
+                             'Nothing was written.')
+        def followon_authority():
+            if not verified_web_authority(request,authority_config,capability,name):
+                raise ValueError('Verified web authority required for this hand-back in this '
+                                 'project. Nothing was written.')
+        def followon_effect():
+            result=followon.apply(body,actor,runner,path,operators=configured_operators(root))
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                    'stderr':warning_text(run_warnings)}
+        with held_coordination_lock(path):
+            return guarded_write(root,request,journal_path(path),followon_effect,
+                                 authority_config=authority_config,require_authority=True,
+                                 runner=runner,identity_check=followon_authority)
     if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')

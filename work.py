@@ -241,7 +241,7 @@ def move_subject(caller, owner=None):
 
 
 def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                 way_back=None):
+                 way_back=None, followon=None, checkpoint_available=True):
     """`(whose_move, next)`: the caller-relative half of the one whose-move decision.
 
     Derived only from the review state the
@@ -251,6 +251,13 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
     for it here: a reconciliation row's move stays its review state's move and
     ``next_actor`` comes from the same decision (review item 2/6 removed the branch
     that could never be taken).
+
+    ``followon`` is an APPLYING hand-back block (kittrial-5bb.343). It is the one
+    exception to the integrated task being the coordinator's move: an open,
+    host-journaled hand-back makes the move the assignee's and quotes the recorded
+    text as ``next``, escaped once. ``checkpoint_available`` is whether this
+    installation can write the disposition that ends it, so the sentence never
+    offers a command that would be refused.
 
     ``way_back`` is how the sentence tells the caller to read the review state. It
     defaults to the client command ``review TASK``; the HTTP next-actions answer passes
@@ -270,6 +277,9 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
         return 'you', 'This is your review: read %s and record your decision.' % back
     if not owned:
         return 'unknown', UNKNOWN_MOVE_TEXT
+    if isinstance(followon, dict) and followon.get('applies'):
+        from followon import next_text
+        return 'you', next_text(followon, checkpoint_available=checkpoint_available)
     if state == 'changes-requested':
         if redelivered:
             # A revision that supersedes the one the items were filed on is already
@@ -313,6 +323,9 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
         # them as its own.
         return 'coordinator', ('Nothing is for you to do: this contribution is integrated; '
                                'the coordinator closes the task or records what remains of it. '
+                               'A coordinator can record what remains as a hand-back that makes it '
+                               'the assignee\'s move (and shows here with its text); without a '
+                               'recorded hand-back this remains the coordinator\'s move. '
                                'Read %s; if scope you owe remains, say so in a checkpoint and the '
                                'coordinator records it.' % back)
     if state in (None, 'none'):
@@ -322,7 +335,8 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
 
 
 def move_decision(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                  assignee=None, closed=False, claimable=None, way_back=None):
+                  assignee=None, closed=False, claimable=None, way_back=None, followon=None,
+                  checkpoint_available=True):
     """THE one whose-move decision (kittrial-5bb.6 review item 2): `(move, next, next_actor)`.
 
     One function gives all three answers, so no reader can be told one mover by
@@ -339,6 +353,10 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
     that role needs; they are the same facts the shared projection passes, so a
     ``work`` row and the ``review`` read of the same task cannot disagree.
 
+    ``followon`` is an APPLYING hand-back block (kittrial-5bb.343); it is the ONE
+    branch that makes an integrated task the assignee's move, and it forces
+    ``next_actor`` to ``'assignee'`` from the same decision.
+
     ``way_back`` is the reference the sentence tells the caller to follow, passed through
     to :func:`_caller_move`; it changes no word of the decision (kittrial-5bb.253 review,
     item 4).
@@ -346,21 +364,26 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
     if not active_work('closed' if closed else 'open', state, pending_items):
         return ('unknown', 'This task is closed; its review and lifecycle records remain in history.',
                 next_actor(state, assignee, closed, pending_items=pending_items, claimable=claimable))
+    applied=isinstance(followon,dict) and followon.get('applies')
     move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered,
-                             way_back=way_back)
+                             way_back=way_back, followon=followon,
+                             checkpoint_available=checkpoint_available)
+    if applied:
+        return move, text, 'assignee'
     return move, text, next_actor(state, assignee, closed, pending_items=pending_items,
                                   claimable=claimable)
 
 
 def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                way_back=None):
+                way_back=None, followon=None, checkpoint_available=True):
     """`(whose_move, next)`: one plain sentence from the validated review state alone.
 
     The public two-answer shape (kittrial-5bb.249), unchanged. The decision it comes
     from is :func:`move_decision`, which yields ``next_actor`` as well.
     """
     move, text, _ = move_decision(state, task, owned, named_reviewer, pending_items, redelivered,
-                                  way_back=way_back)
+                                  way_back=way_back, followon=followon,
+                                  checkpoint_available=checkpoint_available)
     return move, text
 
 
@@ -762,7 +785,8 @@ def approval_wait(state, task, actor, assignee, author, independent_approval=Fal
 
 
 def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_reverts=None,
-             actor=None,independent_approval=False,owners=None):
+             actor=None,independent_approval=False,owners=None,followon=None,
+             provenance_writes=True):
     from review_state import project as reviewed
     result=reviewed(issue,scopes,operators,reverts,journal,invalid_reverts)
     # Additive (kittrial-5bb.115): the standing reviewer recommendations for the current
@@ -777,6 +801,18 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     result['waiting_for_approval']=approval_wait(result.get('review_state'),issue.get('id'),actor,
         issue.get('assignee'),(result.get('contribution') or {}).get('author'),
         independent_approval,owners,named)
+    # The coordinator's recorded hand-back (kittrial-5bb.343). ONE applicability
+    # function decides it, from the same projection and the task's lifecycle
+    # evidence; the block is additive and an applying one makes the shared
+    # next_actor the assignee's. A caller that already evaluated a whole page
+    # passes ``followon`` so the host journal is not re-read per task.
+    if followon is None and journal is not None:
+        import followon as followon_records
+        followon=followon_records.evaluate(issue,result,scopes or [],project=journal)
+    if isinstance(followon,dict) and followon.get('block') is not None:
+        result['followon']=followon['block']
+        if followon.get('applies'):
+            result['next_actor']='assignee'
     return result
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
@@ -859,6 +895,12 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         revert_map,revert_problems=reverts_by_task(rows,operators,journal)
     else:
         revert_map,revert_problems=reverts,{}
+    # The host follow-on journal (kittrial-5bb.343) is read ONCE for the whole page,
+    # exactly like the revert journal, and separately from the export rows: the
+    # journal lives outside the tracker, so a journal write does not move the export
+    # and this read is never served from a cache keyed on it.
+    import followon as followon_records
+    followon_host=followon_records.host_journal(journal) if journal is not None else ({},[])
     from reserved_comments import is_record_anchor
     from review_workflow import author_key
     from coordination import is_merge_slot
@@ -922,8 +964,23 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         task_reverts=revert_map.get(row['id'],[])
         task_scopes=evidence.get(row['id']) if scopes is None else scopes.get(row['id'])
         try:review=workflow(row,task_scopes,operators=operators,reverts=task_reverts,journal=journal,
-                            invalid_reverts=revert_problems.get(row['id']));state=review['review_state'];error=None
+                            invalid_reverts=revert_problems.get(row['id']),followon={},
+                            provenance_writes=provenance_writes);state=review['review_state'];error=None
         except ValueError as e:review={};state='error';error=str(e)[:300]
+        # The ONE applicability decision for this task (kittrial-5bb.343), from the
+        # review projection just made and the page's single fresh journal read. An
+        # applying hand-back makes the move the assignee's in the same shared review
+        # block the `review` read returns.
+        task_followon=None
+        if review and journal is not None:
+            try:
+                task_followon=followon_records.evaluate(row,review,task_scopes or [],host=followon_host)
+            except (ValueError,TypeError,KeyError):
+                task_followon=None
+            if task_followon and task_followon.get('block') is not None:
+                review=dict(review,followon=task_followon['block'])
+                if task_followon.get('applies'):
+                    review=dict(review,next_actor='assignee')
         # The state main decided the closed-row rule and `--state` on: the validated state
         # BEFORE the journal override (kittrial-5bb.6 review item 1). The override changes
         # what the row SHOWS; it never moves the row into another queue, and it never
@@ -1081,7 +1138,9 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         move,move_text,role=move_decision(state,row['id'],bool(subject) and actor_holds(row.get('assignee'), subject),
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
-                                          closed=row.get('status')=='closed',claimable=row_claimable)
+                                          closed=row.get('status')=='closed',claimable=row_claimable,
+                                          followon=task_followon.get('block') if task_followon else None,
+                                          checkpoint_available=provenance_writes)
         # A standing hold (or a failed attestation) is shown BESIDE the state the row
         # already reads (kittrial-5bb.10 item 7): a revision still awaiting review stays in
         # the reviewers' queue, and an author with open requested changes is told the
@@ -1105,6 +1164,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row_owner,'status':row.get('status'),'review_state':state,
                       **({'owner_name':owner_name} if owner_name and owner_name!=row_owner else {}),
                       'whose_move':move,'next':move_text,
+                      # Additive (kittrial-5bb.343): the newest recorded hand-back and
+                      # whether it applies, so a reader sees why an unjournalled or
+                      # ended record does not move the task. Present only when the
+                      # task carries a follow-on comment.
+                      **({'followon':task_followon['block']} if task_followon and task_followon.get('block') is not None else {}),
                       # Additive selection facts (kittrial-5bb.6), all from the one shared
                       # projection: the next-action ROLE (never the assignee field), the
                       # filterable work state, the reconciliation signal with its mismatching
@@ -1363,7 +1427,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         issue=task_row(rows,task)
         from review_state import scopes_for
         return workflow(issue,scopes_for(rows,task),operators=operators,journal=path,
-                        actor=actor,independent_approval=independent_approval,owners=owners)
+                        actor=actor,independent_approval=independent_approval,owners=owners,
+                        provenance_writes=provenance_writes)
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
     item=attachments.get(args[1].partition(':')[2],{})
     if not isinstance(item,dict) or item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')

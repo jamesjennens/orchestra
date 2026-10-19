@@ -724,10 +724,14 @@ def unresolved_directions(entries,direction_idx,owner,counted=True):
     outstanding direction that no reader could ever resolve.
     """
     if not counted:return []
+    import followon
     outstanding=[]
     for e in entries:
         if e['kind']!='comment' or e['author']==owner:continue
         if str(e.get('body','')).startswith(('Kind: task-checkpoint-v1','Kind: contribution-review-v1')):continue
+        # A follow-on WITHDRAWAL record is the coordinator's own "superseded"
+        # disposition of the direction, not a direction of its own (kittrial-5bb.343).
+        if followon.withdrawal_text(str(e.get('body',''))):continue
         d=direction_idx.get(e['entry_id'])
         if d is None or d['state'] not in RESOLUTION_STATES or d.get('digest')!=content_hash(e):
             outstanding.append(e)
@@ -889,7 +893,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     from review_state import RECONCILIATION_WARNING_PREFIX, is_integration_warning, scopes_for
     from guidance import brief_block
     review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal,
-                    actor=actor,independent_approval=independent_approval,owners=owners)
+                    actor=actor,independent_approval=independent_approval,owners=owners,
+                    provenance_writes=provenance_writes)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
     # answer is additive as `review.integration.matches_contribution`.
@@ -1047,6 +1052,18 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                       reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
                       reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None)
     brief_review.pop('reconciliation_needed',None)
+    # The coordinator's recorded hand-back (kittrial-5bb.343): the same additive
+    # block a work row carries. An APPLYING one is the assignee's move, so `next`
+    # quotes the recorded text once and the shared review block names the role.
+    followon_block=review.get('followon')
+    if followon_block is not None:
+        result_followon=followon_block
+    else:
+        result_followon=None
+    if isinstance(followon_block,dict) and followon_block.get('applies'):
+        import followon as followon_records
+        next_action=followon_records.next_text(followon_block,checkpoint_available=provenance_writes)
+        brief_review['next_actor']='assignee'
     # Avoid adding off-state bytes to compact long-chain briefs. The setting
     # is carried only when ON; absence means false, including older endpoints.
     if not brief_review.get('approval_requires_other_party'):
@@ -1064,6 +1081,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'next_action':next_action,
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
             'review':brief_review,
+            **({'followon':result_followon} if result_followon is not None else {}),
             'lifecycle_matches_contribution':matches_contribution,
             'deployed_delivery':deployed_delivery,
             'deployed_delivery_is_current_contribution':deployed_current,

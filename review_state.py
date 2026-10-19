@@ -303,9 +303,18 @@ def integration(contribution, scopes, reverts=None):
         value='unknown'
     removed=sorted({str((entry.get('scope') or {}).get('integration_commit'))
                     for entry in matching if is_reverted(entry)})
+    # The chosen record's native identity and recording order, additive
+    # (kittrial-5bb.343): the write gate that cites an integration record and the
+    # reader that re-verifies the citation compare the SAME native order. The order
+    # is the one the lifecycle evidence carries (the event's native sequence), and
+    # it is ``None`` when the evidence does not carry one, so nothing is guessed.
+    chosen_fact=(chosen or {}).get('integrated') or {}
     answer = {'fact':value,
             'scope':chosen.get('scope') if chosen else None,
             'scope_token':chosen.get('scope_token') if chosen else None,
+            'record_id':chosen_fact.get('event_id'),
+            'order':(chosen_fact.get('order')
+                     if type(chosen_fact.get('order')) is int else None),
             'newest_scope':newest.get('scope') if newest else None,
             'source_commit':scope.get('source_commit') or None,
             'integration_commit':scope.get('integration_commit') or None,
