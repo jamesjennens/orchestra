@@ -3,7 +3,7 @@ import argparse
 import json
 import record_json
 from claim_limit import actor_holds
-from lifecycle import integration_evidence, project_facts
+from lifecycle import events_by_dimension, integration_evidence, project_facts
 from review_state import RECONCILIATION_STATE, next_actor, active_work
 
 CONTRACT_VERSION = 'cli-contract-v1'
@@ -846,7 +846,13 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                 journal_requests.append(request)
             except (OSError,json.JSONDecodeError,ValueError) as exc:
                 journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
-    facts={r['id']:r for r in project_facts(rows)};evidence={r['id']:r['scopes'] for r in integration_evidence(rows)};items=[]
+    # kittrial-5bb.339: the classified-events walk is computed ONCE for the whole
+    # page and shared by every lifecycle reader (it was paid four times per read on
+    # jjbp: 2.1 s of the 4.5 s join).
+    page_events=events_by_dimension(rows)
+    facts={r['id']:r for r in project_facts(rows,events=page_events)}
+    evidence={r['id']:r['scopes'] for r in integration_evidence(rows,events=page_events)}
+    items=[]
     checkpoint_states={}
     from review_state import is_integration_warning, reverts_by_task
     if reverts is None:
@@ -1290,7 +1296,11 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         # Structured output is already JSON; accept the flag consistently with brief/show/work.
         args=[token for token in args if token!='--json']
     if action in ('work','wait'):
-        rows=record_json.loads_rows(run(['export','--all']))
+        # kittrial-5bb.339: the export rows come from the generation-keyed cache when
+        # the tracker has not committed since they were parsed (a write IS visible to
+        # the next read: every write commits, so the key moves and the cache misses).
+        from read_cache import cached_export_rows
+        rows=cached_export_rows(path.parent.parent, path, run)
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
         from lifecycle import host_snapshot

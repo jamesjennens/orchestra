@@ -1,0 +1,231 @@
+"""The generation-keyed export cache (kittrial-5bb.339).
+
+The rules these tests pin:
+- a read with an unchanged tracker generation is served from the cached parsed rows
+  (the export run is not repeated);
+- ANY write commits, so the generation moves, the cache misses and the write is
+  visible to the next read - the correctness the task demands, by construction;
+- the cache is ONE file (format, key and rows together) replaced by one rename:
+  interleaved refreshes can never leave older rows under the newer key (review B1);
+- the stored format version is part of what the reader compares, so a file written
+  by another format - an older kit's parse - is never served (review B2);
+- rows nested past the whole-text bound are stored one per line and still cache
+  (review S2); a symlinked .read-cache is refused, not followed (review S1);
+- the mode assertions run on POSIX only (review B3: Windows has no POSIX modes);
+- everything unexpected - no Dolt server coordinates, an unreadable key, a corrupt
+  or foreign file - fails OPEN to today's behaviour: a fresh export, nothing
+  cached, and a planted cache is never served when the key cannot be read (S4).
+"""
+import json
+import os
+import stat
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+KIT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(KIT))
+import read_cache
+
+
+def row(task='t-1', **more):
+    return dict({'id': task, 'issue_type': 'task', 'title': 'a task', 'status': 'open',
+                 'assignee': None, 'labels': [], 'comments': []}, **more)
+
+
+class FakeRun:
+    """A run() that answers exports from a list the test can change."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.exports = 0
+
+    def __call__(self, argv):
+        assert argv == ['export', '--all'], argv
+        self.exports += 1
+        return ''.join(json.dumps(item) + '\n' for item in self.rows)
+
+
+class ReadCacheTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.project = self.root / 'projects' / 'pp'
+        (self.project / '.beads').mkdir(parents=True)
+        (self.project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.cache = self.project / read_cache.CACHE_DIR
+
+    def cached_file(self):
+        return self.cache / read_cache.FILE_NAME
+
+    def serve(self, rows, key='a' * 32):
+        run = FakeRun(rows)
+        with mock.patch.object(read_cache, 'project_generation', return_value=key):
+            return read_cache.cached_export_rows(self.root, self.project, run), run
+
+    def test_an_unchanged_generation_serves_the_cached_rows_without_an_export(self):
+        first, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)
+        second, again = self.serve([row()])
+        self.assertEqual(again.exports, 0)              # served, no export
+        self.assertEqual(first, second)
+        self.assertTrue(self.cached_file().is_file())
+
+    def test_a_write_moves_the_generation_and_is_visible(self):
+        self.serve([row()], key='a' * 32)
+        visible, run = self.serve([row(), row('t-2')], key='b' * 32)   # the generation moved
+        self.assertEqual(run.exports, 1)                 # the cache missed, the export ran
+        self.assertEqual([item['id'] for item in visible], ['t-1', 't-2'])
+        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
+        self.assertEqual(stored['key'], 'b' * 32)
+
+    def test_interleaved_refreshes_never_leave_older_rows_under_the_newer_key(self):
+        # Review B1: with two files renamed apart, refreshes that interleaved left
+        # the OLDER rows under the NEWER key. The one-file form is atomic by its
+        # single rename; this probe forces the interleave anyway - a whole refresh
+        # of the OLDER state completes between this one's serialize and rename -
+        # and pins that whatever the file holds afterwards belongs to the key it
+        # names, and is what the next read of that key serves.
+        import threading
+        gate = threading.Event()
+        real_serialize = read_cache._serialize
+
+        def interleaving_serialize(rows, key):
+            payload = real_serialize(rows, key)
+            if key == 'b' * 32:
+                self.serve([row(title='R1-older')], key='a' * 32)
+                gate.set()
+            return payload
+
+        self.serve([row(title='R1')], key='a' * 32)
+        with mock.patch.object(read_cache, '_serialize', side_effect=interleaving_serialize):
+            self.serve([row(title='R2')], key='b' * 32)
+        self.assertTrue(gate.is_set())
+        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
+        title = stored['rows'][0]['title']
+        self.assertIn(title, ('R1', 'R1-older', 'R2'))
+        served, run = self.serve([row(title=title)], key=stored['key'])
+        self.assertEqual(run.exports, 0)
+        self.assertEqual(served[0]['title'], title)
+
+    def test_a_file_of_another_format_is_never_served(self):
+        # Review B2: rows parsed by an older kit (another FORMAT) fall back to a
+        # fresh export however valid the file looks and however right the key is.
+        self.serve([row()])
+        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
+        stored['format'] = read_cache.FORMAT - 1
+        stored['rows'] = [row(id='planted', title='FOREIGN')]
+        self.cached_file().write_text(json.dumps(stored), encoding='utf-8')
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)
+        self.assertEqual(served[0]['id'], 't-1')
+        self.assertEqual(json.loads(self.cached_file().read_text(encoding='utf-8'))['format'],
+                         read_cache.FORMAT)
+
+    def test_rows_nested_past_the_whole_text_bound_still_cache(self):
+        # Review S2: one 70-deep row used to disable the cache for good AND make
+        # every read pay a failed write. Such rows are stored one per line (the
+        # per-row bound is 750): the second read serves, and no export repeats.
+        nested = {}
+        for level in range(70):
+            nested = {'inner': nested}
+        deep = row()
+        deep['deep'] = nested
+        first, run = self.serve([deep])
+        self.assertEqual(run.exports, 1)
+        second, again = self.serve([deep])
+        self.assertEqual(again.exports, 0)              # served from the lines form
+        self.assertEqual(second[0]['id'], 't-1')
+        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
+        self.assertEqual(stored.get('kind'), 'lines')
+
+    def test_a_symlinked_cache_directory_is_refused_not_followed(self):
+        # Review S1: a symlink planted at .read-cache must not be written through
+        # or read through. The read still answers, from a fresh export.
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / read_cache.FILE_NAME).write_text(
+            json.dumps({'format': read_cache.FORMAT, 'key': 'a' * 32,
+                        'rows': [row(id='planted')]}), encoding='utf-8')
+        self.cache.symlink_to(outside, target_is_directory=True)
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)
+        self.assertEqual(served[0]['id'], 't-1')        # the planted rows were not served
+        self.assertEqual(sorted(item.name for item in outside.iterdir()),
+                         [read_cache.FILE_NAME])        # nothing new written through it
+
+    def test_the_cache_file_is_mode_0600(self):
+        self.serve([row()])
+        if os.name == 'nt':
+            self.skipTest('POSIX file modes')           # review B3
+        self.assertEqual(oct(stat.S_IMODE(self.cached_file().stat().st_mode)), '0o600')
+
+    def test_no_generation_answers_a_fresh_export_and_caches_nothing(self):
+        with mock.patch.object(read_cache, 'project_generation', return_value=None):
+            run = FakeRun([row()])
+            rows = read_cache.cached_export_rows(self.root, self.project, run)
+        self.assertEqual([item['id'] for item in rows], ['t-1'])
+        self.assertEqual(run.exports, 1)
+        self.assertFalse(self.cache.exists())
+
+    def test_a_planted_cache_is_not_served_when_the_key_cannot_be_read(self):
+        # Review S4 mutant no-generation-serves-cache: the cache exists and holds
+        # the right key, but the generation cannot be read at all - the read must
+        # still fail open to a fresh export, never serve the planted rows.
+        self.serve([row()], key='a' * 32)
+        with mock.patch.object(read_cache, 'project_generation', return_value=None):
+            run = FakeRun([row(id='fresh')])
+            rows = read_cache.cached_export_rows(self.root, self.project, run)
+        self.assertEqual(run.exports, 1)
+        self.assertEqual([item['id'] for item in rows], ['fresh'])
+
+    def test_a_corrupt_cache_file_fails_open_to_a_fresh_export(self):
+        self.serve([row()])
+        self.cached_file().write_text('{not json', encoding='utf-8')
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)
+        self.assertEqual([item['id'] for item in served], ['t-1'])
+
+    def test_each_call_returns_a_freshly_parsed_list(self):
+        self.serve([row()])
+        with mock.patch.object(read_cache, 'project_generation', return_value='a' * 32):
+            one = read_cache.cached_export_rows(self.root, self.project, FakeRun([row()]))
+            two = read_cache.cached_export_rows(self.root, self.project, FakeRun([row()]))
+        self.assertIsNot(one, two)
+        one.append(row('mutated'))
+        self.assertEqual(len(two), 1)
+
+    def test_the_generation_asks_hashof_head(self):
+        # Review S4 mutant oldest-commit: the query must ask the working tree's
+        # CURRENT commit (HASHOF('HEAD')), not a dated log's newest entry.
+        import admin
+        payload = ('127.0.0.1', '49001', 'root', 'pp')
+        answer = "HASHOF('HEAD')\nta8i9934pcmteeh2009obujblqija6sp\n"
+        with mock.patch.object(admin, 'project_server_metadata', return_value=payload), \
+                mock.patch.object(admin, 'sql', return_value=answer) as sql:
+            key = read_cache.project_generation(self.root, 'pp')
+        self.assertEqual(key, 'ta8i9934pcmteeh2009obujblqija6sp')
+        self.assertIn("SELECT HASHOF('HEAD')", sql.call_args[0][1])
+
+    def test_a_generation_that_cannot_be_read_is_none(self):
+        import admin
+        with mock.patch.object(admin, 'project_server_metadata', side_effect=ValueError):
+            self.assertIsNone(read_cache.project_generation(self.root, 'pp'))
+        with mock.patch.object(admin, 'project_server_metadata', return_value=None):
+            self.assertIsNone(read_cache.project_generation(self.root, 'pp'))
+        with mock.patch.object(admin, 'project_server_metadata',
+                               return_value=('h', 1, 'root', 'not a db!')):
+            self.assertIsNone(read_cache.project_generation(self.root, 'pp'))
+        metadata = ('127.0.0.1', 49001, 'root', 'pp')
+        with mock.patch.object(admin, 'project_server_metadata', return_value=metadata):
+            with mock.patch.object(admin, 'sql', side_effect=OSError):
+                self.assertIsNone(read_cache.project_generation(self.root, 'pp'))
+            with mock.patch.object(admin, 'sql', return_value="HASHOF('HEAD')\nnot-a-hash"):
+                self.assertIsNone(read_cache.project_generation(self.root, 'pp'))
+
+
+if __name__ == '__main__':
+    unittest.main()
