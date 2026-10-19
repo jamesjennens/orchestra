@@ -342,6 +342,10 @@ class FollowonMoveTests(unittest.TestCase):
     def test_move_decision_makes_an_applying_handback_the_assignees_move(self):
         move, text, role = work.move_decision('integrated', TASK, True, assignee=WORKER)
         self.assertEqual((move, role), ('coordinator', 'coordinator'))
+        # The .336 sentence stays the answer with no applying record, and deliberately
+        # mentions that the coordinator can now record a hand-back (kittrial-5bb.343).
+        self.assertIn('records what remains', text)
+        self.assertIn('hand-back', text)
         block = followon.evaluate(issue([record_comment()]), review(), scopes(),
                                   project=Path(self.temp.name))['block']
         move, text, role = work.move_decision('integrated', TASK, True, assignee=WORKER, followon=block)
