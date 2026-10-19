@@ -5,6 +5,7 @@ served from it, a native write moves the generation and the next read sees the
 write (the correctness the task demands), and the cache files are mode 0600.
 """
 import json
+import os
 import stat
 import sys
 import time
@@ -67,41 +68,41 @@ class ReadCacheRealBdTests(unittest.TestCase):
         answer, exports = self.work_read()
         self.assertEqual(answer['returncode'], 0, answer)
         self.assertEqual(exports['exports'], 1)
-        self.assertTrue((cache / read_cache.ROWS_NAME).is_file())
-        self.assertEqual(stat.S_IMODE((cache / read_cache.ROWS_NAME).stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE((cache / read_cache.KEY_NAME).stat().st_mode), 0o600)
-        key_after_first = (cache / read_cache.KEY_NAME).read_text(encoding='utf-8').strip()
+        stored_file = cache / read_cache.FILE_NAME
+        self.assertTrue(stored_file.is_file())
+        if os.name != 'nt':                               # review B3: POSIX file modes
+            self.assertEqual(stat.S_IMODE(stored_file.stat().st_mode), 0o600)
+        container = json.loads(stored_file.read_text(encoding='utf-8'))
+        self.assertEqual(container['format'], read_cache.FORMAT)
+        key_after_first = container['key']
 
         # Second read with no write between: served from the cache, no export.
         answer, exports = self.work_read()
         self.assertEqual(exports['exports'], 0)
         page = json.loads(answer['stdout'])
         self.assertIn(task, [item['task'] for item in page['items']])
-        self.assertEqual((cache / read_cache.KEY_NAME).read_text(encoding='utf-8').strip(),
+        self.assertEqual(json.loads(stored_file.read_text(encoding='utf-8'))['key'],
                          key_after_first)
 
-        # A native write: the generation moves, the cache misses, the write shows.
-        written = self.fixture.bd('comments', 'add', task, 'write probe kittrial-5bb.339')
+        # A native write that the WORK ANSWER itself shows: the task's title changes,
+        # so a stale cache would answer with the old one (review S4: assert on the
+        # answer, not on a side export).
+        written = self.fixture.bd('update', task, '--title=Write probe kittrial-5bb.339',
+                                  '--json')
         self.assertEqual(written.returncode, 0, written.stderr)
         answer, exports = self.work_read()
         self.assertEqual(exports['exports'], 1)            # the cache missed
-        key_after_write = (cache / read_cache.KEY_NAME).read_text(encoding='utf-8').strip()
+        page = json.loads(answer['stdout'])
+        item = next(entry for entry in page['items'] if entry['task'] == task)
+        self.assertEqual(item['title'], 'Write probe kittrial-5bb.339')
+        key_after_write = json.loads(stored_file.read_text(encoding='utf-8'))['key']
         self.assertNotEqual(key_after_write, key_after_first)
-        # The write IS in the rows the next read is answered from.
-        import record_json
-        import subprocess
-        import admin
-        env = admin.environment(self.root)
-        raw = subprocess.run([str(self.root / 'bin' / 'bd'), '--directory', str(self.project),
-                              '--sandbox', '--actor', 'op', 'export', '--all'],
-                             capture_output=True, text=True, cwd=str(self.project), env=env).stdout
-        rows = record_json.loads_rows(raw)
-        stored = next(item for item in rows if item['id'] == task)
-        self.assertTrue(any('write probe kittrial-5bb.339' in (comment.get('text') or '')
-                            for comment in stored.get('comments') or []))
-        # And the read after THAT is cached again.
+        # And the read after THAT is cached again, still answering the new title.
         answer, exports = self.work_read()
         self.assertEqual(exports['exports'], 0)
+        page = json.loads(answer['stdout'])
+        item = next(entry for entry in page['items'] if entry['task'] == task)
+        self.assertEqual(item['title'], 'Write probe kittrial-5bb.339')
 
 
 if __name__ == '__main__':
