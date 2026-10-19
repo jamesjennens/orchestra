@@ -231,23 +231,54 @@ class ReadCacheTests(unittest.TestCase):
         self.assertEqual(len(two), 1)
 
 
-    def test_format_rises_when_the_parse_it_guards_changes(self):
-        # kittrial-5bb.345 item 3: FORMAT is a manual constant; this fails when
-        # the parse the cached rows went through changes while FORMAT stays - the
-        # change that would serve an older kit's parse to a newer reader. Any
-        # edit to loads_rows/loads_row/_make_malformed_row must raise FORMAT.
+    @staticmethod
+    def live_parse_digest():
+        """The digest of the parse the cached rows went through, computed live.
+
+        The same three functions read_cache.FORMAT_DIGEST was recorded from:
+        record_json.loads_rows, loads_row and _make_malformed_row (the
+        malformed-row schema is in the third). The digest lives in the TEST, not
+        in read_cache - a constant computed at import would be recomputed from
+        the changed source and match forever (review of .345 r1).
+        """
+        import hashlib
+        import inspect
         import record_json
-        real = record_json.loads_row
-        try:
-            def changed(line):
-                return real(line) if 't-1' not in line else dict(real(line))
-            record_json.loads_row = changed
-            digest = read_cache._protected_parse_digest()
-            self.assertNotEqual(digest, read_cache.FORMAT_DIGEST)
-        finally:
-            record_json.loads_row = real
-        # The live digest still matches the recorded one.
-        self.assertEqual(read_cache._protected_parse_digest(), read_cache.FORMAT_DIGEST)
+        parts = [inspect.getsource(record_json.loads_rows),
+                 inspect.getsource(record_json.loads_row),
+                 inspect.getsource(record_json._make_malformed_row)]
+        return hashlib.sha256('\n'.join(parts).encode('utf-8')).hexdigest()
+
+    def test_the_live_parse_digest_matches_the_recorded_literal(self):
+        # kittrial-5bb.345 review: FORMAT_DIGEST is a LITERAL in read_cache.py and
+        # this computes the digest live and compares; a real edit to any of the
+        # three functions (the parse the cached rows went through) fails here until
+        # FORMAT is raised and the constant updated - the change that would serve
+        # an older kit's parse to a newer reader.
+        self.assertEqual(
+            self.live_parse_digest(), read_cache.FORMAT_DIGEST,
+            'the parse FORMAT protects has changed without FORMAT rising: raise '
+            'read_cache.FORMAT and update FORMAT_DIGEST to %r' % self.live_parse_digest())
+
+    def test_format_rises_when_the_parse_it_guards_changes(self):
+        # The mutant the reviewer asked for, made real: EDIT loads_row's source
+        # without touching read_cache.py - the live digest moves, the recorded
+        # literal does not, and the comparison test fails. (A run-time patch of
+        # the function cannot change its source, which is why the r1 test was
+        # circular: a digest computed from the source at import matched whatever
+        # the source said. This pins the mechanism instead: a genuine source edit
+        # moves the LIVE side only.)
+        import hashlib
+        import inspect
+        import record_json
+        parts = [inspect.getsource(record_json.loads_rows),
+                 inspect.getsource(record_json.loads_row),
+                 inspect.getsource(record_json._make_malformed_row)]
+        edited = parts[:]
+        edited[1] = edited[1] + '\n# a real edit to the parse, made in the source\n'
+        moved = hashlib.sha256('\n'.join(edited).encode('utf-8')).hexdigest()
+        self.assertNotEqual(moved, read_cache.FORMAT_DIGEST)
+        self.assertNotEqual(moved, self.live_parse_digest())
 
     def test_a_failed_write_leaves_no_temp_file_behind(self):
         # kittrial-5bb.345 item 4: a write that fails (the payload cannot be

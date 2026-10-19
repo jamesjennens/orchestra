@@ -45,25 +45,15 @@ FILE_NAME = 'export.json'
 #: kit fall back to a fresh export after an upgrade.
 FORMAT = 2
 
-#: What FORMAT guards, in bytes (kittrial-5bb.345 item 3): a digest of the parse
-#: the cached rows went through - record_json.loads_rows' own source and the row
-#: schema its malformed fallback builds. The test fails when either changes while
-#: FORMAT stays, which is exactly the change that would serve an older kit's
-#: parse to a newer reader.
-import hashlib as _hashlib
-import inspect as _inspect
-
-
-def _protected_parse_digest():
-    import record_json
-    parts = [_inspect.getsource(record_json.loads_rows),
-             _inspect.getsource(record_json.loads_row),
-             _inspect.getsource(record_json._make_malformed_row)]
-    return _hashlib.sha256('\n'.join(parts).encode('utf-8')).hexdigest()
-
-
-#: The digest FORMAT was last raised against. Raise FORMAT whenever this changes.
-FORMAT_DIGEST = _protected_parse_digest()
+#: What FORMAT guards, in bytes (kittrial-5bb.345 item 3, review item: the
+#: computed digest was circular - after a real change to the parse it would be
+#: recomputed and still match): a LITERAL hex constant, the digest of the source
+#: of record_json.loads_rows, loads_row and _make_malformed_row at the time FORMAT
+#: was last set. The TEST computes the live digest the same way and compares it
+#: with this literal; a parse change without FORMAT rising fails it, telling the
+#: editor to raise FORMAT and update the constant. No source is read at import
+#: (compiled-only installs pay nothing and never fail here).
+FORMAT_DIGEST = 'd98ed175e4d422068d2989218d8a2241f73d5cf8d1e839027f217f64ec5b200a'
 
 #: The database-name rule admin.sql itself applies.
 _DATABASE = re.compile(r'[A-Za-z0-9_]{1,64}')
