@@ -14,10 +14,13 @@ The cache is ONE file holding the format version, the key and the rows together,
 replaced by a single rename (kittrial-5bb.339 review B1: two files renamed apart
 let interleaving refreshes leave older rows under the newer key), and the stored
 format version is part of what the reader compares, so rows parsed by an older kit
-are never served after an upgrade (review B2). Rows whose nesting exceeds the
-whole-text bound (a row at 70 levels) are stored one per line and read back with
-``loads_rows``, whose per-row bound is 750 - such a project still caches, and no
-read pays a failed write every time (review S2). A ``.read-cache`` that is a
+are never served after an upgrade (review B2). Since kittrial-5bb.346 r2 the file
+is a HEADER LINE then the export's own bytes verbatim: nothing is re-serialised
+on a refresh, and the key compare reads the header alone, so a miss with a stale
+file present pays neither the container parse nor the re-dump that made the
+first read after a write slower than the kit before the cache. The header carries
+the payload's length, and a reader refuses a file whose payload does not match
+it - a torn file is never served as fewer rows. A ``.read-cache`` that is a
 symlink or not a directory is refused, and the file is opened with ``O_NOFOLLOW``
 (review S1). Everything unexpected - no Dolt server coordinates, an unreadable
 key, a file this kit cannot read - answers TODAY's behaviour: a fresh export,
@@ -51,8 +54,13 @@ FILE_NAME = 'export.json'
 
 #: Raised whenever the stored shape or the parse behind it changes (review B2):
 #: a file written with another value is never served, so rows parsed by an older
-#: kit fall back to a fresh export after an upgrade.
-FORMAT = 2
+#: kit fall back to a fresh export after an upgrade. FORMAT 3 is the RAW form of
+#: kittrial-5bb.346 r2: a header line then the export's own bytes (FORMAT 2 was
+#: the container of parsed rows; its re-serialisation was a third of what the
+#: cache added to the first read after a write). The parse the digest below
+#: guards is unchanged - only the shape moved, but a 2-kit would misread a 3-file,
+#: so the number rises with the shape.
+FORMAT = 3
 
 #: What FORMAT guards, in bytes (kittrial-5bb.345 item 3, review item: the
 #: computed digest was circular - after a real change to the parse it would be
@@ -66,12 +74,6 @@ FORMAT_DIGEST = 'd98ed175e4d422068d2989218d8a2241f73d5cf8d1e839027f217f64ec5b200
 
 #: The database-name rule admin.sql itself applies.
 _DATABASE = re.compile(r'[A-Za-z0-9_]{1,64}')
-
-#: The whole-text nesting bound of record_json.loads (its NESTING_MAX). A rows
-#: array nested deeper than this cannot be read back as one text, so such a
-#: project's rows are stored one per line instead (per-row bound 750).
-_WHOLE_TEXT_NESTING = 64
-
 
 def project_generation(root, name):
     """The tracker's HEAD hash, or ``None`` when it cannot be read.
@@ -147,41 +149,47 @@ def _cache_directory(path):
 def _cached_rows(cache, key):
     """The parsed rows for ``key``, or ``None`` when the cache cannot serve.
 
-    The one file holds ``{"format": F, "key": K, "rows": [...]}`` or, for a
-    project whose rows nest deeper than the whole-text bound,
-    ``{"format": F, "key": K, "kind": "lines", "text": "one row per line"}``.
+    The one file is a header line then the export's own bytes (see the module
+    docstring). The key compare happens on the HEADER ONLY - a miss with a
+    stale file present pays reading it, never parsing it, which is where the
+    container form of .339 spent 1.3 s per check on a 66 MB payload - and the
+    payload is parsed only after the format, the key AND the recorded length
+    all match, so a file a power loss left short is refused, not served
+    truncated (the torn-file test pins both halves).
     """
     raw = _read_no_follow(cache / FILE_NAME)
     if raw is None:
         return None
+    header, separator, payload = raw.partition(b'\n')
+    if not separator:
+        return None
     import record_json
     try:
-        container = record_json.loads(raw.decode('utf-8', 'replace'))
+        head = record_json.loads(header.decode('utf-8', 'replace'))
     except ValueError:
         return None
-    if not isinstance(container, dict):
+    if not isinstance(head, dict):
         return None
-    if container.get('format') != FORMAT or container.get('key') != key:
+    if head.get('format') != FORMAT or head.get('key') != key:
         return None
-    if container.get('kind') == 'lines':
-        rows = record_json.loads_rows(container.get('text') or '')
-    else:
-        rows = container.get('rows')
-    if not isinstance(rows, list):
-        return None
-    return rows
+    if not isinstance(head.get('bytes'), int) or head['bytes'] != len(payload):
+        return None                       # torn or foreign: fall back, never serve
+    return record_json.loads_rows(payload.decode('utf-8', 'replace'))
 
 
-def _serialize(rows, key):
-    """The one file's bytes: the array form, or per-line when nesting is too deep."""
-    container = {'format': FORMAT, 'key': key, 'rows': rows}
-    text = json.dumps(container)
-    import record_json
-    if record_json.nesting(text) <= _WHOLE_TEXT_NESTING:
-        return text.encode('utf-8')
-    lines = ''.join(json.dumps(row) + '\n' for row in rows)
-    return json.dumps({'format': FORMAT, 'key': key, 'kind': 'lines',
-                       'text': lines}).encode('utf-8')
+def _raw_payload(text, key):
+    """The one file's bytes: a header line, then the export's own bytes verbatim.
+
+    Nothing is re-serialised - the bytes bd printed are the payload, so a 58-66 MB
+    refresh writes a byte copy instead of a json.dumps of the parsed rows (the
+    serialize stage the .339 container form paid on every miss). The header
+    carries the length of the payload that follows: the reader refuses a file
+    whose payload is shorter (a torn file a dropped fsync can leave), so
+    truncation can never be served as fewer rows. Rows the export prints one per
+    line need no special form any more - the payload IS one row per line."""
+    header = json.dumps({'format': FORMAT, 'key': key,
+                         'bytes': len(text.encode('utf-8'))})
+    return header.encode('utf-8') + b'\n' + text.encode('utf-8')
 
 
 def _write_one_file(cache, payload):
@@ -282,9 +290,10 @@ def _refresh(cache, key, run):
             if served is not None:
                 return served
             import record_json
-            rows = record_json.loads_rows(run(['export', '--all']))
+            text = run(['export', '--all'])
+            rows = record_json.loads_rows(text)
             try:
-                _write_one_file(cache, _serialize(rows, key))
+                _write_one_file(cache, _raw_payload(text, key))
             except OSError:
                 pass        # the cache is an optimization, never a requirement
             return rows

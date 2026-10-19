@@ -84,8 +84,8 @@ class ReadCacheTests(unittest.TestCase):
         visible, run = self.serve([row(), row('t-2')], key='b' * 32)   # the generation moved
         self.assertEqual(run.exports, 1)                 # the cache missed, the export ran
         self.assertEqual([item['id'] for item in visible], ['t-1', 't-2'])
-        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
-        self.assertEqual(stored['key'], 'b' * 32)
+        header, _, _ = self.cached_file().read_bytes().partition(b'\n')
+        self.assertEqual(json.loads(header)['key'], 'b' * 32)
 
     def test_interleaved_refreshes_never_leave_older_rows_under_the_newer_key(self):
         # Review B1: with two files renamed apart, refreshes that interleaved left
@@ -96,21 +96,22 @@ class ReadCacheTests(unittest.TestCase):
         # names, and is what the next read of that key serves.
         import threading
         gate = threading.Event()
-        real_serialize = read_cache._serialize
+        real_payload = read_cache._raw_payload
 
-        def interleaving_serialize(rows, key):
-            payload = real_serialize(rows, key)
+        def interleaving_payload(text, key):
+            payload = real_payload(text, key)
             if key == 'b' * 32:
                 self.serve([row(title='R1-older')], key='a' * 32)
                 gate.set()
             return payload
 
         self.serve([row(title='R1')], key='a' * 32)
-        with mock.patch.object(read_cache, '_serialize', side_effect=interleaving_serialize):
+        with mock.patch.object(read_cache, '_raw_payload', side_effect=interleaving_payload):
             self.serve([row(title='R2')], key='b' * 32)
         self.assertTrue(gate.is_set())
-        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
-        title = stored['rows'][0]['title']
+        header, _, payload = self.cached_file().read_bytes().partition(b'\n')
+        stored = json.loads(header)
+        title = json.loads(payload.decode('utf-8').splitlines()[0])['title']
         self.assertIn(title, ('R1', 'R1-older', 'R2'))
         served, run = self.serve([row(title=title)], key=stored['key'])
         self.assertEqual(run.exports, 0)
@@ -120,15 +121,17 @@ class ReadCacheTests(unittest.TestCase):
         # Review B2: rows parsed by an older kit (another FORMAT) fall back to a
         # fresh export however valid the file looks and however right the key is.
         self.serve([row()])
-        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
-        stored['format'] = read_cache.FORMAT - 1
-        stored['rows'] = [row(id='planted', title='FOREIGN')]
-        self.cached_file().write_text(json.dumps(stored), encoding='utf-8')
+        header, _, payload = self.cached_file().read_bytes().partition(b'\n')
+        stored = json.loads(header)
+        stored['format'] = read_cache.FORMAT - 1           # an older kit's number
+        planted = json.dumps(row(id='planted', title='FOREIGN')) + '\n'
+        self.cached_file().write_bytes(json.dumps(stored).encode('utf-8') + b'\n'
+                                       + planted.encode('utf-8'))
         served, run = self.serve([row()])
-        self.assertEqual(run.exports, 1)
+        self.assertEqual(run.exports, 1)                    # never served: fresh export
         self.assertEqual(served[0]['id'], 't-1')
-        self.assertEqual(json.loads(self.cached_file().read_text(encoding='utf-8'))['format'],
-                         read_cache.FORMAT)
+        head, _, _ = self.cached_file().read_bytes().partition(b'\n')
+        self.assertEqual(json.loads(head)['format'], read_cache.FORMAT)
 
     def test_rows_nested_past_the_whole_text_bound_still_cache(self):
         # Review S2: one 70-deep row used to disable the cache for good AND make
@@ -142,10 +145,8 @@ class ReadCacheTests(unittest.TestCase):
         first, run = self.serve([deep])
         self.assertEqual(run.exports, 1)
         second, again = self.serve([deep])
-        self.assertEqual(again.exports, 0)              # served from the lines form
-        self.assertEqual(second[0]['id'], 't-1')
-        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
-        self.assertEqual(stored.get('kind'), 'lines')
+        self.assertEqual(again.exports, 0)     # served: the payload is one row per
+        self.assertEqual(second[0]['id'], 't-1')   # line, deep rows need no special form
 
     def test_a_symlinked_cache_directory_is_refused_not_followed(self):
         # Review S1: a symlink planted at .read-cache must not be written through
@@ -235,13 +236,19 @@ class ReadCacheTests(unittest.TestCase):
         # the cache (the file is whole again and the read after it serves).
         self.serve([row()])
         whole = self.cached_file().read_bytes()
-        self.cached_file().write_bytes(whole[:len(whole) // 2])   # torn mid-payload
+        cut = whole.partition(b'\n')[2]
+        self.cached_file().write_bytes(whole[:len(whole) - len(cut) // 2])  # payload short
         served, run = self.serve([row()])
-        self.assertEqual(run.exports, 1)                 # not served: fresh export
+        self.assertEqual(run.exports, 1)          # length mismatch: fresh export
         self.assertEqual([item['id'] for item in served], ['t-1'])
-        json.loads(self.cached_file().read_text(encoding='utf-8'))   # repaired
+        head, _, _ = self.cached_file().read_bytes().partition(b'\n')
+        json.loads(head)                                 # repaired
         again, rerun = self.serve([row()])
         self.assertEqual(rerun.exports, 0)               # and serving again
+        self.cached_file().write_bytes(whole[:5])        # torn in the HEADER itself
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)                 # also refused, also repaired
+        self.assertEqual([item['id'] for item in served], ['t-1'])
 
     def test_five_concurrent_misses_refresh_once(self):
         # kittrial-5bb.346: the five reads a page fires right after a write all
@@ -419,10 +426,10 @@ class ReadCacheTests(unittest.TestCase):
         import tempfile
         self.serve([row()], key='a' * 32)
         before = sorted(item.name for item in self.cache.iterdir())
-        def exploding_serialize(rows, key):
+        def exploding_payload(text, key):
             raise OSError('no space left on device')
         # A NEW key, so the refresh path (export, then the failing write) runs.
-        with mock.patch.object(read_cache, '_serialize', side_effect=exploding_serialize):
+        with mock.patch.object(read_cache, '_raw_payload', side_effect=exploding_payload):
             served, run = self.serve([row()], key='b' * 32)
         self.assertEqual(run.exports, 1)                    # still answered
         self.assertEqual(sorted(item.name for item in self.cache.iterdir()), before)
