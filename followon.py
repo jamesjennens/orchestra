@@ -43,10 +43,10 @@ Ceiling values (text 600 characters, reason 1000) are bounds on the recorded tex
 not on the escaped display form; the display form is escaped exactly once, as
 checkpoint wait text is.
 """
-import json
 import re
 from pathlib import Path
 
+import record_json
 from requirements import canonical_bytes, content_hash
 
 #: The reserved native comment kind. Its own prefix keeps every older reader away
@@ -184,7 +184,7 @@ def parse_text(text):
         raise ValueError('not a follow-on record')
     raw = text[len(PREFIX):]
     try:
-        value = json.loads(raw)
+        value = record_json.loads(raw)
     except (ValueError, RecursionError):
         raise ValueError('not canonical JSON') from None
     if not isinstance(value, dict):
@@ -336,7 +336,7 @@ def host_journal(project):
                 raise ValueError('symlink')
             if path.stat().st_size > JOURNAL_FILE_LIMIT:
                 raise ValueError('oversized')
-            entry = validate_entry(json.loads(path.read_text(encoding='utf-8')), name)
+            entry = validate_entry(record_json.loads(path.read_text(encoding='utf-8')), name)
         except (OSError, ValueError, TypeError, KeyError):
             invalid.append(JOURNAL_DIR + '/' + name)
             continue
@@ -659,14 +659,17 @@ def _record(rows, issue, task, text, actor, run, project, operators):
                       + current['block']['id'] + '); withdraw it before recording another.')
     open_journal(project)
     body_text = body(payload)
-    result = json.loads(run(['comments', 'add', task, body_text, '--json']))
+    result = record_json.loads(run(['comments', 'add', task, body_text, '--json']))
     comment_id = str(result['id'])
     try:
         publish(project, journal_entry(payload, comment_id, actor, len(issue.get('comments') or [])))
     except ValueError as exc:
-        raise _refuse('Follow-on comment ' + comment_id + ' was written but its host journal entry '
-                      'could not be persisted (%s). The record is inert until it is: re-run the same '
-                      'hand-back to persist the entry.' % (exc,)) from None
+        # Not a refusal: the native comment WAS written. This sentence does not claim
+        # otherwise; the guarded write reports the uncertain outcome and re-running the
+        # same hand-back persists the missing entry instead of writing a second comment.
+        raise ValueError('Follow-on comment ' + comment_id + ' was written but its host journal entry '
+                         'could not be persisted (%s). The record is inert until it is: re-run the '
+                         'same hand-back to persist the entry.' % (exc,)) from None
     return {'comment_id': comment_id, 'task': task, 'operation': OPERATION_RECORD,
             'contribution': payload['contribution'], 'commit': payload['commit'],
             'integration': payload['integration'], 'integration_order': payload['integration_order'],
@@ -701,14 +704,15 @@ def _withdraw(rows, issue, target, reason, actor, run, project, operators, expec
         raise _refuse('That hand-back is not open (' + str(current['block']['state'])
                       + '), so there is nothing to withdraw.')
     open_journal(project)
-    result = json.loads(run(['comments', 'add', task, body(payload), '--json']))
+    result = record_json.loads(run(['comments', 'add', task, body(payload), '--json']))
     comment_id = str(result['id'])
     try:
         publish(project, journal_entry(payload, comment_id, actor, len(issue.get('comments') or [])))
     except ValueError as exc:
-        raise _refuse('Withdrawal comment ' + comment_id + ' was written but its host journal entry '
-                      'could not be persisted (%s). The withdrawal is inert until it is: re-run the '
-                      'same withdrawal to persist the entry.' % (exc,)) from None
+        # Not a refusal: the withdrawal comment WAS written (see `_record`).
+        raise ValueError('Withdrawal comment ' + comment_id + ' was written but its host journal entry '
+                         'could not be persisted (%s). The withdrawal is inert until it is: re-run the '
+                         'same withdrawal to persist the entry.' % (exc,)) from None
     return {'comment_id': comment_id, 'task': task, 'operation': OPERATION_WITHDRAW,
             'target': target, 'reconciled': False}
 
