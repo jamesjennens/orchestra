@@ -50,6 +50,10 @@ CLEAR_NAME = '.guidance-clear.json'
 # never parses this file, and the backup does not carry it (the sidecar names its files).
 REPAIR_NAME = '.guidance-repair.json'
 REPAIR_FIELDS = {'schema_version', 'version', 'set_by', 'set_at', 'repaired_by', 'repaired_at'}
+#: ``set_via`` is optional so a repair audit written before kittrial-5bb.349 keeps
+#: reading. A repair of a routed generation records the route it repaired, as
+#: ``.guidance.json`` records it, so the audit names the whole generation.
+REPAIR_OPTIONAL_FIELDS = {'set_via'}
 # The file is local and unauthenticated (anyone who can write the project directory can
 # plant one), so it is read with a bound and shown only when it names the current
 # generation AND a configured operator as the repairer (kittrial-5bb.124).
@@ -484,9 +488,11 @@ def read_repair(path):
         value = record_json.loads(raw.decode('utf-8'))
     except (OSError, UnicodeError, ValueError, RecursionError):
         return None
-    if (not isinstance(value, dict) or set(value) != REPAIR_FIELDS or value.get('schema_version') != 1
+    if (not isinstance(value, dict) or set(value) - REPAIR_OPTIONAL_FIELDS != REPAIR_FIELDS
+            or value.get('schema_version') != 1
             or not isinstance(value.get('version'), str) or not VERSION.fullmatch(value['version'])
             or not _valid_actor(value.get('set_by')) or not _valid_stamp(value.get('set_at'))
+            or 'set_via' in value and not _valid_set_route(value['set_via'])
             or not _valid_actor(value.get('repaired_by')) or not _valid_stamp(value.get('repaired_at'))):
         return None
     return value
@@ -509,12 +515,14 @@ def deployment_operators(path):
 def _repair_audit(path, meta, bound, operators=None):
     """``repaired_by``/``repaired_at`` when a same-text repair kept the original setter of
     this exact, bound version and recorded itself beside the record (kittrial-5bb.121). The
-    file names the generation it repaired (version, setter, time); any later set, including
-    a same-text set by an older kit that never reads this file, changes one of them. The
-    file is local and unauthenticated, so it is shown only when the repairer it names is a
-    configured operator (``operators``, or the deployment's when not given)."""
+    file names the generation it repaired (version, setter, time and, since
+    kittrial-5bb.349, its route when known); any later set, including a same-text set by
+    an older kit that never reads this file, changes one of them. The file is local and
+    unauthenticated, so it is shown only when the repairer it names is a configured operator
+    (``operators``, or the deployment's when not given)."""
     repair = read_repair(path) if bound and isinstance(meta, dict) else None
-    if repair is None or any(repair[key] != meta.get(key) for key in ('version', 'set_by', 'set_at')):
+    if (repair is None or any(repair[key] != meta.get(key) for key in ('version', 'set_by', 'set_at'))
+            or repair.get('set_via') != meta.get('set_via')):
         return {}
     if operators is None:
         operators = deployment_operators(path)
@@ -867,8 +875,12 @@ def write_guidance(path, text, actor, now=None, *, before_write=None, set_via='h
     audit_warning = None
     if rewrite:
         try:
-            atomic(repair_path, {'schema_version': 1, 'version': current, 'set_by': set_by, 'set_at': set_at,
-                                 'repaired_by': actor, 'repaired_at': stamp})
+            audit = {'schema_version': 1, 'version': current, 'set_by': set_by, 'set_at': set_at,
+                     'repaired_by': actor, 'repaired_at': stamp}
+            # kittrial-5bb.349: a routed generation's repair names the route too, so the
+            # audit covers the whole generation (the field stays absent for a legacy one).
+            audit.update(_stored_route(meta))
+            atomic(repair_path, audit)
         except OSError:
             # The record is already repaired; say so in one sentence rather than fail.
             audit_warning = ('The guidance record was repaired, but the repair audit %s could not be written, so '

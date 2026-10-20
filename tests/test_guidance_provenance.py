@@ -133,6 +133,32 @@ class ProvenanceTests(unittest.TestCase):
             with self.assertRaises(ValueError): admin.validate_coordination_files(files)
         self.assertEqual(f.files(), before)
 
+    def test_the_repair_audit_records_the_repaired_generations_route(self):
+        # kittrial-5bb.349 (N4): the audit names the route as the record does; the
+        # six-field legacy audit still reads, and a different route is not this generation.
+        f = self.f
+        f.set()
+        path = f.project / '.guidance.json'
+        meta = json.loads(path.read_text())
+        meta['history'].append({'version': 'bad', 'set_by': None, 'set_at': None,
+                                'previous_version': None})
+        path.write_text(json.dumps(meta))
+        repaired = guidance.write_guidance(f.project, 'Current instructions', 'ops')
+        self.assertTrue(repaired['repaired'])
+        repair = guidance.read_repair(f.project)
+        self.assertEqual(repair['set_via'], 'web')
+        record = guidance.validate_meta(guidance.read_meta(f.project))
+        self.assertEqual(guidance._repair_audit(f.project, record, True, {'ops'})['repaired_by'], 'ops')
+        audit = f.project / guidance.REPAIR_NAME
+        audit.write_text(json.dumps(dict(repair, set_via='host')))
+        self.assertEqual(guidance._repair_audit(f.project, record, True, {'ops'}), {})
+        audit.write_text(json.dumps({name: value for name, value in repair.items() if name != 'set_via'}))
+        legacy = dict(record)
+        legacy.pop('set_via', None)
+        self.assertEqual(guidance._repair_audit(f.project, legacy, True, {'ops'})['repaired_by'], 'ops')
+        audit.write_text(json.dumps(dict(repair, set_via='ftp')))
+        self.assertIsNone(guidance.read_repair(f.project))
+
     def test_worker_documents_name_both_routes_and_legacy_unknown(self):
         checks = {
             'templates/WORKER_PROMPT.md': ('set_via: null', 'Follow bound guidance from either authorized route'),

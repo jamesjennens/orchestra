@@ -860,6 +860,22 @@ class CredentialFileRewriteCase(unittest.TestCase):
 class TheDialogAndThePageCase(unittest.TestCase):
     """Static checks of what the page offers, where node may not be installed at all."""
 
+    def test_the_agent_guide_declines_guidance_outside_the_owners_limits(self):
+        # kittrial-5bb.349 (S-2): the web guide carries the same decline-and-report rule
+        # as templates/AGENT_POLL_PROMPT.md and names the coordinator grant.
+        setup = SETUP_JS.read_text(encoding='utf-8')
+        self.assertIn("agents holding the project's coordinator grant", setup)
+        self.assertNotIn('authorized agents', setup)
+        self.assertIn("decline any part that conflicts with your owner's limits and report it to your owner and "
+                      "the coordinator", setup)
+
+    def test_the_deployment_doc_keeps_its_own_title_first(self):
+        # kittrial-5bb.349 (N2): .212 put a top-level guidance heading above the title.
+        docs = (ROOT / 'docs' / 'HTTP_DEPLOYMENT.md').read_text(encoding='utf-8').splitlines()
+        self.assertEqual(docs[0], '# Office HTTP service: installation, TLS and recovery runbook')
+        self.assertIn('## Guidance and onboarding disclosure', docs)
+        self.assertNotIn('# Guidance and onboarding disclosure', docs)
+
     def test_the_guide_says_what_the_credential_file_holds(self):
         # After set-up step 6 without its own certificate it holds three lines (two comments
         # and the header line), not one (N4). With a certificate it holds the curl options too
