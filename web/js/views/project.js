@@ -432,7 +432,9 @@ export function claimingPanel(ctx, project) {
 export async function settings(ctx, { pid }) {
   const project = await load(ctx, pid);
   const owner = isOwner(project);
-  const membersHost = h('div', { class: 'panel' });
+  // Its own selector: the role options belong to the members list, never to another
+  // panel's control (the claiming setting has data-panel="claiming" instead).
+  const membersHost = h('div', { class: 'panel', 'data-panel': 'members' });
   const agentsHost = h('div');
   const credsHost = h('div');
   const auditHost = h('div');

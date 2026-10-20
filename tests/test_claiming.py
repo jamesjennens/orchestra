@@ -18,7 +18,10 @@ sys.path.insert(0, str(KIT / 'tests'))
 import claiming
 import work
 import waiting
-import endpoint
+try:
+    import endpoint
+except ImportError:  # endpoint imports fcntl (POSIX-only); the kit itself runs on Windows too
+    endpoint = None
 import http_service
 
 
@@ -172,6 +175,11 @@ class ListingTests(ProjectCase):
 
 
 class GateTests(ProjectCase):
+    # The two endpoint routes need endpoint.py, which imports fcntl (POSIX-only); the HTTP
+    # backend below and the record tests run everywhere (kittrial-5bb.352 Windows CI).
+    POSIX = unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+
+    @POSIX
     def test_the_host_claim_guard_refuses_only_an_unassigned_claim(self):
         claiming.write(self.project, 'assigned', 'owner-1')
         with self.assertRaises(ValueError) as caught:
@@ -182,6 +190,7 @@ class GateTests(ProjectCase):
         claiming.write(self.project, 'open', 'owner-1')
         endpoint._guard_claiming_on_claim(self.project, free_row())
 
+    @POSIX
     def test_an_explicit_assignment_is_not_a_bare_claim(self):
         self.assertFalse(endpoint._names_assignee(['update', 'p-1', '--claim', '--json']))
         for args in (['update', 'p-1', '--assignee', 'worker-a'],

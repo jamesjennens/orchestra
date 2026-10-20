@@ -61,7 +61,16 @@ const press = async (page, agent, label) => {
 {
   const page = await view.settings(who.owner, { pid: project });
   await settle();
-  out.roles = [...new Set(page.all((e) => e.tagName === 'OPTION').map((o) => o.textContent))];
+  // The role list is the OPTIONs of the members panel, read through its own selector. The
+  // claiming setting is a separate control in its own panel (kittrial-5bb.352), so its two
+  // choices must never be read as roles.
+  const members = page.all((e) => e.tagName === 'DIV' && e.attributes['data-panel'] === 'members')[0];
+  out.roles = [...new Set(members.all((e) => e.tagName === 'OPTION').map((o) => o.textContent))];
+  const claiming = page.all((e) => e.tagName === 'SECTION' && e.attributes['data-panel'] === 'claiming')[0];
+  out.claiming = claiming ? {
+    options: [...new Set(claiming.all((e) => e.tagName === 'OPTION').map((o) => o.textContent))],
+    select: Boolean(claiming.all((e) => e.tagName === 'SELECT' && e.attributes.id === 'claiming-value')[0]),
+  } : null;
   out.head = panel(page).textContent.slice(0, 160);
   out.before = rows(page);
   const [coordinating, working] = [out.before.find((r) => r.text.includes('Heron')).agent, out.before.find((r) => r.text.includes('Wren')).agent];
