@@ -87,7 +87,10 @@ const api = createApi(async (method, path, _headers, text) => {
     server.issued += 1;
     return { status: 201, data: { credential: { id: 'cred_' + server.issued, secret: SECRET, scopes: ['read', 'tasks'] } } };
   }
-  if (method === 'PATCH' && path === '/v1/agents/agent_1') { server.roles.push(sent.role); return { status: 200, data: {} }; }
+  if (method === 'PATCH' && path === '/v1/agents/agent_1') {
+    if (server.failRole) return { status: 403, data: { error: { code: 'forbidden', message: 'Only the agent’s owner may change its role.' } } };
+    server.roles.push(sent.role); return { status: 200, data: {} };
+  }
   return { status: 404, data: { error: { code: 'not_found', message: 'no route ' + method + ' ' + path } } };
 });
 const ctx = { api, me: { id: 'u1' }, query: { get: (k) => (k === 'agent' ? 'agent_1' : null) }, href: (p) => '#' + p, go: () => {} };
@@ -290,6 +293,12 @@ d.wizard.show('role');
 await windowsChoice(d, 'setup-role', 'reviewer').dispatch('change');
 await tick();
 out.roleSavedOnOrchestra = server.roles[server.roles.length - 1] === 'reviewer';
+server.failRole = true;
+await windowsChoice(d, 'setup-role', 'worker').dispatch('change');
+await tick(); await tick();
+const roleError = attr(d, 'data-wizard-error', 'true')[0];
+out.roleErrorShownInsideTheDialog = roleError.hidden === false && roleError.textContent.includes('Only the agent’s owner may change its role.');
+server.failRole = false;
 
 // ---- 5. Kept from the three-step wizard's test: the keep-alive and its warning (.330), the online
 //         line on the last screen (only while visible), the picker's remembered folder (.329), and
@@ -334,6 +343,15 @@ clearWizardStorage();
 out.signOutClearsTheStoredScreen = !store.has(WIZARD_STORAGE_KEY);
 
 // ---- 6. Site-wide: a toast raised while a modal is open is drawn inside it (kittrial-5bb.348) ----
+// With a confirmation open above the wizard, the toast goes into the TOP dialog.
+const confirmOpen = (await import(domUrl)).confirmDialog({ title: 'Sure?', body: 'x' });
+await tick();
+const topDialog = openDialogs().find((x) => x !== d);
+toast('A message above the confirmation', 'crit');
+out.toastDrawnInTheTopmostDialog = topDialog.all((e) => e.className === 'toast crit' && e.textContent === 'A message above the confirmation').length === 1
+  && d.all((e) => e.textContent === 'A message above the confirmation').length === 0;
+await topDialog.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Cancel')[0].dispatch('click');
+await confirmOpen;
 toast('A message while the wizard is open', 'crit');
 const inside = d.all((e) => e.className === 'toast crit' && e.textContent === 'A message while the wizard is open');
 out.toastDrawnInsideTheOpenModal = inside.length === 1;

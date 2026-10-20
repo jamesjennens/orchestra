@@ -272,7 +272,9 @@ export function certificateMoveCommands(certFile) {
 // CURL_MAX_TIME seconds, and it no longer uses -f: it reads the HTTP code and the answer, so an
 // answer that did not come from Orchestra (an HTML page, a 5xx without the kit's
 // {"error": {...}} shape, no answer in time, or a failed proxy tunnel) prints the ONE proxy
-// sentence instead of a bare curl error. A kit answer prints as before: the agent's JSON, or
+// sentence instead of a bare curl error. In PowerShell curl's error lines are turned into plain text
+// ("$_"): an ErrorRecord from 2>&1 repeats the whole command, --noproxy included, which made every
+// failure look like a proxy's. A kit answer prints as before: the agent's JSON, or
 // "HTTP CODE from Orchestra: ..." for the kit's own errors. In PowerShell each message is one red
 // line (Write-Host), not Write-Error, which repeats the whole command around it.
 export function checkCommands(payload, { hasCertificate = false } = {}) {
@@ -285,7 +287,7 @@ export function checkCommands(payload, { hasCertificate = false } = {}) {
   const psCertCheck = hasCertificate && cert
     ? `$crt="${cert.powershell}"; if (-not (Test-Path $crt)) { $dl=Join-Path $HOME 'Downloads'; if ((Test-Path (Join-Path $dl '${strippedCert}')) -or (Test-Path (Join-Path $dl '${cert.name}'))) { Write-Host -ForegroundColor Red "Certificate is still in Downloads without its leading dot. Fix: Move-Item -Force (Join-Path $HOME 'Downloads\\${strippedCert}') \`"$crt\`""; return } Write-Host -ForegroundColor Red "Missing certificate at $crt -- click Save certificate and run the move command first."; return }; `
     : '';
-  const psCall = `$o = & curl.exe -sS ${flags} -K "$p" -w "\`n%{http_code}" ${url} 2>&1; $rc = $LASTEXITCODE; $t = ($o | Out-String).TrimEnd(); $i = $t.LastIndexOf("\`n"); $code = 0; [void][int]::TryParse($t.Substring($i + 1).Trim(), [ref]$code); $body = if ($i -ge 0) { $t.Substring(0, $i) } else { '' }; `
+  const psCall = `$o = & curl.exe -sS ${flags} -K "$p" -w "\`n%{http_code}" ${url} 2>&1 | ForEach-Object { "$_" }; $rc = $LASTEXITCODE; $t = ($o | Out-String).TrimEnd(); $i = $t.LastIndexOf("\`n"); $code = 0; [void][int]::TryParse($t.Substring($i + 1).Trim(), [ref]$code); $body = if ($i -ge 0) { $t.Substring(0, $i) } else { '' }; `
     + `if ($rc -eq 28 -or $rc -eq 56 -or ($rc -ne 0 -and $t -match 'proxy|CONNECT tunnel') -or $body -match '^\\s*<' -or ($code -ge 500 -and $body -notmatch '"error"\\s*:\\s*\\{')) { Write-Host -ForegroundColor Red "${proxy}"; return }; `
     + `if ($rc -ne 0) { Write-Host -ForegroundColor Red "curl exit $($rc): $t"; return }; if ($code -ge 400) { Write-Host -ForegroundColor Red "HTTP $code from Orchestra: $body"; return }; $body`;
   const powershell = `& { $p="${file.powershell}"; if (-not (Test-Path $p)) { if (Test-Path "$p.txt") { Write-Host -ForegroundColor Red "Notepad added .txt. Fix: Move-Item -Force \`"$p.txt\`" \`"$p\`""; return } Write-Host -ForegroundColor Red "Missing credential file at $p -- save the lines from Save your secret there first."; return }; $raw=[IO.File]::ReadAllText($p); if ($raw -match '<[a-z -]+>') { Write-Host -ForegroundColor Red "Found an unreplaced placeholder in $p -- paste the lines from Save your secret and run the rewrite command so the real user path is written automatically."; return }; ${psCertCheck}${psCall} }`;

@@ -1034,8 +1034,8 @@ class ProxyAwareSelfCheckCase(unittest.TestCase):
                 if kind == 'silent':
                     threading.Event().wait(30)      # never answers within curl's 20 s
                     return
-                if kind == 'html503':
-                    body, status, ctype = page, 503, 'text/html'
+                if kind in ('html503', 'html200'):
+                    body, status, ctype = page, 503 if kind == 'html503' else 200, 'text/html'
                 elif kind == 'kit503':
                     body, status, ctype = b'{"error": {"code": "busy", "message": "The service is busy"}}', 503, 'application/json'
                 else:
@@ -1116,6 +1116,32 @@ class ProxyAwareSelfCheckCase(unittest.TestCase):
                 self.assertIn(sentence, ' '.join(said.split()), said)
                 self.assertNotIn('Operation timed out', said)       # the proxy's page is not printed
                 self.assertNotIn('$p=', said)                       # nor the command around the sentence
+
+    def test_an_html_page_with_status_200_is_the_one_sentence_too(self):
+        # A proxy's own sign-in or block page can come with 200: it is still not Orchestra's JSON.
+        server = self.serve('html200')
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                done, sentence = self.run_check(shell, server)
+                said = done.stdout + done.stderr
+                self.assertIn(sentence, ' '.join(said.split()), said)
+                self.assertNotIn('Network Error', said)
+
+    def test_a_refused_connection_is_not_blamed_on_a_proxy(self):
+        # Nothing listens on the port: curl exit 7 is said as it is, in one line, with no command echoed
+        # (an ErrorRecord's echo of --noproxy once made every curl failure read as a proxy's).
+        import socket
+        probe = socket.socket()
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                done, _ = self.run_check(shell, 'http://127.0.0.1:%d' % port)
+                said = done.stdout + done.stderr
+                self.assertIn('curl exit 7', said)
+                self.assertNotIn('proxy probably answered', said)
+                self.assertNotIn('$p=', said)
 
     def test_no_answer_stops_after_20_s_with_the_one_sentence(self):
         import time
