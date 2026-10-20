@@ -290,7 +290,9 @@ class FollowonEndpointTests(FollowonCase):
         self.assertTrue(cache.is_file(), 'the first work read must have cached the rows')
         cached_bytes = cache.read_bytes()
         cached_mtime = cache.stat().st_mtime_ns
-        self.assertEqual(json.loads(cached_bytes)['key'], key)
+        # The cache file is a header line then the export's raw bytes (.346's
+        # FORMAT 3); the key it answers for lives in the header alone.
+        self.assertEqual(json.loads(cached_bytes.partition(b'\n')[0])['key'], key)
 
         # ONLY the journal entry is written. No native write, so the generation stays.
         followon.publish(self.project, followon.journal_entry(payload, comment_id, COORD, order))
