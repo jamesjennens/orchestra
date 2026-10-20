@@ -240,9 +240,20 @@ def _claims_the_row(args):
 
 
 def _names_assignee(args):
-    """True when the bd invocation itself assigns the row (``--assignee``/``-a``)."""
-    for i, a in enumerate(list(args or [])):
-        if a in ('--assignee', '-a') or a.startswith('--assignee='):
+    """True when the bd invocation itself assigns the row (``--assignee``/``-a``).
+
+    Every spelling bd 1.2.2 accepts is recognised (kittrial-5bb.352 review item B1):
+    ``--assignee W``, ``--assignee=W``, ``-a W``, ``-a=W`` and the joined ``-aW``. The
+    scan stops at ``--``: after it bd takes positionals, not flags. ``-a`` is the
+    assignee shorthand on ``create``/``update`` only, which is where this is asked.
+    """
+    for token in list(args or []):
+        if token == '--':
+            break
+        if token in ('--assignee', '-a') or token.startswith('--assignee='):
+            return True
+        # pflag's short form: -a=W and the joined -aW. ``-a`` itself is the token above.
+        if token.startswith('-a') and token != '-a' and not token.startswith('--'):
             return True
     return False
 
@@ -260,6 +271,48 @@ def _guard_claiming_on_claim(path, row):
     from claiming import CLAIM_REFUSAL, mode
     if mode(path) == 'assigned':
         raise ValueError('Refusing to claim %s: %s' % (row.get('id'), CLAIM_REFUSAL))
+
+
+def _may_assign_work(root, path, actor, authority_config=None, request=None):
+    """Whether this caller may hand work out while the project is ``assigned``.
+
+    The two authorities the setting names (kittrial-5bb.352 review item B1): a listed
+    installation operator (the host route), or the same live ``CAP_COORDINATE`` check
+    the web uses for its own assign/claiming routes. A descriptor is judged against the
+    live authority store by ``verified_web_authority``; it never authorises itself.
+    """
+    if _listed_operator(actor, root, path):
+        return True
+    if authority_config is None or not isinstance(request, dict):
+        return False
+    if not isinstance(request.get('authority'), dict):
+        return False
+    try:
+        return bool(verified_web_authority(request, authority_config,
+                                           CAP_COORDINATE, path.name))
+    except Exception:                      # a refused or unreadable descriptor is no authority
+        return False
+
+
+def _guard_claiming_on_assignment(root, path, actor, authority_config, request, args):
+    """Refuse ``--assignee``/``-a`` on create/update under ``assigned`` (review B1).
+
+    Under ``assigned`` only a coordinator hands work out. The host bd passthrough let a
+    plain worker take an unassigned task by naming itself as the assignee - directly
+    (``update T --assignee W``) or in the same call as a claim (``update T --claim
+    --assignee W``, ``update T --status in_progress --assignee W``). Any assignee
+    spelling is refused unless the caller is a listed operator or holds
+    ``CAP_COORDINATE`` in this project, with the one setting-naming sentence. Creating
+    and assigning in one call is the same hand-out and is refused the same way.
+    """
+    if not args or args[0] not in ('create', 'update') or not _names_assignee(args):
+        return
+    from claiming import CLAIM_REFUSAL, mode
+    if mode(path) != 'assigned':
+        return
+    if _may_assign_work(root, path, actor, authority_config, request):
+        return
+    raise ValueError('Refusing to assign work through bd here: %s' % CLAIM_REFUSAL)
 
 
 def _guard_open_dependency_on_claim(root,path,actor,row):
@@ -333,9 +386,10 @@ def _guard_record_anchor_status(root,path,args,actor):
         if command in ('claim', 'update') and _claims_the_row(args):
             _guard_open_dependency_on_claim(root,path,actor,row)
             # The per-project claiming setting (kittrial-5bb.352): under 'assigned' a
-            # bare claim of an unassigned task is refused on the host route too. An
-            # explicit assignment in the same call is the coordinator handing work out,
-            # not a worker taking it, so it is not this guard.
+            # bare claim of an unassigned task is refused on the host route too. A call
+            # that ALSO names an assignee is the hand-out case, judged by
+            # `_guard_claiming_on_assignment` below (review item B1): it is not a bare
+            # claim, and it is not a claim at all when the caller may assign.
             if not _names_assignee(args):
                 _guard_claiming_on_claim(path,row)
 
@@ -2413,6 +2467,12 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             # acted in this project is left exactly as it is (P5: an operator's
             # `--assignee w1` must keep w1, not a session that later registers the name w1).
             final,assignment_note=_resolved_bd_assignee(root,path,actor,authority_config,final)
+            # kittrial-5bb.352 review item B1: under 'assigned' only a coordinator hands
+            # work out, so an assignee spelling on create/update is refused unless the
+            # caller is a listed operator or holds live coordinate authority here. This
+            # is checked BEFORE the guards below (which may read the rows) and uses the
+            # resolved argv, so every spelling the resolver knows is covered.
+            _guard_claiming_on_assignment(root,path,actor,authority_config,request,final)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
             from review_workflow import listed_operator_actor, operator_owners

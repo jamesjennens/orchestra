@@ -16,6 +16,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
+import claim_limit
 import claiming
 import record_json
 import work
@@ -45,6 +46,13 @@ class ClaimingRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests)
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        # kittrial-5bb.352 review item B1: a listed operator is one of the two callers
+        # allowed to hand work out under 'assigned'. Add the name to this scratch
+        # deployment only (nothing in the fixture asserts an empty allowlist).
+        deployment = cls.root / 'deployment.private.json'
+        configured = json.loads(deployment.read_text(encoding='utf-8'))
+        configured['operators'] = ['session-operator']
+        deployment.write_text(json.dumps(configured), encoding='utf-8')
         try:
             rb.admin.provision_merge_slot(cls.root, 'pp')
         except BaseException:
@@ -162,6 +170,103 @@ class ClaimingRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests)
         refused = self.request('PUT', '/v1/projects/pp/claiming', {'claiming': 'assigned'},
                                token=secret)
         self.assertEqual(403, refused.status, refused.data)
+
+    def agent_secret(self):
+        """A personal agent of the owner, granted this project (kittrial-5bb.352 S1/S2)."""
+        made = self.request('POST', '/v1/agents',
+                            {'name': 'Kestrel', 'projects': ['pp'],
+                             'claim_limit': claim_limit.LIMIT_MAX},
+                            token=self.tokens['alex'])
+        self.assertEqual(201, made.status, made.data)
+        return made.data['credential']['secret']
+
+    def task_ids(self):
+        listed = self.bd('list', '--json')
+        self.assertEqual(0, listed.returncode, listed.stderr)
+        return {row.get('id') for row in json.loads(listed.stdout)}
+
+    def test_an_assignee_through_the_bd_passthrough_is_refused_under_assigned(self):
+        # kittrial-5bb.352 review item B1: a plain worker must not be able to take an
+        # unassigned task by naming itself as assignee, in any bd spelling, on update
+        # or on create.
+        task = self.new('assignee bypass')
+        self.assertEqual(200, self.set_claiming('alex', 'assigned').status)
+        attempts = (
+            ['update', task, '--claim', '--assignee', 'session-worker', '--json'],
+            ['update', task, '--assignee', 'session-worker', '--json'],
+            ['update', task, '--status', 'in_progress', '--assignee', 'session-worker', '--json'],
+            ['update', task, '--claim', '-a', 'session-worker', '--json'],
+            ['update', task, '--assignee=session-worker', '--json'],
+            ['update', task, '-a=session-worker', '--json'],
+            ['update', task, '-asession-worker', '--json'],
+            ['create', 'a created task', '--assignee', 'session-worker', '--json'],
+            ['create', 'another created task', '-a', 'session-worker', '--json'],
+        )
+        before = self.task_ids()
+        for args in attempts:
+            with self.subTest(args=args):
+                with self.assertRaises(ValueError) as caught:
+                    self.host(args)
+                self.assertIn(claiming.CLAIM_REFUSAL, str(caught.exception))
+        self.assertEqual(('open', None), self.bd_row(task))
+        after = self.task_ids()
+        self.assertEqual(before, after)  # neither create wrote a row
+
+    def test_an_operator_may_still_hand_work_out_under_assigned(self):
+        # B1: the host operator allowlist keeps its hand-out power.
+        task = self.new('operator hand-out')
+        self.assertEqual(200, self.set_claiming('alex', 'assigned').status)
+        # An actor that has already acted here: the operator's value is resolved, not
+        # rewritten, exactly as the assignment-time resolver requires (.333).
+        answer = self.host(['update', task, '--assignee', self.ids['alex'], '--json'],
+                           actor='session-operator')
+        self.assertEqual(0, answer['returncode'], answer)
+        self.assertEqual(('open', self.ids['alex']), self.bd_row(task))
+
+    def test_the_agent_routes_carry_the_assigned_empty_answer(self):
+        # kittrial-5bb.352 review item S1: /v1/agents/me/next must carry the sentence it
+        # already computes, /v1/agents/me/wait must carry it too, and the attention loop
+        # must stop offering unassigned work under 'assigned' (S2 mutant at the mode read).
+        task = self.new('agent claiming read')
+        secret = self.agent_secret()
+        offered = self.request('GET', '/v1/agents/me/next', token=secret)
+        self.assertEqual(200, offered.status, offered.data)
+        self.assertIn(('claimable-task', task),
+                      [(a['kind'], a['task']) for a in offered.data['next_actions']])
+        self.assertEqual(200, self.set_claiming('alex', 'assigned').status)
+        nxt = self.request('GET', '/v1/agents/me/next', token=secret)
+        self.assertEqual(200, nxt.status, nxt.data)
+        self.assertEqual(0, nxt.data['attention']['counts']['claimable'])
+        self.assertEqual([], nxt.data['next_actions'])
+        # The sentence travels inside the attention block, which is the set of keys
+        # /v1/agents/me/next copies (review item S1): it used to be dropped there.
+        self.assertEqual(claiming.EMPTY_SENTENCE, nxt.data['attention']['empty_message'])
+        wait = self.request('GET', '/v1/agents/me/wait', token=secret)
+        self.assertEqual(200, wait.status, wait.data)
+        self.assertEqual([], wait.data['items'])
+        self.assertEqual('assigned', wait.data['claiming'])
+        self.assertEqual(claiming.EMPTY_SENTENCE, wait.data['empty_message'])
+        # Back to open: the same task is offered again on both reads.
+        self.assertEqual(200, self.set_claiming('alex', 'open').status)
+        again = self.request('GET', '/v1/agents/me/next', token=secret)
+        self.assertIn(('claimable-task', task),
+                      [(a['kind'], a['task']) for a in again.data['next_actions']])
+
+    def test_the_web_task_list_does_not_offer_unassigned_work_under_assigned(self):
+        # kittrial-5bb.352 review item S2: _task_views must read the setting too, or the
+        # web Tasks list calls an unassigned row claimable while the queue says 0.
+        task = self.new('list claimability')
+        self.assertEqual(200, self.set_claiming('alex', 'assigned').status)
+        listed = self.request('GET', '/v1/projects/pp/tasks', token=self.tokens['alex'])
+        self.assertEqual(200, listed.status, listed.data)
+        row = next(item for item in listed.data['items'] if item['id'] == task)
+        self.assertFalse(row['claimable'])
+        self.assertEqual('coordinator', row['next_action']['who'])
+        self.assertEqual(claiming.EMPTY_SENTENCE, row['next_action']['text'])
+        self.assertEqual(200, self.set_claiming('alex', 'open').status)
+        listed = self.request('GET', '/v1/projects/pp/tasks', token=self.tokens['alex'])
+        row = next(item for item in listed.data['items'] if item['id'] == task)
+        self.assertTrue(row['claimable'])
 
 
 if __name__ == '__main__':

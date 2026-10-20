@@ -394,7 +394,11 @@ export async function feedback(ctx, { pid }) {
 export function claimingPanel(ctx, project) {
   const host = h('section', { class: 'panel', 'data-panel': 'claiming' });
   const block = project.claiming || { claiming: 'open', set_by: null, set_at: null, set_via: null };
-  const canSet = canApprove(project) && !project.archived && project.usable !== false;
+  // The SERVER's answer, not the page's role guess (kittrial-5bb.352 review item S2):
+  // GET /v1/projects/PID answers can_coordinate from the same live CAP_COORDINATE check
+  // the PUT route uses, so the control appears exactly when the save would be allowed
+  // (a superuser who is neither a member nor a granted agent is the case that differed).
+  const canSet = Boolean(project.can_coordinate) && !project.archived && project.usable !== false;
   function draw(value) {
     const chosen = value || block.claiming || 'open';
     const warned = block.source === 'damaged' ? block.warning : null;

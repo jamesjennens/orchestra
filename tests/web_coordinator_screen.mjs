@@ -71,6 +71,16 @@ const press = async (page, agent, label) => {
     options: [...new Set(claiming.all((e) => e.tagName === 'OPTION').map((o) => o.textContent))],
     select: Boolean(claiming.all((e) => e.tagName === 'SELECT' && e.attributes.id === 'claiming-value')[0]),
   } : null;
+  // kittrial-5bb.352 review item S2: the control follows the SERVER's can_coordinate,
+  // not the page's role guess. Two synthetic projects pin both answers.
+  const panelFor = (project) => {
+    const node = view.claimingPanel({}, project);
+    return Boolean(node.all((e) => e.tagName === 'SELECT' && e.attributes.id === 'claiming-value')[0]);
+  };
+  out.claimingCan = {
+    serverYes: panelFor({ role: 'contributor', can_coordinate: true, archived: false, usable: true }),
+    serverNo: panelFor({ role: 'owner', can_coordinate: false, archived: false, usable: true }),
+  };
   out.head = panel(page).textContent.slice(0, 160);
   out.before = rows(page);
   const [coordinating, working] = [out.before.find((r) => r.text.includes('Heron')).agent, out.before.find((r) => r.text.includes('Wren')).agent];

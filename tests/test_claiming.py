@@ -191,13 +191,76 @@ class GateTests(ProjectCase):
         endpoint._guard_claiming_on_claim(self.project, free_row())
 
     @POSIX
-    def test_an_explicit_assignment_is_not_a_bare_claim(self):
+    def test_an_assignee_is_recognised_in_every_bd_spelling(self):
+        # kittrial-5bb.352 review item B1: every spelling bd accepts, including the short
+        # joined forms, and nothing after `--` (which bd reads as a positional).
         self.assertFalse(endpoint._names_assignee(['update', 'p-1', '--claim', '--json']))
         for args in (['update', 'p-1', '--assignee', 'worker-a'],
                      ['update', 'p-1', '--assignee=worker-a'],
-                     ['update', 'p-1', '-a', 'worker-a']):
+                     ['update', 'p-1', '-a', 'worker-a'],
+                     ['update', 'p-1', '-a=worker-a'],
+                     ['update', 'p-1', '-aworker-a'],
+                     ['create', 'work', '--assignee=worker-a']):
             with self.subTest(args=args):
                 self.assertTrue(endpoint._names_assignee(args))
+        self.assertFalse(endpoint._names_assignee(
+            ['update', 'p-1', '--', '--assignee', 'worker-a']))
+
+    @POSIX
+    def test_an_assignment_through_bd_is_refused_under_assigned_unless_authorised(self):
+        # A plain worker cannot hand work out (B1); a listed operator can; and the live
+        # web CAP_COORDINATE answer is the other authority the setting names.
+        import tempfile
+        from unittest.mock import patch
+        root = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        (root / 'deployment.private.json').write_text(
+            json.dumps({'operators': ['operator-1']}), encoding='utf-8')
+        project = root / 'projects' / 'pp'
+        project.mkdir(parents=True)
+        claiming.write(project, 'assigned', 'owner-1')
+        attempts = (['update', 'p-1', '--assignee', 'worker-a'],
+                    ['update', 'p-1', '--claim', '--assignee', 'worker-a'],
+                    ['update', 'p-1', '--status', 'in_progress', '-a', 'worker-a'],
+                    ['update', 'p-1', '--assignee=worker-a'],
+                    ['update', 'p-1', '-a=worker-a'],
+                    ['create', 'work', '--assignee', 'worker-a'])
+        for args in attempts:
+            with self.subTest(args=args):
+                with self.assertRaises(ValueError) as caught:
+                    endpoint._guard_claiming_on_assignment(root, project, 'worker-a', None, {}, args)
+                self.assertIn(claiming.CLAIM_REFUSAL, str(caught.exception))
+        # A listed installation operator is the host hand-out case: allowed.
+        endpoint._guard_claiming_on_assignment(
+            root, project, 'operator-1', None, {}, ['update', 'p-1', '--assignee', 'worker-a'])
+        # A live coordinate descriptor is the web hand-out case: allowed only when the
+        # live check says yes, and never inferred from the request itself.
+        with patch.object(endpoint, 'verified_web_authority', return_value=True) as check:
+            endpoint._guard_claiming_on_assignment(
+                root, project, 'usr_0123456789abcdef', object(), {'authority': {}},
+                ['update', 'p-1', '--assignee', 'worker-a'])
+            check.assert_called_once()
+        with patch.object(endpoint, 'verified_web_authority', return_value=False):
+            with self.assertRaises(ValueError):
+                endpoint._guard_claiming_on_assignment(
+                    root, project, 'usr_0123456789abcdef', object(), {'authority': {}},
+                    ['update', 'p-1', '--assignee', 'worker-a'])
+        # Under 'open' an explicit assignment is unchanged.
+        claiming.write(project, 'open', 'owner-1')
+        endpoint._guard_claiming_on_assignment(
+            root, project, 'worker-a', None, {}, ['update', 'p-1', '--assignee', 'worker-a'])
+
+    def test_the_agent_attention_view_carries_the_empty_sentence(self):
+        # kittrial-5bb.352 review item S1: the sentence the attention read computes must
+        # reach /v1/agents/me/next, which builds its answer through this view.
+        attention = {'state': 'idle', 'summary': 'nothing', 'counts': {}, 'actions': [],
+                     'truncated': False, 'snapshot_truncated': False,
+                     'own_tasks_truncated': False, 'actions_truncated': False,
+                     'computed_at': None, 'empty_message': claiming.EMPTY_SENTENCE}
+        view = http_service.ApiHandler._agent_attention_view({'id': 'agent-1'}, attention)
+        self.assertEqual(claiming.EMPTY_SENTENCE, view['empty_message'])
+        attention.pop('empty_message')
+        self.assertNotIn('empty_message',
+                         http_service.ApiHandler._agent_attention_view({'id': 'agent-1'}, attention))
 
     def test_the_http_backend_remembers_the_setting_and_reads_it_fresh(self):
         service = type('S', (), {'state': {'canonical': {}}, 'store': object()})()

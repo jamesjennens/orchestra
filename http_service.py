@@ -6471,9 +6471,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
         rows = []
+        #: The claiming setting of every project this read covered (kittrial-5bb.352
+        #: review item S1): the same fresh per-project read the endpoints and
+        #: /v1/agents/me/next use, so an empty wait under 'assigned' carries the
+        #: sentence saying who hands work out instead of looking idle.
+        claiming_modes = {}
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(ctx.principal, project_id):
                 continue
+            claiming_modes[project_id] = self._claiming_mode(project_id)
             # The guidance acknowledgement is a move row too (kittrial-5bb.325), so a web
             # agent's wait wakes for a new version and its fingerprint changes with it;
             # the row is the same one /v1/agents/me/next shows as its first next_action.
@@ -6500,7 +6506,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if move == 'you':
                     rows.append(dict(task, task=task.get('id'), project=project_id,
                                      whose_move=move, next_actor=next_actor_value))
-        view = waiting.worker_view(rows)
+        # The project's claiming setting on the wait read (kittrial-5bb.352 review item
+        # S1). The wait can span projects, so report one mode only when they agree;
+        # under any 'assigned' project an empty wait carries the empty-list sentence,
+        # exactly as the agent next/attention loop decides it.
+        modes = set(claiming_modes.values())
+        claiming = (next(iter(modes)) if len(modes) == 1
+                    else ('assigned' if 'assigned' in modes else None))
+        empty_message = None
+        if not rows and 'assigned' in modes:
+            from claiming import EMPTY_SENTENCE
+            empty_message = EMPTY_SENTENCE
+        view = waiting.worker_view(rows, claiming=claiming, empty_message=empty_message)
         view['agent'] = agent.get('id')
         view['generated_at'] = now_iso(self.service._now())
         view['manual_cadence'] = ('Read this route again to see a change; it never blocks, '
@@ -7594,9 +7611,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                          'snapshot_truncated': False, 'own_tasks_truncated': False,
                          'actions_truncated': False,
                          'computed_at': None}
-        return {key: attention[key] for key in
+        view = {key: attention[key] for key in
                 ('state', 'summary', 'counts', 'truncated', 'snapshot_truncated',
                  'own_tasks_truncated', 'actions_truncated', 'computed_at')}
+        # kittrial-5bb.352 review item S1: the empty-list sentence the attention read
+        # computed under 'assigned' must travel on the route, not be dropped here.
+        if attention.get('empty_message'):
+            view['empty_message'] = attention['empty_message']
+        return view
 
     def _agent_resume_prompt(self, agent, attention):
         """A copyable prompt for the owner's local assistant. No secret is included."""

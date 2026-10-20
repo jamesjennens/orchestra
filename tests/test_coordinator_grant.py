@@ -877,6 +877,11 @@ class PageTests(Grants):
         self.assertEqual(seen['claiming'], {
             'options': ['Workers may claim open tasks', 'Only coordinators assign work'],
             'select': True})
+        # kittrial-5bb.352 review item S2: the control follows the server's answer, so a
+        # superuser-shaped role without can_coordinate does NOT get it, and a contributor
+        # role WITH can_coordinate does. A page that went back to canApprove(project)
+        # would answer True for the owner case and fail here.
+        self.assertEqual(seen['claimingCan'], {'serverYes': True, 'serverNo': False})
         self.assertIn('Agents in this project 2', seen['head'])
         self.assertEqual(sorted((row['coordinator'], row['buttons']) for row in seen['before']),
                          [('none', ['Extend existing credential', 'Make coordinator']), ('none', ['Extend existing credential', 'Make coordinator'])])
