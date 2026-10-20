@@ -281,12 +281,60 @@ class NewerActivityQueueTests(unittest.TestCase):
     def test_queue_without_checkpoint_or_with_malformed_history_is_neutral(self):
         item=work.queue(rows(),'alice/session',['--mine'])['items'][0]
         self.assertIsNone(item['newer_activity_by_others'])
+        self.assertIsNone(item['newer_activity_marker'])
         broken=rows()
         p=checkpoint(broken)
         append_checkpoint(broken,'cp1',p)
         append_checkpoint(broken,'cp2',dict(p,summary='Competing branch'))
         item=work.queue(broken,'alice/session',['--mine'])['items'][0]
         self.assertIsNone(item['newer_activity_by_others'])
+        self.assertIsNone(item['newer_activity_marker'])
+
+    def test_the_marker_is_the_newest_other_entry_plus_its_content_digest(self):
+        """kittrial-5bb.351: two comments move it, an edit moves it, own/checkpoint do not."""
+        data=rows()
+        save_cp(data,'cp1',next_action='Nothing pending')
+        data[0]['comments'].append(comment('dir0','Direction 0','2026-09-16T00:00:00Z',
+                                           author='coordinator/session'))
+        item=work.queue(data,'alice/session',['--mine'])['items'][0]
+        first=item['newer_activity_marker']
+        self.assertTrue(first.startswith(TASK+'-cdir0:'),first)
+        self.assertEqual(len(first.rsplit(':',1)[1]),briefing.MARKER_DIGEST)
+        # The kind's own summary carries the same marker, not a second computation.
+        self.assertEqual(briefing.brief(data,PROJECT,TASK)['newer']['newer_activity_marker'],first)
+        # The owner's own comment is not other-party activity: the marker does not move.
+        data[0]['comments'].append(comment('own','Own note','2026-09-16T02:00:00Z'))
+        self.assertEqual(work.queue(data,'alice/session',['--mine'])['items'][0]
+                         ['newer_activity_marker'],first)
+        # A second coordinator comment moves it to the newer entry.
+        data[0]['comments'].append(comment('dir1','Direction 1','2026-09-16T03:00:00Z',
+                                           author='coordinator/session'))
+        second=work.queue(data,'alice/session',['--mine'])['items'][0]['newer_activity_marker']
+        self.assertNotEqual(first,second)
+        self.assertTrue(second.startswith(TASK+'-cdir1:'),second)
+        # An EDIT of that newest entry keeps its id but changes its content digest,
+        # so a bridge that already woke on `second` wakes again.
+        data[0]['comments'][-1]['text']='Direction 1 (corrected)'
+        edited=work.queue(data,'alice/session',['--mine'])['items'][0]['newer_activity_marker']
+        self.assertNotEqual(second,edited)
+        self.assertTrue(edited.startswith(TASK+'-cdir1:'),edited)
+        # A new checkpoint incorporates it and resets the marker.
+        save_cp(data,'cp2',next_action='Process the corrected direction')
+        item=work.queue(data,'alice/session',['--mine'])['items'][0]
+        self.assertIsNone(item['newer_activity_marker'])
+        self.assertEqual(item['newer_activity_coverage'],'current')
+        self.assertIsNone(briefing.brief(data,PROJECT,TASK)['newer'])
+
+    def test_the_marker_is_null_when_coverage_is_unknown(self):
+        """A legacy checkpoint still counts and flags, but makes no precise claim."""
+        data=rows()
+        append_checkpoint(data,'cp1',checkpoint(data))
+        data[0]['comments'].append(comment('dir0','Direction 0','2026-09-16T00:00:00Z',
+                                           author='coordinator/session'))
+        item=work.queue(data,'alice/session',['--mine'])['items'][0]
+        self.assertEqual(item['newer_activity_by_others'],1)
+        self.assertEqual(item['newer_activity_coverage'],'unknown')
+        self.assertIsNone(item['newer_activity_marker'])
 
 
 if __name__=='__main__':unittest.main()

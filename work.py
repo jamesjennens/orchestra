@@ -605,7 +605,7 @@ def help_payload(action='work'):
                             'deployed_delivery', 'deployed_delivery_is_current_contribution',
                             'workflow_state', 'integration', 'integration_disagreements',
                             'integration_warnings', 'review_request', 'review_requests',
-                            'newer_activity_by_others', 'newer_activity_own',
+                            'newer_activity_marker', 'newer_activity_by_others', 'newer_activity_own',
                             'newer_activity_coverage', 'unresolved_directions',
                             'recommended', 'recommended_by', 'contribution_author'],
             'lanes': 'work lanes is the lanes board (kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md): ONE '
@@ -938,7 +938,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'review_request':False,'review_requests':[],
                           'recommended':False,'recommended_by':[],
                           'integration_disagreements':[],'integration_warnings':[],
-                          'newer_activity_by_others':None,'newer_activity_own':None,
+                          'newer_activity_marker':None,'newer_activity_by_others':None,'newer_activity_own':None,
                           'newer_activity_coverage':None,'unresolved_directions':None,
                           'waiting_for_approval':None,
                           'approval_requires_other_party':bool(independent_approval),

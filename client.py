@@ -335,7 +335,8 @@ class _InlineWait:
     EXIT_UNREACHABLE = 3
     MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor',
                    'contribution_id', 'pending_review_items', 'open_items', 'blocking_items',
-                   'checkpoint_at', 'newer_activity', 'redelivered', 'guidance_version')
+                   'checkpoint_at', 'newer_activity', 'newer_activity_marker',
+                   'redelivered', 'guidance_version')
     COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
                             'checkpoint-to-coordinator', 'lane-quiet')
     LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')
@@ -381,7 +382,7 @@ class _InlineWait:
         attention = item.get('attention')
         if isinstance(attention, dict):
             for name in ('open_items', 'blocking_items', 'checkpoint_at', 'newer_activity',
-                         'redelivered', 'pending_review_items'):
+                         'newer_activity_marker', 'redelivered', 'pending_review_items'):
                 if row.get(name) is None and name in attention:
                     row[name] = _InlineWait._scalar(attention.get(name))
         if not isinstance(row.get('pending_review_items'), int):
@@ -396,7 +397,18 @@ class _InlineWait:
             contribution = item.get('contribution')
             if isinstance(contribution, dict) and contribution.get('id') is not None:
                 row['contribution_id'] = _InlineWait._scalar(contribution.get('id'))
+        for name in ('newer_activity_by_others', 'newer_activity_own',
+                     'newer_activity_coverage', 'unresolved_directions'):
+            if row.get(name) is None:
+                value = item.get(name)
+                if value is None and isinstance(attention, dict):
+                    value = attention.get(name)
+                row[name] = _InlineWait._scalar(value)
         return row
+
+    @staticmethod
+    def _fingerprinted(row):
+        return {name: row.get(name) for name in _InlineWait.MOVE_FIELDS}
 
     @staticmethod
     def _canonical(value):
@@ -415,7 +427,8 @@ class _InlineWait:
     @staticmethod
     def fingerprint(items):
         return _InlineWait.digest(_InlineWait._sorted_rows(
-            [_InlineWait.normalize_item(item) for item in items if isinstance(item, dict)]))
+            [_InlineWait._fingerprinted(_InlineWait.normalize_item(item))
+             for item in items if isinstance(item, dict)]))
 
     @staticmethod
     def is_fingerprint(value):
@@ -664,7 +677,8 @@ class _InlineWait:
     def worker_view(items):
         rows = _InlineWait.movement(items)
         return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'worker', 'items': rows,
-                'fingerprint': _InlineWait.digest(rows)}
+                'fingerprint': _InlineWait.digest(_InlineWait._sorted_rows(
+                    [_InlineWait._fingerprinted(row) for row in rows]))}
 
     @staticmethod
     def _lane_row(lane, entry=None):
@@ -721,8 +735,11 @@ class _InlineWait:
         grouped = {name: _InlineWait._sorted_rows(rows) for name, rows in triggers.items()}
         flat = [dict(row, trigger=name) for name in _InlineWait.COORDINATOR_TRIGGERS
                 for row in grouped[name]]
+        fingerprinted = {name: _InlineWait._sorted_rows(
+            [_InlineWait._fingerprinted(row) for row in rows])
+            for name, rows in triggers.items()}
         return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
-                'items': flat, 'fingerprint': _InlineWait.digest(grouped)}
+                'items': flat, 'fingerprint': _InlineWait.digest(fingerprinted)}
 
     @staticmethod
     def parse_read_args(args):

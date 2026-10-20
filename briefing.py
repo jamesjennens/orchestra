@@ -532,6 +532,10 @@ def fitting_prefix(text,budget):
     return text[:lo]
 
 NEWER_MAX=5
+# A stable newer-activity marker is the newest other-party entry's ID plus this many
+# hex characters of that entry's current content digest. The digest is what makes an
+# EDIT to that same entry move the marker; the ID alone would not (kittrial-5bb.351).
+MARKER_DIGEST=16
 # Bounded provenance window: a checkpoint records exact digests for the most
 # recent incorporated entries and a rolling chain hash covering all older ones,
 # so the record stays within the checkpoint size cap on long-lived tasks while
@@ -842,6 +846,16 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     own=[e for e in entries if e['author']==owner]
     others=[e for e in entries if e['author']!=owner]
     authors=sorted({e['author'] for e in others})
+    # A stable marker of the newest OTHER-party entry, so a bridge wakes on the
+    # second coordinator comment too, not only when the `newer_activity` boolean
+    # first flips false->true (kittrial-5bb.351). The content digest is part of
+    # it: an edit to that entry (same ID, new body) must move the marker. Never a
+    # timestamp. Null when there is nothing newer, or when coverage is unknown:
+    # the marker is a precise claim, so a reader falls back to the boolean then.
+    marker=None
+    if coverage!='unknown' and others:
+        newest=max(others,key=lambda e:(parse_moment(e['timestamp']),e['entry_id']))
+        marker=newest['entry_id']+':'+content_hash(newest)[:MARKER_DIGEST]
     refs=[{'entry_id':e['entry_id'],'kind':e['kind'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
            'changed':any(c is e for c in changed_late)} for e in entries[:NEWER_MAX]]
     history='history '+data['task']
@@ -854,6 +868,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
         note+=(' Coverage is WINDOWED: '+str(unverified)+' older entries have no per-entry evidence recorded by this checkpoint, so their current content is unverified and they are excluded from the fresh/changed counts. '
                'Run "checkpoint '+data['task']+' --verify" for the classification supported by evidence retained across the task\'s checkpoints (entries no checkpoint ever recorded stay unknown).')
     result={'own_count':len(own),'other_count':len(others),
+            'newer_activity_marker':marker,
             'fresh_count':len(fresh),'changed_or_late_count':len(changed_late),
             'unverified_count':unverified,
             'coverage':coverage,
@@ -1406,7 +1421,7 @@ def verify_checkpoint(rows,project,task):
 
 def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
     """Bounded queue fields; share the brief's linked state and full-row snapshot."""
-    empty={'newer_activity_by_others':None,'newer_activity_own':None,
+    empty={'newer_activity_marker':None,'newer_activity_by_others':None,'newer_activity_own':None,
            'newer_activity_coverage':None,'unresolved_directions':None}
     try:
         if state is None:state=checkpoint_state(row)
@@ -1418,12 +1433,14 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
         dispositions=chain_dispositions(state['history'])
         context=direction_context(row,state);direction_data=direction_entries(data,context)
         counted,_directions_off_reason=directions_counted(provenance_writes,row.get('status'))
-        if cursor_matches(p['activity_cursor'],data):own=others=0;coverage='current'
+        if cursor_matches(p['activity_cursor'],data):own=others=0;coverage='current';marker=None
         else:
             newer=newer_activity_summary(data,retained_provenance(state),c.get('created_at'),
                                          context[0],dispositions,direction_data,counted,_directions_off_reason)
             own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
-        return {'newer_activity_by_others':others,'newer_activity_own':own,
+            marker=newer['newer_activity_marker']
+        return {'newer_activity_marker':marker,
+                'newer_activity_by_others':others,'newer_activity_own':own,
                 'newer_activity_coverage':coverage,
                 'unresolved_directions':len(unresolved_directions(direction_data,dispositions,context[0],counted))}
     except (ValueError,TypeError,KeyError):return empty

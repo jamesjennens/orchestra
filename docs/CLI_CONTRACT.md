@@ -260,6 +260,12 @@ A return with items (exit 0) is work: the schedule resets. Its `next_command` st
 again at the base `--timeout`, with a fresh `--idle-since` (the return time) and the
 fingerprint just printed.
 
+The fingerprint covers `newer_activity_marker` as well as the `newer_activity`
+boolean. A second other-party comment after the checkpoint, or an edit to the newest
+one, therefore wakes a waiting agent even while the boolean stays `true`; when the
+marker is `null` (no checkpoint, or legacy unknown coverage) the boolean alone decides,
+exactly as before.
+
 **The changed block.** The client keeps a small local state file beside its config (the
 same directory as the `--config` file, derived from that path - never a hard-coded
 `~/.orchestra`; one file per project, actor and form). It holds only the last
@@ -450,8 +456,17 @@ still reads `unknown` and its `event_id` names the event that caused it.
 references, own/other counts and explicit unknown/windowed coverage; the latter
 keeps other-actor comment directions visible until explicit resolution or
 supersession. Reading never acknowledges or completes them.
-`work --mine` adds `newer_activity_by_others`, `newer_activity_own`,
-`newer_activity_coverage` and `unresolved_directions` to displayed task rows.
+`work --mine` adds `newer_activity_marker`, `newer_activity_by_others`,
+`newer_activity_own`, `newer_activity_coverage` and `unresolved_directions` to
+displayed task rows. `newer_activity_marker` is the stable identity of the newest
+other-party entry the current checkpoint did not incorporate: its entry id plus a
+short digest of that entry's current content, written `<entry_id>:<16 hex>`. It is
+never a timestamp. A new other-party entry moves it, and so does an edit to that
+newest entry; the agent's own entries do not move it, and a new checkpoint clears
+it to `null`. It is `null` when the read is current, when there is no valid
+checkpoint, and when coverage is unknown (a legacy checkpoint without per-entry
+digests); a client then falls back to the `newer_activity` boolean, which keeps
+its released meaning. The `brief`'s `newer` block carries the same marker.
 `session resume` records a resume event and returns session, resume and guidance
 metadata; it returns neither task IDs nor task rows. Read `work --mine` for tasks
 and checkpoint attention. The `worker.py resume` wrapper also runs onboarding,
