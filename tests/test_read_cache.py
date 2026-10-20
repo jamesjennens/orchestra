@@ -423,7 +423,13 @@ class ReadCacheTests(unittest.TestCase):
                 thread.join(timeout=30)
         self.assertEqual(errors, [])
         self.assertFalse(any(thread.is_alive() for thread in threads))
-        self.assertEqual(run.exports, 5)                # no lock: all five refresh
+        # Without a lock there is no ORDER either: a reader that starts a moment
+        # after another's rename finds a perfectly good file and serves it - a
+        # hit, not a refresh (CI's ubuntu 3.10 job saw 4 exports, correctly).
+        # What no-lock MUST guarantee is what is asserted: every reader answers
+        # the true rows from its own refresh OR another's, the count sits in
+        # [1, 5], the file left behind is whole, and the next read serves.
+        self.assertTrue(1 <= run.exports <= 5, run.exports)
         for answer in answers:
             self.assertEqual([item['id'] for item in answer], ['t-1'])
         header, _, payload = self.cached_file().read_bytes().partition(b'\n')
