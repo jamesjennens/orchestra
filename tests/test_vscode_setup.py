@@ -852,7 +852,7 @@ class CredentialFileRewriteCase(unittest.TestCase):
         res_move2 = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['move']],
                                    env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(0, res_move2.returncode, res_move2.stderr)
-        self.assertIn('Click Save certificate in step 1 first, then run this again.', res_move2.stdout)
+        self.assertIn('Click Save certificate first, then run this again.', res_move2.stdout)
         self.assertNotIn('ItemNotFoundException', res_move2.stderr)
         self.assertNotIn('Cannot find path', res_move2.stderr)
 
@@ -877,22 +877,26 @@ class TheDialogAndThePageCase(unittest.TestCase):
                       setup)
 
     def test_the_dialog_says_what_is_written_and_what_is_left_to_the_person(self):
+        # kittrial-5bb.348: one action per screen. The files screen says in one sentence what is
+        # written (and that neither file holds the secret); its "More about this" names the files and
+        # the prompt alternative; the VS Code screen names the one command the person runs.
         agents = AGENTS_JS.read_text(encoding='utf-8')
-        self.assertIn("export const SETUP_WRITES_LINE = 'The prompt writes .orchestra/agent.json", agents)
-        self.assertIn("export const SETUP_ONCE_LINE = 'What is still yours, once: install the Orchestra "
-                      "Bridge extension in VS Code, run “Orchestra Bridge: Set up”", agents)
-        self.assertIn("h('p', { class: 'small', 'data-writes': 'setup' }, SETUP_WRITES_LINE)", agents)
-        self.assertIn("h('p', { class: 'small', 'data-once': 'true' }, SETUP_ONCE_LINE)", agents)
+        self.assertIn("'Pick the agent’s folder. Two small files are written there; neither holds the secret.'", agents)
+        self.assertIn('It writes .orchestra/agent.json and .orchestra/AGENT.md and adds .orchestra/ to an existing .gitignore.', agents)
+        self.assertIn("commandLine('Orchestra Bridge: Set up', 'VS Code command')", agents)
+        self.assertIn('It chooses this agent from your credential file, confirms the server, trusts the certificate by its fingerprint', agents)
         setup = SETUP_JS.read_text(encoding='utf-8')
         self.assertIn("export const BRIDGE_ROLES = Object.freeze(['worker', 'reviewer']);", setup)
 
     def test_the_wizard_does_not_pass_null_as_a_child(self):
         # A browser inserts the text "null" for a null child; the wizard used to pass
         # existingChildren[0] || null to replaceChildren (kittrial-5bb.342 review
-        # item static-lists-and-null).
+        # item static-lists-and-null). kittrial-5bb.348: a screen leaves out what does not apply
+        # (a null), so the screen list is filtered, and the in-dialog error line never gets one.
         agents = AGENTS_JS.read_text(encoding='utf-8')
         self.assertNotIn('existingChildren[0] || null', agents)
-        self.assertIn('...(existingChildren[0] ? [existingChildren[0]] : [])', agents)
+        self.assertIn('screenNode.replaceChildren(...screens[state.screen]().filter((node) => node !== null && node !== undefined && node !== false));', agents)
+        self.assertIn('errorLine.replaceChildren(...parts);', agents)
 
     def test_the_page_writes_no_settings_and_no_ca_file(self):
         agents = AGENTS_JS.read_text(encoding='utf-8')
@@ -920,11 +924,13 @@ class TheDialogAndThePageCase(unittest.TestCase):
         self.assertIn("onclick: () => saveCertificate(certificate, payload.certificateFile)", agents)
         self.assertIn("const blob = new Blob([certificate.certificate], { type: 'application/x-pem-file' });", agents)
         self.assertIn("download: file.name", agents)
-        # The certificate block is only built when the service has one.
-        self.assertIn("const certificateBlock = certificate ? h('section'", agents)
-        # The role is still chosen here, one window is one role.
-        self.assertIn("What this agent does in this window: ", agents)
-        self.assertIn("h('option', { value: 'reviewer' }, 'reviews other agents’ deliveries')", agents)
+        # The certificate screens are only in the plan when the service has one (kittrial-5bb.348).
+        setup = SETUP_JS.read_text(encoding='utf-8')
+        self.assertIn("...(hasCertificate ? ['cert-save', 'cert-move'] : [])", setup)
+        # The role is still chosen here, one window is one role; worker comes first.
+        self.assertIn("role: 'What this agent does',", agents)
+        self.assertIn("choice('setup-role', 'worker', 'Works on tasks'", agents)
+        self.assertIn("choice('setup-role', 'reviewer', 'Reviews deliveries'", agents)
         api = API_JS.read_text(encoding='utf-8')
         self.assertIn("certificate: () => call('GET', '/v1/service/certificate')", api)
 
@@ -1002,6 +1008,142 @@ class TheDialogAndThePageCase(unittest.TestCase):
         for text in ('Web personal-agent setup wizard', 'Orchestra Bridge 0.14 or later',
                      'PATCH /v1/agents/me'):
             self.assertIn(text, onboarding)
+
+
+class ProxyAwareSelfCheckCase(unittest.TestCase):
+    """kittrial-5bb.348: every curl the wizard gives bypasses a command-line proxy for the server's
+    own host and stops after 20 s, and the self-check says in ONE sentence that a proxy probably
+    answered when the answer is not Orchestra's. An office PC's HTTPS_PROXY sent curl to a corporate
+    proxy that could not reach the internal server; it answered with its own HTML page (HTTP 503)
+    after hanging. These run the real commands in PowerShell and bash against local servers that
+    play the proxy's part. Nothing leaves 127.0.0.1."""
+
+    HEADER = 'header = "Authorization: Bearer SECRET-XYZ-123"'
+    PAGE = b'<!DOCTYPE html><html><body><h1>Network Error</h1><p>Operation timed out</p></body></html>'
+
+    def serve(self, kind):
+        import http.server
+        page = self.PAGE
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if kind == 'silent':
+                    threading.Event().wait(30)      # never answers within curl's 20 s
+                    return
+                if kind == 'html503':
+                    body, status, ctype = page, 503, 'text/html'
+                elif kind == 'kit503':
+                    body, status, ctype = b'{"error": {"code": "busy", "message": "The service is busy"}}', 503, 'application/json'
+                else:
+                    body, status, ctype = b'{"agent": {"id": "a", "name": "Kestrel"}}', 200, 'application/json'
+                self.send_response(status)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return 'http://127.0.0.1:%d' % server.server_address[1]
+
+    def commands(self, server):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        script = ("const m = await import(process.argv[1]);"
+                  "const p = m.secretlessPayload({agent:{id:'a',name:'Kestrel',projects:['p1']}}, process.argv[2]);"
+                  "console.log(JSON.stringify({check: m.checkCommands(p), test: m.testCommands(p),"
+                  " sentence: m.proxySentence(process.argv[2])}))")
+        out = run_node_module(self, node, script, SETUP_JS.as_uri(), server)
+        self.assertEqual(0, out.returncode, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_every_wizard_curl_bypasses_the_proxy_for_this_host_and_stops_in_20_s(self):
+        cmds = self.commands('https://orchestra.office.example:8443')
+        for text in (cmds['check']['powershell'], cmds['check']['posix'], cmds['test']['powershell'], cmds['test']['posix']):
+            self.assertIn('--noproxy orchestra.office.example --max-time 20', text)
+            self.assertNotIn('--noproxy "*"', text)
+            self.assertNotIn('--noproxy *', text)
+        self.assertEqual("The answer did not come from Orchestra (a web page, an error without Orchestra's details, "
+                         "or no answer in 20 seconds): a proxy probably answered; check HTTPS_PROXY in this shell, "
+                         "or ask IT to let this computer reach orchestra.office.example directly.", cmds['sentence'])
+        # The agent's own calls in AGENT.md carry the same bypass, with the agent's longer limit.
+        node = shutil.which('node')
+        script = ("const m = await import(process.argv[1]);"
+                  "const p = m.secretlessPayload({agent:{id:'a',name:'Kestrel',projects:['p1']}}, 'https://orchestra.office.example:8443');"
+                  "console.log(m.agentGuide(p))")
+        guide = run_node_module(self, node, script, SETUP_JS.as_uri()).stdout
+        self.assertEqual(3, guide.count('--noproxy orchestra.office.example --max-time 60'), guide)
+
+    def run_check(self, shell, server, env_extra=None):
+        cmds = self.commands(server)
+        home = unique_dir('vscode-proxycheck-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / '.orchestra-agent-kestrel.curlrc').write_text(self.HEADER + '\n', encoding='utf-8')
+        # LOCALAPPDATA too: PowerShell writes its module analysis cache there, and it belongs in the
+        # scratch home, not the checkout.
+        env = dict(os.environ, USERPROFILE=str(home), HOME=str(home), LOCALAPPDATA=str(home), **(env_extra or {}))
+        if shell == 'powershell':
+            args = [POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['check']['powershell']]
+        else:
+            args = [BASH, '-c', cmds['check']['posix']]
+        done = subprocess.run(args, env=env, capture_output=True, text=True, timeout=120)
+        return done, cmds['sentence']
+
+    def shells(self):
+        found = []
+        if POWERSHELL and os.name == 'nt':
+            found.append('powershell')
+        if BASH and shutil.which('curl'):
+            found.append('bash')
+        if not found:
+            self.skipTest('neither Windows PowerShell nor bash with curl is installed')
+        return found
+
+    def test_an_html_503_from_a_proxy_is_the_one_sentence(self):
+        server = self.serve('html503')
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                done, sentence = self.run_check(shell, server)
+                said = done.stdout + done.stderr
+                self.assertIn(sentence, ' '.join(said.split()), said)
+                self.assertNotIn('Operation timed out', said)       # the proxy's page is not printed
+                self.assertNotIn('$p=', said)                       # nor the command around the sentence
+
+    def test_no_answer_stops_after_20_s_with_the_one_sentence(self):
+        import time
+        server = self.serve('silent')
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                started = time.monotonic()
+                done, sentence = self.run_check(shell, server)
+                self.assertLess(time.monotonic() - started, 60)
+                self.assertIn(sentence, ' '.join((done.stdout + done.stderr).split()))
+
+    def test_the_kits_own_error_is_not_blamed_on_a_proxy(self):
+        server = self.serve('kit503')
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                done, sentence = self.run_check(shell, server)
+                said = done.stdout + done.stderr
+                self.assertIn('HTTP 503 from Orchestra', said)
+                self.assertNotIn('proxy probably answered', said)
+
+    def test_a_proxy_in_the_environment_is_bypassed_for_this_server(self):
+        server = self.serve('kit200')
+        proxy = self.serve('html503')
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                done, _ = self.run_check(shell, server, {'http_proxy': proxy, 'HTTP_PROXY': proxy,
+                                                         'https_proxy': proxy, 'HTTPS_PROXY': proxy})
+                self.assertIn('"name": "Kestrel"', done.stdout, done.stderr)
+                self.assertNotIn('proxy probably answered', done.stdout + done.stderr)
 
 
 if __name__ == '__main__':

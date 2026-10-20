@@ -195,14 +195,58 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
   return Object.freeze({ powershell, posix });
 }
 
+// The server's own host name or address, as curl's --noproxy takes it (no scheme, port or
+// brackets). An office PC's command-line proxy (HTTPS_PROXY) sent curl to a corporate proxy that
+// cannot reach an internal Orchestra and answered with its own HTML page (kittrial-5bb.348): every
+// curl the wizard gives bypasses the proxy for THIS host only (never "*") and stops after
+// CURL_MAX_TIME seconds instead of hanging.
+export const CURL_MAX_TIME = 20;
+//: The agent's own calls (AGENT.md) wait longer: a first read of a large project after a write can
+//: take over 12 s, and the Bridge's own requests wait 60 s.
+export const AGENT_CURL_MAX_TIME = 60;
+export function serverHost(server) {
+  try { return new URL(String(server)).hostname.replace(/^\[(.*)\]$/, '$1') || 'localhost'; } catch { return 'localhost'; }
+}
+export function curlFlags(server, maxTime = CURL_MAX_TIME) {
+  return `--noproxy ${serverHost(server)} --max-time ${maxTime}`;
+}
+//: What the self-check says when the answer did not come from Orchestra: one sentence.
+export function proxySentence(server) {
+  return `The answer did not come from Orchestra (a web page, an error without Orchestra's details, or no answer in ${CURL_MAX_TIME} seconds): a proxy probably answered; check HTTPS_PROXY in this shell, or ask IT to let this computer reach ${serverHost(server)} directly.`;
+}
+
 // Commands that prove the stored secret works (they never contain it).
 export function testCommands(payload) {
   const file = payload.secretFile;
+  const flags = curlFlags(payload.server);
   return Object.freeze({
-    powershell: `curl.exe -fsS -K "${file.powershell}" ${payload.server}/v1/agents/me`,
+    powershell: `curl.exe -fsS ${flags} -K "${file.powershell}" ${payload.server}/v1/agents/me`,
     posixChmod: `chmod 600 ${file.posix}`,
-    posix: `curl -fsS -K ${file.posix} ${payload.server}/v1/agents/me`,
+    posix: `curl -fsS ${flags} -K ${file.posix} ${payload.server}/v1/agents/me`,
   });
+}
+
+// The lines the person pastes into the credential file on the "Save your secret" screen: the
+// comment lines the extension reads (the server address and, when the service has its own
+// certificate, its fingerprint), then the header line. With the address already in the file,
+// Orchestra Bridge 0.14's Set up proposes the server and checks the fingerprint itself, so the
+// short path needs no rewrite command (kittrial-5bb.348). `secretValue` is the fresh secret, passed
+// in by the one screen that shows it; every other caller gets the placeholder.
+export function credentialFileLines(server, fingerprint, secretValue = SECRET_PLACEHOLDER) {
+  return [...credentialCommentLines(server, fingerprint), headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue)].join('\n') + '\n';
+}
+
+// The wizard's screens, in order, for one path (kittrial-5bb.348: one action per screen). `bridge`
+// is a computer whose VS Code has Orchestra Bridge 0.14 or later: its Set up fetches and checks the
+// certificate, tests the connection and writes the agent's files, so that path skips the
+// certificate, rewrite, self-check and save-files screens. On Windows the file needs no chmod.
+export const WIZARD_SCREENS = Object.freeze(['system', 'role', 'cert-save', 'cert-move', 'secret', 'restrict',
+  'rewrite', 'test', 'files', 'vscode', 'resume']);
+export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false } = {}) {
+  const posix = osKind(os) === 'posix';
+  if (bridge) return ['system', 'role', 'secret', ...(posix ? ['restrict'] : []), 'vscode', 'resume'];
+  return ['system', 'role', ...(hasCertificate ? ['cert-save', 'cert-move'] : []), 'secret',
+    ...(hasCertificate ? ['rewrite'] : (posix ? ['restrict'] : [])), 'test', 'files', 'vscode', 'resume'];
 }
 
 // Browsers strip the leading dot when saving .orchestra-agent-<slug>.crt into Downloads
@@ -212,7 +256,7 @@ export function certificateMoveCommands(certFile) {
   if (!certFile) return Object.freeze({ strippedName: '', powershell: '', posix: '', note: '' });
   const name = certFile.name;
   const strippedName = name.replace(/^\.+/, '');
-  const missing = 'Click Save certificate in step 1 first, then run this again.';
+  const missing = 'Click Save certificate first, then run this again.';
   const powershell = `& { $d = Join-Path $HOME 'Downloads'; $s = if (Test-Path (Join-Path $d '${strippedName}')) { Join-Path $d '${strippedName}' } else { Join-Path $d '${name}' }; if (-not (Test-Path $s)) { Write-Output '${missing}'; return }; Move-Item -Force $s "${certFile.powershell}" }`;
   const posix = `if [ -f "$HOME/Downloads/${strippedName}" ]; then mv -f "$HOME/Downloads/${strippedName}" ${certFile.posix}; elif [ -f "$HOME/Downloads/${name}" ]; then mv -f "$HOME/Downloads/${name}" ${certFile.posix}; else echo '${missing}'; fi`;
   const note = `Browsers strip the leading dot when saving to Downloads (saving ${strippedName} instead of ${name}). Run this command to move it from Downloads into your user profile with its leading dot restored:`;
@@ -222,19 +266,36 @@ export function certificateMoveCommands(certFile) {
 // Self-check commands (kittrial-5bb.328 item 3 & kittrial-5bb.329 item 4): inspect the credential
 // file and certificate location for common setup mistakes (missing file, .curlrc.txt added by
 // Notepad, an unreplaced angle-bracket placeholder in the file, or the certificate still sitting in
-// Downloads without its leading dot) and print a one-line fix before calling curl -fsS -K.
+// Downloads without its leading dot) and print a one-line fix before calling Orchestra.
+//
+// kittrial-5bb.348: the call bypasses a command-line proxy for this server only and gives up after
+// CURL_MAX_TIME seconds, and it no longer uses -f: it reads the HTTP code and the answer, so an
+// answer that did not come from Orchestra (an HTML page, a 5xx without the kit's
+// {"error": {...}} shape, no answer in time, or a failed proxy tunnel) prints the ONE proxy
+// sentence instead of a bare curl error. A kit answer prints as before: the agent's JSON, or
+// "HTTP CODE from Orchestra: ..." for the kit's own errors. In PowerShell each message is one red
+// line (Write-Host), not Write-Error, which repeats the whole command around it.
 export function checkCommands(payload, { hasCertificate = false } = {}) {
   const file = payload.secretFile;
   const cert = payload.certificateFile;
   const strippedCert = cert ? cert.name.replace(/^\.+/, '') : '';
+  const flags = curlFlags(payload.server);
+  const url = `${payload.server}/v1/agents/me`;
+  const proxy = proxySentence(payload.server);
   const psCertCheck = hasCertificate && cert
-    ? `$crt="${cert.powershell}"; if (-not (Test-Path $crt)) { $dl=Join-Path $HOME 'Downloads'; if ((Test-Path (Join-Path $dl '${strippedCert}')) -or (Test-Path (Join-Path $dl '${cert.name}'))) { Write-Error "Certificate is still in Downloads without its leading dot. Fix: Move-Item -Force (Join-Path $HOME 'Downloads\\${strippedCert}') \`"$crt\`""; return } Write-Error "Missing certificate at $crt -- click Save certificate and run the Move-Item command in Step 1."; return }; `
+    ? `$crt="${cert.powershell}"; if (-not (Test-Path $crt)) { $dl=Join-Path $HOME 'Downloads'; if ((Test-Path (Join-Path $dl '${strippedCert}')) -or (Test-Path (Join-Path $dl '${cert.name}'))) { Write-Host -ForegroundColor Red "Certificate is still in Downloads without its leading dot. Fix: Move-Item -Force (Join-Path $HOME 'Downloads\\${strippedCert}') \`"$crt\`""; return } Write-Host -ForegroundColor Red "Missing certificate at $crt -- click Save certificate and run the move command first."; return }; `
     : '';
-  const powershell = `& { $p="${file.powershell}"; if (-not (Test-Path $p)) { if (Test-Path "$p.txt") { Write-Error "Notepad added .txt. Fix: Move-Item -Force \`"$p.txt\`" \`"$p\`""; return } Write-Error "Missing credential file at $p -- save the header line there first."; return }; $raw=[IO.File]::ReadAllText($p); if ($raw -match '<[a-z -]+>') { Write-Error "Found an unreplaced placeholder in $p -- paste the Step 1 header line and run the Step 1 rewrite command so the real user path is written automatically."; return }; ${psCertCheck}curl.exe -fsS -K "${file.powershell}" ${payload.server}/v1/agents/me }`;
+  const psCall = `$o = & curl.exe -sS ${flags} -K "$p" -w "\`n%{http_code}" ${url} 2>&1; $rc = $LASTEXITCODE; $t = ($o | Out-String).TrimEnd(); $i = $t.LastIndexOf("\`n"); $code = 0; [void][int]::TryParse($t.Substring($i + 1).Trim(), [ref]$code); $body = if ($i -ge 0) { $t.Substring(0, $i) } else { '' }; `
+    + `if ($rc -eq 28 -or $rc -eq 56 -or ($rc -ne 0 -and $t -match 'proxy|CONNECT tunnel') -or $body -match '^\\s*<' -or ($code -ge 500 -and $body -notmatch '"error"\\s*:\\s*\\{')) { Write-Host -ForegroundColor Red "${proxy}"; return }; `
+    + `if ($rc -ne 0) { Write-Host -ForegroundColor Red "curl exit $($rc): $t"; return }; if ($code -ge 400) { Write-Host -ForegroundColor Red "HTTP $code from Orchestra: $body"; return }; $body`;
+  const powershell = `& { $p="${file.powershell}"; if (-not (Test-Path $p)) { if (Test-Path "$p.txt") { Write-Host -ForegroundColor Red "Notepad added .txt. Fix: Move-Item -Force \`"$p.txt\`" \`"$p\`""; return } Write-Host -ForegroundColor Red "Missing credential file at $p -- save the lines from Save your secret there first."; return }; $raw=[IO.File]::ReadAllText($p); if ($raw -match '<[a-z -]+>') { Write-Host -ForegroundColor Red "Found an unreplaced placeholder in $p -- paste the lines from Save your secret and run the rewrite command so the real user path is written automatically."; return }; ${psCertCheck}${psCall} }`;
   const posixCertCheck = hasCertificate && cert
-    ? `crt="$HOME/${cert.name}"; if [ ! -f "$crt" ]; then if [ -f "$HOME/Downloads/${strippedCert}" ] || [ -f "$HOME/Downloads/${cert.name}" ]; then echo "Certificate is still in Downloads without its leading dot. Fix: mv -f \\"$HOME/Downloads/${strippedCert}\\" \\"$crt\\"" >&2; exit 1; fi; echo "Missing certificate at $crt -- click Save certificate and run the mv command in Step 1." >&2; exit 1; fi; `
+    ? `crt="$HOME/${cert.name}"; if [ ! -f "$crt" ]; then if [ -f "$HOME/Downloads/${strippedCert}" ] || [ -f "$HOME/Downloads/${cert.name}" ]; then echo "Certificate is still in Downloads without its leading dot. Fix: mv -f \\"$HOME/Downloads/${strippedCert}\\" \\"$crt\\"" >&2; exit 1; fi; echo "Missing certificate at $crt -- click Save certificate and run the move command first." >&2; exit 1; fi; `
     : '';
-  const posix = `( p="$HOME/${file.name}"; if [ ! -f "$p" ]; then if [ -f "$p.txt" ]; then echo "Extra .txt extension. Fix: mv -f \\"$p.txt\\" \\"$p\\"" >&2; exit 1; fi; echo "Missing credential file at $p -- save the header line there first." >&2; exit 1; fi; if grep -Eq '<[a-z -]+>' "$p"; then echo "Found an unreplaced placeholder in $p -- paste the Step 1 header line and run the Step 1 rewrite command so the real user path is written automatically." >&2; exit 1; fi; ${posixCertCheck}chmod 600 "$p" && curl -fsS -K "$p" ${payload.server}/v1/agents/me )`;
+  const posixCall = `out=$(curl -sS ${flags} -K "$p" -w '\\n%{http_code}' ${url} 2>&1); rc=$?; code=$(printf '%s\\n' "$out" | tail -n 1); body=$(printf '%s\\n' "$out" | sed '$d'); case "$code" in [0-9][0-9][0-9]) ;; *) code=0;; esac; `
+    + `if [ "$rc" -eq 28 ] || [ "$rc" -eq 56 ] || { [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -Eiq 'proxy|CONNECT tunnel'; } || printf '%s\\n' "$body" | grep -q '^[[:space:]]*<' || { [ "$code" -ge 500 ] && ! printf '%s' "$body" | grep -Eq '"error"[[:space:]]*:[[:space:]]*\\{'; }; then echo "${proxy}" >&2; exit 1; fi; `
+    + `if [ "$rc" -ne 0 ]; then echo "curl exit $rc: $out" >&2; exit 1; fi; if [ "$code" -ge 400 ]; then echo "HTTP $code from Orchestra: $body" >&2; exit 1; fi; printf '%s\\n' "$body"`;
+  const posix = `( p="$HOME/${file.name}"; if [ ! -f "$p" ]; then if [ -f "$p.txt" ]; then echo "Extra .txt extension. Fix: mv -f \\"$p.txt\\" \\"$p\\"" >&2; exit 1; fi; echo "Missing credential file at $p -- save the lines from Save your secret there first." >&2; exit 1; fi; if grep -Eq '<[a-z -]+>' "$p"; then echo "Found an unreplaced placeholder in $p -- paste the lines from Save your secret and run the rewrite command so the real user path is written automatically." >&2; exit 1; fi; ${posixCertCheck}chmod 600 "$p" && { ${posixCall}; } )`;
   return Object.freeze({ powershell, posix });
 }
 
@@ -280,6 +341,10 @@ export function agentJson(payload) {
 export function agentGuide(payload, { hasCertificate = false } = {}) {
   const file = payload.secretFile;
   const server = payload.server;
+  // kittrial-5bb.348: the agent's own calls bypass a command-line proxy for this server only and stop
+  // after AGENT_CURL_MAX_TIME seconds, like the wizard's (an office proxy answered for an internal
+  // server). Orchestra Bridge 0.14's own copy of this text follows in its next release.
+  const flags = curlFlags(server, AGENT_CURL_MAX_TIME);
   // What the credential file holds after set-up: the comment lines the rewrite put on top, the
   // curl options that make every curl -K accept the service's own certificate (when there is
   // one), and the header line. The commands stay curl -K FILE only -- the options travel in the
@@ -298,8 +363,8 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     '',
     '## Every call',
     '',
-    `- Windows (PowerShell): curl.exe -fsS -K "${file.powershell}" ${server}/v1/...`,
-    `- macOS/Linux: curl -fsS -K ${file.posix} ${server}/v1/...`,
+    `- Windows (PowerShell): curl.exe -fsS ${flags} -K "${file.powershell}" ${server}/v1/...`,
+    `- macOS/Linux: curl -fsS ${flags} -K ${file.posix} ${server}/v1/...`,
     '',
     '## Steps',
     '',
@@ -319,9 +384,10 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
 // this order to the order GET /v1/agents/me/next gives.
 export const RUN_ORDER = ['guidance', 'own-tasks', 'ready-list', 'held', 'checkpoint'];
 export function runSteps(server, file) {
+  const flags = curlFlags(server, AGENT_CURL_MAX_TIME);
   return [
     '1. The coordinator\'s standing guidance does not reach you over this API yet. If your owner gave you guidance for a project, follow it first.',
-    `2. Your own tasks: GET ${server}/v1/agents/me/next, for example curl.exe -fsS -K "${file.powershell}" ${server}/v1/agents/me/next. The reply lists your own tasks first: review requests to address, then a task you left blocked, then one in progress. Act on the first. Blocked and in-progress tasks flag newer activity since your checkpoint. Before you act, read the linked task brief and its newer summary; read its history for full comments (the same address ending in /history). Unknown coverage needs reconciliation; reading acknowledges nothing.`,
+    `2. Your own tasks: GET ${server}/v1/agents/me/next, for example curl.exe -fsS ${flags} -K "${file.powershell}" ${server}/v1/agents/me/next. The reply lists your own tasks first: review requests to address, then a task you left blocked, then one in progress. Act on the first. Blocked and in-progress tasks flag newer activity since your checkpoint. Before you act, read the linked task brief and its newer summary; read its history for full comments (the same address ending in /history). Unknown coverage needs reconciliation; reading acknowledges nothing.`,
     '3. Only when none of your own tasks needs action: the tasks the same reply says you could claim. Claim exactly one that nobody holds, and work on that one until it is delivered.',
     '4. A task assigned to somebody else is held, and so is one somebody else claimed: leave it. A parent or coordination task is background for a task you picked, not an inbox: nothing is posted there for you.',
     '5. Record a checkpoint when you stop, with what you need to continue, and deliver work for review through the API, always with curl -K as above. If an answer is needed before you can proceed, record an open item of kind blocker, not only a question. Only blockers and dependencies mark undelivered work as blocked; delivered work follows its review state.',
