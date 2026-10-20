@@ -6,7 +6,7 @@ kittrial-5bb.212's to ship. Until this service registers BOTH, the HTTP agent ro
 hand out no guidance item and no wake for one.
 
 The switch is a probe of this service's own route table (:func:`http_service.serves_web_guidance`),
-so these tests drive the real table, then a table with the two routes appended, then each
+so these tests drive the real table, then isolated tables with the two routes appended, then each
 route dropped in turn. They are cheap ones: no bd, no server, no endpoint.
 """
 import sys
@@ -65,9 +65,14 @@ def guidance_routes(*, read=True, ack=True):
 
 
 class RouteTableProbeTests(unittest.TestCase):
-    def test_the_shipped_service_serves_no_guidance_route_yet(self):
-        # Today's table: no read route, no ack route, so no item anywhere over HTTP.
-        self.assertEqual((False, False), http_service.serves_web_guidance())
+    def test_the_shipped_service_serves_both_guidance_routes(self):
+        # .212 now ships the actual read and ACK routes: .334's table probe opens
+        # the item automatically, without a second enable flag.
+        self.assertEqual((True, True), http_service.serves_web_guidance())
+        backend = BackendWithGuidance()
+        self.assertEqual(ITEM['guidance_version'],
+                         handler(backend)._agent_guidance_item('pp', 'agent-1')['guidance_version'])
+        self.assertEqual(1, backend.reads)
 
     def test_the_two_routes_are_recognised_when_they_exist(self):
         self.assertEqual((True, True), http_service.serves_web_guidance(guidance_routes()))
@@ -96,6 +101,14 @@ class RouteTableProbeTests(unittest.TestCase):
 
 
 class ItemGateTests(unittest.TestCase):
+    def setUp(self):
+        # Exercise .334's missing/partial-route boundaries independently of the
+        # complete table now registered by .212, restoring the actual table after.
+        from unittest.mock import patch
+        change = patch.object(http_service, 'ROUTES', [])
+        change.start()
+        self.addCleanup(change.stop)
+
     def append_routes(self, *routes):
         for entry in routes:
             http_service.ROUTES.append(entry)

@@ -181,6 +181,18 @@ class GuidanceAckMoveRealBdTests(unittest.TestCase):
         import re
         import http_service
         import test_http_review_fixes as fixes
+        from unittest.mock import patch
+        # .212 supplies the real routes now. Keep .334's native missing-route
+        # scenario explicit, then restore the real table after this test.
+        self.assertTrue(all(http_service.serves_web_guidance()))
+        without_clear_routes = [entry for entry in http_service.ROUTES
+                                if not ((entry[0] == 'GET' and entry[1].match(http_service.GUIDANCE_READ_PROBE))
+                                        or (entry[0] == 'POST' and any(entry[1].match(probe)
+                                            for probe in http_service.GUIDANCE_ACK_PROBES)))]
+        self.assertEqual((False, False), http_service.serves_web_guidance(without_clear_routes))
+        change = patch.object(http_service, 'ROUTES', without_clear_routes)
+        change.start()
+        self.addCleanup(change.stop)
         root = self.root
 
         class HttpHarness(fixes.Harness):
@@ -200,7 +212,7 @@ class GuidanceAckMoveRealBdTests(unittest.TestCase):
             self.assertEqual(201, made.status, made.data)
             secret = made.data['credential']['secret']
             first = self.set_guidance()
-            # 1. Over HTTP there is no guidance read or ack route on this service yet, so
+            # 1. In the isolated table the guidance read and ack routes are absent, so
             # the item is withheld and it is not a wake row either.
             nxt = harness.request('GET', '/v1/agents/me/next', token=secret)
             self.assertEqual(200, nxt.status, nxt.data)

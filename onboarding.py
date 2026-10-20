@@ -143,8 +143,8 @@ def split_web(document):
 def web_action(project_path, project, request, authority_config):
     """The ``set-onboarding`` endpoint action: an owner sets or clears the text. The envelope.
 
-    Only for the web service (``project_creation.service_descriptor``), for a session
-    that holds the project-administration capability on THIS project; re-checked against
+    Only for the authenticated web service, for a current account or personal agent
+    that holds the coordination capability on THIS project; re-checked against
     the live authority store under its lock by ``run_guarded``. The caller holds the
     project's coordination lock. ``args`` is ``['set']`` with the text attached as
     ``text``, or ``['clear']``. Clearing removes only text an owner set from the web: the
@@ -152,15 +152,22 @@ def web_action(project_path, project, request, authority_config):
     """
     import json
     from http_authority import journal_path, run_guarded
-    from project_creation import service_descriptor
-    descriptor = service_descriptor(request, authority_config, 'set-onboarding')
-    if descriptor.get('project') != project:
-        raise ValueError('set-onboarding needs a descriptor for this project')
+    from http_authority import AuthorityDenied, CAP_COORDINATE
+    from web_guidance import require_authority, _FileEffect
+
+    def authorize():
+        return require_authority(request, authority_config, CAP_COORDINATE, project)
     args = request.get('args')
     if args not in (['set'], ['clear']):
         raise ValueError('Use set-onboarding set (with the text attached) or set-onboarding clear')
-    attachment = (request.get('attachments') or {}).get('text')
+    attachments = request.get('attachments') or {}
+    if not isinstance(attachments, dict) or set(attachments) != ({'text'} if args == ['set'] else set()):
+        raise ValueError('Only onboarding set carries a text attachment')
+    attachment = attachments.get('text')
+    if args == ['set'] and (not isinstance(attachment, dict) or set(attachment) != {'flag', 'text'} or attachment.get('flag') != '--file'):
+        raise ValueError('Onboarding set needs one literal text attachment')
     text = attachment.get('text') if isinstance(attachment, dict) else None
+    tracker = _FileEffect()
     target = Path(project_path) / 'ONBOARDING.md'
 
     def effect():
@@ -178,8 +185,10 @@ def web_action(project_path, project, request, authority_config):
                         copy = Path(project_path) / OPERATOR_COPY
                         if copy.is_symlink():
                             raise ValueError('The copy of the operator\'s onboarding text must not be a symlink')
+                        tracker.before_write()
                         write_project(copy, previous)
                         kept = OPERATOR_COPY
+                tracker.before_write()
                 write_project(target, document)
                 result = {'state': 'set', 'source': 'web', 'bytes': len(document.encode('utf-8')),
                           'operator_text_kept_as': kept}
@@ -190,13 +199,19 @@ def web_action(project_path, project, request, authority_config):
                     if not split_web(target.read_text(encoding='utf-8-sig'))[0]:
                         raise ValueError('The onboarding text here was set by an operator on the server; only an '
                                          'operator changes or removes it')
+                    tracker.before_write()
                     target.unlink()
                 result = {'state': 'not-set', 'source': None, 'bytes': 0}
         except ValueError as refusal:
+            if tracker.attempted_write:
+                raise  # The retained operator copy or document may already have changed.
             return {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: %s\n' % refusal}
         return {'returncode': 0, 'stdout': json.dumps(result) + '\n', 'stderr': ''}
-    return run_guarded(request, journal_path(project_path), effect, authority_config=authority_config,
-                       require_authority=True)
+    try:
+        return run_guarded(request, journal_path(project_path), effect, authority_config=authority_config,
+                           require_authority=True, identity_check=authorize, runner=tracker)
+    except AuthorityDenied as error:
+        return dict(returncode=126, stdout='', stderr=error.message + '\n', authority_status=error.status)
 
 
 def _document_unreadable(name, error):

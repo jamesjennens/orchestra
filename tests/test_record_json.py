@@ -339,6 +339,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             # Assignment adds closed roster/request payloads at the endpoint and
             # guards both its native task reply and its reserved notice body.
             'task_assignment.py': 2,
+            # Service-only guidance bodies are caller text, parsed through the nesting guard.
+            'web_guidance.py': 2,
             'web_merge_slot.py': 4,
             # office_service.py (kittrial-5bb.168 review item 2) reads the /healthz answer of
             # whatever holds the port through the guard, not bare json.loads: the mark check

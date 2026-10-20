@@ -1,11 +1,11 @@
-"""Versioned, operator-set, per-project guidance for every actor run.
+"""Versioned per-project guidance with setter-route attribution.
 
-Guidance is an INSTRUCTION channel to agents, so its only writer is the operator
-host command (``admin.py set-guidance``), which checks the deployment operator
-allowlist before it writes. The endpoint can only read it and record that an
-actor has acknowledged a version; contributor-written text (task titles,
-proposal text, capability summaries) can never reach this file. The text is
-attributed to a setter only when the stored version is the hash of the exact text
+Guidance is an instruction channel authored through the operator host command
+or the authenticated web coordinate route. New writes record set_via (host/web)
+and the actual setter. Older records have an unknown route; never infer host
+provenance from the setter's name. It never overrides user authorization.
+Contributor task text and ordinary onboarding prose are data, not this channel.
+The text is attributed to a setter only when the stored version is the hash of the exact text
 read, so a hand edit or a crash between the two writes is reported as a mismatch
 instead of being credited to the previous setter.
 
@@ -14,12 +14,16 @@ onboarding entry point (``ONBOARDING.md``):
 
 * ``GUIDANCE.md`` - the bounded plain text. The version is the SHA-256 of its
   exact UTF-8 bytes, computed by every reader.
-* ``.guidance.json`` - the audit record: version, set_by, set_at, the previous
+* ``.guidance.json`` - the audit record: version, set_by, set_at, optional set_via, the previous
   version and text, a bounded history of earlier versions, and one
   acknowledgement per actor.
 
 Every reader is tolerant of an older kit's project: no ``GUIDANCE.md`` means
-"no guidance set", never an error, and unknown metadata keys are ignored. Text a
+"no guidance set", never an error. Read snapshots ignore unrelated unknown metadata
+keys; strict mutations and backup validators refuse them. New set_via generations
+require a route-aware kit for acknowledgement, compaction, backup and restore:
+older strict validators reject the extra field. Legacy same-text repairs preserve
+an absent route. See docs/HTTP_DEPLOYMENT.md for the rollback boundary. Text a
 missing or mismatched audit record does not bind to a valid operator set is
 WITHHELD from the endpoint (`text: null`, `attention: true`, a warning and a
 `next_action` that says the guidance is being repaired by the operator), because
@@ -157,10 +161,24 @@ JOINER = re.compile('[\u200c\u200d]')
 JOINER_SCRIPTS = frozenset(('ARABIC', 'SYRIAC', 'MONGOLIAN', 'NKO', 'DEVANAGARI', 'BENGALI', 'GURMUKHI', 'GUJARATI',
                             'ORIYA', 'TAMIL', 'TELUGU', 'KANNADA', 'MALAYALAM', 'SINHALA'))
 STAMP = re.compile(r'[0-9A-Za-z:+.\- ]{1,64}')
-META_FIELDS = {'schema_version', 'version', 'set_by', 'set_at', 'previous_version',
+META_FIELDS = {'schema_version', 'version', 'set_by', 'set_at', 'set_via', 'previous_version',
                'previous_text', 'history', 'acknowledged', 'acks_compacted_by',
                'acks_compacted_at'}
 HISTORY_FIELDS = {'version', 'set_by', 'set_at', 'previous_version'}
+SET_ROUTES = frozenset(('web', 'host'))
+
+
+def _valid_set_route(value):
+    return isinstance(value, str) and value in SET_ROUTES
+
+
+def _set_via(meta, bound=True):
+    return meta.get('set_via') if bound and isinstance(meta, dict) and _valid_set_route(meta.get('set_via')) else None
+
+
+def _stored_route(meta):
+    route = _set_via(meta)
+    return {'set_via': route} if route is not None else {}
 CLEAR_FIELDS = {'schema_version', 'clears'}
 CLEAR_ENTRY_FIELDS = {'cleared_by', 'cleared_at', 'cleared_version'}
 # The next action a reader shows while guidance is set but not bound to a valid
@@ -344,6 +362,8 @@ def validate_meta(meta):
         raise ValueError('Invalid guidance record: schema_version must be integer 1')
     if not isinstance(meta['version'], str) or not VERSION.fullmatch(meta['version']):
         raise ValueError('Invalid guidance record: version must be a sha256 hex digest')
+    if 'set_via' in meta and not _valid_set_route(meta['set_via']):
+        raise ValueError('Invalid guidance record: set_via must be web or host')
     if not _valid_actor(meta['set_by']):
         raise ValueError('Invalid guidance record: set_by must be an actor identity')
     if not _valid_stamp(meta['set_at']):
@@ -362,8 +382,10 @@ def validate_meta(meta):
     if not isinstance(history, list) or len(history) > HISTORY_LIMIT:
         raise ValueError('Invalid guidance record: history must be a list of at most %d entries' % HISTORY_LIMIT)
     for entry in history:
-        if not isinstance(entry, dict) or set(entry) != HISTORY_FIELDS:
+        if not isinstance(entry, dict) or set(entry) - {'set_via'} != HISTORY_FIELDS:
             raise ValueError('Invalid guidance record: malformed history entry')
+        if 'set_via' in entry and not _valid_set_route(entry['set_via']):
+            raise ValueError('Invalid guidance record: malformed history set_via')
         if not isinstance(entry['version'], str) or not VERSION.fullmatch(entry['version']):
             raise ValueError('Invalid guidance record: malformed history version')
         if entry['set_by'] is not None and not _valid_actor(entry['set_by']):
@@ -437,6 +459,8 @@ def _attribution(meta, current):
     if meta.get('version') != current:
         return None, None, False, ('Guidance audit metadata records a different version than the text; the record '
                                    'is unbound, so the text is withheld and is being repaired by the operator')
+    if 'set_via' in meta and not _valid_set_route(meta['set_via']):
+        return None, None, False, 'Guidance audit metadata has an invalid setter route; the text is withheld'
     set_by = meta.get('set_by') if _valid_actor(meta.get('set_by')) else None
     set_at = meta.get('set_at') if _valid_stamp(meta.get('set_at')) else None
     if set_by is None or set_at is None:
@@ -504,7 +528,7 @@ def _history_entries(meta):
     out = []
     if isinstance(meta, dict) and isinstance(meta.get('history'), list):
         for entry in meta['history']:
-            if not isinstance(entry, dict) or set(entry) != HISTORY_FIELDS:
+            if not isinstance(entry, dict) or set(entry) - {'set_via'} != HISTORY_FIELDS:
                 continue
             if not isinstance(entry.get('version'), str) or not VERSION.fullmatch(entry['version']):
                 continue
@@ -514,6 +538,8 @@ def _history_entries(meta):
                 continue
             if entry['previous_version'] is not None and (not isinstance(entry['previous_version'], str)
                                                           or not VERSION.fullmatch(entry['previous_version'])):
+                continue
+            if 'set_via' in entry and not _valid_set_route(entry['set_via']):
                 continue
             out.append(dict(entry))
     return out
@@ -537,7 +563,7 @@ def _prune_acks(meta, keep):
 
 
 def _unreadable(message):
-    return {'schema_version': 1, 'present': None, 'version': None, 'set_at': None, 'set_by': None,
+    return {'schema_version': 1, 'present': None, 'version': None, 'set_at': None, 'set_by': None, 'set_via': None,
             'text': None, 'changed': False, 'since': None, 'since_known': False,
             'previous_version': None, 'previous_text': None, 'acknowledged': None,
             'attention': True, 'unreadable': True, 'unbound': False,
@@ -553,7 +579,7 @@ def _withheld(meta, since, warning):
     `present` is true (a text file is there) and `version` is null (nobody may follow or
     acknowledge it), in this read and in `state`, so `get`, `version`, `brief`, `work`
     and resume say the same thing (kittrial-5bb.105)."""
-    return {'schema_version': 1, 'present': True, 'version': None, 'set_at': None, 'set_by': None,
+    return {'schema_version': 1, 'present': True, 'version': None, 'set_at': None, 'set_by': None, 'set_via': None,
             'text': None, 'changed': False, 'since': since, 'since_known': since is None,
             'previous_version': None, 'previous_text': None, 'acknowledged': None,
             'meta_version': meta.get('version') if isinstance(meta, dict) else None,
@@ -609,7 +635,7 @@ def state(path, actor=None, operators=None):
     # The hash of unbound text is not a version: nobody may follow or acknowledge it, so
     # no reader hands it out (`meta_version` still says what the record names).
     result = {'schema_version': 1, 'present': text is not None, 'version': current if bound else None,
-              'set_at': set_at, 'set_by': set_by,
+              'set_at': set_at, 'set_by': set_by, 'set_via': _set_via(meta, bound),
               'previous_version': (meta.get('previous_version') if bound else None),
               'meta_version': meta.get('version') if isinstance(meta, dict) else None,
               'acknowledged': acknowledged if current is not None else None,
@@ -665,7 +691,7 @@ def read(path, args, actor=None, operators=None):
         result['since'] = since
         return result
     if text is None:
-        return {'schema_version': 1, 'present': False, 'version': None, 'set_at': None, 'set_by': None,
+        return {'schema_version': 1, 'present': False, 'version': None, 'set_at': None, 'set_by': None, 'set_via': None,
                 'text': None, 'changed': False, 'since': since, 'since_known': since is None,
                 'previous_version': None, 'previous_text': None, 'acknowledged': None,
                 'attention': False, 'unreadable': False}
@@ -689,7 +715,7 @@ def read(path, args, actor=None, operators=None):
     changed = since is not None and since != current
     entry = _acknowledgement(meta, actor)
     result = {'schema_version': 1, 'present': True, 'version': current,
-              'set_at': set_at, 'set_by': set_by, **_repair_audit(path, meta, True, operators), 'text': text, 'changed': changed,
+              'set_at': set_at, 'set_by': set_by, 'set_via': _set_via(meta, bound), **_repair_audit(path, meta, True, operators), 'text': text, 'changed': changed,
               'since': since, 'since_known': since_known,
               'meta_version': meta.get('version') if isinstance(meta, dict) else None,
               'previous_version': previous,
@@ -714,7 +740,7 @@ def read(path, args, actor=None, operators=None):
     return result
 
 
-def write_guidance(path, text, actor, now=None):
+def write_guidance(path, text, actor, now=None, *, before_write=None, set_via='host'):
     """The operator write. Returns the new audit summary.
 
     Idempotent on unchanged text, but a missing or mismatched audit record is
@@ -732,6 +758,8 @@ def write_guidance(path, text, actor, now=None):
     """
     validate_text(text)
     validate_actor(actor)
+    if not _valid_set_route(set_via):
+        raise ValueError('Guidance setter route must be web or host')
     target, meta_path = _paths(path)
     replaced_unreadable = False
     try:
@@ -755,6 +783,7 @@ def write_guidance(path, text, actor, now=None):
     needs_repair = needs_repair or rewrite
     if previous == current and old_attributed and not rewrite:
         return {'version': current, 'set_by': old_meta['set_by'], 'set_at': old_meta['set_at'],
+                'set_via': _set_via(old_meta),
                 'previous_version': old_meta.get('previous_version'), 'changed': False, 'repaired': False}
     stamp = now or datetime.now(timezone.utc).isoformat()
     history = _history_entries(old_meta)
@@ -766,7 +795,8 @@ def write_guidance(path, text, actor, now=None):
         history.append({'version': previous,
                         'set_by': old_meta['set_by'] if old_attributed else None,
                         'set_at': old_meta['set_at'] if old_attributed else None,
-                        'previous_version': old_meta.get('previous_version') if old_attributed else None})
+                        'previous_version': old_meta.get('previous_version') if old_attributed else None,
+                        **(_stored_route(old_meta) if old_attributed else {})})
         superseded.add(previous)
     # Preserve the generation the audit record itself names when the file no longer
     # matches it (a crash between the two writes, or a hand edit): its own fields
@@ -781,7 +811,8 @@ def write_guidance(path, text, actor, now=None):
                         'set_at': old_meta.get('set_at') if _valid_stamp(old_meta.get('set_at')) else None,
                         'previous_version': (old_meta.get('previous_version')
                                              if isinstance(old_meta.get('previous_version'), str)
-                                             and VERSION.fullmatch(old_meta['previous_version']) else None)})
+                                             and VERSION.fullmatch(old_meta['previous_version']) else None),
+                        **_stored_route(old_meta)})
         superseded.add(record_version)
     if previous == current:
         # A same-text repair replaced no distinct text on disk, so "the previous
@@ -815,6 +846,10 @@ def write_guidance(path, text, actor, now=None):
     if isinstance(old_meta, dict) and 'acks_compacted_by' in old_meta and 'acks_compacted_at' in old_meta:
         meta['acks_compacted_by'] = old_meta['acks_compacted_by']
         meta['acks_compacted_at'] = old_meta['acks_compacted_at']
+    if rewrite:
+        meta.update(_stored_route(old_meta))
+    else:
+        meta['set_via'] = set_via
     validate_meta(meta)
     repair_path = Path(path) / REPAIR_NAME
     if rewrite and (repair_path.is_symlink() or (repair_path.exists() and not repair_path.is_file())):
@@ -825,6 +860,8 @@ def write_guidance(path, text, actor, now=None):
     # The text is written first: a crash before the metadata replace leaves the new
     # version already authoritative (readers derive it from the text) with stale
     # audit fields, which a set with the same text repairs (see above).
+    if before_write is not None:
+        before_write()
     write_text(target, text)
     atomic(meta_path, meta)
     audit_warning = None
@@ -843,7 +880,7 @@ def write_guidance(path, text, actor, now=None):
             repair_path.unlink()
         except OSError:
             pass   # readers ignore an audit whose version is not the record's
-    result = {'version': current, 'set_by': set_by, 'set_at': set_at,
+    result = {'version': current, 'set_by': set_by, 'set_at': set_at, 'set_via': _set_via(meta),
               'previous_version': previous_version,
               'changed': previous != current, 'repaired': needs_repair}
     if rewrite:
@@ -855,7 +892,7 @@ def write_guidance(path, text, actor, now=None):
     return result
 
 
-def acknowledge(path, actor, version=None):
+def acknowledge(path, actor, version=None, *, before_write=None):
     """Record that one actor has read the current guidance version.
 
     The caller must name the version it read; a version that is no longer current
@@ -909,6 +946,8 @@ def acknowledge(path, actor, version=None):
     table[actor] = {'version': current, 'acknowledged_at': stamp}
     meta['acknowledged'] = table
     validate_meta(meta)
+    if before_write is not None:
+        before_write()
     atomic(path / META_NAME, meta)
     return {'acknowledged': True, 'version': current, 'acknowledged_at': stamp, 'reconciled': False}
 
@@ -1011,7 +1050,7 @@ def clears_view(path):
     return view
 
 
-def clear(path, actor):
+def clear(path, actor, *, before_write=None):
     """Operator host route: remove the guidance text and its audit record entirely.
 
     A small local record (``.guidance-clear.json``) keeps who cleared it, when and
@@ -1034,6 +1073,8 @@ def clear(path, actor):
     removed = []
     for target in (text, meta, meta.with_suffix('.tmp'), Path(path) / REPAIR_NAME):
         if target.exists() or target.is_symlink():
+            if before_write is not None:
+                before_write()
             try:
                 target.unlink()
             except OSError:
@@ -1107,9 +1148,10 @@ def _unreadable_status(path, reason, host):
     if isinstance(meta, dict):
         record = {'version': recorded,
                   'set_by': meta.get('set_by') if _valid_actor(meta.get('set_by')) else None,
-                  'set_at': meta.get('set_at') if _valid_stamp(meta.get('set_at')) else None}
+                  'set_at': meta.get('set_at') if _valid_stamp(meta.get('set_at')) else None,
+                  'set_via': _set_via(meta)}
     result = {'schema_version': 1, 'present': None, 'unreadable': True, 'unreadable_reason': reason,
-              'repair': UNREADABLE_REPAIR, 'version': None, 'set_by': None, 'set_at': None,
+              'repair': UNREADABLE_REPAIR, 'version': None, 'set_by': None, 'set_at': None, 'set_via': None,
               'meta_version': recorded, 'audit_record': record, 'previous_version': None,
               'acknowledged': rows, 'acknowledged_total': len(rows),
               # Nobody is up to date with a file nobody can read. `behind` are the
@@ -1128,6 +1170,13 @@ def _unreadable_status(path, reason, host):
 
 
 def status(path, actor, operators=None, host=False):
+    """The unchanged host/operator guard, before any status file is read."""
+    from keyed_records import require_configured_operator
+    require_configured_operator(actor, operators, 'read the guidance acknowledgement status')
+    return _status_snapshot(path, actor, operators, host)
+
+
+def _status_snapshot(path, actor, operators=None, host=False):
     """Which lanes have acknowledged which version.
 
     The endpoint form (``host=False``, the default) reports only versions, actor
@@ -1138,8 +1187,6 @@ def status(path, actor, operators=None, host=False):
     previous text and the history, and is the only place an operator sees the text
     of an unbound record (kittrial-5bb.99 review `small` 1).
     """
-    from keyed_records import require_configured_operator
-    require_configured_operator(actor, operators, 'read the guidance acknowledgement status')
     target, _ = _paths(path)
     try:
         text = read_text(path)
@@ -1169,7 +1216,7 @@ def status(path, actor, operators=None, host=False):
     behind = sorted(row['actor'] for row in rows if not row['current'] and row['version'] == previous)
     stale = sorted(row['actor'] for row in rows if not row['current'] and row['version'] != previous)
     result = {'schema_version': 1, 'present': text is not None, 'version': current,
-              'set_by': set_by, 'set_at': set_at, **_repair_audit(path, meta, bound, operators),
+              'set_by': set_by, 'set_at': set_at, 'set_via': _set_via(meta, bound), **_repair_audit(path, meta, bound, operators),
               'meta_version': meta.get('version') if isinstance(meta, dict) else None,
               'previous_version': previous,
               'acknowledged': rows, 'acknowledged_total': len(rows),

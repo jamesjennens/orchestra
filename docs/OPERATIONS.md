@@ -1572,13 +1572,18 @@ clean, because it does not know the field and nothing survives in the reason any
 
 ### Standing guidance
 
-The standing guidance channel (kittrial-5bb.99) stores one operator-set instruction
-per project in `projects/PROJECT/GUIDANCE.md` plus its audit record
-`projects/PROJECT/.guidance.json`. The version is the SHA-256 of the exact text
-bytes, computed by every reader. Only `admin.py set-guidance` writes it (operator
-allowlist, checked before any file is read). The endpoint can read it and record an
-actor's own acknowledgement of the exact version it names; it cannot write it, and
-every other guidance subcommand is refused. The endpoint's `guidance status` shows
+The standing guidance channel stores one instruction per project in
+`projects/PROJECT/GUIDANCE.md` plus its audit record `projects/PROJECT/.guidance.json`.
+The version is the SHA-256 of the exact text bytes, computed by every reader.
+`admin.py set-guidance` requires the host operator allowlist before any file is read.
+The authenticated web route also lets current project coordinators author guidance
+(owners, superusers, coordinators and explicitly granted personal coordinator agents).
+The distinct service-only endpoint action checks live web authority; ordinary SSH
+`guidance` retains only get/version/ack/status and refuses write-shaped subcommands.
+Every guidance read reports `set_by` and `set_via` (`host` or `web`); `set_via: null`
+means an unknown legacy route, never inferred from the setter. Workers follow bound
+guidance from either authorized route within their user's authorization and limits.
+Contributor task text, proposals and ordinary onboarding prose remain data. The endpoint's `guidance status` shows
 versions and actor names but no guidance text; `admin.py guidance-status` is the
 authoritative operator read and adds the current text, the previous text and the
 history.
@@ -1617,9 +1622,10 @@ history.
 * Acknowledgement requires the version the caller read, given as
   `--version VERSION`; the endpoint refuses a bare positional version and refuses a
   stale version **without naming the current one**, so a caller must run
-  `guidance get` first. **Acks are unauthenticated:** actors are self-declared, any
-  actor the endpoint accepts may ack for itself, and a caller can name another
-  actor. A flood can fill the bounded table and evict a real lane's ack; that fails
+  `guidance get` first. **Host/SSH ack actors are self-declared:** any actor the
+  endpoint accepts may ack for itself, and a caller can name another actor. Web ACKs
+  bind the authenticated account, personal agent or distinct worker actor; a worker
+  credential with no actor or with its issuer account as actor is refused for ACK. A flood can fill the bounded table and evict a real lane's ack; that fails
   safe because an evicted lane re-reads and re-acks. The table is bounded (500): a
   new lane evicts the oldest entry rather than being refused, acks for versions
   other than the current and previous one are dropped at every set, and
@@ -1715,12 +1721,27 @@ has an effect in both directions.
   anything (`Nothing was changed: ...`); remove it and set again. If the audit write
   itself fails after the record was repaired, the set succeeds and prints that the
   repair audit could not be written.
-* **Rolling back below kittrial-5bb.121.** Nothing to do for the repair audit. The
-  record keeps exactly the fields the older kit validates, so `guidance ack`,
-  `compact-guidance-acks`, `backup` and `restore-new` work there unchanged; the older kit
+* **Rolling back below kittrial-5bb.121 with a legacy record.** Nothing to do for
+  the repair audit itself. A legacy record without `set_via` keeps exactly the fields
+  the older kit validates, so its `guidance ack`, `compact-guidance-acks`, `backup`
+  and `restore-new` remain compatible; this does not apply to new route-bearing
+  generations (see the boundary below). The older kit
   never reads `.guidance-repair.json`. A set there that rewrites the record (new text,
   or its own same-text repair) changes the version or the setter and leaves the file
   behind, where this kit then ignores it.
+
+**Guidance setter-route rollout (.212 review).** New generations add optional
+`set_via` to the existing metadata and history entries. Strict older kits, including
+main `07a3de32182dee10319fbd6cf741b92d68bfebeb`, can read text and setter but cannot
+show the route. Their new acknowledgements and compaction refuse the field; their
+backup omits the guidance pair as degraded, and their restore refuses a new pair.
+Upgrade all guidance readers/writers and backup/restore tools together before
+setting a new generation. Installation alone does not migrate existing records;
+a legacy same-text repair keeps an absent route, and a new-record repair keeps its
+known route. Never strip route attribution or run old writers to force acceptance.
+Use the clear-and-clean-backup rollback steps below, retaining text and the route
+audit separately in approved operator evidence. See
+[HTTP deployment](HTTP_DEPLOYMENT.md#guidance-metadata-rollout-and-rollback).
 
 **Rollback gap and the exact step.** An older kit (at or before
 `dca96b9d`) validates the coordination sidecar against a fixed path set that does
