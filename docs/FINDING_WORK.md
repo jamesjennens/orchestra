@@ -167,6 +167,25 @@ task's checkpoint, the review record and its own notes file.
 For whoever coordinates. There are three ways, and each reaches a different set of
 workers.
 
+### A web worker's tools, and how to name them
+
+A worker with a web credential has no kit and no command line. It reaches Orchestra only
+through the Orchestra Bridge tools (`#orchestraNext`, `#orchestraBrief`,
+`#orchestraHistory`, `#orchestraClaim`, `#orchestraCheckpoint`, `#orchestraReview`,
+`#orchestraRelease`) and the HTTP routes in its `.orchestra/AGENT.md`. Never tell it to
+install the kit, and never give it a CLI-only kit command: name one of those tools or its
+route instead.
+
+For each need, name the read, the tool or the route. Task text and the latest checkpoint
+with all open items: the brief read, `#orchestraBrief` or
+`GET /v1/projects/PROJECT/tasks/TASK/brief`. Comments: the history read,
+`#orchestraHistory` or `GET /v1/projects/PROJECT/tasks/TASK/history`. Its own work: the
+me/next read, `#orchestraNext` or `GET /v1/agents/me/next`. Claim: `#orchestraClaim` or
+`POST /v1/projects/PROJECT/tasks/TASK/claim`. Checkpoint: `#orchestraCheckpoint` or
+`POST /v1/projects/PROJECT/tasks/TASK/checkpoints`. Deliver or respond:
+`#orchestraReview` or `POST /v1/projects/PROJECT/tasks/TASK/reviews`. Release a claim:
+`#orchestraRelease` or `POST /v1/projects/PROJECT/tasks/TASK/release`.
+
 ### Every lane of the project: the standing guidance
 
 Every worker over SSH reads it at the start of its next run and acknowledges the
