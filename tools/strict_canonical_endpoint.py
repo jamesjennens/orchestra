@@ -748,6 +748,12 @@ def main():
                 name: actor_names.collision(name, **reserved(rows, own))
                 for name in request.get('args') or []}}))))
             return
+        if request.get('action') == 'web-guidance':
+            # Emulate transport only; use the actual canonical file/authority adapter.
+            # Actual HTTP/native qualification is test_web_guidance_http, not this stub.
+            from web_guidance import web_action
+            print(json.dumps(web_action(canonical.path, request.get('project'), request, config)))
+            return
         if request.get('action') == 'set-onboarding':
             # endpoint.py's service-only action (kittrial-5bb.118 part 2): the kit's own
             # rules, which run their own guarded section.

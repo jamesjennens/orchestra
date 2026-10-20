@@ -21,16 +21,25 @@ workers to re-run `onboard`; that is the interim this channel replaces.
 ## Model
 
 * One **guidance record per project**, separate from the onboarding entry point.
-  It is bounded (8000 bytes), plain text, and set only by the operator host route
-  `admin.py set-guidance PROJECT --actor ACTOR --file FILE`. The configured
+  It is bounded (8000 bytes), plain text, and authored through either the operator
+  host route `admin.py set-guidance PROJECT --actor ACTOR --file FILE` or the
+  authenticated web route `PUT /v1/projects/PROJECT/guidance`. The web route requires
+  current project coordination authority: owner, coordinator, superuser or an
+  explicitly granted personal coordinator agent; worker credentials cannot write it.
+  For the host route, the configured
   operator allowlist (`deployment.private.json`) is checked first, so an empty
   allowlist authorizes nobody. `--actor` is a typed string checked against that
   file, which the host user can edit: it separates a contributor client from the
   host route, but the real boundary is access to the host shell (and, until SSH
   keys are confined under kittrial-5bb.89, that is the only boundary).
-* The record is **audited**: every set records who (`set_by`), when (`set_at`),
+* The record is **audited**: each new generation records who (`set_by`), the
+  actual setter route (`set_via: host` or `set_via: web`), when (`set_at`),
   the new version, the previous version and the previous text. The history is
   bounded (50 entries); the acknowledgement table is bounded (500 actors). The
+  route is also retained in each known history entry. Every guidance read reports
+  `set_by` and `set_via`; a legacy record without the field has `set_via: null`
+  (unknown route). Same-text sets and repairs preserve its original setter and route,
+  including an unknown legacy route, rather than manufacturing host provenance. The
   text is attributed to a setter only when the stored version is the hash of the
   exact text read and both setter fields are valid, so a hand edit or a crash
   between the two writes reads as unbound with no setter (`warning`, `set_by: null`,
@@ -44,7 +53,7 @@ workers to re-run `onboard`; that is the interim this channel replaces.
   write therefore cannot advertise a version that does not describe the text; it
   leaves an unbound record that the next set (even with the same text) repairs.
 * Every **work**, **brief** and session **resume** response carries a compact
-  guidance block: `present`, `version`, `set_at`, `set_by`, `unbound`,
+  guidance block: `present`, `version`, `set_at`, `set_by`, `set_via`, `unbound`,
   `previous_version`, `acknowledged`, and `attention` (true exactly when guidance is
   set, or cannot be read, and the calling actor has not acknowledged the current
   version). `guidance get` returns the full text and what changed since a named
@@ -60,18 +69,22 @@ workers to re-run `onboard`; that is the interim this channel replaces.
   worker or followed, and a same-text set repairs it. Every reader reports unbound
   text the same way, `present: true` with `version: null` (kittrial-5bb.105): the
   hash of withheld text is not a version anyone may follow or acknowledge.
-* The **endpoint never writes guidance**. Its subcommands are an explicit allowlist
-  (`get`, `version`, `ack`, `status`); every write-shaped subcommand is refused, the
-  test enumerates the accepted subcommands and fails on any not in that read+ack
-  set, and the endpoint status read shows no guidance text.
+* The ordinary **host/SSH guidance action** keeps its explicit subcommand allowlist
+  (`get`, `version`, `ack`, `status`); write-shaped subcommands there are refused.
+  The distinct service-only `web-guidance` action accepts authenticated web set/clear
+  only after live coordinate and actor/project binding checks at both the HTTP gate
+  and canonical effect. Host/SSH callers cannot enter that service-only action.
+  Status reads show no guidance text.
 * The **acknowledgement table is bounded and pruned**: acks for versions other than
   the current and previous one are dropped at every set; a new lane evicts the
   oldest entry when the table is full rather than being refused; and the operator
   can drop stale acks with `admin.py compact-guidance-acks` (audited in the record
   as `acks_compacted_by`/`acks_compacted_at`, kept across later sets). An
-  acknowledgement is **not authentication**: actors are self-declared, so naming
-  another actor is always possible and an ack proves only that *some* caller named
-  that actor and version. The endpoint therefore does NOT require a session
+  acknowledgement never proves the text was read or followed. On the host/SSH route,
+  actors are self-declared, so another actor can be named. Web acknowledgement binds
+  the live authenticated account, personal agent or distinct worker actor; a worker
+  credential with no actor or with its issuer account as actor is refused for ACK.
+  The host/SSH endpoint does NOT require a session
   registration for an ack (legacy lanes have none): any actor the endpoint accepts
   may ack for itself. A flood can fill the bounded table and evict a real lane's
   ack; that fails safe because an evicted lane re-reads and re-acks, and a future
@@ -89,8 +102,10 @@ workers to re-run `onboard`; that is the interim this channel replaces.
 Guidance is an **instruction channel to agents**, so the trust rules are the
 strict ones:
 
-* Only the operator host route writes it. The endpoint can read it and record an
-  actor's own acknowledgement of the version it names and nothing else.
+* The operator host route and authenticated web project coordinators can author it.
+  Workers treat bound guidance from either authorized route as instructions within
+  their user's authorization and machine limits. Every read exposes the setter and
+  route; a legacy unknown route is reported honestly, never inferred as host.
 * Every read marks who set the current text and when **only when the stored version
   is the hash of the text read and both setter fields are valid**; a mismatched,
   missing or unattributed record is reported as unbound with a warning, and its text
@@ -98,18 +113,34 @@ strict ones:
 * The host route is protected by the operator allowlist plus host shell access, and
   `--actor` is a typed string checked against a file the host user can edit. Until
   SSH keys are confined under kittrial-5bb.89, host shell access is the only real
-  boundary. An acknowledgement is unauthenticated: any caller that can reach the
-  endpoint can name another actor, so an ack proves only that some caller named
-  that actor and version, not that the text was read.
+  boundary for that route. Host/SSH acknowledgements are self-declared; web ACKs are
+  bound to current authenticated identity and a worker requires a distinct actor.
+  Neither is proof that the guidance was read or followed.
 * It never overrides the user's authorization, the machine's limits for that
   agent, or the worker safety rules. The worker instructions say so explicitly,
   and a worker declines and reports guidance that asks for something outside its
   user's authorization.
-* Contributor-written text (task titles, proposal text, capability summaries,
-  reference entries) can never reach the guidance file: no client action writes
-  it, and the shared instructions keep marking such text as data.
+* Contributor task text, proposals, capability summaries, reference entries and
+  ordinary onboarding prose remain data. A coordinator must deliberately author
+  guidance rather than treating copied contributor text as trusted instructions.
+  An agent explicitly granted project coordination can author guidance; that grant
+  is consequential and is checked live, without adding a global host operator.
 
 ## Rollback and backup behaviour
+
+* **Route-field boundary (.212 review):** new generations add optional `set_via` to
+  the existing record and known history entries. Strict older kits, including main
+  `07a3de32182dee10319fbd6cf741b92d68bfebeb`, reject that field for new ACKs,
+  compaction and restoring a new guidance pair, and omit that pair from their
+  degraded backup. Ordinary old reads cannot show the route. Upgrade guidance
+  writers and backup/restore tools together. Legacy same-text repair keeps the
+  previous shape, but a new generation is not backward write/backup compatible.
+  Do not run old writers on a new record or strip route attribution to force it
+  through an old validator. Before rollback, clear guidance using this kit and
+  take a clean backup without the pair; retain text and route audit separately
+  as approved operator evidence, then re-set guidance after rolling forward.
+  Installation alone does not migrate records. See HTTP_DEPLOYMENT.md for the
+  complete rollout boundary.
 
 * `GUIDANCE.md` and `.guidance.json` are included in the project coordination
   backup and restored as one generation; `validate_coordination_files` and
@@ -161,7 +192,7 @@ action) returns the whole turn prompt composed by the server.
 Composition order (all server-side):
 
 1. the kit's shared worker instructions for the installed version;
-2. the project's operator-set guidance (the record above);
+2. the project's authorized host/web guidance (the record above);
 3. the actor's own state: claims, requested revisions, pending review items,
    attention, and the suggested next action;
 4. per-role variants (worker, coordinator, reviewer) and a size bound.
@@ -174,9 +205,9 @@ coordinator's instruction to be followed only within those limits.
 
 Risks the design must keep handling, stated here so the owner can decide with them
 in front of him: whoever can set the server prompt directs every agent, so writes
-stay operator-only, audited and versioned (and the confined SSH setup,
-kittrial-5bb.89, matters more); acknowledgements are unauthenticated and
-self-declared, so a composed prompt must not present `acknowledged` as proof that a
+require current operator or web project coordination authority and stay audited
+and versioned (the confined SSH setup, kittrial-5bb.89, still matters); host/SSH
+acknowledgements are self-declared and web ACKs bind authenticated identity, so a composed prompt must not present `acknowledged` as proof that a
 lane read or followed the text; contributor-written text is marked as data inside
 the composed prompt; an unreachable server leaves the worker following the last
 version it acknowledged (it names that version; the server keeps the record); the

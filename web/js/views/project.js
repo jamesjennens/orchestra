@@ -3,6 +3,7 @@ import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { setupHint } from './setup.js';
 import { mergeSlotPanel } from './merge_slot.js';
+import { guidancePanel } from './guidance.js';
 import { coordinationPanel } from './coordination.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 
@@ -282,6 +283,7 @@ export async function overview(ctx, { pid }) {
     unusableBanner(project),
     setupLine,
     mergeSlotPanel(ctx, project),
+    guidancePanel(ctx, project),
     // The lane board (kittrial-5bb.263). Every member sees it: the route scopes a viewer
     // who is not an owner or coordinator to their own agents' lanes, so a lane always sees
     // its own row here, and the cross-lane view is never inherited from the transport.

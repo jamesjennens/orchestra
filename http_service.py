@@ -3158,18 +3158,48 @@ class EndpointBackend:
     CREATION_FAILED = ('The project could not be created, or was only partly made. Ask an operator of the server '
                        'to look before you try again.')
 
+    def guidance_command(self, principal, project_id, operation, body=None, text=None, key=None):
+        """One canonical guidance operation, with the real authenticated identity."""
+        import web_guidance
+        capability = web_guidance.CAPABILITIES[operation]
+        writing = operation in ('set', 'clear', 'ack')
+        operation_id = self._result_key(principal, project_id, 'guidance.' + operation, key, None) if writing else None
+        if writing:
+            self._settle_actor_rows(principal, project_id)
+        payload = dict(body or {}, operation=operation)
+        attachments = {'text': {'flag': '--file', 'text': text}} if operation == 'set' else {}
+        try:
+            reply = self._endpoint('web-guidance', project_id, self._actor(principal), [json.dumps(payload)],
+                                   attachments, operation_id=operation_id,
+                                   authority=authority_request(principal, project_id, capability,
+                                                               now=self.service._expiry_now()),
+                                   require_authority=True, route='guidance.' + operation)
+        except HttpError as error:
+            if not writing and error.status == 503 and error.code == 'uncertain':
+                refused = HttpError(503, 'unavailable', 'Guidance or onboarding could not be read. Nothing was changed; try again shortly.')
+                refused.nothing_done = True
+                raise refused from None
+            raise
+        return self._checked(reply, reading=not writing)
+
+    def guidance_replay_guard(self, principal, project_id, operation):
+        # Re-check live canonical authority before a service-cache replay. A revoked
+        # coordinator grant must not replay a cached coordinate operation.
+        return self.guidance_command(principal, project_id,
+                                     'read' if operation == 'ack' else 'coordinate-check')
+
     def set_onboarding(self, principal, project_id, text, key):
         """An owner sets (``text``) or clears (``None``) the project's onboarding text.
 
         One service-only ``set-onboarding`` endpoint action. The endpoint re-checks the
-        project-administration capability under the authority lock and applies the same
+        coordination capability under the authority lock and applies the same
         size limit as ``admin.py set-onboarding`` plus the plain-text rule. The text
         travels as an attachment, never on a command line.
         """
         operation_id = self._result_key(principal, project_id, 'projects.onboarding', key, None)
-        authority = authority_request(principal, project_id, CAP_PROJECT_ADMIN, now=self.service._expiry_now())
+        authority = authority_request(principal, project_id, CAP_COORDINATE, now=self.service._expiry_now())
         attachments = {} if text is None else {'text': {'flag': '--file', 'text': text}}
-        reply = self._endpoint('set-onboarding', project_id, principal.user_id,
+        reply = self._endpoint('set-onboarding', project_id, self._actor(principal),
                                ['clear'] if text is None else ['set'], attachments, operation_id=operation_id,
                                authority=authority, require_authority=True, route='projects.onboarding')
         if isinstance(reply, dict) and reply.get('returncode') == 2:
@@ -5830,11 +5860,92 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'projects.update', ctx.params['pid'], update,
                             capability=CAP_PROJECT_ADMIN)
 
+    def _guidance_project(self, ctx, capability=CAP_READ):
+        self._project(ctx, capability)
+        if not hasattr(self.backend, 'guidance_command'):
+            raise not_implemented('This server has no canonical guidance adapter')
+
+    def _guidance_can_coordinate(self, ctx):
+        try:
+            self.service.check_authority(ctx.principal, ctx.params['pid'], CAP_COORDINATE)
+            return True
+        except HttpError:
+            return False
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/guidance')
+    def project_guidance(self, ctx):
+        self._guidance_project(ctx)
+        result = self.backend.guidance_command(ctx.principal, ctx.params['pid'], 'read')
+        return 200, dict(result, can_coordinate=self._guidance_can_coordinate(ctx))
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/guidance/status')
+    def project_guidance_status(self, ctx):
+        self._guidance_project(ctx, CAP_COORDINATE)
+        pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(pairs) - {'offset', 'limit'} or any(len(v) != 1 for v in pairs.values()):
+            raise invalid('Use only one offset and limit')
+        try:
+            offset = int(pairs.get('offset', ['0'])[0])
+            limit = int(pairs.get('limit', ['50'])[0])
+        except (ValueError, TypeError):
+            raise invalid('Use an integer offset and limit') from None
+        if not 0 <= offset <= 500 or not 1 <= limit <= 100:
+            raise invalid('Use offset 0..500 and limit 1..100')
+        return 200, self.backend.guidance_command(ctx.principal, ctx.params['pid'], 'status',
+                                                  body=dict(offset=offset, limit=limit))
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/onboarding/read')
+    def project_onboarding_read(self, ctx):
+        """Every current project member reads the WHOLE document, including operator text."""
+        self._guidance_project(ctx)
+        result = self.backend.guidance_command(ctx.principal, ctx.params['pid'], 'onboarding')
+        return 200, dict(result, can_coordinate=self._guidance_can_coordinate(ctx))
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/guidance')
+    def project_guidance_set(self, ctx):
+        return self._guidance_write(ctx, 'set')
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/guidance')
+    def project_guidance_clear(self, ctx):
+        return self._guidance_write(ctx, 'clear')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/guidance/ack')
+    def project_guidance_ack(self, ctx):
+        return self._guidance_write(ctx, 'ack')
+
+    def _guidance_write(self, ctx, operation):
+        capability = CAP_READ if operation == 'ack' else CAP_COORDINATE
+        self._guidance_project(ctx, capability)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        fields = {'set': {'text'}, 'ack': {'version'}, 'clear': set()}[operation]
+        if set(payload) != fields or (ctx.payload is not None and not isinstance(ctx.payload, dict)):
+            raise invalid('Send exactly: ' + (', '.join(sorted(fields)) or 'an empty object'))
+        import web_guidance
+        body = {k: v for k, v in payload.items() if k != 'text'}
+        try:
+            web_guidance.validate(dict(body, operation=operation),
+                {'text': {'flag': '--file', 'text': payload['text']}} if operation == 'set' else {})
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        key = ctx.idempotency_key or ctx.request_id
+        def write():
+            try:
+                result = self.backend.guidance_command(ctx.principal, ctx.params['pid'], operation,
+                                                        body=body, text=payload.get('text'), key=key)
+            except HttpError as failure:
+                if failure.status == 503 and not getattr(failure, 'nothing_done', False):
+                    raise UncertainOutcome() from None
+                raise
+            return result, result
+        def replay_check():
+            self.backend.guidance_replay_guard(ctx.principal, ctx.params['pid'], operation)
+        return self._mutate(ctx, 'guidance.' + operation, ctx.params['pid'], write, capability=capability,
+                            serialize=False, canonical=True, reason=operation, replay_check=replay_check)
+
     def _onboarding_owner(self, ctx):
-        # Project administration is refused for every credential by the authority rule itself
-        # (CREDENTIAL_FORBIDDEN_CAPABILITIES), so no second check for a credential stands here:
-        # one stood, could not be reached, and no test could pin it (review 01a109cc).
-        self._project(ctx, CAP_PROJECT_ADMIN)
+        # The existing edit route retains operator-text withholding; the member read
+        # is a distinct route. Granted personal coordinator agents may edit too.
+        self._project(ctx, CAP_COORDINATE)
         if not hasattr(self.backend, 'set_onboarding'):
             raise not_implemented('This server has no host project behind it, so there is no onboarding text to set')
 
@@ -5847,6 +5958,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         document is reported as set, with its size, and is not returned here.
         """
         self._onboarding_owner(ctx)
+        if hasattr(self.backend, 'guidance_command'):
+            return 200, self.backend.guidance_command(ctx.principal, ctx.params['pid'], 'onboarding-edit')
         from onboarding import PROJECT_LIMIT, WEB_HEADER, split_web
         document = self.backend.read_onboarding(ctx.params['pid'])
         if document is None:
@@ -5880,6 +5993,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def project_onboarding_clear(self, ctx):
         """Remove onboarding text an owner set here. The operator's own text is not removable here."""
         self._onboarding_owner(ctx)
+        if ctx.payload is not None and (not isinstance(ctx.payload, dict) or ctx.payload):
+            raise invalid('Send an empty object to clear onboarding')
         return self._onboarding_write(ctx, None)
 
     def _onboarding_write(self, ctx, text):
@@ -5905,8 +6020,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self.service.store.save()
             return result, result
         size = 'cleared' if text is None else 'set %d bytes' % len(text.encode('utf-8'))
-        return self._mutate(ctx, 'projects.onboarding', ctx.params['pid'], write, capability=CAP_PROJECT_ADMIN,
-                            serialize=False, canonical=True, reason='account=%s %s' % (ctx.principal.user_id, size))
+        def replay_check():
+            if hasattr(self.backend, 'guidance_replay_guard'):
+                self.backend.guidance_replay_guard(ctx.principal, ctx.params['pid'], 'onboarding')
+        return self._mutate(ctx, 'projects.onboarding', ctx.params['pid'], write, capability=CAP_COORDINATE,
+                            serialize=False, canonical=True, reason='account=%s %s' % (ctx.principal.user_id, size),
+                            replay_check=replay_check)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/setup')
     def project_setup(self, ctx):
