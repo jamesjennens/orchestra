@@ -668,7 +668,11 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   if (!setupText.OS_CHOICES.some(([v]) => v === state.os)) state.os = 'windows';
   const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
   const plan = () => setupText.screenPlan({ bridge: state.bridge, os: state.os, hasCertificate });
-  if (same) {
+  if (state.secretValue) {
+    // A fresh secret exists only while this dialog is open: open where it is saved (Back reaches the
+    // system and role screens), never two clicks away from it.
+    state.screen = 'secret';
+  } else if (same) {
     const wanted = same.screen || oldStepScreen(same.step, state.bridge);
     if (wanted && plan().includes(wanted)) state.screen = wanted;
   }

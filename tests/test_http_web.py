@@ -1673,7 +1673,8 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertIn('function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {', code)
         # (the second line is the screen's own name, the key of its builder, not the value)
         self.assertEqual(['secretValue: secret,', 'secret: () => ['], uses)
-        self.assertEqual(['state.secretValue = value;', 'state.secretValue',
+        # (the first line only opens the dialog on the screen that shows a fresh secret)
+        self.assertEqual(['if (state.secretValue) {', 'state.secretValue = value;', 'state.secretValue',
                           '? secretLinesBlock(payload, state.secretValue, state.os)'],
                          [line.strip() for line in dialog.splitlines() if 'secretValue' in line and not line.strip().startswith('//')
                           and not line.strip().startswith('secretValue:')])

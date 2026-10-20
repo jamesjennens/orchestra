@@ -716,7 +716,7 @@ class CredentialFileRewriteCase(unittest.TestCase):
         proc = subprocess.run([BASH, '-c', command], env=dict(os.environ, HOME=str(home)),
                               capture_output=True, text=True)
         self.assertEqual(0, proc.returncode, proc.stderr)
-        self.assertEqual('Save the header line in step 1 first, then run this again.', proc.stdout.strip())
+        self.assertEqual('Save the header line first, then run this again.', proc.stdout.strip())
         self.assertEqual('', proc.stderr.strip(), 'a raw shell error leaked to the person')
         self.assertFalse(path.exists())                     # nothing half-written
         self.assertFalse((home / '.orchestra-agent-kestrel.curlrc.new').exists())
@@ -738,7 +738,7 @@ class CredentialFileRewriteCase(unittest.TestCase):
         proc = subprocess.run([BASH, '-c', command], env=dict(os.environ, HOME=str(home)),
                               capture_output=True, text=True)
         self.assertEqual(0, proc.returncode, proc.stderr)
-        self.assertEqual('Click Save certificate in step 1 first, then run this again.', proc.stdout.strip())
+        self.assertEqual('Click Save certificate first, then run this again.', proc.stdout.strip())
         self.assertEqual('', proc.stderr.strip(), 'a raw mv error leaked to the person')
 
     @unittest.skipUnless(os.name == 'posix', 'the temporary file\'s mode is a POSIX property')
@@ -786,7 +786,7 @@ class CredentialFileRewriteCase(unittest.TestCase):
         out = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', command],
                              env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(0, out.returncode, out.stderr)
-        self.assertIn('Save the header line in step 1 first, then run this again.', out.stdout)
+        self.assertIn('Save the header line first, then run this again.', out.stdout)
         self.assertNotIn('Exception', out.stderr)
         self.assertFalse((home / '.orchestra-agent-kestrel.curlrc').exists())
 

@@ -185,11 +185,11 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
     psParts.push('"ssl-no-revoke`r`n"');
   }
   const psPrefix = psParts.join(' + ');
-  const powershell = '& { $p="' + file.powershell + '"; if (-not (Test-Path $p)) { Write-Output \'Save the header line in step 1 first, then run this again.\'; return }; $c=[IO.File]::ReadAllText($p); '
+  const powershell = '& { $p="' + file.powershell + '"; if (-not (Test-Path $p)) { Write-Output \'Save the header line first, then run this again.\'; return }; $c=[IO.File]::ReadAllText($p); '
     + '$c=[Text.RegularExpressions.Regex]::Replace($c,' + POWERSHELL_MANAGED_PATTERN + ",''); "
     + 'if ($c -and -not $c.EndsWith("`n")) { $c = $c + "`r`n" } '
     + '[IO.File]::WriteAllText($p, (' + psPrefix + ') + $c) }';
-  const posix = `( umask 077; [ -f ${file.posix} ] || { echo 'Save the header line in step 1 first, then run this again.'; exit 0; }; rm -f ${file.posix}.new; printf '%s\\n' ${quoted} > ${file.posix}.new && `
+  const posix = `( umask 077; [ -f ${file.posix} ] || { echo 'Save the header line first, then run this again.'; exit 0; }; rm -f ${file.posix}.new; printf '%s\\n' ${quoted} > ${file.posix}.new && `
     + `grep -vE ${CREDENTIAL_MANAGED_PATTERN} ${file.posix} >> ${file.posix}.new && `
     + `chmod 600 ${file.posix}.new && mv ${file.posix}.new ${file.posix} || rm -f ${file.posix}.new )`;
   return Object.freeze({ powershell, posix });
@@ -449,7 +449,7 @@ export function setupPrompt(payload, { role = 'worker', certificate = null, brid
       : '   Run exactly one of these commands. That command is the one exception to step 5: it reads the credential file only to rewrite that same file in place -- nothing is printed and the secret is copied nowhere else -- and it removes any earlier copy of these comment lines first, so running it a second time leaves exactly the same content.',
     `   - PowerShell: ${command.powershell}`,
     `   - macOS/Linux: ${command.posix}`,
-    '   The first line is the address the extension reads, so nobody types it. If that credential file is a symlink, the rewrite replaces the symlink with a regular file and the old target keeps its own content: keep it a regular file. If the credential file does not exist yet, stop here and ask me for step 1 of the dialog first.',
+    '   The first line is the address the extension reads, so nobody types it. If that credential file is a symlink, the rewrite replaces the symlink with a regular file and the old target keeps its own content: keep it a regular file. If the credential file does not exist yet, stop here and ask me to save the secret first (the set-up wizard’s “Save your secret”).',
     `7. This window's role is ${roleWord}: when you run "Orchestra Bridge: Set up" in VS Code, choose ${roleWord} (the extension's own set-up writes the workspace settings from the address line above; the kit writes no settings file).`,
     `Then continue: ${resumePrompt(payload.name)}`,
     '',
