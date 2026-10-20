@@ -199,8 +199,15 @@ class ClaimingRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests)
             ['update', task, '--assignee=session-worker', '--json'],
             ['update', task, '-a=session-worker', '--json'],
             ['update', task, '-asession-worker', '--json'],
+            # pflag boolean clusters: -a at the end of a run of -q/-v/-h shorthands
+            # (review item B1). Each consumed the next token or the rest of the token.
+            ['update', task, '-qa', 'session-worker', '--json'],
+            ['update', task, '-qaW', '--json'],
+            ['update', task, '-va=W', '--json'],
+            ['update', task, '-qva', 'W', '--json'],
             ['create', 'a created task', '--assignee', 'session-worker', '--json'],
             ['create', 'another created task', '-a', 'session-worker', '--json'],
+            ['create', 'a clustered created task', '-qa', 'session-worker', '--json'],
         )
         before = self.task_ids()
         for args in attempts:
@@ -211,6 +218,49 @@ class ClaimingRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests)
         self.assertEqual(('open', None), self.bd_row(task))
         after = self.task_ids()
         self.assertEqual(before, after)  # neither create wrote a row
+
+    def test_a_status_shorthand_cannot_claim_an_unassigned_task_under_assigned(self):
+        # kittrial-5bb.352 review item B2: `-s=in_progress`, `-sin_progress`,
+        # `-qs in_progress` and `-qsin_progress` all move an unassigned task to
+        # in_progress in real bd with no assignee, so each must be refused with the
+        # setting sentence and leave the row open and unassigned.
+        task = self.new('status shorthand bypass')
+        self.assertEqual(200, self.set_claiming('alex', 'assigned').status)
+        attempts = (
+            ['update', task, '-s=in_progress', '--json'],
+            ['update', task, '-sin_progress', '--json'],
+            ['update', task, '-qs', 'in_progress', '--json'],
+            ['update', task, '-qsin_progress', '--json'],
+        )
+        for args in attempts:
+            with self.subTest(args=args):
+                with self.assertRaises(ValueError) as caught:
+                    self.host(args)
+                self.assertIn(claiming.CLAIM_REFUSAL, str(caught.exception))
+                self.assertEqual(('open', None), self.bd_row(task))
+
+    def test_a_status_shorthand_cannot_bypass_the_open_dependency_guard(self):
+        # kittrial-5bb.352 review item B2: the kittrial-5bb.293 open-dependency guard
+        # reads status through the SAME `_claims_the_row`, so each shorthand must be
+        # refused there too, naming the open dependency, with the blocked row unchanged.
+        opener = self.new('open dependency')
+        blocked = self.new('blocked work')
+        added = self.bd('dep', 'add', blocked, opener)
+        self.assertEqual(0, added.returncode, added.stderr)
+        attempts = (
+            ['update', blocked, '-s=in_progress', '--json'],
+            ['update', blocked, '-sin_progress', '--json'],
+            ['update', blocked, '-qs', 'in_progress', '--json'],
+            ['update', blocked, '-qsin_progress', '--json'],
+        )
+        for args in attempts:
+            with self.subTest(args=args):
+                with self.assertRaises(ValueError) as caught:
+                    self.host(args)
+                said = str(caught.exception)
+                self.assertIn('open dependency', said)
+                self.assertIn(opener, said)
+                self.assertEqual(('open', None), self.bd_row(blocked))
 
     def test_an_operator_may_still_hand_work_out_under_assigned(self):
         # B1: the host operator allowlist keeps its hand-out power.

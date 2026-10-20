@@ -38,7 +38,7 @@ from coordination import is_merge_slot, merge_slot_sentence
 from render import render
 from lifecycle import apply_native
 from version import report
-from reserved_comments import (carries_record_label, check_raw_request, comment_target,
+from reserved_comments import (bd_flag_values, carries_record_label, check_raw_request, comment_target,
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
@@ -222,19 +222,26 @@ def _native_anchor_rows(root,path,actor,tokens):
         resolved[token]=(rid,row)
     return resolved
 
+#: The claiming guards' two flags, in both the long and the shorthand spelling the
+#: shared parser reports (kittrial-5bb.352 B1/B2).
+_ASSIGNEE_FLAGS = ('--assignee', '-a')
+_STATUS_FLAGS = ('--status', '-s')
+
+
 def _claims_the_row(args):
     """True when the bd invocation claims the row or makes it in_progress (kittrial-5bb.293).
 
     Flags are matched by PARSED argument, not substring: a ``--notes`` text that
-    contains ``in_progress`` never triggers this (rev3).
+    contains ``in_progress`` never triggers this (rev3). The parse is the shared
+    pflag-aware ``bd_flag_values`` (kittrial-5bb.352 B2), so a status shorthand inside
+    a boolean cluster (``-qs in_progress``, ``-qsin_progress``, ``-s=in_progress``,
+    ``-sin_progress``) is seen exactly as bd sees it. A bare ``--claim`` (or any
+    ``--claim=VALUE``) counts conservatively, as before.
     """
-    args=list(args or [])
-    if '--claim' in args or any(a.startswith('--claim=') for a in args):
-        return True
-    for i,a in enumerate(args):
-        if a in ('--status','-s') and i+1<len(args) and args[i+1]=='in_progress':
+    for name,_value in bd_flag_values(list(args or [])):
+        if name=='--claim':
             return True
-        if a.startswith('--status=') and a.split('=',1)[1]=='in_progress':
+        if name in _STATUS_FLAGS and _value=='in_progress':
             return True
     return False
 
@@ -242,20 +249,14 @@ def _claims_the_row(args):
 def _names_assignee(args):
     """True when the bd invocation itself assigns the row (``--assignee``/``-a``).
 
-    Every spelling bd 1.2.2 accepts is recognised (kittrial-5bb.352 review item B1):
-    ``--assignee W``, ``--assignee=W``, ``-a W``, ``-a=W`` and the joined ``-aW``. The
-    scan stops at ``--``: after it bd takes positionals, not flags. ``-a`` is the
+    Every spelling bd 1.2.2 accepts is recognised (kittrial-5bb.352 review item B1),
+    through the shared pflag-aware ``bd_flag_values``: ``--assignee W``,
+    ``--assignee=W``, ``-a W``, ``-a=W``, the joined ``-aW``, and ``-a`` at the end of a
+    run of boolean shorthands (``-qa W``, ``-qaW``, ``-va=W``, ``-qva W``). The scan
+    stops at ``--`` because after it bd takes positionals, not flags. ``-a`` is the
     assignee shorthand on ``create``/``update`` only, which is where this is asked.
     """
-    for token in list(args or []):
-        if token == '--':
-            break
-        if token in ('--assignee', '-a') or token.startswith('--assignee='):
-            return True
-        # pflag's short form: -a=W and the joined -aW. ``-a`` itself is the token above.
-        if token.startswith('-a') and token != '-a' and not token.startswith('--'):
-            return True
-    return False
+    return any(name in _ASSIGNEE_FLAGS for name,_value in bd_flag_values(list(args or [])))
 
 
 def _guard_claiming_on_claim(path, row):

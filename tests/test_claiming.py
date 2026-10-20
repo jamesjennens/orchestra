@@ -193,18 +193,51 @@ class GateTests(ProjectCase):
     @POSIX
     def test_an_assignee_is_recognised_in_every_bd_spelling(self):
         # kittrial-5bb.352 review item B1: every spelling bd accepts, including the short
-        # joined forms, and nothing after `--` (which bd reads as a positional).
+        # joined forms and an `-a` at the end of a run of boolean shorthands (pflag
+        # clusters -q/-v/-h with a value-taking -a), and nothing after `--`.
         self.assertFalse(endpoint._names_assignee(['update', 'p-1', '--claim', '--json']))
         for args in (['update', 'p-1', '--assignee', 'worker-a'],
                      ['update', 'p-1', '--assignee=worker-a'],
                      ['update', 'p-1', '-a', 'worker-a'],
                      ['update', 'p-1', '-a=worker-a'],
                      ['update', 'p-1', '-aworker-a'],
-                     ['create', 'work', '--assignee=worker-a']):
+                     ['update', 'p-1', '-qa', 'worker-a'],
+                     ['update', 'p-1', '-qaW'],
+                     ['update', 'p-1', '-va=W'],
+                     ['update', 'p-1', '-qva', 'W'],
+                     ['create', 'work', '--assignee=worker-a'],
+                     ['create', 'work', '-qa', 'worker-a']):
             with self.subTest(args=args):
                 self.assertTrue(endpoint._names_assignee(args))
         self.assertFalse(endpoint._names_assignee(
             ['update', 'p-1', '--', '--assignee', 'worker-a']))
+        # A value that begins with `-` is a value, not a flag: pflag gives `-qa` to
+        # --title here, so it does not assign the row.
+        self.assertFalse(endpoint._names_assignee(
+            ['update', 'p-1', '--title', '-qa', 'worker-a']))
+
+    @POSIX
+    def test_a_status_shorthand_is_recognised_in_every_bd_spelling(self):
+        # kittrial-5bb.352 review item B2: `_claims_the_row` drove BOTH the claiming and
+        # the open-dependency guards, and its `-s` scan missed the boolean-cluster and
+        # `=value` forms. Every form below is one bd accepts for in_progress.
+        for args in (['update', 'p-1', '--status', 'in_progress'],
+                     ['update', 'p-1', '--status=in_progress'],
+                     ['update', 'p-1', '-s', 'in_progress'],
+                     ['update', 'p-1', '-s=in_progress'],
+                     ['update', 'p-1', '-sin_progress'],
+                     ['update', 'p-1', '-qs', 'in_progress'],
+                     ['update', 'p-1', '-qsin_progress'],
+                     ['update', 'p-1', '-q', '-sin_progress']):
+            with self.subTest(args=args):
+                self.assertTrue(endpoint._claims_the_row(args))
+        # Not a claim: another status, and a value that names in_progress in notes.
+        for args in (['update', 'p-1', '--status', 'open'],
+                     ['update', 'p-1', '--status=deferred'],
+                     ['update', 'p-1', '--notes', 'in_progress'],
+                     ['update', 'p-1', '--title', '-sin_progress']):
+            with self.subTest(args=args):
+                self.assertFalse(endpoint._claims_the_row(args))
 
     @POSIX
     def test_an_assignment_through_bd_is_refused_under_assigned_unless_authorised(self):
