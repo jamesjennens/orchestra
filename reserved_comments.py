@@ -211,6 +211,14 @@ COORDINATOR_DECISION_PREFIX = 'Kind: coordinator-decision-v1\n'
 # RECORD_ANCHOR_FAMILIES or RECORD_COMMENT_FAMILIES, so it anchors no row and every
 # surface -- an older kit included -- reads it as an ordinary comment.
 LANE_STATE_PREFIX = 'Kind: lane-state-v1\n'
+# kittrial-5bb.343. The coordinator's recorded hand-back of an integrated task to
+# its assignee. Reserved so the raw `comments add` path can never plant one; the
+# record is honoured only with its host journal entry
+# (``<project>/.assignee-followons/``), so a reserved-prefix write without one is
+# inert even before this guard. Deliberately NOT a record-anchor family: it anchors
+# no row and every surface -- an older kit included -- reads it as an ordinary
+# comment.
+ASSIGNEE_FOLLOWON_PREFIX = 'Kind: assignee-followon-v1\n'
 
 RESERVED = (
     (TASK_ASSIGNMENT_PREFIX, 'task assignment notice', 'the dedicated coordinate assignment operation'),
@@ -245,6 +253,8 @@ RESERVED = (
     (COORDINATOR_DECISION_PREFIX, 'coordinator decision',
      'decisions record on the coordination host or in the web interface'),
     (LANE_STATE_PREFIX, 'lane state', 'checkpoint TASK --file checkpoint.json (the lane_state key)'),
+    (ASSIGNEE_FOLLOWON_PREFIX, 'assignee follow-on record',
+     'coordinator followon on the coordination host or the web route'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)

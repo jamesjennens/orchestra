@@ -2479,6 +2479,10 @@ BLOCK_CAPABILITIES = {
     'web-guidance': {'read': CAP_READ, 'ack': CAP_READ, 'onboarding': CAP_READ,
                      'set': CAP_COORDINATE, 'clear': CAP_COORDINATE, 'status': CAP_COORDINATE,
                      'coordinate-check': CAP_COORDINATE, 'onboarding-edit': CAP_COORDINATE},
+    # The coordinator's recorded hand-back (kittrial-5bb.343): both operations are
+    # coordinator writes, and the record's own journal still has to exist for a read
+    # to honour it.
+    'assignee-followon': {'record': CAP_COORDINATE, 'withdraw': CAP_COORDINATE},
     'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
                None: CAP_REVIEWS},         # reviews.add, every other operation
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
@@ -2510,7 +2514,7 @@ def required_capability(request):
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-guidance'):
+    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-guidance', 'assignee-followon'):
         if len(args) != 1:
             return None
         item = {'text': args[0]}

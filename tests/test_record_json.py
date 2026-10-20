@@ -188,12 +188,14 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (25, 'bd output and files on the coordination host, in operator commands; the export row reads '
+        'admin.py': (26, 'bd output and files on the coordination host, in operator commands; the export row reads '
                          'of credential-actors (kittrial-5bb.184) and adopt-actor\'s tracker check (kittrial-5bb.194 '
                          'revision 2) go through record_json.loads_rows (kittrial-5bb.221 revision 2): rows nested '
                          'to 750 read normally and any unreadable row fails the read as a whole; two more '
                          '(kittrial-5bb.202) read a project\'s .beads/metadata.json and one bd merge-slot check '
-                         'answer in project_merge_slot_state, whose caller catches OSError/ValueError itself'),
+                         'answer in project_merge_slot_state, whose caller catches OSError/ValueError itself; the '
+                         'twenty-sixth (kittrial-5bb.343) reads one .assignee-followons entry before its own '
+                         'validator checks it, exactly as the .integration-reverts entry beside it is read'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'bd_refusals.py': (1, "bd's own answer to one command; it catches RecursionError itself"),
@@ -317,7 +319,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # seventh) so a deeply nested bd answer cannot raise RecursionError.
             # kittrial-5bb.301 revision: endpoint.py's tenth guards the closed release
             # request body (a task id and a reason) that a worker transports.
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 10, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            # kittrial-5bb.343: the eleventh guards the web hand-back payload (a text or a
+            # reason this caller transports) before the SAME library call the coordinator
+            # command makes.
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 11, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
@@ -349,6 +354,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # abandonment store beside the family (kittrial-5bb.271 item 1) is read
             # through the guard as well, so a deeply nested store is a refusal.
             'lifecycle_voids.py': 7,
+            # kittrial-5bb.343: followon.py parses the reserved record body carried by any
+            # actor's comment, its host journal entry files and the bd comments-add
+            # receipts of both writes through the guard (four).
+            'followon.py': 4,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):
