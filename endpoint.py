@@ -239,6 +239,29 @@ def _claims_the_row(args):
     return False
 
 
+def _names_assignee(args):
+    """True when the bd invocation itself assigns the row (``--assignee``/``-a``)."""
+    for i, a in enumerate(list(args or [])):
+        if a in ('--assignee', '-a') or a.startswith('--assignee='):
+            return True
+    return False
+
+
+def _guard_claiming_on_claim(path, row):
+    """Refuse a claim of an UNASSIGNED task while the project is set to ``assigned``.
+
+    The per-project claiming setting (kittrial-5bb.352) is read fresh from the project
+    directory here: it lives outside the tracker, so no cached row can hide a change.
+    A task already assigned to its holder is not this guard's business: its holder may
+    still start it, and a different claimant is refused by bd itself.
+    """
+    if row.get('assignee'):
+        return
+    from claiming import CLAIM_REFUSAL, mode
+    if mode(path) == 'assigned':
+        raise ValueError('Refusing to claim %s: %s' % (row.get('id'), CLAIM_REFUSAL))
+
+
 def _guard_open_dependency_on_claim(root,path,actor,row):
     """Refuse a claim on a task blocked by an open dependency (kittrial-5bb.293 item 3a)."""
     from work import BLOCKING_DEPENDENCY_TYPES, dependency_index, dependency_ref, open_dependency_ids, open_dependency_sentence
@@ -309,6 +332,12 @@ def _guard_record_anchor_status(root,path,args,actor):
         # when the other ends cannot be read (item 3c).
         if command in ('claim', 'update') and _claims_the_row(args):
             _guard_open_dependency_on_claim(root,path,actor,row)
+            # The per-project claiming setting (kittrial-5bb.352): under 'assigned' a
+            # bare claim of an unassigned task is refused on the host route too. An
+            # explicit assignment in the same call is the coordinator handing work out,
+            # not a worker taking it, so it is not this guard.
+            if not _names_assignee(args):
+                _guard_claiming_on_claim(path,row)
 
 def _guard_record_anchor_title(root,path,args,actor,rows=None):
     """Read-before-write guard: the title of a record anchor is not changed through bd (kittrial-5bb.97).
@@ -2448,10 +2477,19 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         rows=None
                     if isinstance(rows,list):
                         from work import drop_internal_from_ready
-                        stdout=json.dumps(drop_internal_from_ready(rows))+'\n'
+                        rows=drop_internal_from_ready(rows)
+                        # The per-project claiming setting (kittrial-5bb.352): under
+                        # 'assigned' no unassigned task is offered as claimable here.
+                        from claiming import mode as claiming_mode
+                        if claiming_mode(path)=='assigned':
+                            rows=[]
+                        stdout=json.dumps(rows)+'\n'
                     elif isinstance(rows,dict) and isinstance(rows.get('items'),list):
                         from work import drop_internal_from_ready
                         rows=dict(rows);rows['items']=drop_internal_from_ready(rows['items'])
+                        from claiming import mode as claiming_mode
+                        if claiming_mode(path)=='assigned':
+                            rows['items']=[]
                         stdout=json.dumps(rows)+'\n'
                 return {'returncode':p.returncode,'stdout':stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch, project=path)

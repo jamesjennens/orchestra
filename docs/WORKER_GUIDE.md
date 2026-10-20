@@ -345,6 +345,16 @@ who can move a task whose holder is gone with a plain update on the host route a
 settles a task that is in progress with nobody. A worker does not make that update
 itself.
 
+A project can also turn claiming off: its `claiming` setting set to `assigned` means
+only the project's coordinators hand work out. Then `work`, `work --claimable`,
+`ready`, the agent's `next` list and `wait` offer no unassigned task as claimable, and a
+claim of one is refused with one sentence naming the setting, on the host route and the
+HTTP route alike. An assigned task may still be started by its assignee, and releasing
+your own claim is unchanged. An empty answer then carries the sentence "Only the
+project's coordinators assign work here; nothing is assigned to you yet." Do not work
+round it by assigning yourself the task: wait for the coordinator to assign it, or ask
+the coordinator.
+
 ## Deliver work that another worker can retrieve
 
 Before a handoff, preserve the actual implementation as either:
