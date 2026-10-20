@@ -1147,12 +1147,31 @@ class InProcessBackend:
     def get_task(self, project_id, task_id):
         return dict(self._task(project_id, task_id))
 
-    def task_history(self, project_id, task_id, limit, offset, canonical=None):
+    def task_history(self, project_id, task_id, limit, offset, canonical=None,
+                     recent=False, since_checkpoint=False):
+        """The task's events, oldest first or (``recent``) newest first. This backend has no
+        continuation cursor, so only the first page is reachable: the route says so in
+        ``truncated`` when more exists (kittrial-5bb.353). ``since_checkpoint`` keeps the
+        events after the newest ``checkpoint-added`` (all of them when there is none)."""
         self._task(project_id, task_id)
         events = [e for e in self.state.get('events', [])
                   if e.get('project') == project_id and e.get('task') == task_id]
-        return {'items': events[offset:offset + limit], 'total': len(events),
-                'canonical_cursor': None, 'activity_cursor': None}
+        checkpoint = None
+        if since_checkpoint:
+            marks = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added']
+            if marks:
+                checkpoint = events[marks[-1]]
+                events = events[marks[-1] + 1:]
+        if recent:
+            events = events[::-1]
+        result = {'items': events[offset:offset + limit], 'total': len(events),
+                  'canonical_cursor': None, 'activity_cursor': None}
+        if since_checkpoint:
+            result.update({'since_checkpoint': checkpoint.get('time') if checkpoint else None,
+                           'checkpoint_author': checkpoint.get('actor') if checkpoint else None,
+                           'checkpoint_timestamp': checkpoint.get('time') if checkpoint else None,
+                           'checkpoint_coverage': None, 'unverified_entries': 0})
+        return result
 
     def list_feedback(self, project_id, limit, offset):
         items = self.state.get('feedback', {}).get(project_id, [])
@@ -2758,8 +2777,14 @@ class EndpointBackend:
             raise not_found('Task not found')
         return self._with_record_comments(project_id, [row])[0]
 
-    def task_history(self, project_id, task_id, limit, offset, canonical=None):
+    def task_history(self, project_id, task_id, limit, offset, canonical=None,
+                     recent=False, since_checkpoint=False):
         """Page the canonical snapshot cursor, never asking for more than its limit.
+
+        ``recent`` reads the same snapshot newest first (the canonical ``--recent``, whose
+        cursor walks toward older entries and keeps a long comment's fragments together in
+        body order); ``since_checkpoint`` passes ``--since-checkpoint``, whose boundary the
+        canonical cursor carries (kittrial-5bb.353).
 
         The canonical ``history`` action accepts 1..20 entries per call and binds its
         continuation cursor to a snapshot digest. Accumulating exact-size canonical
@@ -2784,10 +2809,14 @@ class EndpointBackend:
         cursor = canonical
         total = 0
         activity = None
+        selection = {}
         pages = 0
         while len(collected) < needed and pages < 100:
             pages += 1
-            argv = [str(task_id), '--limit', str(min(20, needed - len(collected))), '--json']
+            argv = [str(task_id), '--recent' if recent else '--limit',
+                    str(min(20, needed - len(collected))), '--json']
+            if since_checkpoint:
+                argv.append('--since-checkpoint')
             if cursor:
                 argv += ['--cursor', cursor]
             reply = self._run('history', project_id, self.actor_namespace + '/read', argv)
@@ -2799,13 +2828,17 @@ class EndpointBackend:
             entries = reply.get('entries') or []
             if reply.get('activity_cursor'):
                 activity = reply['activity_cursor']
+            if since_checkpoint:
+                selection = {key: reply.get(key) for key in (
+                    'since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
+                    'checkpoint_coverage', 'unverified_entries')}
             collected.extend(entries)
             total = reply.get('total_entries', len(collected))
             cursor = reply.get('next_cursor')
             if cursor is None:
                 break
-        return {'items': (collected[:limit] if canonical else collected[offset:offset + limit]),
-                'total': total, 'canonical_cursor': cursor, 'activity_cursor': activity}
+        return dict({'items': (collected[:limit] if canonical else collected[offset:offset + limit]),
+                     'total': total, 'canonical_cursor': cursor, 'activity_cursor': activity}, **selection)
 
     def list_feedback(self, project_id, limit, offset):
         raise not_implemented('Canonical backend has no feedback read yet: %s'
@@ -9467,7 +9500,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
     def tasks_history(self, ctx):
-        """The task's history, oldest first, in exact cursor-bound pages.
+        """The task's history in exact cursor-bound pages, oldest first or newest first.
 
         Every page is exact for any ``limit``: a page continued from ``next_cursor``
         resumes at the first entry the previous page did not return, and ``total`` counts
@@ -9476,12 +9509,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         whole body) and ``continued`` (true when more of the same body follows).
         Concatenating them in page order reconstructs the body, so a page boundary may
         split a comment without losing text (kittrial-5bb.273).
+
+        ``recent=N`` (1..100, kittrial-5bb.353; the CLI's ``history --recent``) is the
+        page size of a NEWEST-FIRST read of the same snapshot: the newest N logical
+        entries first, and ``next_cursor`` continuing toward older ones. A long comment's
+        fragments still arrive together and in body order. It replaces ``limit`` (giving
+        both is refused). ``since_checkpoint=true`` selects the entries the task's newest
+        valid checkpoint did not incorporate, in either order. The cursor is bound to the
+        query, so it continues only the same direction and selection. ``order`` says
+        which direction a page is in, and ``truncated`` is true when entries exist that
+        this answer neither returned nor can continue to (a backend that cannot page).
         """
         self._project(ctx, CAP_READ)
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
-        limit, state = self._page(ctx, ctx.query)
+        recent, since_checkpoint = self._history_selection(ctx.query)
+        if recent is not None:
+            limit = recent
+            state = read_cursor(ctx.principal, ctx.params.get('pid'), ctx.query, ctx.query.get('cursor'))
+        else:
+            limit, state = self._page(ctx, ctx.query)
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
-                                           state['o'], canonical=state['x'])
+                                           state['o'], canonical=state['x'],
+                                           recent=recent is not None, since_checkpoint=since_checkpoint)
         who = lambda e: (e.get('user_id') or e.get('author')) if isinstance(e, dict) else None
         # (A canonical entry's author may be structured; ActorNames.get ignores it.)
         names = self._actor_names([who(e) for e in result['items']], ctx.params['pid'])
@@ -9494,7 +9543,39 @@ class ApiHandler(BaseHTTPRequestHandler):
             make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                         state['o'] + len(result['items']), continuation)
             if continuation else None)
+        body['order'] = 'newest-first' if recent is not None else 'oldest-first'
+        # Entries this answer neither returned nor can continue to: a backend without a
+        # continuation cursor (the in-process one) cannot page past its first page, so the
+        # answer says so instead of looking complete (kittrial-5bb.353).
+        returned = state['o'] + len(result['items'])
+        body['truncated'] = body['next_cursor'] is None and returned < result['total']
+        if body['truncated']:
+            body['truncated_note'] = (
+                '%d of %d entries are not in this answer and this server cannot page to them: '
+                'read them with the client\'s history command.' % (result['total'] - returned, result['total']))
+        if since_checkpoint:
+            for key in ('since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
+                        'checkpoint_coverage', 'unverified_entries'):
+                body[key] = result.get(key)
         return 200, body
+
+    @staticmethod
+    def _history_selection(query):
+        """``recent`` (1..MAX_PAGE, or None) and ``since_checkpoint`` (a bool) of a history read."""
+        recent = query.get('recent')
+        if recent is not None:
+            if 'limit' in query:
+                raise invalid('Give limit or recent, not both: recent is the page size of a newest-first read')
+            try:
+                recent = int(recent)
+            except (TypeError, ValueError):
+                raise invalid('recent must be an integer')
+            if not 1 <= recent <= MAX_PAGE:
+                raise invalid('recent must be between 1 and %d' % MAX_PAGE)
+        since = query.get('since_checkpoint', 'false')
+        if since not in ('true', 'false'):
+            raise invalid('since_checkpoint must be true or false')
+        return recent, since == 'true'
 
     # -- review queue and personal work ---------------------------------------
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/queue')

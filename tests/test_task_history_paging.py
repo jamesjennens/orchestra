@@ -135,5 +135,211 @@ class HistoryPagingCase(fixes.CanonicalEndpointCase):
         self.assertIn(LONG, bodies)
 
 
+#: kittrial-5bb.353: 150 entries, one of them long enough to fragment, placed so its fragments
+#: straddle the canonical 20-entry page boundary and the HTTP page boundary of most walks below.
+MANY = ['comment %03d' % index for index in range(150)]
+MANY[75] = 'long-comment-75-' + ('y' * 9000)
+
+
+@only_own_tests
+class RecentHistoryCase(HistoryPagingCase):
+    """``recent=N``: the newest entries first, a cursor back to the oldest (kittrial-5bb.353).
+
+    Office agents could not read a coordinator's newest comment: the history route paged only
+    oldest first, and a client that read the first page of a long history never saw the end.
+    """
+
+    def seed(self, task, texts, start=1, stamp='2026-02-01T%02d:%02d:%02dZ'):
+        state_path = self.canonical_root / 'canonical.json'
+        state = json.loads(state_path.read_text(encoding='utf-8'))
+        row = next(row for row in state['rows'] if row['id'] == task)
+        row.setdefault('comments', [])
+        for offset, text in enumerate(texts):
+            n = start + offset
+            row['comments'].append({'id': 'seeded-%d' % n, 'author': 'alex', 'text': text,
+                                    'created_at': stamp % (n // 3600, (n // 60) % 60, n % 60)})
+        state_path.write_text(json.dumps(state), encoding='utf-8')
+
+    def read(self, token, project, task, query, cursor=None, status=200):
+        path = '/v1/projects/%s/tasks/%s/history?%s' % (project, task, query)
+        if cursor:
+            path += '&cursor=' + cursor
+        response = self.request('GET', path, token=token)
+        self.assertEqual(status, response.status, response.data)
+        return response.data
+
+    def walk(self, token, project, task, query):
+        items, cursor, pages = [], None, 0
+        while pages < 400:
+            pages += 1
+            page = self.read(token, project, task, query, cursor)
+            items.extend(page['items'])
+            cursor = page.get('next_cursor')
+            if not cursor:
+                return items, page
+        self.fail('the walk did not finish')
+
+    def a_task(self, key):
+        alex, project = self._setup_project()
+        created = self.create_task(alex, project, 'a task with a long history', key=key)
+        self.assertEqual(201, created.status, created.data)
+        return alex, project, created.data['id']
+
+    def test_the_newest_come_first_and_the_cursor_reaches_the_oldest_exactly(self):
+        alex, project, task = self.a_task('history-recent-0001')
+        self.seed(task, MANY)
+        oldest, _ = self.walk(alex, project, task, 'limit=100')
+        expected = reassemble(oldest)
+        self.assertEqual(MANY, [body for _, body in expected])
+        first = self.read(alex, project, task, 'recent=20')
+        self.assertEqual('newest-first', first['order'])
+        self.assertFalse(first['truncated'])
+        self.assertEqual(150, first['total'])
+        self.assertEqual(['comment 149', 'comment 148', 'comment 147'], [e['body'] for e in first['items'][:3]])
+        self.assertTrue(first['next_cursor'])
+        for size in (7, 20, 100):
+            with self.subTest(recent=size):
+                walked, last = self.walk(alex, project, task, 'recent=%d' % size)
+                newest_first = reassemble(walked)
+                # No skip, no repeat: every entry once, newest first, the long one whole.
+                self.assertEqual(len(MANY), len(newest_first))
+                self.assertEqual(list(reversed(expected)), newest_first)
+                self.assertEqual('comment 000', newest_first[-1][1])
+                self.assertIsNone(last['next_cursor'])
+
+    def test_recent_and_oldest_first_pages_cover_the_same_entries(self):
+        # The coordinator's addition: the two directions read the same set, fragment for fragment.
+        alex, project, task = self.a_task('history-recent-0002')
+        self.seed(task, MANY)
+        newest, _ = self.walk(alex, project, task, 'recent=13')
+        oldest, _ = self.walk(alex, project, task, 'limit=13')
+        self.assertEqual(sorted(reassemble(newest)), sorted(reassemble(oldest)))
+        self.assertEqual({e['entry_id'] for e in newest}, {e['entry_id'] for e in oldest})
+
+    def test_a_long_comment_keeps_its_fragments_together_and_in_order_newest_first(self):
+        alex, project, task = self.a_task('history-recent-0003')
+        self.seed(task, MANY)
+        walked, _ = self.walk(alex, project, task, 'recent=3')
+        long_id = next(e['entry_id'] for e in walked if e['body'].startswith('long-comment-75-'))
+        positions = [i for i, e in enumerate(walked) if e['entry_id'] == long_id]
+        self.assertGreater(len(positions), 1, 'the long comment did not fragment')
+        self.assertEqual(list(range(positions[0], positions[0] + len(positions))), positions)   # together
+        offsets = [walked[i]['body_offset'] for i in positions]
+        self.assertEqual(sorted(offsets), offsets)                                              # in body order
+        self.assertEqual(MANY[75], ''.join(walked[i]['body'] for i in positions))
+
+    def test_a_cursor_continues_only_its_own_direction(self):
+        alex, project, task = self.a_task('history-recent-0004')
+        self.seed(task, MANY[:30])
+        newest = self.read(alex, project, task, 'recent=5')
+        oldest = self.read(alex, project, task, 'limit=5')
+        refused = self.read(alex, project, task, 'limit=5', newest['next_cursor'], status=409)
+        self.assertIn('Cursor is stale or belongs to a different query', json.dumps(refused))
+        self.read(alex, project, task, 'recent=5', oldest['next_cursor'], status=409)
+        self.read(alex, project, task, 'recent=6', newest['next_cursor'], status=409)
+
+    def test_one_sentence_refusals(self):
+        alex, project, task = self.a_task('history-recent-0005')
+        for query, said in (('recent=0', 'recent must be between 1 and 100'),
+                            ('recent=101', 'recent must be between 1 and 100'),
+                            ('recent=x', 'recent must be an integer'),
+                            ('recent=5&limit=5', 'Give limit or recent, not both'),
+                            ('since_checkpoint=yes', 'since_checkpoint must be true or false')):
+            with self.subTest(query=query):
+                response = self.request('GET', '/v1/projects/%s/tasks/%s/history?%s' % (project, task, query), token=alex)
+                self.assertGreaterEqual(response.status, 400, response.data)
+                self.assertIn(said, json.dumps(response.data))
+
+    def test_since_checkpoint_selects_what_the_newest_checkpoint_did_not_incorporate(self):
+        alex, project, task = self.a_task('history-recent-0006')
+        # Before the checkpoint on the harness's clock (it writes the checkpoint at 2026-01-01), and after it.
+        self.seed(task, ['before %d' % n for n in range(5)], stamp='2025-06-01T%02d:%02d:%02dZ')
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (project, task), {}, token=alex).status)
+        cursor = self.read(alex, project, task, 'limit=5')['activity_cursor']
+        checkpoint = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/checkpoints' % (project, task),
+            {'schema_version': 1, 'previous': None, 'activity_cursor': cursor, 'source_commit': fixes.COMMIT,
+             'branch': 'contrib/test', 'intent': 'a baseline', 'acceptance': 'a baseline',
+             'summary': 'the baseline', 'next_action': 'read what came after', 'open_items': [], 'resolved': []},
+            token=alex)
+        self.assertEqual(201, checkpoint.status, checkpoint.data)
+        self.seed(task, ['after %d' % n for n in range(4)], start=100, stamp='2099-01-01T%02d:%02d:%02dZ')
+        for query, order in (('since_checkpoint=true&limit=50', 'oldest-first'),
+                             ('since_checkpoint=true&recent=2', 'newest-first')):
+            with self.subTest(query=query):
+                walked, last = self.walk(alex, project, task, query)
+                bodies = [body for _, body in reassemble(walked)]
+                self.assertEqual(order, last['order'])
+                self.assertTrue(last['since_checkpoint'])
+                self.assertFalse([b for b in bodies if b.startswith('before ')], bodies)
+                afters = [b for b in bodies if b.startswith('after ')]
+                self.assertEqual(['after 0', 'after 1', 'after 2', 'after 3'][::(-1 if order == 'newest-first' else 1)], afters)
+
+
+import test_http_service as service_harness  # noqa: E402  (the in-process backend harness)
+
+
+class InProcessRecentCase(service_harness.ServerHarness):
+    """The in-process backend has no continuation cursor: only the first page is reachable.
+
+    The coordinator's addition to kittrial-5bb.353: when more entries exist than the answer
+    returns, ``recent`` (or an oldest-first page) must SAY so (``truncated`` and one
+    sentence), never look complete.
+    """
+
+    def task_with_events(self, count):
+        admin = self.admin_token()
+        self.create_account(admin, 'alex', 'alex-password-1')
+        alex = self.login('alex', 'alex-password-1')[0]
+        project = self.create_project(alex, 'Alpha')
+        task = self.create_task(alex, project, 'many events').data['id']
+        events = self.backend.state.setdefault('events', [])
+        for n in range(count):
+            events.append({'time': '2026-02-01T00:%02d:%02dZ' % (n // 60, n % 60), 'project': project,
+                           'task': task, 'action': 'note-%03d' % n, 'user_id': None, 'actor': 'alex'})
+        return alex, project, task
+
+    def get(self, token, project, task, query):
+        response = self.request('GET', '/v1/projects/%s/tasks/%s/history?%s' % (project, task, query), token=token)
+        self.assertEqual(200, response.status, response.data)
+        return response.data
+
+    def test_recent_is_newest_first_and_says_what_it_cannot_reach(self):
+        alex, project, task = self.task_with_events(130)
+        page = self.get(alex, project, task, 'recent=100')
+        notes = [e['action'] for e in page['items'] if e.get('action', '').startswith('note-')]
+        self.assertEqual('newest-first', page['order'])
+        self.assertEqual('note-129', notes[0])
+        self.assertEqual(sorted(notes, reverse=True), notes)
+        self.assertIsNone(page['next_cursor'])
+        self.assertTrue(page['truncated'])
+        hidden = page['total'] - len(page['items'])
+        self.assertGreater(hidden, 0)
+        self.assertEqual('%d of %d entries are not in this answer and this server cannot page to them: '
+                         "read them with the client's history command." % (hidden, page['total']),
+                         page['truncated_note'])
+
+    def test_a_page_that_holds_everything_is_not_truncated(self):
+        alex, project, task = self.task_with_events(10)
+        for query, order in (('recent=100', 'newest-first'), ('limit=100', 'oldest-first')):
+            with self.subTest(query=query):
+                page = self.get(alex, project, task, query)
+                self.assertEqual(order, page['order'])
+                self.assertFalse(page['truncated'])
+                self.assertNotIn('truncated_note', page)
+                self.assertEqual(page['total'], len(page['items']))
+
+    def test_since_checkpoint_keeps_what_came_after_the_newest_checkpoint(self):
+        alex, project, task = self.task_with_events(3)
+        events = self.backend.state['events']
+        events.append({'time': '2026-02-02T00:00:00Z', 'project': project, 'task': task,
+                       'action': 'checkpoint-added', 'user_id': None, 'actor': 'alex'})
+        events.append({'time': '2026-02-03T00:00:00Z', 'project': project, 'task': task,
+                       'action': 'note-after', 'user_id': None, 'actor': 'blair'})
+        page = self.get(alex, project, task, 'since_checkpoint=true&recent=10')
+        self.assertEqual(['note-after'], [e['action'] for e in page['items']])
+        self.assertEqual('2026-02-02T00:00:00Z', page['checkpoint_timestamp'])
+
+
 if __name__ == '__main__':
     unittest.main()

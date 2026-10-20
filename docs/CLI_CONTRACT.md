@@ -416,6 +416,16 @@ whose checkpoint was the baseline and what it could not be shown. `brief --full`
 `full_context` with the same additive rule; its `omission_counts` are the compact
 read's clips and its `full_omitted_chars`/`truncated`/`complete` are the bound's own.
 
+The web service's `GET /v1/projects/{id}/tasks/{task}/history` gives the same two
+directions (kittrial-5bb.353):
+- its `recent=N` (1..100) is this `--recent`/`--last`, read newest first over the same
+  snapshot, with the same fragment order and a cursor toward older entries;
+- its `since_checkpoint=true` is this `--since-checkpoint`.
+
+The route assembles each page from canonical pages of at most 20, so its page size may be
+larger than the canonical `--recent` range. Its answer carries `order` and the checkpoint
+keys above; see docs/HTTP_DEPLOYMENT.md ("Reading a task's history, newest first").
+
 `brief` and each `work` item also carry three additive lifecycle delivery fields
 (kittrial-5bb.107 item 7, rev2 item 6.1). `deployed_delivery` is the delivery a passed
 `deployed` fact belongs to, or `null` when the task has no trusted `deployed=passed`

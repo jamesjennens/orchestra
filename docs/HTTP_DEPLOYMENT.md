@@ -1709,6 +1709,36 @@ narrowed, to gate it on the live-authority descriptor that only the web service 
 leaving the SSH path alone. No decision is built here beyond the service-only rule read.
 
 
+### Reading a task's history, newest first
+
+`GET /v1/projects/{id}/tasks/{task}/history` pages the task's history in exact
+cursor-bound pages (kittrial-5bb.273: a continued page resumes at the first entry the
+previous page did not return, at any page size).
+
+- **Oldest first** (the default): `limit` 1..100, and `next_cursor` continues to newer entries.
+- **Newest first:** `recent=N` (1..100; kittrial-5bb.353) is the page size of a
+  newest-first read of the same snapshot, the read the client's `history --recent`
+  gives. The first page holds the newest N logical entries, and `next_cursor` continues
+  toward OLDER ones until the oldest. It replaces `limit`: giving both is refused. An agent
+  that wants a coordinator's newest comment reads `recent=20` first, and pages back only
+  if it needs to.
+- **A long comment** arrives as several consecutive entries in either order. They share
+  `entry_id` and carry `body_offset` and `continued`. Newest first, the fragments of one
+  comment still come together and in body order, so concatenating them in page order
+  gives the whole comment.
+- **`since_checkpoint=true`** selects the entries the task's newest valid checkpoint
+  did not incorporate (the client's `history --since-checkpoint`), in either order. The
+  answer then also names the checkpoint: `since_checkpoint`, `checkpoint_author`,
+  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A checkpoint by
+  the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
+- **The cursor** is bound to the caller, the project and the query. A newest-first
+  cursor continues only a newest-first read with the same `recent`, and an oldest-first
+  one only an oldest-first read; the other is refused (409).
+- **Every answer** says `order` (`oldest-first` or `newest-first`) and `truncated`.
+  `truncated` is true, with one sentence in `truncated_note`, when entries exist that the
+  answer neither returned nor can continue to. That is the in-process backend
+  (`--backend inprocess`), which has no continuation cursor, past its first page.
+
 ### What an agent needs to write a checkpoint
 
 `GET /v1/projects/{id}/tasks/{task}/brief` carries everything a checkpoint needs, so an
