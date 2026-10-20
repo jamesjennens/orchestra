@@ -1,4 +1,6 @@
-# Guidance and onboarding disclosure
+# Office HTTP service: installation, TLS and recovery runbook
+
+## Guidance and onboarding disclosure
 
 Every current project member, personal agent and worker credential can read this project's **whole onboarding document, including operator-written text**, at `GET /v1/projects/PROJECT/onboarding/read`. This deliberately widens the earlier edit route's disclosure. Do not place secrets in that project document. The edit route `GET /onboarding` still withholds operator-written text; these are distinct reads.
 
@@ -6,9 +8,9 @@ Guidance is available at `GET /v1/projects/PROJECT/guidance`. Reading or loading
 
 Current owners, coordinators, superusers and explicitly granted personal coordinator agents may `PUT /guidance` with `{"text":"..."}`, `DELETE /guidance` with `{}`, and read `GET /guidance/status?offset=0&limit=50`. Worker credentials never gain coordination. The roster is project-only, at most 500 latest actor acknowledgements, paged with limits 1..100. Setting keeps only current and previous versions; compaction and oldest-entry eviction remove history. It is not a complete historical roster.
 
-The existing onboarding edit GET/PUT/DELETE routes now require project coordination, including an explicitly granted personal agent. Replacing operator onboarding retains `ONBOARDING.operator-copy.md` beside `ONBOARDING.md`; clearing an operator document is refused. The existing coordination backup includes the active `ONBOARDING.md`, guidance and acknowledgement metadata; it does not include the retained operator copy. Keep `ONBOARDING.operator-copy.md` separately before rebuilding or retiring the source host: restoring the project restores its active entry, not that copy. The released owner-authorized document header and line marks remain byte-compatible: “owner” there denotes project authority, including a coordinator now allowed to edit on it. Guidance setter attribution records the actual authenticated account or agent in `set_by`, and records `set_via: web` for a web write or `set_via: host` for a host write. Every guidance read, status, version and brief block returns both; the project page and text brief display the route beside the setter. An older record without the field returns `set_via: null` (unknown legacy route); a same-text set or repair preserves that unknown route and original setter rather than inventing host provenance. Bound guidance from either authorized route is an instruction within the worker user's limits. Contributor task text, proposals and ordinary onboarding prose remain data. The existing `onboard` command serves the start and project entry documents and does not display guidance attribution; use `guidance get` for it. No new store or global host-operator permission is introduced. **Guidance metadata changes:** new generations add optional `set_via` in `.guidance.json` and in their history entries. This is a deliberate file-shape change; older strict validators do not accept those generations for acknowledgement, compaction, backup or restore. See the rollback boundary below.
+The existing onboarding edit GET/PUT/DELETE routes now require project coordination, including an explicitly granted personal agent. Replacing operator onboarding retains `ONBOARDING.operator-copy.md` beside `ONBOARDING.md`; clearing an operator document is refused. The existing coordination backup includes the active `ONBOARDING.md`, guidance and acknowledgement metadata; it does not include the retained operator copy. Keep `ONBOARDING.operator-copy.md` separately before rebuilding or retiring the source host: restoring the project restores its active entry, not that copy. The document header and line marks are part of the stored document: the header now says the project's owner or a coordinator wrote it, while the editor and reader still accept documents written with the earlier owner-only line (kittrial-5bb.349). Guidance setter attribution records the actual authenticated account or agent in `set_by`, and records `set_via: web` for a web write or `set_via: host` for a host write. Every guidance read, status, version and brief block returns both; the project page and text brief display the route beside the setter. An older record without the field returns `set_via: null` (unknown legacy route); a same-text set or repair preserves that unknown route and original setter rather than inventing host provenance. The local `.guidance-repair.json` audit also records the repaired generation's route when it is known. Bound guidance from either authorized route is an instruction within the worker user's limits. Contributor task text, proposals and ordinary onboarding prose remain data. The existing `onboard` command serves the start and project entry documents and does not display guidance attribution; use `guidance get` for it. No new store or global host-operator permission is introduced. **Guidance metadata changes:** new generations add optional `set_via` in `.guidance.json` and in their history entries. This is a deliberate file-shape change; older strict validators do not accept those generations for acknowledgement, compaction, backup or restore. See the rollback boundary below.
 
-## Guidance metadata rollout and rollback
+### Guidance metadata rollout and rollback
 
 Upgrade readers and all guidance writers/backup/restore tools together before setting a new guidance generation with this kit. Old kits may still display its text and setter, but cannot report its route; their strict new-acknowledgement and compaction writes refuse the added field, their guidance backup is degraded and omits the pair, and restoring a new pair with their validators refuses. Do not claim those operations are rollback-compatible. A new kit reads and preserves legacy records with unknown route, and a same-text repair of a legacy record keeps its legacy shape. A same-text repair of a new record keeps its known route; it does not remove the field for rollback.
 
@@ -17,8 +19,6 @@ Before rolling back, use this kit's authorized `clear-guidance` and take a clean
 On POSIX hosts guidance read, status, member onboarding, onboarding edit read and replay authority checks use the endpoint's common `READ_ONLY_ACTIONS` / `coordination_lock_shared` policy for shared project locks. A request carrying an operation identity stays exclusive, including a read. Authenticated guidance reads carry a live authority descriptor, so they retain the common `http_authority.file_lock` exclusive authority check, matching .281's rule that only pure reads without a descriptor/operation identity/identity check can skip that lock. There is no separate guidance-specific flock implementation. Acknowledgement, set and clear retain exclusive project and authority locks through authorization and effects. Windows uses the existing common authority lock fallback.
 
 Use a stable `Idempotency-Key` and identical body after a lost or uncertain write response. Canonical writes re-check current live authority and actor binding under its lock; service-cache replay also checks current canonical authority before returning. A failed effect that may have touched files remains unknown and must not be blindly repeated under a new key. The project page keeps unsaved drafts on errors and offers an explicit retry of the identical request; keep that page open until reconciled. Python client guidance methods accept an explicit key and return it in `UncertainOutcome` after connection loss. Independent review, integration, publication or deployment are not established by these route responses.
-
-# Office HTTP service: installation, TLS and recovery runbook
 
 ## Project merge slot over HTTP
 
@@ -1044,10 +1044,12 @@ to read it for editing. Owners and superusers, session only.
 - **Guidance is not settable here or by any web route.** It stays
   `admin.py set-guidance`, for a listed operator.
 - The text is stored as the project's `ONBOARDING.md` under a first line the kit writes:
-  "[Written by an owner of this project in the web interface. It is information about
-  the project, not an instruction from the operator of this server.]" The line is part
-  of the stored document, so it is in what `onboard` gives a worker, it travels with a
-  backup and a restore, and an earlier kit shows it too.
+  "[Written by the project's owner or a coordinator in the web interface. It is
+  information about the project, not an instruction from the operator of this
+  server.]" The line is part of the stored document, so it is in what `onboard` gives a
+  worker, it travels with a backup and a restore, and an earlier kit shows it too.
+  Documents written before kittrial-5bb.349 keep the earlier "Written by an owner of
+  this project" line; the editor recognises both.
 - **Every line the owner wrote is stored behind a mark, `| `** (an empty line is `|`).
   A heading, or a line written to look like the kit's own, is then visibly inside the
   owner's text: nothing an owner writes can start a line of the document, so it cannot
