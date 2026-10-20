@@ -14,7 +14,22 @@ The rules these tests pin:
 - the mode assertions run on POSIX only (review B3: Windows has no POSIX modes);
 - everything unexpected - no Dolt server coordinates, an unreadable key, a corrupt
   or foreign file - fails OPEN to today's behaviour: a fresh export, nothing
-  cached, and a planted cache is never served when the key cannot be read (S4).
+  cached, and a planted cache is never served when the key cannot be read (S4);
+- a file a power loss leaves TORN fails the reader's compare and falls back to a
+  fresh export that repairs it - the reason the write may drop its fsync - and
+  five concurrent misses refresh ONCE (the first holds the cache directory's
+  flock; the others wait briefly and serve what it wrote, and a loser whose wait
+  runs out answers from its own export and writes nothing) (kittrial-5bb.346);
+- where POSIX locks are missing (a Windows kit) the one-refresher tests skip on
+  the same condition the code uses, and the no-lock behaviour is pinned instead:
+  every reader refreshes, every answer is the true rows, and the file stays
+  whole (kittrial-5bb.346 r3, the CI Windows reason);
+- ONLY a held flock reads as busy (EWOULDBLOCK/EAGAIN; ENOLCK answers at once,
+  an unopenable directory caches nothing), the header carries the payload's
+  sha256 so a zero-filled file of the right length is refused too, a waiter's
+  compare reads the HEADER LINE alone (the payload parses outside the lock),
+  and the format compare and the BYTE-counted length are pinned by their own
+  mutants (kittrial-5bb.346 r4).
 """
 import json
 import os
@@ -23,6 +38,11 @@ import sys
 import unittest
 from pathlib import Path
 from unittest import mock
+
+try:
+    import fcntl
+except ImportError:                      # a Windows kit: no directory flock
+    fcntl = None
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
@@ -79,8 +99,8 @@ class ReadCacheTests(unittest.TestCase):
         visible, run = self.serve([row(), row('t-2')], key='b' * 32)   # the generation moved
         self.assertEqual(run.exports, 1)                 # the cache missed, the export ran
         self.assertEqual([item['id'] for item in visible], ['t-1', 't-2'])
-        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
-        self.assertEqual(stored['key'], 'b' * 32)
+        header, _, _ = self.cached_file().read_bytes().partition(b'\n')
+        self.assertEqual(json.loads(header)['key'], 'b' * 32)
 
     def test_interleaved_refreshes_never_leave_older_rows_under_the_newer_key(self):
         # Review B1: with two files renamed apart, refreshes that interleaved left
@@ -91,21 +111,22 @@ class ReadCacheTests(unittest.TestCase):
         # names, and is what the next read of that key serves.
         import threading
         gate = threading.Event()
-        real_serialize = read_cache._serialize
+        real_payload = read_cache._raw_payload
 
-        def interleaving_serialize(rows, key):
-            payload = real_serialize(rows, key)
+        def interleaving_payload(text, key):
+            payload = real_payload(text, key)
             if key == 'b' * 32:
                 self.serve([row(title='R1-older')], key='a' * 32)
                 gate.set()
             return payload
 
         self.serve([row(title='R1')], key='a' * 32)
-        with mock.patch.object(read_cache, '_serialize', side_effect=interleaving_serialize):
+        with mock.patch.object(read_cache, '_raw_payload', side_effect=interleaving_payload):
             self.serve([row(title='R2')], key='b' * 32)
         self.assertTrue(gate.is_set())
-        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
-        title = stored['rows'][0]['title']
+        header, _, payload = self.cached_file().read_bytes().partition(b'\n')
+        stored = json.loads(header)
+        title = json.loads(payload.decode('utf-8').splitlines()[0])['title']
         self.assertIn(title, ('R1', 'R1-older', 'R2'))
         served, run = self.serve([row(title=title)], key=stored['key'])
         self.assertEqual(run.exports, 0)
@@ -115,15 +136,17 @@ class ReadCacheTests(unittest.TestCase):
         # Review B2: rows parsed by an older kit (another FORMAT) fall back to a
         # fresh export however valid the file looks and however right the key is.
         self.serve([row()])
-        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
-        stored['format'] = read_cache.FORMAT - 1
-        stored['rows'] = [row(id='planted', title='FOREIGN')]
-        self.cached_file().write_text(json.dumps(stored), encoding='utf-8')
+        header, _, payload = self.cached_file().read_bytes().partition(b'\n')
+        stored = json.loads(header)
+        stored['format'] = read_cache.FORMAT - 1           # an older kit's number
+        planted = json.dumps(row(id='planted', title='FOREIGN')) + '\n'
+        self.cached_file().write_bytes(json.dumps(stored).encode('utf-8') + b'\n'
+                                       + planted.encode('utf-8'))
         served, run = self.serve([row()])
-        self.assertEqual(run.exports, 1)
+        self.assertEqual(run.exports, 1)                    # never served: fresh export
         self.assertEqual(served[0]['id'], 't-1')
-        self.assertEqual(json.loads(self.cached_file().read_text(encoding='utf-8'))['format'],
-                         read_cache.FORMAT)
+        head, _, _ = self.cached_file().read_bytes().partition(b'\n')
+        self.assertEqual(json.loads(head)['format'], read_cache.FORMAT)
 
     def test_rows_nested_past_the_whole_text_bound_still_cache(self):
         # Review S2: one 70-deep row used to disable the cache for good AND make
@@ -137,10 +160,8 @@ class ReadCacheTests(unittest.TestCase):
         first, run = self.serve([deep])
         self.assertEqual(run.exports, 1)
         second, again = self.serve([deep])
-        self.assertEqual(again.exports, 0)              # served from the lines form
-        self.assertEqual(second[0]['id'], 't-1')
-        stored = json.loads(self.cached_file().read_text(encoding='utf-8'))
-        self.assertEqual(stored.get('kind'), 'lines')
+        self.assertEqual(again.exports, 0)     # served: the payload is one row per
+        self.assertEqual(second[0]['id'], 't-1')   # line, deep rows need no special form
 
     def test_a_symlinked_cache_directory_is_refused_not_followed(self):
         # Review S1: a symlink planted at .read-cache must not be written through
@@ -221,6 +242,324 @@ class ReadCacheTests(unittest.TestCase):
         self.assertEqual(run.exports, 1)
         self.assertEqual([item['id'] for item in served], ['t-1'])
 
+    def test_a_torn_cache_file_falls_back_and_is_repaired(self):
+        # kittrial-5bb.346: the cache write carries no fsync - the rename is
+        # atomic, and a file a power loss leaves SHORT fails the reader's parse
+        # and/or the key compare inside the file, so it falls back to a fresh
+        # export. That fallback is the whole reason dropping the fsync is safe;
+        # this pins it on the torn shape itself and that the next miss REPAIRS
+        # the cache (the file is whole again and the read after it serves).
+        self.serve([row()])
+        whole = self.cached_file().read_bytes()
+        cut = whole.partition(b'\n')[2]
+        self.cached_file().write_bytes(whole[:len(whole) - len(cut) // 2])  # payload short
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)          # length mismatch: fresh export
+        self.assertEqual([item['id'] for item in served], ['t-1'])
+        head, _, _ = self.cached_file().read_bytes().partition(b'\n')
+        json.loads(head)                                 # repaired
+        again, rerun = self.serve([row()])
+        self.assertEqual(rerun.exports, 0)               # and serving again
+        self.cached_file().write_bytes(whole[:5])        # torn in the HEADER itself
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)                 # also refused, also repaired
+        self.assertEqual([item['id'] for item in served], ['t-1'])
+
+    @unittest.skipIf(fcntl is None,
+                   'the one refresher is the cache directory\'s flock; without POSIX '
+                   'locks the code keeps today\'s behaviour - every reader refreshes - '
+                   'which test_on_a_kit_without_posix_locks pins instead')
+    def test_five_concurrent_misses_refresh_once(self):
+        # kittrial-5bb.346: the five reads a page fires right after a write all
+        # miss together, and the export server runs their exports one at a time.
+        # The first miss to hold the cache directory's flock refreshes; the
+        # others WAIT briefly and serve what it wrote - one export, one write,
+        # five answers. The barrier releases all five misses into the lock
+        # together while the winner's write is held open, which is the window
+        # the live page actually spends its time in.
+        import threading
+        gate = threading.Barrier(5, timeout=5)
+        real_cached = read_cache._cached_rows
+        real_write = read_cache._write_one_file
+        writes = []
+        run = FakeRun([row()])
+
+        def gated_cached(cache, key):
+            if not (cache / read_cache.FILE_NAME).exists():
+                try:
+                    gate.wait()
+                except threading.BrokenBarrierError:
+                    pass                # a straggler missed the window: proceed
+            return real_cached(cache, key)
+
+        def slow_write(cache, payload):
+            import time
+            time.sleep(1.0)             # the winner holds the lock, losers wait
+            writes.append(payload)
+            real_write(cache, payload)
+
+        answers = [None] * 5
+        errors = []
+        def miss(index):
+            try:
+                answers[index] = read_cache.cached_export_rows(
+                    self.root, self.project, run)
+            except BaseException as error:      # pragma: no cover - reported below
+                errors.append(error)
+
+        # The patches are opened ONCE, from the test thread: five threads each
+        # entering mock.patch on the same attribute restore whatever they SAW on
+        # enter, and interleave into leaving a mock installed for later tests.
+        with mock.patch.object(read_cache, 'project_generation',
+                               return_value='a' * 32), \
+                mock.patch.object(read_cache, '_cached_rows', gated_cached), \
+                mock.patch.object(read_cache, '_write_one_file', slow_write):
+            threads = [threading.Thread(target=miss, args=(index,)) for index in range(5)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(run.exports, 1)                # ONE export served all five
+        self.assertEqual(len(writes), 1)                # and ONE cache write
+        for answer in answers:
+            self.assertEqual([item['id'] for item in answer], ['t-1'])
+
+    @unittest.skipIf(fcntl is None,
+                   'the one refresher is the cache directory\'s flock; without POSIX '
+                   'locks the code keeps today\'s behaviour - every reader refreshes - '
+                   'which test_on_a_kit_without_posix_locks pins instead')
+    def test_a_loser_whose_wait_runs_out_answers_from_its_own_export(self):
+        # The other half of the .346 rule: a miss whose wait runs out - the
+        # refresher is wedged, or this project simply will not cache fast
+        # enough - answers from its OWN export and writes NOTHING, so waits can
+        # never stack writes behind a stuck one. The winner's write outlives
+        # the losers' whole wait budget here, deterministically.
+        import threading
+        import time
+        gate = threading.Barrier(5, timeout=5)
+        real_cached = read_cache._cached_rows
+        real_write = read_cache._write_one_file
+        writes = []
+        run = FakeRun([row()])
+
+        def gated_cached(cache, key):
+            if not (cache / read_cache.FILE_NAME).exists():
+                try:
+                    gate.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            return real_cached(cache, key)
+
+        def stuck_write(cache, payload):
+            time.sleep(1.0)             # still held when every loser gives up
+            writes.append(payload)
+            real_write(cache, payload)
+
+        answers = [None] * 5
+        errors = []
+        def miss(index):
+            try:
+                answers[index] = read_cache.cached_export_rows(
+                    self.root, self.project, run)
+            except BaseException as error:      # pragma: no cover - reported below
+                errors.append(error)
+
+        with mock.patch.object(read_cache, 'project_generation',
+                               return_value='a' * 32), \
+                mock.patch.object(read_cache, '_cached_rows', gated_cached), \
+                mock.patch.object(read_cache, '_write_one_file', stuck_write), \
+                mock.patch.object(read_cache, '_REFRESH_WAIT_SECONDS', 0.2):
+            threads = [threading.Thread(target=miss, args=(index,)) for index in range(5)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(run.exports, 5)                # the winner plus four own
+        self.assertEqual(len(writes), 1)                # still exactly one write
+        for answer in answers:
+            self.assertEqual([item['id'] for item in answer], ['t-1'])
+
+    def test_on_a_kit_without_posix_locks_every_reader_answers_and_nothing_is_torn(self):
+        # The Windows shape, pinned: _refresh_lock answers (None, 'posix') - no
+        # fcntl - and the code keeps today's behaviour, EVERY miss refreshing on
+        # its own. What must still hold there (CI's one red reason): every
+        # reader answers the true rows, the file left behind is whole - its
+        # header names a payload length that matches - and the next read serves.
+        import threading
+        run = FakeRun([row()])
+        gate = threading.Barrier(5, timeout=5)
+        real_cached = read_cache._cached_rows
+
+        def gated_cached(cache, key):
+            if not (cache / read_cache.FILE_NAME).exists():
+                try:
+                    gate.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            return real_cached(cache, key)
+
+        answers = [None] * 5
+        errors = []
+        def miss(index):
+            try:
+                answers[index] = read_cache.cached_export_rows(
+                    self.root, self.project, run)
+            except BaseException as error:      # pragma: no cover - reported below
+                errors.append(error)
+
+        with mock.patch.object(read_cache, 'project_generation',
+                               return_value='a' * 32), \
+                mock.patch.object(read_cache, '_cached_rows', gated_cached), \
+                mock.patch.object(read_cache, '_refresh_lock',
+                                  side_effect=lambda cache: (None, 'posix')):
+            threads = [threading.Thread(target=miss, args=(index,)) for index in range(5)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        # Without a lock there is no ORDER either: a reader that starts a moment
+        # after another's rename finds a perfectly good file and serves it - a
+        # hit, not a refresh (CI's ubuntu 3.10 job saw 4 exports, correctly).
+        # What no-lock MUST guarantee is what is asserted: every reader answers
+        # the true rows from its own refresh OR another's, the count sits in
+        # [1, 5], the file left behind is whole, and the next read serves.
+        self.assertTrue(1 <= run.exports <= 5, run.exports)
+        for answer in answers:
+            self.assertEqual([item['id'] for item in answer], ['t-1'])
+        header, _, payload = self.cached_file().read_bytes().partition(b'\n')
+        self.assertEqual(json.loads(header)['bytes'], len(payload))   # whole
+        again, rerun = self.serve([row()])
+        self.assertEqual(rerun.exports, 0)              # and the next read serves
+
+    @unittest.skipIf(fcntl is None, 'the errno answers need the POSIX lock path')
+    def test_only_a_held_lock_reads_as_busy(self):
+        # Review B2 of .346 r3: EVERY OSError used to read as 'busy', so a
+        # filesystem without flock (ENOLCK) or an unopenable directory made each
+        # miss wait the full 45 s. Only EWOULDBLOCK/EAGAIN mean held; anything
+        # else means NO LOCK - refresh at once, the Windows shape - and an
+        # unopenable directory means no cache this read.
+        import errno as _errno
+        import fcntl as _fcntl
+        self.serve([row()])
+        with mock.patch.object(_fcntl, 'flock',
+                               side_effect=BlockingIOError(_errno.EWOULDBLOCK,
+                                                           'resource temporarily unavailable')):
+            self.assertEqual(read_cache._refresh_lock(self.cache), (None, 'busy'))
+        with mock.patch.object(_fcntl, 'flock',
+                               side_effect=OSError(_errno.EAGAIN, 'try again')):
+            self.assertEqual(read_cache._refresh_lock(self.cache), (None, 'busy'))
+        with mock.patch.object(_fcntl, 'flock',
+                               side_effect=OSError(_errno.ENOLCK, 'no locks available')):
+            self.assertEqual(read_cache._refresh_lock(self.cache), (None, 'posix'))
+        with mock.patch.object(_fcntl, 'flock',
+                               side_effect=OSError(_errno.EINVAL, 'invalid argument')):
+            self.assertEqual(read_cache._refresh_lock(self.cache), (None, 'posix'))
+        with mock.patch.object(read_cache.os, 'open',
+                               side_effect=OSError(_errno.ELOOP, 'too many levels of symbolic links')):
+            self.assertEqual(read_cache._refresh_lock(self.cache), (None, 'refuse'))
+        fd, state = read_cache._refresh_lock(self.cache)     # and untouched: held
+        self.assertEqual(state, 'held')
+        os.close(fd)
+
+    @unittest.skipIf(fcntl is None, 'the errno answers need the POSIX lock path')
+    def test_a_lock_error_that_is_not_busy_answers_at_once(self):
+        # The ENOLCK behaviour end to end: no 45 s wait, no pile-up - the miss
+        # exports, writes and answers immediately, exactly as a Windows kit.
+        import errno as _errno
+        import fcntl as _fcntl
+        import time
+        run = FakeRun([row()])
+        started = time.monotonic()
+        with mock.patch.object(read_cache, 'project_generation',
+                               return_value='a' * 32), \
+                mock.patch.object(_fcntl, 'flock',
+                                  side_effect=OSError(_errno.ENOLCK, 'no locks')):
+            rows = read_cache.cached_export_rows(self.root, self.project, run)
+        self.assertLess(time.monotonic() - started, 5)      # no wait ran out first
+        self.assertEqual([item['id'] for item in rows], ['t-1'])
+        self.assertEqual(run.exports, 1)
+        again, rerun = self.serve([row()])
+        self.assertEqual(rerun.exports, 0)                  # and it still cached
+
+    def test_a_directory_that_cannot_be_opened_answers_without_caching(self):
+        # The 'refuse' answer: the lock open itself failed (a symlink won the
+        # race, permissions), so this read caches nothing and still answers.
+        run = FakeRun([row()])
+        with mock.patch.object(read_cache, 'project_generation',
+                               return_value='a' * 32), \
+                mock.patch.object(read_cache, '_refresh_lock',
+                                  side_effect=lambda cache: (None, 'refuse')):
+            rows = read_cache.cached_export_rows(self.root, self.project, run)
+        self.assertEqual([item['id'] for item in rows], ['t-1'])
+        self.assertEqual(run.exports, 1)
+        self.assertFalse(self.cached_file().exists())       # nothing was written
+
+    def test_a_zero_filled_payload_of_the_right_length_is_never_served(self):
+        # Review S of .346 r3: with the fsync gone, a power loss can leave a
+        # right-LENGTH block of zeros. The header's sha256 refuses it; the read
+        # falls back to a fresh export and repairs the file.
+        self.serve([row()])
+        header, _, payload = self.cached_file().read_bytes().partition(b'\n')
+        self.cached_file().write_bytes(header + b'\n' + b'\0' * len(payload))
+        served, run = self.serve([row()])
+        self.assertEqual(run.exports, 1)             # digest mismatch: refused
+        self.assertEqual([item['id'] for item in served], ['t-1'])
+        again, rerun = self.serve([row()])
+        self.assertEqual(rerun.exports, 0)           # repaired, and serving
+
+    def test_the_format_compare_is_what_refuses_a_foreign_format(self):
+        # Review S mutant, killed: a file whose key, length and digest are all
+        # right and ONLY the format number differs must be refused - removing
+        # the format compare from the reader would serve it.
+        for foreign in (read_cache.FORMAT - 1, read_cache.FORMAT + 1):
+            self.serve([row(id='planted' if False else 't-1')])
+            raw = self.cached_file().read_bytes()
+            header, _, payload = raw.partition(b'\n')
+            head = json.loads(header)
+            head['format'] = foreign
+            self.cached_file().write_bytes(
+                json.dumps(head).encode('utf-8') + b'\n' + payload)
+            served, run = self.serve([row()])
+            self.assertEqual(run.exports, 1)         # refused on format alone
+            self.assertEqual([item['id'] for item in served], ['t-1'])
+            fresh, _, _ = self.cached_file().read_bytes().partition(b'\n')
+            self.assertEqual(json.loads(fresh)['format'], read_cache.FORMAT)
+
+    def test_the_payload_length_is_counted_in_bytes_not_characters(self):
+        # Review S mutant, killed: multi-byte text makes len(text) differ from
+        # len(text.encode()). If the header counted characters, every read of a
+        # project with such text would miss forever - the second serve pins it.
+        unicode_row = row(title='the caf\u00e9 \u6771\u4eac label')
+        first, run = self.serve([unicode_row])
+        self.assertEqual(run.exports, 1)
+        second, again = self.serve([unicode_row])
+        self.assertEqual(again.exports, 0)           # served: the lengths agree
+        self.assertEqual(second[0]['title'], unicode_row['title'])
+        header, _, payload = self.cached_file().read_bytes().partition(b'\n')
+        self.assertEqual(json.loads(header)['bytes'], len(payload))
+
+    def test_the_waiters_compare_reads_the_header_line_only(self):
+        # Review S of .346 r3: a waiter that just acquired the lock must not
+        # read (let alone parse) the payload - the compare is the header line.
+        # Garbage of any length behind a valid header still names its key.
+        self.serve([row()])
+        header, _, _ = self.cached_file().read_bytes().partition(b'\n')
+        self.assertEqual(read_cache._header_key(self.cache), 'a' * 32)
+        garbage = header + b'\n' + b'x' * 4096      # right header, junk payload
+        self.cached_file().write_bytes(garbage)
+        self.assertEqual(read_cache._header_key(self.cache), 'a' * 32)
+        self.assertIsNone(read_cache._cached_rows(self.cache, 'a' * 32))
+        self.cached_file().write_bytes(b'{not a header')    # no newline at all
+        self.assertIsNone(read_cache._header_key(self.cache))
+        self.cached_file().unlink()
+        self.assertIsNone(read_cache._header_key(self.cache))
+
     def test_each_call_returns_a_freshly_parsed_list(self):
         self.serve([row()])
         with mock.patch.object(read_cache, 'project_generation', return_value='a' * 32):
@@ -287,10 +626,10 @@ class ReadCacheTests(unittest.TestCase):
         import tempfile
         self.serve([row()], key='a' * 32)
         before = sorted(item.name for item in self.cache.iterdir())
-        def exploding_serialize(rows, key):
+        def exploding_payload(text, key):
             raise OSError('no space left on device')
         # A NEW key, so the refresh path (export, then the failing write) runs.
-        with mock.patch.object(read_cache, '_serialize', side_effect=exploding_serialize):
+        with mock.patch.object(read_cache, '_raw_payload', side_effect=exploding_payload):
             served, run = self.serve([row()], key='b' * 32)
         self.assertEqual(run.exports, 1)                    # still answered
         self.assertEqual(sorted(item.name for item in self.cache.iterdir()), before)
