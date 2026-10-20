@@ -581,7 +581,11 @@ and are not already listed as `reference-review` items:
   exist, so the exact number is not shown. To see drafts, run `ref find` yourself; each
   is marked not accepted there.
 
-`brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`;
+`brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`.
+`checkpoint.open_items` holds only the first ten and carries `open_items_shown`,
+`open_items_total` and, when the list is cut, a one-sentence `open_items_note`;
+`carry_open_items` is the complete list, in order, and is null when it could not all be
+read. Copy `carry_open_items`, not the first ten.
 `history` pages entries with `entry_id`, `body`, `body_offset`, `body_total_chars` and
 `continued`, so a long body is reassembled by concatenating fragments in offset order.
 

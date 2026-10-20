@@ -1728,9 +1728,13 @@ agent can write its first one from the brief alone.
   - `carried_open_items`: how many open items `body` holds. It is null when they could
     not all be read (the task changed during the read); `body.open_items` is then
     empty, the note says so, and the brief is read again.
-  - The brief's own `checkpoint.open_items` shows the first ten, each now with its
-    `source`; a task with more costs one further canonical read, which asks for all
-    of them (the canonical `brief --items-limit` now goes up to 100).
+  - The brief's own `checkpoint.open_items` shows the first ten, each with its
+    `source`, and carries `open_items_shown` and `open_items_total`; when the list is
+    cut, `checkpoint.open_items_note` says so in one sentence. `carry_open_items` is the
+    complete list, in order, and is null when they could not all be read. Copy
+    `carry_open_items` (or the template's `body.open_items`), not the first ten: a task
+    with more costs one further canonical read, which asks for all of them (the
+    canonical `brief --items-limit` goes up to 100).
   - `required`: the four texts to fill (`intent`, `acceptance`, `summary`,
     `next_action`); `optional`: what may be left out and when; `limits`; the shape of an
     `open_item` (with the allowed `kind` values) and of a `resolved_item`.

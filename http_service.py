@@ -1200,12 +1200,16 @@ class InProcessBackend:
         checkpoint = None
         if checkpoints:
             last = checkpoints[-1]
+            items = [{'id': item.get('id'),
+                      'kind': item.get('kind') or 'item',
+                      'text': item.get('text'), 'source': item.get('source')}
+                     for item in last.get('open_items') or []]
             checkpoint = {'id': last['id'], 'at': last['created_at'], 'author': last['actor'],
                           'summary': last['summary'], 'next_action': last.get('next_action'),
-                          'open_items': [{'id': item.get('id'),
-                                          'kind': item.get('kind') or 'item',
-                                          'text': item.get('text'), 'source': item.get('source')}
-                                         for item in last.get('open_items') or []]}
+                          'open_items': items,
+                          # This backend holds the checkpoint in memory and always reads
+                          # every item, so the shown list is the whole list, with no note.
+                          'open_items_shown': len(items), 'open_items_total': len(items)}
         return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
                 'carry_open_items': [dict(item) for item in checkpoints[-1].get('open_items') or []
                                      if isinstance(item, dict)] if checkpoints else [],
@@ -2879,6 +2883,24 @@ class EndpointBackend:
             point = data['checkpoint']
             unresolved = data.get('unresolved') or {}
             carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved)
+            shown_items = [{'id': item.get('id'), 'kind': item.get('kind'),
+                            'text': item.get('text'), 'source': item.get('source')}
+                           for item in unresolved.get('items') or []
+                           if isinstance(item, dict)]
+            shown = len(shown_items)
+            total = unresolved.get('total')
+            # The page shows the first ten; carry_open_items is the complete list. Say
+            # which is which, or an agent reads the first ten as the whole set
+            # (kittrial-5bb.356). The note appears when a list was cut, or when the
+            # complete list could not be read at all.
+            note = None
+            if isinstance(total, int) and shown < total:
+                note = ('The first %d of %d; carry_open_items %s' % (
+                    shown, total,
+                    'has all %d, in order, to carry forward unchanged.' % total
+                    if carry is not None else 'could not all be read: read the brief again.'))
+            elif carry is None:
+                note = 'carry_open_items could not all be read: read the brief again.'
             checkpoint = {'id': point.get('comment_id'), 'at': point.get('timestamp'),
                           'author': point.get('author'), 'summary': data.get('current_position'),
                           'next_action': data.get('next_action'),
@@ -2886,11 +2908,10 @@ class EndpointBackend:
                           'intent': (data.get('intent') or {}).get('text'),
                           'acceptance': (data.get('acceptance') or {}).get('text'),
                           'newer_activity': point.get('newer_activity'),
-                          'open_items': [{'id': item.get('id'), 'kind': item.get('kind'),
-                                          'text': item.get('text'), 'source': item.get('source')}
-                                         for item in unresolved.get('items') or []
-                                         if isinstance(item, dict)],
-                          'open_items_total': unresolved.get('total')}
+                          'open_items': shown_items,
+                          'open_items_shown': shown,
+                          'open_items_total': total,
+                          **({'open_items_note': note} if note else {})}
         review = data.get('review') or {}
         current = review.get('contribution')
         priors = review.get('prior_contributions_total') or 0
@@ -9128,7 +9149,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
         # The same note wherever the value reaches an agent: it is a label, not an instruction.
         brief['project_repository_note'] = self.service.REPOSITORY_NOTE if brief['project_repository'] else None
-        brief['checkpoint_template'] = self._checkpoint_template(brief, base, brief.pop('carry_open_items', []))
+        # The page needs the complete list, not the first ten: keep carry_open_items in
+        # the answer and build the template from it (kittrial-5bb.356).
+        brief['checkpoint_template'] = self._checkpoint_template(brief, base, brief.get('carry_open_items', []))
         brief['generated_at'] = now_iso(self.service._now())
         return 200, brief
 

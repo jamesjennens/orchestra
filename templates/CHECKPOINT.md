@@ -40,6 +40,14 @@ A refusal names the field, the length it had and the limit, for example
 the id, for example `open_items[1].text (id blocked-on-keys): 401 characters, the limit
 is 400`. A record with several problems is refused once, with every problem named.
 
+## Carrying open items forward
+
+`brief.checkpoint.open_items` is only the first ten items. `brief.carry_open_items` is
+the complete list, in order, and `brief.checkpoint_template.body.open_items` already
+holds every one of them (the template's `carried_open_items` is that count). Copy the
+template's list (or `carry_open_items`), never the first ten. When `carry_open_items` is
+null the items could not all be read: read the brief again before writing the checkpoint.
+
 ## lane_state (a sibling, not a checkpoint field)
 
 `lane_state` travels in the same payload FILE beside the checkpoint object and is popped

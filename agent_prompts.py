@@ -256,7 +256,7 @@ CLASSES = [
      lambda i: 'assignee %s; no delivery yet' % _assignee(i), 'updated_at'),
     ('unclaimed', 'Unclaimed high-priority tasks (P0/P1): find someone to take them',
      lambda i: 'priority P%s; unclaimed' % token(i.get('priority')), 'created_at'),
-    ('working', 'Your claimed tasks in progress: continue, checkpoint, deliver',
+    ('working', 'Your claimed tasks in progress: continue, checkpoint (copy every carry_open_items entry the brief gives), deliver',
      lambda i: 'state none; claimed by you%s' % (
          '; BLOCKED: the latest checkpoint has unresolved items' if i.get('blocked') else ''),
      'updated_at'),
