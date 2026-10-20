@@ -820,7 +820,8 @@ class CredentialFileRewriteCase(unittest.TestCase):
         cmds = json.loads(out.stdout)
         home = unique_dir('vscode-pscheck-')
         self.addCleanup(shutil.rmtree, home, ignore_errors=True)
-        env = dict(os.environ, USERPROFILE=str(home), HOME=str(home))
+        # LOCALAPPDATA too, so PowerShell's module analysis cache lands in the scratch home, not the checkout.
+        env = dict(os.environ, USERPROFILE=str(home), HOME=str(home), LOCALAPPDATA=str(home))
         # 1. Extra .txt extension is diagnosed by checkCommands:
         (home / '.orchestra-agent-kestrel.curlrc.txt').write_text(self.HEADER, encoding='utf-8')
         res1 = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['check']],
