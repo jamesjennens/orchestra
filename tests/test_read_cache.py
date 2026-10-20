@@ -64,7 +64,11 @@ class FakeRun:
     def __call__(self, argv):
         assert argv == ['export', '--all'], argv
         self.exports += 1
-        return ''.join(json.dumps(item) + '\n' for item in self.rows)
+        # Raw multi-byte UTF-8, exactly as real bd prints it (kittrial-5bb.347
+        # S1): json.dumps' default \u escapes would make every payload pure
+        # ASCII, char count == byte count, and the byte-length test's mutant
+        # survive - the approving review caught exactly that.
+        return ''.join(json.dumps(item, ensure_ascii=False) + '\n' for item in self.rows)
 
 
 class ReadCacheTests(unittest.TestCase):
@@ -559,6 +563,93 @@ class ReadCacheTests(unittest.TestCase):
         self.assertIsNone(read_cache._header_key(self.cache))
         self.cached_file().unlink()
         self.assertIsNone(read_cache._header_key(self.cache))
+
+    @unittest.skipIf(fcntl is None, 'the lock tracking needs the POSIX lock path')
+    def test_waiters_parse_the_payload_outside_the_lock(self):
+        # kittrial-5bb.347 S2: nothing pinned WHERE the served payload parses.
+        # The refresh lock is held across the export and the write (one
+        # refresher per key), but a waiter's _cached_rows must run AFTER the
+        # release - five waiters parsing one at a time under the lock is the
+        # queue .346 r4 removed. A tracked fd marks the lock held; every
+        # _cached_rows call in this test asserts it is not, so moving the parse
+        # back under the lock fails here.
+        import threading
+        import time
+        run = FakeRun([row()])
+        gate = threading.Barrier(2, timeout=5)
+        real_lock = read_cache._refresh_lock
+        real_rows = read_cache._cached_rows
+        real_write = read_cache._write_one_file
+        real_header = read_cache._header_key
+        tracked = set()
+        state = threading.local()        # PER THREAD: another thread's lock is
+        real_close = os.close            # not this call's lock
+
+        def tracking_close(fd):
+            if fd in tracked:
+                tracked.discard(fd)
+                state.under = False
+            real_close(fd)
+
+        def tracking_lock(cache):
+            fd, held = real_lock(cache)
+            if fd is not None:
+                tracked.add(fd)
+                state.under = True
+            return fd, held
+
+        def tracking_header(cache):
+            found = real_header(cache)
+            if found is not None:        # this thread matched under the lock:
+                state.armed = True       # the serve that follows must not
+            return found
+
+        def tracking_rows(cache, key):
+            if getattr(state, 'armed', False):
+                state.armed = False      # one shot: the parse after the release
+                self.assertFalse(getattr(state, 'under', False),
+                                 'the served payload parsed under the refresh lock')
+            return real_rows(cache, key)
+
+        def slow_write(cache, payload):
+            time.sleep(1.0)             # the winner holds the lock; one waits
+            real_write(cache, payload)
+
+        answers = {}
+        errors = []
+        def miss(name):
+            try:
+                answers[name] = read_cache.cached_export_rows(
+                    self.root, self.project, run)
+            except BaseException as error:      # pragma: no cover - reported below
+                errors.append(error)
+
+        # The patches are opened ONCE, from the test thread: two threads each
+        # entering mock.patch on the same attributes restore whatever they SAW
+        # on enter, and interleave into leaving the mocks installed for the
+        # rest of the process (the .346 r2 lesson, relearned here - the leak
+        # left a sleeping write and a mocked generation behind and broke the
+        # real-bd suite that ran after this module).
+        with mock.patch.object(read_cache, 'project_generation',
+                               return_value='a' * 32), \
+                mock.patch.object(read_cache, '_cached_rows', tracking_rows), \
+                mock.patch.object(read_cache, '_header_key', tracking_header), \
+                mock.patch.object(read_cache, '_refresh_lock', tracking_lock), \
+                mock.patch.object(read_cache, '_write_one_file', slow_write), \
+                mock.patch.object(read_cache.os, 'close', tracking_close):
+            winner = threading.Thread(target=miss, args=('winner',))
+            waiter = threading.Thread(target=miss, args=('waiter',))
+            winner.start()
+            time.sleep(0.3)            # the winner exports (and holds) first
+            waiter.start()             # the waiter polls, then serves outside
+            for thread in (winner, waiter):
+                thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(t.is_alive() for t in (winner, waiter)))
+        self.assertEqual(run.exports, 1)             # the waiter served, no export
+        for name, answer in answers.items():
+            self.assertEqual([item['id'] for item in answer], ['t-1'], name)
+        self.assertEqual(tracked, set())             # every lock taken was released
 
     def test_each_call_returns_a_freshly_parsed_list(self):
         self.serve([row()])
