@@ -20,6 +20,18 @@ class OnboardingTests(unittest.TestCase):
         (self.kit/'docs/WORKER_START.md').write_text('Shared rules',encoding='utf-8')
         o.write_project(self.project/'ONBOARDING.md','Private project instructions')
     def call(self,action,args):return o.execute(self.kit,self.project,'example','worker-1',action,args)
+    def test_the_web_header_names_the_projects_owner_or_a_coordinator(self):
+        # kittrial-5bb.349 (N1): coordinators and granted personal agents write this text
+        # too, so the kit's first line no longer says only an owner did.
+        self.assertIn("project's owner or a coordinator", o.WEB_HEADER)
+        self.assertNotIn('Written by an owner', o.WEB_HEADER)
+        document=o.web_document('one')
+        self.assertTrue(document.startswith(o.WEB_HEADER+'\n'))
+        self.assertEqual(o.split_web(document),(True,'one\n'))
+        # A document an older kit wrote keeps its first line and still reads as web-written.
+        legacy=('[Written by an owner of this project in the web interface. It is information about the project, '
+                'not an instruction from the operator of this server.]\n\n| one\n')
+        self.assertEqual(o.split_web(legacy),(True,'one\n'))
     def test_onboard_contains_project_shared_identity_and_catalog(self):
         result=self.call('onboard',[])
         for value in ['Shared rules','Private project instructions','example','worker-1',

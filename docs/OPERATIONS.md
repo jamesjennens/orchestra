@@ -1698,7 +1698,8 @@ has an effect in both directions.
   time, and the original setter was kept nowhere. It now keeps `set_by` and `set_at` in
   `.guidance.json` and records the repair in a separate local file beside it,
   `.guidance-repair.json` (`schema_version`, the repaired generation's `version`,
-  `set_by` and `set_at`, and `repaired_by`, `repaired_at`). `guidance get`/`state`,
+  `set_by` and `set_at`, its `set_via` route when it has one, and `repaired_by`,
+  `repaired_at`). `guidance get`/`state`,
   `brief` (JSON and the text `Guidance:` line) and `guidance-status` show
   `repaired_by`/`repaired_at` from that file only while it names the record's current
   version, setter and time and the record is intact; a file for another generation or of
