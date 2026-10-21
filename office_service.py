@@ -29,7 +29,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 import admin
@@ -107,16 +106,13 @@ def service_config(path):
         raise ValueError('http_host must not carry a port: give the address alone and the port in --port (got %s)' % host)
     public_url = config.get('public_url')
     if public_url is not None:
-        # urlsplit itself refuses a port that is not a number; either way the setting is named.
-        try:
-            named = urlsplit(public_url) if isinstance(public_url, str) else None
-            scheme, hostname = (named.scheme, named.hostname) if named is not None else (None, None)
-            if named is not None:
-                named.port                                  # raises when the port is not a number
-        except ValueError:
-            scheme, hostname = None, None
-        if scheme not in ('http', 'https') or not hostname:
-            raise ValueError('public_url must be an http or https URL with a host (got %r)' % (public_url,))
+        # kittrial-5bb.360: the address is copied into the set-up commands people paste into a
+        # shell, so it must be a plain http(s) address: one rule (server_address.py), one sentence
+        # naming the setting, this file and the first character it refuses.
+        from server_address import public_url_problem
+        problem = public_url_problem(public_url, 'the office configuration (%s)' % os.path.basename(str(path)))
+        if problem:
+            raise ValueError(problem)
     if not isinstance(config.get('approval_by_another_party', False), bool):
         raise ValueError('approval_by_another_party must be true or false')
     if 'agent_credential_days' in config:

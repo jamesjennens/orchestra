@@ -2503,7 +2503,10 @@ agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its crede
 bearer token (`Authorization: Bearer <agent-secret>`); every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may
 only name a project the owner can open, including when a superuser edits somebody
-else's agent (`404` otherwise). Set `--public-url https://<HOSTNAME>` so the setup and
+else's agent (`404` otherwise). Set `--public-url https://<HOSTNAME>` (a plain address: an http or https
+URL with a host, an optional port and a path of letters, digits, `. _ ~ - /` and `%XX` escapes; anything
+else is refused at start in one sentence, because the address is copied into commands people run;
+kittrial-5bb.360) so the setup and
 resume snippets carry the real address. Attention is computed at read time only: the
 service runs no scheduled job, poller or timer, and the owner resumes the agent
 manually.
