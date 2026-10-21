@@ -249,6 +249,10 @@ class TheFieldsCase(unittest.TestCase):
                             ('2026-09-15T10:00:00.9Z', {'title': 'A task', 'description': 'Intent',
                                                        'acceptance_criteria': 'Acceptance'}),
                             ('2026-09-15T09:00:00Z', {'title': 'A task', 'description': 'Intent',
+                                                     'acceptance_criteria': 'Acceptance'}),
+                            # An older value before the checkpoint is not "previous": the
+                            # newest commit at or before the checkpoint is.
+                            ('2026-09-14T09:00:00Z', {'title': 'A task', 'description': 'Draft intent',
                                                      'acceptance_criteria': 'Acceptance'}))
         section = b.brief(self.data, PROJECT, TASK, field_history=read)['changes_since_checkpoint']
         self.assertIsNone(section['fields_note'])
