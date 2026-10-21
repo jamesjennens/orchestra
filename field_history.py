@@ -18,6 +18,8 @@ read, never on a wait or next poll, and only when the checkpoint's cursor is sta
 read is bounded (``HISTORY_LIMIT`` commits); a history that does not reach back to the
 checkpoint, a compacted one, or one that cannot be read says so instead of guessing.
 """
+import re
+
 import record_json
 
 #: The three fields this section and the marker watch. Never status, assignee,
@@ -34,6 +36,18 @@ def command(task, limit=HISTORY_LIMIT):
 UNKNOWN_NOTE = ('Which task fields changed could not be determined (%s); read the task itself '
                 'with show for its current title, description and acceptance.')
 WHO_NOTE = 'who made the change is not recorded'
+#: bd prints commit times with one to nine fraction digits (``04:02:36.32Z`` measured);
+#: Python 3.10's ``fromisoformat`` takes only three or six, so the fraction is cut or
+#: padded to six before the kit's one time parser reads it.
+_FRACTION = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d{1,9})(Z|[+-]\d{2}:\d{2})$')
+
+
+def commit_moment(value):
+    from activity import parse_moment
+    match = _FRACTION.match(value) if isinstance(value, str) else None
+    if match:
+        value = '%s.%s%s' % (match.group(1), match.group(2)[:6].ljust(6, '0'), match.group(3))
+    return parse_moment(value, 'history commit date')
 
 
 def parse(text):
@@ -42,7 +56,6 @@ def parse(text):
     Each is ``(moment, {field: value})``. Anything not in that shape makes the whole
     answer unusable (None): a partial reading could name the wrong previous value.
     """
-    from activity import parse_moment
     try:
         data = record_json.loads(text)
     except (ValueError, TypeError, RecursionError):
@@ -54,7 +67,7 @@ def parse(text):
         if not isinstance(item, dict) or not isinstance(item.get('Issue'), dict):
             return None
         try:
-            moment = parse_moment(item.get('CommitDate'), 'history commit date')
+            moment = commit_moment(item.get('CommitDate'))
         except (ValueError, TypeError):
             return None
         issue = item['Issue']
