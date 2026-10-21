@@ -401,6 +401,40 @@ def cached_export_rows(root, path, run, name=None):
 #: cost one history read per generation. The files are bounded by the number of tasks
 #: read and each is replaced, never appended to.
 HISTORY_PREFIX = 'history-'
+#: Pruning (kittrial-5bb.362): each history write also removes the history files older
+#: than this many seconds, and any beyond the newest :data:`HISTORY_KEEP`. Only files
+#: with :data:`HISTORY_PREFIX` are touched; the export file never is.
+HISTORY_MAX_AGE = 24 * 3600
+HISTORY_KEEP = 256
+
+
+def _prune_history(cache, now=None):
+    """Remove aged and excess ``history-*.json`` files; every error is skipped.
+
+    Entries are read with ``lstat`` and removed with ``unlink``, so a symlink planted
+    under a history name is removed as a link and never followed.
+    """
+    import time
+    now = time.time() if now is None else now
+    try:
+        entries = []
+        with os.scandir(str(cache)) as found:
+            for entry in found:
+                if not (entry.name.startswith(HISTORY_PREFIX) and entry.name.endswith('.json')):
+                    continue
+                try:
+                    entries.append((entry.stat(follow_symlinks=False).st_mtime, entry.name))
+                except OSError:
+                    continue
+    except OSError:
+        return
+    entries.sort(reverse=True)                       # newest first
+    for index, (mtime, name) in enumerate(entries):
+        if index >= HISTORY_KEEP or now - mtime > HISTORY_MAX_AGE:
+            try:
+                os.unlink(str(cache / name))
+            except OSError:
+                pass
 
 
 def _history_file(task):
@@ -461,6 +495,7 @@ def cached_task_history(root, path, task, fetch, name=None):
         cache = _cache_directory(path)
         if cache is not None:
             _write_one_file(cache, _history_raw(text, key, task), name=_history_file(task))
+            _prune_history(cache)
     except OSError:
         pass
     return text

@@ -27,6 +27,22 @@ import record_json
 FIELDS = ('title', 'description', 'acceptance_criteria')
 #: At most this many commits are read per task read.
 HISTORY_LIMIT = 50
+#: ... and at most this many bytes of bd's answer (kittrial-5bb.362: 55 updates of a 60 KB
+#: description were about 3 MB). The reader stops at the cap; nothing beyond it is held,
+#: parsed or cached. One smaller read (:data:`RETRY_LIMIT` commits) is then tried, so a task
+#: with a huge description edited once or twice since the checkpoint still reads.
+HISTORY_MAX_BYTES = 256 * 1024
+RETRY_LIMIT = 5
+
+
+class TooLarge(ValueError):
+    """bd's history answer for one task passed :data:`HISTORY_MAX_BYTES`."""
+
+
+TOO_LARGE_NOTE = ('Which task fields changed could not be determined: this task\'s tracker history is larger '
+                  'than the %d KiB this read takes (it stops there), so its previous values are not shown; '
+                  'read the task itself with show for its current title, description and acceptance.'
+                  % (HISTORY_MAX_BYTES // 1024))
 #: Each value is clipped to this many characters.
 VALUE_CHARS = 300
 #: The fixed native read. ``--readonly`` makes bd itself refuse any write.

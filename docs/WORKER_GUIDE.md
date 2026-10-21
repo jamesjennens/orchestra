@@ -77,6 +77,10 @@ first wait started. A caller that passes none of the schedule flags keeps the sa
 existing output fields and exit codes as before; the additive `changed` block and the
 remembered default for `--since` apply to every call.
 
+## Never put a secret in task text
+
+A task's title, description and acceptance are read by everyone in the project, and the tracker keeps every earlier version of them. Since kittrial-5bb.354, brief's "changes since your checkpoint" section also shows up to 300 characters of a field's PREVIOUS value until the task's next checkpoint (docs/BRIEFINGS.md, "Changes since your checkpoint"). Editing a pasted secret out of a description therefore does not remove it: rotate the secret, and keep secrets in the files and stores meant for them, never in task text or comments.
+
 ## Preflight before claiming implementation
 
 Read the prospective task first, then verify:

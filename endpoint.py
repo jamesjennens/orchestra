@@ -1945,7 +1945,16 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(run, project=path)
+        def bounded(argv,max_bytes):
+            # kittrial-5bb.362: the field-history read stops reading bd's pipe at the cap.
+            completed,over=native.run_bounded(native.argv(root,path,actor,argv),environment(root),max_bytes)
+            if over:
+                import field_history
+                raise field_history.TooLarge('bd answered more than %d bytes' % max_bytes)
+            stdout,warnings=native.split(completed)
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(run, project=path, bounded=bounded)
         def briefing_effect():
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,

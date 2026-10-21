@@ -475,6 +475,189 @@ class TheInProcessRoutesAgreeCase(test_http_agents.AgentHarness):
         self.assertIn('keeps no tracker history', section['fields_note'])
 
 
+class TheHistoryReadIsBoundedCase(unittest.TestCase):
+    """kittrial-5bb.362, from the security review of .354: the read stops AT the byte cap
+    (the pipe is not read further, the process is ended), retries once smaller, and says so;
+    the per-task cache is pruned; a file holding another task's history is never served."""
+
+    def fake_bd(self, home, megabytes=4, then_sleep=30):
+        """A stand-in for bd that writes far more than the cap and then lingers."""
+        script = home / 'fake_bd.py'
+        script.write_text('import sys, time\n'
+                          'for _ in range(%d):\n'
+                          '    sys.stdout.write("[" + "x" * 65534 + "]"); sys.stdout.flush()\n'
+                          'time.sleep(%d)\n' % (megabytes * 16, then_sleep), encoding='utf-8')
+        return [sys.executable, str(script)]
+
+    def test_the_reader_stops_at_the_cap_and_ends_the_process(self):
+        import time
+        import native
+        from test_http_service import unique_dir
+        home = unique_dir('bounded-read-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        started = time.monotonic()
+        completed, over = native.run_bounded(self.fake_bd(home), dict(os.environ), field_history.HISTORY_MAX_BYTES)
+        self.assertTrue(over)
+        self.assertLessEqual(len(completed.stdout.encode('utf-8')), field_history.HISTORY_MAX_BYTES)
+        # It did not wait for the 4 MB writer, nor for its 30 s sleep: the process was ended.
+        self.assertLess(time.monotonic() - started, 15)
+        small = native.run_bounded([sys.executable, '-c', 'print("[]")'], dict(os.environ), 1024)
+        self.assertEqual(('[]\n', False, 0), (small[0].stdout, small[1], small[0].returncode))
+
+    def test_the_endpoint_runner_turns_it_into_too_large(self):
+        import native
+        from http_authority import NativeRunner
+        from test_http_service import unique_dir
+        home = unique_dir('bounded-runner-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        argv = self.fake_bd(home)
+
+        def bounded(command, max_bytes):          # endpoint.py's wrapper, over the fake bd
+            completed, over = native.run_bounded(argv, dict(os.environ), max_bytes)
+            if over:
+                raise field_history.TooLarge('over')
+            return completed.stdout
+        runner = NativeRunner(lambda command: '', bounded=bounded)
+        with self.assertRaises(field_history.TooLarge):
+            runner.bounded(field_history.command(TASK), field_history.HISTORY_MAX_BYTES)
+        # The bounded read is for reads only: a write is refused before anything runs.
+        called = []
+        recording = NativeRunner(lambda command: '', bounded=lambda command, cap: called.append(command))
+        with self.assertRaises(ValueError) as refused:
+            recording.bounded(['update', TASK, '--title', 'x'], 1024)
+        self.assertNotIsInstance(refused.exception, field_history.TooLarge)
+        self.assertIn('cannot run a write', str(refused.exception))
+        self.assertEqual([], called)
+        self.assertFalse(recording.attempted_write)
+        self.assertIsNone(NativeRunner(lambda command: '').bounded)
+
+    def test_the_cap_is_256_kib_and_the_docs_say_so(self):
+        self.assertEqual(256 * 1024, field_history.HISTORY_MAX_BYTES)
+        self.assertEqual(5, field_history.RETRY_LIMIT)
+        docs = (Path(__file__).resolve().parents[1] / 'docs' / 'BRIEFINGS.md').read_text(encoding='utf-8')
+        self.assertIn('The read stops at 256 KiB of bd\'s answer', docs)
+        self.assertIn('newest 5 commits', docs)
+
+    def brief_through_execute(self, runner):
+        """brief as the endpoint runs it (briefing.execute), with a stale checkpoint."""
+        data = rows()
+        save_cp(data, 'cp1', next_action='Wait')
+        data[0]['description'] = 'Intent, revised'
+        export = '\n'.join(json.dumps(row) for row in data) + '\n'
+
+        def dispatch(argv):
+            if argv[:2] == ['export', '--all']:
+                return export
+            return runner(argv)
+        from http_authority import NativeRunner
+        native_runner = NativeRunner(dispatch, bounded=getattr(runner, 'bounded', None))
+        with mock.patch.object(read_cache, 'project_generation', return_value=None):
+            out = b.execute(Path('.'), Path('.'), PROJECT, 'alice/session', 'brief', [TASK, '--json'], {}, native_runner)
+        return json.loads(out)['changes_since_checkpoint']
+
+    def test_one_smaller_read_follows_and_a_second_refusal_is_said(self):
+        same = {'title': 'A task', 'acceptance_criteria': 'Acceptance'}
+        fits = history_json(('2026-09-16T02:00:00Z', dict(same, description='Intent, revised')),
+                            ('2026-09-15T09:00:00Z', dict(same, description='Intent')))
+        asked = []
+
+        class Runner:
+            def __call__(self, argv):
+                return ''
+
+            def bounded(self, argv, max_bytes):
+                asked.append(argv[argv.index('--limit') + 1])
+                if argv[argv.index('--limit') + 1] == str(field_history.HISTORY_LIMIT):
+                    raise field_history.TooLarge('over')
+                return fits
+        section = self.brief_through_execute(Runner())
+        self.assertEqual([str(field_history.HISTORY_LIMIT), str(field_history.RETRY_LIMIT)], asked)
+        [field] = section['fields']
+        self.assertEqual(('description', 'Intent'), (field['field'], field['previous']['text']))
+
+        class Always(Runner):
+            def bounded(self, argv, max_bytes):
+                raise field_history.TooLarge('over')
+        section = self.brief_through_execute(Always())
+        self.assertEqual([], section['fields'])
+        self.assertEqual(field_history.TOO_LARGE_NOTE, section['fields_note'])
+        self.assertIn('%d KiB' % (field_history.HISTORY_MAX_BYTES // 1024), section['fields_note'])
+
+    def test_a_runner_without_a_bounded_read_is_still_capped(self):
+        class Plain:
+            def __call__(self, argv):
+                return '[' + ' ' * (field_history.HISTORY_MAX_BYTES + 10) + ']'
+        section = self.brief_through_execute(Plain())
+        self.assertEqual(field_history.TOO_LARGE_NOTE, section['fields_note'])
+
+    def cache_dir(self):
+        from test_http_service import unique_dir
+        home = unique_dir('history-prune-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        project = home / 'projects' / 'trial'
+        (project / read_cache.CACHE_DIR).mkdir(parents=True)
+        return home, project, project / read_cache.CACHE_DIR
+
+    def test_the_history_cache_is_pruned_by_age_and_count(self):
+        import time
+        home, project, cache = self.cache_dir()
+        (cache / read_cache.FILE_NAME).write_text('export', encoding='utf-8')
+        old = time.time() - read_cache.HISTORY_MAX_AGE - 60
+        (cache / 'history-aged.json').write_text('x', encoding='utf-8')
+        os.utime(cache / 'history-aged.json', (old, old))
+        os.utime(cache / read_cache.FILE_NAME, (old, old))         # the export is never pruned
+        for index in range(read_cache.HISTORY_KEEP + 5):
+            path = cache / ('history-%04d.json' % index)
+            path.write_text('x', encoding='utf-8')
+            stamp = time.time() - 3600 + index
+            os.utime(path, (stamp, stamp))
+        with mock.patch.object(read_cache, 'project_generation', return_value='k' * 32):
+            self.assertEqual('fresh', read_cache.cached_task_history(home, project, TASK, lambda: 'fresh'))
+        names = sorted(p.name for p in cache.iterdir())
+        self.assertIn(read_cache.FILE_NAME, names)
+        self.assertIn(read_cache._history_file(TASK), names)
+        self.assertNotIn('history-aged.json', names)
+        history = [n for n in names if n.startswith(read_cache.HISTORY_PREFIX)]
+        self.assertEqual(read_cache.HISTORY_KEEP, len(history))
+        # The oldest of the counted ones went; the newest stayed.
+        self.assertNotIn('history-0000.json', names)
+        self.assertIn('history-%04d.json' % (read_cache.HISTORY_KEEP + 4), names)
+
+    def test_an_aged_history_file_is_pruned_even_when_few_files_exist(self):
+        import time
+        home, project, cache = self.cache_dir()
+        old = time.time() - read_cache.HISTORY_MAX_AGE - 60
+        (cache / 'history-aged.json').write_text('x', encoding='utf-8')
+        os.utime(cache / 'history-aged.json', (old, old))
+        (cache / 'history-recent.json').write_text('x', encoding='utf-8')
+        read_cache._prune_history(cache)
+        self.assertEqual(['history-recent.json'], sorted(p.name for p in cache.iterdir()))
+
+    @unittest.skipIf(os.name == 'nt', 'symlinks need privileges on Windows')
+    def test_pruning_removes_a_planted_link_without_following_it(self):
+        import time
+        home, project, cache = self.cache_dir()
+        target = home / 'outside.json'
+        target.write_text('keep me', encoding='utf-8')
+        link = cache / 'history-planted.json'
+        link.symlink_to(target)
+        old = time.time() - read_cache.HISTORY_MAX_AGE - 60
+        os.utime(link, (old, old), follow_symlinks=False)
+        read_cache._prune_history(cache)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual('keep me', target.read_text(encoding='utf-8'))
+
+    def test_a_file_holding_another_tasks_history_is_not_served(self):
+        """Mutant M7: the header names the task, and a file whose header names another task is
+        refused even under this task's name (the file-name hash alone would not catch a file
+        copied or renamed into place)."""
+        home, project, cache = self.cache_dir()
+        key = 'k' * 32
+        (cache / read_cache._history_file(TASK)).write_bytes(read_cache._history_raw('other answer', key, 'other-task'))
+        with mock.patch.object(read_cache, 'project_generation', return_value=key):
+            self.assertEqual('fresh answer', read_cache.cached_task_history(home, project, TASK, lambda: 'fresh answer'))
+
+
 class ThePromptsCase(unittest.TestCase):
     """The worker prompt and the agent prompt say to read the section first after a wake."""
 
