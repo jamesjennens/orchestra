@@ -409,7 +409,8 @@ def build_prompt(agent, owner_name, projects, generated_at, server):
             'are not listed here.',
             '3. Re-check each item\'s current state (GET %s/v1/projects/<project id>/tasks/'
             '<task id>/brief) immediately before acting on it: this list is a snapshot and may '
-            'be out of date.' % server,
+            'be out of date. After a wake, read that brief\'s changes_since_checkpoint first: '
+            'what was written or edited since your checkpoint, newest first.' % server,
             '4. Never ask for, print, copy or write your secret. It stays in %s (%s on '
             'macOS/Linux) and curl reads it with -K.' % (secret_file['windows'], secret_file['posix']),
             '5. Items assigned to your owner are not assigned to you. If one needs you to '

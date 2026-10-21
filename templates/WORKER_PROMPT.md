@@ -179,6 +179,9 @@ checkpoint the task and stop. Copy the script for your platform into your own
 private directory, set its one wake command, and test it once: show that it woke you.
 Record in a checkpoint how you are woken. A lane must not end its turn to wait without a
 waker; if your harness cannot be woken, say so in one line instead of promising to wait.
+After a wake, read `brief TASK` first: its `Changes since your checkpoint (READ THESE
+FIRST)` lines list what was written or edited since your checkpoint, newest first, and
+which task fields changed. Then read the newest comments with `history TASK --recent 10`.
 `docs finding-work` has the contract, the scheduler files and example wake commands.
 
 After delivery, use only the mode authorized for this worker:

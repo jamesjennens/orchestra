@@ -536,6 +536,44 @@ NEWER_MAX=5
 # hex characters of that entry's current content digest. The digest is what makes an
 # EDIT to that same entry move the marker; the ID alone would not (kittrial-5bb.351).
 MARKER_DIGEST=16
+#: The task fields whose edits move the marker (kittrial-5bb.354). Never status, assignee,
+#: priority, notes or labels: a claim must not wake the agent that made it.
+MARKER_FIELDS=('title','description','acceptance_criteria')
+
+def fields_digest(row):
+    """Digest of the CURRENT title, description and acceptance of one task row."""
+    return content_hash({name:str(row.get(name) or '') for name in MARKER_FIELDS})
+
+def activity_marker(newest_other,digest):
+    """The stable newer-activity marker (kittrial-5bb.351, fields folded in by kittrial-5bb.354).
+
+    ``<entry_id>:<16 hex>`` names the newest other-party entry the checkpoint did not
+    incorporate; ``fields:<16 hex>`` stands when there is none. The hex covers that
+    entry's current content AND the current title, description and acceptance, so a new
+    other-party entry, an edit to the newest one and an edit of one of those three fields
+    each move it, while a claim, a status change or the owner's own comment never does.
+    Never a timestamp.
+    """
+    combined=content_hash({'entry':content_hash(newest_other) if newest_other is not None else None,'fields':digest})
+    return (newest_other['entry_id'] if newest_other is not None else 'fields')+':'+combined[:MARKER_DIGEST]
+
+def newer_comment_by_other(row,checkpoint_comment):
+    """The released ``newer_activity`` boolean, in ONE place (kittrial-5bb.354).
+
+    True when a comment by anyone other than the assignee was written after the
+    checkpoint comment, the lane-state record written with that checkpoint excepted
+    (kittrial-5bb.263). Unchanged from the rule ``work`` rows carried since
+    kittrial-5bb.114, so older clients read what they always read; the counts and the
+    marker are the precise signals. Raises StopIteration when the checkpoint comment is
+    not on the row.
+    """
+    comments=row.get('comments') or []
+    position=next(index for index,comment in enumerate(comments)
+                  if str(comment.get('id'))==str(checkpoint_comment.get('id')))
+    checkpoint_id=str(checkpoint_comment.get('id'));checkpoint_author=checkpoint_comment.get('author')
+    return any(comment.get('author')!=row.get('assignee')
+               and not lane_state_record(comment,checkpoint_id,checkpoint_author)
+               for comment in comments[position+1:])
 # Bounded provenance window: a checkpoint records exact digests for the most
 # recent incorporated entries and a rolling chain hash covering all older ones,
 # so the record stays within the checkpoint size cap on long-lived tasks while
@@ -827,7 +865,23 @@ def field_changes_since(recorded_fields, current_fields, only_if_unexplained=Fal
     return changed
 
 
-def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off',field_changes=None):
+def newer_selection(data,prov,checkpoint_timestamp):
+    """The ONE selection of what a checkpoint did not incorporate (kittrial-5bb.354).
+
+    Returns (coverage, entries, fresh, changed_or_late, unverified_count). The counts,
+    the marker, the boolean and the 'changes since your checkpoint' section all read
+    this, so no route can count differently. With recorded provenance the selection is
+    exact (new, edited and late entries); a legacy checkpoint has none, so the released
+    timestamp rule applies and coverage is 'unknown'.
+    """
+    coverage='unknown' if prov is None else ('snapshot' if prov['complete'] else 'windowed')
+    if prov is None and checkpoint_timestamp:
+        data=dict(data,entries=[e for e in data['entries']
+                               if parse_moment(e['timestamp'])>=parse_moment(checkpoint_timestamp)])
+    entries,fresh,changed_late,unverified=unincorporated(data,prov)
+    return coverage,entries,fresh,changed_late,unverified
+
+def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off',field_changes=None,marker_fields=None):
     """Bounded, per-entry view of activity the current checkpoint did not incorporate.
 
     `prov` is the checkpoint's normalized provenance, so edited entries (same ID,
@@ -838,11 +892,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     are tracked to an explicit acknowledged/resolved/superseded disposition; every
     collection is bounded with an explicit omitted count. Reading changes nothing.
     """
-    coverage='unknown' if prov is None else ('snapshot' if prov['complete'] else 'windowed')
-    if prov is None and checkpoint_timestamp:
-        data=dict(data,entries=[e for e in data['entries']
-                               if parse_moment(e['timestamp'])>=parse_moment(checkpoint_timestamp)])
-    entries,fresh,changed_late,unverified=unincorporated(data,prov)
+    coverage,entries,fresh,changed_late,unverified=newer_selection(data,prov,checkpoint_timestamp)
     own=[e for e in entries if e['author']==owner]
     others=[e for e in entries if e['author']!=owner]
     authors=sorted({e['author'] for e in others})
@@ -852,10 +902,13 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     # it: an edit to that entry (same ID, new body) must move the marker. Never a
     # timestamp. Null when there is nothing newer, or when coverage is unknown:
     # the marker is a precise claim, so a reader falls back to the boolean then.
+    # kittrial-5bb.354: with ``marker_fields`` (the current fields digest) the marker is
+    # the shared activity_marker, so it also moves on a title/description/acceptance edit.
     marker=None
-    if coverage!='unknown' and others:
-        newest=max(others,key=lambda e:(parse_moment(e['timestamp']),e['entry_id']))
-        marker=newest['entry_id']+':'+content_hash(newest)[:MARKER_DIGEST]
+    if coverage!='unknown' and (others or marker_fields is not None):
+        newest=max(others,key=lambda e:(parse_moment(e['timestamp']),e['entry_id'])) if others else None
+        marker=(activity_marker(newest,marker_fields) if marker_fields is not None
+                else newest['entry_id']+':'+content_hash(newest)[:MARKER_DIGEST])
     refs=[{'entry_id':e['entry_id'],'kind':e['kind'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
            'changed':any(c is e for c in changed_late)} for e in entries[:NEWER_MAX]]
     history='history '+data['task']
@@ -902,7 +955,8 @@ def compact_integration(value):
 
 
 def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
-          independent_approval=False,owners=None,provenance_writes=True,identity_names=None):
+          independent_approval=False,owners=None,provenance_writes=True,identity_names=None,
+          field_history=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
@@ -1034,7 +1088,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             recorded_fields=(recorded or {}).get('fields') if isinstance(recorded,dict) else None
             current_sizes={k:len(str(issue.get(k) or '')) for k in ('title','description','acceptance_criteria')}
             changes=field_changes_since(recorded_fields, current_sizes)
-            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason,field_changes=changes)
+            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason,field_changes=changes,marker_fields=fields_digest(issue))
             if not recorded_fields and not changes and not newer.get('entries'):
                 # An older cursor carries no lengths and no entry explains the stale
                 # flag: the change is in the task fields (state_sha256). Report that
@@ -1050,6 +1104,30 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                              +('' if newer['coverage']!='unknown' else ', coverage UNKNOWN — reconcile with history before trusting counts')
                              +'). Read newer activity first: '+newer['history']
                              +'. The recorded checkpoint next action was: '+p['next_action'])
+    # The one newer-activity definition (kittrial-5bb.354): brief carries the SAME fields
+    # the work rows and the agent routes carry, from the same function, beside the
+    # released `checkpoint.newer_activity` (which means "the checkpoint is stale", own
+    # entries and task-state changes included).
+    activity=checkpoint_queue_fields(rows,issue,state,provenance_writes=provenance_writes) if p is not None else None
+    # Which of title, description and acceptance changed: only the tracker's version
+    # history knows (field_history.py), read ONLY when the checkpoint is stale and only
+    # here - never on a wait or next poll. ``field_history`` is the caller's bounded,
+    # read-only, cached reader; without one the section says the fields are not known.
+    changed_fields=[];fields_note=None
+    if p is not None and stale:
+        import field_history as field_versions
+        if field_history is None:
+            fields_note=field_versions.UNKNOWN_NOTE%'this route does not read the tracker history'
+        else:
+            try:
+                history_text=field_history(task)
+            except Exception:
+                history_text=None
+            changed_fields,fields_note=field_versions.changes(history_text,issue,c.get('created_at'))
+    section=changes_since_checkpoint(
+        excluded if p is not None else data, retained_provenance(state) if p is not None else None,
+        {'comment_id':c['id'],'author':c.get('author'),'timestamp':c.get('created_at')} if p is not None else None,
+        context[0],fields=changed_fields,current=p is not None and not stale,fields_note=fields_note)
     # The project the checkpoint was taken in, when it is not this one (kittrial-5bb.136):
     # after restore-new under another name an unchanged task reads current, which is true
     # of the copy, but the restore is still worth reconciling before trusting the
@@ -1111,6 +1189,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
             'newer':newer,
+            'activity':activity,
+            'changes_since_checkpoint':section,
             'directions':dir_out,
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
             'current_position':p['summary'] if p else 'No checkpoint yet; current position and unresolved items have not been summarized.',
@@ -1419,8 +1499,78 @@ def verify_checkpoint(rows,project,task):
                     +'There is no shortcut that verifies never-recorded entries: publish a checkpoint to record '
                     'current evidence; reconcile history manually via history/show.')}
 
+#: The 'changes since your checkpoint' section (kittrial-5bb.354): at most this many
+#: entries, newest first, each body clipped to SECTION_BODY_CHARS, and all bodies
+#: together within SECTION_BUDGET encoded bytes; what does not fit is counted.
+SECTION_ENTRIES_MAX=10
+SECTION_BODY_CHARS=300
+SECTION_BUDGET=3000
+SECTION_NO_CHECKPOINT=('This task has no checkpoint yet, so there is nothing to compare with: '
+                       'everything on it is new to you. Read its history.')
+
+def entry_state(entry,fresh,checkpoint_timestamp):
+    """new, edited or late: how one unincorporated entry relates to the checkpoint."""
+    if not any(e is entry for e in fresh):return 'edited'
+    if checkpoint_timestamp and parse_moment(entry['timestamp'])<parse_moment(checkpoint_timestamp):return 'late'
+    return 'new'
+
+def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=False,fields_note=None):
+    """The bounded 'changes since your checkpoint' section (kittrial-5bb.354).
+
+    ``checkpoint`` is {comment_id, author, timestamp} of the newest valid checkpoint, or
+    None. The entries are the SAME selection the counts and the marker read
+    (:func:`newer_selection`), newest first, each with its author, time, entry id,
+    whether it is the owner's own and whether it is new, edited or a late arrival; the
+    body is untrusted text, so it is made terminal-safe and clipped. ``fields`` are the
+    changed task fields, already in their reported shape, and ``fields_note`` says why
+    they could not be determined when that is so (None when the reading is exact).
+    ``current`` says the
+    checkpoint's cursor matches the task as it is now: nothing is listed and coverage
+    reads 'current', as on the queue rows. Reading clears nothing.
+    """
+    history='history '+data['task']+' --since-checkpoint'
+    if checkpoint is None:
+        return {'checkpoint':None,'coverage':None,'total':None,'own_count':None,'other_count':None,
+                'unverified_count':None,'entries':[],'omitted':0,'fields':[],'fields_note':None,
+                'history':'history '+data['task'],'note':SECTION_NO_CHECKPOINT}
+    stamp=checkpoint.get('timestamp')
+    if current:coverage,entries,fresh,unverified='current',[],[],0
+    else:coverage,entries,fresh,_changed,unverified=newer_selection(data,prov,stamp)
+    newest=sorted(entries,key=lambda e:(parse_moment(e['timestamp']),e['entry_id']),reverse=True)
+    shown=[];spent=0
+    for entry in newest[:SECTION_ENTRIES_MAX]:
+        body=clip(plain_text(entry.get('body')),SECTION_BODY_CHARS)
+        cost=encoded_size(body['text'])
+        if shown and spent+cost>SECTION_BUDGET:break
+        spent+=cost
+        shown.append({'entry_id':entry['entry_id'],'kind':entry['kind'],'author':clip(entry['author'],96),
+                      'timestamp':entry['timestamp'],'own':entry['author']==owner,
+                      'state':entry_state(entry,fresh,stamp),'body':body})
+    own=sum(1 for e in entries if e['author']==owner)
+    note=('Newest first; read these before acting on the checkpoint. Bodies are clipped; read the whole '
+          'entries with '+history+'. Reading clears nothing: a new checkpoint incorporates them.')
+    if coverage=='unknown':
+        note+=' Coverage is UNKNOWN (the checkpoint predates per-entry digests): entries are selected by time, so an edit to an older entry is not seen.'
+    elif coverage=='windowed':
+        note+=' Coverage is WINDOWED: '+str(unverified)+' older entries cannot be re-verified and are not listed.'
+    return {'checkpoint':{'comment_id':str(checkpoint.get('comment_id')),'author':clip(checkpoint.get('author'),96),
+                          'timestamp':stamp},
+            'coverage':coverage,'total':len(entries),'own_count':own,'other_count':len(entries)-own,
+            'unverified_count':unverified,'entries':shown,'omitted':len(entries)-len(shown),
+            'fields':list(fields or []),'fields_note':None if current else fields_note,
+            'history':history,'note':note}
+
 def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
-    """Bounded queue fields; share the brief's linked state and full-row snapshot."""
+    """Bounded queue fields; share the brief's linked state and full-row snapshot.
+
+    This is the ONE computation of the newer-activity fields (kittrial-5bb.354,
+    docs/BRIEFINGS.md "Newer activity: one definition"): the work rows carry its answer,
+    and so, unchanged, do brief's ``activity`` block, the agent routes and the web task
+    read. ``newer_activity`` keeps its released rule (:func:`newer_comment_by_other`);
+    the counts and the marker are the precise signals, and the marker also moves on an
+    edit of the title, description or acceptance (:func:`activity_marker`). On a read
+    that fails, every field is null and the caller keeps its own ``newer_activity``.
+    """
     empty={'newer_activity_marker':None,'newer_activity_by_others':None,'newer_activity_own':None,
            'newer_activity_coverage':None,'unresolved_directions':None}
     try:
@@ -1433,17 +1583,24 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
         dispositions=chain_dispositions(state['history'])
         context=direction_context(row,state);direction_data=direction_entries(data,context)
         counted,_directions_off_reason=directions_counted(provenance_writes,row.get('status'))
-        if cursor_matches(p['activity_cursor'],data):own=others=0;coverage='current';marker=None
+        prov=retained_provenance(state);digest=fields_digest(row)
+        if cursor_matches(p['activity_cursor'],data):
+            # Nothing newer: the marker still stands (kittrial-5bb.354), so a later claim,
+            # which makes the cursor stale but adds no entry and no field edit, reads the
+            # same marker. A legacy checkpoint (no per-entry digests) has none.
+            own=others=0;coverage='current';marker=None if prov is None else activity_marker(None,digest)
         else:
-            newer=newer_activity_summary(data,retained_provenance(state),c.get('created_at'),
-                                         context[0],dispositions,direction_data,counted,_directions_off_reason)
+            newer=newer_activity_summary(data,prov,c.get('created_at'),
+                                         context[0],dispositions,direction_data,counted,_directions_off_reason,
+                                         marker_fields=digest)
             own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
             marker=newer['newer_activity_marker']
-        return {'newer_activity_marker':marker,
+        return {'newer_activity':newer_comment_by_other(row,c),
+                'newer_activity_marker':marker,
                 'newer_activity_by_others':others,'newer_activity_own':own,
                 'newer_activity_coverage':coverage,
                 'unresolved_directions':len(unresolved_directions(direction_data,dispositions,context[0],counted))}
-    except (ValueError,TypeError,KeyError):return empty
+    except (ValueError,TypeError,KeyError,StopIteration):return empty
 
 def snapshot_checkpoints(data):
     """Valid checkpoints of one snapshot in linked order, exactly as ``checkpoint`` reads them.
@@ -1715,6 +1872,37 @@ def parse_args(action,args):
             parsed.since_checkpoint=True
     return parsed
 
+def format_changes(section,activity):
+    """Text lines of the 'changes since your checkpoint' section (kittrial-5bb.354)."""
+    if not section:return []
+    if section['checkpoint'] is None:return ['Changes since your checkpoint: '+section['note']]
+    lines=[]
+    if activity:
+        lines.append('Newer activity: newer_activity=%s marker=%s by_others=%s own=%s coverage=%s unresolved_directions=%s'%(
+            activity.get('newer_activity'),activity.get('newer_activity_marker'),activity.get('newer_activity_by_others'),
+            activity.get('newer_activity_own'),activity.get('newer_activity_coverage'),activity.get('unresolved_directions')))
+    if not section['total'] and not section['fields']:
+        return lines+['Changes since your checkpoint: none (coverage %s).'%section['coverage']
+                      +(' '+section['fields_note'] if section.get('fields_note') else '')]
+    lines.append('Changes since your checkpoint (READ THESE FIRST): %d entries, %d by others, %d own; coverage %s.'%(
+        section['total'],section['other_count'],section['own_count'],section['coverage']))
+    for entry in section['entries']:
+        body=re.sub(r'[\r\n]+',' / ',entry['body']['text'])
+        more=' [+%d characters]'%entry['body']['omitted_chars'] if entry['body']['omitted_chars'] else ''
+        lines.append('  %s %s [%s, %s%s] by %s: %s%s'%(entry['timestamp'],entry['entry_id'],entry['kind'],entry['state'],
+                                                     ', own' if entry['own'] else '',entry['author']['text'],body,more))
+    if section['omitted']:lines.append('  ... %d more; read them with: %s'%(section['omitted'],section['history']))
+    for field in section['fields']:
+        lines.append('  field %s changed%s: now %s%s'%(field['field'],
+                     '' if field.get('author') else ' (who made the change is not recorded)',
+                     json.dumps(field['current']['text'],ensure_ascii=False),
+                     ' [+%d characters]'%field['current']['omitted_chars'] if field['current']['omitted_chars'] else '')
+                     +('; previous %s'%json.dumps(field['previous']['text'],ensure_ascii=False) if field.get('previous')
+                       else '; previous value not recorded'))
+    if section.get('fields_note'):lines.append('  '+section['fields_note'])
+    lines.append('  '+section['note'])
+    return lines
+
 def format_brief(result):
     def excerpt(value):return value['text']+(f' [excerpt; {value["omitted_chars"]} characters omitted — use show/history]' if value['omitted_chars'] else '')
     lines=[f'{result["task"]}: {excerpt(result["title"])}',f'Owner: {excerpt(result["owner"])} | Status: {result["status"]}',
@@ -1753,6 +1941,7 @@ def format_brief(result):
         lines += ['  '+e['entry_id']+' ['+e['kind']+(' changed' if e['changed'] else '')+'] '+e['timestamp']+' by '+e['author']['text'] for e in newer['entries']]
         if newer['omitted']:lines += [f'  ... {newer["omitted"]} more; fresh activity: '+newer['history_new']+'; full: '+newer['history']]
         lines += ['Read newer activity: '+newer['history_new'], newer['note']]
+    lines += format_changes(result.get('changes_since_checkpoint'),result.get('activity'))
     dirs=result['directions']
     if dirs:
         ids=', '.join(i['entry_id'] for i in dirs['items'])
@@ -2043,11 +2232,17 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
     else:
         rows=exported_rows(run)
         if action=='brief':
+            def field_history(task_id):
+                # One bounded read-only `bd history` per stale brief, through the read
+                # cache under the tracker's generation (kittrial-5bb.354).
+                import field_history as field_versions
+                from read_cache import cached_task_history
+                return cached_task_history(root,path,task_id,lambda:run(field_versions.command(task_id)),name=project)
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
                          verifiers=verifiers,actor=actor,full=a.full,
                          independent_approval=independent_approval,owners=owners,
                          provenance_writes=checkpoint_writes_enabled(root),
-                         identity_names=identity_names)
+                         identity_names=identity_names,field_history=field_history)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

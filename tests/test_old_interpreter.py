@@ -45,7 +45,8 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'claiming.py',  # kittrial-5bb.352: library-only (no __main__ block); imported by work/waiting/endpoint/http_service
            'claim_limit.py',
            'capability_misses.py', 'capability_records.py', 'capability_verification.py', 'credential_store.py',
-           'endpoint_process.py', 'feedback.py', 'field_limits.py',
+           'endpoint_process.py', 'feedback.py', 'field_history.py',  # kittrial-5bb.354: library-only; imported by briefing and http_service
+           'field_limits.py',
            'followon.py',  # kittrial-5bb.343: library-only (no __main__ block); imported by work/endpoint
            'guidance.py', 'handoff.py', 'host_reads.py', 'http_auth.py', 'http_authority.py',
            'keyed_entries.py', 'keyed_records.py', 'lane_state.py', 'lanes.py', 'lifecycle_voids.py', 'native.py', 'onboarding.py', 'open_items.py',

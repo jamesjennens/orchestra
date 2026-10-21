@@ -178,10 +178,12 @@ class WorkHelpContractTests(unittest.TestCase):
     def test_brief_shape_is_backward_compatible(self):
         result = briefing.brief(rows(), PROJECT, TASK)
         # Every v1 field stays; the only additions are the documented, additive
-        # reference-review attention fields (kittrial-5bb.66, .41 7.1).
+        # reference-review attention fields (kittrial-5bb.66, .41 7.1), and kittrial-5bb.354's
+        # `activity` (the one newer-activity definition) and `changes_since_checkpoint`.
         self.assertLessEqual(BRIEF_FIELDS, set(result))
         self.assertEqual(set(result) - BRIEF_FIELDS, {'attention', 'attention_total', 'attention_more',
-                                                      'reference_drafts_matching','newer','directions'})
+                                                      'reference_drafts_matching','newer','directions',
+                                                      'activity','changes_since_checkpoint'})
         # kittrial-5bb.293 item 1 (r6): `read_whole` is additive and is present ONLY
         # when a compact field was actually cut, so an uncut brief keeps its exact
         # pre-pointer size. `WorkerFeedbackBriefTests` pins the cut case.

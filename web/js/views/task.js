@@ -83,6 +83,7 @@ export async function detail(ctx, { pid, tid }) {
     h('div', { class: 'panel-body' },
       t.description ? h('p', { class: 'prose' }, t.description) : h('p', { class: 'muted' }, 'No description yet.'),
       cp ? [h('h3', { class: 'small' }, 'Where it stands'), h('p', { class: 'prose' }, cp.summary), cp.next_action ? h('p', null, h('strong', null, 'Next step: '), cp.next_action) : null] : null,
+      cp ? changesSinceCheckpoint(brief.changes_since_checkpoint) : null,
       cp && openItems.length ? [h('h3', { class: 'small' }, 'Unresolved items ', h('span', { class: 'nav-count' }, String(openTotal))),
         h('ul', { class: 'open-items' }, openItems.map((o) => h('li', null, h('span', { class: 'chip plain' }, o.kind), ' ', o.text)))] : null,
       incomplete ? h('div', { class: 'banner', role: 'note' }, 'The complete list of unresolved items could not all be read. ',
@@ -246,6 +247,37 @@ export async function detail(ctx, { pid, tid }) {
     lifecyclePanel(ctx, project, t),
     nextBanner,
     h('div', { class: 'detail' }, h('div', { class: 'stack' }, editPanel, owner && !project.archived ? assignmentForm(ctx, pid, tid, t) : null, brief.assignment_notices ? h('div', { class: 'banner info' }, brief.assignment_notices.items.map(item => h('p', { class: 'prose' }, item.message))) : null, briefPanel, reviewPanel, writer ? commentForm(ctx, pid, tid) : null, writer ? checkpointForm(ctx, pid, tid, brief) : null, historyPanel), side));
+}
+
+// What happened on the task after its checkpoint (kittrial-5bb.354): the entries newest
+// first (author, time, new/edited/late, the clipped body) and the changed task fields with
+// their previous value where the tracker records one. Every value is the server's text and
+// goes into the page as text, never as markup.
+export function changesSinceCheckpoint(section) {
+  if (!section || !section.checkpoint) return null;
+  const entries = Array.isArray(section.entries) ? section.entries : [];
+  const fields = Array.isArray(section.fields) ? section.fields : [];
+  if (!section.total && !fields.length) {
+    return h('p', { class: 'small muted', 'data-changes': 'none' }, 'Nothing has changed since this checkpoint.',
+      section.fields_note ? ' ' + section.fields_note : '');
+  }
+  const label = { title: 'Title', description: 'Description', acceptance_criteria: 'Acceptance' };
+  const clipped = (value) => value && value.omitted_chars ? ` … (${value.omitted_chars} more characters)` : '';
+  return h('div', { class: 'changes', 'data-changes': 'listed' },
+    h('h3', { class: 'small' }, 'Changes since this checkpoint ', h('span', { class: 'nav-count' }, String(section.total || 0))),
+    entries.length ? h('ul', { class: 'changes-entries' }, entries.map((e) => h('li', null,
+      h('span', { class: 'chip plain' }, e.state), ' ', e.own ? h('span', { class: 'chip plain' }, 'yours') : null, ' ',
+      (e.author && e.author.text) || 'unknown', ' · ', time(e.timestamp), ': ',
+      (e.body && e.body.text) || '', clipped(e.body)))) : null,
+    section.omitted ? h('p', { class: 'small muted' }, `${section.omitted} more are not shown; the history below has them all.`) : null,
+    fields.length ? h('ul', { class: 'changes-fields' }, fields.map((f) => h('li', null,
+      h('strong', null, (label[f.field] || f.field) + ' changed'),
+      f.changed_at ? [' · ', time(f.changed_at)] : null, ' (who made the change is not recorded). Now: ',
+      (f.current && f.current.text) || '', clipped(f.current),
+      f.previous ? ['. Before: ', f.previous.text || '', clipped(f.previous)] : '. The previous value is not recorded.'))) : null,
+    section.fields_note ? h('p', { class: 'small muted' }, section.fields_note) : null,
+    section.coverage === 'unknown' || section.coverage === 'windowed'
+      ? h('p', { class: 'small muted' }, section.note) : null);
 }
 
 export function checkpointForm(ctx, pid, tid, initialBrief) {

@@ -318,10 +318,13 @@ class NewerActivityQueueTests(unittest.TestCase):
         edited=work.queue(data,'alice/session',['--mine'])['items'][0]['newer_activity_marker']
         self.assertNotEqual(second,edited)
         self.assertTrue(edited.startswith(TASK+'-cdir1:'),edited)
-        # A new checkpoint incorporates it and resets the marker.
+        # A new checkpoint incorporates it: no other-party entry is newer, so the marker
+        # names the task fields only (kittrial-5bb.354: it stays non-null, so a later
+        # claim, which adds no entry, cannot move it).
         save_cp(data,'cp2',next_action='Process the corrected direction')
         item=work.queue(data,'alice/session',['--mine'])['items'][0]
-        self.assertIsNone(item['newer_activity_marker'])
+        self.assertTrue(item['newer_activity_marker'].startswith('fields:'),item['newer_activity_marker'])
+        self.assertNotEqual(item['newer_activity_marker'],edited)
         self.assertEqual(item['newer_activity_coverage'],'current')
         self.assertIsNone(briefing.brief(data,PROJECT,TASK)['newer'])
 
