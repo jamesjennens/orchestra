@@ -663,8 +663,9 @@ class RestoreNoticeCase(unittest.TestCase):
             review_workflow.StaleReviewPrevious('task', 'old', 'new', 'changes-requested'),
         )
         for error in errors:
-            line = '%s: %s' % (
-                type(error).__name__, str(error).replace('\r', '\\r').replace('\n', '\\n'))
+            class_name = '' if type(error) is ValueError else type(error).__name__ + ': '
+            line = 'ValueError: %s%s' % (
+                class_name, str(error).replace('\r', '\\r').replace('\n', '\\n'))
             with patch.object(admin, 'main', side_effect=error):
                 with self.assertRaises(SystemExit) as refused:
                     admin.run_main()

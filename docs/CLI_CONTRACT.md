@@ -43,8 +43,10 @@ Every request is one JSON object on stdin; every response is one JSON object on 
   `stdout` to `FILE` as UTF-8 with LF line endings and no BOM instead, and leaves its
   own stdout empty.
 - On validation or transport failure, `returncode` is nonzero (`2` for endpoint
-  validation), `stdout` is empty, and `stderr` starts with the error type
-  (`ValueError: ...`). Automation should parse stdout only when the exit code is `0`.
+  validation), `stdout` is empty, and kit refusal `stderr` starts with `ValueError: `.
+  For kit-specific `ValueError` subclasses, the concrete class name follows that prefix,
+  except `ConfigurationUnreadable` retains its existing exact output for compatibility.
+  Automation should parse stdout only when the exit code is `0`.
 - **The server's time of a write** (additive). The answer of a write that was carried
   out has one more field, `"server_time": "2026-10-06T07:50:12+00:00"`: the endpoint
   host's clock, UTC with its offset, whole seconds. Cite it where a record says when
