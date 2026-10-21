@@ -381,6 +381,8 @@ export function createApi(transport) {
     setMember: (pid, uid, role) => mutate('PUT', `/v1/projects/${pid}/members/${uid}`, { role }),
     // The agents that work in a project, as its owner sees them, and the coordinator grant (kittrial-5bb.209).
     projectAgents: (pid) => call('GET', `/v1/projects/${pid}/agents`),
+    // kittrial-5bb.365: the agent's history as this project's owners see it.
+    projectAgentHistory: (pid, aid) => call('GET', `/v1/projects/${pid}/agents/${aid}/history`),
     grantCoordinator: (pid, aid) => mutate('PUT', `/v1/projects/${pid}/agents/${aid}/coordinator`, {}),
     revokeCoordinator: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/coordinator`),
     // Who coordinates the project and the rules that bind them, for any member; read only (kittrial-5bb.198).
@@ -416,6 +418,8 @@ export function createApi(transport) {
     certificate: () => call('GET', '/v1/service/certificate'),
     updateAgent: (aid, body) => mutate('PATCH', `/v1/agents/${aid}`, body),
     agent: (aid) => call('GET', `/v1/agents/${aid}`),
+    // kittrial-5bb.365: the agent's history, its owner's view.
+    agentHistory: (aid) => call('GET', `/v1/agents/${aid}/history`),
     // A NEW credential for the agent; its secret is in this one response only.
     // With no list the new credential carries what the agent has; a list sets what it has from now on
     // (kittrial-5bb.208). The page sends a list only from "What it may do" on the agent's card.

@@ -2093,6 +2093,31 @@ credential approved anything; this is the one place where that is lifted.
   or viewer) stays on record and shows as "Granted, no effect" until the account is raised
   again or the grant is removed.
 
+**An agent's history (kittrial-5bb.365).** It is read from the service's audit, and nothing is
+rewritten. It covers credentials issued, revoked and extended, the agent disabled,
+enabled or changed, its owner's account disabled, and projects and coordinator grants
+given and taken; each with who and when, newest first, at most 50 (`omitted` counts the
+rest). There are two views:
+
+- `GET /v1/agents/{id}/history` is the agent's own view, for its account or a superuser.
+  It names each credential by its label, read from the credential record while that record is kept (the audit itself never holds a label), and shows the scopes before and after a change.
+  Anyone else gets the same `404` an unknown id gets, and a credential cannot read it.
+- `GET /v1/projects/{id}/agents/{agent}/history` is the project's view, for its owners and
+  admins. It shows no label, no scopes and nothing about another project, and nothing from
+  before the agent was given THIS project.
+  - The time of the grant is the agent's `agents.project.granted` audit event. The service
+    writes one for each project granted since this change.
+  - A grant older than that has no recorded time, so this view then lists nothing and says
+    why. It never shows the agent's history from another project.
+  - An agent not granted the project is the same `404` as the project's agent read.
+
+`GET /v1/projects/{id}/audit` also lists the events of agents whose grant names the project
+at the time of reading, tagged `agent: {id, name}` and cut to the same project view. A
+disable is one row with `revoked_count`. An agent taken out of the project drops out of the
+list: it is a view of the current grants, not a log of the project. `notes` says when the
+service no longer keeps an agent's oldest events (see docs/OPERATIONS.md, "How long the
+audit keeps events").
+
 `GET /v1/projects/{id}/agents` and `.../agents/{agent}` carry `coordinator` for each
 agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective,
 no_effect_because}`; the last is `null` while the grant has effect, else `agent-disabled`,

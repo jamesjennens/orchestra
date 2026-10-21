@@ -107,6 +107,8 @@ LOGIN_MAX_ATTEMPTS = 10
 LOOKUP_WINDOW_SECONDS = 10 * 60
 LOOKUP_MAX_PER_WINDOW = 20
 AUDIT_LIMIT = 10000
+#: An agent's history on the web (kittrial-5bb.365): at most this many events, newest first.
+AGENT_HISTORY_MAX = 50
 #: How long a committed canonical result stays replayable in the record store. It is a
 #: time-only retention: nothing is ever evicted by entry count or serialized bytes, and
 #: once this window has closed the record is dropped, after which the durable endpoint
@@ -3061,6 +3063,144 @@ class Service:
         shown = sorted(live + dead, key=self._credential_age)
         return [dict(self.credential_view(c), working=self._credential_live(c, moment)) for c in shown]
 
+    # -- an agent's history (kittrial-5bb.365) ---------------------------------------
+    #: The audit actions that make an agent's history, and the word each is shown as.
+    AGENT_HISTORY_KINDS = {
+        'agents.created': 'created',
+        'agents.credentials.issued': 'credential issued',
+        'agents.credentials.revoked': 'credential revoked',
+        'agents.credentials.extended': 'credential extended',
+        'agents.disable': 'disabled',
+        'agents.enable': 'enabled',
+        'agents.update': 'changed',
+        'accounts.disable': 'owner account disabled',
+        'agents.project.granted': 'given the project',
+        'agents.project.revoke': 'removed from the project',
+        'agents.coordinator.grant': 'coordinator grant given',
+        'agents.coordinator.revoke': 'coordinator grant ended',
+    }
+    #: Project-bound kinds: a project's view lists them only for its own project.
+    AGENT_HISTORY_PROJECT_KINDS = ('agents.project.granted', 'agents.project.revoke',
+                                   'agents.coordinator.grant', 'agents.coordinator.revoke')
+    AGENT_HISTORY_DROPPED = ('Older history is no longer kept: the service keeps the last %d audit events '
+                             'for all projects together.' % AUDIT_LIMIT)
+    AGENT_HISTORY_GRANT_UNKNOWN = ('This agent was given this project before the time of a grant was recorded, so its '
+                                   'earlier history is not shown here; its owner sees it on My agents.')
+
+    def _audit_project_grants(self, principal, agent, added, request_id):
+        """One ``agents.project.granted`` event per newly granted project: the grant time a
+        project's view of the agent's history starts from (kittrial-5bb.365)."""
+        for project_id in added:
+            event = self.audit(request_id, principal, 'agents.project.granted', 'committed',
+                               project_id=project_id, actor=self.agent_actor(agent))
+            event.update(agent_id=agent['id'])
+
+    @staticmethod
+    def _names_agent(event, agent_id):
+        if event.get('agent_id') == agent_id or agent_id in (event.get('agent_ids') or []):
+            return True
+        reason = event.get('reason') or ''
+        return reason == 'agent ' + agent_id or reason.startswith('agent %s:' % agent_id)
+
+    def agent_history(self, principal, agent_id, project_id=None):
+        """The agent's history from the audit tail, newest first, at most
+        :data:`AGENT_HISTORY_MAX` rows.
+
+        With no ``project_id`` it is the agent's own view (its owner or a superuser, the
+        :meth:`_agent_owned` rule; anyone else gets the plain 404 an unknown id gets): every
+        committed event about the agent, with each credential's label and the scopes before
+        and after. With a ``project_id`` it is that project's view (the route holds
+        ``CAP_PROJECT_ADMIN``; an agent not granted the project is the same 404 as
+        :meth:`get_project_agent`): no label, no scopes, no other project's events, and only
+        events from the time the agent was given THIS project. That time is its newest
+        ``agents.project.granted`` event; where none is kept, only events strictly after the
+        agent's newest create or update are listed (either could have been the grant), and
+        the answer says so. Stored events are never changed.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if project_id is None:
+                agent = self._agent_owned(principal, agent_id)
+            else:
+                agent = self._agent(agent_id)
+                if project_id not in (agent.get('projects') or []):
+                    raise not_found('Agent not found')
+            events = [(index, event) for index, event in enumerate(self.state['audit'])
+                      if event.get('outcome') == 'committed' and event.get('action') in self.AGENT_HISTORY_KINDS
+                      and self._names_agent(event, agent_id)]
+            notes = []
+            if project_id is not None:
+                events, note = self._since_project_grant(events, project_id)
+                if note:
+                    notes.append(note)
+            if not any(event.get('action') == 'agents.created' for _index, event in events) and project_id is None:
+                notes.append(self.AGENT_HISTORY_DROPPED)
+            newest = list(reversed(events))
+            shown = newest[:AGENT_HISTORY_MAX]
+            names = self.actor_names([event.get('user_id') for _index, event in shown])
+            labels = {cid: c.get('label') for cid, c in self.state['credentials'].items()
+                      if c.get('agent_id') == agent_id}
+            items = [self._history_row(event, names, labels, project_id is None) for _index, event in shown]
+            return {'agent': agent_id, 'project': project_id, 'items': items, 'total': len(events),
+                    'omitted': max(0, len(events) - len(shown)), 'notes': notes}
+
+    def _since_project_grant(self, events, project_id):
+        """The project's view: its own project events, and the rest only since the grant."""
+        own = [(i, e) for i, e in events if e.get('action') not in self.AGENT_HISTORY_PROJECT_KINDS
+               or e.get('project_id') == project_id]
+        grants = [i for i, e in own if e.get('action') == 'agents.project.granted' and e.get('project_id') == project_id]
+        if grants:
+            return [(i, e) for i, e in own if i >= grants[-1]], None
+        # No grant event is kept (a grant made before kittrial-5bb.365, or one the audit cap
+        # dropped). An earlier update event does not say which projects it changed, so no
+        # point in the log can be shown to follow the grant: nothing is listed, and the
+        # answer says why. It can show less, never the agent's history from another project.
+        return [], self.AGENT_HISTORY_GRANT_UNKNOWN
+
+    def _history_row(self, event, names, labels, full):
+        action = event.get('action')
+        row = {'at': event.get('time'), 'kind': self.AGENT_HISTORY_KINDS[action], 'action': action,
+               'by': names.get(event.get('user_id')) or event.get('user_id')}
+        if event.get('target_credential_id'):
+            row['credential'] = event['target_credential_id']
+        if event.get('target_credential_ids') is not None:
+            row['revoked_count'] = len(event.get('target_credential_ids') or [])
+        if action in self.AGENT_HISTORY_PROJECT_KINDS:
+            row['project'] = event.get('project_id')
+        if full:
+            if row.get('credential'):
+                # The label is read from the credential record, never stored in the audit
+                # (the audit carries no credential payload). A pruned record shows its id only.
+                row['label'] = labels.get(row['credential'])
+            if event.get('scopes_before') is not None or event.get('scopes_after') is not None:
+                row['scopes_before'] = event.get('scopes_before')
+                row['scopes_after'] = event.get('scopes_after')
+                if event.get('scopes_before') != event.get('scopes_after'):
+                    row['kind'] = 'scopes changed'
+        return row
+
+    def project_agent_audit(self, project_id):
+        """The project audit's agent rows (kittrial-5bb.365): the events of agents whose live
+        grant names ``project_id``, cut to the project's view, each tagged with its agent.
+        A view at read time: nothing stored is changed or gains a project."""
+        with self.store.lock:
+            agents = [a for a in self.state['agents'].values() if project_id in (a.get('projects') or [])]
+            rows = []
+            for agent in agents:
+                events = [(index, event) for index, event in enumerate(self.state['audit'])
+                          if event.get('outcome') == 'committed' and event.get('action') in self.AGENT_HISTORY_KINDS
+                          and self._names_agent(event, agent['id'])]
+                events, _note = self._since_project_grant(events, project_id)
+                # The project's own events (its grant, its coordinator grants) are already in
+                # the project audit under their project; only the agent's other events are added.
+                for _index, event in [(i, e) for i, e in events if e.get('project_id') != project_id]:
+                    rows.append({'time': event.get('time'), 'action': event.get('action'), 'outcome': 'committed',
+                                 'user_id': event.get('user_id'), 'project_id': None, 'reason': None,
+                                 'agent': {'id': agent['id'], 'name': agent['name']},
+                                 'revoked_count': (len(event.get('target_credential_ids') or [])
+                                                   if event.get('target_credential_ids') is not None else None)})
+            return rows
+
     def agent_view(self, agent, principal):
         """The owner-visible agent record. The path never leaks to anyone else."""
         owner_sees_path = bool(principal.superuser or
@@ -3631,6 +3771,8 @@ class Service:
             if clean_role is not None:
                 agent['role'] = clean_role
             self.state['agents'][agent_id] = agent
+            # The grants first, so a project's view of the history includes the first credential.
+            self._audit_project_grants(principal, agent, list(granted or []), request_id)
             credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry)
             self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
                                          self.agent_scopes(agent), request_id)
@@ -3721,7 +3863,9 @@ class Service:
                 # an owner who empties the field on My agents sends.
                 changes['claim_limit'] = validate_claim_limit(payload.get('claim_limit'))
             left = [pid for pid in (agent.get('projects') or []) if pid not in changes.get('projects', agent.get('projects') or [])]
+            added = [pid for pid in changes.get('projects', []) if pid not in (agent.get('projects') or [])]
             agent.update(changes)
+            self._audit_project_grants(principal, agent, added, request_id)
             if 'role' in payload:
                 clean_role = validate_agent_role(payload.get('role'))
                 if clean_role is None:

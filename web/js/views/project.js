@@ -6,6 +6,7 @@ import { mergeSlotPanel } from './merge_slot.js';
 import { guidancePanel } from './guidance.js';
 import { coordinationPanel } from './coordination.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
+import { historyPanel } from '../agentHistory.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
@@ -517,7 +518,8 @@ export async function settings(ctx, { pid }) {
             drawAgents(); coordination.draw();
           };
           return h('tr', { 'data-agent': a.id, 'data-coordinator': grant ? String(grant.effective) : 'none' },
-            h('td', null, a.name, a.enabled ? null : h('div', { class: 'sub' }, 'Disabled')),
+            h('td', null, a.name, a.enabled ? null : h('div', { class: 'sub' }, 'Disabled'),
+              historyPanel(() => ctx.api.projectAgentHistory(pid, a.id))),
             h('td', null, a.owner_display_name || a.owner),
             h('td', null, !grant ? h('span', { class: 'muted' }, 'No') :
               [h('span', { class: 'chip ' + (grant.effective ? 'ok' : 'plain') }, grant.effective ? 'Coordinates' : 'Granted, no effect'),

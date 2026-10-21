@@ -6757,6 +6757,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, {'items': items, 'total': len(items),
                      'generated_at': now_iso(self.service._now())}
 
+    @route('GET', r'/v1/agents/(?P<aid>' + ID + r')/history')
+    def agents_history(self, ctx):
+        """The agent's history, its owner's view (kittrial-5bb.365): credentials issued,
+        revoked, extended; disabled, enabled, changed; projects given and taken. Readable by
+        the agent's owner or a superuser; anyone else gets the plain 404 an unknown id gets.
+        A credential cannot read it (``agents.manage`` is never a credential's)."""
+        self.require(ctx, CAP_AGENTS)
+        return 200, dict(self.service.agent_history(ctx.principal, ctx.params['aid']),
+                         generated_at=now_iso(self.service._now()))
+
     @route('GET', r'/v1/agents/(?P<aid>' + ID + r')')
     def agents_get(self, ctx):
         self.require(ctx, CAP_AGENTS)
@@ -6794,6 +6804,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             if 'enabled' in payload and payload['enabled'] is not None and not bool(payload['enabled']):
                 metadata.update(self._revocation_metadata(agent_id=ctx.params['aid']))
+            # The event names its agent (kittrial-5bb.365), so the agent's history lists it.
+            metadata.setdefault('agent_ids', [ctx.params['aid']])
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload,
                                                request_id=ctx.request_id)
             return result, result
@@ -7071,6 +7083,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                ctx.params['aid'])
         return 200, {'project': ctx.params['pid'], 'agent': agent,
                      'generated_at': now_iso(self.service._now())}
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/history')
+    def project_agent_history(self, ctx):
+        """The agent's history as this project's owners see it (kittrial-5bb.365): no
+        credential label, no scopes, nothing about another project, and nothing from before
+        the agent was given this project. An agent not granted here is the same 404 as the
+        project's agent read."""
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        return 200, dict(self.service.agent_history(ctx.principal, ctx.params['aid'], project_id=ctx.params['pid']),
+                         generated_at=now_iso(self.service._now()))
 
     @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/coordinator')
     def project_agent_coordinator_grant(self, ctx):
@@ -10217,6 +10239,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_PROJECT_ADMIN)
         limit, state = self._page(ctx, ctx.query)
         events = [e for e in self.service.state['audit'] if e.get('project_id') == ctx.params['pid']]
+        # The events of agents granted this project, cut to the project's view and only since
+        # the agent was given this project (kittrial-5bb.365). Stored events are not changed.
+        agent_rows = self.service.project_agent_audit(ctx.params['pid'])
+        if agent_rows:
+            events = sorted(events + agent_rows, key=lambda event: event['time'])
         if hasattr(self.backend, 'requirement_operator_audits'):
             operator_events = self.backend.requirement_operator_audits(ctx.params['pid'])
             if operator_events:

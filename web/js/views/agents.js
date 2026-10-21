@@ -6,6 +6,7 @@ import { pageHead, empty, field, setFieldError, formValues, act, errorState, des
 import * as setupText from '../agentSetup.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { SESSION_IDLE_WARNING_EVENT } from '../api.js';
+import { historyPanel } from '../agentHistory.js';
 
 export const ATTENTION = {
   feedback: ['Has feedback to act on', 'warn'],
@@ -154,7 +155,8 @@ export async function list(ctx) {
     let data;
     try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
     const items = data.items;
-    host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null))) :
+    host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null,
+      manages(ctx, a) ? historyPanel(() => ctx.api.agentHistory(a.id)) : null))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
     host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
       h('span', { class: 'small muted' }, `${items.length} shown of ${data.total} agents`),
