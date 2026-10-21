@@ -712,7 +712,11 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
 
   dialog.append(
     h('div', { class: 'dialog-body' },
-      h('div', { class: 'copy-row' }, progress), title, idleWarningBanner, screenNode, errorLine, checkStatus),
+      h('div', { class: 'copy-row' }, progress), title, idleWarningBanner,
+      // kittrial-5bb.360: an address that may not go into a command is never used in one.
+      payload.serverRefused ? h('p', { class: 'small error-text', role: 'alert', 'data-server-refused': 'true' },
+        'This server’s address cannot be used in a command, so the commands show <ORCHESTRA_SERVER_URL>: ask whoever runs the server to correct its public_url.') : null,
+      screenNode, errorLine, checkStatus),
     h('div', { class: 'dialog-foot' }, skipBtn, backBtn, nextBtn, doneBtn));
 
   // ---- the screens -------------------------------------------------------------------------

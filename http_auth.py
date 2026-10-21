@@ -33,6 +33,7 @@ import hashlib
 import copy
 from contextlib import contextmanager
 import hmac
+from server_address import ps_quote, sh_quote
 import ipaddress
 import json
 import math
@@ -1051,6 +1052,12 @@ class Service:
         self.login_max_attempts = login_max_attempts
         #: Canonical base URL of this service, used only to render the copyable agent
         #: setup/resume snippets. It is deployment configuration, never request data.
+        # kittrial-5bb.360: the address goes into the set-up commands people paste into a shell.
+        if public_url:
+            from server_address import public_url_problem
+            problem = public_url_problem(public_url, 'the service start (--public-url)')
+            if problem:
+                raise ValueError(problem)
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
         self._audit_defer_trim = 0
@@ -3305,20 +3312,23 @@ class Service:
             "#    in a text editor, then: chmod 600 %(posix)s (mode 600).\n"
             "# 2. Test it (success prints the agent's JSON; 401 means a wrong secret or header\n"
             "#    line; \"cannot read config\" means a wrong file name or a .txt extension):\n"
-            "#    PowerShell:  curl.exe -fsS -K \"%(ps)s\" %(server)s/v1/agents/me\n"
-            "#    macOS/Linux: curl -fsS -K %(posix)s %(server)s/v1/agents/me\n"
+            "#    PowerShell:  curl.exe -fsS -K \"%(ps)s\" %(me_ps)s\n"
+            "#    macOS/Linux: curl -fsS -K %(posix)s %(me_sh)s\n"
             "# 3. In the agent folder (shell shown; the web page can save these files for you):\n"
             "mkdir -p .orchestra\n"
             "cat > %(config_path)s <<'JSON'\n%(config)s\nJSON\n"
             "[ -f .gitignore ] && ! grep -qx '.orchestra/' .gitignore && printf '\\n.orchestra/\\n' >> .gitignore\n"
             "# Every call hands curl the config file (-K), so the secret never reaches a\n"
             "# command line, shell history or the process list:\n"
-            "curl -fsS -K %(posix)s %(server)s/v1/agents/me/next\n"
+            "curl -fsS -K %(posix)s %(next_sh)s\n"
             "# Secondary fallback only, for a machine where that file cannot be kept: the\n"
             "# %(env)s environment variable may hold the secret. Never write the secret\n"
             "# on a command line, in the agent folder, in agent.json or in Git.\n"
         ) % {'win': secret_file['windows'], 'ps': secret_file['windows_powershell'],
-             'posix': secret_file['posix'], 'server': server, 'config_path': AGENT_CONFIG_PATH,
+             'posix': secret_file['posix'], 'config_path': AGENT_CONFIG_PATH,
+             # kittrial-5bb.360: the address is single-quoted in every command (nothing in it expands).
+             'me_ps': ps_quote(server + '/v1/agents/me'), 'me_sh': sh_quote(server + '/v1/agents/me'),
+             'next_sh': sh_quote(server + '/v1/agents/me/next'),
              'config': json.dumps(config, indent=2, sort_keys=True), 'env': AGENT_SECRET_ENV}
         # Where each granted project's repository is, as its owner recorded it
         # (kittrial-5bb.118). A label for the person setting the agent up: it is listed

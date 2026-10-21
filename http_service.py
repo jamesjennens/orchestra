@@ -31,6 +31,7 @@ import hashlib
 import ipaddress
 import json
 import os
+from server_address import ps_quote, sh_quote
 import record_json
 import re
 import secrets
@@ -7773,10 +7774,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         secret_file = agent_secret_file(agent['name'])
         return ("Open your agent folder%s for agent '%s' (%s). %s\n"
                 "Your secret is in %s (never print or copy it). Then run:\n"
-                "  PowerShell:  curl.exe -fsS -K \"%s\" %s/v1/agents/me/next\n"
-                "  macOS/Linux: curl -fsS -K %s %s/v1/agents/me/next"
+                "  PowerShell:  curl.exe -fsS -K \"%s\" %s\n"
+                "  macOS/Linux: curl -fsS -K %s %s"
                 % (where, agent['name'], agent['id'], what, secret_file['windows'],
-                   secret_file['windows_powershell'], server, secret_file['posix'], server))
+                   # kittrial-5bb.360: the address single-quoted, so nothing in it expands.
+                   secret_file['windows_powershell'], ps_quote(server + '/v1/agents/me/next'),
+                   secret_file['posix'], sh_quote(server + '/v1/agents/me/next')))
 
     # -- task routes -----------------------------------------------------------
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks')
@@ -10928,6 +10931,12 @@ def main(argv=None):
     if not 1 <= args.logins_per_address <= Service.LOGINS_AT_ONCE:
         parser.error('--logins-per-address must be a whole number from 1 to %d (the log-ins in flight in all)'
                      % Service.LOGINS_AT_ONCE)
+    if args.public_url:
+        # kittrial-5bb.360: one sentence, before the state is opened or a port is bound.
+        from server_address import public_url_problem
+        problem = public_url_problem(args.public_url, 'the service start (--public-url)')
+        if problem:
+            parser.error(problem)
     store = Store(args.state)
     if args.backend == 'endpoint' and (not args.endpoint or not args.root):
         parser.error('--backend endpoint requires --endpoint and --root '

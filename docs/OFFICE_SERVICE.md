@@ -404,9 +404,19 @@ none of the settings below behaves as it always did.
   Passwords and session cookies cross the network unencrypted. Use cert and
   key for HTTPS.` The setting together with loopback, or together with a
   certificate, is refused: it would do nothing there.
-- A `cert` or `key` that is not a string, and a `public_url` that is not an
-  `http` or `https` URL with a host, are refused before anything starts, each
-  with a sentence naming the setting. `strict_transport_security` must be
+- A `cert` or `key` that is not a string is refused before anything starts,
+  with a sentence naming the setting.
+- **`public_url`** is copied into the set-up commands people paste into a shell, so it
+  must be a plain address (kittrial-5bb.360): `http` or `https`, a host (a DNS name,
+  an IPv4 address or a bracketed IPv6 address), an optional port and an optional path
+  of letters, digits, `. _ ~ - /` and `%XX` escapes. The three forms `orc.sh` writes
+  (`http://localhost:PORT`, `https://ADDRESS:PORT`, `http://ADDRESS:PORT`) all pass.
+  - Anything else is refused before anything starts, in one sentence naming the
+    setting, this file and the first character refused: quotes, `$`, a backtick,
+    `;`, `|`, `&`, brackets, whitespace, userinfo, a query, a fragment, or a `%XX`
+    escape of one of those.
+  - The service applies the same rule to `--public-url`.
+  - The commands quote the address as well. `strict_transport_security` must be
   `true` or `false` (see below).
 - **A relative `cert` or `key` is relative to the runtime root**, because the
   web service is started with the runtime root as its working directory. The
