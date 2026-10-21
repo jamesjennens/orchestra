@@ -768,11 +768,12 @@ class CredentialFileRewriteCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, home, ignore_errors=True)
         path = home / '.orchestra-agent-kestrel.curlrc'
         path.write_text(self.HEADER, encoding='utf-8')      # Notepad: no final newline
-        env = dict(os.environ, USERPROFILE=str(home))
+        # LOCALAPPDATA too: PowerShell writes its module analysis cache there (kittrial-5bb.361).
+        env = dict(os.environ, USERPROFILE=str(home), LOCALAPPDATA=str(home))
         for run in range(2):
             with self.subTest(run=run):
                 out = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', command],
-                                     env=env, capture_output=True, text=True, timeout=120)
+                                     env=env, cwd=str(home), capture_output=True, text=True, timeout=120)
                 self.assertEqual(0, out.returncode, out.stderr)
                 self.assert_file_shape(path)
 
@@ -782,9 +783,10 @@ class CredentialFileRewriteCase(unittest.TestCase):
         command = self.prompt_powershell_command()
         home = unique_dir('vscode-psmissing-')
         self.addCleanup(shutil.rmtree, home, ignore_errors=True)
-        env = dict(os.environ, USERPROFILE=str(home))
+        # LOCALAPPDATA too: PowerShell writes its module analysis cache there (kittrial-5bb.361).
+        env = dict(os.environ, USERPROFILE=str(home), LOCALAPPDATA=str(home))
         out = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', command],
-                             env=env, capture_output=True, text=True, timeout=120)
+                             env=env, cwd=str(home), capture_output=True, text=True, timeout=120)
         self.assertEqual(0, out.returncode, out.stderr)
         self.assertIn('Save the header line first, then run this again.', out.stdout)
         self.assertNotIn('Exception', out.stderr)
@@ -1110,7 +1112,9 @@ class ProxyAwareSelfCheckCase(unittest.TestCase):
             args = [POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['check']['powershell']]
         else:
             args = [BASH, '-c', cmds['check']['posix']]
-        done = subprocess.run(args, env=env, capture_output=True, text=True, timeout=120)
+        # The working directory is the scratch home too: a slow run (the 20 s timeout case) still left
+        # PowerShell's module analysis cache in the checkout's tests/ folder (kittrial-5bb.361).
+        done = subprocess.run(args, env=env, cwd=str(home), capture_output=True, text=True, timeout=120)
         return done, cmds['sentence']
 
     def shells(self):
@@ -1232,7 +1236,8 @@ class TheQuotesAndTheBrowserRuleCase(unittest.TestCase):
         script.write_text('\n'.join('Write-Output %s' % ps_quote(value) for value in values) + '\n', encoding='utf-8-sig')
         done = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
                                '-Command', '[Console]::OutputEncoding = [Text.Encoding]::UTF8; & %s' % ps_quote(str(script))],
-                              cwd=str(home), capture_output=True, timeout=120)
+                              cwd=str(home), capture_output=True, timeout=120,
+                              env=dict(os.environ, LOCALAPPDATA=str(home)))      # its module cache stays in home
         self.assertEqual(0, done.returncode, done.stderr.decode('utf-8', 'replace'))
         self.assertEqual(values, done.stdout.decode('utf-8').splitlines())
         self.assertEqual([], sorted(p.name for p in home.iterdir() if p.name.startswith('PWNED')))

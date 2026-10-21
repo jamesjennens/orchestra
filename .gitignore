@@ -11,3 +11,6 @@ client.*.private.json
 *.cursor.json
 # Optional graphify output read by `capability lookup`; generated, never committed.
 graphify-out/
+# PowerShell's module analysis cache: a real-shell test whose LOCALAPPDATA is not a scratch
+# folder would write it into the checkout (kittrial-5bb.361); it is never committed.
+ModuleAnalysisCache
