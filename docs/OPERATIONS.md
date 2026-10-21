@@ -361,8 +361,7 @@ same function the web route and `coordinator followon` call, under the project's
 `.coordination.lock` (and the deployment configuration lock), so validation, fact
 derivation and the journal cannot drift between the routes.
 
-**A comment changes no move.** On an integrated-but-open task a comment - including a
-coordinator's plain comment - changes nothing about whose move it is. A comment does not change whose move an integrated-but-open task is: record a hand-back or close the task.
+**A comment changes no move.** A comment does not change whose move an integrated-but-open task is: record a hand-back or close the task.
 
 **An older kit refuses to restore a backup that holds `.assignee-followons/`.**
 Its fixed coordination-sidecar path whitelist does not know the journal, so its

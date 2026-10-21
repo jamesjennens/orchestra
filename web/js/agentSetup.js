@@ -201,10 +201,20 @@ export function credentialFileCommand(file, comments, { certFile = null, hasCert
 export function shQuote(text) {
   return "'" + String(text).replace(/'/g, "'\\''") + "'";
 }
+// PowerShell 5.1 ends a single-quoted string at the ASCII quote AND at U+2018, U+2019, U+201A
+// and U+201B; doubling any of them makes it a literal (kittrial-5bb.361), as server_address.ps_quote.
 export function psQuote(text) {
-  return "'" + String(text).replace(/'/g, "''") + "'";
+  return "'" + String(text).replace(/['\u2018\u2019\u201a\u201b]/g, (quote) => quote + quote) + "'";
 }
 const ADDRESS = /^[Hh][Tt][Tt][Pp][Ss]?:\/\/(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/%-]*)?$/;
+// The host rule of server_address._NAME, character for character (kittrial-5bb.361): labels of
+// letters, digits, _ and -, not starting or ending with -, 1-63 long, an optional final dot.
+const NAME = /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)*\.?$/;
+// A bracketed host is an IPv6 address when the URL parser takes it as one (the server checks with
+// Python's ipaddress).
+function ipv6(bracketed) {
+  try { return new URL('http://' + bracketed + '/').hostname.length > 2; } catch { return false; }
+}
 const ESCAPE_REFUSED = /['"$`;|&()<>\\!*?{}[\]#%\x00-\x20\x7f]/;
 // null when the address may go into a command, else one sentence.
 export function serverUrlProblem(server) {
@@ -213,6 +223,7 @@ export function serverUrlProblem(server) {
   if (bad) return `The server address has the character ${JSON.stringify(bad[0])}, which a server address may not hold.`;
   const match = ADDRESS.exec(text);
   if (!match) return 'The server address is not an http or https address with a host.';
+  if (match[1].startsWith('[') ? !ipv6(match[1]) : !NAME.test(match[1])) return 'The server address has a host that is not a name or an address.';
   if (match[2] && !(Number(match[2].slice(1)) >= 1 && Number(match[2].slice(1)) <= 65535)) return 'The server address has a port outside 1..65535.';
   for (const escape of (match[3] || '').matchAll(/%(..)?/g)) {
     if (!escape[1] || !/^[0-9A-Fa-f]{2}$/.test(escape[1])) return 'The server address has a % that is not a %XX escape.';
