@@ -155,7 +155,7 @@ def open_dependency_sentence(open_ids):
 
 
 def claimable(issue_type, status, assignee, contribution_id, review_state, record_anchor=False,
-              labels=None, open_dependencies=None):
+              labels=None, open_dependencies=None, claiming='open'):
     """One bounded interpretation of claimable work (kittrial-5bb.6 deliverable b).
 
     Advisory only: claimability is not a reservation, and an atomic claim can still
@@ -169,6 +169,12 @@ def claimable(issue_type, status, assignee, contribution_id, review_state, recor
     which is never claimable whatever its status, assignee or contribution.
     """
     if open_dependencies:
+        return False
+    # The per-project claiming setting (kittrial-5bb.352): under 'assigned' an
+    # unassigned task is never offered as claimable. A row assigned to the caller is
+    # already not claimable here (the assignee check below); the claim route separately
+    # lets its holder start it.
+    if str(claiming or 'open') == 'assigned' and not assignee:
         return False
     if str(issue_type or 'task') in CLAIMABLE_EXCLUDED_TYPES:
         return False
@@ -605,7 +611,7 @@ def help_payload(action='work'):
                             'deployed_delivery', 'deployed_delivery_is_current_contribution',
                             'workflow_state', 'integration', 'integration_disagreements',
                             'integration_warnings', 'review_request', 'review_requests',
-                            'newer_activity_by_others', 'newer_activity_own',
+                            'newer_activity_marker', 'newer_activity_by_others', 'newer_activity_own',
                             'newer_activity_coverage', 'unresolved_directions',
                             'recommended', 'recommended_by', 'contribution_author'],
             'lanes': 'work lanes is the lanes board (kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md): ONE '
@@ -845,6 +851,16 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     parser.add_argument('--capability-limit',type=int,default=20);parser.add_argument('--capability-offset',type=int,default=0)
     parser.add_argument('--json',action='store_true')  # output is always JSON; accepted for consistency
     a=parser.parse_args(args)
+    # The per-project claiming setting (kittrial-5bb.352). Read FRESH from the project
+    # directory on every queue read: it lives outside the tracker, so the tracker read
+    # cache (keyed on the dolt commit) would never see a setting change. No project
+    # directory means the default, today's `open`.
+    claiming_state={'claiming':'open','set_by':None,'set_at':None,'set_via':None,
+                    'previous':None,'history':[]}
+    if journal is not None:
+        from claiming import read as read_claiming
+        claiming_state=read_claiming(journal)
+    claiming_mode=claiming_state['claiming']
     from lifecycle_voids import Snapshot, snapshot
     if journal is not None and not isinstance(rows,Snapshot):
         rows=snapshot(rows,journal)
@@ -938,7 +954,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'review_request':False,'review_requests':[],
                           'recommended':False,'recommended_by':[],
                           'integration_disagreements':[],'integration_warnings':[],
-                          'newer_activity_by_others':None,'newer_activity_own':None,
+                          'newer_activity_marker':None,'newer_activity_by_others':None,'newer_activity_own':None,
                           'newer_activity_coverage':None,'unresolved_directions':None,
                           'waiting_for_approval':None,
                           'approval_requires_other_party':bool(independent_approval),
@@ -1132,7 +1148,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         row_claimable=claimable(row.get('issue_type'),row.get('status'),row.get('assignee'),
                                 contribution.get('comment_id'),state,
                                 record_anchor=is_record_anchor(row),labels=row.get('labels'),
-                                open_dependencies=row_open_deps)
+                                open_dependencies=row_open_deps,claiming=claiming_mode)
         # Whose move it is, one plain sentence saying so, and the caller-neutral ROLE of
         # that same decision -- ONE call, so a row can never name one mover and deny
         # another (kittrial-5bb.6 review item 2). Derived from the validated review state
@@ -1270,6 +1286,15 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         coverage+=' %d unparseable issue row(s).'%unparseable_count
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':coverage}
+    # Additive (kittrial-5bb.352): the project's claiming setting this page was built
+    # with, and the sentence an empty listing carries under `assigned` so a reader (and
+    # the Bridge's empty-list message) can say why nothing is offered.
+    result['claiming']=claiming_mode
+    if claiming_state.get('warning'):
+        result['claiming_warning']=claiming_state['warning']
+    if claiming_mode=='assigned' and not result['total']:
+        from claiming import EMPTY_SENTENCE
+        result['empty_message']=EMPTY_SENTENCE
     # A closed task stays out of the actionable queue. Its durable assignment
     # notice still reaches both holders as bounded metadata beside that queue.
     if a.mine and journal is not None:
@@ -1406,7 +1431,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             guidance_item=(queue_payload.get('guidance') or {}).get('item')
             if isinstance(guidance_item,dict):
                 move_rows.append(guidance_item)
-            return worker_view(move_rows)
+            return worker_view(move_rows,claiming=queue_payload.get('claiming'),
+                               empty_message=queue_payload.get('empty_message'))
         if args[:1]==['lanes']:
             # The lanes board (kittrial-5bb.263) reads the SAME export this action already
             # loaded, plus the project's session registry: one pass, no per-task comment

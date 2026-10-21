@@ -38,7 +38,7 @@ from coordination import is_merge_slot, merge_slot_sentence
 from render import render
 from lifecycle import apply_native
 from version import report
-from reserved_comments import (carries_record_label, check_raw_request, comment_target,
+from reserved_comments import (bd_flag_values, carries_record_label, check_raw_request, comment_target,
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
@@ -222,21 +222,98 @@ def _native_anchor_rows(root,path,actor,tokens):
         resolved[token]=(rid,row)
     return resolved
 
+#: The claiming guards' two flags, in both the long and the shorthand spelling the
+#: shared parser reports (kittrial-5bb.352 B1/B2).
+_ASSIGNEE_FLAGS = ('--assignee', '-a')
+_STATUS_FLAGS = ('--status', '-s')
+
+
 def _claims_the_row(args):
     """True when the bd invocation claims the row or makes it in_progress (kittrial-5bb.293).
 
     Flags are matched by PARSED argument, not substring: a ``--notes`` text that
-    contains ``in_progress`` never triggers this (rev3).
+    contains ``in_progress`` never triggers this (rev3). The parse is the shared
+    pflag-aware ``bd_flag_values`` (kittrial-5bb.352 B2), so a status shorthand inside
+    a boolean cluster (``-qs in_progress``, ``-qsin_progress``, ``-s=in_progress``,
+    ``-sin_progress``) is seen exactly as bd sees it. A bare ``--claim`` (or any
+    ``--claim=VALUE``) counts conservatively, as before.
     """
-    args=list(args or [])
-    if '--claim' in args or any(a.startswith('--claim=') for a in args):
-        return True
-    for i,a in enumerate(args):
-        if a in ('--status','-s') and i+1<len(args) and args[i+1]=='in_progress':
+    for name,_value in bd_flag_values(list(args or [])):
+        if name=='--claim':
             return True
-        if a.startswith('--status=') and a.split('=',1)[1]=='in_progress':
+        if name in _STATUS_FLAGS and _value=='in_progress':
             return True
     return False
+
+
+def _names_assignee(args):
+    """True when the bd invocation itself assigns the row (``--assignee``/``-a``).
+
+    Every spelling bd 1.2.2 accepts is recognised (kittrial-5bb.352 review item B1),
+    through the shared pflag-aware ``bd_flag_values``: ``--assignee W``,
+    ``--assignee=W``, ``-a W``, ``-a=W``, the joined ``-aW``, and ``-a`` at the end of a
+    run of boolean shorthands (``-qa W``, ``-qaW``, ``-va=W``, ``-qva W``). The scan
+    stops at ``--`` because after it bd takes positionals, not flags. ``-a`` is the
+    assignee shorthand on ``create``/``update`` only, which is where this is asked.
+    """
+    return any(name in _ASSIGNEE_FLAGS for name,_value in bd_flag_values(list(args or [])))
+
+
+def _guard_claiming_on_claim(path, row):
+    """Refuse a claim of an UNASSIGNED task while the project is set to ``assigned``.
+
+    The per-project claiming setting (kittrial-5bb.352) is read fresh from the project
+    directory here: it lives outside the tracker, so no cached row can hide a change.
+    A task already assigned to its holder is not this guard's business: its holder may
+    still start it, and a different claimant is refused by bd itself.
+    """
+    if row.get('assignee'):
+        return
+    from claiming import CLAIM_REFUSAL, mode
+    if mode(path) == 'assigned':
+        raise ValueError('Refusing to claim %s: %s' % (row.get('id'), CLAIM_REFUSAL))
+
+
+def _may_assign_work(root, path, actor, authority_config=None, request=None):
+    """Whether this caller may hand work out while the project is ``assigned``.
+
+    The two authorities the setting names (kittrial-5bb.352 review item B1): a listed
+    installation operator (the host route), or the same live ``CAP_COORDINATE`` check
+    the web uses for its own assign/claiming routes. A descriptor is judged against the
+    live authority store by ``verified_web_authority``; it never authorises itself.
+    """
+    if _listed_operator(actor, root, path):
+        return True
+    if authority_config is None or not isinstance(request, dict):
+        return False
+    if not isinstance(request.get('authority'), dict):
+        return False
+    try:
+        return bool(verified_web_authority(request, authority_config,
+                                           CAP_COORDINATE, path.name))
+    except Exception:                      # a refused or unreadable descriptor is no authority
+        return False
+
+
+def _guard_claiming_on_assignment(root, path, actor, authority_config, request, args):
+    """Refuse ``--assignee``/``-a`` on create/update under ``assigned`` (review B1).
+
+    Under ``assigned`` only a coordinator hands work out. The host bd passthrough let a
+    plain worker take an unassigned task by naming itself as the assignee - directly
+    (``update T --assignee W``) or in the same call as a claim (``update T --claim
+    --assignee W``, ``update T --status in_progress --assignee W``). Any assignee
+    spelling is refused unless the caller is a listed operator or holds
+    ``CAP_COORDINATE`` in this project, with the one setting-naming sentence. Creating
+    and assigning in one call is the same hand-out and is refused the same way.
+    """
+    if not args or args[0] not in ('create', 'update') or not _names_assignee(args):
+        return
+    from claiming import CLAIM_REFUSAL, mode
+    if mode(path) != 'assigned':
+        return
+    if _may_assign_work(root, path, actor, authority_config, request):
+        return
+    raise ValueError('Refusing to assign work through bd here: %s' % CLAIM_REFUSAL)
 
 
 def _guard_open_dependency_on_claim(root,path,actor,row):
@@ -309,6 +386,13 @@ def _guard_record_anchor_status(root,path,args,actor):
         # when the other ends cannot be read (item 3c).
         if command in ('claim', 'update') and _claims_the_row(args):
             _guard_open_dependency_on_claim(root,path,actor,row)
+            # The per-project claiming setting (kittrial-5bb.352): under 'assigned' a
+            # bare claim of an unassigned task is refused on the host route too. A call
+            # that ALSO names an assignee is the hand-out case, judged by
+            # `_guard_claiming_on_assignment` below (review item B1): it is not a bare
+            # claim, and it is not a claim at all when the caller may assign.
+            if not _names_assignee(args):
+                _guard_claiming_on_claim(path,row)
 
 def _guard_record_anchor_title(root,path,args,actor,rows=None):
     """Read-before-write guard: the title of a record anchor is not changed through bd (kittrial-5bb.97).
@@ -2384,6 +2468,12 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             # acted in this project is left exactly as it is (P5: an operator's
             # `--assignee w1` must keep w1, not a session that later registers the name w1).
             final,assignment_note=_resolved_bd_assignee(root,path,actor,authority_config,final)
+            # kittrial-5bb.352 review item B1: under 'assigned' only a coordinator hands
+            # work out, so an assignee spelling on create/update is refused unless the
+            # caller is a listed operator or holds live coordinate authority here. This
+            # is checked BEFORE the guards below (which may read the rows) and uses the
+            # resolved argv, so every spelling the resolver knows is covered.
+            _guard_claiming_on_assignment(root,path,actor,authority_config,request,final)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
             from review_workflow import listed_operator_actor, operator_owners
@@ -2448,10 +2538,19 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         rows=None
                     if isinstance(rows,list):
                         from work import drop_internal_from_ready
-                        stdout=json.dumps(drop_internal_from_ready(rows))+'\n'
+                        rows=drop_internal_from_ready(rows)
+                        # The per-project claiming setting (kittrial-5bb.352): under
+                        # 'assigned' no unassigned task is offered as claimable here.
+                        from claiming import mode as claiming_mode
+                        if claiming_mode(path)=='assigned':
+                            rows=[]
+                        stdout=json.dumps(rows)+'\n'
                     elif isinstance(rows,dict) and isinstance(rows.get('items'),list):
                         from work import drop_internal_from_ready
                         rows=dict(rows);rows['items']=drop_internal_from_ready(rows['items'])
+                        from claiming import mode as claiming_mode
+                        if claiming_mode(path)=='assigned':
+                            rows['items']=[]
                         stdout=json.dumps(rows)+'\n'
                 return {'returncode':p.returncode,'stdout':stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch, project=path)

@@ -45,7 +45,7 @@ ITEM_FIELDS = {
     # Additive liveness (kittrial-5bb.107 rev2).
     'deployed_live',
     # Additive checkpoint attention (.1), independent of review completion.
-    'newer_activity_by_others', 'newer_activity_own',
+    'newer_activity_marker', 'newer_activity_by_others', 'newer_activity_own',
     'newer_activity_coverage', 'unresolved_directions',
     # Additive: one sentence for a contribution that waits for somebody else's approval
     # (kittrial-5bb.197 review request 01a12894, item 3b).
@@ -163,7 +163,13 @@ class WorkHelpContractTests(unittest.TestCase):
 
     def test_work_output_shape_is_backward_compatible(self):
         result = work.queue(rows(), 'alice/session', ['--mine'])
-        self.assertEqual(set(result), {'owner', 'total', 'your_move', 'items', 'next_offset', 'coverage'})
+        # Additive claiming setting (kittrial-5bb.352): `claiming` is a new optional
+        # top-level key. No existing field changes type or meaning, and a reader that
+        # predates it ignores an unknown key, so the v1 shape still works for older
+        # clients. The conditional `claiming_warning`/`empty_message` keys are absent
+        # for this open project, so they are not part of the shape pinned here.
+        self.assertEqual(set(result), {'owner', 'total', 'your_move', 'items', 'next_offset', 'coverage',
+                                       'claiming'})
         self.assertEqual(result['total'], 1)
         self.assertEqual(result['your_move'], {'count': 1, 'text': '1 of your tasks need your action'})
         # Every existing field remains; owned authored wait context is additive.

@@ -462,6 +462,34 @@ class EndpointAttentionTests(fixes.EndpointCase):
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
         self.assertTrue(action['newer_activity'])
 
+    def test_the_held_action_and_the_wait_row_carry_the_marker_and_its_counts(self):
+        """kittrial-5bb.351: the same newer-activity read rides next and wait."""
+        task=self.tasks[0];self.claim(task)
+        self.checkpoint(task,[])
+        self.native('blair')(['comments','add',task,'First direction after the checkpoint.'])
+        action=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertEqual(action['kind'],'in-progress')
+        self.assertTrue(action['newer_activity'])
+        for name in ('newer_activity_marker','newer_activity_by_others','newer_activity_own',
+                     'newer_activity_coverage','unresolved_directions'):
+            self.assertIn(name,action)
+        self.assertEqual(action['newer_activity_by_others'],1)
+        self.assertEqual(action['newer_activity_coverage'],'unknown')
+        # This installation has provenance writes off, so the checkpoint cannot make a
+        # precise per-entry claim: the marker is null and the boolean is the fallback.
+        self.assertIsNone(action['newer_activity_marker'])
+        wait=self.request('GET','/v1/agents/me/wait',token=self.secret)
+        self.assertEqual(200,wait.status,wait.data)
+        row=next(x for x in wait.data['items'] if x['task']==task)
+        self.assertIsNone(row['newer_activity_marker'])
+        self.assertEqual(row['newer_activity_by_others'],1)
+        self.assertEqual(row['newer_activity_own'],0)
+        self.assertEqual(row['newer_activity_coverage'],'unknown')
+        # The stub counts the one other-party comment as a direction (its work path
+        # defaults provenance writes on); the exact count is not what this pins.
+        self.assertIsInstance(row['unresolved_directions'],int)
+        self.assertGreaterEqual(row['unresolved_directions'],0)
+
     @patch.dict(os.environ, {'PYTHONUTF8': '1'})
     def test_in_progress_activity_and_web_summary_are_read_only(self):
         task = self.tasks[0]; self.claim(task)
@@ -598,7 +626,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
             # An older/omitted field reads unknown, which `review_move` treats as not
             # redelivered (kittrial-5bb.253 item 1).
             'redelivered': None,
-            'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True})
+            'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True,
+            # This page is an older endpoint's canonical row: it omits the stable
+            # marker and its counts, which honestly read unknown (kittrial-5bb.351).
+            'newer_activity_marker': None, 'newer_activity_by_others': None,
+            'newer_activity_own': None, 'newer_activity_coverage': None,
+            'unresolved_directions': None})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
                                  ['--owner', 'me', '--limit', '100', '--offset', '100', '--json']])
         # Unfiltered (the owners' list): every HELD task, never an unassigned one, from the
@@ -681,9 +714,11 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         # count the move sentence needs, carried by both backends alike. `redelivered` is
         # additive too (kittrial-5bb.253 item 1).
         self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
+                                       'newer_activity_by_others', 'newer_activity_coverage',
+                                       'newer_activity_marker', 'newer_activity_own',
                                        'open_items', 'pending_change_requests', 'pending_review_items',
                                        'redelivered',
-                                       'review_state', 'status', 'title'])
+                                       'review_state', 'status', 'title', 'unresolved_directions'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
     def test_actor_filter_excludes_somebody_elses_work(self):

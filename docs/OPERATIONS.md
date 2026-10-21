@@ -342,6 +342,28 @@ backup taken by an older kit while the deployment is rolled back silently omits
 it, and every recorded hand-back then reads inert (the `.336` coordinator move
 stands) until it is re-recorded.
 
+**Recording one from the host.** An installation operator records or withdraws a
+hand-back without a bound coordinator key or a web account:
+
+```sh
+python3 admin.py --root /path/to/root followon --project PROJECT --actor OPERATOR --file payload.json
+```
+
+The payload's own `operation` chooses the write: `{"schema_version":1,"operation":
+"record","task":"TASK","text":"..."}` or `{"schema_version":1,"operation":"withdraw",
+"target":"FOLLOWON_COMMENT_ID","reason":"..."}` (the shapes and their bounds are in
+[CLI_CONTRACT.md](CLI_CONTRACT.md)). `--actor` must itself be on the installation's
+operator allowlist (`operators` in `deployment.private.json`, read strictly), the
+recorded actor is exactly that name, and a payload that carries its own `actor` must
+name the same one; a non-operator caller or a differing payload actor is refused
+before a lock is taken and nothing is written. The command calls `followon.apply`, the
+same function the web route and `coordinator followon` call, under the project's
+`.coordination.lock` (and the deployment configuration lock), so validation, fact
+derivation and the journal cannot drift between the routes.
+
+**A comment changes no move.** On an integrated-but-open task a comment - including a
+coordinator's plain comment - changes nothing about whose move it is. A comment does not change whose move an integrated-but-open task is: record a hand-back or close the task.
+
 **An older kit refuses to restore a backup that holds `.assignee-followons/`.**
 Its fixed coordination-sidecar path whitelist does not know the journal, so its
 `restore-new` fails for the whole project with
@@ -355,6 +377,25 @@ backup** first and restore that copy — the hand-backs are then absent (inert),
 not silently half-applied. Before rolling back, take and retain a complete
 backup with this kit; after rolling forward, restore that sidecar or re-record
 the hand-backs.
+
+### The claiming setting: restore and rollback
+
+`<project>/.claiming.json` holds whether workers may claim open tasks (`open`, the
+default) or only the project's coordinators assign work (`assigned`). It is written
+by the web Settings page and by `admin.py project-setting PROJECT --claiming VALUE
+--actor OPERATOR`, collected by `admin.py backup` with the coordination sidecar,
+and validated and restored by `restore-new`. A damaged file is carried byte for byte
+and reads back restrictive (`assigned`), never as the permissive default.
+
+**Rollback:** an older kit ignores `.claiming.json` entirely. A project set to
+`assigned` therefore reads as **open** again as soon as the older kit serves it, and
+workers can claim unassigned tasks until the setting is written again by a kit that
+knows it. This is a behaviour change, not just a missing label: before rolling back,
+record the value (and, if it matters, take a complete backup with this kit), and after
+rolling forward set it again on the Settings page or with
+`admin.py project-setting`. An older kit also refuses to restore a backup that holds
+`.claiming.json` (its coordination-sidecar whitelist does not know the path); restore
+such a backup with this kit or a newer one, as with `.assignee-followons/`.
 
 ## Install on Linux
 

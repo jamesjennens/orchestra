@@ -38,8 +38,10 @@ Object.assign(globalThis.document, {
   },
 });
 globalThis.location = { origin: 'https://127.0.0.1:8765', hash: '#/setup' };
-globalThis.setInterval = () => 1;
-globalThis.clearInterval = () => {};
+let nextInterval = 1;
+const cleared = [];
+globalThis.setInterval = () => nextInterval++;
+globalThis.clearInterval = (id) => { cleared.push(id); };
 const pickerCalls = [];
 globalThis.window = {
   location: globalThis.location,
@@ -321,6 +323,10 @@ globalThis.document.visibilityState = 'visible';
 await d.wizard.pollOnce();
 const online = attr(d, 'data-online-status', 'true')[0];
 out.onlineLineSaysConnected = online.getAttribute('data-online-state') === 'connected' && /Connected: Kestrel has reached Orchestra/.test(online.textContent);
+// kittrial-5bb.360 (review of .348): once it said connected, the check stops: no more agent reads.
+const readsAfterSuccess = agentReads;
+const pollAgain = [await d.wizard.pollOnce(), await d.wizard.pollOnce()];
+out.onlineCheckStopsAfterSuccess = pollAgain.every((x) => x === false) && agentReads === readsAfterSuccess;
 // An agent never seen when the wizard opened, then seen (on the VS Code screen, before this one):
 // the last screen says connected (the real-browser walk-through found it stuck on "Waiting").
 server.lastSeen = null;
@@ -341,6 +347,19 @@ out.pickerRemembersTheFolder = pickerCalls.length === 2 && !pickerCalls[0].start
 out.savedFilesSaidOnTheScreen = /Saved in kestrel: \.orchestra\/agent\.json, \.orchestra\/AGENT\.md\./.test(attr(d, 'data-save-status', 'true')[0].textContent);
 clearWizardStorage();
 out.signOutClearsTheStoredScreen = !store.has(WIZARD_STORAGE_KEY);
+
+// ---- kittrial-5bb.360: an address that may not go into a command is never used in one -----------
+const goodOrigin = globalThis.location.origin;
+globalThis.location.origin = 'https://h/$(touch PWNED)';
+store.clear();
+d = await openWizard();
+d.wizard.show('vscode');
+const refusedLine = attr(d, 'data-server-refused', 'true')[0];
+out.refusedAddressSaidAndNotUsed = Boolean(refusedLine) && /cannot be used in a command/.test(refusedLine.textContent)
+  && !JSON.stringify(d.all(() => true).map((e) => e.textContent)).includes('touch PWNED');
+globalThis.location.origin = goodOrigin;
+d = await openWizard();
+out.goodAddressHasNoRefusedLine = attr(d, 'data-server-refused', 'true').length === 0;
 
 // ---- 6. Site-wide: a toast raised while a modal is open is drawn inside it (kittrial-5bb.348) ----
 // With a confirmation open above the wizard, the toast goes into the TOP dialog.

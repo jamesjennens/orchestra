@@ -202,6 +202,10 @@ class NoUnguardedParseTests(unittest.TestCase):
         'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
         'capabilities.py': (1, "a graph.json in the caller's own checkout; it catches RecursionError itself"),
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
+        'claiming.py': (2, 'the project\'s own .claiming.json, written by this kit on the coordination host; '
+                           'a damaged, unreadable or nested file is caught and read as the restrictive '
+                           '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
+                           'permissive default'),
         'client.py': (13, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
                          'kittrial-5bb.285 added two of the thirteen: the wait read\'s answer from the endpoint and the '
                          'wait command\'s own read of the config file (both the same kind of text as the other ten, '

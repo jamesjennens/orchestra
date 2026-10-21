@@ -1189,5 +1189,124 @@ class ProxyAwareSelfCheckCase(unittest.TestCase):
                 self.assertNotIn('proxy probably answered', done.stdout + done.stderr)
 
 
+class TheServerAddressStaysTextCase(unittest.TestCase):
+    """kittrial-5bb.360: a server address is single-quoted in every command the wizard and AGENT.md
+    give, so even a hostile value (one the server would refuse; set here directly, past that check)
+    runs nothing in real bash or PowerShell. And --noproxy takes an IPv6 address without its
+    brackets, which curl needs to bypass the proxy (review of kittrial-5bb.348)."""
+
+    HOSTILE_SH = "http://127.0.0.1:1/x$(touch PWNED1)`touch PWNED2`';touch PWNED3;'"
+    HOSTILE_PS = "http://127.0.0.1:1/x$(New-Item -ItemType File PWNED4)';New-Item -ItemType File PWNED5;'"
+    PAGE = ProxyAwareSelfCheckCase.PAGE     # for the borrowed proxy-like server
+
+    def commands(self, server):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        script = ("const m = await import(process.argv[1]);"
+                  "const good = m.secretlessPayload({agent:{id:'a',name:'Kestrel',projects:['p1']}}, 'https://ok.example');"
+                  "const p = Object.assign({}, good, {server: process.argv[2]});"
+                  "const guide = m.agentGuide(p).split('\\n');"
+                  "console.log(JSON.stringify({test: m.testCommands(p), check: m.checkCommands(p),"
+                  " rewrite: m.credentialFileCommand(p.secretFile, m.credentialCommentLines(process.argv[2], null)),"
+                  " guidePs: guide.filter((l) => l.startsWith('- Windows (PowerShell): ')).map((l) => l.slice(24)),"
+                  " guideSh: guide.filter((l) => l.startsWith('- macOS/Linux: ')).map((l) => l.slice(15)),"
+                  " refused: m.secretlessPayload({agent:{id:'a',name:'Kestrel',projects:[]}}, process.argv[2])}))")
+        out = run_node_module(self, node, script, SETUP_JS.as_uri(), server)
+        self.assertEqual(0, out.returncode, out.stderr)
+        return json.loads(out.stdout)
+
+    def home(self):
+        home = unique_dir('vscode-hostile-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / '.orchestra-agent-kestrel.curlrc').write_text('header = "Authorization: Bearer S3"\n', encoding='utf-8')
+        return home
+
+    def test_a_hostile_address_runs_nothing_in_bash(self):
+        if not BASH or not shutil.which('curl'):
+            self.skipTest('bash with curl is not installed')
+        cmds = self.commands(self.HOSTILE_SH)
+        self.assertEqual('<ORCHESTRA_SERVER_URL>', cmds['refused']['server'])     # the wizard never builds from it
+        self.assertTrue(cmds['refused']['serverRefused'])
+        home = self.home()
+        env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+        for command in [cmds['test']['posix'], cmds['check']['posix'], cmds['rewrite']['posix']] + cmds['guideSh']:
+            with self.subTest(command=command[:60]):
+                subprocess.run([BASH, '-c', command], cwd=str(home), env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual([], sorted(p.name for p in home.iterdir() if p.name.startswith('PWNED')))
+        self.assertIn('# server = ' + self.HOSTILE_SH,
+                      (home / '.orchestra-agent-kestrel.curlrc').read_text(encoding='utf-8'))    # kept as text
+
+    def test_a_hostile_address_runs_nothing_in_powershell(self):
+        if not POWERSHELL or os.name != 'nt':
+            self.skipTest('runs where Windows PowerShell is installed')
+        cmds = self.commands(self.HOSTILE_PS)
+        home = self.home()
+        env = dict(os.environ, HOME=str(home), USERPROFILE=str(home), LOCALAPPDATA=str(home))
+        for command in [cmds['test']['powershell'], cmds['check']['powershell'], cmds['rewrite']['powershell']] + cmds['guidePs']:
+            with self.subTest(command=command[:60]):
+                subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', command], cwd=str(home),
+                               env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual([], sorted(p.name for p in home.iterdir() if p.name.startswith('PWNED')))
+        self.assertIn('# server = ' + self.HOSTILE_PS,
+                      (home / '.orchestra-agent-kestrel.curlrc').read_text(encoding='utf-8'))
+
+    def test_noproxy_takes_an_ipv6_address_without_its_brackets(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        script = ("const m = await import(process.argv[1]);"
+                  "console.log(JSON.stringify(['https://[::1]:8443', 'http://[fd00::5]/orc', 'https://h.example:1'].map((u) => m.curlFlags(u))))")
+        out = run_node_module(self, node, script, SETUP_JS.as_uri())
+        self.assertEqual(['--noproxy ::1 --max-time 20', '--noproxy fd00::5 --max-time 20', '--noproxy h.example --max-time 20'],
+                         json.loads(out.stdout))
+
+    def test_curl_bypasses_the_proxy_for_an_ipv6_server(self):
+        # Where IPv6 loopback works: the server on [::1], http_proxy pointing at a proxy-like page.
+        import http.server
+        import socket
+
+        class Server(http.server.ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                body = b'{"agent": {"id": "a", "name": "Kestrel"}}'
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        try:
+            server = Server(('::1', 0), Handler)
+        except OSError:
+            self.skipTest('IPv6 loopback is not available here')
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        proxy = ProxyAwareSelfCheckCase.serve(self, 'html503')
+        url = 'http://[::1]:%d' % server.server_address[1]
+        cmds = ProxyAwareSelfCheckCase.commands(self, url)
+        home = self.home()
+        env = dict(os.environ, HOME=str(home), USERPROFILE=str(home), LOCALAPPDATA=str(home),
+                   http_proxy=proxy, HTTP_PROXY=proxy)
+        ran = 0
+        if BASH and shutil.which('curl'):
+            done = subprocess.run([BASH, '-c', cmds['test']['posix']], env=env, capture_output=True, text=True, timeout=60)
+            self.assertIn('"name": "Kestrel"', done.stdout, done.stderr)
+            ran += 1
+        if POWERSHELL and os.name == 'nt':
+            done = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', cmds['test']['powershell']],
+                                  env=env, capture_output=True, text=True, timeout=120)
+            self.assertIn('"name": "Kestrel"', done.stdout, done.stderr)
+            ran += 1
+        if not ran:
+            self.skipTest('neither bash with curl nor Windows PowerShell is installed')
+
+
 if __name__ == '__main__':
     unittest.main()

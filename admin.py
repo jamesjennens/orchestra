@@ -4150,7 +4150,7 @@ def validate_coordination_files(files):
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
         journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -4214,6 +4214,12 @@ def validate_coordination_files(files):
             from feedback import validate_feed_text
             if set(record) != {'text'}:raise ValueError('Invalid feedback backup')
             validate_feed_text(record['text'])
+        if name=='.claiming.json':
+            # The per-project claiming setting (kittrial-5bb.352): a validated record,
+            # or the verbatim text/bytes of a damaged file that must read back damaged
+            # (restrictive) after a restore, never as the permissive default.
+            from claiming import restore_record as validate_claiming_backup
+            validate_claiming_backup(record)
         if quarantine:
             from feedback import validate_quarantine_record
             validate_quarantine_record(name,record)
@@ -4707,6 +4713,14 @@ def backup_project(root,name):
         for record in followon_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Assignee follow-on journal entry must not be a symlink')
             files['.assignee-followons/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The per-project claiming setting (kittrial-5bb.352). It lives outside the
+        # tracker, so a backup that dropped it would silently open claiming again after
+        # a restore. A damaged file is carried byte for byte and reads back restrictive.
+        claiming_file=path/'.claiming.json'
+        if claiming_file.is_symlink():raise ValueError('Claiming setting must not be a symlink')
+        from claiming import backup_record as claiming_backup_record
+        claiming_record=claiming_backup_record(path)
+        if claiming_record is not None:files['.claiming.json']=claiming_record
         # The owner answers journal (kittrial-5bb.126): written by no kit yet, collected
         # only when present, so a backup of a runtime with open-item writes off is
         # byte-for-byte what the previous kit takes.
@@ -6699,6 +6713,11 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name=='.guidance-clear.json':
             from guidance import validate_clear_record
             validate_clear_record(record)
+        elif name=='.claiming.json':
+            # The per-project claiming setting (kittrial-5bb.352): validated before the
+            # first write, so a bad entry refuses the whole restore.
+            from claiming import restore_record as validate_claiming_backup
+            validate_claiming_backup(record)
     # The guidance text and its audit record are one generation: refuse to restore a
     # mismatched pair rather than installing text that cannot be attributed.
     if 'GUIDANCE.md' in files or '.guidance.json' in files:
@@ -6733,6 +6752,22 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
             from guidance import validate_meta
             validate_meta(record)
             atomic(target,record)
+        elif name=='.claiming.json':
+            # A validated record is written as record JSON; the verbatim form of a
+            # damaged file is written back byte for byte, so it still reads restrictive.
+            from claiming import restore_record as validate_claiming_backup
+            validate_claiming_backup(record)
+            if set(record)=={'text'}:
+                temporary=target.with_suffix('.tmp')
+                temporary.write_text(record['text'],encoding='utf-8',newline='')
+                os.replace(temporary,target)
+            elif set(record)=={'base64'}:
+                import base64
+                temporary=target.with_suffix('.tmp')
+                temporary.write_bytes(base64.b64decode(record['base64'],validate=True))
+                os.replace(temporary,target)
+            else:
+                atomic(target,record)
         elif name=='.feedback.jsonl':
             temporary=target.with_suffix('.tmp')
             temporary.write_text(record['text'],encoding='utf-8',newline='\n')
@@ -9886,6 +9921,10 @@ def main():
     a=sub.add_parser('remove-creation',help='remove a project creation that did not finish (operator allowlist); refuses a finished project and a running creation')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
+    a=sub.add_parser('project-setting',help='read a project setting, or set the claiming setting: open (workers may claim open tasks) or assigned (only coordinators assign); setting needs --actor on the operator allowlist')
+    a.add_argument('project')
+    a.add_argument('--claiming',choices=['open','assigned'],default=None)
+    a.add_argument('--actor')
     a=sub.add_parser('set-guidance',help='set the standing coordinator guidance every actor reads each run (operator allowlist, audited)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('guidance-status',help='which actors have acknowledged which guidance version (operator allowlist)')
@@ -9895,6 +9934,8 @@ def main():
     a=sub.add_parser('compact-guidance-acks',help='drop guidance acknowledgements for versions no longer current or previous (operator allowlist, audited)')
     a.add_argument('project');a.add_argument('--actor',required=True)
     a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('followon',help='record or withdraw a coordinator hand-back of an integrated-but-open task (operator allowlist, host journal)')
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-reconcile');a.add_argument('project');a.add_argument('--operation-id',required=True)
@@ -10306,6 +10347,26 @@ def main():
         for warning in probe_endpoints(text,args.project,Path(__file__).resolve().parent):
             print(warning,file=sys.stderr)
         print('Project onboarding installed; back up the project after changes.')
+    elif args.command=='project-setting':
+        import fcntl
+        from claiming import read as read_claiming, write as write_claiming
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        if args.claiming is None:
+            print(json.dumps(read_claiming(path),sort_keys=True,indent=2))
+        else:
+            from keyed_records import require_configured_operator
+            # The operator allowlist is checked before the project is read or any file
+            # is written, as set-guidance does, so a contributor actor cannot set it
+            # even if it reaches the host command line.
+            require_configured_operator(args.actor,operators(root,strict=True),
+                                        'set the project claiming setting')
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                result=write_claiming(path,args.claiming,args.actor,via='host')
+            print('Project claiming setting set to %s; back up the project after changes.'
+                  %result['claiming'])
+            print(json.dumps(result,sort_keys=True))
     elif args.command=='set-guidance':
         import fcntl
         from guidance import write_guidance
@@ -10448,6 +10509,48 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(handoff(path,args.actor,payload,run,operator=True)))
+    elif args.command=='followon':
+        # The installation operator's host route for the coordinator's recorded
+        # hand-back (kittrial-5bb.358): the confined coordinator's `coordinator
+        # followon` and the web route both refuse on this host when no coordinator
+        # key is bound. It calls the SAME followon.apply the endpoint calls at
+        # endpoint.py:1801 and :2213, under the SAME project coordination lock as the
+        # other host writes, so validation, fact derivation and the journal cannot
+        # drift. The payload's own `operation` decides record or withdraw.
+        import fcntl
+        import followon as followon_records
+        from keyed_records import require_configured_operator
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        if not isinstance(payload,dict):
+            raise ValueError('The hand-back payload must be a JSON object. Nothing was written.')
+        # A payload may repeat the command's actor, but only to AGREE with it: the
+        # recorded actor is exactly the --actor given to this command (kittrial-5bb.358
+        # coordinator addition). A differing value is refused, never silently ignored.
+        # An agreeing one is dropped, because the request shape followon.apply takes
+        # does not carry an actor at all (it derives the recorded fact from this name).
+        if 'actor' in payload and payload['actor']!=args.actor:
+            raise ValueError('The hand-back payload names actor %r but --actor is %r; the recorded actor is the '
+                             '--actor given to this command, so the two must match. Nothing was written.'
+                             %(payload['actor'],args.actor))
+        # Authority is the deployment allowlist, read strictly, and it is checked BEFORE
+        # the lock: a non-operator creates no coordination-lock file and reserves nothing.
+        # Inside the lock it is read again and handed to the library, exactly as the
+        # endpoint hands its configured set on (endpoint.py:1801, :2213).
+        require_configured_operator(args.actor,operators(root,strict=True),
+                                    'record or withdraw a hand-back')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        request=dict(payload)
+        request.pop('actor',None)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            authority=operators(root,strict=True)
+            require_configured_operator(args.actor,authority,'record or withdraw a hand-back')
+            print(json.dumps(followon_records.apply(request,args.actor,run,path,operators=authority),
+                             ensure_ascii=False))
     elif args.command=='requirement-backfill':
         import fcntl
         from requirement_records import backfill

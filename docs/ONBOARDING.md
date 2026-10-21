@@ -98,6 +98,13 @@ another task until this one is delivered. The Delivery section is supplied by th
 separate onboarding-template dependency (.36); if it is absent or unclear in the
 server-owned entry, ask the coordinator rather than guessing.
 
+A project may be set so that only its coordinators assign work (`claiming: assigned`).
+Then `ready`, `work --claimable`, the agent's `next` list and `wait` offer no
+unassigned task, and a claim of one is refused with one sentence naming the setting. A
+task already assigned to you can still be started; an empty listing carries "Only the
+project's coordinators assign work here; nothing is assigned to you yet." Do not
+claim an unassigned task in that project: wait for the coordinator to assign it.
+
 Run ready/work through the installed client, not as bare shell commands. Example
 after replacing the client, config, project and actor with the printed values:
 

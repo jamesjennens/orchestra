@@ -111,7 +111,8 @@ EXIT_UNREACHABLE = 3
 #: fingerprint is taken and the two transports cannot disagree about one task.
 MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor',
                'contribution_id', 'pending_review_items', 'open_items', 'blocking_items',
-               'checkpoint_at', 'newer_activity', 'redelivered', 'guidance_version')
+               'checkpoint_at', 'newer_activity', 'newer_activity_marker',
+               'redelivered', 'guidance_version')
 
 #: The four things a coordinator wakes for, in the order the task names them.
 COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
@@ -165,7 +166,7 @@ def normalize_item(item):
     attention = item.get('attention')
     if isinstance(attention, dict):
         for name in ('open_items', 'blocking_items', 'checkpoint_at', 'newer_activity',
-                     'redelivered', 'pending_review_items'):
+                     'newer_activity_marker', 'redelivered', 'pending_review_items'):
             if row.get(name) is None and name in attention:
                 row[name] = _scalar(attention.get(name))
     if not isinstance(row.get('pending_review_items'), int):
@@ -180,7 +181,23 @@ def normalize_item(item):
         contribution = item.get('contribution')
         if isinstance(contribution, dict) and contribution.get('id') is not None:
             row['contribution_id'] = _scalar(contribution.get('id'))
+    # The stable newer-activity marker is fingerprinted (it is in MOVE_FIELDS). The
+    # counts it was read with are carried for the reader but deliberately NOT
+    # fingerprinted: incrementing `newer_activity_own` for the caller's own comment
+    # must not wake the caller that wrote it (kittrial-5bb.351).
+    for name in ('newer_activity_by_others', 'newer_activity_own',
+                 'newer_activity_coverage', 'unresolved_directions'):
+        if row.get(name) is None:
+            value = item.get(name)
+            if value is None and isinstance(attention, dict):
+                value = attention.get(name)
+            row[name] = _scalar(value)
     return row
+
+
+def _fingerprinted(row):
+    """The stable subset a fingerprint is taken over; extra reader fields stay out."""
+    return {name: row.get(name) for name in MOVE_FIELDS}
 
 
 def _canonical(value):
@@ -200,8 +217,8 @@ def digest(value):
 
 def fingerprint(items):
     """The fingerprint of a list of move rows."""
-    return digest(_sorted_rows([normalize_item(item) for item in items
-                                if isinstance(item, dict)]))
+    return digest(_sorted_rows([_fingerprinted(normalize_item(item))
+                                for item in items if isinstance(item, dict)]))
 
 
 def is_fingerprint(value):
@@ -524,11 +541,22 @@ def movement(items):
                          if isinstance(item, dict) and item.get('whose_move') == 'you'])
 
 
-def worker_view(items):
-    """The worker form's answer: the rows whose move is the caller's plus a fingerprint."""
+def worker_view(items, claiming=None, empty_message=None):
+    """The worker form's answer: the rows whose move is the caller's plus a fingerprint.
+
+    ``claiming`` is the project's claiming setting this read used, and
+    ``empty_message`` the sentence an empty listing carries under ``assigned``
+    (kittrial-5bb.352). Both are additive: a reader that does not know them ignores
+    them, and a project with no project directory keeps exactly the old answer.
+    """
     rows = movement(items)
-    return {'schema': WAIT_SCHEMA, 'form': 'worker', 'items': rows,
-            'fingerprint': digest(rows)}
+    view = {'schema': WAIT_SCHEMA, 'form': 'worker', 'items': rows,
+            'fingerprint': digest(_sorted_rows([_fingerprinted(row) for row in rows]))}
+    if claiming:
+        view['claiming'] = claiming
+    if not rows and empty_message:
+        view['empty_message'] = empty_message
+    return view
 
 
 def _lane_row(lane, entry=None):
@@ -591,8 +619,10 @@ def coordinator_view(queue_items, lanes_payload):
                 triggers['checkpoint-to-coordinator'].append(_lane_row(lane, entry))
     grouped = {name: _sorted_rows(rows) for name, rows in triggers.items()}
     flat = [dict(row, trigger=name) for name in COORDINATOR_TRIGGERS for row in grouped[name]]
+    fingerprinted = {name: _sorted_rows([_fingerprinted(row) for row in rows])
+                     for name, rows in triggers.items()}
     return {'schema': WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
-            'items': flat, 'fingerprint': digest(grouped)}
+            'items': flat, 'fingerprint': digest(fingerprinted)}
 
 
 def parse_read_args(args):

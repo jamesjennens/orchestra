@@ -1228,6 +1228,30 @@ def _bd_scan(args, command):
     return flags, operands, unknown
 
 
+def bd_flag_values(args):
+    """(name, value) for every flag of a `create`/`update` argv, as pflag parses it.
+
+    The ONE shorthand-aware reader the claiming guards share (kittrial-5bb.352 review
+    items B1/B2). The stock endpoint scans only matched a token that started with the
+    short letter, so pflag's boolean-cluster form (`-qa W`, `-qaW`, `-qsin_progress`)
+    hid the assignee and status flags from them. This delegates to `_bd_scan`, whose
+    inventory is the pinned bd 1.2.2 one: a single-dash token is a run of shorthand
+    letters, a value-taking letter consumes the rest of the token (`-aW`, `-sin_progress`)
+    or the next argv token (`-a W`, `-qs in_progress`), `=value` is accepted
+    (`-a=W`, `-s=in_progress`), and `--` ends flag parsing. A shorthand is reported as
+    ``-<letter>``; long flags keep their ``--name`` spelling. Unknown flags are not
+    guessed at: the caller of this function (the raw create/update path) has already
+    refused them with `unresolved_bd_flags` before any guard runs.
+    """
+    if not isinstance(args, list) or not args:
+        return []
+    command = args[0] if isinstance(args[0], str) else None
+    if command not in ('create', 'update'):
+        return []
+    flags, _, _ = _bd_scan(args, command)
+    return flags
+
+
 def unresolved_bd_flags(args):
     """Unresolvable create/update flags; a non-empty list must fail the guard.
 

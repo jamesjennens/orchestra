@@ -424,6 +424,31 @@ class ServedRuleTests(unittest.TestCase):
         self.assertNotIn('A question first', wait)
         self.assertIn('and 1 more', wait)
 
+    def test_the_attention_projection_carries_the_stable_marker(self):
+        # kittrial-5bb.351: the marker and the counts it was read with reach both the
+        # queue row's attention block and the holder's own row (the wait source).
+        import http_service
+        fields = http_service.EndpointBackend._attention_fields(
+            {'newer_activity': True, 'newer_activity_marker': 'task-bi:0123456789abcdef',
+             'newer_activity_by_others': 2, 'newer_activity_own': 1,
+             'newer_activity_coverage': 'snapshot', 'unresolved_directions': 3})
+        self.assertEqual(fields['newer_activity_marker'], 'task-bi:0123456789abcdef')
+        self.assertEqual(fields['newer_activity_by_others'], 2)
+        self.assertEqual(fields['newer_activity_own'], 1)
+        self.assertEqual(fields['newer_activity_coverage'], 'snapshot')
+        self.assertEqual(fields['unresolved_directions'], 3)
+        self.assertEqual(http_service.attention_field(
+            {'attention': fields}, 'newer_activity_marker'), 'task-bi:0123456789abcdef')
+        queue = {'complete': True, 'items': [
+            {'id': 'task', 'title': 'Task', 'status': 'in_progress', 'assignee': 'me/session',
+             'review_state': 'none', 'open_requests': 0, 'contribution': None,
+             'attention': fields}]}
+        task = http_service.own_queue_tasks(queue, 'me/session')['tasks'][0]
+        self.assertEqual(task['newer_activity_marker'], 'task-bi:0123456789abcdef')
+        self.assertEqual(task['newer_activity_by_others'], 2)
+        self.assertEqual(task['newer_activity_coverage'], 'snapshot')
+        self.assertEqual(task['unresolved_directions'], 3)
+
     def test_a_non_iterable_pending_change_requests_is_ignored_not_a_500(self):
         # kittrial-5bb.264 item 6.
         import http_service

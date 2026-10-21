@@ -2461,6 +2461,14 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   list to agents with inferred or unknown scopes. A new page used with an older service
   that omits scope metadata says so and asks the user to check the new credential's scopes;
   it does not promise that a plain renewal preserves scopes the page cannot know.
+- **Editing another account's agent** (kittrial-5bb.355): the project list offers only the
+  projects that agent's OWNER may be granted; every other project the viewer can see is
+  listed greyed with "OWNER is not a member of PROJECT: add them under the project's
+  Members first", linking to that project's Members & settings when the viewer may manage
+  it. The page learns this from `owner_grantable_projects` on the agent read: the owner's
+  live memberships (everything when the owner is a superuser), intersected with the
+  projects THAT reader can see, so the answer never reveals a project the reader cannot
+  see. Only the agent's owner or a superuser can edit an agent, as before.
 - An agent may hold at most 20 credentials **that still work**; revoked and expired ones
   are not counted (counted, an agent could not be renewed a twentieth time). Of those
   that no longer work **the newest 5 are kept** per agent, as the short history the card
@@ -2537,7 +2545,15 @@ agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its crede
 bearer token (`Authorization: Bearer <agent-secret>`); every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may
 only name a project the owner can open, including when a superuser edits somebody
-else's agent (`404` otherwise). Set `--public-url https://<HOSTNAME>` so the setup and
+else's agent. The refusal is a `404`, and its sentence now depends on what the caller
+can already see (kittrial-5bb.355): a caller who cannot see the project gets the plain
+`Project not found`, while one who can see it (a superuser, or a member of that project)
+gets the same `404` with "`OWNER` is not a member of `PROJECT`: add them under the
+project's Members first" - the rule is unchanged, only the sentence is clearer. Set
+`--public-url https://<HOSTNAME>` (a plain address: an http or https
+URL with a host, an optional port and a path of letters, digits, `. _ ~ - /` and `%XX` escapes; anything
+else is refused at start in one sentence, because the address is copied into commands people run;
+kittrial-5bb.360) so the setup and
 resume snippets carry the real address. Attention is computed at read time only: the
 service runs no scheduled job, poller or timer, and the owner resumes the agent
 manually.
@@ -3349,6 +3365,20 @@ line separately and unconfined.
     coverage; its `newer.history` is the authorized task `/history` route. SSH-only
     `history_new` and `verify` commands are omitted. Read history to reconcile unknown
     coverage; reading acknowledges nothing.
+    - **A stable newer-activity marker (kittrial-5bb.351).** A held action (`blocked`
+      or `in-progress`) and every row of `GET /v1/agents/me/wait` carry
+      `newer_activity_marker` beside `newer_activity`, `newer_activity_by_others`,
+      `newer_activity_own`, `newer_activity_coverage` and `unresolved_directions`.
+      The marker is the newest other-party entry the agent's checkpoint did not
+      incorporate, written `<entry_id>:<16 hex>` where the hex is a short digest of
+      that entry's current content. It changes for each new other-party entry and
+      when that newest entry is **edited**, and it never encodes a timestamp. The
+      agent's own entries do not move it. It is `null` when the read is current,
+      without a valid checkpoint, or with unknown coverage (a legacy checkpoint
+      without per-entry digests); a client then falls back to `newer_activity`. The
+      wait fingerprint includes the marker, so a second coordinator comment, or an
+      edit to the newest one, wakes a waiting bridge even while the boolean stays
+      `true`. This is the one definition `kittrial-5bb.354` reuses.
     No kind was renumbered when these two were added. A
     client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,

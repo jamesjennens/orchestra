@@ -387,10 +387,58 @@ export async function feedback(ctx, { pid }) {
     list);
 }
 
+// The per-project claiming setting (kittrial-5bb.352). Owners and coordinators set it;
+// every member sees the value and who set it, and the page explains what each value
+// means. The server reads the value fresh from the project's own file, so the answer
+// here is not a cached tracker read.
+export function claimingPanel(ctx, project) {
+  const host = h('section', { class: 'panel', 'data-panel': 'claiming' });
+  const block = project.claiming || { claiming: 'open', set_by: null, set_at: null, set_via: null };
+  // The SERVER's answer, not the page's role guess (kittrial-5bb.352 review item S2):
+  // GET /v1/projects/PID answers can_coordinate from the same live CAP_COORDINATE check
+  // the PUT route uses, so the control appears exactly when the save would be allowed
+  // (a superuser who is neither a member nor a granted agent is the case that differed).
+  const canSet = Boolean(project.can_coordinate) && !project.archived && project.usable !== false;
+  function draw(value) {
+    const chosen = value || block.claiming || 'open';
+    const warned = block.source === 'damaged' ? block.warning : null;
+    const select = h('select', { id: 'claiming-value', 'aria-label': 'How work is handed out' },
+      h('option', { value: 'open', selected: chosen === 'open' }, 'Workers may claim open tasks'),
+      h('option', { value: 'assigned', selected: chosen === 'assigned' }, 'Only coordinators assign work'));
+    const save = h('button', { type: 'button', class: 'primary', onclick: async (e) => {
+      try {
+        const result = await act(e.currentTarget, () => ctx.api.setProjectClaiming(project.id, select.value),
+          { success: 'Claiming setting saved' });
+        if (result && result.claiming) Object.assign(block, result);
+        draw(select.value);
+      } catch { /* the refusal is shown beside the control */ }
+    } }, 'Save');
+    host.replaceChildren(
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'How work is handed out')),
+      h('div', { class: 'panel-body' },
+        h('p', { class: 'muted' }, chosen === 'assigned'
+          ? 'Only this project’s coordinators assign work: unassigned tasks are not offered as claimable and a claim of one is refused. A task already assigned to you can still be started.'
+          : 'Any member who may write tasks can claim an open, unassigned task. That is the default.'),
+        canSet ? h('div', { class: 'toolbar' }, h('label', { class: 'check', for: 'claiming-value' }, 'Claiming'), select, save) : null,
+        h('p', { class: 'small muted' },
+          (chosen === 'assigned' ? 'Set to “only coordinators assign”' : 'Set to “workers may claim open tasks”'),
+          block.set_by ? [' by ', h('span', { class: 'mono' }, block.set_by)] : null,
+          block.set_at ? [' ', time(block.set_at)] : null,
+          block.set_via ? [' (', block.set_via, ')'] : null,
+          block.source === 'default' ? ' — the default; nobody has changed it.' : '.'),
+        warned ? h('p', { class: 'small', role: 'status' }, warned) : null,
+        h('p', { class: 'small muted' }, 'This setting is stored with the project and carried by its backup. An older kit that does not know it reads the project as open, so after a rollback to an older release claiming is open again until it is set here again.')));
+  }
+  draw();
+  return host;
+}
+
 export async function settings(ctx, { pid }) {
   const project = await load(ctx, pid);
   const owner = isOwner(project);
-  const membersHost = h('div', { class: 'panel' });
+  // Its own selector: the role options belong to the members list, never to another
+  // panel's control (the claiming setting has data-panel="claiming" instead).
+  const membersHost = h('div', { class: 'panel', 'data-panel': 'members' });
   const agentsHost = h('div');
   const credsHost = h('div');
   const auditHost = h('div');
@@ -542,5 +590,5 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
-    membersHost, coordination.node, agentsHost, credsHost, auditHost, danger);
+    membersHost, claimingPanel(ctx, project), coordination.node, agentsHost, credsHost, auditHost, danger);
 }
