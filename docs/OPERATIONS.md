@@ -3110,6 +3110,24 @@ If a client times out, inspect the task before retrying a mutation: the write ma
 
 To retire the service, back up first, then `systemctl --user disable --now beads-team.service`. Preserve the runtime until recovery is no longer needed. Remove only the exact unit installed for that deployment and run `systemctl --user daemon-reload`. Linger is an account-wide setting: leave it enabled if other user services need it.
 
+### How long the audit keeps events
+
+The web service keeps ONE audit list for the whole installation: every account, agent,
+credential and project event, with who, when and the outcome (`http_auth.audit`; never a
+secret or a payload).
+- **Where it lives:** in the service's state file (`--state`, for example `http-state.json`),
+  and so in every backup of it.
+- **How much:** the last `AUDIT_LIMIT` = 10,000 events, for all projects together. Older ones
+  are dropped first, so how far back it reaches depends on how busy the service is.
+- **What reads it:**
+  - a project's "Recent activity (audit)" panel (`GET /v1/projects/{id}/audit`), which also
+    lists its granted agents' events (kittrial-5bb.365);
+  - an agent's History (on Agents, and on the project's Members & settings).
+- **When events have gone:** the History says older history is no longer kept, rather than
+  show a partial list as whole.
+- **Keeping more:** copy the state file's `audit` list before it rolls over; the kit does not
+  ship a longer archive.
+
 ### Leftover atomic temporaries
 
 Most coordination files are written with a temporary file beside the target and one

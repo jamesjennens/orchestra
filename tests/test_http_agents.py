@@ -2254,5 +2254,166 @@ for _name in dir(RenewalScopeTests):
         setattr(AgentsPageTests, _name, None)
 
 
+class AgentHistoryTests(AgentHarness):
+    """kittrial-5bb.365: an agent's history on the web, from the audit tail, for those who may
+    already see the agent; the project's view is narrower and starts at the project's grant."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.alex_id = self.create_account(self.admin, 'alex', 'alex-password-1')
+        self.blair_id = self.create_account(self.admin, 'blair', 'blair-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+        self.blair = self.login('blair', 'blair-password-1')[0]
+        self.alpha = self.create_project(self.alex, 'Alpha')
+        self.beta = self.create_project(self.alex, 'Beta')
+        self.gamma = self.create_project(self.alex, 'Gamma')
+        self.agent_id, _secret, created = self.agent_secret(self.alex, name='Kestrel', projects=[self.alpha])
+        self.first_credential = created['credential']['id']
+
+    def history(self, token, project=None, agent=None):
+        path = ('/v1/projects/%s/agents/%s/history' % (project, agent or self.agent_id) if project
+                else '/v1/agents/%s/history' % (agent or self.agent_id))
+        return self.request('GET', path, token=token)
+
+    def issue(self, label):
+        made = self.request('POST', '/v1/agents/%s/credentials' % self.agent_id, {'label': label},
+                            token=self.alex, key='issue-' + label)
+        self.assertEqual(201, made.status, made.data)
+        return made.data['credential']['id'] if 'credential' in made.data else made.data['id']
+
+    def revoke(self, credential):
+        done = self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (self.agent_id, credential),
+                            {}, token=self.alex, key='revoke-' + credential)
+        self.assertIn(done.status, (200, 204), done.data)
+
+    def test_an_owner_revokes_a_credential_and_the_history_says_so(self):
+        self.revoke(self.first_credential)
+        got = self.history(self.alex)
+        self.assertEqual(200, got.status, got.data)
+        newest = got.data['items'][0]
+        self.assertEqual(('credential revoked', self.first_credential), (newest['kind'], newest['credential']))
+        self.assertEqual('alex', newest['by'])
+        self.assertIn('label', newest)
+        kinds = [row['kind'] for row in got.data['items']]
+        self.assertIn('created', kinds)
+        self.assertIn('credential issued', kinds)
+        self.assertEqual([], got.data['notes'])
+
+    def test_a_disable_is_one_event_that_revoked_n_credentials(self):
+        self.issue('second')
+        self.issue('third')
+        done = self.request('POST', '/v1/agents/%s/disable' % self.agent_id, {}, token=self.alex, key='disable-1')
+        self.assertIn(done.status, (200, 204), done.data)
+        rows = [row for row in self.history(self.alex).data['items'] if row['kind'] == 'disabled']
+        self.assertEqual(1, len(rows))
+        self.assertEqual(3, rows[0]['revoked_count'])
+
+    def test_nobody_else_learns_anything(self):
+        unknown = self.history(self.blair, agent='agt_doesnotexist')
+        other = self.history(self.blair)
+        self.assertEqual(404, other.status, other.data)
+        self.assertEqual(unknown.status, other.status)
+        self.assertEqual(unknown.data['error']['message'], other.data['error']['message'])
+        # A project owner of a project the agent is not granted: the project agent read's 404.
+        self.assertEqual(404, self.history(self.alex, project=self.gamma).status)
+        # A credential, even the agent's own, cannot read it.
+        _aid, secret, _ = self.agent_secret(self.alex, name='Merlin', projects=[self.alpha])
+        self.assertIn(self.history(secret).status, (401, 403, 404))
+        # A superuser may.
+        self.assertEqual(200, self.history(self.admin).status)
+
+    def give_beta(self):
+        done = self.request('PATCH', '/v1/agents/%s' % self.agent_id, {'projects': [self.alpha, self.beta]},
+                            token=self.alex, key='give-beta')
+        self.assertEqual(200, done.status, done.data)
+
+    def test_a_project_sees_nothing_from_before_its_grant_and_no_labels(self):
+        # While the agent serves only Alpha: a credential is revoked and another issued.
+        self.revoke(self.first_credential)
+        self.issue('while-alpha')
+        self.give_beta()
+        later = self.issue('after-beta')
+        got = self.history(self.alex, project=self.beta)
+        self.assertEqual(200, got.status, got.data)
+        rows = got.data['items']
+        kinds = [row['kind'] for row in rows]
+        self.assertEqual('given the project', kinds[-1])                # oldest shown is the grant
+        self.assertNotIn('credential revoked', kinds)
+        self.assertEqual([later], [row['credential'] for row in rows if row.get('credential')])
+        for row in rows:
+            self.assertNotIn('label', row)
+            self.assertNotIn('scopes_before', row)
+            self.assertNotIn('scopes_after', row)
+            self.assertIn(row.get('project'), (None, self.beta))
+        # The project audit: the agent's rows only since the grant, tagged, nothing stored changed.
+        before = [dict(event) for event in self.service.state['audit']]
+        audit = self.request('GET', '/v1/projects/%s/audit' % self.beta, token=self.alex)
+        self.assertEqual(200, audit.status, audit.data)
+        agent_rows = [row for row in audit.data['items'] if row.get('agent')]
+        self.assertTrue(agent_rows)
+        self.assertEqual({self.agent_id}, {row['agent']['id'] for row in agent_rows})
+        self.assertNotIn('agents.credentials.revoked', [row['action'] for row in agent_rows])
+        self.assertEqual(before, [dict(event) for event in self.service.state['audit']][:len(before)])
+        self.assertNotIn('while-alpha', json.dumps(audit.data))
+        # Once the grant is removed, the project neither lists nor reads the agent.
+        removed = self.request('DELETE', '/v1/projects/%s/agents/%s' % (self.beta, self.agent_id),
+                               token=self.alex, key='remove-beta')
+        self.assertIn(removed.status, (200, 204), removed.data)
+        audit = self.request('GET', '/v1/projects/%s/audit' % self.beta, token=self.alex)
+        self.assertEqual([], [row for row in audit.data['items'] if row.get('agent')])
+        self.assertEqual(404, self.history(self.alex, project=self.beta).status)
+
+    def test_without_a_recorded_grant_the_project_sees_none_of_its_history(self):
+        self.revoke(self.first_credential)
+        self.give_beta()
+        self.issue('after-beta')
+        # A grant made before grant times were recorded: no agents.project.granted event.
+        with self.service.store.lock:
+            self.service.state['audit'][:] = [e for e in self.service.state['audit']
+                                              if e.get('action') != 'agents.project.granted']
+        got = self.history(self.alex, project=self.beta)
+        self.assertEqual(([], [self.service.AGENT_HISTORY_GRANT_UNKNOWN]), (got.data['items'], got.data['notes']))
+        audit = self.request('GET', '/v1/projects/%s/audit' % self.beta, token=self.alex)
+        self.assertEqual([], [row for row in audit.data['items'] if row.get('agent')])
+        # The owner's own view is unaffected.
+        self.assertIn('credential revoked', [row['kind'] for row in self.history(self.alex).data['items']])
+
+    def test_it_is_bounded_and_says_when_older_history_is_gone(self):
+        with self.service.store.lock:
+            for index in range(60):
+                self.service.state['audit'].append({
+                    'time': '2026-10-21T00:%02d:00Z' % index, 'request_id': None, 'user_id': self.alex_id,
+                    'actor': None, 'credential_id': None, 'project_id': None,
+                    'action': 'agents.credentials.extended', 'outcome': 'committed', 'reason': None,
+                    'agent_id': self.agent_id, 'target_credential_id': self.first_credential})
+        got = self.history(self.alex).data
+        self.assertEqual(50, len(got['items']))
+        self.assertEqual(got['total'] - 50, got['omitted'])
+        self.assertEqual([], got['notes'])
+        with self.service.store.lock:
+            self.service.state['audit'][:] = [e for e in self.service.state['audit'] if e.get('action') != 'agents.created']
+        self.assertEqual([self.service.AGENT_HISTORY_DROPPED], self.history(self.alex).data['notes'])
+
+    def test_the_page_shows_the_history_as_text(self):
+        import shutil
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        kit = Path(__file__).resolve().parents[1]
+        done = test_http_web.run_node_module(self, node, 'await import(process.argv[1])',
+                                             (kit / 'tests' / 'web_agent_history.mjs').as_uri(),
+                                             (kit / 'tests' / 'web_dom_shim.mjs').as_uri(),
+                                             (kit / 'web' / 'js' / 'agentHistory.js').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(['disabled', 'credential revoked', 'scopes changed'], seen['rowsInOrder'])
+        for name in ('loadedOnceWhenOpened', 'disableSaysCount', 'hostileLabelIsText', 'scopesShown',
+                     'omittedShown', 'noteShown'):
+            self.assertTrue(seen[name], name)
+        self.assertFalse(seen['pwned'])
+
+
 if __name__ == '__main__':
     unittest.main()
