@@ -220,7 +220,8 @@ class WhichCallsWriteTests(unittest.TestCase):
         before the table would call `dep add` a read again."""
         self.assertNotIn('dep', http_authority.READ_ONLY_BD_VERBS)
         self.assertEqual(http_authority.READ_ONLY_BD_VERBS,
-                         frozenset({'export', 'list', 'show', 'ready', 'search', 'count', 'state', 'lint'}))
+                         # kittrial-5bb.354 added `history`: one task's Dolt log, which reads.
+                         frozenset({'export', 'list', 'show', 'ready', 'search', 'count', 'state', 'lint', 'history'}))
         with mock.patch.object(http_authority, '_writes_rows', return_value=True) as asked:
             self.assertTrue(http_authority.is_mutating_invocation(['dep', 'add', 'pp-1', 'pp-2']))
         asked.assert_called_once()

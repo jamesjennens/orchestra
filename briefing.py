@@ -1108,7 +1108,13 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # the work rows and the agent routes carry, from the same function, beside the
     # released `checkpoint.newer_activity` (which means "the checkpoint is stale", own
     # entries and task-state changes included).
-    activity=checkpoint_queue_fields(rows,issue,state,provenance_writes=provenance_writes) if p is not None else None
+    activity=None
+    if p is not None:
+        try:
+            activity=activity_fields(issue,c,retained_provenance(state),fields_digest(issue),newer if stale else None,
+                                     dir_out['total'])
+        except StopIteration:
+            activity=None
     # Which of title, description and acceptance changed: only the tracker's version
     # history knows (field_history.py), read ONLY when the checkpoint is stale and only
     # here - never on a wait or next poll. ``field_history`` is the caller's bounded,
@@ -1189,8 +1195,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
             'newer':newer,
-            'activity':activity,
-            'changes_since_checkpoint':section,
+            # kittrial-5bb.354: only with a checkpoint, so a task without one keeps the
+            # compact size the long-chain brief holds; the text form and the web task
+            # read still say there is no checkpoint (SECTION_NO_CHECKPOINT).
+            **({'activity':activity,'changes_since_checkpoint':section} if p is not None else {}),
             'directions':dir_out,
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
             'current_position':p['summary'] if p else 'No checkpoint yet; current position and unresolved items have not been summarized.',
@@ -1584,23 +1592,37 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
         context=direction_context(row,state);direction_data=direction_entries(data,context)
         counted,_directions_off_reason=directions_counted(provenance_writes,row.get('status'))
         prov=retained_provenance(state);digest=fields_digest(row)
-        if cursor_matches(p['activity_cursor'],data):
-            # Nothing newer: the marker still stands (kittrial-5bb.354), so a later claim,
-            # which makes the cursor stale but adds no entry and no field edit, reads the
-            # same marker. A legacy checkpoint (no per-entry digests) has none.
-            own=others=0;coverage='current';marker=None if prov is None else activity_marker(None,digest)
-        else:
+        newer=None
+        if not cursor_matches(p['activity_cursor'],data):
             newer=newer_activity_summary(data,prov,c.get('created_at'),
                                          context[0],dispositions,direction_data,counted,_directions_off_reason,
                                          marker_fields=digest)
-            own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
-            marker=newer['newer_activity_marker']
-        return {'newer_activity':newer_comment_by_other(row,c),
-                'newer_activity_marker':marker,
-                'newer_activity_by_others':others,'newer_activity_own':own,
-                'newer_activity_coverage':coverage,
-                'unresolved_directions':len(unresolved_directions(direction_data,dispositions,context[0],counted))}
+        return activity_fields(row,c,prov,digest,newer,
+                               len(unresolved_directions(direction_data,dispositions,context[0],counted)))
     except (ValueError,TypeError,KeyError,StopIteration):return empty
+
+def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved):
+    """The six newer-activity fields from one read's own results (kittrial-5bb.354).
+
+    ``newer`` is that read's :func:`newer_activity_summary` (computed with
+    ``marker_fields=digest``), or None when the checkpoint's cursor is current. brief and
+    the queue rows both call this, each with what it already computed, so the fields
+    cannot differ and brief reads nothing twice. Raises StopIteration when the checkpoint
+    comment is not on the row.
+    """
+    if newer is None:
+        # Nothing newer: the marker still stands, so a later claim, which makes the cursor
+        # stale but adds no entry and no field edit, reads the same marker. A legacy
+        # checkpoint (no per-entry digests) has none.
+        own=others=0;coverage='current';marker=None if prov is None else activity_marker(None,digest)
+    else:
+        own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
+        marker=newer['newer_activity_marker']
+    return {'newer_activity':newer_comment_by_other(row,checkpoint_comment),
+            'newer_activity_marker':marker,
+            'newer_activity_by_others':others,'newer_activity_own':own,
+            'newer_activity_coverage':coverage,
+            'unresolved_directions':unresolved}
 
 def snapshot_checkpoints(data):
     """Valid checkpoints of one snapshot in linked order, exactly as ``checkpoint`` reads them.
@@ -1941,7 +1963,8 @@ def format_brief(result):
         lines += ['  '+e['entry_id']+' ['+e['kind']+(' changed' if e['changed'] else '')+'] '+e['timestamp']+' by '+e['author']['text'] for e in newer['entries']]
         if newer['omitted']:lines += [f'  ... {newer["omitted"]} more; fresh activity: '+newer['history_new']+'; full: '+newer['history']]
         lines += ['Read newer activity: '+newer['history_new'], newer['note']]
-    lines += format_changes(result.get('changes_since_checkpoint'),result.get('activity'))
+    lines += (format_changes(result.get('changes_since_checkpoint'),result.get('activity')) if result['checkpoint']
+              else ['Changes since your checkpoint: '+SECTION_NO_CHECKPOINT])
     dirs=result['directions']
     if dirs:
         ids=', '.join(i['entry_id'] for i in dirs['items'])

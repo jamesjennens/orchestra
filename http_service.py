@@ -3190,7 +3190,16 @@ class EndpointBackend:
                 # older endpoint omits both: null, never inferred here.
                 'activity': data.get('activity') if isinstance(data.get('activity'), dict) else None,
                 'changes_since_checkpoint': data.get('changes_since_checkpoint')
-                if isinstance(data.get('changes_since_checkpoint'), dict) else None}
+                if isinstance(data.get('changes_since_checkpoint'), dict)
+                else self._no_checkpoint_section(task) if data.get('checkpoint') is None else None}
+
+    @staticmethod
+    def _no_checkpoint_section(task):
+        """The section's own sentence for a task with no checkpoint: the canonical brief
+        leaves the block out then (it keeps the compact size), and that is true of an older
+        endpoint's brief too."""
+        from briefing import changes_since_checkpoint
+        return changes_since_checkpoint({'task': task, 'entries': []}, None, None, None)
 
     def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.

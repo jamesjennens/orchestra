@@ -200,7 +200,14 @@ class TheSectionCase(unittest.TestCase):
         self.assertEqual('cp2', section['checkpoint']['comment_id'])
 
     def test_no_checkpoint_says_so(self):
-        section = b.brief(rows(), PROJECT, TASK)['changes_since_checkpoint']
+        # The JSON brief leaves both blocks out (it keeps its compact size); the text says
+        # so, and the web task read builds the section's sentence (TheInProcessRoutes /
+        # TheRoutesAgree cases and the endpoint's _no_checkpoint_section).
+        brief = b.brief(rows(), PROJECT, TASK)
+        self.assertNotIn('changes_since_checkpoint', brief)
+        self.assertNotIn('activity', brief)
+        import http_service
+        section = http_service.EndpointBackend._no_checkpoint_section(TASK)
         self.assertIsNone(section['checkpoint'])
         self.assertEqual(b.SECTION_NO_CHECKPOINT, section['note'])
         self.assertIn('Changes since your checkpoint: ' + b.SECTION_NO_CHECKPOINT,
