@@ -231,7 +231,10 @@ class FollowonAdminCommandTests(real.FollowonCase):
             message = self.refusal({'schema_version': 1, 'operation': 'record', 'task': task,
                                     'text': 'Removed from the allowlist meanwhile.'})
         self.assertGreaterEqual(len(calls), 2, 'the allowlist must be read again inside the lock')
-        self.assertIn('Actor ' + COORD + ' is not a server-side configured operator', message)
+        # COORD is this fixture's only operator, so the in-lock reading is an empty allowlist
+        # and the refusal is the one an empty allowlist gets.
+        self.assertEqual('No operator allowlist is configured on the coordination host; add the acting operator '
+                         'to deployment.private.json before you record or withdraw a hand-back', message)
         self.assertEqual(self.comment_ids(task), before_ids)
         self.assertEqual(self.journal_names(), before_journal)
 
