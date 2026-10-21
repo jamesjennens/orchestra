@@ -2828,6 +2828,50 @@ class Service:
                     raise invalid('working_directory must be a valid Windows or POSIX folder path, not prose')
         return text
 
+    def _visible_project_ids(self, principal):
+        """Project ids ``principal`` may read, without raising.
+
+        The same visibility :meth:`list_projects` answers with: a superuser sees every
+        project, a session the projects its membership names, and a credential only the
+        projects its grant names while its issuer is still a member. Used where one
+        account is told something about ANOTHER account's memberships
+        (kittrial-5bb.355): the answer is intersected with this set, so it never names a
+        project the caller could not already see.
+        """
+        if principal is None:
+            return set()
+        projects = self.state['projects']
+        if principal.via == 'credential':
+            if principal.agent_id:
+                agent = self.state['agents'].get(principal.agent_id) or {}
+                named = [pid for pid in (agent.get('projects') or []) if pid in projects]
+            else:
+                pid = principal.credential_project
+                named = [pid] if pid in projects else []
+            return {pid for pid in named
+                    if principal.superuser or
+                    principal.user_id in self.state['memberships'].get(pid, {})}
+        if principal.superuser:
+            return set(projects)
+        return {pid for pid in projects
+                if principal.user_id in self.state['memberships'].get(pid, {})}
+
+    def _owner_grantable_projects(self, owner_id, principal):
+        """Projects the agent's owner may be granted, as THIS reader may learn them.
+
+        :meth:`_agent_projects` admits a project the owner is a live member of, or any
+        existing project when the owner is a superuser (the pre-existing owner rule).
+        The answer is limited to the projects ``principal`` may read, so a view of
+        another account's agent never reveals that its owner belongs to a project this
+        reader cannot see (kittrial-5bb.355, the coordinator's addition).
+        """
+        visible = self._visible_project_ids(principal)
+        owner = self.state['users'].get(owner_id) or {}
+        if owner.get('superuser'):
+            return sorted(visible)
+        return sorted(pid for pid in visible
+                      if owner_id in self.state['memberships'].get(pid, {}))
+
     def _agent_projects(self, principal, projects, owner_id=None):
         """Validate a requested agent grant against the *owner's* live membership.
 
@@ -2838,6 +2882,11 @@ class Service:
         be read. The stored list is a *ceiling*: the live role cap in
         :func:`http_authority.decide` is still applied on every request, and attention
         re-authorizes each project at read time.
+
+        The refusal is a plain ``404 Project not found`` for a caller who cannot see the
+        project (no leak). When the caller CAN see it (a superuser, or a member of that
+        project) the same not-found path says plainly that the agent's owner is not a
+        member (kittrial-5bb.355): the rule is unchanged, only the sentence is clearer.
         """
         if projects is None:
             return []
@@ -2858,8 +2907,24 @@ class Service:
                 raise not_found('Project not found')
             if not owner_is_superuser and \
                     owner_id not in self.state['memberships'].get(pid, {}):
+                # Only a caller who can already see the project is told whose
+                # membership is missing; everyone else keeps the plain sentence, so
+                # the answer never reveals a project it did not reveal before.
+                if pid in self._visible_project_ids(principal):
+                    raise not_found(self._owner_not_member_message(owner_id, pid))
                 raise not_found('Project not found')
         return granted
+
+    def _owner_not_member_message(self, owner_id, project_id):
+        """The clearer refusal for a caller who can see the project (kittrial-5bb.355).
+
+        Same 404 path as ``Project not found``; the sentence names the agent's owner
+        and the project, and the move that fixes it, because this caller already sees
+        both. It is never used for a caller who cannot see the project.
+        """
+        project = self.state['projects'].get(project_id) or {}
+        return "%s is not a member of %s: add them under the project's Members first" % (
+            self._owner_name(owner_id), project.get('name') or project_id)
 
     def check_agent_grant(self, principal, projects, owner_id=None):
         """Judge an agent grant without writing anything (kittrial-5bb.183 review item 1).
@@ -3001,6 +3066,11 @@ class Service:
             'notes': agent.get('notes'), 'enabled': bool(agent.get('enabled')),
             'actor': self.agent_actor(agent),
             'projects': list(agent.get('projects') or []),
+            # The projects the owner may be granted, as THIS reader may learn them
+            # (kittrial-5bb.355): the page greys out the rest and says why. Limited to
+            # projects the reader can already see, so another account's unseen
+            # memberships are never revealed.
+            'owner_grantable_projects': self._owner_grantable_projects(agent['owner'], principal),
             'created_at': agent.get('created_at'),
             'last_seen_at': agent.get('last_seen_at'),
             # Every credential that works (at most AGENT_MAX_CREDENTIALS) and the newest few that
