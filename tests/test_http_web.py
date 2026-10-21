@@ -1870,8 +1870,8 @@ console.log(JSON.stringify({
   promptResumes: m.setupPrompt(p).includes('Read .orchestra/AGENT.md in this folder'),
   reopenedJson: JSON.parse(m.agentJson(reopened)),
   guideNamesFile: m.agentGuide(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc')
-    && m.agentGuide(p).includes('curl.exe -fsS --noproxy 127.0.0.1 --max-time 60 -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" http://127.0.0.1:1/v1/')
-    && m.agentGuide(p).includes('curl -fsS --noproxy 127.0.0.1 --max-time 60 -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/'),
+    && m.agentGuide(p).includes('curl.exe -fsS --noproxy 127.0.0.1 --max-time 60 -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" \'http://127.0.0.1:1/v1/')
+    && m.agentGuide(p).includes('curl -fsS --noproxy 127.0.0.1 --max-time 60 -K ~/.orchestra-agent-kestrel.curlrc \'http://127.0.0.1:1/v1/'),
   promptNamesFile: m.setupPrompt(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'),
   placeholder: m.headerLine(), real: m.headerLine('S3'),
   tests: m.testCommands(p),
@@ -1925,9 +1925,9 @@ console.log(JSON.stringify({
         self.assertEqual({
             # kittrial-5bb.348: past a command-line proxy for this host only, and never hanging.
             'powershell': 'curl.exe -fsS --noproxy 127.0.0.1 --max-time 20 -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" '
-                          'http://127.0.0.1:1/v1/agents/me',
+                          "'http://127.0.0.1:1/v1/agents/me'",   # kittrial-5bb.360: single-quoted
             'posixChmod': 'chmod 600 ~/.orchestra-agent-kestrel.curlrc',
-            'posix': 'curl -fsS --noproxy 127.0.0.1 --max-time 20 -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/agents/me'},
+            'posix': "curl -fsS --noproxy 127.0.0.1 --max-time 20 -K ~/.orchestra-agent-kestrel.curlrc 'http://127.0.0.1:1/v1/agents/me'"},
             result['tests'])
         self.assertEqual([
             {'path': 'C:\\Users\\james\\zcode-x\\.orchestra\\agent.json', 'relative': False},
@@ -2209,15 +2209,18 @@ console.log(JSON.stringify({
             'noSecretOneLineWhy',
             'noSecretShownYet',
             'noToastBehindTheModal',
+            'goodAddressHasNoRefusedLine',
             'oldExtensionToldAboutCaFileBehindMore',
             'oldStepTwoMapsToFilesOnTheLongPath',
             'oldStepTwoMapsToVsCodeOnTheShortPath',
             'onlineLineSaysConnected',
+            'onlineCheckStopsAfterSuccess',
             'onlineWhenFirstSeenBeforeTheLastScreen',
             'opensOnTheFirstScreen',
             'pickerRemembersTheFolder',
             'progressCountsTheChosenPath',
             'progressSaysStepOfFive',
+            'refusedAddressSaidAndNotUsed',
             'reloadResumesTheScreen',
             'reloadShowsNoSecret',
             'resumeScreenHasOnlyThePrompt',

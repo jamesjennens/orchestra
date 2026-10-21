@@ -53,7 +53,9 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'project_coordination.py', 'project_creation.py', 'project_setup.py', 'proposal_records.py', 'raw_lifecycle.py', 'read_cache.py', 'record_json.py', 'recovery.py',
            'reference_records.py', 'render.py', 'requirement_governance.py', 'requirement_http.py',
            'requirement_owner_records.py', 'requirement_terminal.py', 'reserved_comments.py', 'review_recommendations.py',
-           'review_state.py', 'review_workflow.py', 'sessions.py', 'task_assignment.py', 'version.py', 'waiting.py', 'web_guidance.py', 'web_lifecycle.py', 'web_lifecycle_marks.py', 'web_merge_slot.py', 'work.py')
+           'review_state.py', 'review_workflow.py',
+           'server_address.py',  # kittrial-5bb.360: library-only; imported by office_service, http_auth, http_service
+           'sessions.py', 'task_assignment.py', 'version.py', 'waiting.py', 'web_guidance.py', 'web_lifecycle.py', 'web_lifecycle_marks.py', 'web_merge_slot.py', 'work.py')
 
 AS_VERSION = """
 import collections, runpy, sys

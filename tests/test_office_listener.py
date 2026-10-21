@@ -152,8 +152,10 @@ class ConfigurationTests(unittest.TestCase):
         for value in ('ftp://x', 'https:///no-host', 'office.example.invalid', '/just/a/path', '', 'http://',
                       'https://office:notaport', 7, ['u']):
             with self.subTest(public_url=value):
-                self.assertIn('public_url must be an http or https URL with a host',
-                              self.refused(cert='/c', key='/k', public_url=value))
+                # kittrial-5bb.360: one rule (server_address.py), one sentence naming the setting and this file.
+                said = self.refused(cert='/c', key='/k', public_url=value)
+                self.assertIn('public_url from the office configuration (office.json) ', said)
+                self.assertIn('http or https address', said)
         for value in ('https://office.example.invalid:8443', 'http://[::1]:8000', 'http://localhost'):
             with self.subTest(public_url=value):
                 self.assertEqual(self.config(cert='/c', key='/k', public_url=value)['public_url'], value)
