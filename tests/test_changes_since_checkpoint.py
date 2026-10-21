@@ -407,6 +407,12 @@ class TheRoutesAgreeCase(fixes.EndpointCase):
     @mock.patch.dict(os.environ, {'PYTHONUTF8': '1'})
     def test_every_route_carries_the_same_fields_and_the_section_names_the_comment(self):
         self.assertEqual(200, self.request('POST', self.base + '/claim', {}, token=self.secret).status)
+        # Before any checkpoint the canonical brief leaves the section out; the task read
+        # still carries its sentence.
+        page = self.request('GET', self.base + '/brief', token=self.secret)
+        self.assertEqual(200, page.status, page.data)
+        self.assertEqual(b.SECTION_NO_CHECKPOINT, page.data['changes_since_checkpoint']['note'])
+        self.assertIsNone(page.data['activity'])
         self.checkpoint()
         self.native('blair')(['comments', 'add', self.task, 'A direction after the checkpoint.'])
         on_next, on_wait, on_page, section = self.read()

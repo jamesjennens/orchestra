@@ -3191,7 +3191,7 @@ class EndpointBackend:
                 'activity': data.get('activity') if isinstance(data.get('activity'), dict) else None,
                 'changes_since_checkpoint': data.get('changes_since_checkpoint')
                 if isinstance(data.get('changes_since_checkpoint'), dict)
-                else self._no_checkpoint_section(task) if data.get('checkpoint') is None else None}
+                else self._no_checkpoint_section(task_id) if data.get('checkpoint') is None else None}
 
     @staticmethod
     def _no_checkpoint_section(task):
