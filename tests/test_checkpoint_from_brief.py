@@ -284,7 +284,12 @@ class OpenItemTests(AgentTask, fixes.EndpointCase):
         self.assertEqual(template['body']['open_items'], [item('key'), item('choice', 'decision')])
         self.assertEqual(template['carried_open_items'], 2)
         self.assertIn('already holds them all, complete with source', template['note'])
-        self.assertNotIn('carry_open_items', brief)
+        # The brief carries the complete list too, so a reader that does not use the
+        # template can copy every item rather than the first page (kittrial-5bb.356).
+        self.assertEqual(brief['carry_open_items'], [item('key'), item('choice', 'decision')])
+        self.assertEqual((brief['checkpoint']['open_items_shown'],
+                          brief['checkpoint']['open_items_total']), (2, 2))
+        self.assertNotIn('open_items_note', brief['checkpoint'])
         # Template plus the four texts is accepted: nothing else to look up.
         second = self.save(summary='second')
         self.assertEqual(201, second.status, second.data)
@@ -326,12 +331,29 @@ class OpenItemTests(AgentTask, fixes.EndpointCase):
         brief = self.brief()
         self.assertEqual(brief['checkpoint_template']['body']['open_items'], many)
         self.assertEqual(brief['checkpoint_template']['carried_open_items'], 23)
-        # The page still shows the first ten and says how many there are.
-        self.assertEqual((len(brief['checkpoint']['open_items']), brief['checkpoint']['open_items_total']), (10, 23))
+        # The page shows the first ten and says, in the brief itself, that it is cut
+        # and where the complete list is (kittrial-5bb.356).
+        point = brief['checkpoint']
+        self.assertEqual((len(point['open_items']), point['open_items_shown'],
+                          point['open_items_total']), (10, 10, 23))
+        self.assertEqual(point['open_items_note'],
+                         'The first 10 of 23; carry_open_items has all 23, in order, '
+                         'to carry forward unchanged.')
+        self.assertEqual(brief['carry_open_items'], many)
         # One further read asks for all of them (review 01a10c0b: it was one read per ten).
         self.assertEqual([(args[args.index('--items-limit') + 1], args[args.index('--items-offset') + 1]
                            if '--items-offset' in args else None) for args in calls], [('10', None), ('100', '0')])
         self.assertEqual(201, self.save(summary='all carried').status)
+
+    def test_a_task_with_three_open_items_has_no_cut_note(self):
+        three = [item('a'), item('b'), item('c')]
+        self.assertEqual(201, self.save(open_items=three).status)
+        brief = self.brief()
+        point = brief['checkpoint']
+        self.assertEqual((point['open_items_shown'], point['open_items_total']), (3, 3))
+        self.assertEqual(point['open_items'], three)
+        self.assertNotIn('open_items_note', point)
+        self.assertEqual(brief['carry_open_items'], three)
 
     def test_a_hundred_open_items_cost_two_reads(self):
         many = [item('i%03d' % number) for number in range(100)]
@@ -383,6 +405,10 @@ class OpenItemTests(AgentTask, fixes.EndpointCase):
         template = self.brief()['checkpoint_template']
         self.assertEqual((template['body']['open_items'], template['carried_open_items']), ([], None))
         self.assertTrue(template['note'].startswith('The open items of the previous checkpoint could not all be read'))
+        # The brief says why its own list is only the first page, and what to do.
+        point = self.brief()['checkpoint']
+        self.assertIn('could not all be read: read the brief again', point['open_items_note'])
+        self.assertIsNone(self.brief()['carry_open_items'])
 
     def test_a_checkpoint_written_between_two_pages_of_an_older_endpoint_is_noticed(self):
         self.assertEqual(201, self.save(open_items=[item('i%02d' % number) for number in range(23)]).status)
@@ -521,7 +547,10 @@ class InProcessCarryTests(test_http_agents.AgentHarness):
         brief = self.request('GET', base + '/brief', token=admin).data
         self.assertEqual(brief['checkpoint_template']['body']['open_items'], [item('key')])
         self.assertEqual(brief['checkpoint']['open_items'], [item('key')])
-        self.assertNotIn('carry_open_items', brief)
+        # The page needs the complete list: it travels beside the template (kittrial-5bb.356).
+        self.assertEqual(brief['carry_open_items'], [item('key')])
+        self.assertEqual((brief['checkpoint']['open_items_shown'],
+                          brief['checkpoint']['open_items_total']), (1, 1))
 class MergedChecksTests(unittest.TestCase):
     """The optional fields of kittrial-5bb.1 revision 3, checked in the list of problems.
 

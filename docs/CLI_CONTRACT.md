@@ -416,6 +416,16 @@ whose checkpoint was the baseline and what it could not be shown. `brief --full`
 `full_context` with the same additive rule; its `omission_counts` are the compact
 read's clips and its `full_omitted_chars`/`truncated`/`complete` are the bound's own.
 
+The web service's `GET /v1/projects/{id}/tasks/{task}/history` gives the same two
+directions (kittrial-5bb.353):
+- its `recent=N` (1..100) is this `--recent`/`--last`, read newest first over the same
+  snapshot, with the same fragment order and a cursor toward older entries;
+- its `since_checkpoint=true` is this `--since-checkpoint`.
+
+The route assembles each page from canonical pages of at most 20, so its page size may be
+larger than the canonical `--recent` range. Its answer carries `order` and the checkpoint
+keys above; see docs/HTTP_DEPLOYMENT.md ("Reading a task's history, newest first").
+
 `brief` and each `work` item also carry three additive lifecycle delivery fields
 (kittrial-5bb.107 item 7, rev2 item 6.1). `deployed_delivery` is the delivery a passed
 `deployed` fact belongs to, or `null` when the task has no trusted `deployed=passed`
@@ -581,7 +591,11 @@ and are not already listed as `reference-review` items:
   exist, so the exact number is not shown. To see drafts, run `ref find` yourself; each
   is marked not accepted there.
 
-`brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`;
+`brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`.
+`checkpoint.open_items` holds only the first ten and carries `open_items_shown`,
+`open_items_total` and, when the list is cut, a one-sentence `open_items_note`;
+`carry_open_items` is the complete list, in order, and is null when it could not all be
+read. Copy `carry_open_items`, not the first ten.
 `history` pages entries with `entry_id`, `body`, `body_offset`, `body_total_chars` and
 `continued`, so a long body is reassembled by concatenating fragments in offset order.
 

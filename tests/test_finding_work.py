@@ -73,6 +73,30 @@ class ServedTextTests(unittest.TestCase):
         self.assertNotIn('\n|', text)
         self.assertIsNone(re.search(r'^\s*[-*]\s', text, re.M))
 
+    def test_the_text_names_a_web_workers_tools_and_the_route_for_each_need(self):
+        """kittrial-5bb.357: a coordinator can quote a tool or route instead of a kit command."""
+        text = ' '.join((KIT / 'docs' / 'FINDING_WORK.md').read_text(encoding='utf-8').split()).replace('`', '')
+        self.assertIn('A worker with a web credential has no kit and no command line', text)
+        for tool in ('#orchestraNext', '#orchestraBrief', '#orchestraHistory', '#orchestraClaim',
+                     '#orchestraCheckpoint', '#orchestraReview', '#orchestraRelease'):
+            with self.subTest(tool=tool):
+                self.assertIn(tool, text)
+        for need in ('#orchestraBrief or GET /v1/projects/PROJECT/tasks/TASK/brief',
+                     '#orchestraHistory or GET /v1/projects/PROJECT/tasks/TASK/history',
+                     '#orchestraNext or GET /v1/agents/me/next',
+                     '#orchestraClaim or POST /v1/projects/PROJECT/tasks/TASK/claim',
+                     '#orchestraCheckpoint or POST /v1/projects/PROJECT/tasks/TASK/checkpoints',
+                     '#orchestraReview or POST /v1/projects/PROJECT/tasks/TASK/reviews',
+                     '#orchestraRelease or POST /v1/projects/PROJECT/tasks/TASK/release'):
+            with self.subTest(need=need):
+                self.assertIn(need, text)
+        self.assertIn('latest checkpoint with all open items', text)
+        for read_name in ('the brief read', 'the history read', 'the me/next read'):
+            with self.subTest(read=read_name):
+                self.assertIn(read_name, text)
+        self.assertIn('Never tell it to install the kit', text)
+        self.assertIn('never give it a CLI-only kit command', text)
+
     def test_the_documented_guidance_comment_and_assignment_routes_exist(self):
         """Check actual compiled routes: source fragments missed paths assembled with ID."""
         import http_service
