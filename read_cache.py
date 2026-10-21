@@ -204,7 +204,7 @@ def _raw_payload(text, key):
     return header.encode('utf-8') + b'\n' + payload
 
 
-def _write_one_file(cache, payload):
+def _write_one_file(cache, payload, name=FILE_NAME):
     """Write the whole cache as ONE privately-modeled file, one rename (review B1).
 
     A write that fails leaves NO temp file behind (kittrial-5bb.345 item 4): the
@@ -222,7 +222,7 @@ def _write_one_file(cache, payload):
         finally:
             os.close(handle)
         os.chmod(temp, 0o600)
-        os.replace(temp, str(cache / FILE_NAME))
+        os.replace(temp, str(cache / name))
     except BaseException:
         try:
             os.unlink(temp)
@@ -393,6 +393,77 @@ def cached_export_rows(root, path, run, name=None):
         if rows is not None:
             return rows
     return _miss(path, key, run)
+
+
+#: One task's ``bd history`` answer is cached beside the export (kittrial-5bb.354), in
+#: its own file per task, under the same generation key: a kit write moves the key, so
+#: a stale answer is never served, and repeated brief or task-page reads of one task
+#: cost one history read per generation. The files are bounded by the number of tasks
+#: read and each is replaced, never appended to.
+HISTORY_PREFIX = 'history-'
+
+
+def _history_file(task):
+    import hashlib
+    return HISTORY_PREFIX + hashlib.sha256(task.encode('utf-8')).hexdigest()[:32] + '.json'
+
+
+def _history_raw(text, key, task):
+    payload = text.encode('utf-8')
+    import hashlib
+    header = json.dumps({'format': FORMAT, 'kind': 'history', 'key': key, 'task': task,
+                         'bytes': len(payload), 'sha256': hashlib.sha256(payload).hexdigest()})
+    return header.encode('utf-8') + b'\n' + payload
+
+
+def _cached_history(cache, key, task):
+    """The cached history text for ``task`` at ``key``, or ``None`` (the same checks as the export)."""
+    raw = _read_no_follow(cache / _history_file(task))
+    if raw is None:
+        return None
+    header, separator, payload = raw.partition(b'\n')
+    if not separator:
+        return None
+    import record_json
+    try:
+        head = record_json.loads(header.decode('utf-8', 'replace'))
+    except ValueError:
+        return None
+    if (not isinstance(head, dict) or head.get('format') != FORMAT or head.get('kind') != 'history'
+            or head.get('key') != key or head.get('task') != task):
+        return None
+    if not isinstance(head.get('bytes'), int) or head['bytes'] != len(payload):
+        return None
+    import hashlib
+    if head.get('sha256') != hashlib.sha256(payload).hexdigest():
+        return None
+    return payload.decode('utf-8', 'replace')
+
+
+def cached_task_history(root, path, task, fetch, name=None):
+    """One task's ``bd history`` text: from the cache when the generation matches.
+
+    ``fetch()`` is the fresh read (the caller's native ``bd history`` call). With no
+    generation to key on, every read is fresh, as for the export; a cache that cannot
+    be written is skipped, never an error.
+    """
+    key = project_generation(root, name if name is not None else path.name)
+    if key is None:
+        return fetch()
+    cache = _cache_directory(path)
+    if cache is not None:
+        text = _cached_history(cache, key, task)
+        if text is not None:
+            return text
+    text = fetch()
+    try:
+        (path / CACHE_DIR).mkdir(mode=0o700, exist_ok=True)
+        cache = _cache_directory(path)
+        if cache is not None:
+            _write_one_file(cache, _history_raw(text, key, task), name=_history_file(task))
+    except OSError:
+        pass
+    return text
 
 
 def _miss(path, key, run):

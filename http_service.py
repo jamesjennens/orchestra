@@ -1277,7 +1277,45 @@ class InProcessBackend:
                 'lifecycle': {}, 'depends_on': [],
                 # This backend keeps no activity cursor; its checkpoints need none.
                 'activity_cursor': None,
-                'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None}
+                'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None,
+                **self._activity_blocks(task, checkpoints[-1] if checkpoints else None)}
+
+    def _activity_blocks(self, task, checkpoint):
+        """The task read's ``activity`` and ``changes_since_checkpoint`` (kittrial-5bb.354).
+
+        ``activity`` is the very block this backend's agent rows carry
+        (:meth:`_agent_fields`), so the task read and next/wait cannot disagree. This
+        model keeps no per-entry digests and no tracker history, so the section lists the
+        events after the checkpoint event (coverage unknown) and says the task fields are
+        not known here; the canonical backend reads both from the tracker.
+        """
+        from briefing import changes_since_checkpoint
+        import field_history as field_versions
+        if checkpoint is None:
+            return {'activity': None,
+                    'changes_since_checkpoint': changes_since_checkpoint(
+                        {'task': task['id'], 'entries': []}, None, None, None)}
+        review = self._review_view(task)
+        fields = self._agent_fields(task, review)
+        activity = {name: fields.get(name) for name in (
+            'newer_activity', 'newer_activity_marker', 'newer_activity_by_others', 'newer_activity_own',
+            'newer_activity_coverage', 'unresolved_directions')}
+        events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
+        anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
+                   and e.get('actor') == checkpoint.get('actor')
+                   and e.get('time', '') >= checkpoint.get('created_at', '')]
+        after = events[anchors[-1] + 1:] if anchors else []
+        entries = [{'entry_id': '%s-e%d' % (task['id'], index), 'kind': e.get('action') or 'event',
+                    'author': e.get('actor') or 'unknown', 'timestamp': e.get('time'),
+                    'body': e.get('detail') or e.get('action') or ''}
+                   for index, e in enumerate(after, start=(anchors[-1] + 1) if anchors else 0)]
+        section = changes_since_checkpoint(
+            {'task': task['id'], 'entries': entries}, None,
+            {'comment_id': checkpoint.get('id'), 'author': checkpoint.get('actor'),
+             'timestamp': checkpoint.get('created_at')},
+            task.get('assignee') or checkpoint.get('actor'), current=bool(anchors) and not entries,
+            fields_note=field_versions.UNKNOWN_NOTE % 'this backend keeps no tracker history')
+        return {'activity': activity, 'changes_since_checkpoint': section}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -3146,7 +3184,23 @@ class EndpointBackend:
                 'warnings': data.get('warnings') or [],
                 # The canonical brief already bounds refs, authors and omissions;
                 # preserve its coverage/unknown counts rather than infer from time.
-                'newer': data.get('newer')}
+                'newer': data.get('newer'),
+                # kittrial-5bb.354: the ONE newer-activity definition (the same fields a
+                # work row, next and wait carry) and the bounded 'changes since your
+                # checkpoint' section, exactly as the canonical brief computed them. An
+                # older endpoint omits both: null, never inferred here.
+                'activity': data.get('activity') if isinstance(data.get('activity'), dict) else None,
+                'changes_since_checkpoint': data.get('changes_since_checkpoint')
+                if isinstance(data.get('changes_since_checkpoint'), dict)
+                else self._no_checkpoint_section(task_id) if data.get('checkpoint') is None else None}
+
+    @staticmethod
+    def _no_checkpoint_section(task):
+        """The section's own sentence for a task with no checkpoint: the canonical brief
+        leaves the block out then (it keeps the compact size), and that is true of an older
+        endpoint's brief too."""
+        from briefing import changes_since_checkpoint
+        return changes_since_checkpoint({'task': task, 'entries': []}, None, None, None)
 
     def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.

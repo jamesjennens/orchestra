@@ -3370,15 +3370,27 @@ line separately and unconfined.
       `newer_activity_marker` beside `newer_activity`, `newer_activity_by_others`,
       `newer_activity_own`, `newer_activity_coverage` and `unresolved_directions`.
       The marker is the newest other-party entry the agent's checkpoint did not
-      incorporate, written `<entry_id>:<16 hex>` where the hex is a short digest of
-      that entry's current content. It changes for each new other-party entry and
-      when that newest entry is **edited**, and it never encodes a timestamp. The
-      agent's own entries do not move it. It is `null` when the read is current,
-      without a valid checkpoint, or with unknown coverage (a legacy checkpoint
-      without per-entry digests); a client then falls back to `newer_activity`. The
-      wait fingerprint includes the marker, so a second coordinator comment, or an
-      edit to the newest one, wakes a waiting bridge even while the boolean stays
-      `true`. This is the one definition `kittrial-5bb.354` reuses.
+      incorporate, written `<entry_id>:<16 hex>`, or `fields:<16 hex>` when there is
+      none; the hex covers that entry's current content and the current title,
+      description and acceptance (kittrial-5bb.354). It changes for each new
+      other-party entry, when that newest entry is **edited**, and when one of those
+      three fields is edited; never for a claim or a status change, and it never
+      encodes a timestamp. The agent's own entries do not move it. It is `null` only
+      without a valid checkpoint or with unknown coverage (a legacy checkpoint without
+      per-entry digests); a client then falls back to `newer_activity`, which keeps its
+      released rule. The wait fingerprint includes the marker, so a second coordinator
+      comment, an edit to the newest one, or a description edit wakes a waiting bridge
+      even while the boolean stays `true`. All six fields are defined once in
+      docs/BRIEFINGS.md, "Newer activity: one definition".
+    - **The task read carries the same fields and the changes (kittrial-5bb.354).**
+      `GET /v1/projects/{pid}/tasks/{tid}/brief` adds `activity` (the same six fields,
+      from the same computation as next and wait) and `changes_since_checkpoint`: the
+      entries since the checkpoint, newest first, with author, time, own or other, new,
+      edited or late, and a clipped body, plus the changed title, description or
+      acceptance with its current and previous value and "who made the change is not
+      recorded". The section and its bounds are in docs/BRIEFINGS.md, "Changes since
+      your checkpoint". The task page shows it under "Where it stands". An endpoint
+      older than this kit omits both blocks: they read `null`.
     No kind was renumbered when these two were added. A
     client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,

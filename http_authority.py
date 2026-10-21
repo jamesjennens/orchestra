@@ -1030,7 +1030,10 @@ class PreEffectFailure(Exception):
 #: allowlist: an unrecognized verb is treated as a write, so an unknown future
 #: mutation can never be mistaken for a read and released.
 READ_ONLY_BD_VERBS = frozenset({'export', 'list', 'show', 'ready', 'search',
-                                'count', 'state', 'lint'})
+                                'count', 'state', 'lint',
+                                # kittrial-5bb.354: one task's version history (the Dolt log
+                                # of its row); it reads and the kit always adds --readonly.
+                                'history'})
 
 #: Exceptions the canonical effect layer raises to refuse a request (bad attachment,
 #: task mismatch, malformed payload, unknown flag). They release the identity only

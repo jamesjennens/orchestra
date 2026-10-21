@@ -315,8 +315,13 @@ class NoUnguardedParseTests(unittest.TestCase):
             # through the guard (corrupt = a miss and a fresh export). The second
             # (kittrial-5bb.346 r2/r4) is the cache file's HEADER line, read by both
             # the serving parse and the waiter's header-only compare: a planted or
-            # deeply nested header reads as no header, never a traceback.
-            'read_cache.py': 2,
+            # deeply nested header reads as no header, never a traceback. The third
+            # (kittrial-5bb.354) is the header of one task's cached `bd history` file, read
+            # the same way.
+            'read_cache.py': 3,
+            # field_history.py (kittrial-5bb.354): one `bd history --json` answer, which
+            # carries other people's field text; a nested answer is "not determined".
+            'field_history.py': 1,
             # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.
