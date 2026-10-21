@@ -84,6 +84,14 @@ def sh_quote(text):
     return "'" + str(text).replace("'", "'\\''") + "'"
 
 
+#: Every character PowerShell takes as a single-quote delimiter: the ASCII one and the
+#: four typographic ones (U+2018, U+2019, U+201A, U+201B). PowerShell 5.1 ends a
+#: single-quoted string at ANY of them, so each is doubled, which makes it a literal
+#: (kittrial-5bb.361, from the .360 review's probe).
+PS_QUOTES = "'\u2018\u2019\u201a\u201b"
+
+
 def ps_quote(text):
-    """``text`` as one PowerShell literal: single quotes, nothing expanded (``'`` doubled)."""
-    return "'" + str(text).replace("'", "''") + "'"
+    """``text`` as one PowerShell literal: single quotes, nothing expanded (every
+    single-quote character PowerShell knows, :data:`PS_QUOTES`, doubled)."""
+    return "'" + ''.join(c + c if c in PS_QUOTES else c for c in str(text)) + "'"

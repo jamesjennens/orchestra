@@ -756,6 +756,28 @@ class AgentOwnerProjectsTests(AgentHarness):
         self.assertEqual(404, self.request('GET', '/v1/agents/%s' % self.agent_id,
                                            token=self.blair).status)
 
+    def test_an_agent_whose_owner_is_a_superuser_may_be_granted_every_visible_project(self):
+        """kittrial-5bb.361 (review of .355, mutant superuser-owner-gets-nothing): a superuser
+        owner may be granted any project, so the answer is every project the reader can see,
+        not an empty list that would grey every project on the page."""
+        agent_id, _secret, _ = self.agent_secret(self.admin, name='Osprey', projects=[self.gamma])
+        own = self.request('GET', '/v1/agents/%s' % agent_id, token=self.admin)
+        self.assertEqual(200, own.status, own.data)
+        self.assertEqual(sorted([self.alpha, self.beta, self.gamma]), own.data['owner_grantable_projects'])
+        # Built for a reader who sees fewer projects, it is still every project THAT reader sees.
+        for_alex = self.service.agent_view(self.service.state['agents'][agent_id], self.principal(self.alex))
+        self.assertEqual(sorted([self.alpha, self.beta]), for_alex['owner_grantable_projects'])
+
+    def test_an_agent_credential_reading_itself_sees_only_its_own_grant(self):
+        """kittrial-5bb.361 (review of .355, mutant credential-sees-all): /v1/agents/me read
+        with the agent's own secret names only the projects that agent was granted, never
+        the owner's other memberships."""
+        _agent_id, secret, _ = self.agent_secret(self.alex, name='Merlin', projects=[self.alpha])
+        me = self.request('GET', '/v1/agents/me', token=secret)
+        self.assertEqual(200, me.status, me.data)
+        self.assertEqual([self.alpha], me.data['agent']['owner_grantable_projects'])
+        self.assertNotIn(self.beta, json.dumps(me.data))
+
 
 class AgentProjectsPageTests(AgentHarness):
     """kittrial-5bb.355 through the Agents page under Node: the administrator sees the

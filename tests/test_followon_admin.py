@@ -211,6 +211,49 @@ class FollowonAdminCommandTests(real.FollowonCase):
         self.assertEqual(self.journal_names(), before_journal)
         self.assertFalse(lock.exists(), 'the mismatched payload must be refused before the lock')
 
+    def test_the_allowlist_is_read_again_inside_the_lock(self):
+        """kittrial-5bb.361 (review of .358, mutant F2): the operator allowlist read inside the
+        lock decides. An operator removed between the pre-lock check and the lock is refused
+        and nothing is written."""
+        task = self.integrated_task()
+        before_ids = self.comment_ids(task)
+        before_journal = self.journal_names()
+        real_operators = admin.operators
+        calls = []
+
+        def changing(root, **kwargs):
+            calls.append(kwargs)
+            found = real_operators(root, **kwargs)
+            # The first strict read (before the lock) still lists COORD; every later one does not.
+            return found if len(calls) == 1 else frozenset(found) - {COORD}
+
+        with mock.patch.object(admin, 'operators', side_effect=changing):
+            message = self.refusal({'schema_version': 1, 'operation': 'record', 'task': task,
+                                    'text': 'Removed from the allowlist meanwhile.'})
+        self.assertGreaterEqual(len(calls), 2, 'the allowlist must be read again inside the lock')
+        self.assertIn('Actor ' + COORD + ' is not a server-side configured operator', message)
+        self.assertEqual(self.comment_ids(task), before_ids)
+        self.assertEqual(self.journal_names(), before_journal)
+
+    def test_a_symlinked_coordination_lock_is_refused(self):
+        """kittrial-5bb.361 (review of .358, mutant F6): a .coordination.lock that is a symlink
+        is refused before anything is opened through it; nothing is written and the link's
+        target is not created."""
+        task = self.integrated_task()
+        before_ids = self.comment_ids(task)
+        before_journal = self.journal_names()
+        lock = self.project / '.coordination.lock'
+        lock.unlink(missing_ok=True)
+        target = self.root / ('elsewhere-' + uuid.uuid4().hex)
+        lock.symlink_to(target)
+        self.addCleanup(lambda: lock.unlink(missing_ok=True))
+        message = self.refusal({'schema_version': 1, 'operation': 'record', 'task': task,
+                                'text': 'Through a planted link.'})
+        self.assertEqual('Coordination lock must not be a symlink', message)
+        self.assertFalse(target.exists(), 'nothing may be created through the link')
+        self.assertEqual(self.comment_ids(task), before_ids)
+        self.assertEqual(self.journal_names(), before_journal)
+
     def test_the_admin_route_adds_no_bypass_of_followons_own_refusals(self):
         task = self.integrated_task()
         before_ids = self.comment_ids(task)

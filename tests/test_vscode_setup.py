@@ -1189,6 +1189,79 @@ class ProxyAwareSelfCheckCase(unittest.TestCase):
                 self.assertNotIn('proxy probably answered', done.stdout + done.stderr)
 
 
+class TheQuotesAndTheBrowserRuleCase(unittest.TestCase):
+    """kittrial-5bb.361, from the review of kittrial-5bb.360: (1) PowerShell 5.1 ends a single-quoted
+    string at U+2018, U+2019, U+201A and U+201B as well as the ASCII quote, so both quote functions
+    double all five; (2) the browser copy of the address rule is pinned for $, (, ) and a space one
+    by one; (3) the browser rule and the server rule give the same answer on one shared table."""
+
+    QUOTES = "'‘’‚‛"
+
+    def node_json(self, script, *args):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        out = run_node_module(self, node, "const m = await import(process.argv[1]);" + script, SETUP_JS.as_uri(), *args)
+        self.assertEqual(0, out.returncode, out.stderr)
+        return json.loads(out.stdout)
+
+    def hostile(self):
+        """For each PowerShell quote: text that a quote-ending, command-running value would hold."""
+        return ['x%s;New-Item -ItemType File PWNED%d;%s' % (quote, index, quote)
+                for index, quote in enumerate(self.QUOTES)]
+
+    def test_both_quote_functions_double_every_powershell_quote(self):
+        from server_address import ps_quote
+        for quote in self.QUOTES:
+            self.assertEqual("'a%s%sb'" % (quote, quote), ps_quote('a%sb' % quote))
+        values = self.hostile()
+        browser = self.node_json("console.log(JSON.stringify(JSON.parse(process.argv[2]).map((t) => m.psQuote(t))))",
+                                 json.dumps(values))
+        self.assertEqual([ps_quote(value) for value in values], browser)
+
+    def test_a_typographic_quote_runs_nothing_in_real_powershell(self):
+        if not POWERSHELL or os.name != 'nt':
+            self.skipTest('runs where Windows PowerShell is installed')
+        from server_address import ps_quote
+        home = unique_dir('ps-quotes-')
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        values = self.hostile()
+        # The command goes through a UTF-8 file: a -Command argument would pass through the
+        # console code page, which is not what a person's pasted command does.
+        script = home / 'quoted.ps1'
+        script.write_text('\n'.join('Write-Output %s' % ps_quote(value) for value in values) + '\n', encoding='utf-8-sig')
+        done = subprocess.run([POWERSHELL, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                               '-Command', '[Console]::OutputEncoding = [Text.Encoding]::UTF8; & %s' % ps_quote(str(script))],
+                              cwd=str(home), capture_output=True, timeout=120)
+        self.assertEqual(0, done.returncode, done.stderr.decode('utf-8', 'replace'))
+        self.assertEqual(values, done.stdout.decode('utf-8').splitlines())
+        self.assertEqual([], sorted(p.name for p in home.iterdir() if p.name.startswith('PWNED')))
+
+    def test_the_browser_rule_refuses_each_character(self):
+        for character in ('$', '(', ')', ' '):
+            with self.subTest(character=character):
+                said = self.node_json("console.log(JSON.stringify(m.serverUrlProblem(process.argv[2])))",
+                                      'https://h.example/a%sb' % character)
+                self.assertEqual('The server address has the character %s, which a server address may not hold.'
+                                 % json.dumps(character), said)
+
+    def test_the_browser_rule_and_the_server_rule_agree(self):
+        from server_address import public_url_problem
+        from test_server_address import ACCEPTED, REFUSED
+        table = list(ACCEPTED) + [value for value, _named in REFUSED] + [
+            'https://-bad-.example', 'https://bad-.example', 'https://-x', 'https://a..b', 'https://[zz]/',
+            'https://[::1', 'https://' + 'a' * 63 + '.example', 'https://' + 'a' * 64 + '.example',
+            'https://under_score.example', 'https://h.example.', 'https://[fd00::5]:8443/orc', 'https://[1::2::3]',
+            'http://10.0.0.1:0', 'https://h/%2', 'https://h/%41', 'ftp://h.example']
+        browser = self.node_json("console.log(JSON.stringify(JSON.parse(process.argv[2]).map((u) => m.serverUrlProblem(u) === null)))",
+                                 json.dumps(table))
+        server = [public_url_problem(value, 'the table') is None for value in table]
+        self.assertEqual([(value, answer) for value, answer in zip(table, server)],
+                         [(value, answer) for value, answer in zip(table, browser)])
+        self.assertIn(False, server)
+        self.assertIn(True, server)
+
+
 class TheServerAddressStaysTextCase(unittest.TestCase):
     """kittrial-5bb.360: a server address is single-quoted in every command the wizard and AGENT.md
     give, so even a hostile value (one the server would refuse; set here directly, past that check)
