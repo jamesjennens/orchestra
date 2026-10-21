@@ -11334,16 +11334,17 @@ def kit_refusal(error):
 def run_main():
     """``main()`` with the command-line exits: a failure is one line, never a traceback.
 
-    A refusal (``ValueError``) ends with the same last line a traceback would have,
-    ``ValueError: <message>``, so anything that reads that line is unaffected. Only the
-    kit's own refusals are shortened (``kit_refusal``): any other error, including a
-    ``ValueError`` subclass from the standard library such as ``JSONDecodeError``, keeps
-    its traceback, because the traceback is the only thing that says where it came from.
+    A kit refusal keeps its concrete exception name; embedded line breaks are escaped so a
+    structured refusal remains one terminal line. Only the kit's own refusals are shortened
+    (``kit_refusal``): any other error, including a ``ValueError`` subclass from the
+    standard library such as ``JSONDecodeError``, keeps its traceback, because the traceback
+    is the only thing that says where it came from.
     """
     try: main()
     except ValueError as e:
         if not kit_refusal(e):raise
-        raise SystemExit('ValueError: %s'%e)
+        message=str(e).replace('\r','\\r').replace('\n','\\n')
+        raise SystemExit('%s: %s'%(type(e).__name__,message))
     except subprocess.CalledProcessError as e:
         # Never echo credential-bearing command input or the environment.
         raise SystemExit(f'Command failed ({e.returncode}): {e.stderr[:2000]}')

@@ -687,6 +687,11 @@ class ForcedCommandDocumentationTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn('forced_command', (KIT / name).read_text(encoding='utf-8'))
 
+    def test_onboarding_documents_the_setup_assistant_option(self):
+        text = self.text('ONBOARDING.md')
+        self.assertIn('--forced-command', text)
+        self.assertIn('setup_assistant.py', text)
+
     def test_http_deployment_points_at_the_confined_setup(self):
         text = self.text('HTTP_DEPLOYMENT.md')
         self.assertIn('ssh_forced_command.py', text)

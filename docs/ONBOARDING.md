@@ -39,6 +39,8 @@ The project entry point should explicitly supersede obsolete checkout-local coor
 
 `setup_assistant.py` writes the private `client.local.json`-shaped config that `client.py` reads (`transport`, `host`, `endpoint`, `root`, `python`; `client.py` also reads the optional `forced_command` boolean, which this tool does not set) and, only when asked, stores a secret in the operating system's credential store instead of in a file:
 
+For a contributor key confined to the endpoint, pass `--forced-command` when setting up its SSH client config. This writes `"forced_command": true`, so the client sends only the configured endpoint; keep the option paired with that key's server-side `authorized_keys` forced command. Omit it for ordinary SSH keys.
+
 ```sh
 python3 setup_assistant.py --help
 python3 setup_assistant.py --project example --config /private/example/client.local.json \
