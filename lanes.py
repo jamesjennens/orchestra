@@ -200,7 +200,13 @@ def held_task(row, task, actor, now, threshold, review=None, error=None):
         move, text, next_actor_value = move_decision(
             state, task, True, pending_items=pending_items, redelivered=redelivered,
             assignee=row.get('assignee'), closed=row.get('status') == 'closed',
-            claimable=row_claimable)
+            claimable=row_claimable,
+            # The shared projection carries the newest hand-back block, and when it
+            # applies it made the move the assignee's (kittrial-5bb.343). The lane
+            # board passes that SAME block through the ONE decision, so a lane row
+            # cannot keep saying the coordinator's move while work/brief/wait say the
+            # holder's.
+            followon=review.get('followon') if isinstance(review, dict) else None)
     found = declared_state(row, task)
     checkpoint = newest_checkpoint(row)
     declared = found is not None
