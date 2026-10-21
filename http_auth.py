@@ -3169,7 +3169,9 @@ class Service:
             row['project'] = event.get('project_id')
         if full:
             if row.get('credential'):
-                row['label'] = event.get('credential_label') or labels.get(row['credential'])
+                # The label is read from the credential record, never stored in the audit
+                # (the audit carries no credential payload). A pruned record shows its id only.
+                row['label'] = labels.get(row['credential'])
             if event.get('scopes_before') is not None or event.get('scopes_after') is not None:
                 row['scopes_before'] = event.get('scopes_before')
                 row['scopes_after'] = event.get('scopes_after')
@@ -3647,9 +3649,6 @@ class Service:
         after = self.agent_scopes(agent)
         event = self.audit(request_id, principal, action, 'committed', actor=self.agent_actor(agent))
         event.update(agent_id=agent['id'], target_credential_id=credential['id'],
-                     # The label is kept with the event (kittrial-5bb.365), so a history still
-                     # names a credential after the credential record itself was pruned.
-                     credential_label=credential.get('label'),
                      credential_scopes=list(credential['scopes']),
                      scopes_before=None if before[0] is None else list(before[0]),
                      scopes_after=None if after[0] is None else list(after[0]),

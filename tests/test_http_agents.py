@@ -2334,6 +2334,12 @@ class AgentHistoryTests(AgentHarness):
         self.issue('while-alpha')
         self.give_beta()
         later = self.issue('after-beta')
+        # Another project's event AFTER the grant: Alpha makes the agent its coordinator. Beta
+        # must not learn of it (the agent's other grants are not Beta's business).
+        made = self.request('PUT', '/v1/projects/%s/agents/%s/coordinator' % (self.alpha, self.agent_id), {},
+                            token=self.alex, key='coordinate-alpha')
+        self.assertEqual(200, made.status, made.data)
+        self.assertIn('coordinator grant given', [row['kind'] for row in self.history(self.alex).data['items']])
         got = self.history(self.alex, project=self.beta)
         self.assertEqual(200, got.status, got.data)
         rows = got.data['items']

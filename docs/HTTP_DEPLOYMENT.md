@@ -2100,7 +2100,7 @@ given and taken; each with who and when, newest first, at most 50 (`omitted` cou
 rest). There are two views:
 
 - `GET /v1/agents/{id}/history` is the agent's own view, for its account or a superuser.
-  It names each credential by its label, and shows the scopes before and after a change.
+  It names each credential by its label, read from the credential record while that record is kept (the audit itself never holds a label), and shows the scopes before and after a change.
   Anyone else gets the same `404` an unknown id gets, and a credential cannot read it.
 - `GET /v1/projects/{id}/agents/{agent}/history` is the project's view, for its owners and
   admins. It shows no label, no scopes and nothing about another project, and nothing from
