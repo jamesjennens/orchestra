@@ -45,6 +45,11 @@ its last checkpoint.
 
 **Agent:** `GET /v1/agents/me/next`. The reply lists its own tasks first: changes
 requested, then a task blocked by its last checkpoint, then a task in progress.
+**The "waiting" count** the Bridge shows for an agent is its own tasks plus the open
+tasks nobody holds, which it may claim. So a new agent in a busy project can show many
+waiting before it has done anything. The unheld open tasks are not counted when the
+project's "How work is handed out" setting (Members & settings) is "Only coordinators
+assign work" (kittrial-5bb.352).
 Blocked and in-progress tasks carry `newer_activity`: whether another actor wrote
 activity its last checkpoint did not incorporate. No checkpoint or uncertain history
 stays unknown. Read the linked task brief before acting: its `newer` summary gives

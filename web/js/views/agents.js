@@ -836,9 +836,14 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
           h('code', null, setupText.osCertificateFile(payload.certificateFile, state.os)),
           '. Never install the certificate in the system certificate store, start VS Code with --use-system-ca, or set NODE_EXTRA_CA_CERTS.') : null),
     ],
+    // Orchestra Bridge 0.14 or later starts the agent with its own prompt, so the Bridge path shows
+    // no prompt to paste; the older path keeps it (kittrial-5bb.364, James at the office).
     resume: () => [
-      h('p', { class: 'small' }, 'Paste this into the agent’s chat in VS Code.'),
-      commandLine(setupText.resumePrompt(payload.name), 'resume prompt'),
+      ...(state.bridge
+        ? [h('p', { class: 'small', 'data-bridge-prompt': 'true' }, 'Orchestra Bridge starts the agent with its own prompt: nothing needs pasting here.')]
+        : [h('p', { class: 'small' }, 'Paste this into the agent’s chat in VS Code.'),
+          commandLine(setupText.resumePrompt(payload.name), 'resume prompt')]),
+      h('p', { class: 'small muted', 'data-waiting-count': 'true' }, setupText.WAITING_COUNT_SENTENCE),
       onlineStatus,
       more(h('p', { class: 'small muted', 'data-screen-reader-tip': 'true' }, 'If VS Code makes sounds while the agent works, click the screen reader button in the bottom right of VS Code to switch it off.')),
     ],

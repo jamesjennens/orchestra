@@ -237,6 +237,10 @@ export function serverUrlProblem(server) {
 // cannot reach an internal Orchestra and answered with its own HTML page (kittrial-5bb.348): every
 // curl the wizard gives bypasses the proxy for THIS host only (never "*") and stops after
 // CURL_MAX_TIME seconds instead of hanging.
+// What the Bridge's “N waiting” counts (kittrial-5bb.364: a new agent showed 11 waiting, which
+// read as odd). The setting's labels are the ones Members & settings shows (web/js/views/project.js).
+export const WAITING_COUNT_SENTENCE = 'The agent’s “waiting” count is its own tasks plus open tasks nobody holds, '
+  + 'unless the project’s “How work is handed out” setting (Members & settings) is “Only coordinators assign work”.';
 export const CURL_MAX_TIME = 20;
 //: The agent's own calls (AGENT.md) wait longer: a first read of a large project after a write can
 //: take over 12 s, and the Bridge's own requests wait 60 s.
