@@ -189,12 +189,13 @@ class RealBdLaneStateTests(unittest.TestCase):
         self.assertNotEqual(row['newer_activity_marker'], marker)
         self.assertTrue(row['newer_activity_marker'].startswith(task + '-c'))
         self.assertEqual(row['newer_activity_by_others'], 2)
-        # A checkpoint that incorporates both clears the marker to null.
+        # A checkpoint that incorporates both moves the marker once, to the fields-only
+        # marker (kittrial-5bb.354: it stays non-null, so a later claim cannot move it).
         b.save_checkpoint(self.export_rows(), 'pp', task, self.payload(task), 'op',
                           self.writer('op'), provenance_writes=True)
         row = next(item for item in work.queue(self.export_rows(), 'op', [])['items']
                    if item['task'] == task)
-        self.assertIsNone(row['newer_activity_marker'])
+        self.assertTrue(row['newer_activity_marker'].startswith('fields:'), row['newer_activity_marker'])
         self.assertEqual(row['newer_activity_coverage'], 'current')
 
     @unittest.skipIf(not RELEASED, 'released checkout not configured (ORCHESTRA_LANES_RELEASED_KIT)')
