@@ -83,14 +83,28 @@ export function shortSha(sha) {
   return sha ? String(sha).slice(0, 9) : '';
 }
 
-let toastHost;
+// The layer a toast must be drawn in. A dialog opened with showModal() sits in the browser's top
+// layer, ABOVE everything in document.body, so a toast appended to the body is drawn under it: an
+// error raised while the set-up wizard was open showed as a red box behind it, mostly hidden
+// (kittrial-5bb.348). While a modal dialog is open, the toast goes INSIDE the topmost one (its
+// position: fixed is still the viewport's); otherwise into the body as before.
+export function toastLayer() {
+  const open = document.querySelectorAll ? Array.from(document.querySelectorAll('dialog[open]')) : [];
+  const shown = open.filter((dialog) => dialog.open !== false);
+  return shown.length ? shown[shown.length - 1] : document.body;
+}
+
+const toastHosts = new WeakMap();
 export function toast(message, kind) {
-  if (!toastHost) {
-    toastHost = h('div', { class: 'toasts', role: 'status', 'aria-live': 'polite' });
-    document.body.appendChild(toastHost);
+  const layer = toastLayer();
+  let host = toastHosts.get(layer);
+  if (!host || host.parentNode !== layer) {
+    host = h('div', { class: 'toasts', role: 'status', 'aria-live': 'polite' });
+    layer.appendChild(host);
+    toastHosts.set(layer, host);
   }
   const el = h('div', { class: 'toast' + (kind ? ' ' + kind : '') }, message);
-  toastHost.appendChild(el);
+  host.appendChild(el);
   setTimeout(() => el.remove(), kind === 'crit' ? 7000 : 3500);
 }
 
