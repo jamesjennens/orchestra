@@ -191,3 +191,32 @@ class CodeHostGitAccessWordingTests(unittest.TestCase):
 
     def test_the_project_template_states_code_host_access_first(self):
         self.assert_code_host_access_first(self.read('templates/PROJECT_ONBOARDING.md'))
+
+
+class WebWorkerToolsWordingTests(unittest.TestCase):
+    """A web project's coordinator is told what its worker can use (kittrial-5bb.357).
+
+    A web worker has no kit and no command line, so the coordinator-facing text names the
+    Bridge tools and the HTTP route for each need and forbids CLI-only kit commands."""
+
+    TOOLS = ('#orchestraNext', '#orchestraBrief', '#orchestraHistory', '#orchestraClaim',
+             '#orchestraCheckpoint', '#orchestraReview', '#orchestraRelease')
+    READS = ('#orchestraBrief or GET /v1/projects/PROJECT/tasks/TASK/brief',
+             '#orchestraHistory or GET /v1/projects/PROJECT/tasks/TASK/history',
+             '#orchestraNext or GET /v1/agents/me/next')
+
+    def read(self, relative):
+        return ' '.join((Path(__file__).resolve().parents[1] / relative).read_text(encoding='utf-8').split()).replace('`', '')
+
+    def test_the_coordinator_texts_forbid_cli_only_commands_for_a_web_worker(self):
+        for relative in ('docs/ONBOARDING.md', 'templates/COORDINATOR_PROMPT.md'):
+            with self.subTest(document=relative):
+                text = self.read(relative)
+                self.assertIn("A web project's coordinator must not give its worker CLI-only kit commands", text)
+                self.assertIn('no kit and no command line', text)
+                for tool in self.TOOLS:
+                    self.assertIn(tool, text)
+                for read in self.READS:
+                    self.assertIn(read, text)
+                self.assertIn('latest checkpoint with all open items', text)
+                self.assertIn('never tell it to install the kit', text.lower())

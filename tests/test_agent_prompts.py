@@ -224,6 +224,36 @@ class PromptCase(unittest.TestCase):
         text = result['text']
         self.assertLess(text.index('READ-ONLY projects'), text.index('task b1'))
 
+    def test_a_coordinator_prompt_names_a_web_workers_tools_and_routes(self):
+        """kittrial-5bb.357: a coordinator is told what a web worker can actually use."""
+        project = {'id': 'p1', 'name': 'Alpha', 'role': 'coordinator'}
+        text = prompt([classify(OWNER, [row('t1', 'awaiting-review', OTHER)], project=project)])['text']
+        self.assertIn('A web worker has no kit and no command line', text)
+        for tool in ('#orchestraNext', '#orchestraBrief', '#orchestraHistory', '#orchestraClaim',
+                     '#orchestraCheckpoint', '#orchestraReview', '#orchestraRelease'):
+            with self.subTest(tool=tool):
+                self.assertIn(tool, text)
+        for read in ('#orchestraBrief or GET /v1/projects/PROJECT/tasks/TASK/brief',
+                     '#orchestraHistory or GET /v1/projects/PROJECT/tasks/TASK/history',
+                     '#orchestraNext or GET /v1/agents/me/next'):
+            with self.subTest(read=read):
+                self.assertIn(read, text)
+        for read_name in ('brief for task text and the latest checkpoint with all open items',
+                          'history for comments', 'me/next for its own work'):
+            with self.subTest(read=read_name):
+                self.assertIn(read_name, text)
+        self.assertIn('Never tell a web worker to install the kit', text)
+        self.assertIn('never give it a CLI-only kit command', text)
+
+    def test_a_non_coordinator_prompt_does_not_carry_the_web_worker_paragraph(self):
+        for role in ('contributor', 'owner', 'viewer'):
+            with self.subTest(role=role):
+                project = {'id': 'p1', 'name': 'Alpha', 'role': role}
+                text = prompt([classify(OWNER, [row('t1', 'awaiting-review', OTHER)],
+                                        project=project)])['text']
+                self.assertNotIn('no kit and no command line', text)
+                self.assertNotIn('#orchestraBrief', text)
+
     def test_no_projects_gives_a_grant_note_without_an_action_list(self):
         for agent, reason in ((AGENT, 'This agent has no projects yet.'),
                               (dict(AGENT, projects=['p9']),
