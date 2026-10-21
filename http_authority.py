@@ -1200,11 +1200,13 @@ class NativeRunner:
     """
 
     __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote',
-                 'lifecycle_project', 'bounded_task_reads',
+                 'lifecycle_project', 'bounded_task_reads', '_bounded',
                  '_lifecycle_void_journal', '_web_lifecycle_mark_journal')
 
-    def __init__(self, dispatch, project=None, bounded_task_reads=False):
+    def __init__(self, dispatch, project=None, bounded_task_reads=False, bounded=None):
         self._dispatch = dispatch
+        #: A read whose stdout is stopped at a byte cap (kittrial-5bb.362), or None.
+        self._bounded = bounded
         self.attempted_write = False
         self.calls = 0
         #: Set by an effect that wrote something that is not a bd row (the kit's handoff
@@ -1226,6 +1228,21 @@ class NativeRunner:
         if is_mutating_invocation(argv):
             self.attempted_write = True
         return self._dispatch(argv)
+
+    @property
+    def bounded(self):
+        """``bounded(argv, max_bytes)``: a READ whose output stops at ``max_bytes``
+        (kittrial-5bb.362), or None when this runner has none. A write is refused here: the
+        cap would cut its receipt, so writes always go through the call itself."""
+        if self._bounded is None:
+            return None
+
+        def read(argv, max_bytes):
+            if is_mutating_invocation(argv):
+                raise ValueError('A bounded native read cannot run a write: %s' % (argv[:1],))
+            self.calls += 1
+            return self._bounded(argv, max_bytes)
+        return read
 
 
 def read_legacy_journal(path):

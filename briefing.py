@@ -1127,9 +1127,14 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         else:
             try:
                 history_text=field_history(task)
+            except field_versions.TooLarge:
+                history_text=False
             except Exception:
                 history_text=None
-            changed_fields,fields_note=field_versions.changes(history_text,issue,c.get('created_at'))
+            if history_text is False:
+                changed_fields,fields_note=[],field_versions.TOO_LARGE_NOTE
+            else:
+                changed_fields,fields_note=field_versions.changes(history_text,issue,c.get('created_at'))
     section=changes_since_checkpoint(
         excluded if p is not None else data, retained_provenance(state) if p is not None else None,
         {'comment_id':c['id'],'author':c.get('author'),'timestamp':c.get('created_at')} if p is not None else None,
@@ -2257,10 +2262,26 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         if action=='brief':
             def field_history(task_id):
                 # One bounded read-only `bd history` per stale brief, through the read
-                # cache under the tracker's generation (kittrial-5bb.354).
+                # cache under the tracker's generation (kittrial-5bb.354), stopped at
+                # HISTORY_MAX_BYTES while it is read (kittrial-5bb.362); one smaller
+                # read follows a refused one, and a second refusal raises TooLarge.
                 import field_history as field_versions
                 from read_cache import cached_task_history
-                return cached_task_history(root,path,task_id,lambda:run(field_versions.command(task_id)),name=project)
+                def bounded(limit):
+                    argv=field_versions.command(task_id,limit)
+                    reader=getattr(run,'bounded',None)
+                    if reader is not None:
+                        return reader(argv,field_versions.HISTORY_MAX_BYTES)
+                    text=run(argv)          # a runner without a bounded read (a test double)
+                    if len(text.encode('utf-8'))>field_versions.HISTORY_MAX_BYTES:
+                        raise field_versions.TooLarge('history answer over the cap')
+                    return text
+                def fetch():
+                    try:
+                        return bounded(field_versions.HISTORY_LIMIT)
+                    except field_versions.TooLarge:
+                        return bounded(field_versions.RETRY_LIMIT)
+                return cached_task_history(root,path,task_id,fetch,name=project)
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
                          verifiers=verifiers,actor=actor,full=a.full,
                          independent_approval=independent_approval,owners=owners,

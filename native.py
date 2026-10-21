@@ -104,6 +104,68 @@ def run(command, env, timeout=TIMEOUT):
                           encoding='utf-8', timeout=timeout)
 
 
+#: Bytes read from the pipe per step, and the most of a bounded read's stderr kept.
+_CHUNK = 65536
+_STDERR_KEEP = 65536
+
+
+def run_bounded(command, env, max_bytes, timeout=TIMEOUT):
+    """``(completed, over)``: :func:`run`, but stdout is read at most ``max_bytes`` deep.
+
+    The pipe is read in steps of :data:`_CHUNK`; as soon as more than ``max_bytes`` have
+    arrived the process is killed and ``over`` is True, so an answer of any size never
+    sits in memory whole (kittrial-5bb.362: a task's ``bd history`` reached megabytes).
+    ``completed`` is a CompletedProcess with the text read so far; stderr is drained by
+    a thread and keeps at most :data:`_STDERR_KEEP` bytes. The timeout kills the process
+    too and raises ``subprocess.TimeoutExpired``, as :func:`run` does.
+    """
+    import threading
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    errors = []
+
+    def drain():
+        kept = 0
+        for block in iter(lambda: process.stderr.read(_CHUNK), b''):
+            if kept < _STDERR_KEEP:
+                errors.append(block[:_STDERR_KEEP - kept])
+                kept += len(errors[-1])
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    expired = []
+
+    def expire():
+        expired.append(True)
+        process.kill()
+
+    timer = threading.Timer(timeout, expire)
+    timer.start()
+    chunks, total, over = [], 0, False
+    try:
+        while True:
+            block = process.stdout.read1(_CHUNK) if hasattr(process.stdout, 'read1') else process.stdout.read(_CHUNK)
+            if not block:
+                break
+            total += len(block)
+            if total > max_bytes:
+                over = True
+                process.kill()
+                break
+            chunks.append(block)
+        process.wait()
+    finally:
+        timer.cancel()
+        process.stdout.close()
+    reader.join(timeout=5)
+    process.stderr.close()
+    if expired and not over:
+        raise subprocess.TimeoutExpired(command, timeout)
+    # Universal newlines, as run()'s text mode gives.
+    stdout = b''.join(chunks).decode('utf-8', 'replace').replace('\r\n', '\n')
+    stderr = b''.join(errors).decode('utf-8', 'replace').replace('\r\n', '\n')
+    return subprocess.CompletedProcess(command, 0 if over else process.returncode, stdout, stderr), over
+
+
 def _relative_path(match):
     token = match.group(0)
     last = token.replace('\\', '/').rsplit('/', 1)[-1]
