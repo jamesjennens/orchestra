@@ -13,6 +13,7 @@ import base64
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -42,7 +43,7 @@ def office_install(root):
         (kit / name).write_text('', encoding='utf-8')
     interpreter = release / 'python-runtime' / 'bin' / 'python3'
     interpreter.parent.mkdir(parents=True)
-    interpreter.write_text('', encoding='utf-8')
+    shutil.copy2(sys.executable, interpreter)
     (release / 'manifest.json').write_text(
         json.dumps({'schema_version': 1, 'python_executable': 'bin/python3'}), encoding='utf-8')
     (root / 'current').symlink_to('releases/build-a')
@@ -90,7 +91,7 @@ def release_root_install(root):
         (release / name).write_text('', encoding='utf-8')
     interpreter = release / 'python-runtime' / 'bin' / 'python3'
     interpreter.parent.mkdir(parents=True)
-    interpreter.write_text('', encoding='utf-8')
+    shutil.copy2(sys.executable, interpreter)
     (release / 'manifest.json').write_text(
         json.dumps({'schema_version': 1, 'python_executable': 'bin/python3'}), encoding='utf-8')
     (root / 'current').symlink_to('releases/build-a')

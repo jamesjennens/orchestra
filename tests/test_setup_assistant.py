@@ -127,6 +127,14 @@ class FreshSetupTests(SetupTestCase):
         self.assertNotIn(FAKE_SECRET, text)
         self.assertNotIn(FAKE_SECRET, json.dumps(self.config_dict()))
 
+    def test_cli_writes_forced_command_for_a_confined_ssh_key(self):
+        code, _, err = self.call_main(
+            "--project", "example", "--config", str(self.config),
+            "--host", "example-host", "--endpoint", "/srv/endpoint.py",
+            "--root", "/srv/orchestra/runtime", "--forced-command", "--non-interactive")
+        self.assertEqual(code, sa.EXIT_OK, err)
+        self.assertIs(self.config_dict()["forced_command"], True)
+
     @unittest.skipUnless(os.name == "posix", "owner-only file mode is a POSIX property")
     def test_config_file_is_owner_only(self):
         self.run_setup()

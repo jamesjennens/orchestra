@@ -222,7 +222,7 @@ class DeploymentLockWaitTests(unittest.TestCase):
         '''), REPO, str(self.root)], capture_output=True, text=True, timeout=60,
             env={key: value for key, value in os.environ.items() if key != 'ORCHESTRA_OPERATORS'})
         self.assertEqual((done.returncode, done.stdout), (1, ''), done.stderr)
-        self.assertRegex(done.stderr.strip(), r'^ValueError: Nothing was changed: another change to '
+        self.assertRegex(done.stderr.strip(), r'^ValueError: DeploymentLockBusy: Nothing was changed: another change to '
                                               r'deployment\.private\.json or an adopt-actor run '
                                               r'still holds its lock \(\.review-writes\.lock\) '
                                               r'after 0 s\. Run the command again')

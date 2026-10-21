@@ -651,13 +651,27 @@ class RestoreNoticeCase(unittest.TestCase):
 
     def test_a_refusal_is_one_line_not_a_traceback(self):
         # Review 01a10219, P3 (e): the line a traceback would end with, and nothing else.
+        import artifacts
+        import capabilities
         import requirements
-        for error, line in ((ValueError('Refusing to retire x: y'), 'ValueError: Refusing to retire x: y'),
-                            (requirements.ValidationError('bad publication'), 'ValueError: bad publication')):
+        import review_workflow
+        errors = (
+            ValueError('Refusing to retire x: y'),
+            requirements.ValidationError('bad publication'),
+            artifacts.ArtifactError('bad artifact'),
+            capabilities.TooComplex('too complex'),
+            review_workflow.StaleReviewPrevious('task', 'old', 'new', 'changes-requested'),
+        )
+        for error in errors:
+            class_name = '' if type(error) is ValueError else type(error).__name__ + ': '
+            line = 'ValueError: %s%s' % (
+                class_name, str(error).replace('\r', '\\r').replace('\n', '\\n'))
             with patch.object(admin, 'main', side_effect=error):
                 with self.assertRaises(SystemExit) as refused:
                     admin.run_main()
             self.assertEqual(refused.exception.code, line)
+            self.assertNotIn('\n', refused.exception.code)
+            self.assertNotIn('\r', refused.exception.code)
 
     def test_an_error_that_is_not_a_kit_refusal_keeps_its_traceback(self):
         # Review 01a1026a, P2: JSONDecodeError is a ValueError; shortened to one line it named

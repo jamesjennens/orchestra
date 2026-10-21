@@ -50,8 +50,9 @@ key; pass ``--credential-key`` to override.
 
 Config compatibility: the writer produces the same keys ``client.py`` reads for
 its ``ssh``/``local`` transports (``transport``, ``host``, ``endpoint``,
-``root``, ``python``) plus non-secret bookkeeping keys the client ignores
-(``project``, ``checkout``, ``services``, ``credential``).
+``root``, ``python``), plus the optional ``forced_command`` flag for confined SSH
+keys and non-secret bookkeeping keys the client ignores (``project``, ``checkout``,
+``services``, ``credential``).
 """
 import sys
 if sys.version_info < (3, 10):
@@ -149,6 +150,7 @@ class SetupRequest:
     root: Optional[str] = None
     checkout: Optional[str] = None
     python: Optional[str] = None
+    forced_command: bool = False
     services: Tuple[ServiceSpec, ...] = ()
     credential_key: Optional[str] = None
     actor: Optional[str] = None
@@ -269,6 +271,8 @@ def build_config(
         config["project"] = request.project
     if request.checkout:
         config["checkout"] = request.checkout
+    if request.forced_command:
+        config["forced_command"] = True
     if request.services:
         config["services"] = [service.as_dict() for service in request.services]
     if request.store_secret and credential_key:
@@ -663,6 +667,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Python interpreter that runs the endpoint: on the server for the ssh "
                              "transport, locally for the local transport (default: python3; an office "
                              "install uses its bundled interpreter under install/current)")
+    parser.add_argument("--forced-command", action="store_true",
+                        help="configure the client for an SSH key confined to the endpoint")
     parser.add_argument("--service", action="append", default=[], metavar="NAME=ADDRESS",
                         help="optional project service address; repeatable")
     parser.add_argument("--credential-key",
@@ -726,6 +732,7 @@ def main(
             root=args.root,
             checkout=args.checkout,
             python=args.python,
+            forced_command=args.forced_command,
             services=services,
             credential_key=args.credential_key,
             actor=args.actor,

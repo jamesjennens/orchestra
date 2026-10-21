@@ -382,7 +382,7 @@ class PrintCommandTests(unittest.TestCase):
         self.assertNotIn('--project', plain['contributor'])
         self.assertNotIn('orchestra-projects', plain['contributor'])
         self.assertIn('operator', plain)
-        self.assertEqual(len(plain['notes']), 6)
+        self.assertEqual(len(plain['notes']), 7)
         self.assertNotIn('bound', json.dumps(plain))
 
     def test_with_the_flag_the_bound_line_alone_is_printed(self):
@@ -393,7 +393,7 @@ class PrintCommandTests(unittest.TestCase):
                 self.assertIn(' --project alpha --project beta",restrict,', bound['contributor'])
                 self.assertTrue(bound['contributor'].endswith(' alex@laptop orchestra-projects=alpha,beta'))
                 self.assertNotIn('operator', bound)
-                self.assertEqual(len(bound['notes']), 9)
+                self.assertEqual(len(bound['notes']), 10)
 
     def test_what_cannot_be_bound_is_refused(self):
         for more, said in ((('--project', 'gamma'), 'no such project in this runtime'),
