@@ -2223,7 +2223,11 @@ console.log(JSON.stringify({
             'refusedAddressSaidAndNotUsed',
             'reloadResumesTheScreen',
             'reloadShowsNoSecret',
-            'resumeScreenHasOnlyThePrompt',
+            # kittrial-5bb.364: the Bridge path's last screen has no prompt to paste; both
+            # paths say what the waiting count includes.
+            'bridgeResumeHasNoPromptToPaste',
+            'bridgeResumeSaysWhatWaitingCounts',
+            'longResumeKeepsThePromptAndTheCount',
             'reviewerSaidInOneLine',
             'roleErrorShownInsideTheDialog',
             'roleSavedOnOrchestra',

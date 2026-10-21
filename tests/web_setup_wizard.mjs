@@ -211,7 +211,13 @@ out.checkHoldsNextUntilSeen = screenOf(d) === 'vscode' && check.hidden === false
 server.lastSeen = new Date(Date.now() + 1000).toISOString();
 await d.wizard.next();
 out.checkPassesOnceSeen = screenOf(d) === 'resume';
-out.resumeScreenHasOnlyThePrompt = JSON.stringify(commands(d)) === JSON.stringify(['resume prompt']);
+// kittrial-5bb.364: on the Bridge path the Bridge gives the agent its prompt, so nothing is pasted here,
+// and the screen says what the waiting count includes.
+out.bridgeResumeHasNoPromptToPaste = JSON.stringify(commands(d)) === JSON.stringify([])
+  && attr(d, 'data-bridge-prompt', 'true').length === 1
+  && /Orchestra Bridge starts the agent with its own prompt: nothing needs pasting here\./.test(shownText(d));
+out.bridgeResumeSaysWhatWaitingCounts = attr(d, 'data-waiting-count', 'true').length === 1
+  && /own tasks plus open tasks nobody holds, unless the project’s “How work is handed out” setting \(Members & settings\) is “Only coordinators assign work”/.test(shownText(d));
 out.nextHiddenAndDonePrimaryOnTheLast = button(d, 'wizard-next').hidden === true && button(d, 'wizard-done').className === 'primary';
 texts.resume = shownText(d); sentences.resume = firstSentenceCount(d);
 const back = [];
@@ -250,6 +256,10 @@ for (const screen of d.wizard.plan()) { d.wizard.show(screen); perScreen[screen]
 out.eachScreenOnlyItsOwnCommand = JSON.stringify(perScreen) === JSON.stringify({
   system: [], role: [], 'cert-save': [], 'cert-move': ['certificate move command'], secret: [], rewrite: ['rewrite command'],
   test: ['self-check command'], files: [], vscode: ['folder path', 'VS Code command'], resume: ['resume prompt'] });
+d.wizard.show('resume');
+out.longResumeKeepsThePromptAndTheCount = JSON.stringify(commands(d)) === JSON.stringify(['resume prompt'])
+  && attr(d, 'data-bridge-prompt', 'true').length === 0 && attr(d, 'data-waiting-count', 'true').length === 1
+  && /Paste this into the agent’s chat in VS Code\./.test(shownText(d));
 d.wizard.show('cert-save');
 out.saveCertificateIsTheOneButton = Boolean(button(d, 'save-certificate')) && commands(d).length === 0;
 d.wizard.show('cert-move');
