@@ -70,13 +70,23 @@ export async function detail(ctx, { pid, tid }) {
 
   // ---- brief -------------------------------------------------------------------
   const cp = brief.checkpoint;
+  // checkpoint.open_items is only the first page the brief shows; carry_open_items is
+  // the complete list, in order (kittrial-5bb.356). A null carry list means the server
+  // could not read all of them: show what it has and offer a reload rather than let
+  // the first page read as the whole list.
+  const carry = Array.isArray(brief.carry_open_items) ? brief.carry_open_items : null;
+  const openItems = carry || (cp && Array.isArray(cp.open_items) ? cp.open_items : []);
+  const openTotal = cp && Number.isInteger(cp.open_items_total) ? cp.open_items_total : openItems.length;
+  const incomplete = brief.carry_open_items === null;
   const briefPanel = h('section', { class: 'panel', 'aria-labelledby': 'brief-h' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'brief-h' }, 'Brief'), cp ? h('span', { class: 'small muted' }, 'Checkpoint ', time(cp.at), ' by ', cp.author_name || cp.author) : null),
     h('div', { class: 'panel-body' },
       t.description ? h('p', { class: 'prose' }, t.description) : h('p', { class: 'muted' }, 'No description yet.'),
       cp ? [h('h3', { class: 'small' }, 'Where it stands'), h('p', { class: 'prose' }, cp.summary), cp.next_action ? h('p', null, h('strong', null, 'Next step: '), cp.next_action) : null] : null,
-      cp && cp.open_items && cp.open_items.length ? [h('h3', { class: 'small' }, 'Unresolved items ', h('span', { class: 'nav-count' }, cp.open_items.length)),
-        h('ul', { class: 'open-items' }, cp.open_items.map((o) => h('li', null, h('span', { class: 'chip plain' }, o.kind), ' ', o.text)))] : null));
+      cp && openItems.length ? [h('h3', { class: 'small' }, 'Unresolved items ', h('span', { class: 'nav-count' }, String(openTotal))),
+        h('ul', { class: 'open-items' }, openItems.map((o) => h('li', null, h('span', { class: 'chip plain' }, o.kind), ' ', o.text)))] : null,
+      incomplete ? h('div', { class: 'banner', role: 'note' }, 'The complete list of unresolved items could not all be read. ',
+        h('button', { type: 'button', class: 'link', onclick: () => reload() }, 'Reload the task'), ' to try again.') : null));
 
   // ---- contribution & review ---------------------------------------------------
   const c = review.contribution;
@@ -120,23 +130,60 @@ export async function detail(ctx, { pid, tid }) {
     h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'review-h' }, 'Contribution & review'), reviewChip(review.state)), reviewBody);
 
   // ---- history (bounded pages) -----------------------------------------------
+  // History is oldest first, so the next page holds NEWER entries: the button says so.
+  // A long comment is several entries sharing entry_id, each with body_offset and
+  // continued (kittrial-5bb.356): join them into one item, fetching the following page
+  // while the last fragment still says more of the same body follows.
   const historyList = h('ul', { class: 'timeline' });
-  const more = h('button', { type: 'button', hidden: true }, 'Show older');
+  const more = h('button', { type: 'button', hidden: true }, 'Show newer');
   let cursor = null;
-  async function loadHistory() {
-    let page;
-    try { page = await ctx.api.history(pid, tid, { limit: 20, cursor }); } catch (error) { historyList.replaceChildren(h('li', null, h('span'), h('p', { class: 'muted' }, describe(error)))); return; }
-    for (const e of page.items) {
+  let loading = false;
+  const entries = [];
+  const byEntry = new Map();
+  function addEntry(e) {
+    if (typeof e.entry_id === 'string' && e.entry_id && typeof e.body === 'string') {
+      let target = byEntry.get(e.entry_id);
+      if (!target) { target = { ...e, body: '' }; entries.push(target); byEntry.set(e.entry_id, target); }
+      const offset = Number.isInteger(e.body_offset) ? e.body_offset : target.body.length;
+      // A page boundary may repeat no text but must never drop any: add only the part
+      // of this fragment past what the joined body already holds.
+      target.body += offset >= target.body.length ? e.body : e.body.slice(target.body.length - offset);
+      target.continued = Boolean(e.continued);
+      return;
+    }
+    entries.push({ ...e });
+  }
+  function drawHistory() {
+    historyList.replaceChildren(...entries.map((e) => {
       // In-process events carry action/user/time; canonical entries carry kind/author/timestamp/body.
       const action = e.action || e.kind;
       const [label, tone] = ACTIONS[action] || [action, ''];
-      const detail = e.detail || e.body;
+      const detail = typeof e.body === 'string' ? e.body : e.detail;
       const who = [e.user_name, e.author_name, e.author, e.actor, e.user_id].find((v) => typeof v === 'string' && v) || '';
-      historyList.append(h('li', null, h('span', { class: 'dot ' + tone, 'aria-hidden': 'true' }),
-        h('div', null, h('div', { class: 'event-head' }, h('strong', null, who), h('span', null, label), time(e.time || e.timestamp)), detail ? h('p', { class: 'event-body prose' }, detail) : null)));
-    }
-    if (!page.items.length && !cursor) historyList.append(h('li', null, h('span'), h('p', { class: 'muted' }, 'No history yet.')));
-    cursor = page.next_cursor; more.hidden = !cursor;
+      return h('li', null, h('span', { class: 'dot ' + tone, 'aria-hidden': 'true' }),
+        h('div', null, h('div', { class: 'event-head' }, h('strong', null, who), h('span', null, label), time(e.time || e.timestamp)), detail ? h('p', { class: 'event-body prose' }, detail) : null));
+    }));
+    if (!entries.length) historyList.append(h('li', null, h('span'), h('p', { class: 'muted' }, 'No history yet.')));
+  }
+  async function loadHistory() {
+    if (loading) return;
+    loading = true;
+    try {
+      let page;
+      try { page = await ctx.api.history(pid, tid, { limit: 20, cursor }); } catch (error) { historyList.append(h('li', null, h('span'), h('p', { class: 'muted' }, describe(error)))); return; }
+      for (const e of page.items) addEntry(e);
+      cursor = page.next_cursor;
+      // The last fragment is continued: the rest of that body is on the next page.
+      let guard = 0;
+      while (entries.length && entries[entries.length - 1].continued && cursor && guard < 50) {
+        guard += 1;
+        try { page = await ctx.api.history(pid, tid, { limit: 20, cursor }); } catch (error) { break; }
+        for (const e of page.items) addEntry(e);
+        cursor = page.next_cursor;
+      }
+      drawHistory();
+      more.hidden = !cursor;
+    } finally { loading = false; }
   }
   more.addEventListener('click', loadHistory);
   loadHistory();
