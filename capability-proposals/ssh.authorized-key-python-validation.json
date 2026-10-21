@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb359-ssh-python-validation-0001",
+  "key": "ssh.authorized-key-python-validation",
+  "name": "Absolute authorized-key Python paths are verified before printing",
+  "aliases": [
+    "authorized keys python interpreter validation",
+    "authorized-key interpreter check",
+    "ssh forced-command python version check"
+  ],
+  "summary": "admin.py authorized-keys refuses an absolute --python path unless it exists, is executable and reports Python 3.10+ to a three-second version probe; a bare interpreter name is left unchanged and resolved through the server account PATH when SSH starts the forced command.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "admin.py::_verified_authorized_key_python",
+    "admin.py::authorized_keys"
+  ],
+  "tests": [
+    "tests/test_ssh_forced_command.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "ssh",
+    "operations",
+    "security"
+  ]
+}

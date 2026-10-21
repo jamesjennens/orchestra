@@ -474,6 +474,11 @@ user site directory; not `-I`, which would also drop the script's directory from
 `sys.path`), and it refuses a `--python` outside the same bare-name-or-absolute-path
 character class as `--root`, so `--python '$(touch${IFS}/tmp/canary)python3'` is refused
 instead of printed into an entry the account shell would expand on every connection.
+Before printing, an absolute `--python` path must exist, be executable and report Python
+3.10 or newer to a short version probe; otherwise the helper refuses with one sentence.
+A bare interpreter name is left unchanged and resolved through the server account's `PATH`
+when SSH starts the forced command, so use an absolute path when the interpreter must be
+checked before the line is installed.
 
 Confinement binds the key to the endpoint, not to an actor. A confined key still
 self-declares its actor on every request, exactly as an unconfined one does; what the

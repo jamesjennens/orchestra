@@ -486,6 +486,110 @@ class AuthorizedKeyLineTests(unittest.TestCase):
             self.lines(comment='two\nlines')
 
 
+class AuthorizedKeyPythonValidationTests(unittest.TestCase):
+    """The public helper validates absolute interpreters before printing a key line."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.key_file = self.root / 'alex.pub'
+        self.key_file.write_text(KEY_LINE + '\n', encoding='utf-8')
+        self.kit = self.root / 'kit'
+        self.kit.mkdir()
+        for name in ('ssh_forced_command.py', 'endpoint.py'):
+            (self.kit / name).write_text('', encoding='utf-8')
+
+    def invoke(self, python):
+        with patch.object(admin, 'install_current_path', return_value=self.kit), \
+                patch.object(admin, 'key_projects', return_value=[]), \
+                patch.object(admin, 'key_principal', return_value=None), \
+                patch.object(admin, 'bound_keys_only', return_value=False), \
+                patch.object(admin, 'authorized_key_lines', return_value={
+                    'root': '/srv/state', 'kit': '/srv/kit', 'endpoint': ENDPOINT,
+                    'wrapper': '/srv/kit/ssh_forced_command.py', 'python': python,
+                    'contributor_options': list(admin.CONTRIBUTOR_KEY_OPTIONS),
+                    'contributor': 'command="%s -E -s %s"' % (python, ENDPOINT),
+                    'operator': KEY_LINE
+                }):
+            return admin.authorized_keys('/srv/state', self.key_file, role='contributor',
+                                         python=python)
+
+    def test_a_missing_absolute_interpreter_is_refused_before_printing(self):
+        real_isfile = os.path.isfile
+
+        def isfile(path):
+            return False if os.fspath(path) == '/srv/missing-python' else real_isfile(path)
+
+        with patch('admin.os.path.isfile', side_effect=isfile), \
+                patch('admin.subprocess.run') as run:
+            with self.assertRaisesRegex(
+                    ValueError, r'^--python path must be an executable Python 3\.10\+ interpreter\.$'):
+                self.invoke('/srv/missing-python')
+        run.assert_not_called()
+
+    def test_a_non_executable_absolute_interpreter_is_refused(self):
+        with patch('admin.os.path.isfile', return_value=True), \
+                patch('admin.os.access', return_value=False), \
+                patch('admin.subprocess.run') as run:
+            with self.assertRaisesRegex(ValueError, r'^--python path must be an executable Python 3\.10\+ interpreter\.$'):
+                self.invoke('/srv/not-executable')
+        run.assert_not_called()
+
+    def test_a_path_must_report_python_310_or_newer(self):
+        result = subprocess.CompletedProcess([], 0, '3.9\n', '')
+        with patch('admin.os.path.isfile', return_value=True), \
+                patch('admin.os.access', return_value=True), \
+                patch('admin.subprocess.run', return_value=result) as run:
+            with self.assertRaisesRegex(ValueError, r'^--python path must be an executable Python 3\.10\+ interpreter\.$'):
+                self.invoke('/srv/python39')
+        self.assertEqual(run.call_args.args[0][:2], ['/srv/python39', '-c'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 3)
+
+    def test_a_failed_probe_is_refused_in_one_sentence(self):
+        result = subprocess.CompletedProcess([], 1, '', 'not Python')
+        with patch('admin.os.path.isfile', return_value=True), \
+                patch('admin.os.access', return_value=True), \
+                patch('admin.subprocess.run', return_value=result):
+            with self.assertRaisesRegex(
+                    ValueError, r'^--python path must be an executable Python 3\.10\+ interpreter\.$'):
+                self.invoke('/srv/python')
+
+    def test_a_timed_out_probe_is_refused_in_one_sentence(self):
+        timeout = subprocess.TimeoutExpired(['/srv/python'], 3)
+        with patch('admin.os.path.isfile', return_value=True), \
+                patch('admin.os.access', return_value=True), \
+                patch('admin.subprocess.run', side_effect=timeout):
+            with self.assertRaisesRegex(
+                    ValueError, r'^--python path must be an executable Python 3\.10\+ interpreter\.$'):
+                self.invoke('/srv/python')
+
+    def test_a_valid_absolute_interpreter_is_probed_with_a_short_timeout(self):
+        result = subprocess.CompletedProcess([], 0, '3.10\n', '')
+        with patch('admin.os.path.isfile', return_value=True), \
+                patch('admin.os.access', return_value=True), \
+                patch('admin.subprocess.run', return_value=result) as run, \
+                patch('sys.stdout', io.StringIO()):
+            self.invoke('/srv/python310')
+        self.assertEqual(run.call_args.args[0][:2], ['/srv/python310', '-c'])
+        self.assertIn('sys.version_info', run.call_args.args[0][2])
+        self.assertEqual(run.call_args.kwargs['timeout'], 3)
+
+    def test_a_bare_interpreter_name_is_left_for_server_path_resolution(self):
+        with patch('admin.os.path.isfile') as isfile, \
+                patch('admin.os.access') as access, \
+                patch('admin.subprocess.run') as run, \
+                patch('sys.stdout', io.StringIO()) as out:
+            self.invoke('python3')
+        isfile.assert_not_called()
+        access.assert_not_called()
+        run.assert_not_called()
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload['python'], 'python3')
+        self.assertTrue(any('resolved through the server account' in note
+                            and 'when SSH starts' in note for note in payload['notes']))
+
+
 @unittest.skipUnless(os.name == 'posix', 'admin.py host commands use Linux absolute paths')
 class AuthorizedKeysCommandTests(unittest.TestCase):
     """The admin.py subcommand prints parseable JSON and honours --role."""
@@ -644,7 +748,8 @@ class ForcedCommandDocumentationTests(unittest.TestCase):
         text = self.text('OPERATIONS.md')
         for phrase in ('ssh_forced_command.py', 'authorized-keys', 'forced_command',
                        'no-pty', 'no-port-forwarding', 'no-agent-forwarding', 'no-X11-forwarding',
-                       '--authority-store', 'migration'):
+                       '--authority-store', 'migration', '3.10 or newer',
+                       'resolved through the server account'):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 
