@@ -2370,6 +2370,27 @@ class AgentHistoryTests(AgentHarness):
         self.assertEqual([], [row for row in audit.data['items'] if row.get('agent')])
         self.assertEqual(404, self.history(self.alex, project=self.beta).status)
 
+    def test_only_the_projects_admins_read_its_view(self):
+        """kittrial-5bb.365 security review (mutant H9): the project's view of an agent, and its
+        project audit, are for the project's owners/admins only. A viewer, a contributor and a
+        coordinator of the project are refused, and the answer reveals nothing of the agent."""
+        self.give_beta()
+        self.revoke(self.first_credential)
+        for role in ('viewer', 'contributor', 'coordinator'):
+            with self.subTest(role=role):
+                user_id = self.create_account(self.admin, 'member-' + role, 'member-password-1')
+                added = self.request('PUT', '/v1/projects/%s/members/%s' % (self.beta, user_id), {'role': role},
+                                     token=self.alex)
+                self.assertIn(added.status, (200, 201), added.data)
+                token = self.login('member-' + role, 'member-password-1')[0]
+                for path in ('/v1/projects/%s/agents/%s/history' % (self.beta, self.agent_id),
+                             '/v1/projects/%s/audit' % self.beta):
+                    got = self.request('GET', path, token=token)
+                    self.assertIn(got.status, (403, 404), (role, path, got.data))
+                    body = json.dumps(got.data)
+                    for secret in (self.agent_id, 'Kestrel', self.first_credential, 'credential revoked'):
+                        self.assertNotIn(secret, body, (role, path))
+
     def test_without_a_recorded_grant_the_project_sees_none_of_its_history(self):
         self.revoke(self.first_credential)
         self.give_beta()
