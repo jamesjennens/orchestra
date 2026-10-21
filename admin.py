@@ -7081,8 +7081,9 @@ AUTHORIZED_KEY_TYPES=('ssh-ed25519','ssh-rsa','ecdsa-sha2-nistp256','ecdsa-sha2-
 # `restrict` comes first: OpenSSH documents it as switching off pty, port forwarding, agent
 # forwarding, X11 forwarding *and* the user rc file (~/.ssh/rc), so a capability OpenSSH adds
 # later is off for this key by default rather than granted until someone edits this list. The
-# four explicit options follow so a stock sshd that predates `restrict` still gets them, and
-# so a reader sees exactly what the entry closes.
+# explicit no-* options are redundant with `restrict`; keep them so a reader can see exactly
+# what the entry closes. An sshd too old to recognize `restrict` refuses the entire key line;
+# these options are not a compatibility fallback.
 CONTRIBUTOR_KEY_OPTIONS=('restrict','no-pty','no-port-forwarding','no-agent-forwarding',
                          'no-X11-forwarding')
 # The character class --root, the kit directory and --python must all satisfy: sshd hands
@@ -7156,13 +7157,36 @@ def _authorized_key_python(value):
 
     The same character class as --root and the kit directory. sshd hands `command=` to the
     account shell, so `--python '$(touch${IFS}/tmp/canary)python3'` would run the substitution
-    on every connection; a value outside this class is refused rather than printed.
+    on every connection; a value outside this class is refused rather than printed. The
+    authorized-keys command separately verifies absolute paths; bare names stay unresolved
+    until the server account shell resolves them through PATH at connection time.
     """
     text=str(value)
     if not AUTHORIZED_KEY_PYTHON.fullmatch(text):
         raise ValueError('--python must be one interpreter name or absolute path using only '
                          'letters, digits, dot, underscore, dash and slash, to be usable '
                          'inside an authorized_keys command=')
+    return text
+
+AUTHORIZED_KEY_PYTHON_REFUSAL='--python path must be an executable Python 3.10+ interpreter.'
+
+def _verified_authorized_key_python(value):
+    text=_authorized_key_python(value)
+    if not text.startswith('/'):
+        return text
+    if not os.path.isfile(text) or not os.access(text,os.X_OK):
+        raise ValueError(AUTHORIZED_KEY_PYTHON_REFUSAL)
+    try:
+        result=subprocess.run(
+            [text,'-c','import sys; print("%d.%d" % (sys.version_info[0], sys.version_info[1]))'],
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
+            text=True,timeout=3,check=False)
+    except (OSError,subprocess.SubprocessError,UnicodeError):
+        raise ValueError(AUTHORIZED_KEY_PYTHON_REFUSAL) from None
+    output=result.stdout if isinstance(result.stdout,str) else ''
+    version=re.fullmatch(r'(\d+)\.(\d+)\s*',output) if len(output)<=32 else None
+    if result.returncode!=0 or version is None or tuple(map(int,version.groups()))<(3,10):
+        raise ValueError(AUTHORIZED_KEY_PYTHON_REFUSAL)
     return text
 
 def _authorized_key_comment(comment):
@@ -7842,6 +7866,7 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
     if (projects or principal is not None) and role=='operator':
         raise ValueError('--project and --principal bind the confined contributor line; an unrestricted operator '
                          'key has a shell and cannot be bound to projects or to a principal')
+    python=_verified_authorized_key_python(default_authorized_key_python() if python is None else python)
     if role in ('contributor','both') and (not projects or principal is None) and bound_keys_only(root):
         # This installation set `bound-keys-only`: the forced command refuses such a line, so
         # printing it would hand the operator a line that cannot work (kittrial-5bb.196).
@@ -7873,7 +7898,10 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
                       'The endpoint in the contributor line goes through the installation\'s '
                       'install/current link where it has one. Put that exact path in the contributor\'s '
                       'client config: the wrapper compares it as one token, and a releases/<ID> spelling '
-                      'would keep that key on the release that printed it.']}
+                      'would keep that key on the release that printed it.',
+                      'A bare --python name is left unchanged and resolved through the server account\'s '
+                      'PATH when SSH starts the forced command; use an absolute path to verify the '
+                      'interpreter while printing the line.']}
     if projects or principal is not None:
         # Rules 1 and 2 of docs/COORDINATORS_PER_PROJECT_DESIGN.md. Only the bound line is
         # printed: the operator line is a shell, and a shell is every project.
@@ -10085,7 +10113,10 @@ def main():
     a.add_argument('--key-file',required=True,help='a file holding one plain OpenSSH public key line')
     a.add_argument('--role',choices=['contributor','operator','both'],default='both',
                    help='which line(s) to print (default: both, for different keys)')
-    a.add_argument('--python',default=None,help='interpreter in the contributor forced command (default: this interpreter, or /usr/bin/python3)')
+    a.add_argument('--python',default=None,
+                   help='interpreter in the contributor forced command (absolute paths are checked for '
+                        'executable Python 3.10+; a bare name is resolved through the server account PATH '
+                        'at connection time; default: this interpreter, or /usr/bin/python3)')
     a.add_argument('--comment',default=None,help='replace the key line comment')
     a.add_argument('--project',action='append',default=None,metavar='NAME',
                    help='bind the contributor line to this project (repeatable): the endpoint then refuses every '
@@ -11437,16 +11468,19 @@ def kit_refusal(error):
 def run_main():
     """``main()`` with the command-line exits: a failure is one line, never a traceback.
 
-    A refusal (``ValueError``) ends with the same last line a traceback would have,
-    ``ValueError: <message>``, so anything that reads that line is unaffected. Only the
-    kit's own refusals are shortened (``kit_refusal``): any other error, including a
-    ``ValueError`` subclass from the standard library such as ``JSONDecodeError``, keeps
-    its traceback, because the traceback is the only thing that says where it came from.
+    Kit refusals keep the ``ValueError: `` prefix; concrete kit exception names follow it,
+    except for ``ConfigurationUnreadable`` whose existing one-line text is a compatibility
+    contract. Embedded line breaks are escaped. Only the kit's own refusals are shortened
+    (``kit_refusal``): any other error, including a ``ValueError`` subclass from the
+    standard library such as ``JSONDecodeError``, keeps its traceback, because the traceback
+    is the only thing that says where it came from.
     """
     try: main()
     except ValueError as e:
         if not kit_refusal(e):raise
-        raise SystemExit('ValueError: %s'%e)
+        message=str(e).replace('\r','\\r').replace('\n','\\n')
+        class_name = '' if type(e) in (ValueError, ConfigurationUnreadable) else type(e).__name__ + ': '
+        raise SystemExit('ValueError: %s%s'%(class_name,message))
     except subprocess.CalledProcessError as e:
         # Never echo credential-bearing command input or the environment.
         raise SystemExit(f'Command failed ({e.returncode}): {e.stderr[:2000]}')
