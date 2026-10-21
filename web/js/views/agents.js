@@ -57,8 +57,16 @@ export function resumePrompt(agent) {
 
 // Only the agent's owner (or a superuser) may set up its folder or issue it a secret;
 // the server enforces the same rule (a non-owner gets 404 from /v1/agents/{id}).
+function ownerId(raw) {
+  return raw.owner || raw.owner_id || raw.agent_of;
+}
+
+function ownedBy(ctx, raw) {
+  return Boolean(ctx.me && ownerId(raw) === ctx.me.id);
+}
+
 function manages(ctx, raw) {
-  const owner = raw.owner || raw.owner_id || raw.agent_of;
+  const owner = ownerId(raw);
   return Boolean(ctx.me && (ctx.me.superuser || owner === ctx.me.id));
 }
 
@@ -204,20 +212,36 @@ export async function list(ctx) {
   // whole change or none of it, and refuses a project the agent's owner cannot open.
   function editProjects(agent) {
     const granted = new Set((agent.projects || []).map((p) => (typeof p === 'string' ? p : p.id)));
-    const choices = grantable();
+    // For an agent this viewer does not own, the list is the OWNER's, not the viewer's
+    // (kittrial-5bb.355): the server sends the projects the owner may be granted,
+    // limited to the projects this viewer can already see. The rest are listed greyed
+    // with the move that fixes it. An older service sends none: keep the old list.
+    const ownerProjects = !ownedBy(ctx, agent) && Array.isArray(agent.owner_grantable_projects)
+      ? new Set(agent.owner_grantable_projects) : null;
+    const choices = ownerProjects ? grantable().filter((p) => ownerProjects.has(p.id)) : grantable();
+    const blocked = ownerProjects ? grantable().filter((p) => !ownerProjects.has(p.id)) : [];
+    const ownerName = agent.owner_display_name || ownerId(agent);
     const details = h('details', { class: 'deliver', open: granted.size ? null : true });
     const form = h('form', { class: 'form', novalidate: true },
       h('fieldset', { class: 'checks' }, h('legend', null, 'Projects it can work on'),
         choices.length ? choices.map((p) => h('label', { class: 'check', for: `gp-${agent.id}-${p.id}` },
           h('input', { type: 'checkbox', id: `gp-${agent.id}-${p.id}`, name: 'project', value: p.id, checked: granted.has(p.id) ? true : null }), p.name)) :
-          h('p', { class: 'small muted' }, 'You need contributor access to a project first.')),
+          (blocked.length ? null : h('p', { class: 'small muted' }, 'You need contributor access to a project first.')),
+        blocked.map((p) => h('label', { class: 'check muted', 'data-owner-not-member': p.id },
+          h('input', { type: 'checkbox', disabled: true, 'aria-label': `${p.name} (not available to ${ownerName})` }),
+          h('span', null, `${ownerName} is not a member of ${p.name}: `,
+            ctx.me && (ctx.me.superuser || p.role === 'owner')
+              ? h('a', { href: ctx.href(`/p/${p.id}/settings`) }, "add them under the project's Members first")
+              : "add them under the project's Members first")))),
       h('div', null, h('button', { type: 'submit' }, 'Save projects')));
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      // Keep grants this page cannot show (e.g. a project hidden from this list).
-      const shown = new Set(choices.map((p) => p.id));
+      // Keep grants this page cannot show (e.g. a project hidden from this list). A
+      // blocked project that is already granted drops out: the server would refuse the
+      // whole change if the page sent that grant again.
+      const shown = new Set(choices.concat(blocked).map((p) => p.id));
       const chosen = [...granted].filter((id) => !shown.has(id))
-        .concat([...form.querySelectorAll('input[name=project]:checked')].map((i) => i.value));
+        .concat([...form.querySelectorAll('input[name=project]')].filter((i) => i.checked && !i.disabled).map((i) => i.value));
       const saved = await act(form.querySelector('button'), () => ctx.api.updateAgent(agent.id, { projects: chosen }), { success: 'Projects saved' }).catch(() => null);
       if (saved) load();
     });

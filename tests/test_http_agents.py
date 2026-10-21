@@ -665,6 +665,163 @@ class AgentUpdateAtomicityTests(AgentHarness):
         self.assertEqual([], after['projects'])
 
 
+class AgentOwnerProjectsTests(AgentHarness):
+    """kittrial-5bb.355: the agents page and another account's agent.
+
+    An administrator editing somebody else's agent was offered the projects the VIEWER
+    could see, so a project the agent's owner could not be granted was still tickable,
+    and the refusal read as if the project did not exist. The gate is unchanged: a grant
+    may only name a project the owner is a member of. What changed is that the page is
+    told which projects the owner may be granted (only among projects the viewer can
+    already see) and greys the rest, and that a caller who CAN see the project is told
+    why instead of the plain not-found sentence.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.alex_id = self.create_account(self.admin, 'alex', 'alex-password-1')
+        self.blair_id = self.create_account(self.admin, 'blair', 'blair-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+        self.blair = self.login('blair', 'blair-password-1')[0]
+        self.alpha = self.create_project(self.alex, 'Alpha')     # alex owns it
+        self.beta = self.create_project(self.alex, 'Beta')
+        self.gamma = self.create_project(self.admin, 'Gamma')    # alex is not a member
+        # Blair sees Alpha only, so a per-viewer answer about Alex's memberships can be
+        # checked against a real reader who cannot see one of Alex's projects.
+        self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s'
+                                          % (self.alpha, self.blair_id),
+                                          {'role': 'contributor'}, token=self.alex).status)
+        self.agent_id, self.secret, _ = self.agent_secret(
+            self.alex, name='Kestrel', projects=[self.alpha, self.beta])
+
+    def principal(self, token):
+        return self.service.authenticate(token)
+
+    def stored_projects(self):
+        return self.service.state['agents'][self.agent_id]['projects']
+
+    def test_a_caller_who_cannot_see_the_project_keeps_the_plain_404(self):
+        """Alex is the agent's owner and cannot see Gamma, so nothing about it is said."""
+        before = self.stored_projects()
+        refused = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                               {'projects': [self.gamma]}, token=self.alex)
+        self.assertEqual(404, refused.status, refused.data)
+        self.assertEqual(('not_found', 'Project not found'),
+                         (refused.data['error']['code'], refused.data['error']['message']))
+        self.assertNotIn('member', refused.data['error']['message'].lower())
+        self.assertEqual(before, self.stored_projects())
+        with self.assertRaises(http_auth.HttpError) as caught:
+            self.service.check_agent_grant(self.principal(self.alex), [self.gamma],
+                                           owner_id=self.alex_id)
+        self.assertEqual((404, 'Project not found'),
+                         (caught.exception.status, caught.exception.message))
+
+    def test_a_caller_who_can_see_it_is_told_the_owner_is_not_a_member(self):
+        """The gate still refuses; a superuser who can see Gamma is told why, then how."""
+        sentence = ("alex is not a member of Gamma: add them under the project's Members first")
+        with self.assertRaises(http_auth.HttpError) as caught:
+            self.service.check_agent_grant(self.principal(self.admin), [self.gamma],
+                                           owner_id=self.alex_id)
+        self.assertEqual((404, sentence), (caught.exception.status, caught.exception.message))
+        refused = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                               {'projects': [self.gamma]}, token=self.admin)
+        self.assertEqual(404, refused.status, refused.data)
+        self.assertEqual(sentence, refused.data['error']['message'])
+        self.assertEqual([self.alpha, self.beta], self.stored_projects())
+        # Adding the owner under the project's Members first makes the same grant work.
+        added = self.request('PUT', '/v1/projects/%s/members/%s'
+                             % (self.gamma, self.alex_id),
+                             {'role': 'contributor'}, token=self.admin)
+        self.assertEqual(200, added.status, added.data)
+        granted = self.request('PATCH', '/v1/agents/%s' % self.agent_id,
+                               {'projects': [self.alpha, self.beta, self.gamma]},
+                               token=self.admin)
+        self.assertEqual(200, granted.status, granted.data)
+        self.assertEqual([self.alpha, self.beta, self.gamma], granted.data['projects'])
+        self.assertEqual(granted.data['projects'], self.stored_projects())
+
+    def test_the_owner_projects_are_limited_to_what_the_reader_can_see(self):
+        """The view says which projects the OWNER may be granted, never naming an unseen one."""
+        mine = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.alex).data
+        self.assertEqual(sorted([self.alpha, self.beta]), mine['owner_grantable_projects'])
+        admin = self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.admin).data
+        self.assertEqual(sorted([self.alpha, self.beta]), admin['owner_grantable_projects'])
+        # Blair can see Alpha, never Beta or Gamma. The same view built for Blair may name
+        # Alpha only: the answer is intersected with what the reader can already see.
+        guessed = self.service.agent_view(self.service.state['agents'][self.agent_id],
+                                          self.principal(self.blair))
+        self.assertEqual([self.alpha], guessed['owner_grantable_projects'])
+        # The route itself does not serve Blair the agent at all.
+        self.assertEqual(404, self.request('GET', '/v1/agents/%s' % self.agent_id,
+                                           token=self.blair).status)
+
+
+class AgentProjectsPageTests(AgentHarness):
+    """kittrial-5bb.355 through the Agents page under Node: the administrator sees the
+    project the owner cannot be granted greyed with the sentence and the Members link,
+    and granting works once the owner is added; the owner's own page never sees it."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.admin_token()
+        self.alex_id = self.create_account(self.admin, 'alex', 'alex-password-1')
+        self.alex = self.login('alex', 'alex-password-1')[0]
+        self.alpha = self.create_project(self.admin, 'Alpha')
+        self.beta = self.create_project(self.admin, 'Beta')      # alex is not a member
+        added = self.request('PUT', '/v1/projects/%s/members/%s'
+                             % (self.alpha, self.alex_id),
+                             {'role': 'contributor'}, token=self.admin)
+        self.assertEqual(200, added.status, added.data)
+        self.agent_id, self.secret, _ = self.agent_secret(
+            self.alex, name='Kestrel', projects=[self.alpha])
+
+    def test_the_page_of_an_administrator_greys_the_rest_and_grants_after_the_owner_is_added(self):
+        node = shutil.which('node')
+        if not node:
+            print('NOTE: AgentProjectsPageTests.test_the_page_of_an_administrator_greys_the_rest_and_grants_after_the_owner_is_added '
+                  'was SKIPPED: node is not installed, so web/js/views/agents.js was not run on this platform.', file=sys.stderr)
+            self.skipTest('node is not installed; the agents page is not run here')
+        from test_http_web import run_node_module
+        web = ROOT / 'web' / 'js'
+        done = run_node_module(
+            self, node, 'await import(process.argv[1])',
+            (ROOT / 'tests' / 'web_agent_projects.mjs').as_uri(),
+            (ROOT / 'tests' / 'web_dom_shim.mjs').as_uri(), (web / 'api.js').as_uri(),
+            (web / 'views' / 'agents.js').as_uri(), 'http://127.0.0.1:%d' % self.port,
+            self.alpha, self.beta, self.agent_id,
+            'alex=%s=%s' % (self.alex_id, self.alex),
+            'admin=%s=%s' % (self.admin_user['id'], self.admin))
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+        # 1. The administrator's page: Alpha offered; Beta greyed with the sentence and a
+        #    link to its Members panel.
+        before = seen['adminBefore']
+        self.assertEqual([[self.alpha, True, False]], before['tickable'])
+        self.assertEqual(1, len(before['blocked']))
+        blocked = before['blocked'][0]
+        self.assertEqual(self.beta, blocked['id'])
+        self.assertTrue(blocked['disabled'])
+        self.assertEqual("alex is not a member of Beta: add them under the project's Members first",
+                         blocked['text'])
+        self.assertEqual(['#/p/%s/settings' % self.beta], blocked['links'])
+        self.assertEqual([self.alpha], before['ownerGrantable'])
+        # 2. The owner's own page knows nothing of Beta (it is not the owner's project).
+        owner = seen['ownerBefore']
+        self.assertEqual([[self.alpha, True, False]], owner['tickable'])
+        self.assertEqual([], owner['blocked'])
+        self.assertEqual([self.alpha], owner['ownerGrantable'])
+        self.assertFalse(owner['namesBeta'])
+        # 3. Add the owner to Beta, reopen the page, and Beta becomes tickable; saving it
+        #    sends and stores both projects (the rule is unchanged and now satisfied).
+        self.assertEqual(200, seen['addedMember'])
+        after = seen['adminAfter']
+        self.assertEqual([[self.alpha, True, False], [self.beta, False, False]], after['tickable'])
+        self.assertEqual([], after['blocked'])
+        self.assertEqual([self.alpha, self.beta], seen['savedProjects'])
+        self.assertEqual([{'projects': [self.alpha, self.beta]}], seen['patch'])
+
+
 class ProjectOwnerAgentTests(AgentHarness):
     """Owner decision 4: a project owner/admin sees and revokes agents in it.
 
