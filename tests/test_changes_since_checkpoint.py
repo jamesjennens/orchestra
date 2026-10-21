@@ -520,10 +520,23 @@ class TheHistoryReadIsBoundedCase(unittest.TestCase):
         runner = NativeRunner(lambda command: '', bounded=bounded)
         with self.assertRaises(field_history.TooLarge):
             runner.bounded(field_history.command(TASK), field_history.HISTORY_MAX_BYTES)
-        # The bounded read is for reads only: a write is refused before it runs.
-        with self.assertRaises(ValueError):
-            runner.bounded(['update', TASK, '--title', 'x'], 1024)
+        # The bounded read is for reads only: a write is refused before anything runs.
+        called = []
+        recording = NativeRunner(lambda command: '', bounded=lambda command, cap: called.append(command))
+        with self.assertRaises(ValueError) as refused:
+            recording.bounded(['update', TASK, '--title', 'x'], 1024)
+        self.assertNotIsInstance(refused.exception, field_history.TooLarge)
+        self.assertIn('cannot run a write', str(refused.exception))
+        self.assertEqual([], called)
+        self.assertFalse(recording.attempted_write)
         self.assertIsNone(NativeRunner(lambda command: '').bounded)
+
+    def test_the_cap_is_256_kib_and_the_docs_say_so(self):
+        self.assertEqual(256 * 1024, field_history.HISTORY_MAX_BYTES)
+        self.assertEqual(5, field_history.RETRY_LIMIT)
+        docs = (Path(__file__).resolve().parents[1] / 'docs' / 'BRIEFINGS.md').read_text(encoding='utf-8')
+        self.assertIn('The read stops at 256 KiB of bd\'s answer', docs)
+        self.assertIn('newest 5 commits', docs)
 
     def brief_through_execute(self, runner):
         """brief as the endpoint runs it (briefing.execute), with a stale checkpoint."""
@@ -609,6 +622,16 @@ class TheHistoryReadIsBoundedCase(unittest.TestCase):
         # The oldest of the counted ones went; the newest stayed.
         self.assertNotIn('history-0000.json', names)
         self.assertIn('history-%04d.json' % (read_cache.HISTORY_KEEP + 4), names)
+
+    def test_an_aged_history_file_is_pruned_even_when_few_files_exist(self):
+        import time
+        home, project, cache = self.cache_dir()
+        old = time.time() - read_cache.HISTORY_MAX_AGE - 60
+        (cache / 'history-aged.json').write_text('x', encoding='utf-8')
+        os.utime(cache / 'history-aged.json', (old, old))
+        (cache / 'history-recent.json').write_text('x', encoding='utf-8')
+        read_cache._prune_history(cache)
+        self.assertEqual(['history-recent.json'], sorted(p.name for p in cache.iterdir()))
 
     @unittest.skipIf(os.name == 'nt', 'symlinks need privileges on Windows')
     def test_pruning_removes_a_planted_link_without_following_it(self):
