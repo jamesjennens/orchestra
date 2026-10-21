@@ -517,6 +517,45 @@ class InProcessBackend:
         """
         return None
 
+    #: The per-project claiming setting (kittrial-5bb.352) this backend remembers in
+    #: its canonical state when it has no host project directory. Absent means open.
+    CLAIMING_DEFAULT = {'claiming': 'open', 'set_by': None, 'set_at': None,
+                        'set_via': None, 'previous': None, 'history': [],
+                        'source': 'default'}
+
+    def claiming_state(self, project_id):
+        values = self.state.get('claiming')
+        entry = values.get(project_id) if isinstance(values, dict) else None
+        if not isinstance(entry, dict) or entry.get('claiming') not in ('open', 'assigned'):
+            return dict(self.CLAIMING_DEFAULT)
+        result = {key: entry.get(key) for key in
+                  ('claiming', 'set_by', 'set_at', 'set_via', 'previous', 'history')}
+        result['source'] = 'record'
+        return result
+
+    def set_claiming(self, project_id, value, actor, via='web'):
+        if value not in ('open', 'assigned'):
+            raise ValueError("The claiming setting must be 'open' or 'assigned'")
+        current = self.claiming_state(project_id)
+        previous = None
+        history = list(current.get('history') or [])
+        if current.get('source') == 'record':
+            previous = {key: current.get(key) for key in
+                        ('claiming', 'set_by', 'set_at', 'set_via')}
+            history.append(previous)
+        import datetime
+        record = {'claiming': value, 'set_by': actor, 'set_via': via,
+                  'set_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                  'previous': previous, 'history': history[-20:]}
+        values = self.state.setdefault('claiming', {})
+        if not isinstance(values, dict):
+            values = self.state['claiming'] = {}
+        values[project_id] = record
+        result = {key: record.get(key) for key in
+                  ('claiming', 'set_by', 'set_at', 'set_via', 'previous', 'history')}
+        result['source'] = 'record'
+        return result
+
     @property
     def state(self):
         return self.service.state['canonical']
@@ -1384,7 +1423,8 @@ class InProcessBackend:
                 attention=self._agent_fields(task, review),
                 recommended_by=[r['author'] for r in review['recommendations']],
                 contribution_author=(review['contribution'] or {}).get('author'),
-                claimable=claimable_task(task, review)))
+                claimable=claimable_task(task, review,
+                                          claiming=self.claiming_state(project_id)['claiming'])))
         items.sort(key=queue_order)
         return {'items': items, 'complete': True, 'warnings': []}
 
@@ -1526,7 +1566,7 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'contribution_author': contribution_author}
 
 
-def claimable_task(task, review):
+def claimable_task(task, review, claiming='open'):
     """One in-process task's bounded claimability, from the shared ``work.claimable``.
 
     The disposable backend knows each row's issue type directly; the canonical backend
@@ -1539,7 +1579,8 @@ def claimable_task(task, review):
                      (contribution or {}).get('id'),
                      review.get('state') if isinstance(review, dict) else None,
                      labels=task.get('labels'),
-                     open_dependencies=task.get('open_dependencies') or None)
+                     open_dependencies=task.get('open_dependencies') or None,
+                     claiming=claiming)
 
 
 def attention_blocking_items(fields):
@@ -3368,6 +3409,26 @@ class EndpointBackend:
         project_path = Path(self.root) / 'projects' / project_id
         return guidance_module.brief_block(project_path, actor)
 
+    def claiming_state(self, project_id):
+        """The project's claiming setting, read FRESH from its directory (kittrial-5bb.352).
+
+        It lives outside the tracker, so the tracker's read cache (keyed on the dolt
+        commit) must never be used for it: every listing and every claim gate reads the
+        file again. An absent file is open; a damaged one reads as the restrictive
+        'assigned' with a warning, never as the permissive default.
+        """
+        import claiming as claiming_module
+        return claiming_module.read(Path(self.root) / 'projects' / project_id)
+
+    def set_claiming(self, project_id, value, actor, via='web'):
+        """Record the setting under the project's coordination lock (kittrial-5bb.352)."""
+        import fcntl
+        import claiming as claiming_module
+        project_path = Path(self.root) / 'projects' / project_id
+        with (project_path / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return claiming_module.write(project_path, value, actor, via=via)
+
     #: How long the host's session names of one project are reused (kittrial-5bb.198). A task
     #: list names its assignees on every read, and a session registered just now may show by
     #: its id for this long.
@@ -3780,7 +3841,7 @@ def _canonical_payload(stdout):
 REQUIREMENT_DECISION_LABEL = 'owner-requirement-decision:'
 
 
-def next_action(task):
+def next_action(task, claiming='open'):
     """Who acts next on a task, derived only from its status, assignee and review state."""
     state = task.get('review_state')
     from review_state import active_work
@@ -3814,9 +3875,12 @@ def next_action(task):
     open_deps = task.get('open_dependencies') or []
     if not claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
                      task.get('contribution_id'), state, labels=task.get('labels'),
-                     open_dependencies=open_deps):
+                     open_dependencies=open_deps, claiming=claiming):
         if open_deps:
             return {'who': 'owner', 'text': open_dependency_sentence(open_deps) or 'Blocked'}
+        if str(claiming or 'open') == 'assigned' and not task.get('assignee'):
+            from claiming import EMPTY_SENTENCE
+            return {'who': 'coordinator', 'text': EMPTY_SENTENCE}
         if requirement_record(task.get('labels')):
             return {'who': 'owner',
                     'text': "Requirement record: edit it on the project's Requirements page"}
@@ -4566,6 +4630,27 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _project(self, ctx, capability=CAP_READ):
         return self.service.check_authority(ctx.principal, ctx.params['pid'], capability)
 
+    #: What an answer is when a backend (a test double from an older slice) has no
+    #: claiming setting: absent means open, today's behaviour.
+    CLAIMING_DEFAULT = {'claiming': 'open', 'set_by': None, 'set_at': None,
+                        'set_via': None, 'previous': None, 'history': [],
+                        'source': 'default'}
+
+    def _claiming_state(self, project_id):
+        """The project's claiming setting from the backend, or the open default.
+
+        Both shipped backends implement ``claiming_state`` (kittrial-5bb.352); a backend
+        double that predates it keeps answering as an open project rather than failing
+        a listing, exactly as a project with no file reads.
+        """
+        read = getattr(self.backend, 'claiming_state', None)
+        if read is None:
+            return dict(self.CLAIMING_DEFAULT)
+        return read(project_id)
+
+    def _claiming_mode(self, project_id):
+        return self._claiming_state(project_id)['claiming']
+
     def _task_payload(self, ctx):
         payload = dict(ctx.payload or {})
         payload['task_id'] = ctx.params['tid']
@@ -4674,7 +4759,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         body.update(extra)
         return body
 
-    def _task_view(self, task, names, tasks=None):
+    def _task_view(self, task, names, tasks=None, project_id=None, claiming=None):
         """A task row plus presentation fields (assignee name, next action, requirement
         marker and claimability). Additive: every field a route already returned stays.
 
@@ -4684,12 +4769,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         tasks list cannot disagree with the queue about what is claimable work
         (kittrial-5bb.277). The list route feeds its rows through here, so a web Tasks
         page can mark a requirement record plainly instead of offering it as a task.
+
+        ``claiming`` is the project's claiming setting (kittrial-5bb.352), read fresh
+        when the caller does not pass it; under ``assigned`` an unassigned row is not
+        claimable and its next action names the coordinators instead of inviting a claim.
         """
         from work import claimable, requirement_record
+        if claiming is None:
+            claiming = (self._claiming_mode(project_id)
+                        if project_id else 'open')
         view = dict(task)
         assignee = view.get('assignee')
         view['assignee_name'] = names.get(assignee, assignee) if assignee else None
-        view['next_action'] = next_action(view)
+        view['next_action'] = next_action(view, claiming=claiming)
         view['requirement_record'] = requirement_record(view.get('labels'))
         from work import dependency_index, open_dependency_ids
         # A list view passes its snapshot; a single-task view passes none, and the
@@ -4701,12 +4793,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['claimable'] = claimable(view.get('issue_type'), view.get('status'), assignee,
                                       view.get('contribution_id'), view.get('review_state'),
                                       labels=view.get('labels'),
-                                      open_dependencies=view['open_dependencies'] or None)
+                                      open_dependencies=view['open_dependencies'] or None,
+                                      claiming=claiming)
         return view
 
     def _task_views(self, tasks, project_id=None):
         names = self._actor_names([t.get('assignee') for t in tasks], project_id)
-        return [self._task_view(t, names, tasks=tasks) for t in tasks]
+        claiming = (self._claiming_mode(project_id)
+                    if project_id else 'open')
+        return [self._task_view(t, names, tasks=tasks, claiming=claiming) for t in tasks]
 
     def _actor_names(self, actors, project_id=None):
         """Display names, as :meth:`Service.actor_names` gives them, and a host session's too.
@@ -5898,7 +5993,40 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')')
     def project_get(self, ctx):
         self._project(ctx, CAP_READ)
-        return 200, self._usable(self.service.project_view(ctx.principal, ctx.params['pid']))
+        result = self._usable(self.service.project_view(ctx.principal, ctx.params['pid']))
+        # The per-project claiming setting (kittrial-5bb.352), read FRESH from the
+        # project's directory: it lives outside the tracker and is not cached. The
+        # Settings page also learns whether this caller may change it.
+        result['claiming'] = self._claiming_state(ctx.params['pid'])
+        result['can_coordinate'] = self._guidance_can_coordinate(ctx)
+        return 200, result
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/claiming')
+    def project_claiming(self, ctx):
+        """Set the project's claiming mode (kittrial-5bb.352).
+
+        Owners and coordinators (CAP_COORDINATE, which includes an owner and an agent
+        holding the coordinator grant) may set it; workers, reviewers and viewers may
+        not. The write records who set it, when and by which route, is audited, and is
+        carried by the coordination backup.
+        """
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'claiming'}:
+            raise invalid("Send exactly the field to change: claiming")
+        value = payload['claiming']
+        if value not in ('open', 'assigned'):
+            raise invalid("claiming must be 'open' or 'assigned'")
+        actor = self.service.bind_actor(ctx.principal, None)
+        write = getattr(self.backend, 'set_claiming', None)
+        if write is None:
+            raise not_implemented('This server cannot store the claiming setting')
+
+        def update():
+            result = write(ctx.params['pid'], value, actor, via='web')
+            return result, result
+        return self._mutate(ctx, 'projects.claiming', ctx.params['pid'], update,
+                            capability=CAP_COORDINATE,
+                            audit_metadata={'claiming': value})
 
     @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')')
     def project_update(self, ctx):
@@ -6397,9 +6525,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
         rows = []
+        #: The claiming setting of every project this read covered (kittrial-5bb.352
+        #: review item S1): the same fresh per-project read the endpoints and
+        #: /v1/agents/me/next use, so an empty wait under 'assigned' carries the
+        #: sentence saying who hands work out instead of looking idle.
+        claiming_modes = {}
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(ctx.principal, project_id):
                 continue
+            claiming_modes[project_id] = self._claiming_mode(project_id)
             # The guidance acknowledgement is a move row too (kittrial-5bb.325), so a web
             # agent's wait wakes for a new version and its fingerprint changes with it;
             # the row is the same one /v1/agents/me/next shows as its first next_action.
@@ -6426,7 +6560,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if move == 'you':
                     rows.append(dict(task, task=task.get('id'), project=project_id,
                                      whose_move=move, next_actor=next_actor_value))
-        view = waiting.worker_view(rows)
+        # The project's claiming setting on the wait read (kittrial-5bb.352 review item
+        # S1). The wait can span projects, so report one mode only when they agree;
+        # under any 'assigned' project an empty wait carries the empty-list sentence,
+        # exactly as the agent next/attention loop decides it.
+        modes = set(claiming_modes.values())
+        claiming = (next(iter(modes)) if len(modes) == 1
+                    else ('assigned' if 'assigned' in modes else None))
+        empty_message = None
+        if not rows and 'assigned' in modes:
+            from claiming import EMPTY_SENTENCE
+            empty_message = EMPTY_SENTENCE
+        view = waiting.worker_view(rows, claiming=claiming, empty_message=empty_message)
         view['agent'] = agent.get('id')
         view['generated_at'] = now_iso(self.service._now())
         view['manual_cadence'] = ('Read this route again to see a change; it never blocks, '
@@ -7221,9 +7366,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         review_actions = []
         truncated = False
         snapshot_truncated = own_tasks_truncated = actions_truncated = False
+        claiming_modes = {}
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(principal, project_id):
                 continue
+            # The per-project claiming setting (kittrial-5bb.352), read FRESH here (it
+            # lives outside the tracker, so the tracker read cache would not see it) and
+            # used by every claimability answer and next-action sentence below.
+            claiming_mode = self._claiming_mode(project_id)
+            claiming_modes[project_id] = claiming_mode
             # The guidance acknowledgement (kittrial-5bb.325) is this agent's own move in
             # every project it may read: one row per project whose current version this
             # actor has not acknowledged. No guidance set means no row, and no row while
@@ -7340,8 +7491,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                         'Approved; waiting for the coordinator to integrate it. Nothing for the agent to do.',
                         **details))
                 elif is_open or review in ACTIVE_REVIEW_STATES:
-                    action = (next_action(task) if review in ('withdrawn', 'superseded', 'integrated',
-                                                             'legacy-review-ready') else None)
+                    action = (next_action(task, claiming=claiming_mode)
+                              if review in ('withdrawn', 'superseded', 'integrated',
+                                            'legacy-review-ready') else None)
                     action = action or {'who': 'owner', 'text': 'Check the task and its review history'}
                     own_actions.append(self._agent_action(
                         5, 'review-state', project_id, task,
@@ -7411,13 +7563,24 @@ class ApiHandler(BaseHTTPRequestHandler):
             # next and no run prompt is guaranteed to run `guidance get` (kittrial-5bb.325).
             summary = ('The project guidance changed since this agent last acknowledged it; read it and '
                        'record the read before other work. ' + summary)
-        return {'state': state, 'summary': summary,
-                'counts': counts, 'claim_limit_held': claim_held,
-                'claim_limit_blocked': claim_blocked, 'actions': actions,
-                'truncated': truncated,
-                'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
-                'actions_truncated':actions_truncated,
-                'computed_at': now_iso(self.service._now())}
+        empty_message = None
+        if not actions and 'assigned' in claiming_modes.values():
+            from claiming import EMPTY_SENTENCE
+            empty_message = EMPTY_SENTENCE
+        result = {'state': state, 'summary': summary,
+                  'counts': counts, 'claim_limit_held': claim_held,
+                  'claim_limit_blocked': claim_blocked, 'actions': actions,
+                  'truncated': truncated,
+                  'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
+                  'actions_truncated':actions_truncated,
+                  'computed_at': now_iso(self.service._now())}
+        # The empty-list sentence (kittrial-5bb.352 adjustment 4): under 'assigned', an
+        # empty answer says who hands work out, so the Bridge's empty-list message can
+        # show it instead of "nothing to do".
+        if empty_message:
+            result['empty_message'] = empty_message
+        return result
+
     @staticmethod
     def _agent_summary(state, counts, snapshot_truncated=False, own_tasks_truncated=False):
         claimable = ('at least ' if snapshot_truncated else '') + str(counts.get('claimable', 0))
@@ -7502,9 +7665,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                          'snapshot_truncated': False, 'own_tasks_truncated': False,
                          'actions_truncated': False,
                          'computed_at': None}
-        return {key: attention[key] for key in
+        view = {key: attention[key] for key in
                 ('state', 'summary', 'counts', 'truncated', 'snapshot_truncated',
                  'own_tasks_truncated', 'actions_truncated', 'computed_at')}
+        # kittrial-5bb.352 review item S1: the empty-list sentence the attention read
+        # computed under 'assigned' must travel on the route, not be dropped here.
+        if attention.get('empty_message'):
+            view['empty_message'] = attention['empty_message']
+        return view
 
     def _agent_resume_prompt(self, agent, attention):
         """A copyable prompt for the owner's local assistant. No secret is included."""
@@ -9155,7 +9323,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         actors += [entry.get('author') for entry in advice]
         names = self._actor_names(actors, pid)
         task = dict(brief['task'], review_state=review.get('state') or 'none')
-        brief['task'] = self._task_view(task, names)
+        brief['task'] = self._task_view(task, names, project_id=ctx.params['pid'])
         if checkpoint:
             checkpoint['author_name'] = names.get(checkpoint.get('author'))
         if contribution:
@@ -9263,6 +9431,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload['actor'] = actor
 
         def claim():
+            # The per-project claiming setting (kittrial-5bb.352): under 'assigned' a
+            # claim of an UNASSIGNED task is refused with one sentence naming the
+            # setting. A task already assigned to the caller is not refused here: its
+            # holder may still start it, as before. Read FRESH: the setting lives
+            # outside the tracker, so the tracker cache must not answer for it. This is
+            # inside the mutation, after the idempotency reserve, so an exact retry
+            # replays its stored answer instead of being refused again.
+            if not (isinstance(task, dict) and task.get('assignee')):
+                if self._claiming_mode(ctx.params['pid']) == 'assigned':
+                    from claiming import CLAIM_REFUSAL
+                    raise conflict(CLAIM_REFUSAL)
             # The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276)
             # is judged here, before the write is sent, so one gate covers the web
             # page, orchestra-client.py and any other client of this route. It is

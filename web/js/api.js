@@ -372,6 +372,8 @@ export function createApi(transport) {
       expected_task ? { expected_holder, reason, expected_task } : { expected_holder, reason }),
     createMergeSlot: (pid) => mutate('POST', `/v1/projects/${pid}/merge-slot/create`, {}),
     setRepository: (pid, repository) => mutate('PATCH', `/v1/projects/${pid}`, { repository }),
+    // The per-project claiming setting (kittrial-5bb.352): owners and coordinators set it.
+    setProjectClaiming: (pid, claiming) => mutate('PUT', `/v1/projects/${pid}/claiming`, { claiming }),
     // Superuser only: the records this server will not serve, to confirm or archive.
     unconfirmedProjects: () => call('GET', '/v1/projects/unconfirmed'),
     confirmProject: (pid) => mutate('POST', `/v1/projects/${pid}/confirm`, {}),

@@ -125,6 +125,19 @@ contribution, and not an epic, decision, gate, job, record anchor, or a task car
 `decision` label. It is a suggestion, never a reservation. Not considered, and stated here
 rather than implied: open dependencies and parent tasks.
 
+**A project may turn claiming off.** Its `claiming` setting is either `open` (the
+default: any member who may write tasks can claim an open, unassigned task) or
+`assigned` (only the project's owners and coordinators hand work out). Under
+`assigned`, `work`, `work --claimable`, `ready`, `/v1/agents/me/next` and `wait` offer
+no unassigned task as claimable, and a claim of one is refused with one sentence naming
+the setting, on the host route and the HTTP route alike. A task already assigned to you
+can still be started by you, and release/give-back are unchanged. The setting is read
+fresh on every read (it lives outside the tracker), so a change shows on the next
+`work`/`next`/`wait` even when the tracker rows come from the read cache. An empty list
+then carries: "Only the project's coordinators assign work here; nothing is assigned to
+you yet." If you are not a coordinator, wait for an assignment rather than asking for
+the setting to be changed.
+
 ### 3. Only when none of its own tasks needs action: the ready list
 
 It claims **exactly one** task that nobody holds, registers its plan on the task, and

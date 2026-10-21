@@ -524,11 +524,22 @@ def movement(items):
                          if isinstance(item, dict) and item.get('whose_move') == 'you'])
 
 
-def worker_view(items):
-    """The worker form's answer: the rows whose move is the caller's plus a fingerprint."""
+def worker_view(items, claiming=None, empty_message=None):
+    """The worker form's answer: the rows whose move is the caller's plus a fingerprint.
+
+    ``claiming`` is the project's claiming setting this read used, and
+    ``empty_message`` the sentence an empty listing carries under ``assigned``
+    (kittrial-5bb.352). Both are additive: a reader that does not know them ignores
+    them, and a project with no project directory keeps exactly the old answer.
+    """
     rows = movement(items)
-    return {'schema': WAIT_SCHEMA, 'form': 'worker', 'items': rows,
+    view = {'schema': WAIT_SCHEMA, 'form': 'worker', 'items': rows,
             'fingerprint': digest(rows)}
+    if claiming:
+        view['claiming'] = claiming
+    if not rows and empty_message:
+        view['empty_message'] = empty_message
+    return view
 
 
 def _lane_row(lane, entry=None):
