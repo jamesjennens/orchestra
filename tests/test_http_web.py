@@ -1665,24 +1665,31 @@ class AgentSetupDialogCase(unittest.TestCase):
             self.assertNotIn('secret', built)
             self.assertNotIn('created', built)
             self.assertIn('payload', built)
-        # In the dialog the secret is only handed to secretSection(), the single place
-        # that renders one; everything else is built from the secretless payload.
+        # kittrial-5bb.348: in the dialog the secret is only kept as the state's secretValue, never
+        # stored and never handed anywhere but secretLinesBlock(), the single place that renders one,
+        # on the "Save your secret" screen; everything else is built from the secretless payload.
         uses = [line.strip() for line in dialog.splitlines()
-                if re.search(r'\bsecret\b', self.unquoted(line))]
+                if not line.strip().startswith('//') and re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertIn('function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {', code)
-        self.assertEqual(["secret ? secretSection(secret, 'Secret (shown once)', payload, { hasCertificate }) : "
-                          "reissueSection(ctx, source.agent || {}, payload, { hasCertificate })),"], uses)
-        section = self.function_body(code, 'secretSection')
-        self.assertIn("copyButton('Copy', secret", section)
-        self.assertIn("h('div', { class: 'secret' }, secret)", section)
-        # Step 1's body is the only other thing built from the secret, and only here.
-        self.assertIn('secretSteps(payload, secret, { withSecret: true, hasCertificate })', section)
-        self.assertEqual(1, code.count('secretSteps(payload, secret,'))
-        steps = self.function_body(code, 'secretSteps')
-        # secretSteps builds the pasted body from the value it is handed; it never
-        # reads a credential record or a .secret property (kittrial-5bb.275).
-        self.assertIsNone(re.search(r'\.secret\b|\.credential\b|\bcredential\.', self.unquoted(steps)))
-        self.assertNotIn('created', steps)
+        # (the second line is the screen's own name, the key of its builder, not the value)
+        self.assertEqual(['secretValue: secret,', 'secret: () => ['], uses)
+        # (the first line only opens the dialog on the screen that shows a fresh secret)
+        self.assertEqual(['if (state.secretValue) {', 'state.secretValue = value;', 'state.secretValue',
+                          '? secretLinesBlock(payload, state.secretValue, state.os)'],
+                         [line.strip() for line in dialog.splitlines() if 'secretValue' in line and not line.strip().startswith('//')
+                          and not line.strip().startswith('secretValue:')])
+        self.assertEqual(2, code.count('secretLinesBlock('))          # the definition and the one call
+        block = self.function_body(code, 'secretLinesBlock')
+        self.assertIn('setupText.credentialFileLines(address, fingerprint, secretValue)', block)
+        self.assertIn("copyButton('Copy', lines, { ariaLabel: 'Copy the credential file text with the secret'", block)
+        # It builds the lines from the value it is handed; it never reads a credential record or a
+        # .secret property (kittrial-5bb.275).
+        self.assertIsNone(re.search(r'\.secret\b|\.credential\b|\bcredential\.', self.unquoted(block)))
+        self.assertNotIn('created', block)
+        # The wizard's stored state holds no secret.
+        stored = self.function_body(code, 'writeWizardStorage')
+        self.assertIsNone(re.search(r'secret', self.unquoted(stored).replace("'Secretless:", '').split('//')[0], re.I))
+        self.assertNotIn('secretValue', stored)
 
     @staticmethod
     def unquoted(line):
@@ -1695,8 +1702,9 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertIn('ctx.api.agent(agentId)', reopen)
         self.assertIn('setupDialog(ctx, { agent }, { secret: null, certificate: await agentCertificate(ctx) })', reopen)
         self.assertIsNone(re.search(r'credential|\.secret\b', reopen))
-        # Losing the secret means issuing a NEW credential; only its fresh secret is shown.
-        reissue = self.function_body(code, 'reissueSection')
+        # Losing the secret means issuing a NEW credential; only its fresh secret is shown, on the
+        # "Save your secret" screen, at once (kittrial-5bb.348).
+        reissue = self.function_body(code, 'issueBlock')
         self.assertIn('ctx.api.issueAgentCredential(agent.id)', reissue)
         # The confirmation has nested template literals for inferred versus stored
         # scopes. The simple quoted-text stripper cannot parse those; check the
@@ -1708,13 +1716,16 @@ class AgentSetupDialogCase(unittest.TestCase):
         uses = [line.strip() for line in reissue.splitlines()
                 if not line.strip().startswith('body:')
                 and re.search(r'\bsecret\b', self.unquoted(line))]
-        self.assertEqual(['if (!credential.secret) {',
-                          "section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload, { hasCertificate }),"],
-                         uses)
-        # What the new credential carries is shown with it, and the confirmation says what a renewal keeps
-        # (kittrial-5bb.208: the page sends no scope list, and the server used to answer the default four).
-        self.assertIn("'data-scopes': (credential.scopes || []).join(' ')", reissue)
-        self.assertIn("'This credential carries' + (scopeList(credential.scopes) || ': nothing beyond reading') + '.'", reissue)
+        self.assertEqual(['if (!credential.secret) {', 'wizard.secretIssued(credential.secret, credential, agent);'], uses)
+        # An error is shown inside the wizard, never as a toast behind it.
+        self.assertIn("{ success: 'New secret issued', onError: wizard.showError }", reissue)
+        # Opened without a secret, the screen says why in one line, with the issue button right there.
+        self.assertIn("'The secret is shown only once, when it is issued; issue a new one to continue.'", reissue)
+        # What the new credential carries is shown with it (kittrial-5bb.208), and the confirmation
+        # says what a renewal keeps.
+        dialog = self.function_body(code, 'setupDialog')
+        self.assertIn("'data-scopes': ((state.issued.credential && state.issued.credential.scopes) || []).join(' ')", dialog)
+        self.assertIn("'This credential carries' + (scopeList(state.issued.credential && state.issued.credential.scopes) || ': nothing beyond reading') + '.'", dialog)
         self.assertIn('It carries what the agent has now${scopeList(agent.scopes)}.', reissue)
         # What the agent may do is on its card, and "What it may do" on the Agents page is the one place
         # that sends a list (the page is run in tests/test_http_agents.py AgentsPageTests).
@@ -1726,8 +1737,6 @@ class AgentSetupDialogCase(unittest.TestCase):
                       (WEB / 'js' / 'api.js').read_text(encoding='utf-8'))
         self.assertEqual(code.count('ctx.api.issueAgentCredential('), 2)
         self.assertIn('ctx.api.issueAgentCredential(agent.id, chosen)', code)
-        # Without a fresh secret the steps show the placeholder line only.
-        self.assertIn('secretSteps(payload, null, { withSecret: false, hasCertificate })', reissue)
         older = self.function_body(code, 'olderCredentials')
         self.assertIsNone(re.search(r'\bsecret\b', self.unquoted(older)))
         self.assertIn('ctx.api.revokeAgentCredential(agent.id, c.id)', older)
@@ -1743,21 +1752,23 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertIn("manages(ctx, raw) ? h('div'", card)
         self.assertIn('reopenSetup(ctx, raw.id', card)
 
-    def test_dialog_is_three_numbered_steps(self):
+    def test_the_wizard_is_one_action_per_screen_on_two_paths(self):
+        # kittrial-5bb.348 (James at the office): one action per screen; a computer with Orchestra
+        # Bridge 0.14 or later takes the short path, any other the longer one with the
+        # certificate, rewrite, self-check and save-files screens.
+        setup = self.code(self.SETUP_JS)
+        plan = self.function_body(setup, 'screenPlan')
+        self.assertIn("if (bridge) return ['system', 'role', 'secret', ...(posix ? ['restrict'] : []), 'vscode', 'resume'];", plan)
+        self.assertIn("return ['system', 'role', ...(hasCertificate ? ['cert-save', 'cert-move'] : []), 'secret',", plan)
         dialog = self.function_body(self.code(self.AGENTS_JS), 'setupDialog')
-        order = [dialog.index("step(1, 'Store the secret'"), dialog.index("step(2, 'Set up the folder'"),
-                 dialog.index("step(3, 'Start the agent'")]
-        self.assertEqual(sorted(order), order)
-        step3 = dialog[order[2]:]
-        self.assertIn("copyLine('Resume prompt:', resume", step3)
-        steps = self.function_body(self.code(self.AGENTS_JS), 'secretSteps')
-        for text in ('Open Notepad', 'Save as type', 'All files (*.*)', 'file.windows', 'file.posix',
-                     'test.posixChmod', 'test.powershell', 'test.posix', '.txt'):
-            self.assertIn(text, steps)
-        # kittrial-5bb.275: each curl error the person may see gets one line, and the
-        # certificate is saved BEFORE the test.
-        self.assertIn('Save the service’s certificate FIRST', steps)
-        self.assertIn("'data-curl-error': code", steps)
+        # Only the current screen is in the dialog: the screen node is replaced, not hidden.
+        self.assertIn('screenNode.replaceChildren(...screens[state.screen]()', dialog)
+        self.assertNotIn('.hidden = !active', dialog)
+        # The resume prompt is the last screen's one command.
+        self.assertIn("commandLine(setupText.resumePrompt(payload.name), 'resume prompt')", dialog)
+        # kittrial-5bb.275: each curl error the person may see gets one line (behind "More about this"
+        # on the test screen).
+        self.assertIn("'data-curl-error': code", dialog)
         agents = self.AGENTS_JS.read_text(encoding='utf-8')
         for line in ('curl exit 60', 'curl exit 35', 'curl exit 26', 'HTTP 401'):
             self.assertIn(line, agents)
@@ -1792,9 +1803,10 @@ class AgentSetupDialogCase(unittest.TestCase):
     def test_owner_facing_labels(self):
         agents = self.AGENTS_JS.read_text(encoding='utf-8')
         self.assertIn("export const SETUP_PROMPT_LABEL = 'Copy setup prompt (creates the files)';", agents)
-        self.assertIn('Set up the agent’s folder in one of two ways: Save to agent folder, or paste '
-                      'the setup prompt into the agent’s chat. Copy path is only for saving the '
-                      'files by hand.', agents)
+        # kittrial-5bb.348: one action per screen, each with a short title.
+        for title in ("system: 'Your computer'", "secret: 'Save your secret'", "files: 'Save the agent’s files'",
+                      "vscode: 'Set up in VS Code'", "resume: 'Start the agent'"):
+            self.assertIn(title, agents)
         self.assertIn("'Resume prompt (after setup)'", agents)
         self.assertIn("'Needs .orchestra/agent.json in the folder; use Set up folder first.'", agents)
         self.assertIn("}, 'Set up folder')", agents)
@@ -1858,8 +1870,8 @@ console.log(JSON.stringify({
   promptResumes: m.setupPrompt(p).includes('Read .orchestra/AGENT.md in this folder'),
   reopenedJson: JSON.parse(m.agentJson(reopened)),
   guideNamesFile: m.agentGuide(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc')
-    && m.agentGuide(p).includes('curl.exe -fsS -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" http://127.0.0.1:1/v1/')
-    && m.agentGuide(p).includes('curl -fsS -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/'),
+    && m.agentGuide(p).includes('curl.exe -fsS --noproxy 127.0.0.1 --max-time 60 -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" http://127.0.0.1:1/v1/')
+    && m.agentGuide(p).includes('curl -fsS --noproxy 127.0.0.1 --max-time 60 -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/'),
   promptNamesFile: m.setupPrompt(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'),
   placeholder: m.headerLine(), real: m.headerLine('S3'),
   tests: m.testCommands(p),
@@ -1887,7 +1899,7 @@ console.log(JSON.stringify({
     { certFile: m.certificateFile('Kestrel'), hasCertificate: true }).posix,
   testHasCacert: /--cacert/.test(m.testCommands(p).posix + m.testCommands(p).powershell),
   guideWithCert: m.agentGuide(p, { hasCertificate: true }),
-  guideWithCertIsKOnly: m.agentGuide(p, { hasCertificate: true }).includes('curl -fsS -K')
+  guideWithCertIsKOnly: m.agentGuide(p, { hasCertificate: true }).includes('curl -fsS --noproxy 127.0.0.1 --max-time 60 -K')
     && !/curl[^\\n]*--cacert/.test(m.agentGuide(p, { hasCertificate: true })),
   paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
           m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
@@ -1911,10 +1923,11 @@ console.log(JSON.stringify({
         self.assertEqual('header = "Authorization: Bearer <your secret>"', result['placeholder'])
         self.assertEqual('header = "Authorization: Bearer S3"', result['real'])
         self.assertEqual({
-            'powershell': 'curl.exe -fsS -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" '
+            # kittrial-5bb.348: past a command-line proxy for this host only, and never hanging.
+            'powershell': 'curl.exe -fsS --noproxy 127.0.0.1 --max-time 20 -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" '
                           'http://127.0.0.1:1/v1/agents/me',
             'posixChmod': 'chmod 600 ~/.orchestra-agent-kestrel.curlrc',
-            'posix': 'curl -fsS -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/agents/me'},
+            'posix': 'curl -fsS --noproxy 127.0.0.1 --max-time 20 -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/agents/me'},
             result['tests'])
         self.assertEqual([
             {'path': 'C:\\Users\\james\\zcode-x\\.orchestra\\agent.json', 'relative': False},
@@ -2058,8 +2071,9 @@ console.log(JSON.stringify({
         agents = self.AGENTS_JS.read_text(encoding='utf-8')
         for code in ('2', '60', '35', '26', '401'):
             self.assertIn("  %s: '" % code, agents)
-        self.assertIn('Orchestra Bridge 0.14 or later: ', agents)
-        self.assertIn('Older Orchestra Bridge extension (before 0.14): ', agents)
+        # kittrial-5bb.348: the first screen asks whether this computer's VS Code has the Bridge 0.14+.
+        self.assertIn("choice('setup-bridge', 'yes', 'Orchestra Bridge 0.14 or later'", agents)
+        self.assertIn("choice('setup-bridge', 'no', 'An older extension, or none'", agents)
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not installed; the static checks above still apply')
@@ -2147,457 +2161,92 @@ console.log(JSON.stringify({
                                             env=env, stderr=subprocess.STDOUT, text=True)
                 self.assertIn('Downloads/orchestra-agent-kestrel.crt', ctx_err.exception.output)
 
-    def test_wizard_dom_step_by_step_os_selector_and_checks_under_node(self):
-        # kittrial-5bb.329: run the real setup wizard DOM under Node with web_dom_shim.mjs
-        # and the real createApi from web/js/api.js.
+    def test_wizard_one_action_per_screen_under_node(self):
+        # kittrial-5bb.348: the real wizard of agents.js under Node with web_dom_shim.mjs and the
+        # real createApi (tests/web_setup_wizard.mjs). Both paths in order with Back and Next, one
+        # action per screen (another screen's command is absent, not hidden), short text, worker
+        # first, the issue button and the issued secret on the secret screen, an error shown inside
+        # the dialog and no toast behind it, the check before Next, a reload resuming the screen,
+        # the curl flags, a toast drawn inside an open modal, and what the three-step wizard's test
+        # pinned: the keep-alive and its warning, the online line only while visible, the picker's
+        # remembered folder and the stored state cleared on sign-out.
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not installed; the static checks above still apply')
-        script = r"""
-const [, shimUri, apiUri, agentsUri] = process.argv;
-const { Element } = await import(shimUri);
-Element.prototype.showModal = function showModal() { this.open = true; };
-Element.prototype.close = function close() { this.open = false; return this.dispatch('close'); };
-// Element.replaceWith now comes from the shim itself (kittrial-5bb.342); childNodes is a
-// NodeList-like live collection, so copy before using array methods.
-const store = new Map();
-globalThis.sessionStorage = {
-  getItem: (k) => (store.has(k) ? store.get(k) : null),
-  setItem: (k, v) => store.set(k, String(v)),
-  removeItem: (k) => store.delete(k),
-};
-Object.defineProperty(globalThis, 'navigator', {
-  value: { platform: 'Win32', userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-  configurable: true,
-});
-const docListeners = new Map();
-globalThis.document.visibilityState = 'visible';
-globalThis.document.addEventListener = (type, fn) => {
-  if (!docListeners.has(type)) docListeners.set(type, new Set());
-  docListeners.get(type).add(fn);
-};
-globalThis.document.removeEventListener = (type, fn) => {
-  if (docListeners.has(type)) docListeners.get(type).delete(fn);
-};
-globalThis.document.dispatchEvent = (ev) => {
-  const set = docListeners.get(ev && ev.type);
-  if (set) for (const fn of [...set]) fn(ev);
-};
-globalThis.location = { origin: 'https://127.0.0.1:8765', hash: '#/setup' };
-
-const realSetTimeout = globalThis.setTimeout;
-const realClearTimeout = globalThis.clearTimeout;
-const intervals = [];
-const timeouts = [];
-let nextTimerId = 1;
-globalThis.setInterval = (fn, ms) => { const id = nextTimerId++; intervals.push({ id, fn, ms, cleared: false }); return id; };
-globalThis.clearInterval = (id) => { const entry = intervals.find((x) => x.id === id); if (entry) entry.cleared = true; };
-globalThis.setTimeout = (fn, ms) => {
-  if (ms <= 50) return realSetTimeout(fn, ms);
-  const id = nextTimerId++;
-  if (ms >= 10000) {
-    const entry = { id, fn: (...args) => { entry.cleared = true; return fn(...args); }, ms, cleared: false };
-    timeouts.push(entry);
-  }
-  return id;
-};
-globalThis.clearTimeout = (id) => {
-  const entry = timeouts.find((x) => x.id === id);
-  if (entry) entry.cleared = true;
-  else realClearTimeout(id);
-};
-const pickerCalls = [];
-globalThis.window = {
-  location: globalThis.location,
-  isSecureContext: true,
-  setInterval: globalThis.setInterval,
-  clearInterval: globalThis.clearInterval,
-  showDirectoryPicker: async (opts) => {
-    pickerCalls.push(opts);
-    return {
-      name: 'kestrel',
-      getDirectoryHandle: async (_n, dirOpts) => {
-        if (!dirOpts || !dirOpts.create) { const e = new Error('missing'); e.name = 'NotFoundError'; throw e; }
-        return {
-          getFileHandle: async () => ({ createWritable: async () => ({ write: async () => {}, close: async () => {} }) }),
-        };
-      },
-      getFileHandle: async () => { const e = new Error('missing'); e.name = 'NotFoundError'; throw e; },
-    };
-  },
-};
-
-const { createApi } = await import(apiUri);
-let agentLastSeen = '2026-10-17T00:00:00Z'; // Older last_seen_at before Step 1 started
-let agentRole = 'reviewer';
-let failUpdateAgent = false;
-let agentCalls = 0;
-let sessionReads = 0;
-const updatedRoles = [];
-const realApi = createApi(async (method, path, _headers, bodyStr) => {
-  const body = bodyStr ? JSON.parse(bodyStr) : undefined;
-  if (method === 'GET' && path === '/v1/sessions/current') {
-    sessionReads++;
-    return {
-      status: 200,
-      data: {
-        csrf_token: 'csrf-1',
-        idle_seconds: 300,
-        idle_expires_at: new Date(Date.now() + 240 * 1000).toISOString(),
-        user: { id: 'u1', username: 'olive', display_name: 'Olive', superuser: false },
-      },
-    };
-  }
-  if (method === 'DELETE' && path === '/v1/sessions/current') {
-    return { status: 204, data: null };
-  }
-  if (method === 'GET' && path === '/v1/service/certificate') {
-    return { status: 200, data: { certificate: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', sha256: 'AA:BB' } };
-  }
-  if (method === 'GET' && (path === '/v1/agents' || path.startsWith('/v1/agents?'))) {
-    return {
-      status: 200,
-      data: {
-        items: [
-          { id: 'agent_1', name: 'Kestrel', owner: 'u1', owner_display_name: 'Olive', role: agentRole },
-          { id: 'agent_2', name: 'Merlin', owner: 'u1', owner_display_name: 'Olive', role: 'worker' },
-        ],
-      },
-    };
-  }
-  if (method === 'GET' && path === '/v1/agents/agent_1') {
-    agentCalls++;
-    return {
-      status: 200,
-      data: {
-        id: 'agent_1', name: 'Kestrel', owner: 'u1', owner_display_name: 'Olive',
-        role: agentRole,
-        working_directory: 'C:\\Users\\olive\\kestrel', projects: ['p1'],
-        last_seen_at: agentLastSeen, scopes: ['read'], scopes_source: 'set',
-        credentials: [{ id: 'c1', label: 'initial', revoked: false, working: true, scopes: ['read'] }],
-      },
-    };
-  }
-  if (method === 'PATCH' && path === '/v1/agents/agent_1') {
-    if (failUpdateAgent) {
-      return { status: 503, data: { error: { code: 'unavailable', message: 'Could not save role right now.' } } };
-    }
-    updatedRoles.push(['agent_1', body]);
-    if (body && body.role) agentRole = body.role;
-    return { status: 200, data: { id: 'agent_1', ...body } };
-  }
-  if (method === 'POST' && path === '/v1/agents/agent_1/credentials') {
-    return {
-      status: 200,
-      data: {
-        credential: { id: 'c2', secret: 'FRESH-SECRET-999', scopes: ['read'] },
-        agent: { id: 'agent_1', name: 'Kestrel', role: agentRole, scopes: ['read'], scopes_source: 'set' },
-      },
-    };
-  }
-  return { status: 404, data: { error: { code: 'not_found', message: path } } };
-});
-
-const views = await import(agentsUri);
-const byAttr = (root, key, val) => root.all((e) => e.attributes[key] === val);
-const firstAttr = (root, key, val) => byAttr(root, key, val)[0] || null;
-
-// 1. #/setup with no ?agent= and empty sessionStorage renders an agent chooser and opens 0 modals:
-const chooserCtx = {
-  me: { id: 'u1', username: 'olive', display_name: 'Olive', superuser: false },
-  href: (p) => '#' + p,
-  go: () => {},
-  query: new URLSearchParams(''),
-  api: realApi,
-};
-const chooserRoot = await views.setupWizardPage(chooserCtx);
-const chooserPresent = Boolean(chooserRoot && chooserRoot.attributes['data-agent-chooser'] === 'true');
-const dialogsDuringChooser = document.body.all((e) => e.tagName === 'DIALOG').length;
-
-// 2. Now open the wizard for agent_1 (which has role: 'reviewer' and an older last_seen_at):
-const ctx = {
-  me: { id: 'u1', username: 'olive', display_name: 'Olive', superuser: false },
-  href: (p) => '#' + p,
-  go: () => {},
-  query: new URLSearchParams('agent=agent_1'),
-  api: realApi,
-};
-await views.setupWizardPage(ctx);
-await new Promise((r) => realSetTimeout(r, 10));
-const dialog = document.body.all((e) => e.tagName === 'DIALOG')[0];
-
-// Issue a fresh secret in Step 1 so secretSteps is rendered with hasCertificate = true:
-const issueBtn = dialog.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue a new secret')[0];
-const issueClick = issueBtn.dispatch('click');
-await new Promise((r) => realSetTimeout(r, 10));
-const confirmDialogNode = document.body.all((e) => e.tagName === 'DIALOG').find((d) => d !== dialog);
-if (confirmDialogNode) {
-  const confirmBtn = confirmDialogNode.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0];
-  await confirmBtn.dispatch('click');
-}
-await issueClick;
-
-const steps = [1, 2, 3].map((n) => firstAttr(dialog, 'data-wizard-step', String(n)));
-const progress = dialog.all((e) => 'data-wizard-progress' in e.attributes)[0];
-const osSelect = firstAttr(dialog, 'data-os-select', 'true');
-const backBtn = firstAttr(dialog, 'data-action', 'wizard-back');
-const nextBtn = firstAttr(dialog, 'data-action', 'wizard-next');
-const skipBtn = firstAttr(dialog, 'data-action', 'skip-check');
-const doneBtn = firstAttr(dialog, 'data-action', 'wizard-done');
-const statusEl = firstAttr(dialog, 'data-wizard-check-status', 'true');
-
-const initialStepHidden = steps.map((s) => s.hidden);
-const initialProgress = progress.textContent;
-// kittrial-5bb.342 item 4: the progress badge is the step's one title. The old numbered
-// heading inside the step list said "1. Store the secret" under "Step 1 of 3: Store the secret".
-const step1Headings = steps[0].all((e) => e.tagName === 'H3').map((e) => e.textContent);
-// kittrial-5bb.342 item 2: Save certificate is a primary action, and one line says it downloads
-// the file the move command below places.
-const saveCertBtn = steps[0].all((e) => e.tagName === 'BUTTON' && e.textContent === 'Save certificate')[0];
-const saveCertLine = firstAttr(steps[0], 'data-save-certificate-line', 'true');
-const initialBackHidden = backBtn.hidden;
-const initialOs = osSelect.value;
-
-// Verify OS selector toggles visibility in Step 1 and macOS/Linux has no visible "Notepad":
-function visibleText(node) {
-  if (!node) return '';
-  if (typeof node === 'string') return node;
-  if (!(node instanceof Element)) return String(node.textContent || '');
-  if (node.hidden) return '';
-  if (node.tagName === 'DETAILS' && !('open' in node.attributes)) {
-    const sum = Array.from(node.childNodes).find((c) => c instanceof Element && c.tagName === 'SUMMARY');
-    return sum ? visibleText(sum) : '';
-  }
-  return Array.from(node.childNodes).map(visibleText).join(' ');
-}
-const winVisibility = {
-  winHidden: byAttr(steps[0], 'data-os', 'windows').some((e) => e.hidden),
-  posixAllHidden: byAttr(steps[0], 'data-os', 'posix').every((e) => e.hidden),
-};
-osSelect.value = 'linux';
-await osSelect.dispatch('change');
-const linuxVisibleStep1 = visibleText(steps[0]);
-const linuxVisibility = {
-  winAllHidden: byAttr(steps[0], 'data-os', 'windows').every((e) => e.hidden),
-  posixHidden: byAttr(steps[0], 'data-os', 'posix').some((e) => e.hidden),
-  mentionsNotepad: linuxVisibleStep1.includes('Notepad'),
-};
-osSelect.value = 'windows';
-await osSelect.dispatch('change');
-
-// Verify no <your-name> placeholder exists in any primary <code> or step text outside <details data-fallback="manual-body"> (except the curl exit 2 diagnostic row)
-const fallbackDetails = firstAttr(steps[0], 'data-fallback', 'manual-body');
-const insideFallback = new Set(fallbackDetails ? [fallbackDetails, ...fallbackDetails.all(() => true)] : []);
-const placeholderOutsideFallback = steps[0].all((e) => !insideFallback.has(e)
-  && !e.attributes['data-curl-error']
-  && Array.from(e.childNodes).some((c) => !(c instanceof Element) && String(c.textContent || '').includes('<your-name>'))).length;
-
-// Verify every step has a "What you will see when it worked" block:
-const workedBlocks = [1, 2, 3].map((n) => Boolean(firstAttr(steps[n - 1], 'data-when-worked', String(n))));
-
-// Step 1 Next when last_seen_at is from BEFORE Step 1 started ('2026-10-17T00:00:00Z'):
-// must block advancement and show remedy + skip button!
-await nextBtn.dispatch('click');
-const afterFailedNext = {
-  stepHidden: steps.map((s) => s.hidden),
-  statusText: statusEl.textContent,
-  skipHidden: skipBtn.hidden,
-};
-
-// Step 1 Next when last_seen_at is newer than when Step 1 started: advances to Step 2
-agentLastSeen = new Date(Date.now() + 60 * 1000).toISOString();
-await nextBtn.dispatch('click');
-const roleNoteEl = firstAttr(steps[1], 'data-role-note', 'true');
-const roleSelect = steps[1].all((e) => e.attributes.id === 'setup-role')[0];
-const initialRoleSelectValue = roleSelect.value;
-const roleStatusEl = firstAttr(steps[1], 'data-role-status', 'true');
-// Test error surfacing when updateAgent fails:
-failUpdateAgent = true;
-roleSelect.value = 'worker';
-await roleSelect.dispatch('change');
-const roleErrorInfo = {
-  text: roleStatusEl ? roleStatusEl.textContent : '',
-  roleAttr: roleStatusEl ? roleStatusEl.attributes.role : null,
-};
-failUpdateAgent = false;
-roleSelect.value = 'reviewer';
-await roleSelect.dispatch('change');
-roleSelect.value = 'worker';
-await roleSelect.dispatch('change');
-const onStep2 = {
-  stepHidden: steps.map((s) => s.hidden),
-  progress: progress.textContent,
-  backHidden: backBtn.hidden,
-  initialRoleSelectValue,
-  roleErrorInfo,
-  hasRoleNote: Boolean(roleNoteEl) && roleNoteEl.textContent.includes('Deliver and review') && roleNoteEl.textContent.includes('/v1/agents/me/next'),
-  updatedRoles,
-  activeIntervals: intervals.filter((i) => !i.cleared).length,
-};
-
-// Step 2 Save to agent folder called twice: second call receives startIn from first call
-const saveBtn = steps[1].all((e) => e.tagName === 'BUTTON' && e.textContent.includes('Save to agent folder'))[0];
-await saveBtn.dispatch('click');
-await saveBtn.dispatch('click');
-
-// Advance to Step 3 (with an older last_seen_at so Step 3 polls until a fresh connection arrives):
-agentLastSeen = '2026-10-17T00:00:00Z';
-await nextBtn.dispatch('click');
-const step3CaFileBlock = firstAttr(steps[2], 'data-bridge-cafile', 'true');
-const screenReaderTipEl = firstAttr(steps[2], 'data-screen-reader-tip', 'true');
-const step3Text = steps[2].textContent;
-const onStep3 = {
-  stepHidden: steps.map((s) => s.hidden),
-  progress: progress.textContent,
-  nextHidden: nextBtn.hidden,
-  donePrimary: doneBtn.className === 'primary',
-  hasBridgeNoteStep2: Boolean(firstAttr(steps[1], 'data-bridge-note', 'step2')),
-  hasBridgeNoteStep3: Boolean(firstAttr(steps[2], 'data-bridge-note', 'step3')),
-  hasBridgeCaFile: Boolean(step3CaFileBlock),
-  hasScreenReaderTip: Boolean(screenReaderTipEl) && screenReaderTipEl.textContent.includes('screen reader button in the bottom right of VS Code'),
-  step3HasBridgeSetup: step3Text.includes('Orchestra Bridge: Set up'),
-  step3HasCaFile: step3Text.includes('orchestraBridge.caFile')
-    && step3Text.includes('--use-system-ca')
-    && step3Text.includes('NODE_EXTRA_CA_CERTS'),
-  step3HasBefore014: step3Text.includes('before 0.14'),
-  activeIntervals: intervals.filter((i) => !i.cleared).length,
-};
-
-// Step 3 3-second online check: skips when hidden, stops when agent comes online with a fresh timestamp
-const activeTimer = intervals.find((i) => !i.cleared);
-const callsBeforeHidden = agentCalls;
-globalThis.document.visibilityState = 'hidden';
-await activeTimer.fn();
-const callsAfterHidden = agentCalls;
-const timerClearedOnHidden = activeTimer.cleared;
-// Re-showing Step 3 while visible starts a fresh 3s timer and stops when last_seen_at is newer than Step 3 start:
-globalThis.document.visibilityState = 'visible';
-dialog.wizard.syncStep3Poll();
-const secondTimer = intervals.find((i) => !i.cleared);
-agentLastSeen = new Date(Date.now() + 120 * 1000).toISOString();
-await secondTimer.fn();
-const onlineStatus = firstAttr(steps[2], 'data-online-status', 'true').textContent;
-const timerClearedOnSuccess = secondTimer.cleared;
-
-// Verify real keepAliveWhileVisible from api.js:
-// 1. Opening the wizard triggered an immediate GET /v1/sessions/current touch and scheduled a warning timeout.
-const sessionReadsBeforeWarn = sessionReads;
-const idleBanner = firstAttr(dialog, 'data-wizard-idle-warning', 'true');
-const idleHiddenBefore = idleBanner ? idleBanner.hidden : true;
-// Fire the shorter timeout (the warning timer scheduled at deadline - warnMs):
-const activeTimeouts = timeouts.filter((t) => !t.cleared).sort((a, b) => a.ms - b.ms);
-if (activeTimeouts[0]) await activeTimeouts[0].fn();
-const idleVisibleAfter = idleBanner ? !idleBanner.hidden && idleBanner.textContent.includes('min') : false;
-// Clicking "Keep session open" in the banner calls realApi.keepAlive() and hides the banner:
-const keepOpenBtn = firstAttr(dialog, 'data-action', 'wizard-keep-alive');
-if (keepOpenBtn) await keepOpenBtn.dispatch('click');
-const sessionReadsAfterKeepOpen = sessionReads;
-const idleHiddenAfterKeepOpen = idleBanner ? idleBanner.hidden : false;
-
-await doneBtn.dispatch('click');
-const timeoutsClearedAfterDone = timeouts.every((t) => t.cleared);
-
-const savedStateRaw = globalThis.sessionStorage.getItem('orchestra.agentSetup.v1');
-// Sign out via realApi.logout() must clear orchestra.agentSetup.v1 from sessionStorage:
-await realApi.logout();
-const savedStateAfterLogout = globalThis.sessionStorage.getItem('orchestra.agentSetup.v1');
-
-console.log(JSON.stringify({
-  chooser: { chooserPresent, dialogsDuringChooser },
-  scopes: views.SCOPES,
-  initialStepHidden, initialProgress, initialBackHidden, initialOs, step1Headings,
-  saveCertificate: { primary: Boolean(saveCertBtn) && saveCertBtn.className === 'primary',
-    line: saveCertLine ? saveCertLine.textContent : null },
-  winVisibility, linuxVisibility, placeholderOutsideFallback, workedBlocks,
-  afterFailedNext, onStep2,
-  pickerStartInFirst: Boolean(pickerCalls[0] && pickerCalls[0].startIn),
-  pickerStartInSecond: Boolean(pickerCalls[1] && pickerCalls[1].startIn),
-  onStep3,
-  hiddenPollSkipped: callsAfterHidden === callsBeforeHidden && timerClearedOnHidden,
-  onlineStatus, timerClearedOnSuccess,
-  keepAlive: {
-    sessionReadsBeforeWarn,
-    sessionReadsAfterKeepOpen,
-    idleHiddenBefore,
-    idleVisibleAfter,
-    idleHiddenAfterKeepOpen,
-    timeoutsClearedAfterDone,
-  },
-  savedState: JSON.parse(savedStateRaw),
-  secretInStorage: savedStateRaw.includes('FRESH-SECRET-999'),
-  savedStateAfterLogout,
-}));
-"""
-        out = run_node_module(self, node, script,
-                              (ROOT / 'tests' / 'web_dom_shim.mjs').as_uri(),
-                              (ROOT / 'web' / 'js' / 'api.js').as_uri(),
-                              self.AGENTS_JS.as_uri())
-        self.assertEqual(0, out.returncode, out.stderr)
-        res = json.loads(out.stdout)
-        self.assertEqual({'chooserPresent': True, 'dialogsDuringChooser': 0}, res['chooser'])
-        self.assertIn(['read', 'Read (every agent can read)'], res['scopes'])
-        self.assertIn(['reviews', 'Deliver and review (needed to deliver at all)'], res['scopes'])
-        self.assertEqual([False, True, True], res['initialStepHidden'])
-        self.assertEqual('Step 1 of 3: Store the secret', res['initialProgress'])
-        # One title: the step list carries no numbered heading repeating "step 1" (item 4).
-        self.assertEqual([], res['step1Headings'])
-        # Save certificate is a visible primary action with the one line explaining it (item 2).
-        self.assertTrue(res['saveCertificate']['primary'], 'Save certificate must be a primary action')
-        self.assertIn('downloads the certificate file', res['saveCertificate']['line'])
-        self.assertTrue(res['initialBackHidden'])
-        self.assertEqual('windows', res['initialOs'])
-        self.assertEqual({'winHidden': False, 'posixAllHidden': True}, res['winVisibility'])
-        self.assertEqual({'winAllHidden': True, 'posixHidden': False, 'mentionsNotepad': False},
-                         res['linuxVisibility'])
-        self.assertEqual(0, res['placeholderOutsideFallback'])
-        self.assertEqual([True, True, True], res['workedBlocks'])
-        # Check before Next blocks advancement when last_seen_at is older than Step 1 start:
-        self.assertEqual([False, True, True], res['afterFailedNext']['stepHidden'])
-        self.assertIn('Run the self-check or test command in Step 1',
-                      res['afterFailedNext']['statusText'])
-        self.assertIn('since this step started', res['afterFailedNext']['statusText'])
-        self.assertFalse(res['afterFailedNext']['skipHidden'])
-        # Advancing to Step 2 when seen after Step 1 started:
-        self.assertEqual([True, False, True], res['onStep2']['stepHidden'])
-        self.assertEqual('Step 2 of 3: Set up the folder', res['onStep2']['progress'])
-        self.assertFalse(res['onStep2']['backHidden'])
-        self.assertEqual('reviewer', res['onStep2']['initialRoleSelectValue'])
-        self.assertIn('Could not save role right now.', res['onStep2']['roleErrorInfo']['text'])
-        self.assertEqual('alert', res['onStep2']['roleErrorInfo']['roleAttr'])
-        self.assertTrue(res['onStep2']['hasRoleNote'])
-        self.assertEqual([['agent_1', {'role': 'reviewer'}], ['agent_1', {'role': 'worker'}]],
-                         res['onStep2']['updatedRoles'])
-        self.assertEqual(0, res['onStep2']['activeIntervals'])
-        # Remembered directory handle passed via startIn on second call:
-        self.assertFalse(res['pickerStartInFirst'])
-        self.assertTrue(res['pickerStartInSecond'])
-        # Step 3 state and 3-second online check:
-        self.assertEqual([True, True, False], res['onStep3']['stepHidden'])
-        self.assertEqual('Step 3 of 3: Start the agent', res['onStep3']['progress'])
-        self.assertTrue(res['onStep3']['nextHidden'])
-        self.assertTrue(res['onStep3']['donePrimary'])
-        self.assertTrue(res['onStep3']['hasBridgeNoteStep2'])
-        self.assertTrue(res['onStep3']['hasBridgeNoteStep3'])
-        self.assertTrue(res['onStep3']['hasBridgeCaFile'])
-        self.assertTrue(res['onStep3']['hasScreenReaderTip'])
-        self.assertTrue(res['onStep3']['step3HasBridgeSetup'])
-        self.assertTrue(res['onStep3']['step3HasCaFile'])
-        self.assertTrue(res['onStep3']['step3HasBefore014'])
-        self.assertEqual(1, res['onStep3']['activeIntervals'])
-        self.assertTrue(res['hiddenPollSkipped'])
-        self.assertIn('Connected: Kestrel has reached Orchestra', res['onlineStatus'])
-        self.assertTrue(res['timerClearedOnSuccess'])
-        self.assertGreaterEqual(res['keepAlive']['sessionReadsBeforeWarn'], 1)
-        self.assertGreater(res['keepAlive']['sessionReadsAfterKeepOpen'],
-                           res['keepAlive']['sessionReadsBeforeWarn'])
-        self.assertTrue(res['keepAlive']['idleHiddenBefore'])
-        self.assertTrue(res['keepAlive']['idleVisibleAfter'])
-        self.assertTrue(res['keepAlive']['idleHiddenAfterKeepOpen'])
-        self.assertTrue(res['keepAlive']['timeoutsClearedAfterDone'])
-        self.assertEqual({'agentId': 'agent_1', 'step': 3, 'os': 'windows', 'role': 'worker'},
-                         res['savedState'])
-        self.assertFalse(res['secretInStorage'])
-        self.assertIsNone(res['savedStateAfterLogout'])
+        tests = Path(__file__).resolve().parent
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (tests / 'web_setup_wizard.mjs').as_uri(), (tests / 'web_dom_shim.mjs').as_uri(),
+                               (WEB / 'js' / 'api.js').as_uri(), self.AGENTS_JS.as_uri(), (WEB / 'js' / 'dom.js').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        observed = json.loads(done.stdout.strip().splitlines()[-1])
+        for name, value in observed.items():
+            self.assertIs(True, value, 'the wizard reported %s=%r' % (name, value))
+        self.assertEqual({
+            'atMostTwoSentencesPerScreen',
+            'backHiddenOnTheFirstScreen',
+            'backRetracesTheShortPath',
+            'checkHoldsNextUntilSeen',
+            'checkPassesOnceSeen',
+            'choiceKeepsTheSameRadioSoFocusStays',
+            'confirmationIsAboveTheWizard',
+            'eachScreenOnlyItsOwnCommand',
+            'errorClearedAfterSuccess',
+            'errorHasNoNullText',
+            'errorShownInsideTheDialog',
+            'folderPathBesideTheSaveButton',
+            'hiddenTabDoesNotPoll',
+            'idleWarningShownInTheWizard',
+            'issueButtonRightThere',
+            'issuedSecretShownAtOnce',
+            'keepSessionOpenTouchesTheSession',
+            'longCommandIsCopyAndCollapsed',
+            'longPathPlanWithCertificateOnPosix',
+            'longPathWalksInOrder',
+            'longPathWithoutCertificateRestricts',
+            'moveCommandIsThePosixOne',
+            'nextHiddenAndDonePrimaryOnTheLast',
+            'noScreenShowsNull',
+            'noSecretOneLineWhy',
+            'noSecretShownYet',
+            'noToastBehindTheModal',
+            'oldExtensionToldAboutCaFileBehindMore',
+            'oldStepTwoMapsToFilesOnTheLongPath',
+            'oldStepTwoMapsToVsCodeOnTheShortPath',
+            'onlineLineSaysConnected',
+            'onlineWhenFirstSeenBeforeTheLastScreen',
+            'opensOnTheFirstScreen',
+            'pickerRemembersTheFolder',
+            'progressCountsTheChosenPath',
+            'progressSaysStepOfFive',
+            'reloadResumesTheScreen',
+            'reloadShowsNoSecret',
+            'resumeScreenHasOnlyThePrompt',
+            'reviewerSaidInOneLine',
+            'roleErrorShownInsideTheDialog',
+            'roleSavedOnOrchestra',
+            'roleScreenSecond',
+            'saveCertificateIsTheOneButton',
+            'savedFilesSaidOnTheScreen',
+            'secretAbsentFromOtherScreens',
+            'secretNeverStored',
+            'secretScreenNamesTheFile',
+            'secretScreenThird',
+            'selfCheckBypassesTheProxyForThisHostOnly',
+            'selfCheckSaysTheProxySentence',
+            'shortPathOnMacRestricts',
+            'shortPathOnWindowsHasNoChmod',
+            'shortPathPlan',
+            'signOutClearsTheStoredScreen',
+            'stillOnTheSecretScreen',
+            'systemScreenHasNoCommand',
+            'testScreenChecksBeforeNext',
+            'toastDrawnInTheTopmostDialog',
+            'toastDrawnInsideTheOpenModal',
+            'toastWithoutAModalGoesToTheBody',
+            'vscodeScreenFourth',
+            'vscodeScreenHasFolderAndCommand',
+            'workerPreselected',
+        }, set(observed))
 
 
 

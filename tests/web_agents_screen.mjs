@@ -51,6 +51,8 @@ async function untilAsked(before) {
 const dialogs = () => document.body.all((e) => e.tagName === 'DIALOG');
 const closeDialogs = async () => { for (const d of dialogs()) { await d.close(); d.remove(); } };
 const button = (root, label) => root.all((e) => e.tagName === 'BUTTON' && e.textContent === label)[0];
+// kittrial-5bb.348: one action per screen; the issue button is on the wizard's "Save your secret" screen.
+const secretScreen = (dialog) => { dialog.wizard.show('secret'); return dialog; };
 // Presses something that asks for confirmation, answers the dialog with `answer`, and waits for the page.
 async function pressAndConfirm(control, type, answer) {
   const before = dialogs().length;
@@ -101,7 +103,7 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   out.afterRevoke = seen(page, 'Wren');
   await button(block(page, 'Wren'), 'Set up folder').dispatch('click');
   await settle();
-  out.ownerInferredAsked = await pressAndConfirm(button(dialogs().slice(-1)[0], 'Issue a new secret'), 'click', 'Cancel');
+  out.ownerInferredAsked = await pressAndConfirm(button(secretScreen(dialogs().slice(-1)[0]), 'Issue a new secret'), 'click', 'Cancel');
   await closeDialogs();
   out.ownerInferredSaveText = form(page, 'Wren').textContent;
   out.ownerInferredSaveAsked = await pressAndConfirm(form(page, 'Wren'), 'submit', 'Cancel');
@@ -117,7 +119,7 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   // 4. The one with nothing that says: reading is ticked alone; saved, it has a new secret and its scopes.
   const lone = await open(who.alex);
   out.loneAsked = await pressAndConfirm(form(lone, 'Lone'), 'submit', 'Issue new secret');
-  out.loneDialog = dialogs().map((d) => d.textContent).filter((t) => t.includes('Secret (shown once)')).length;
+  out.loneDialog = dialogs().filter((d) => d.all((e) => e.attributes['data-secret-file-text'] === 'true').length === 1).length;
   await closeDialogs();
   out.afterChoice = seen(lone, 'Lone');
 
@@ -150,7 +152,7 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
     save: Boolean(button(unknown, 'Save and issue a new secret')) };
   await button(block(page, 'Wren'), 'Set up folder').dispatch('click');
   await settle();
-  const inferredDialog = dialogs().slice(-1)[0];
+  const inferredDialog = secretScreen(dialogs().slice(-1)[0]);
   out.adminInferredSetup = {
     needed: inferredDialog.all((e) => e.attributes['data-scopes-needed']).length,
     issue: Boolean(button(inferredDialog, 'Issue a new secret')),
@@ -168,7 +170,7 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   for (const name of ['Kestrel', 'Dove']) {
     await button(block(page, name), 'Set up folder').dispatch('click');
     await settle();
-    const dialog = dialogs().slice(-1)[0];
+    const dialog = secretScreen(dialogs().slice(-1)[0]);
     const issue = button(dialog, 'Issue a new secret');
     const entry = { needed: dialog.all((e) => e.attributes['data-scopes-needed']).length, issue: Boolean(issue) };
     if (issue) {
@@ -191,7 +193,7 @@ async function open(ctx) { const page = await view.list(ctx); await settle(); re
   const page = await open(legacy);
   await button(block(page, 'Kestrel'), 'Set up folder').dispatch('click');
   await settle();
-  out.olderAsked = await pressAndConfirm(button(dialogs().slice(-1)[0], 'Issue a new secret'), 'click', 'Cancel');
+  out.olderAsked = await pressAndConfirm(button(secretScreen(dialogs().slice(-1)[0]), 'Issue a new secret'), 'click', 'Cancel');
   await closeDialogs();
 }
 // 8. Records the page must not fall over: no lists, lists of the wrong things, an older service.

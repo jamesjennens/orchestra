@@ -1709,6 +1709,36 @@ narrowed, to gate it on the live-authority descriptor that only the web service 
 leaving the SSH path alone. No decision is built here beyond the service-only rule read.
 
 
+### Reading a task's history, newest first
+
+`GET /v1/projects/{id}/tasks/{task}/history` pages the task's history in exact
+cursor-bound pages (kittrial-5bb.273: a continued page resumes at the first entry the
+previous page did not return, at any page size).
+
+- **Oldest first** (the default): `limit` 1..100, and `next_cursor` continues to newer entries.
+- **Newest first:** `recent=N` (1..100; kittrial-5bb.353) is the page size of a
+  newest-first read of the same snapshot, the read the client's `history --recent`
+  gives. The first page holds the newest N logical entries, and `next_cursor` continues
+  toward OLDER ones until the oldest. It replaces `limit`: giving both is refused. An agent
+  that wants a coordinator's newest comment reads `recent=20` first, and pages back only
+  if it needs to.
+- **A long comment** arrives as several consecutive entries in either order. They share
+  `entry_id` and carry `body_offset` and `continued`. Newest first, the fragments of one
+  comment still come together and in body order, so concatenating them in page order
+  gives the whole comment.
+- **`since_checkpoint=true`** selects the entries the task's newest valid checkpoint
+  did not incorporate (the client's `history --since-checkpoint`), in either order. The
+  answer then also names the checkpoint: `since_checkpoint`, `checkpoint_author`,
+  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A checkpoint by
+  the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
+- **The cursor** is bound to the caller, the project and the query. A newest-first
+  cursor continues only a newest-first read with the same `recent`, and an oldest-first
+  one only an oldest-first read; the other is refused (409).
+- **Every answer** says `order` (`oldest-first` or `newest-first`) and `truncated`.
+  `truncated` is true, with one sentence in `truncated_note`, when entries exist that the
+  answer neither returned nor can continue to. That is the in-process backend
+  (`--backend inprocess`), which has no continuation cursor, past its first page.
+
 ### What an agent needs to write a checkpoint
 
 `GET /v1/projects/{id}/tasks/{task}/brief` carries everything a checkpoint needs, so an
@@ -1728,9 +1758,13 @@ agent can write its first one from the brief alone.
   - `carried_open_items`: how many open items `body` holds. It is null when they could
     not all be read (the task changed during the read); `body.open_items` is then
     empty, the note says so, and the brief is read again.
-  - The brief's own `checkpoint.open_items` shows the first ten, each now with its
-    `source`; a task with more costs one further canonical read, which asks for all
-    of them (the canonical `brief --items-limit` now goes up to 100).
+  - The brief's own `checkpoint.open_items` shows the first ten, each with its
+    `source`, and carries `open_items_shown` and `open_items_total`; when the list is
+    cut, `checkpoint.open_items_note` says so in one sentence. `carry_open_items` is the
+    complete list, in order, and is null when they could not all be read. Copy
+    `carry_open_items` (or the template's `body.open_items`), not the first ten: a task
+    with more costs one further canonical read, which asks for all of them (the
+    canonical `brief --items-limit` goes up to 100).
   - `required`: the four texts to fill (`intent`, `acceptance`, `summary`,
     `next_action`); `optional`: what may be left out and when; `limits`; the shape of an
     `open_item` (with the allowed `kind` values) and of a `resolved_item`.
@@ -2291,45 +2325,78 @@ own set-up. What the person still does once is said in the dialog: install the e
 "Orchestra Bridge: Set up" (and compare the fingerprint it shows), reload the window, click the
 first wake.
 
-**Step-by-step setup wizard (`kittrial-5bb.329`, slice 4 of `docs/ONBOARDING_DESIGN.md`).** The setup
-dialog and standalone `#/setup` route present the three steps (`Step 1 of 3: Store the secret`,
-`Step 2 of 3: Set up the folder`, `Step 3 of 3: Start the agent`) one screen at a time with `Back`,
-`Check connection`, `Next` and `Done` controls, a `"What you will see when it worked"` callout on
-every step, and secretless `sessionStorage` state (`orchestra.agentSetup.v1`) so reloading the page
-resumes at the current step and operating system without ever storing a secret. The progress badge
-is the step's one title; the step list carries no numbered heading repeating it (kittrial-5bb.342). An **Operating
-system** selector (`Windows (PowerShell)`, `macOS`, `Linux`, auto-detected from `navigator`) is
-chosen first and hides commands and paths for other systems (`data-os="windows"` vs
-`data-os="posix"`). In Step 1, when the service serves its own certificate, the wizard explains
-that browsers strip the leading dot when saving `.orchestra-agent-<slug>.crt` into `Downloads`
-(saving `orchestra-agent-<slug>.crt`) and gives a filled-in `Move-Item` / `mv` command to move it
-into the user profile with the leading dot restored. **Save certificate** is a primary action and
-one line says it downloads the file that move command places; the move command checks first and,
-with nothing in `Downloads`, prints one plain sentence (`Click Save certificate in step 1 first,
-then run this again.`) instead of a raw shell error. The primary Step 1 flow has **zero `<your-name>`
-placeholders**: the person saves the single `header = "Authorization: Bearer ..."` line and runs the
-filled-in rewrite command (`credentialFileCommand`), which expands the real user profile path on
-that machine (`[Environment]::GetFolderPath('UserProfile')` on Windows, `$HOME` on macOS/Linux) and
-writes `# server = ...`, `# server certificate sha256 = ...` and `cacert = ...` automatically (the
-manual `<your-name>` Notepad body is tucked into a collapsed fallback `<details>`); if the credential
-file is missing, that command says what to save first instead of printing a raw error. A filled-in
-self-check command (`checkCommands`) inspects the credential file for `.curlrc.txt`, leftover
-`<your-name>` placeholders, or a certificate still sitting in `Downloads/orchestra-agent-<slug>.crt`
-before running `curl -fsS -K`, and `CURL_ERROR_LINES` covers `curl` exit codes `2`, `26`, `35`, `60`
-and `HTTP 401`. Clicking `Next` checks `GET /v1/service/certificate` (when applicable) and
-`GET /v1/agents/{id}` (`last_seen_at`), advancing when the agent has reached the service or showing a
-one-sentence remedy (with a secondary `Continue without checking` button). On Step 2 and Step 3, the
-wizard states plainly that **Orchestra Bridge 0.14 or later** writes `.orchestra/agent.json`
-(`config_path`) and `.orchestra/AGENT.md` (`guide_path`) and adds `.orchestra/` (`gitignore_line`)
-to `.gitignore` directly into the open VS Code workspace folder from `GET /v1/agents/me` (which now
-includes the secretless `setup` bundle alongside `agent` with zero canonical work reads) and
-compares the open workspace folder against `working_directory` (offering to record it via
-`PATCH /v1/agents/me` with `{"working_directory": "..."}` when they differ), **and with an older
-extension** (before 0.14) shows the fallback (**Save to agent folder…**, which passes the last
-chosen directory handle as `startIn` to `showDirectoryPicker`, or **Or let the agent do it**). While
-Step 3 is open and `document.visibilityState === 'visible'`, a 3-second check polls
-`GET /v1/agents/{id}` and stops immediately once `last_seen_at` is set, or when leaving Step 3,
-hiding the tab, or closing the dialog.
+**Step-by-step setup wizard (`kittrial-5bb.329`, slice 4 of `docs/ONBOARDING_DESIGN.md`; one action
+per screen since `kittrial-5bb.348`).** The setup dialog and the standalone `#/setup` route show ONE
+screen at a time: a short title, at most two short sentences, the screen's one action (a button, a
+choice, or one command with its Copy button) and `Back` / `Next`; any explanation is behind a
+collapsed "More about this". Only the current screen is in the dialog, so another screen's command
+is absent, not hidden. The first screen chooses the **operating system** (`Windows (PowerShell)`,
+`macOS`, `Linux`, auto-detected from `navigator`) and whether that computer's VS Code has
+**Orchestra Bridge 0.14 or later**; the second chooses what the agent does (worker first; reviewer
+also gets other people's deliveries). The rest of the screens are `screenPlan()` in
+`web/js/agentSetup.js`:
+
+- **Orchestra Bridge 0.14 or later** (the short path): *Save your secret* → *Restrict the file*
+  (macOS/Linux only) → *Set up in VS Code* → *Start the agent*. The extension's own "Orchestra
+  Bridge: Set up" fetches and checks the certificate, tests the connection, writes
+  `.orchestra/agent.json` (`config_path`) and `.orchestra/AGENT.md` (`guide_path`), adds
+  `.orchestra/` (`gitignore_line`) to `.gitignore` from `GET /v1/agents/me` (which includes the
+  secretless `setup` bundle), and compares the open folder with `working_directory` (offering
+  `PATCH /v1/agents/me` with `{"working_directory": "..."}` when they differ). So this path has no
+  certificate, rewrite, self-check or save-files screen.
+- **An older extension, or curl only** (the longer path): *Save the certificate* and *Move the
+  certificate* (when the service has its own) → *Save your secret* → *Add the certificate path*
+  (the rewrite command, when there is a certificate; otherwise *Restrict the file* on macOS/Linux)
+  → *Test it* (the self-check) → *Save the agent's files* → *Set up in VS Code* → *Start the
+  agent*.
+
+*Save your secret* shows the lines to paste into the credential file: `# server = ...`,
+`# server certificate sha256 = ...` (when there is a certificate) and the header line with the
+secret, behind one Copy button, and the file name. With the server line in the file, the Bridge's
+Set up proposes the server itself. Opened without a secret (the agent's card), that screen says in
+one line why (`The secret is shown only once, when it is issued; issue a new one to continue.`) with
+the **Issue a new secret** button right there, and the new secret's lines appear on the screen at
+once. The secret is shown on that screen only, never stored (the secretless `sessionStorage` state
+`orchestra.agentSetup.v1` holds the agent, the path, the screen, the system and the role, so a
+reload resumes the screen), and never in the folder files, the prompts or a command line.
+
+**Every error raised while the wizard is open is shown inside it**, on the current screen, in full
+(the sentence and the request id). Before `kittrial-5bb.348` a failed issue showed only a toast,
+which `document.body` draws UNDER a modal dialog (the browser's top layer): at the office it was a red
+box behind the wizard. Site-wide, a toast raised while a modal dialog is open is now drawn inside the
+topmost one (`toastLayer()` in `web/js/dom.js`).
+
+**Move the certificate**: browsers strip the leading dot when saving `.orchestra-agent-<slug>.crt`
+into `Downloads`; the filled-in `Move-Item` / `mv` command moves it into the user profile with the
+dot restored, and with nothing in `Downloads` prints one plain sentence (`Click Save certificate
+first, then run this again.`). **Add the certificate path** runs the rewrite command
+(`credentialFileCommand`), which expands the real user profile path on that machine
+(`[Environment]::GetFolderPath('UserProfile')` on Windows, `$HOME` on macOS/Linux) and writes the
+comment lines and `cacert = ...` with no `<your-name>` to edit. **Test it** gives the self-check
+(`checkCommands`): it looks for `.curlrc.txt`, a leftover `<your-name>`, or a certificate still in
+`Downloads/orchestra-agent-<slug>.crt`, then calls Orchestra; `CURL_ERROR_LINES` (behind "More
+about this") covers `curl` exit codes `2`, `26`, `35`, `60` and `HTTP 401`. **Save the agent's
+files** is the **Save to agent folder…** button with the agent's recorded folder path printed beside
+it (it passes the last chosen directory handle as `startIn` to `showDirectoryPicker`); the setup
+prompt and the two files to copy by hand are behind "More about this".
+
+**A command-line proxy** (`kittrial-5bb.348`): an office PC's `HTTPS_PROXY` sent curl to a corporate
+proxy that cannot reach the internal server; it hung and then answered with its own HTML page (HTTP
+503). Every curl the wizard gives carries `--noproxy HOST --max-time 20`, HOST being the server's own
+host (never `*`: only this server bypasses the proxy), and the self-check no longer uses `-f`: when
+the answer is not the kit's JSON (a web page, a 5xx without the kit's `{"error": {...}}`, no answer
+within 20 seconds, or a failed proxy tunnel) it prints ONE sentence, that a proxy probably answered
+and to check `HTTPS_PROXY` or ask IT to let the computer reach HOST directly. The agent's own calls in
+`AGENT.md` carry `--noproxy HOST --max-time 60` (a first read of a large project can take over 12 s).
+Orchestra Bridge 0.14 writes its own copy of `AGENT.md` and checks it byte for byte against the
+site's: that parity check fails against this kit until the next Bridge release carries the same
+lines.
+
+`Next` on *Test it* and *Set up in VS Code* first checks `GET /v1/agents/{id}` (`last_seen_at`),
+advancing when the agent reached the service during that screen, or showing a one-sentence remedy
+with a `Continue without checking` button. While *Start the agent* is open and
+`document.visibilityState === 'visible'`, a 3-second check polls `GET /v1/agents/{id}` and stops
+once the agent is seen, or when leaving the screen, hiding the tab, or closing the dialog.
 
 **What an agent may do is kept on the agent, and a new credential carries exactly that**
 (kittrial-5bb.208). The agent record holds its `scopes`: written when the agent is made

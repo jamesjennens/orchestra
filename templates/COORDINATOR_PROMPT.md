@@ -23,6 +23,16 @@ obtain an agreed interim parent/job target rather than using an unrelated task.
 Use the documented activity export/cursors and history; do not treat issue
 updated_at as a complete activity cursor.
 
+A web project's coordinator must not give its worker CLI-only kit commands: a worker
+with a web credential has no kit and no command line. It reaches Orchestra only through
+the Orchestra Bridge tools (#orchestraNext, #orchestraBrief, #orchestraHistory,
+#orchestraClaim, #orchestraCheckpoint, #orchestraReview, #orchestraRelease) and the HTTP
+routes in its .orchestra/AGENT.md. Name the tool or route for each need - task text and
+the latest checkpoint with all open items: #orchestraBrief or
+GET /v1/projects/PROJECT/tasks/TASK/brief; comments: #orchestraHistory or
+GET /v1/projects/PROJECT/tasks/TASK/history; its own work: #orchestraNext or
+GET /v1/agents/me/next - and never tell it to install the kit.
+
 Rather than making the intake pass on a timer of your own, run `wait --coordinator`
 while you have nothing else to do: it blocks and returns only when there is something
 for you - a new delivery awaiting review, approved work awaiting integration, a
