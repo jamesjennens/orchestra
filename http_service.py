@@ -1331,13 +1331,22 @@ class InProcessBackend:
         # The one rule from work.py, not a copy (kittrial-5bb.264 item 4).
         from work import is_redelivery
         redelivered=is_redelivery(contribution_id, open_requests)
+        # This disposable model keeps no per-entry checkpoint digests, so its coverage
+        # is unknown and the stable marker is honestly null (kittrial-5bb.351); the
+        # counts are the same summary its brief route already answers with.
+        activity=self._agent_activity_summary(task,last) if last and not unreadable else None
         return {'pending_change_requests':[r['id'] for r in review['requests'] if r['status']=='open'][:20],
                 'open_items':None if unreadable else (len(last.get('open_items') or []) if last else 0),
                 'blocking_items':None if unreadable else sum(item.get('kind') in ('blocker','dependency')
                                                             for item in (last.get('open_items') or []) if isinstance(item,dict)) if last else 0,
                 'redelivered':redelivered,
                 'checkpoint_at':at,
-                'newer_activity':self._other_agent_activity(task,last) if last and not unreadable else None}
+                'newer_activity':self._other_agent_activity(task,last) if last and not unreadable else None,
+                'newer_activity_marker':None,
+                'newer_activity_by_others':(activity or {}).get('other_count'),
+                'newer_activity_own':(activity or {}).get('own_count'),
+                'newer_activity_coverage':(activity or {}).get('coverage'),
+                'unresolved_directions':None}
 
     def _other_agent_activity(self, task, checkpoint):
         events=[e for e in self.state.get('events') or [] if e.get('task')==task['id']]
@@ -1593,6 +1602,23 @@ def attention_blocking_items(fields):
     return value if type(value) is int and value >= 0 else None
 
 
+def attention_field(row, name):
+    """One attention field from a queue row itself, else from its nested attention block.
+
+    A canonical ``work`` row carries the checkpoint attention fields at the top level;
+    the web service's queue row carries them under ``attention``. The wait route reads
+    either shape, so a bridge and the SSH client see one marker (kittrial-5bb.351).
+    """
+    if isinstance(row, dict):
+        value = row.get(name)
+        if value is not None:
+            return value
+        attention = row.get('attention')
+        if isinstance(attention, dict):
+            return attention.get(name)
+    return None
+
+
 def holder_move(status, task_id, assignee, review_state, open_requests, contribution_id,
                 redelivered=None, claimable_value=None):
     """The HOLDER's move reading for a projection row, from the ONE shared decision.
@@ -1640,7 +1666,14 @@ def own_queue_tasks(queue, actor=None):
                       # (kittrial-5bb.253 item 1), for `review_move`.
                       'redelivered':fields.get('redelivered'),
                       'checkpoint_at':fields.get('checkpoint_at'),
-                      'newer_activity':fields.get('newer_activity')})
+                      'newer_activity':fields.get('newer_activity'),
+                      # The stable marker and its counts (kittrial-5bb.351): a wait row
+                      # carries them, so a marker change alone moves the fingerprint.
+                      'newer_activity_marker':fields.get('newer_activity_marker'),
+                      'newer_activity_by_others':fields.get('newer_activity_by_others'),
+                      'newer_activity_own':fields.get('newer_activity_own'),
+                      'newer_activity_coverage':fields.get('newer_activity_coverage'),
+                      'unresolved_directions':fields.get('unresolved_directions')})
         if row.get('lifecycle_reasons'):
             tasks[-1]['lifecycle_reasons'] = dict(row['lifecycle_reasons'])
     return {'tasks':tasks,'complete':bool(queue.get('complete'))}
@@ -3502,7 +3535,21 @@ class EndpointBackend:
                 # (kittrial-5bb.253 item 1).
                 'redelivered': redelivered if type(redelivered) is bool else None,
                 'checkpoint_at': row.get('checkpoint_at') if isinstance(row.get('checkpoint_at'), str) else None,
-                'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None}
+                'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None,
+                # The stable marker and the counts it was computed with (kittrial-5bb.351):
+                # the bridge wakes on a marker change even while the boolean stays true.
+                # A legacy checkpoint (unknown coverage) yields a null marker, so a
+                # reader falls back to `newer_activity`.
+                'newer_activity_marker': row.get('newer_activity_marker')
+                if isinstance(row.get('newer_activity_marker'), str) else None,
+                'newer_activity_by_others': row.get('newer_activity_by_others')
+                if type(row.get('newer_activity_by_others')) is int and row.get('newer_activity_by_others') >= 0 else None,
+                'newer_activity_own': row.get('newer_activity_own')
+                if type(row.get('newer_activity_own')) is int and row.get('newer_activity_own') >= 0 else None,
+                'newer_activity_coverage': row.get('newer_activity_coverage')
+                if isinstance(row.get('newer_activity_coverage'), str) else None,
+                'unresolved_directions': row.get('unresolved_directions')
+                if type(row.get('unresolved_directions')) is int and row.get('unresolved_directions') >= 0 else None}
 
     def agent_tasks(self, project_id, actor=None, queue=None):
         """The tasks one actor holds, from the canonical ``work --owner ACTOR`` view.
@@ -3544,7 +3591,14 @@ class EndpointBackend:
                              # The superseding-redelivery fact (kittrial-5bb.253 item 1).
                              'redelivered': attention.get('redelivered'),
                              'checkpoint_at': attention.get('checkpoint_at'),
-                             'newer_activity': attention.get('newer_activity')})
+                             'newer_activity': attention.get('newer_activity'),
+                             # The stable newer-activity marker and its counts
+                             # (kittrial-5bb.351), carried exactly as `work` read them.
+                             'newer_activity_marker': attention.get('newer_activity_marker'),
+                             'newer_activity_by_others': attention.get('newer_activity_by_others'),
+                             'newer_activity_own': attention.get('newer_activity_own'),
+                             'newer_activity_coverage': attention.get('newer_activity_coverage'),
+                             'unresolved_directions': attention.get('unresolved_directions')})
                 if item.get('lifecycle_reasons'):
                     rows[-1]['lifecycle_reasons'] = dict(item['lifecycle_reasons'])
             return {'tasks': rows, 'complete': bool(queue.get('complete'))}
@@ -6559,7 +6613,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                     claimable=task.get('claimable') if isinstance(task.get('claimable'), bool) else None)
                 if move == 'you':
                     rows.append(dict(task, task=task.get('id'), project=project_id,
-                                     whose_move=move, next_actor=next_actor_value))
+                                     whose_move=move, next_actor=next_actor_value,
+                                     # The wait row carries the marker and its counts
+                                     # (kittrial-5bb.351): a new other-party entry, or an
+                                     # edit to it, moves the fingerprint even while the
+                                     # boolean stays true.
+                                     newer_activity_marker=attention_field(task, 'newer_activity_marker'),
+                                     newer_activity_by_others=attention_field(task, 'newer_activity_by_others'),
+                                     newer_activity_own=attention_field(task, 'newer_activity_own'),
+                                     newer_activity_coverage=attention_field(task, 'newer_activity_coverage'),
+                                     unresolved_directions=attention_field(task, 'unresolved_directions')))
         # The project's claiming setting on the wait read (kittrial-5bb.352 review item
         # S1). The wait can span projects, so report one mode only when they agree;
         # under any 'assigned' project an empty wait carries the empty-list sentence,
@@ -7428,7 +7491,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
                            'blocking_items':blocking_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
-                           'newer_activity': task.get('newer_activity') if blocked or in_progress else None}
+                           'newer_activity': task.get('newer_activity') if blocked or in_progress else None,
+                           # A stable marker of the newest other-party activity after the
+                           # checkpoint, plus the counts it was read with (kittrial-5bb.351).
+                           # Held actions only, exactly like the boolean it refines; a
+                           # legacy checkpoint yields null and a reader falls back to it.
+                           'newer_activity_marker': task.get('newer_activity_marker')
+                           if blocked or in_progress else None,
+                           'newer_activity_by_others': task.get('newer_activity_by_others')
+                           if blocked or in_progress else None,
+                           'newer_activity_own': task.get('newer_activity_own')
+                           if blocked or in_progress else None,
+                           'newer_activity_coverage': task.get('newer_activity_coverage')
+                           if blocked or in_progress else None,
+                           'unresolved_directions': task.get('unresolved_directions')
+                           if blocked or in_progress else None}
                 # Whose move it is, in the same words as the canonical `work --mine` row
                 # (kittrial-5bb.249): one helper, so the two answers cannot disagree about the
                 # move, the item count or the redelivery fact. The one deliberate difference is

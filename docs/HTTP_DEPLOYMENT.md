@@ -3349,6 +3349,20 @@ line separately and unconfined.
     coverage; its `newer.history` is the authorized task `/history` route. SSH-only
     `history_new` and `verify` commands are omitted. Read history to reconcile unknown
     coverage; reading acknowledges nothing.
+    - **A stable newer-activity marker (kittrial-5bb.351).** A held action (`blocked`
+      or `in-progress`) and every row of `GET /v1/agents/me/wait` carry
+      `newer_activity_marker` beside `newer_activity`, `newer_activity_by_others`,
+      `newer_activity_own`, `newer_activity_coverage` and `unresolved_directions`.
+      The marker is the newest other-party entry the agent's checkpoint did not
+      incorporate, written `<entry_id>:<16 hex>` where the hex is a short digest of
+      that entry's current content. It changes for each new other-party entry and
+      when that newest entry is **edited**, and it never encodes a timestamp. The
+      agent's own entries do not move it. It is `null` when the read is current,
+      without a valid checkpoint, or with unknown coverage (a legacy checkpoint
+      without per-entry digests); a client then falls back to `newer_activity`. The
+      wait fingerprint includes the marker, so a second coordinator comment, or an
+      edit to the newest one, wakes a waiting bridge even while the boolean stays
+      `true`. This is the one definition `kittrial-5bb.354` reuses.
     No kind was renumbered when these two were added. A
     client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,

@@ -262,6 +262,26 @@ class FingerprintTests(unittest.TestCase):
                       'whose_move': 'you', 'generated_at': '2030-01-01T00:00:00Z'})
         self.assertEqual(one['fingerprint'], two['fingerprint'])
 
+    def test_a_marker_change_alone_returns_again(self):
+        """kittrial-5bb.351: the second other-party comment wakes even while the boolean stays true."""
+        clock = FakeClock()
+        before = worker({'task': 't1', 'whose_move': 'you', 'review_state': 'in-progress',
+                         'newer_activity': True, 'newer_activity_marker': 't1-ca:aaaa'})
+        after = worker({'task': 't1', 'whose_move': 'you', 'review_state': 'in-progress',
+                        'newer_activity': True, 'newer_activity_marker': 't1-cb:bbbb'})
+        self.assertNotEqual(before['fingerprint'], after['fingerprint'])
+        read = scripted([before, after])
+        code, view = waiting.run_wait(read, since=before['fingerprint'], interval=60, timeout=600,
+                                      clock=clock.clock, sleep=clock.sleep)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual(view['fingerprint'], after['fingerprint'])
+        # A marker inside the web queue row's attention block is lifted too: the two
+        # transports must fingerprint the same task the same way.
+        nested = worker({'task': 't1', 'whose_move': 'you', 'review_state': 'in-progress',
+                         'attention': {'newer_activity': True,
+                                       'newer_activity_marker': 't1-cb:bbbb'}})
+        self.assertEqual(nested['fingerprint'], after['fingerprint'])
+
     def test_a_fingerprint_is_versioned(self):
         self.assertTrue(waiting.is_fingerprint(waiting.fingerprint([])))
         self.assertFalse(waiting.is_fingerprint('wait1:xyz'))
