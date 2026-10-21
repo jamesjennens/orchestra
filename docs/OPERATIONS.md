@@ -342,6 +342,28 @@ backup taken by an older kit while the deployment is rolled back silently omits
 it, and every recorded hand-back then reads inert (the `.336` coordinator move
 stands) until it is re-recorded.
 
+**Recording one from the host.** An installation operator records or withdraws a
+hand-back without a bound coordinator key or a web account:
+
+```sh
+python3 admin.py --root /path/to/root followon --project PROJECT --actor OPERATOR --file payload.json
+```
+
+The payload's own `operation` chooses the write: `{"schema_version":1,"operation":
+"record","task":"TASK","text":"..."}` or `{"schema_version":1,"operation":"withdraw",
+"target":"FOLLOWON_COMMENT_ID","reason":"..."}` (the shapes and their bounds are in
+[CLI_CONTRACT.md](CLI_CONTRACT.md)). `--actor` must itself be on the installation's
+operator allowlist (`operators` in `deployment.private.json`, read strictly), the
+recorded actor is exactly that name, and a payload that carries its own `actor` must
+name the same one; a non-operator caller or a differing payload actor is refused
+before a lock is taken and nothing is written. The command calls `followon.apply`, the
+same function the web route and `coordinator followon` call, under the project's
+`.coordination.lock` (and the deployment configuration lock), so validation, fact
+derivation and the journal cannot drift between the routes.
+
+**A comment changes no move.** On an integrated-but-open task a comment - including a
+coordinator's plain comment - changes nothing about whose move it is. A comment does not change whose move an integrated-but-open task is: record a hand-back or close the task.
+
 **An older kit refuses to restore a backup that holds `.assignee-followons/`.**
 Its fixed coordination-sidecar path whitelist does not know the journal, so its
 `restore-new` fails for the whole project with

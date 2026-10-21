@@ -9867,6 +9867,8 @@ def main():
     a=sub.add_parser('compact-guidance-acks',help='drop guidance acknowledgements for versions no longer current or previous (operator allowlist, audited)')
     a.add_argument('project');a.add_argument('--actor',required=True)
     a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('followon',help='record or withdraw a coordinator hand-back of an integrated-but-open task (operator allowlist, host journal)')
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-reconcile');a.add_argument('project');a.add_argument('--operation-id',required=True)
@@ -10417,6 +10419,48 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(handoff(path,args.actor,payload,run,operator=True)))
+    elif args.command=='followon':
+        # The installation operator's host route for the coordinator's recorded
+        # hand-back (kittrial-5bb.358): the confined coordinator's `coordinator
+        # followon` and the web route both refuse on this host when no coordinator
+        # key is bound. It calls the SAME followon.apply the endpoint calls at
+        # endpoint.py:1801 and :2213, under the SAME project coordination lock as the
+        # other host writes, so validation, fact derivation and the journal cannot
+        # drift. The payload's own `operation` decides record or withdraw.
+        import fcntl
+        import followon as followon_records
+        from keyed_records import require_configured_operator
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        if not isinstance(payload,dict):
+            raise ValueError('The hand-back payload must be a JSON object. Nothing was written.')
+        # A payload may repeat the command's actor, but only to AGREE with it: the
+        # recorded actor is exactly the --actor given to this command (kittrial-5bb.358
+        # coordinator addition). A differing value is refused, never silently ignored.
+        # An agreeing one is dropped, because the request shape followon.apply takes
+        # does not carry an actor at all (it derives the recorded fact from this name).
+        if 'actor' in payload and payload['actor']!=args.actor:
+            raise ValueError('The hand-back payload names actor %r but --actor is %r; the recorded actor is the '
+                             '--actor given to this command, so the two must match. Nothing was written.'
+                             %(payload['actor'],args.actor))
+        # Authority is the deployment allowlist, read strictly, and it is checked BEFORE
+        # the lock: a non-operator creates no coordination-lock file and reserves nothing.
+        # Inside the lock it is read again and handed to the library, exactly as the
+        # endpoint hands its configured set on (endpoint.py:1801, :2213).
+        require_configured_operator(args.actor,operators(root,strict=True),
+                                    'record or withdraw a hand-back')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        request=dict(payload)
+        request.pop('actor',None)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            authority=operators(root,strict=True)
+            require_configured_operator(args.actor,authority,'record or withdraw a hand-back')
+            print(json.dumps(followon_records.apply(request,args.actor,run,path,operators=authority),
+                             ensure_ascii=False))
     elif args.command=='requirement-backfill':
         import fcntl
         from requirement_records import backfill

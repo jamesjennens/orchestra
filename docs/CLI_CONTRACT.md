@@ -1787,6 +1787,23 @@ withdraws it, a new contribution becomes current, or the task closes. The web ro
 `POST .../assignee-followon/{fid}/withdraw` (body `reason`), both gated on
 `CAP_COORDINATE`. Every refusal ends "Nothing was written."
 
+**The host route (kittrial-5bb.358).** An installation operator records and withdraws
+the same records without a bound coordinator key or a web account:
+
+```sh
+python3 admin.py --root /path/to/root followon --project PROJECT --actor OPERATOR --file payload.json
+```
+
+The payload is the same JSON object as `coordinator followon` above; its own
+`operation` chooses record or withdraw. `--actor` must itself be on the installation's
+operator allowlist (`operators` in `deployment.private.json`, read strictly), the
+recorded actor is exactly that name, and a payload that carries its own `actor` must
+name the same one; a non-operator caller or a differing payload actor is refused
+before a lock is taken and nothing is written. The command takes the project's
+`.coordination.lock` and calls `followon.apply`, the same library function the
+`coordinator followon` and web routes call, so its validation, fact derivation and
+journal are identical.
+
 ## `docs` and `onboard`: the installed documents
 
 `docs` lists the catalogued documents and serves one whole; `docs --status` reports every
