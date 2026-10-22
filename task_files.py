@@ -68,6 +68,14 @@ LIMIT_DEFAULTS = {
     'min_free_bytes': 1024 * MIB,
     'max_transfers': 4,
     'max_transfers_per_actor': 2,
+    # r2 (review s1): one project may hold at most this many of the service's transfers, so one project's uploads
+    # cannot shut every other project out.
+    'max_transfers_per_project': 3,
+    # r2 (review s1): a transfer may take at most transfer_grace_seconds + bytes / min_transfer_bytes_per_second; a
+    # slower one (a client that trickles, or reads a download a byte at a time) is cut off and gives its slot back.
+    # The defaults let 25 MiB take 60 s + 800 s.
+    'min_transfer_bytes_per_second': 32 * 1024,
+    'transfer_grace_seconds': 60,
 }
 #: The two that may be 0 (keep no disk free) without meaning "nothing at all".
 LIMIT_ZERO_ALLOWED = ('min_free_bytes',)
@@ -160,7 +168,20 @@ def clean_name(name):
             or any(ord(c) < 32 or ord(c) == 127 for c in name):
         raise Refusal(422, 'invalid', 'A file name must be a plain name: no / or \\, no control '
                       'characters, not . or .., and no leading or trailing space.')
+    plain(name, 'A file name')
     return name
+
+
+def plain(value, label):
+    # r2 (review s3): the kit's rule for text other people read (review_workflow.plain_text): no control, bidi,
+    # zero-width, C1, tag or variation-selector characters. A name with a right-to-left override that shows as
+    # invoiceexe.jpg is refused, and so is a note or a reason that hides text.
+    from review_workflow import plain_text
+    try:
+        plain_text(value, label)
+    except ValueError as refused:
+        raise Refusal(422, 'invalid', str(refused) + '.') from None
+    return value
 
 
 def check_sha256(value):
@@ -191,7 +212,7 @@ def check_text(value, label, limit, required=False):
         return None
     if not isinstance(value, str) or len(value) > limit or '\0' in value:
         raise Refusal(422, 'invalid', 'The %s is text of at most %d characters.' % (label, limit))
-    return value
+    return plain(value, 'The ' + label)
 
 
 def task_key(task):
@@ -295,22 +316,53 @@ def open_blob(project, sha256):
     return os.fdopen(descriptor, 'rb')
 
 
-def project_bytes(project):
-    """The bytes stored in the project's folder: every blob, live or withdrawn (all on disk)."""
-    base = folder(project)
-    if base is None:
-        return 0
-    total = 0
-    with os.scandir(str(base)) as entries:
-        for entry in entries:
-            if len(entry.name) != 2 or not re.fullmatch(r'[0-9a-f]{2}', entry.name) \
-                    or not entry.is_dir(follow_symlinks=False):
+def referenced(project):
+    """Every sha256 a journal entry of any task names, live or withdrawn (r2, review s2)."""
+    records = _sub(project, RECORDS, False) if folder(project) is not None else None
+    found = set()
+    if records is None:
+        return found
+    with os.scandir(str(records)) as tasks:
+        for task in tasks:
+            if not task.is_dir(follow_symlinks=False):
                 continue
-            with os.scandir(entry.path) as blobs:
-                for blob in blobs:
-                    if SHA256.fullmatch(blob.name) and blob.is_file(follow_symlinks=False):
-                        total += blob.stat(follow_symlinks=False).st_size
+            with os.scandir(task.path) as items:
+                for item in items:
+                    name = item.name
+                    if name.endswith('.json') and SHA256.fullmatch(name[:-5]) and item.is_file(follow_symlinks=False):
+                        found.add(name[:-5])
+    return found
+
+
+def project_bytes(project):
+    """The bytes the project's records hold: every blob a journal entry names, live or withdrawn.
+
+    r2 (review s2): a blob no entry names (an upload whose record was then refused, a process killed between the
+    two) is not counted, so it can never use up the project's limit; it is removed where it is made (discard) or by
+    the operator purge of a later slice.
+    """
+    total = 0
+    for sha256 in referenced(project):
+        size = blob_size(project, sha256)
+        if size is not None:
+            total += size
     return total
+
+
+def discard(project, sha256):
+    """Remove a blob that THIS upload stored when no journal entry names it (r2, review s2); True when removed."""
+    if sha256 in referenced(project):
+        return False
+    path = blob_path(project, sha256)
+    if path is None:
+        return False
+    try:
+        if stat.S_ISREG(os.lstat(str(path)).st_mode):
+            os.unlink(str(path))
+            return True
+    except FileNotFoundError:
+        pass
+    return False
 
 
 def free_bytes(project):
@@ -463,8 +515,24 @@ def check_room(project, task, length, limit, present=None):
                                                      size_text(length), size_text(max(free - length, 0))))
 
 
+def transfer_seconds(length, limit):
+    """How long a transfer of ``length`` bytes may take (r2, review s1)."""
+    return limit['transfer_grace_seconds'] + length / float(limit['min_transfer_bytes_per_second'])
+
+
+def too_slow(length, limit):
+    return Refusal(408, 'request_timeout', 'The transfer was slower than the server allows (%s a second after %d '
+                   'seconds; %s and %s); nothing was stored.'
+                   % (size_text(limit['min_transfer_bytes_per_second']), limit['transfer_grace_seconds'],
+                      setting('min_transfer_bytes_per_second'), setting('transfer_grace_seconds')))
+
+
 def receive(read, length, project, expected=None, step=None):
-    """Store exactly ``length`` bytes from ``read`` (``read(n) -> bytes``); returns ``(sha256, length)``.
+    """Store exactly ``length`` bytes from ``read`` (``read(n) -> bytes``); returns ``(sha256, length, created)``.
+
+    ``created`` is True when this call put the blob in place (r2, review s2: the caller removes it again with
+    :func:`discard` when its record is then refused). ``read`` may raise :class:`Refusal` itself (the caller's
+    deadline, review s1); the temporary file is removed then too.
 
     The bytes go to a fresh temporary file (``O_EXCL``, mode 0600) in 64 KiB steps while they
     are hashed and counted; nothing is held whole. Fewer bytes than ``length`` (the client
@@ -514,7 +582,7 @@ def receive(read, length, project, expected=None, step=None):
             kept = True
         elif not stat.S_ISREG(info.st_mode):
             raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file is not a regular file'))
-        return sha256, count
+        return sha256, count, kept
     finally:
         if not kept:
             try:

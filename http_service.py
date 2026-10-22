@@ -4204,28 +4204,40 @@ class TransferGate:
         self._lock = threading.Lock()
         self._total = 0
         self._by = {}
+        self._projects = {}         # r2 (review s1): one project's share of the service's transfers
 
-    def take(self, key, limit):
+    def take(self, key, limit, project=None):
         with self._lock:
             if self._total >= limit['max_transfers']:
                 raise busy(TRANSFERS_BUSY % task_files.setting('max_transfers'), retry_after=1)
             if self._by.get(key, 0) >= limit['max_transfers_per_actor']:
                 raise busy(TRANSFERS_BUSY % task_files.setting('max_transfers_per_actor'), retry_after=1)
+            if project is not None and self._projects.get(project, 0) >= limit['max_transfers_per_project']:
+                raise busy(TRANSFERS_BUSY % task_files.setting('max_transfers_per_project'), retry_after=1)
             self._total += 1
             self._by[key] = self._by.get(key, 0) + 1
+            if project is not None:
+                self._projects[project] = self._projects.get(project, 0) + 1
 
-    def give(self, key):
+    def give(self, key, project=None):
         with self._lock:
             self._total -= 1
-            left = self._by.get(key, 1) - 1
-            if left > 0:
-                self._by[key] = left
-            else:
-                self._by.pop(key, None)
+            for table, name in ((self._by, key), (self._projects, project)):
+                if name is None:
+                    continue
+                left = table.get(name, 1) - 1
+                if left > 0:
+                    table[name] = left
+                else:
+                    table.pop(name, None)
 
     def held(self):
         with self._lock:
             return self._total, dict(self._by)
+
+    def projects(self):
+        with self._lock:
+            return dict(self._projects)
 
 
 #: One gate for handlers made without :func:`build_handler` (a test's own subclass).
@@ -4644,6 +4656,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                         raise forbidden('CSRF token missing or invalid')
         return payload, auth_source
 
+    def handle_expect_100(self):
+        # r2 (review s4c): never "100 Continue" before the route has authorized the request and checked its limits.
+        # http.server answers it while it parses the request line; here it is only noted, and _continue sends it
+        # where the body is about to be read: at once for a JSON body (as before), and for the streamed upload only
+        # after every check passed. A refused upload is answered with its refusal and the connection closed.
+        self._expect_100 = True
+        return True
+
+    def _continue(self):
+        if getattr(self, '_expect_100', False):
+            self._expect_100 = False
+            self.send_response_only(100)
+            self.end_headers()
+
     def _read_body(self):
         length_header = self.headers.get('Content-Length')
         if length_header is None:
@@ -4658,6 +4684,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise HttpError(413, 'payload_too_large', 'Request body exceeds the configured limit')
         if length == 0:
             return b''
+        self._continue()
         if not getattr(self, '_guarded', False):
             return self.rfile.read(length)
         self.server.watch(self.connection, self.server.client_seconds)
@@ -4712,6 +4739,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_header('Strict-Transport-Security', HSTS_HEADER)
 
     def _send_json(self, status, body):
+        self._expect_100 = False            # r2 (s4c): one request's Expect ends with its answer
         # 204/304 are bodyless by definition; sending a body would desynchronize an
         # HTTP/1.1 keep-alive connection.
         payload = b'' if status in (204, 304) else \
@@ -4950,13 +4978,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 'task=%s sha256=%s' % (ctx.params['tid'], sha256 or ctx.params.get('sha') or '-')
 
     def _files_audit(self, ctx, action, outcome, reason, actor=None):
+        # r2 (review s4e): an audit line that cannot be recorded is said in the service's log, with what it was
+        # about (never a secret: the action, outcome, task and digest); the answer itself is not changed by it.
         try:
             with self.service.store.lock:
                 self.service.audit(ctx.request_id, ctx.principal, action, outcome,
                                    project_id=ctx.params['pid'], reason=reason, actor=actor)
                 self.service.store.save_soon('the audit entry of a task file')
-        except Exception:
-            pass
+            return True
+        except Exception as failed:
+            print('audit: the %s line (%s, %s) of request %s could not be recorded: %s'
+                  % (action, outcome, ascii(str(reason)[:200]), ctx.request_id,
+                     ascii(str(failed)[:200]) or type(failed).__name__), file=sys.stderr, flush=True)
+            return False
 
     def _files_refused(self, ctx, action, error, sha256=None):
         # One audit line for a refused upload, download or withdrawal, then the refusal itself.
@@ -4968,22 +5002,64 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._audited_refusal = True
         return error
 
-    def _files_reader(self):
-        # read(n): at most n bytes of the body, waiting on the client under the same bound as a
-        # JSON body, re-armed for every 64 KiB step so a slow upload that keeps moving goes on.
+    def _files_reader(self, length, limit):
+        # read(n): at most n bytes of the body. Each wait on the client is bounded by the client deadline AND by
+        # what is left of the whole transfer's time (r2, review s1: transfer_grace_seconds + length /
+        # min_transfer_bytes_per_second), so a client that trickles is cut off and its slot given back.
         guarded = getattr(self, '_guarded', False)
+        ends = time.monotonic() + task_files.transfer_seconds(length, limit)
 
         def read(count):
+            left = ends - time.monotonic()
+            if left <= 0:
+                raise task_files.too_slow(length, limit)
+            wait = max(0.05, min(self.server.client_seconds, left)) if guarded else left
             if guarded:
-                self.server.watch(self.connection, self.server.client_seconds)
+                self.server.watch(self.connection, wait)
+            before = self.connection.gettimeout()
             try:
-                return self.rfile.read(count)
+                # The socket's own timeout too: on Windows the reaper's shutdown does not end a wait that is under
+                # way in another thread, the timeout does.
+                self.connection.settimeout(wait)
+                chunk = self.rfile.read(count)
             except OSError:
-                return b''
+                chunk = b''
             finally:
+                try:
+                    self.connection.settimeout(before)
+                except OSError:
+                    pass
                 if guarded:
                     self.server.unwatch(self.connection)
+            if time.monotonic() >= ends:
+                raise task_files.too_slow(length, limit)
+            return chunk
         return read
+
+    def _files_send(self, chunk, ends):
+        # One step of a download under what is left of its time (r2, review s1): a client that reads too slowly
+        # is cut off by the server's reaper; the caller gives the slot back and closes the connection.
+        inner = getattr(self.wfile, '_inner', self.wfile)
+        left = ends - time.monotonic()
+        if left <= 0:
+            raise ConnectionAbortedError('the download was slower than the server allows')
+        guarded = getattr(self, '_guarded', False)
+        wait = max(0.05, min(self.server.client_seconds, left)) if guarded else left
+        if guarded:
+            self.server.watch(self.connection, wait)
+        before = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(wait)           # as in the reader: a send that is stuck ends on Windows too
+            inner.write(chunk)
+        except (TimeoutError, OSError):
+            raise ConnectionAbortedError('the client did not take the download') from None
+        finally:
+            try:
+                self.connection.settimeout(before)
+            except OSError:
+                pass
+            if guarded:
+                self.server.unwatch(self.connection)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/files')
     def tasks_files_list(self, ctx):
@@ -5007,6 +5083,10 @@ class ApiHandler(BaseHTTPRequestHandler):
     def tasks_file_put(self, ctx):
         action = 'tasks.files.upload'
         try:
+            if self.headers.get('Transfer-Encoding') is not None:
+                # r2 (review s4b): http.server does not undo chunked framing, which would be stored as the file.
+                raise HttpError(400, 'invalid', 'An upload is sent with a Content-Length, not with Transfer-Encoding; '
+                                'nothing was stored.')
             project = self._files_project(ctx)
             record, _role = self._project(ctx, CAP_TASKS)
             if isinstance(record, dict) and record.get('archived'):
@@ -5052,11 +5132,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             task_files.check_room(project, tid, length, limit)
             gate = self.transfers or DEFAULT_TRANSFERS
             key = self._files_key(ctx)
-            gate.take(key, limit)
+            gate.take(key, limit, ctx.params['pid'])
             try:
-                sha256, size = task_files.receive(self._files_reader(), length, project, expected)
+                self._continue()                        # r2 (s4c): only now may the client send the body
+                sha256, size, created = task_files.receive(self._files_reader(length, limit), length, project, expected)
             finally:
-                gate.give(key)
+                gate.give(key, ctx.params['pid'])
         except (HttpError, task_files.Refusal) as error:
             raise self._files_refused(ctx, action, error) from None
         payload = {'operation': operation, 'task_id': tid, 'sha256': sha256, 'name': name, 'bytes': size,
@@ -5068,9 +5149,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                                          ctx.idempotency_key, target=ctx.route_target,
                                          authorize=ctx.authorize, capability=capability)
             return result, result
-        status, result = self._mutate(ctx, action, ctx.params['pid'], write, capability=capability,
-                                      status=201, serialize=False, canonical=True,
-                                      reason=self._files_target(ctx, sha256))
+        try:
+            status, result = self._mutate(ctx, action, ctx.params['pid'], write, capability=capability,
+                                          status=201, serialize=False, canonical=True,
+                                          reason=self._files_target(ctx, sha256))
+        except HttpError as refused:
+            # r2 (review s2): a record that was refused leaves no blob behind that this upload stored and no record
+            # names. Only for a definite refusal: a 5xx that does not say nothing was done may follow a written
+            # record (a retry settles it), so its blob stays.
+            if created and (refused.status < 500 or getattr(refused, 'nothing_done', False)):
+                task_files.discard(project, sha256)
+            raise
         if isinstance(result, dict):
             result = dict(result)
             status = result.pop('status', status)
@@ -5082,12 +5171,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         sha256 = ctx.params['sha']
         try:
             project = self._files_project(ctx)
-            self._project(ctx, CAP_READ)
+            record, _role = self._project(ctx, CAP_READ)
             actor = self._files_actor(ctx)
             row = self._files_row(ctx)
-            if not (self._files_coordinates(ctx) or task_files.is_assignee(row, actor)):
+            coordinates = self._files_coordinates(ctx)
+            if not (coordinates or task_files.is_assignee(row, actor)):
                 raise forbidden('Only the task\'s current assignee and the project\'s coordinators may download its '
                                 'files.')
+            if isinstance(record, dict) and record.get('archived') and not coordinates:
+                # r2 (review s4d): an archived project is read-only; its files stay downloadable by its coordinators.
+                raise forbidden('The project is archived: only its coordinators download its files.')
             entry = task_files.read_entry(project, ctx.params['tid'], sha256)
             if entry is None or entry.get('withdrawn') is not None:
                 raise not_found('No such file on this task.')
@@ -5105,10 +5198,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                         409, 'conflict', 'The stored file does not match its record (its size changed); it is not '
                         'served. An operator must look at it.'), sha256)
                 try:
-                    gate.take(key, limit)
+                    gate.take(key, limit, ctx.params['pid'])
                 except HttpError as error:
                     raise self._files_refused(ctx, action, error, sha256) from None
                 sent = 0
+                ends = time.monotonic() + task_files.transfer_seconds(size, limit)
                 try:
                     self.send_response(200)
                     self.send_header('Content-Type', task_files.OPAQUE)
@@ -5126,10 +5220,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                         chunk = handle.read(min(task_files.STEP, size - sent))
                         if not chunk:
                             break
-                        self.wfile.write(chunk)
+                        self._files_send(chunk, ends)
                         sent += len(chunk)
+                except ConnectionError:
+                    self.close_connection = True       # cut off, too slow, or gone: nothing more to answer
                 finally:
-                    gate.give(key)
+                    gate.give(key, ctx.params['pid'])
                     self._files_audit(ctx, action, 'committed' if sent == size else 'interrupted',
                                       '%s bytes=%d' % (self._files_target(ctx, sha256), sent), actor=actor)
                 if sent != size:
@@ -5144,7 +5240,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         sha256 = ctx.params['sha']
         try:
             project = self._files_project(ctx)
-            self._project(ctx, CAP_TASKS)
+            record, _role = self._project(ctx, CAP_TASKS)
+            if isinstance(record, dict) and record.get('archived'):
+                raise conflict('The project is archived: its files are read-only and none is withdrawn.')
             payload = dict(ctx.payload or {})
             refuse_unknown_fields(payload, ('reason',), 'A file withdrawal')
             reason = task_files.check_text(payload.get('reason'), 'reason', task_files.REASON_LIMIT, required=True)

@@ -39,8 +39,14 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-SMALL = {'max_file_bytes': 4096, 'max_files_per_task': 3, 'max_task_bytes': 6000, 'max_project_bytes': 9000,
-         'min_free_bytes': 0, 'max_transfers': 4, 'max_transfers_per_actor': 2}
+SMALL = dict(task_files.LIMIT_DEFAULTS, max_file_bytes=4096, max_files_per_task=3, max_task_bytes=6000,
+             max_project_bytes=9000, min_free_bytes=0, max_transfers=4, max_transfers_per_actor=2)
+SMALL_RATE = dict(task_files.LIMIT_DEFAULTS, min_transfer_bytes_per_second=1000, transfer_grace_seconds=1)
+
+
+def http_auth_forbidden(message):
+    import http_auth
+    return http_auth.forbidden(message)
 
 
 class TaskFilesStoreTests(unittest.TestCase):
@@ -97,7 +103,7 @@ class TaskFilesStoreTests(unittest.TestCase):
         def read(count):
             reads.append(count)
             return stream.read(count)
-        digest, size = task_files.receive(read, len(data), self.project)
+        digest, size, _ = task_files.receive(read, len(data), self.project)
         self.assertEqual((sha(data), len(data)), (digest, size))
         self.assertTrue(all(count <= task_files.STEP for count in reads), reads)
         stored = self.project / task_files.FOLDER / digest[:2] / digest
@@ -196,7 +202,7 @@ class TaskFilesStoreTests(unittest.TestCase):
         return run, comments
 
     def _record(self, operation, actor, rows, data=b'hello', task='t1', name='a.txt', direction=None):
-        digest, size = task_files.receive(io.BytesIO(data).read, len(data), self.project)
+        digest, size, _ = task_files.receive(io.BytesIO(data).read, len(data), self.project)
         run, comments = self._run(task, rows)
         payload = {'schema_version': 1, 'operation': operation, 'task': task, 'sha256': digest, 'name': name,
                    'bytes': size, 'media_type': task_files.OPAQUE,
@@ -279,11 +285,50 @@ class TaskFilesStoreTests(unittest.TestCase):
         with self.assertRaises(task_files.Refusal) as caught:
             task_files.apply(payload, 'coord', run, self.project, lambda: 'now')
         self.assertEqual(409, caught.exception.status)
-        digest, size = task_files.receive(io.BytesIO(b'real').read, 4, self.project)
+        digest, size, _ = task_files.receive(io.BytesIO(b'real').read, 4, self.project)
         with self.assertRaises(task_files.Refusal):
             task_files.apply(dict(payload, sha256=digest, bytes=size + 1), 'coord', run, self.project, lambda: 'now')
         self.assertEqual([], comments, 'nothing was recorded')
         self.assertIsNone(task_files.read_entry(self.project, 't1', digest))
+
+    def test_r2_s3_names_notes_and_reasons_are_plain_text(self):
+        # Review s3: a right-to-left override that shows "invoiceexe.jpg", a zero-width space, a C1 control, a tag
+        # character and a variation selector are refused in a name, a note and a reason alike.
+        for bad in ('invoice‮gpj.exe', 'a​b', 'a\u0085b', 'a\U000e0041b', 'a\U000e0100b', 'a⁦b'):
+            with self.assertRaises(task_files.Refusal, msg=repr(bad)) as caught:
+                task_files.clean_name(bad)
+            self.assertEqual(422, caught.exception.status)
+            for label in ('note', 'reason'):
+                with self.assertRaises(task_files.Refusal, msg=repr(bad)):
+                    task_files.check_text(bad, label, 1000)
+        self.assertEqual('Plan ünïcode (2).xlsx', task_files.clean_name('Plan ünïcode (2).xlsx'))
+        self.assertEqual('line one\nline two', task_files.check_text('line one\nline two', 'note', 1000))
+
+    def test_r2_s2_project_bytes_counts_only_referenced_blobs_and_discard_removes_an_orphan(self):
+        rows = {'t1': {'status': 'open', 'assignee': 'worker'}}
+        _, _, kept = self._record('coordinator-record', 'coord', rows, data=b'kept bytes')
+        orphan, size, created = task_files.receive(io.BytesIO(b'orphan!').read, 7, self.project)
+        self.assertTrue(created)
+        self.assertEqual(len(b'kept bytes'), task_files.project_bytes(self.project), 'the orphan is not counted')
+        self.assertFalse(task_files.discard(self.project, kept), 'a referenced blob is never removed')
+        self.assertTrue(task_files.discard(self.project, orphan))
+        self.assertIsNone(task_files.blob_size(self.project, orphan))
+        self.assertIsNotNone(task_files.blob_size(self.project, kept))
+        self.assertFalse(task_files.receive(io.BytesIO(b'kept bytes').read, 10, self.project)[2], 'already stored')
+
+    def test_r2_s1_a_reader_past_its_deadline_is_refused_408_and_nothing_is_stored(self):
+        def read(count, state={'n': 0}):
+            state['n'] += 1
+            if state['n'] > 1:
+                raise task_files.too_slow(10 ** 6, SMALL_RATE)
+            return b'x' * count
+        with self.assertRaises(task_files.Refusal) as caught:
+            task_files.receive(read, 10 ** 6, self.project)
+        self.assertEqual(408, caught.exception.status)
+        self.assertIn('task_files.min_transfer_bytes_per_second', str(caught.exception))
+        self.assertEqual([], os.listdir(self.project / task_files.FOLDER / task_files.TMP))
+        self.assertAlmostEqual(60 + 25 * task_files.MIB / (32 * 1024.0), task_files.transfer_seconds(25 * task_files.MIB,
+                               task_files.LIMIT_DEFAULTS))
 
     def test_record_texts_are_reserved_on_the_raw_comment_path(self):
         entry = {'name': 'a', 'sha256': 'a' * 64, 'bytes': 1, 'media_type': task_files.OPAQUE,
@@ -629,6 +674,7 @@ class TaskFilesHttpTests(agents.AgentHarness):
         self.assertEqual([], os.listdir(elsewhere))
 
     def test_concurrent_uploads_at_the_transfer_caps_get_503_with_retry_after(self):
+        self.limit['max_transfers_per_project'] = 4        # the project's share has its own test (r2)
         gate = self.httpd.RequestHandlerClass.transfers
         held = []
 
@@ -690,6 +736,187 @@ class TaskFilesHttpTests(agents.AgentHarness):
         self.assertTrue(any(c['text'].startswith(task_files.WITHDRAWN_PREFIX) for c in comments))
         self.assertEqual(['committed'], [e['outcome'] for e in self.audit_lines('tasks.files.withdraw')
                                          if e['outcome'] == 'committed'])
+
+    # -- r2 (review 01a16364) ----------------------------------------------------------------------
+    def test_r2_s1_a_trickling_upload_is_cut_off_and_gives_its_slot_back(self):
+        self.limit.update(min_transfer_bytes_per_second=10 ** 6, transfer_grace_seconds=1)
+        gate = self.httpd.RequestHandlerClass.transfers
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=30)
+        try:
+            body = b'z' * 400000
+            head = ('PUT %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Length: %d\r\n\r\n'
+                    % (self.files_path(name='slow.bin', direction='to-worker'), self.tokens['coord'], len(body)))
+            sock.sendall(head.encode() + body[:1000])
+            started = time.monotonic()
+            for _ in range(10):                                   # a trickle: 10 bytes a second
+                try:
+                    sock.sendall(b'z' * 10)
+                except OSError:
+                    break
+                time.sleep(1)
+                if gate.held()[0] == 0:
+                    break
+            self.assertEqual((0, {}), gate.held(), 'the slot is given back')
+            self.assertLess(time.monotonic() - started, 8, 'cut off at the deadline, not by the client')
+        finally:
+            sock.close()
+        self.assertEqual([], self.stored())
+        self.assertTrue(any('request_timeout' in (e.get('reason') or '') for e in self.audit_lines('tasks.files.upload')))
+
+    def test_r2_s1_a_download_read_too_slowly_is_cut_off_and_gives_its_slot_back(self):
+        data = os.urandom(8 * task_files.MIB)
+        digest = self.given(data, name='big.bin')
+        self.limit.update(min_transfer_bytes_per_second=10 ** 7, transfer_grace_seconds=1)
+        gate = self.httpd.RequestHandlerClass.transfers
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=30)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.sendall(('GET %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n\r\n'
+                          % (self.files_path(sha256=digest), self.tokens['worker'])).encode())
+            sock.recv(100)                                        # then reads nothing more
+            for _ in range(100):
+                if gate.held()[0] == 0:
+                    break
+                time.sleep(0.1)
+            self.assertEqual((0, {}), gate.held(), 'the slot is given back')
+        finally:
+            sock.close()
+        for _ in range(50):
+            if any(e['outcome'] == 'interrupted' for e in self.audit_lines('tasks.files.download')):
+                break
+            time.sleep(0.1)
+        self.assertIn('interrupted', [e['outcome'] for e in self.audit_lines('tasks.files.download')])
+
+    def test_r2_s1_one_project_holds_at_most_its_share_of_the_transfers(self):
+        self.limit.update(max_transfers=4, max_transfers_per_actor=4, max_transfers_per_project=1)
+        gate = self.httpd.RequestHandlerClass.transfers
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=30)
+        try:
+            body = b'p' * 300000
+            sock.sendall(('PUT %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Length: %d\r\n\r\n'
+                          % (self.files_path(name='one', direction='to-worker'), self.tokens['coord'], len(body))).encode()
+                         + body[:1000])
+            for _ in range(200):
+                if gate.held()[0] == 1:
+                    break
+                time.sleep(0.01)
+            second = self.upload(self.tokens['coord2'], b'second', name='two')
+            self.assertEqual(503, second.status, second.data)
+            self.assertIn('(task_files.max_transfers_per_project)', second.data['error']['message'])
+            self.assertEqual({self.pid: 1}, gate.projects())
+            sock.sendall(body[1000:])
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            response.read()
+            self.assertEqual(201, response.status)
+        finally:
+            sock.close()
+        self.assertEqual({}, gate.projects())
+
+    def test_r2_s2_a_refused_record_leaves_no_blob_and_the_listed_blobs_are_all_that_is_stored(self):
+        first = self.raw('PUT', self.files_path(name='a.txt', direction='to-worker'), self.tokens['coord'], b'first file',
+                         headers={'Idempotency-Key': 'files-key-0001'})
+        self.assertEqual(201, first.status, first.data)
+        reused = self.raw('PUT', self.files_path(name='b.txt', direction='to-worker'), self.tokens['coord'], b'other bytes',
+                          headers={'Idempotency-Key': 'files-key-0001'})
+        self.assertEqual(409, reused.status, reused.data)
+        invoke = self.backend.invoke
+
+        def lost_the_task(route, *a, **k):
+            if route == 'files.record':
+                raise http_auth_forbidden('the assignee changed meanwhile')
+            return invoke(route, *a, **k)
+        self.backend.invoke = lost_the_task
+        refused = self.upload(self.tokens['coord'], b'refused at the record', name='c.txt')
+        self.assertEqual(403, refused.status, refused.data)
+        self.backend.invoke = invoke
+        third = self.upload(self.tokens['coord'], b'third file', name='d.txt')
+        self.assertEqual(201, third.status, third.data)
+        listed = sorted(i['sha256'] for i in self.listing(self.tokens['coord']).data['items'])
+        self.assertEqual(listed, self.stored(), 'exactly the listed blobs are on disk')
+        self.assertEqual(len(b'first file') + len(b'third file'),
+                         task_files.project_bytes(self.files_root / self.pid))
+
+    def test_r2_s4a_an_aborted_download_gives_its_slot_back(self):
+        digest = self.given(os.urandom(4 * task_files.MIB), name='abort.bin')
+        gate = self.httpd.RequestHandlerClass.transfers
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=30)
+        sock.sendall(('GET %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n\r\n'
+                      % (self.files_path(sha256=digest), self.tokens['worker'])).encode())
+        sock.recv(65536)
+        sock.close()                                              # gone mid-download
+        for _ in range(200):
+            if gate.held() == (0, {}) and any(e['outcome'] == 'interrupted' for e in self.audit_lines('tasks.files.download')):
+                break
+            time.sleep(0.05)
+        self.assertEqual((0, {}), gate.held())
+        self.assertEqual({}, gate.projects())
+        self.assertIn('interrupted', [e['outcome'] for e in self.audit_lines('tasks.files.download')])
+
+    def test_r2_s4b_transfer_encoding_is_refused_and_nothing_is_stored(self):
+        chunked = b'5\r\nhello\r\n0\r\n\r\n'
+        answer = self.raw('PUT', self.files_path(name='chunked.txt', direction='to-worker'), self.tokens['coord'], chunked,
+                          headers={'Transfer-Encoding': 'chunked'})
+        self.assertEqual(400, answer.status, answer.data)
+        self.assertIn('Transfer-Encoding', answer.data['error']['message'])
+        self.assertEqual([], self.stored())
+
+    def test_r2_s4c_no_100_continue_before_the_checks_and_one_after_them(self):
+        def expect(token, direction):
+            sock = socket.create_connection(('127.0.0.1', self.port), timeout=30)
+            try:
+                sock.sendall(('PUT %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Length: 5\r\n'
+                              'Expect: 100-continue\r\n\r\n' % (self.files_path(name='e.txt', direction=direction), token)).encode())
+                first = sock.recv(4096).decode('latin-1')
+                if first.startswith('HTTP/1.1 100'):
+                    sock.sendall(b'hello')
+                    rest = b''
+                    while b'\r\n\r\n' not in rest:
+                        rest += sock.recv(4096)
+                    return first, rest.decode('latin-1')
+                return first, None
+            finally:
+                sock.close()
+        first, rest = expect(self.tokens['viewer'], 'to-worker')
+        self.assertTrue(first.startswith('HTTP/1.1 403'), first)
+        self.assertIsNone(rest, 'no 100 Continue before the refusal')
+        first, rest = expect(self.tokens['coord'], 'to-worker')
+        self.assertTrue(first.startswith('HTTP/1.1 100'), first)
+        self.assertTrue(rest.startswith('HTTP/1.1 201'), rest)
+
+    def test_r2_s4d_an_archived_project_serves_its_coordinators_only_and_takes_no_withdrawal(self):
+        digest = self.given()
+        self.assertEqual(201, self.upload(self.tokens['worker'], b'res', name='r.txt', direction='from-worker').status)
+        archived = self.request('POST', '/v1/projects/%s/archive' % self.pid, {}, token=self.admin)
+        self.assertEqual(200, archived.status, archived.data)
+        status, _, body = self.download(self.tokens['worker'], digest)
+        self.assertEqual(403, status)
+        self.assertNotIn(b'input', body)
+        self.assertEqual(200, self.download(self.tokens['coord'], digest)[0])
+        refused = self.request('POST', self.files_path(sha256=digest) + '/withdraw', {'reason': 'x'}, token=self.tokens['coord'])
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('archived', refused.data['error']['message'])
+
+    def test_r2_s4e_an_audit_line_that_cannot_be_recorded_is_said_in_the_log(self):
+        digest = self.given()
+        import contextlib
+        err = io.StringIO()
+        original = self.service.audit
+
+        def broken(*a, **k):
+            if a[2] == 'tasks.files.download':
+                raise OSError('disk full')
+            return original(*a, **k)
+        self.service.audit = broken
+        try:
+            with contextlib.redirect_stderr(err):
+                status, _, body = self.download(self.tokens['worker'], digest)
+                time.sleep(0.2)
+        finally:
+            self.service.audit = original
+        self.assertEqual(200, status)
+        self.assertIn('audit: the tasks.files.download line (committed', err.getvalue())
+        self.assertIn('disk full', err.getvalue())
 
     def test_a_coordinator_withdraws_anyone_s_file(self):
         mine = self.upload(self.tokens['worker'], b'x1', name='r.txt', direction='from-worker')

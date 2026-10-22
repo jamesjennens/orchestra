@@ -3746,13 +3746,28 @@ tools, the SSH framing, backups of the folder and the operator commands come lat
   `X-Orchestra-SHA256`, when sent, must match (`422`). Only a complete file is renamed into
   place. `201` answers with the record; the same file under the same name again answers `200`
   (sent with `X-Orchestra-SHA256`, without reading the body again).
+  - A request with `Transfer-Encoding` (chunked) is refused (`400`): the body must be sent with
+    a `Content-Length`.
+  - `Expect: 100-continue` is answered with `100 Continue` only after the caller was authorized
+    and the limits were checked; a refused upload gets its refusal instead, and the connection
+    is closed.
+  - A transfer has a time limit: `transfer_grace_seconds` plus its size divided by
+    `min_transfer_bytes_per_second` (60 s + 800 s for 25 MiB by default). An upload that is
+    slower is refused (`408`) and nothing is stored; a download that is read more slowly is cut
+    off. Either way its place among the transfers is given back.
+  - When the record of an upload is refused (another body under the same `Idempotency-Key`, the
+    caller lost the task meanwhile, the endpoint refused it), the bytes this upload stored are
+    removed again unless a record names them. Only bytes that a record names count towards
+    `max_project_bytes`.
 - **Downloads** are `application/octet-stream` with `Content-Disposition: attachment`
   (`filename*=UTF-8''...`), `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`,
   `Content-Security-Policy: sandbox; default-src 'none'`, `Content-Length` and
   `X-Orchestra-SHA256`. A client checks the digest before it keeps the file.
 - **Where:** `projects/NAME/.task-files/`, beside the project's other kit-owned state. Blobs are
   named by the server, `<first two hex>/<sha256>`; the name a person gives is a label only (at
-  most 128 characters, no `/` or `\`, no control characters, not `.` or `..`). `.task-files`,
+  most 128 characters, no `/` or `\`, not `.` or `..`, and plain text by the kit's rule for text
+  other people read: no control, bidi, zero-width, C1, tag or variation-selector characters; a
+  note and a withdrawal reason follow the same rule). `.task-files`,
   or any folder in it, that is a symlink or not a folder is refused (`503`) and nothing is
   written or served through it.
 - **What makes a file attached** is its host journal entry under `.task-files/records/`,
@@ -3764,6 +3779,10 @@ tools, the SSH framing, backups of the folder and the operator commands come lat
 - **Audit:** every upload, download and withdrawal, and every refusal of one, is one line in
   the service's audit (`tasks.files.upload`, `tasks.files.download`, `tasks.files.withdraw`)
   with `task=... sha256=...` in the reason, readable with `GET /v1/projects/{id}/audit`.
+- **An archived project** is read-only: its files are downloaded by its coordinators only, and
+  nothing is attached or withdrawn (`409`).
+- **Audit:** a line that cannot be recorded is said in the service's log (`audit: the ... line
+  ... could not be recorded`), with the action, outcome, task and digest.
 - **Not yet:** the folder is not in backups (slice 5): copy `projects/NAME/.task-files/` with the
   project until then. Withdrawn bytes stay on disk until the operator purge of slice 5.
 
@@ -3775,7 +3794,8 @@ number keeps its default, with a warning in the service's log:
 ```json
 {"task_files": {"max_file_bytes": 26214400, "max_files_per_task": 20, "max_task_bytes": 104857600,
                 "max_project_bytes": 2147483648, "min_free_bytes": 1073741824,
-                "max_transfers": 4, "max_transfers_per_actor": 2}}
+                "max_transfers": 4, "max_transfers_per_actor": 2, "max_transfers_per_project": 3,
+                "min_transfer_bytes_per_second": 32768, "transfer_grace_seconds": 60}}
 ```
 
 | Setting | Default | Refusal |
@@ -3787,6 +3807,9 @@ number keeps its default, with a warning in the service's log:
 | `min_free_bytes` | 1 GiB | `507`: the upload would leave less free on the project's disk |
 | `max_transfers` | 4 | `503` with `Retry-After` |
 | `max_transfers_per_actor` | 2 (per credential, else per account) | `503` with `Retry-After` |
+| `max_transfers_per_project` | 3 (one project's share of `max_transfers`) | `503` with `Retry-After` |
+| `min_transfer_bytes_per_second` | 32 KiB | `408` for an upload; a download is cut off |
+| `transfer_grace_seconds` | 60 | (added to the time above) |
 
 A reverse proxy in front of the site has its own body limit (nginx `client_max_body_size`);
 raise it to `max_file_bytes`, or uploads near the limit are cut by the proxy.
