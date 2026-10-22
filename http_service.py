@@ -425,8 +425,6 @@ def _pack_history_cursor(cursor, project_id, task_id, recent):
             prefix = str(task_id) + '-'
             if isinstance(scp, str) and scp.startswith(prefix):
                 scp = '~' + scp[len(prefix):]
-            elif isinstance(scp, str) and scp.startswith('~'):
-                scp = '~~' + scp[1:]
             packed.append(scp)
         return packed
     except Exception:
@@ -456,9 +454,7 @@ def _unpack_history_cursor(packed, project_id, task_id, recent):
             scp = packed[3]
             if not isinstance(scp, str):
                 raise ValueError('bad scp')
-            if scp.startswith('~~'):
-                scp = scp[1:]
-            elif scp.startswith('~'):
+            if scp.startswith('~'):
                 scp = str(task_id) + '-' + scp[1:]
             c['scp'] = scp
         return token(c)

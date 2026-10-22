@@ -370,6 +370,19 @@ class RecentHistoryCase(HistoryPagingCase):
         self.assertEqual(['comment 024', 'comment 023', 'comment 022', 'comment 021', 'comment 020'],
                          [e['body'] for e in restarted_stripped['items']])
 
+        # An unsigned cursor cannot skip the binding: another user's or another task's unsigned cursor is refused (409).
+        refused_unsigned_user = self.read(blair, project, task, 'recent=5', stripped_cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_unsigned_user['error']['message'])
+        refused_unsigned_task = self.read(alex, project, other_task, 'recent=5', stripped_cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_unsigned_task['error']['message'])
+        refused_legacy_user = self.read(blair, project, task, 'recent=5', legacy_cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_legacy_user['error']['message'])
+        legacy_other_task = base64.urlsafe_b64encode(
+            json.dumps(dict(legacy_payload, p=project + '/' + other_task), separators=(',', ':')).encode('utf-8')
+        ).decode('ascii').rstrip('=')
+        refused_legacy_task = self.read(alex, project, task, 'recent=5', legacy_other_task, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_legacy_task['error']['message'])
+
         # 4. Removing cursor_key from a saved state, starting the service, and restarting
         # BEFORE any write persists the newly created key so a cursor signed before the
         # restart still reads after the restart.
@@ -427,17 +440,28 @@ class RecentHistoryCase(HistoryPagingCase):
              'summary': 'baseline', 'next_action': 'continue', 'open_items': [], 'resolved': []},
             token=alex)
         self.assertEqual(201, cp.status, cp.data)
+        # Give the checkpoint comment a real bd-shaped '<task>-c<uuid>' id so the
+        # task-prefix packing and unpacking of 'scp' is exercised across pages.
+        prefixed_cp_id = '%s-c01a1608e-f8f1-75f5-a4c6-eacb09ed6ee3' % long_task
+        state = json.loads(state_path.read_text(encoding='utf-8'))
+        row = next(r for r in state['rows'] if r['id'] == long_task)
+        row['comments'][-1]['id'] = prefixed_cp_id
+        state_path.write_text(json.dumps(state), encoding='utf-8')
         self.seed(long_task, ['after %d' % i for i in range(10)], start=100, stamp='2099-01-01T%02d:%02d:%02dZ')
 
         for query in ('recent=3', 'limit=3', 'since_checkpoint=true&recent=3'):
             with self.subTest(query=query):
                 first = self.read(alex, project, long_task, query)
+                if 'since_checkpoint' in query:
+                    self.assertEqual(prefixed_cp_id, first['since_checkpoint'])
                 cursor = first['next_cursor']
                 self.assertTrue(cursor)
                 self.assertLess(len(cursor), MAX_CURSOR // 2,
                                 'cursor length %d is not well under MAX_CURSOR=%d' % (len(cursor), MAX_CURSOR))
                 second = self.read(alex, project, long_task, query, cursor)
                 self.assertTrue(second['items'])
+                if 'since_checkpoint' in query:
+                    self.assertEqual(prefixed_cp_id, second['since_checkpoint'])
 
         # Direct check with both a 128-char project ID and a 128-char task ID.
         long_project = 'p' + ('b' * 127)
