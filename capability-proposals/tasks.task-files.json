@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb370-tasks-task-files-0001",
+  "key": "tasks.task-files",
+  "name": "Files attached to a task: .task-files store, journal authority, streamed upload, safe download",
+  "aliases": [
+    "task files",
+    "task attachments",
+    "attach a file to a task",
+    "upload a file",
+    "download a task file",
+    "withdraw a task file",
+    "task-file-v1",
+    "X-Orchestra-SHA256",
+    "transfer cap"
+  ],
+  "summary": "A coordinator attaches files to a task for its assignee (to-worker) and the assignee attaches results (from-worker): GET/PUT /v1/projects/{id}/tasks/{task}/files, GET .../files/{sha256}, POST .../files/{sha256}/withdraw. Bytes live in projects/NAME/.task-files/<2 hex>/<sha256> (content-addressed; a symlinked folder is refused). A file is attached only by its host journal entry under .task-files/records, written by the service-only endpoint action task-file under the project lock and live authority; the reserved Kind: task-file-v1 / task-file-withdrawn-v1 comments are the history record, so a planted one is inert. Who may is read live: coordinators (CAP_COORDINATE) and the current assignee of an open task download; every reader lists. The upload is the one streamed route (Content-Length required, limits and free disk checked first, 64 KiB steps, digest checked, connection closed after). Limits are deployment.private.json task_files settings; at most 4 transfers in the service and 2 per caller (503 Retry-After); every upload, download and withdrawal is audited.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#files-attached-to-a-task-over-http"
+  ],
+  "code": [
+    "task_files.py::apply",
+    "task_files.py::receive",
+    "task_files.py::check_room",
+    "task_files.py::limits",
+    "task_files.py::is_assignee",
+    "task_files.py::live",
+    "task_files.py::read_entry",
+    "task_files.py::clean_name",
+    "task_files.py::folder",
+    "http_service.py::ApiHandler.tasks_files_list",
+    "http_service.py::ApiHandler.tasks_file_put",
+    "http_service.py::ApiHandler.tasks_file_get",
+    "http_service.py::ApiHandler.tasks_file_withdraw",
+    "http_service.py::TransferGate",
+    "endpoint.py::execute"
+  ],
+  "tests": [
+    "tests/test_task_files.py",
+    "tests/test_task_files_real_bd.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "tasks",
+    "files",
+    "http",
+    "security"
+  ]
+}

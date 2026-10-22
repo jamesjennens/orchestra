@@ -219,6 +219,14 @@ LANE_STATE_PREFIX = 'Kind: lane-state-v1\n'
 # no row and every surface -- an older kit included -- reads it as an ordinary
 # comment.
 ASSIGNEE_FOLLOWON_PREFIX = 'Kind: assignee-followon-v1\n'
+# kittrial-5bb.370 (docs/TASK_FILES_DESIGN.md 2b A). The history record of a file attached to
+# a task, and of its withdrawal. Reserved so the raw `comments add` path can never plant one;
+# a record is honoured only with its host journal entry under ``<project>/.task-files/records``
+# (task_files.py), so one planted where the prefix is not reserved (an older kit) is inert.
+# Deliberately NOT record-anchor families: every surface, an older kit included, reads them as
+# ordinary comments (design 6).
+TASK_FILE_PREFIX = 'Kind: task-file-v1\n'
+TASK_FILE_WITHDRAWN_PREFIX = 'Kind: task-file-withdrawn-v1\n'
 
 RESERVED = (
     (TASK_ASSIGNMENT_PREFIX, 'task assignment notice', 'the dedicated coordinate assignment operation'),
@@ -255,6 +263,9 @@ RESERVED = (
     (LANE_STATE_PREFIX, 'lane state', 'checkpoint TASK --file checkpoint.json (the lane_state key)'),
     (ASSIGNEE_FOLLOWON_PREFIX, 'assignee follow-on record',
      'coordinator followon on the coordination host or the web route'),
+    (TASK_FILE_PREFIX, 'task file record', 'the task files route (PUT /v1/projects/PID/tasks/TID/files)'),
+    (TASK_FILE_WITHDRAWN_PREFIX, 'task file withdrawal record',
+     'the task files route (POST /v1/projects/PID/tasks/TID/files/SHA256/withdraw)'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)

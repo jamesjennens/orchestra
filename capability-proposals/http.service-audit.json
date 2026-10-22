@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb370-http-service-audit-0003",
+  "key": "http.service-audit",
+  "name": "The web service audit: one line per write, refusal or file transfer",
+  "aliases": [
+    "service audit line",
+    "audit entry",
+    "project audit",
+    "who fetched what",
+    "audit log"
+  ],
+  "summary": "Service.audit appends one redacted event (time, request id, user, actor, credential, project, action, outcome, reason of at most 200 characters); never a secret or a body. _mutate writes the committed/rejected/denied/unknown line of every write; _note_denied the line of a 401/403; the task files routes one line per upload, download and withdrawal with task and sha256 in the reason. A project admin reads it with GET /v1/projects/{id}/audit.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "http_auth.py::Service.audit",
+    "http_service.py::ApiHandler._mutate",
+    "http_service.py::ApiHandler._note_denied",
+    "http_service.py::ApiHandler.audit_list",
+    "http_service.py::ApiHandler._files_audit"
+  ],
+  "tests": [
+    "tests/test_task_files.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "audit"
+  ]
+}

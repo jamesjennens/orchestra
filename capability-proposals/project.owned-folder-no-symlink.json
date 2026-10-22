@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb370-project-owned-folder-no-symlink-0004",
+  "key": "project.owned-folder-no-symlink",
+  "name": "Kit-owned folders inside a project directory are refused when they are links",
+  "aliases": [
+    "project folder refused if symlink",
+    "symlink refused",
+    "no follow",
+    "planted symlink",
+    ".read-cache symlink",
+    ".task-files symlink"
+  ],
+  "summary": "A kit-owned folder beside a project (.read-cache, .assignee-followons, .task-files and the folders inside it) is checked with lstat and refused when it is a symlink or not a directory, so nothing is written or served through a planted link: read_cache._cache_directory, followon._journal_directory / open_journal, task_files._directory. The project directory itself is refused as a symlink by admin.project_dir.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "read_cache.py::_cache_directory",
+    "followon.py::open_journal",
+    "task_files.py::_directory",
+    "admin.py::project_dir"
+  ],
+  "tests": [
+    "tests/test_task_files.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "security",
+    "filesystem",
+    "project"
+  ]
+}
