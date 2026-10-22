@@ -212,6 +212,22 @@ class TaskFilesRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests
         self.assertEqual([False], done)
         self.assertEqual(size, task_files.blob_size(self.project, digest))
 
+    def test_380_the_discard_gives_up_on_a_lock_held_too_long(self):
+        # kittrial-5bb.380 (review of .370 r3): the wait for .coordination.lock is bounded; the blob then stays.
+        import fcntl
+        import http_service
+        from unittest import mock
+        data = b'bytes nobody records'
+        digest, size, created = task_files.receive(lambda n, s=[data]: s.pop() if s else b'', len(data), self.project)
+        with (self.project / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with mock.patch.object(http_service, 'DISCARD_LOCK_SECONDS', 0.5):
+                with self.assertRaisesRegex(TimeoutError, 'not free within'):
+                    self.backend.files_discard('pp', digest)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertEqual(size, task_files.blob_size(self.project, digest))
+        self.assertTrue(self.backend.files_discard('pp', digest), 'with the lock free it is removed')
+
     def test_withdraw_by_the_author_writes_the_withdrawal_record(self):
         task = self.claimed('casey')
         data = b'my result'

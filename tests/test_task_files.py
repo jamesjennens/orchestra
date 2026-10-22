@@ -854,6 +854,51 @@ class TaskFilesHttpTests(agents.AgentHarness):
         self.assertEqual([(self.pid, sha(b'orphan'))], calls)
         self.assertEqual(0, direct.call_count)
 
+    def test_380_a_discard_that_fails_never_replaces_the_refusal(self):
+        # kittrial-5bb.380 (review of .370 r3): the refusal is the answer; the failed discard is said in the log and
+        # the stored bytes stay (an orphan for task-files purge).
+        import contextlib
+        first = self.raw('PUT', self.files_path(name='a.txt', direction='to-worker'), self.tokens['coord'], b'kept',
+                         headers={'Idempotency-Key': 'files-key-380-01'})
+        self.assertEqual(201, first.status, first.data)
+
+        def broken(pid, sha256):
+            raise OSError('the disk went away')
+        self.backend.files_discard = broken
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said):
+            refused = self.raw('PUT', self.files_path(name='b.txt', direction='to-worker'), self.tokens['coord'], b'orphan',
+                               headers={'Idempotency-Key': 'files-key-380-01'})
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('was refused and its stored bytes were kept', said.getvalue())
+        self.assertIn('the disk went away', said.getvalue())
+        self.assertEqual(6, task_files.blob_size(self.backend.files_project(self.pid), sha(b'orphan')))
+
+    def test_380_the_discard_waits_for_the_lock_a_bounded_time(self):
+        # kittrial-5bb.380 (review of .370 r3): a lock that stays taken does not hold the discard (and the request's
+        # thread) for ever: after DISCARD_LOCK_SECONDS it gives up, and the blob stays.
+        import http_service
+        digest = self.given(b'held bytes', name='h.txt')
+        holding, release = threading.Event(), threading.Event()
+
+        def hold():
+            with self.service.store.lock:
+                holding.set()
+                release.wait(10)
+        holder = threading.Thread(target=hold)
+        holder.start()
+        try:
+            holding.wait(5)
+            with mock.patch.object(http_service, 'DISCARD_LOCK_SECONDS', 0.3):
+                started = time.monotonic()
+                with self.assertRaisesRegex(TimeoutError, 'not free within'):
+                    self.backend.files_discard(self.pid, digest)
+                self.assertLess(time.monotonic() - started, 3)
+        finally:
+            release.set()
+            holder.join(10)
+        self.assertEqual(len(b'held bytes'), task_files.blob_size(self.backend.files_project(self.pid), digest))
+
     def test_r2_s1_a_download_read_too_slowly_is_cut_off_and_gives_its_slot_back(self):
         data = os.urandom(8 * task_files.MIB)
         digest = self.given(data, name='big.bin')

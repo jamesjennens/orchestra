@@ -730,8 +730,14 @@ class InProcessBackend:
         project = self.files_project(project_id)
         if project is None:
             return False
-        with self.service.store.lock:
+        # kittrial-5bb.380 (review of .370 r3): the wait for the lock is bounded; a blob not removed in time stays an
+        # orphan, which `admin.py task-files purge` removes once it is a day old.
+        if not self.service.store.lock.acquire(timeout=DISCARD_LOCK_SECONDS):
+            raise TimeoutError('the store lock was not free within %d s' % DISCARD_LOCK_SECONDS)
+        try:
             return task_files.discard(project, sha256)
+        finally:
+            self.service.store.lock.release()
 
     def _files_write(self, principal, project_id, payload):
         # The same task_files.apply the endpoint action runs, over this backend's own rows:
@@ -1890,10 +1896,20 @@ class EndpointBackend:
         # entry while it holds the project's .coordination.lock EXCLUSIVELY; this takes the same lock, so another
         # upload's record of the same bytes is either finished (and its entry keeps the blob) or not yet begun (and it
         # then finds the blob gone and answers "upload it again"). Never a record whose bytes vanished under it.
+        # kittrial-5bb.380 (review of .370 r3): the wait is bounded (DISCARD_LOCK_SECONDS); a blob not removed in time
+        # stays an orphan, which `admin.py task-files purge` removes once it is a day old.
         import fcntl
         project = self.files_project(project_id)
         with (project / '.coordination.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            ends = time.monotonic() + DISCARD_LOCK_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= ends:
+                        raise TimeoutError('the project lock was not free within %d s' % DISCARD_LOCK_SECONDS) from None
+                    time.sleep(0.05)
             return task_files.discard(project, sha256)
 
     def assignment_roster(self, principal, project_id, offset=0, limit=200):
@@ -4265,6 +4281,8 @@ DEFAULT_TRANSFERS = TransferGate()
 #: kittrial-5bb.380: the lingering closes of answered uploads now running in this process, and the counts
 #: of those done and of those closed at once because LINGER_MAX were running.
 LINGERING = {'now': 0, 'lingered': 0, 'hard': 0}
+#: kittrial-5bb.380 (review of .370 r3): how long a refused upload's discard waits for the project's lock.
+DISCARD_LOCK_SECONDS = 10
 LINGERING_LOCK = threading.Lock()
 FILES_UNAVAILABLE = 'Task files are not available on this server.'
 FILE_CODES = {400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict', 411: 'length_required',
@@ -5256,7 +5274,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             # names. Only for a definite refusal: a 5xx that does not say nothing was done may follow a written
             # record (a retry settles it), so its blob stays.
             if created and (refused.status < 500 or getattr(refused, 'nothing_done', False)):
-                self.backend.files_discard(ctx.params['pid'], sha256)
+                # kittrial-5bb.380 (review of .370 r3): the refusal is the answer. A discard that fails (the lock not
+                # free in time, a disk error) is said in the service's log and keeps the blob as an orphan, which
+                # `admin.py task-files purge` removes once it is a day old; it never replaces the refusal.
+                try:
+                    self.backend.files_discard(ctx.params['pid'], sha256)
+                except Exception as failed:
+                    print('task files: the upload %s of request %s was refused and its stored bytes were kept (task-files '
+                          'purge removes them after a day): %s' % (sha256, ctx.request_id,
+                                                                   ascii(str(failed)[:200]) or type(failed).__name__),
+                          file=sys.stderr, flush=True)
             raise
         if isinstance(result, dict):
             result = dict(result)
