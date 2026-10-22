@@ -724,6 +724,15 @@ class InProcessBackend:
     def files_limits(self):
         return dict(task_files.LIMIT_DEFAULTS)
 
+    def files_discard(self, project_id, sha256):
+        # r3 (review discard-race): under the lock every record is written under (invoke holds it around apply), so a
+        # record of the same bytes that is being written is finished, and seen, before the blob may be removed.
+        project = self.files_project(project_id)
+        if project is None:
+            return False
+        with self.service.store.lock:
+            return task_files.discard(project, sha256)
+
     def _files_write(self, principal, project_id, payload):
         # The same task_files.apply the endpoint action runs, over this backend's own rows:
         # ``invoke`` holds the store lock and ran the route's authority check first.
@@ -1875,6 +1884,17 @@ class EndpointBackend:
 
     def files_limits(self, warnings=None):
         return task_files.limits(Path(self.root), warnings=warnings)
+
+    def files_discard(self, project_id, sha256):
+        # r3 (review discard-race): the endpoint's task-file action reads the blob, writes the comment and the journal
+        # entry while it holds the project's .coordination.lock EXCLUSIVELY; this takes the same lock, so another
+        # upload's record of the same bytes is either finished (and its entry keeps the blob) or not yet begun (and it
+        # then finds the blob gone and answers "upload it again"). Never a record whose bytes vanished under it.
+        import fcntl
+        project = self.files_project(project_id)
+        with (project / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return task_files.discard(project, sha256)
 
     def assignment_roster(self, principal, project_id, offset=0, limit=200):
         return self._run('assignment-roster', project_id, self._actor(principal),
@@ -4656,6 +4676,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                         raise forbidden('CSRF token missing or invalid')
         return payload, auth_source
 
+    #: r3 (review N1): how long after a too-slow upload's deadline the server still waits to write its 408.
+    ANSWER_MARGIN = 5
+
+    def parse_request(self):
+        # r3 (review N4): one request's Expect: 100-continue never outlives it; http.server notes it while it parses.
+        self._expect_100 = False
+        return super().parse_request()
+
     def handle_expect_100(self):
         # r2 (review s4c): never "100 Continue" before the route has authorized the request and checked its limits.
         # http.server answers it while it parses the request line; here it is only noted, and _continue sends it
@@ -5015,13 +5043,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise task_files.too_slow(length, limit)
             wait = max(0.05, min(self.server.client_seconds, left)) if guarded else left
             if guarded:
-                self.server.watch(self.connection, wait)
+                # r3 (review N1): the reaper only after a margin; the socket's own timeout below ends the wait at the
+                # deadline, so the 408 can still be written before the connection is cut.
+                self.server.watch(self.connection, wait + self.ANSWER_MARGIN)
             before = self.connection.gettimeout()
             try:
                 # The socket's own timeout too: on Windows the reaper's shutdown does not end a wait that is under
                 # way in another thread, the timeout does.
                 self.connection.settimeout(wait)
-                chunk = self.rfile.read(count)
+                # r3 (review N1): one receive at a time (read1), so the deadline is looked at between small pieces;
+                # read(count) would keep waiting for all of them, and a trickle never lets the timeout fire.
+                read1 = getattr(self.rfile, 'read1', None)
+                chunk = read1(count) if read1 is not None else self.rfile.read(count)
             except OSError:
                 chunk = b''
             finally:
@@ -5158,7 +5191,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             # names. Only for a definite refusal: a 5xx that does not say nothing was done may follow a written
             # record (a retry settles it), so its blob stays.
             if created and (refused.status < 500 or getattr(refused, 'nothing_done', False)):
-                task_files.discard(project, sha256)
+                self.backend.files_discard(ctx.params['pid'], sha256)
             raise
         if isinstance(result, dict):
             result = dict(result)

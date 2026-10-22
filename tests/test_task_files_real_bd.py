@@ -187,6 +187,31 @@ class TaskFilesRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests
         worker.join(120)
         self.assertEqual(201, done[0][0], done)
 
+    def test_r3_discard_waits_for_the_projects_coordination_lock(self):
+        # r3 (review discard-race): the endpoint writes a record under the project's .coordination.lock; a discard
+        # takes the same lock, so it waits for a record of the same bytes and then keeps the blob that record names.
+        import fcntl
+        import threading
+        import time
+        task = self.claimed('casey')
+        data = b'bytes being recorded'
+        digest, size, created = task_files.receive(lambda n, s=[data]: s.pop() if s else b'', len(data), self.project)
+        done = []
+        with (self.project / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)                     # a record of these bytes is being written
+            worker = threading.Thread(target=lambda: done.append(self.backend.files_discard('pp', digest)))
+            worker.start()
+            time.sleep(2)
+            self.assertTrue(worker.is_alive(), 'the discard waits for the lock')
+            task_files._write_entry(self.project, {'schema_version': 1, 'task': task, 'sha256': digest, 'name': 'r.txt',
+                                                   'bytes': size, 'media_type': task_files.OPAQUE, 'direction': 'to-worker',
+                                                   'note': None, 'by': 'alex', 'at': 'now', 'record_comment': 'c1',
+                                                   'withdrawn': None})
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        worker.join(30)
+        self.assertEqual([False], done)
+        self.assertEqual(size, task_files.blob_size(self.project, digest))
+
     def test_withdraw_by_the_author_writes_the_withdrawal_record(self):
         task = self.claimed('casey')
         data = b'my result'

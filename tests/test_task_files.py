@@ -772,6 +772,15 @@ class TaskFilesHttpTests(agents.AgentHarness):
                     break
             self.assertEqual((0, {}), gate.held(), 'the slot is given back')
             self.assertLess(time.monotonic() - started, 8, 'cut off at the deadline, not by the client')
+            # r3 (review N1): the client is told why: the 408 reaches it before the connection is closed.
+            answer = b''
+            sock.settimeout(10)
+            while b'\r\n\r\n' not in answer:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                answer += piece
+            self.assertTrue(answer.startswith(b'HTTP/1.1 408'), answer[:200])
         finally:
             sock.close()
         self.assertEqual([], self.stored())
@@ -866,6 +875,63 @@ class TaskFilesHttpTests(agents.AgentHarness):
         self.assertEqual((0, {}), gate.held())
         self.assertEqual({}, gate.projects())
         self.assertIn('interrupted', [e['outcome'] for e in self.audit_lines('tasks.files.download')])
+
+    def test_r3_discard_waits_for_a_record_being_written_and_keeps_its_blob(self):
+        # r3 (review discard-race): upload B of the same bytes to another task is recording them (under the lock its
+        # backend writes every record under) while A's refused record discards; the discard waits, then sees B's
+        # entry and keeps the blob.
+        project = self.files_project_dir()
+        digest, size, created = task_files.receive(io.BytesIO(b'shared bytes').read, 12, project)
+        self.assertTrue(created)
+        writing = threading.Event()
+        done = []
+
+        def record_b():
+            with self.service.store.lock:
+                writing.set()
+                time.sleep(1.5)                                   # B's comment and entry are being written
+                task_files._write_entry(project, {'schema_version': 1, 'task': self.tid2, 'sha256': digest, 'name': 'b.txt',
+                                                  'bytes': size, 'media_type': task_files.OPAQUE, 'direction': 'to-worker',
+                                                  'note': None, 'by': 'coord', 'at': 'now', 'record_comment': 'c1',
+                                                  'withdrawn': None})
+        b = threading.Thread(target=record_b)
+        b.start()
+        writing.wait(5)
+        a = threading.Thread(target=lambda: done.append(self.backend.files_discard(self.pid, digest)))
+        a.start()
+        time.sleep(0.5)
+        self.assertTrue(a.is_alive(), 'the discard waits for the record being written')
+        b.join(10)
+        a.join(10)
+        self.assertEqual([False], done)
+        self.assertEqual(size, task_files.blob_size(project, digest), 'the blob B recorded is still there')
+
+    def test_r3_an_expect_on_one_request_never_answers_the_next_one(self):
+        # r3 (review N4): a download asked with Expect: 100-continue (answered without _send_json) must not leave the
+        # flag set, so the next JSON request on the same connection gets no stray 100 Continue.
+        digest = self.given()
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=10)
+        try:
+            sock.sendall(('GET %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nExpect: 100-continue\r\n\r\n'
+                          % (self.files_path(sha256=digest), self.tokens['coord'])).encode())
+            first = http.client.HTTPResponse(sock)
+            first.begin()
+            first.read()
+            self.assertEqual(200, first.status)
+            body = json.dumps({'reason': 'x'}).encode()
+            sock.sendall(('POST %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\n'
+                          'Content-Length: %d\r\n\r\n' % (self.files_path(sha256='f' * 64) + '/withdraw', self.tokens['coord'],
+                                                          len(body))).encode() + body)
+            answer = b''
+            while b'\r\n\r\n' not in answer:
+                answer += sock.recv(4096)
+            self.assertFalse(answer.startswith(b'HTTP/1.1 100'), answer[:80])
+            self.assertTrue(answer.startswith(b'HTTP/1.1 404'), answer[:80])
+        finally:
+            sock.close()
+
+    def files_project_dir(self):
+        return self.backend.files_project(self.pid)
 
     def test_r2_s4b_transfer_encoding_is_refused_and_nothing_is_stored(self):
         chunked = b'5\r\nhello\r\n0\r\n\r\n'
