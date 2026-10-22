@@ -6245,11 +6245,14 @@ def backup_task_files(root,name):
     ``backup-copy`` take them in, so no record of a file can land half way through. The coordination
     sidecar is untouched: an older kit's restore of it is unchanged (design 6). Returns
     task_files.backup_folder's summary."""
-    import fcntl
     import task_files
     path=project_dir(root,name)
     target=task_files_backup_path(root,name)
     if target.is_symlink():raise ValueError('The task-files backup %s must not be a symlink'%target)
+    if not os.path.lexists(str(path/task_files.FOLDER)) and not os.path.lexists(str(target)):
+        # No files and no earlier backup of them: nothing to copy or empty, so no lock is taken.
+        return {'files':0,'bytes':0,'records':0,'problems':[],'absent':True}
+    import fcntl
     with backup_lock(root,name),(path/'.coordination.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         try:
@@ -11465,16 +11468,19 @@ def restore_task_files(root,source,destination):
     makes the restore end with exit 3 when the backup's files did not match their manifest (nothing
     of them is placed then). A backup without the folder (an older kit, or a copy that lost it)
     restores as before, and says that the restored file records will report their files missing."""
-    import fcntl
     import task_files
     backup=task_files_backup_path(root,source)
     path=project_dir(root,destination)
-    with (path/'.coordination.lock').open('a') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX)
-        try:
-            outcome=task_files.restore_folder(backup,path)
-        except task_files.Refusal as refused:
-            outcome={'status':'refused','problems':[str(refused)]}
+    if not os.path.lexists(str(backup)):
+        outcome={'status':'absent'}        # nothing to place, so no lock is taken
+    else:
+        import fcntl
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            try:
+                outcome=task_files.restore_folder(backup,path)
+            except task_files.Refusal as refused:
+                outcome={'status':'refused','problems':[str(refused)]}
     if outcome['status']=='absent':
         print('This backup has no task files (backups/%s.task-files): any file records the task history '
               'holds now say that the stored file is missing.'%source)
