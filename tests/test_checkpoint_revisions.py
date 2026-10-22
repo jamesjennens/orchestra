@@ -84,7 +84,7 @@ class CheckpointRevisionTests(unittest.TestCase):
         self.assertEqual(result['fresh'],0)
         self.assertEqual(result['unverified'],3)
         data[0]['title']='Activity changed'
-        self.assertEqual(b.brief(data,PROJECT,TASK)['newer']['coverage'],'unknown')
+        self.assertEqual(b.brief(data,PROJECT,TASK)['newer']['coverage'],'timestamp')
         save_cp(data,'cp3')
         self.assertEqual(self.verify(data)['coverage'],'verified')
 

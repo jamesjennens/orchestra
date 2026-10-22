@@ -45,8 +45,11 @@ ITEM_FIELDS = {
     # Additive liveness (kittrial-5bb.107 rev2).
     'deployed_live',
     # Additive checkpoint attention (.1), independent of review completion.
-    'newer_activity_marker', 'newer_activity_by_others', 'newer_activity_own',
+    'newer_activity_marker', 'newer_activity_fields', 'newer_activity_by_others', 'newer_activity_own',
     'newer_activity_coverage', 'unresolved_directions',
+    # Additive: the checkpoint-independent marker a worker's wait fingerprints
+    # (kittrial-5bb.369).
+    'wait_newer_activity_marker',
     # Additive: one sentence for a contribution that waits for somebody else's approval
     # (kittrial-5bb.197 review request 01a12894, item 3b).
     'waiting_for_approval', 'approval_requires_other_party',

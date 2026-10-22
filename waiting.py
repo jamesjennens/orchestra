@@ -114,6 +114,20 @@ MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor',
                'checkpoint_at', 'newer_activity', 'newer_activity_marker',
                'redelivered', 'guidance_version')
 
+#: The fields a WORKER's move row is fingerprinted over (kittrial-5bb.369). It drops what
+#: only the caller's own checkpoint changes - ``checkpoint_at``, the two checkpoint item
+#: counts, the checkpoint-relative ``newer_activity`` boolean and the marker that resets
+#: on that checkpoint - and replaces the marker with the checkpoint-INDEPENDENT
+#: ``wait_newer_activity_marker`` (newest entry by another actor, plus the current
+#: title/description/acceptance digest). Everything by others still wakes: a comment or
+#: an edit moves that marker, and ``review_state``, ``whose_move``, ``next_actor``,
+#: ``pending_review_items``, ``owner`` (the assignment), ``status`` (claim/release),
+#: ``contribution_id`` and ``redelivered`` are carried directly. The coordinator form
+#: keeps :data:`MOVE_FIELDS` unchanged.
+WORKER_MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor', 'owner', 'status',
+                      'contribution_id', 'pending_review_items', 'redelivered',
+                      'guidance_version', 'wait_newer_activity_marker')
+
 #: The four things a coordinator wakes for, in the order the task names them.
 COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
                         'checkpoint-to-coordinator', 'lane-quiet')
@@ -163,10 +177,16 @@ def normalize_item(item):
     if not isinstance(item, dict):
         return {}
     row = {name: _scalar(item.get(name)) for name in MOVE_FIELDS}
+    # A work row names the assignee ``owner``; the web queue row names it ``assignee``.
+    # Carry either under ``owner`` so the worker fingerprint cannot depend on transport.
+    row['wait_newer_activity_marker'] = _scalar(item.get('wait_newer_activity_marker'))
+    row['owner'] = _scalar(item.get('owner') if item.get('owner') is not None else item.get('assignee'))
+    row['status'] = _scalar(item.get('status'))
     attention = item.get('attention')
     if isinstance(attention, dict):
         for name in ('open_items', 'blocking_items', 'checkpoint_at', 'newer_activity',
-                     'newer_activity_marker', 'redelivered', 'pending_review_items'):
+                     'newer_activity_marker', 'wait_newer_activity_marker',
+                     'redelivered', 'pending_review_items'):
             if row.get(name) is None and name in attention:
                 row[name] = _scalar(attention.get(name))
     if not isinstance(row.get('pending_review_items'), int):
@@ -184,9 +204,11 @@ def normalize_item(item):
     # The stable newer-activity marker is fingerprinted (it is in MOVE_FIELDS). The
     # counts it was read with are carried for the reader but deliberately NOT
     # fingerprinted: incrementing `newer_activity_own` for the caller's own comment
-    # must not wake the caller that wrote it (kittrial-5bb.351).
+    # must not wake the caller that wrote it (kittrial-5bb.351). The current fields
+    # digest (kittrial-5bb.367) is carried the same way: the marker already moves on
+    # a field edit, so fingerprinting the digest too would be redundant.
     for name in ('newer_activity_by_others', 'newer_activity_own',
-                 'newer_activity_coverage', 'unresolved_directions'):
+                 'newer_activity_fields', 'newer_activity_coverage', 'unresolved_directions'):
         if row.get(name) is None:
             value = item.get(name)
             if value is None and isinstance(attention, dict):
@@ -198,6 +220,11 @@ def normalize_item(item):
 def _fingerprinted(row):
     """The stable subset a fingerprint is taken over; extra reader fields stay out."""
     return {name: row.get(name) for name in MOVE_FIELDS}
+
+
+def _worker_fingerprinted(row):
+    """The worker fingerprint's subset: no field that only the caller's own checkpoint moves."""
+    return {name: row.get(name) for name in WORKER_MOVE_FIELDS}
 
 
 def _canonical(value):
@@ -551,7 +578,7 @@ def worker_view(items, claiming=None, empty_message=None):
     """
     rows = movement(items)
     view = {'schema': WAIT_SCHEMA, 'form': 'worker', 'items': rows,
-            'fingerprint': digest(_sorted_rows([_fingerprinted(row) for row in rows]))}
+            'fingerprint': digest(_sorted_rows([_worker_fingerprinted(row) for row in rows]))}
     if claiming:
         view['claiming'] = claiming
     if not rows and empty_message:

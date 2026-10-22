@@ -328,16 +328,21 @@ class NewerActivityQueueTests(unittest.TestCase):
         self.assertEqual(item['newer_activity_coverage'],'current')
         self.assertIsNone(briefing.brief(data,PROJECT,TASK)['newer'])
 
-    def test_the_marker_is_null_when_coverage_is_unknown(self):
-        """A legacy checkpoint still counts and flags, but makes no precise claim."""
+    def test_the_marker_is_timestamp_based_when_provenance_is_off(self):
+        """A legacy checkpoint still counts and flags, and makes the timestamp claim."""
         data=rows()
         append_checkpoint(data,'cp1',checkpoint(data))
+        item=work.queue(data,'alice/session',['--mine'])['items'][0]
+        self.assertEqual(item['newer_activity_coverage'],'current')
+        self.assertTrue(item['newer_activity_marker'].startswith('fields:'),item['newer_activity_marker'])
+        first=item['newer_activity_marker']
         data[0]['comments'].append(comment('dir0','Direction 0','2026-09-16T00:00:00Z',
                                            author='coordinator/session'))
         item=work.queue(data,'alice/session',['--mine'])['items'][0]
         self.assertEqual(item['newer_activity_by_others'],1)
-        self.assertEqual(item['newer_activity_coverage'],'unknown')
-        self.assertIsNone(item['newer_activity_marker'])
+        self.assertEqual(item['newer_activity_coverage'],'timestamp')
+        self.assertTrue(item['newer_activity_marker'].startswith(TASK+'-cdir0:'),item['newer_activity_marker'])
+        self.assertNotEqual(first,item['newer_activity_marker'])
 
 
 if __name__=='__main__':unittest.main()

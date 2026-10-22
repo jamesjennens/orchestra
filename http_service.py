@@ -1298,7 +1298,9 @@ class InProcessBackend:
         review = self._review_view(task)
         fields = self._agent_fields(task, review)
         activity = {name: fields.get(name) for name in (
-            'newer_activity', 'newer_activity_marker', 'newer_activity_by_others', 'newer_activity_own',
+            'newer_activity', 'newer_activity_marker', 'newer_activity_fields',
+            'wait_newer_activity_marker',
+            'newer_activity_by_others', 'newer_activity_own',
             'newer_activity_coverage', 'unresolved_directions')}
         events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
         anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
@@ -1369,6 +1371,7 @@ class InProcessBackend:
         contribution_id=(review['contribution'] or {}).get('id')
         # The one rule from work.py, not a copy (kittrial-5bb.264 item 4).
         from work import is_redelivery
+        from briefing import MARKER_DIGEST, fields_digest
         redelivered=is_redelivery(contribution_id, open_requests)
         # This disposable model keeps no per-entry checkpoint digests, so its coverage
         # is unknown and the stable marker is honestly null (kittrial-5bb.351); the
@@ -1382,10 +1385,39 @@ class InProcessBackend:
                 'checkpoint_at':at,
                 'newer_activity':self._other_agent_activity(task,last) if last and not unreadable else None,
                 'newer_activity_marker':None,
+                # The current title/description/acceptance digest (kittrial-5bb.367 F2b):
+                # this model carries the fields even though it records no per-entry digests.
+                'newer_activity_fields':fields_digest(task)[:MARKER_DIGEST] if last and not unreadable else None,
+                # The checkpoint-independent wait marker (kittrial-5bb.369): the newest
+                # entry by anybody but the assignee, folded with the fields digest. This
+                # model's events carry their author, so the own checkpoint never moves it.
+                # Computed without a checkpoint too, so the first one is invisible to a wait.
+                'wait_newer_activity_marker':self._wait_activity_marker(task),
                 'newer_activity_by_others':(activity or {}).get('other_count'),
                 'newer_activity_own':(activity or {}).get('own_count'),
                 'newer_activity_coverage':(activity or {}).get('coverage'),
                 'unresolved_directions':None}
+
+    def _wait_activity_marker(self, task):
+        """The stable wait marker of one in-process task (kittrial-5bb.369).
+
+        The same definition the canonical snapshot uses: the newest event by anybody
+        other than the assignee, folded with the current fields digest by
+        :func:`briefing.activity_marker`. This model has no per-entry checkpoint
+        digests, but its events name their actor, so the agent's own checkpoint event
+        is its own entry and never moves the marker.
+        """
+        from briefing import activity_marker, fields_digest
+        events = [(index, event) for index, event in enumerate(self.state.get('events') or [])
+                  if isinstance(event, dict) and event.get('task') == task['id']]
+        others = [(index, event) for index, event in events
+                  if (event.get('actor') or 'unknown') != task.get('assignee')]
+        newest = max(others, key=lambda pair: (pair[1].get('time') or '', pair[0])) if others else None
+        entry = None
+        if newest is not None:
+            entry = dict(newest[1])
+            entry['entry_id'] = str(newest[1].get('entry_id') or '%s-e%d' % (task['id'], newest[0]))
+        return activity_marker(entry, fields_digest(task))
 
     def _other_agent_activity(self, task, checkpoint):
         events=[e for e in self.state.get('events') or [] if e.get('task')==task['id']]
@@ -1709,6 +1741,9 @@ def own_queue_tasks(queue, actor=None):
                       # The stable marker and its counts (kittrial-5bb.351): a wait row
                       # carries them, so a marker change alone moves the fingerprint.
                       'newer_activity_marker':fields.get('newer_activity_marker'),
+                      'newer_activity_fields':fields.get('newer_activity_fields'),
+                      # The checkpoint-independent wait marker (kittrial-5bb.369).
+                      'wait_newer_activity_marker':fields.get('wait_newer_activity_marker'),
                       'newer_activity_by_others':fields.get('newer_activity_by_others'),
                       'newer_activity_own':fields.get('newer_activity_own'),
                       'newer_activity_coverage':fields.get('newer_activity_coverage'),
@@ -3597,6 +3632,13 @@ class EndpointBackend:
                 # reader falls back to `newer_activity`.
                 'newer_activity_marker': row.get('newer_activity_marker')
                 if isinstance(row.get('newer_activity_marker'), str) else None,
+                # The current fields digest alone (kittrial-5bb.367 F2b).
+                'newer_activity_fields': row.get('newer_activity_fields')
+                if isinstance(row.get('newer_activity_fields'), str) else None,
+                # The checkpoint-independent wait marker (kittrial-5bb.369): a worker's
+                # wait fingerprints this, so its own checkpoint does not wake it.
+                'wait_newer_activity_marker': row.get('wait_newer_activity_marker')
+                if isinstance(row.get('wait_newer_activity_marker'), str) else None,
                 'newer_activity_by_others': row.get('newer_activity_by_others')
                 if type(row.get('newer_activity_by_others')) is int and row.get('newer_activity_by_others') >= 0 else None,
                 'newer_activity_own': row.get('newer_activity_own')
@@ -3650,6 +3692,9 @@ class EndpointBackend:
                              # The stable newer-activity marker and its counts
                              # (kittrial-5bb.351), carried exactly as `work` read them.
                              'newer_activity_marker': attention.get('newer_activity_marker'),
+                             'newer_activity_fields': attention.get('newer_activity_fields'),
+                             # The checkpoint-independent wait marker (kittrial-5bb.369).
+                             'wait_newer_activity_marker': attention.get('wait_newer_activity_marker'),
                              'newer_activity_by_others': attention.get('newer_activity_by_others'),
                              'newer_activity_own': attention.get('newer_activity_own'),
                              'newer_activity_coverage': attention.get('newer_activity_coverage'),
@@ -6674,6 +6719,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                                      # edit to it, moves the fingerprint even while the
                                      # boolean stays true.
                                      newer_activity_marker=attention_field(task, 'newer_activity_marker'),
+                                     newer_activity_fields=attention_field(task, 'newer_activity_fields'),
+                                     # The checkpoint-independent marker the worker's
+                                     # wait fingerprints (kittrial-5bb.369): the agent's
+                                     # own checkpoint does not move it.
+                                     wait_newer_activity_marker=attention_field(task, 'wait_newer_activity_marker'),
                                      newer_activity_by_others=attention_field(task, 'newer_activity_by_others'),
                                      newer_activity_own=attention_field(task, 'newer_activity_own'),
                                      newer_activity_coverage=attention_field(task, 'newer_activity_coverage'),
@@ -7574,6 +7624,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                            # Held actions only, exactly like the boolean it refines; a
                            # legacy checkpoint yields null and a reader falls back to it.
                            'newer_activity_marker': task.get('newer_activity_marker')
+                           if blocked or in_progress else None,
+                           # The current fields digest alone (kittrial-5bb.367 F2b).
+                           'newer_activity_fields': task.get('newer_activity_fields')
+                           if blocked or in_progress else None,
+                           # The checkpoint-independent wait marker (kittrial-5bb.369),
+                           # carried beside the marker on held actions so /next, /wait and
+                           # the task read answer the same fields.
+                           'wait_newer_activity_marker': task.get('wait_newer_activity_marker')
                            if blocked or in_progress else None,
                            'newer_activity_by_others': task.get('newer_activity_by_others')
                            if blocked or in_progress else None,

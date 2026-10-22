@@ -1729,7 +1729,9 @@ previous page did not return, at any page size).
 - **`since_checkpoint=true`** selects the entries the task's newest valid checkpoint
   did not incorporate (the client's `history --since-checkpoint`), in either order. The
   answer then also names the checkpoint: `since_checkpoint`, `checkpoint_author`,
-  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A checkpoint by
+  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A legacy
+  record (no per-entry digests) reports `timestamp`: the released timestamp rule selects
+  the entries, so a backdated arrival or an older edit can be missed. A checkpoint by
   the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
 - **The cursor** is bound to the caller, the project and the query. A newest-first
   cursor continues only a newest-first read with the same `recent`, and an oldest-first
@@ -3401,14 +3403,35 @@ line separately and unconfined.
       other-party entry, when that newest entry is **edited**, and when one of those
       three fields is edited; never for a claim or a status change, and it never
       encodes a timestamp. The agent's own entries do not move it. It is `null` only
-      without a valid checkpoint or with unknown coverage (a legacy checkpoint without
-      per-entry digests); a client then falls back to `newer_activity`, which keeps its
-      released rule. The wait fingerprint includes the marker, so a second coordinator
+      without a valid checkpoint (or for a legacy checkpoint with no timestamp at all).
+      A legacy checkpoint with the switch off is read by the released timestamp rule and
+      gets the same marker, with `newer_activity_coverage: timestamp` saying that a
+      backdated arrival or an older edit can be missed; a client then falls back to
+      `newer_activity`, which keeps its released rule. The wait fingerprint includes the
+      marker, so a second coordinator
       comment, an edit to the newest one, or a description edit wakes a waiting bridge
-      even while the boolean stays `true`. All six fields are defined once in
+      even while the boolean stays `true`. Alongside it, `newer_activity_fields` carries
+      the current title/description/acceptance digest alone as 16 hex characters
+      (kittrial-5bb.367 F2b): it moves only when one of those three fields is edited,
+      never for a claim, status change or the owner's own comment, and is `null` without
+      a valid checkpoint. A bridge can therefore tell a field edit from the agent's own
+      checkpoint (the marker moves in both cases, this digest only in the first).
+      `wait_newer_activity_marker` is the checkpoint-independent marker a worker's
+      `wait` fingerprints (kittrial-5bb.369): the newest entry by anybody other than the
+      assignee across the whole task, folded with the same fields digest, or
+      `fields:<16 hex>` when nobody else has written. It is computed even before the
+      first checkpoint, so the agent's own plan checkpoint does not wake its own wait;
+      a new or edited other-party entry, another actor's checkpoint and a field edit
+      still do. The worker fingerprint compares it instead of `checkpoint_at`,
+      `open_items`, `blocking_items`, `newer_activity` and `newer_activity_marker`, and
+      keeps `review_state`, `whose_move`, `next_actor`, the assignment (`owner`),
+      `status` (claim/release), `pending_review_items`, `contribution_id` and
+      `redelivered`; the coordinator form and its fingerprint are unchanged. A held
+      action, a wait row and the task read's `activity` block all carry the field, from
+      the one computation. All eight fields are defined once in
       docs/BRIEFINGS.md, "Newer activity: one definition".
     - **The task read carries the same fields and the changes (kittrial-5bb.354).**
-      `GET /v1/projects/{pid}/tasks/{tid}/brief` adds `activity` (the same six fields,
+      `GET /v1/projects/{pid}/tasks/{tid}/brief` adds `activity` (the same seven fields,
       from the same computation as next and wait) and `changes_since_checkpoint`: the
       entries since the checkpoint, newest first, with author, time, own or other, new,
       edited or late, and a clipped body, plus the changed title, description or

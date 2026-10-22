@@ -163,7 +163,7 @@ class CheckpointThirdReviewTests(unittest.TestCase):
                 read=b.brief(data,'restored-project',TASK)
                 self.assertTrue(read['checkpoint']['newer_activity'])
                 self.assertEqual(read['newer']['other_count'],1)
-                self.assertEqual(read['newer']['coverage'],'unknown' if shape=='legacy' else 'snapshot')
+                self.assertEqual(read['newer']['coverage'],'timestamp' if shape=='legacy' else 'snapshot')
                 # Stale and from another project: both are said, STALE first.
                 self.assertEqual(read['checkpoint']['taken_in_project'],PROJECT)
                 self.assertTrue(read['next_action'].startswith('STALE CHECKPOINT'))

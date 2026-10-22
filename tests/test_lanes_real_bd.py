@@ -198,6 +198,54 @@ class RealBdLaneStateTests(unittest.TestCase):
         self.assertTrue(row['newer_activity_marker'].startswith('fields:'), row['newer_activity_marker'])
         self.assertEqual(row['newer_activity_coverage'], 'current')
 
+    def test_the_queue_marker_moves_with_provenance_writes_off(self):
+        """kittrial-5bb.367: with the switch OFF a second coordinator comment and a
+        description edit still move the marker; own acts do not; the own checkpoint
+        resets it once."""
+        task = self.create('Switch-off marker task')
+        b.save_checkpoint(self.export_rows(), 'pp', task, self.payload(task), 'op',
+                          self.writer('op'), provenance_writes=False)
+
+        def row():
+            return next(item for item in work.queue(self.export_rows(), 'op', [])['items']
+                        if item['task'] == task)
+        first = row()
+        self.assertEqual(first['newer_activity_coverage'], 'current')
+        self.assertTrue(first['newer_activity_marker'].startswith('fields:'),
+                        first['newer_activity_marker'])
+        fields_marker = first['newer_activity_marker']
+        other = self.writer('coordinator/session')
+        other(['comments', 'add', task, 'First direction', '--json'])
+        one = row()
+        self.assertEqual(one['newer_activity_coverage'], 'timestamp')
+        self.assertEqual(one['newer_activity_by_others'], 1)
+        self.assertTrue(one['newer_activity_marker'].startswith(task + '-c'),
+                        one['newer_activity_marker'])
+        other(['comments', 'add', task, 'Second direction', '--json'])
+        two = row()
+        self.assertNotEqual(two['newer_activity_marker'], one['newer_activity_marker'])
+        self.assertTrue(two['newer_activity_marker'].startswith(task + '-c'))
+        # The owner's own comment does not move it.
+        self.writer('op')(['comments', 'add', task, 'Own progress', '--json'])
+        self.assertEqual(row()['newer_activity_marker'], two['newer_activity_marker'])
+        # An edit of an owner-visible field does.
+        self.bd('update', task, '--description', 'A changed description', '--json',
+                actor='coordinator/session')
+        edited = row()
+        self.assertNotEqual(edited['newer_activity_marker'], two['newer_activity_marker'])
+        self.assertTrue(edited['newer_activity_marker'].startswith(task + '-c'),
+                        edited['newer_activity_marker'])
+        # The owner's own checkpoint resets it once; the next read is stable.
+        b.save_checkpoint(self.export_rows(), 'pp', task, self.payload(task), 'op',
+                          self.writer('op'), provenance_writes=False)
+        after = row()
+        self.assertEqual(after['newer_activity_coverage'], 'current')
+        self.assertTrue(after['newer_activity_marker'].startswith('fields:'),
+                        after['newer_activity_marker'])
+        self.assertNotEqual(after['newer_activity_marker'], edited['newer_activity_marker'])
+        self.assertNotEqual(after['newer_activity_marker'], fields_marker)
+        self.assertEqual(row()['newer_activity_marker'], after['newer_activity_marker'])
+
     @unittest.skipIf(not RELEASED, 'released checkout not configured (ORCHESTRA_LANES_RELEASED_KIT)')
     def test_the_released_kit_reads_the_task_and_reports_the_documented_stale_reading(self):
         task = self.create('Released kit task')
