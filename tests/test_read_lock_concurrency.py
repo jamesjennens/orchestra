@@ -226,7 +226,8 @@ WRITE_ACTIONS = ('checkpoint', 'review', 'handoff', 'coordinate', 'lifecycle', '
 #: The actions that are read-only always.
 READ_ACTIONS = ('brief', 'history', 'requirements', 'work')
 #: The actions whose shared/exclusive choice is the payload operation.
-READ_OPERATIONS = (('web-lifecycle', 'read'), ('web-merge-slot', 'check')) + tuple(
+READ_OPERATIONS = (('web-lifecycle', 'read'), ('web-lifecycle', 'check'),
+                   ('web-merge-slot', 'check')) + tuple(
     ('web-guidance', operation) for operation in
     ('read', 'status', 'onboarding', 'onboarding-edit', 'coordinate-check'))
 

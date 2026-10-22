@@ -5,6 +5,64 @@ const DIMENSIONS = ['implemented', 'tested', 'reviewed', 'integrated', 'deployed
 const VALUES = ['unknown', 'pending', 'passed', 'failed', 'not-applicable'];
 const SCOPE = ['source_commit', 'integration_commit', 'release_id', 'environment'];
 
+function integrationCheck(ctx, project, task) {
+  if (!ctx.api.integrationCheck) return null;
+  const target = h('input', { maxlength: 160, 'aria-label': 'Integration target (optional)' });
+  const button = h('button', { type: 'button' }, 'Read integration check');
+  const output = h('div', { class: 'stack', role: 'status' });
+  let reading = false;
+  function render(state) {
+    const contribution = state.contribution;
+    output.replaceChildren(
+      h('p', null, 'Contribution: ', contribution ? (contribution.commit || 'no commit') : 'none',
+        contribution && contribution.author ? ' by ' + contribution.author : '',
+        state.review_state ? ' · review: ' + state.review_state : ''),
+      h('h4', null, 'Checks the server can make'),
+      h('ul', null, (state.checks || []).map(row => h('li', null,
+        h('strong', null, row.check + ': '), row.allowed ? 'allowed' : 'refused',
+        row.reason ? h('span', { class: 'muted' }, ' — ' + row.reason) : null,
+        row.approver ? h('span', { class: 'muted' }, ' — approver ' + row.approver) : null,
+        row.holder !== undefined && row.holder !== null
+          ? h('span', { class: 'muted' }, ' — holder ' + row.holder) : null,
+        row.target ? h('span', { class: 'muted' }, ' — target ' + row.target) : null))),
+      h('h4', null, 'Not checked by the server'),
+      h('ul', null, (state.unchecked || []).map(row => h('li', null,
+        h('strong', null, row.check + ': '), 'not checked — ' + (row.reason || 'unknown')))),
+      h('h4', null, 'Writes still owed'),
+      h('ol', null, (state.next || []).map(step => h('li', null,
+        h('strong', null, step.step + ': '), step.state,
+        h('div', { class: 'muted' }, step.route,
+          step.operation_id ? ' · operation ' + step.operation_id : ' · new operation identity'),
+        step.operation_id_note ? h('div', { class: 'muted' }, step.operation_id_note) : null,
+        step.reason ? h('div', { class: 'muted' }, step.reason) : null))),
+      h('p', { class: 'muted' }, 'The server never performs the merge, the test run or the push; those stay a person\'s step.'));
+  }
+  button.addEventListener('click', async () => {
+    if (reading) return;
+    reading = true; button.disabled = true;
+    output.replaceChildren(h('p', { class: 'muted' }, 'Reading…'));
+    try {
+      render(await ctx.api.integrationCheck(project.id, task.id, target.value.trim() || undefined));
+    } catch (failure) {
+      // A definite "this task does not exist" answer must not be reported as an
+      // older server without the route (kittrial-5bb.374 review item 3a). Both
+      // carry status 404, so the server's own sentence is the discriminator.
+      if (failure.status === 404 && /Lifecycle task does not exist/i.test(failure.message || '')) {
+        output.replaceChildren(h('p', { role: 'alert' }, failure.message));
+      } else if ([404, 501].includes(failure.status)) {
+        output.replaceChildren(h('p', { class: 'muted' }, 'This server has no integration check.'));
+      } else {
+        output.replaceChildren(h('p', { role: 'alert' }, failure.message || describe(failure)),
+          failure.status === 409
+            ? h('p', { class: 'muted' }, 'Read the current state again before changing anything.') : null);
+      }
+    } finally { reading = false; button.disabled = false; }
+  });
+  return h('details', null, h('summary', null, 'Integration check (read-only)'),
+    h('p', { class: 'muted' }, 'Reports the merge preconditions the server can see, and the ones it cannot. It writes nothing.'),
+    h('label', { class: 'stack' }, 'Integration target (optional)', target), button, output);
+}
+
 export function lifecyclePanel(ctx, project, task) {
   const panel = h('section', { id: 'lifecycle-facts', class: 'panel', 'aria-label': 'Lifecycle facts', hidden: true });
   if (!ctx.api.lifecycle) return null;
@@ -109,6 +167,7 @@ export function lifecyclePanel(ctx, project, task) {
           h('ul', null, (fact.evidence || []).map(pointer => h('li', null, pointer))));
       })),
       h('button', { type: 'button', onclick: draw }, 'Refresh facts'),
+      integrationCheck(ctx, project, task),
       pending.length ? h('div', { class: 'banner warn stack' }, h('strong', null, 'Requests to reconcile'),
         pending.map(request => h('div', null,
           h('p', null, request.operation + ' · Source: ' + (request.body.scope?.source_commit || 'none')

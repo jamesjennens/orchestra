@@ -786,6 +786,85 @@ class InProcessBackend:
                                          'Current coordinate permission is required'),
                         affordances=affordances, mark_writer_enabled=False)
 
+    def integration_check(self, principal, project_id, task_id, target=None):
+        """The same four-part read on the disposable backend (kittrial-5bb.374).
+
+        This backend has no host merge slot, approval chain reader or mark family, so
+        the checks that need them are refused with that reason rather than invented.
+        It writes nothing, exactly as the host read does.
+        """
+        import lifecycle
+        import web_lifecycle
+        from requirements import content_hash
+        body = dict(operation='check', task=task_id)
+        if target is not None:
+            body['target'] = target
+        try:
+            web_lifecycle.validate(body, None, None)
+        except web_lifecycle.LifecycleError as error:
+            raise invalid(str(error)) from None
+        with self.service.store.lock:
+            self.service.check_authority(principal, project_id, CAP_READ)
+            task = self._task(project_id, task_id)
+            memory = task.get('web_lifecycle') or {}
+            scope = memory.get('scope')
+            token = content_hash(scope) if scope is not None else None
+            facts = {d: {'value': 'unknown', 'event_id': None}
+                     for d in lifecycle.DIMENSIONS}
+            facts.update((memory.get('scopes', {}).get(token) or {}).get('facts') or {})
+            contributions = self.state.get('contributions', {}).get(task_id, [])
+            record = next((r for r in reversed(contributions)
+                           if r.get('kind') == 'contribution'), None)
+            contribution = (dict(comment_id=record.get('id'), commit=record.get('commit'),
+                                 base_commit=record.get('base_commit'),
+                                 author=record.get('actor'), summary=record.get('summary'))
+                            if record else None)
+            commit = (contribution or {}).get('commit')
+            source_allowed = bool(scope is not None and commit
+                                  and scope.get('source_commit') == commit)
+            checks = [
+                dict(check='approval', allowed=False,
+                     reason='Use the host backend to record reviewed or integrated facts'),
+                dict(check='source_commit', allowed=source_allowed,
+                     reason=None if source_allowed else
+                     'The full source commit must match the current approved contribution',
+                     source_commit=(scope or {}).get('source_commit'), contribution_commit=commit),
+                dict(check='slot', allowed=False,
+                     reason='The disposable backend has no host merge slot', holder=None, target=None),
+                dict(check='hold', allowed=True, reason=None),
+                dict(check='reverted', allowed=True, reason=None,
+                     integration_commit=(scope or {}).get('integration_commit'), reverted_commits=[]),
+            ]
+            base = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
+            steps = [dict(step='scope', route='POST ' + base + '/lifecycle/scope',
+                          state='committed' if scope is not None else 'not-attempted',
+                          operation_id=None)]
+            for dimension in ('reviewed', 'integrated'):
+                passed = facts[dimension]['value'] == 'passed'
+                steps.append(dict(step=dimension,
+                                  route='POST ' + base + '/lifecycle/facts/' + dimension,
+                                  state='committed' if passed else 'not-attempted',
+                                  operation_id=None))
+            steps.append(dict(step='integrated-mark',
+                              route='POST ' + base + '/lifecycle/facts/integrated',
+                              automatic=True, state='not-attempted', operation_id=None))
+            steps.append(dict(step='slot-release',
+                              route='POST /v1/projects/%s/merge-slot/release' % project_id,
+                              state='not-held', operation_id=None,
+                              operation_id_note='The server records no identity for a slot release.'))
+            return dict(task=dict(id=task.get('id'), title=task.get('title'),
+                                  status=task.get('status'), assignee=task.get('assignee')),
+                        contribution=contribution, review_state=None,
+                        target=target, checks=checks,
+                        unchecked=[dict(row) for row in
+                                   (dict(check='base_membership', known=False,
+                                         reason='the server has no code-host access'),
+                                    dict(check='tests', known=False,
+                                         reason='the server has no code-host access'),
+                                    dict(check='pushed_result', known=False,
+                                         reason='the server has no code-host access'))],
+                        next=steps, merge_ready=all(row['allowed'] for row in checks))
+
     def _lifecycle_write(self, route, principal, project_id, payload, operation_id):
         import web_lifecycle
         from requirements import content_hash
@@ -2084,6 +2163,17 @@ class EndpointBackend:
     def lifecycle_read(self, principal, project_id, task_id):
         return self._run('web-lifecycle', project_id, self._actor(principal),
                          [json.dumps(dict(operation='read', task=task_id))],
+                         authority=authority_request(principal, project_id, CAP_READ,
+                                                     now=self.service._expiry_now()),
+                         require_authority=True)
+
+    def integration_check(self, principal, project_id, task_id, target=None):
+        """The read-only merge check (kittrial-5bb.374). One read, no identity, no write."""
+        body = dict(operation='check', task=task_id)
+        if target is not None:
+            body['target'] = target
+        return self._run('web-lifecycle', project_id, self._actor(principal),
+                         [json.dumps(body)],
                          authority=authority_request(principal, project_id, CAP_READ,
                                                      now=self.service._expiry_now()),
                          require_authority=True)
@@ -6702,6 +6792,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                     ctx.params['tid'], ctx.params['dimension'])
         return self._mutate(ctx, route_name, ctx.params['pid'], write, capability=CAP_COORDINATE,
                             status=201, serialize=False, canonical=True, audit_success=False, replay_check=replay_check)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/integration-check')
+    def integration_check_get(self, ctx):
+        """The read-only merge check (kittrial-5bb.374): project read, no write."""
+        self._project(ctx, CAP_READ)
+        if not hasattr(self.backend, 'integration_check'):
+            raise not_implemented('The integration check is unavailable on this server')
+        refuse_unknown_fields(ctx.query, ('target',), 'Integration check query')
+        target = ctx.query.get('target')
+        result = self.backend.integration_check(ctx.principal, ctx.params['pid'],
+                                                ctx.params['tid'], target)
+        result['current_actor'] = self.service.bind_actor(ctx.principal, None)
+        return 200, result
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle/scope')
     def lifecycle_scope(self, ctx):

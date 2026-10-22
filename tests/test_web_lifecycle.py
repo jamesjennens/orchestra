@@ -135,6 +135,39 @@ class AdapterTests(unittest.TestCase):
         self.assertIn('another party than the author',str(raised.exception))
         self.assertEqual(self.writes,0)
 
+    def test_approved_source_keeps_mains_order_when_source_and_party_both_fail(self):
+        # kittrial-5bb.374 review item b1: approval, then source, then parties.
+        author = self.rows[0]['comments'][0]['author']
+        self.parties = lambda name: {'same-account'} if name in (author, REVIEWER) else {name}
+        self.scope['source_commit'] = 'c' * 40
+        for parties in (self.parties, None):
+            with self.subTest(parties=bool(parties)):
+                with self.assertRaises(web.LifecycleError) as raised:
+                    web.approved_source(self.rows[0], self.scope, owners={}, project=self.project,
+                                        parties=parties)
+                self.assertEqual(raised.exception.status, 409)
+                self.assertEqual(str(raised.exception),
+                                 'The full source commit must match the current approved contribution')
+
+    def test_read_and_apply_pin_the_source_sentence_when_source_and_party_both_fail(self):
+        self.scope_first()
+        author = self.rows[0]['comments'][0]['author']
+        self.parties = lambda name: {'same-account'} if name in (author, REVIEWER) else {name}
+        # Move the scope to a source that no longer matches the approved contribution.
+        self.apply(self.scope_body(dict(self.scope, source_commit='c' * 40),
+                                   expected=content_hash(self.scope)), 'stale-source')
+        self.scope['source_commit'] = 'c' * 40
+        state = web.read(TASK, 'op', self.native_run, self.project, parties=self.parties)
+        self.assertEqual(state['approval_reason'],
+                         'The full source commit must match the current approved contribution')
+        before = (copy.deepcopy(self.rows), self.writes)
+        with self.assertRaises(web.LifecycleError) as raised:
+            self.apply(self.body('reviewed'), 'both-fail')
+        self.assertEqual(raised.exception.status, 409)
+        self.assertEqual(str(raised.exception),
+                         'The full source commit must match the current approved contribution')
+        self.assertEqual((self.rows, self.writes), before)
+
     def test_historical_worker_issuer_matches_approver_party(self):
         self.scope_first()
         author = self.rows[0]['comments'][0]['author']
