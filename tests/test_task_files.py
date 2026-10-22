@@ -527,6 +527,20 @@ class TaskFilesHttpTests(agents.AgentHarness):
         self.assertEqual(before, self.stored(), 'a refused upload stores no bytes: it is refused before a byte is read')
         self.assertEqual([], [route for route in calls if route.startswith('files.')])
 
+    def test_an_upload_the_caller_may_not_make_is_refused_before_its_body_is_read(self):
+        # The refusal is answered from the headers alone: a client that has sent no byte of its body yet is not
+        # waited for, so a body that would not be allowed is never taken in (r2: the orphan removal would otherwise
+        # hide that the bytes were read).
+        for token, direction in ((self.tokens['worker'], 'to-worker'), (self.tokens['worker2'], 'from-worker')):
+            sock = socket.create_connection(('127.0.0.1', self.port), timeout=5)
+            try:
+                sock.sendall(('PUT %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Length: 100000\r\n\r\n'
+                              % (self.files_path(name='never.bin', direction=direction), token)).encode())
+                answer = sock.recv(4096).decode('latin-1')            # times out (5 s) if the server waits for the body
+            finally:
+                sock.close()
+            self.assertTrue(answer.startswith('HTTP/1.1 403'), (direction, answer[:80]))
+
     def test_a_withdrawal_by_somebody_else_is_refused_before_the_backend_is_asked(self):
         mine = self.upload(self.tokens['worker'], b'mine', name='m.txt', direction='from-worker')
         calls = []
