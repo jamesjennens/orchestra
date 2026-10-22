@@ -152,6 +152,19 @@ def require_configured_operator(actor, operators, action):
                          'configured operator may ' + action)
 
 
+def http_actor_id(actor):
+    """Return the first HTTP actor segment (`usr_*` or `agent_*`) for a web actor, else None."""
+    from http_authority import http_actor_id as _http_actor_id
+    return _http_actor_id(actor)
+
+
+def http_actor_account(actor):
+    """Return `account:<id>` for a web actor (`usr_*` or `agent_*`), else None."""
+    head = http_actor_id(actor)
+    return ('account:' + head) if head is not None else None
+
+
+
 # -- F3 acceptance binding ------------------------------------------------------------
 
 def validate_acceptance_shape(acceptance):
@@ -397,7 +410,7 @@ def uncertain(message, action, spec):
 
 # -- the single write entry point ------------------------------------------------------------
 
-def apply_native(payload, actor, run, project, spec, operator=False, operators=None):
+def apply_native(payload, actor, run, project, spec, operator=False, operators=None, web_coordinator=False):
     """Caller holds the canonical project lock; run(argv) invokes pinned bd.
 
     `operator=True` is the owner/operator route; only it may accept a record (or
@@ -409,9 +422,11 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
 
     `operators` is the deployment operator allowlist; the admin CLI supplies
     `operators(root, strict=True)` and an actor outside it is refused before any
-    journal or native write.
+    journal or native write. When `web_coordinator=True`, the endpoint has already
+    verified `CAP_COORDINATE` and project membership for the web actor (`usr_...` /
+    `agent_...`), while `operators` is still passed for prior-evidence and void reads.
     """
-    if operator:
+    if operator and not web_coordinator:
         require_configured_operator(actor, operators, spec.accept_action)
     spec.validate(payload, operator)
     spec.refuse_before_journal(payload, operator)

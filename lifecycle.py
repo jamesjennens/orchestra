@@ -20,6 +20,8 @@ from requirements import canonical_bytes, content_hash, load_json
 DIMENSIONS = ('implemented','tested','reviewed','integrated','deployed','live-verified')
 VALUES = ('unknown','pending','passed','failed','not-applicable')
 SCOPE_KEYS = {'source_commit','integration_commit','release_id','environment'}
+#: The fields in the order every operator-facing refusal names them.
+SCOPE_ORDER = ('source_commit','integration_commit','release_id','environment')
 PREFIX = 'Kind: lifecycle-v1\n'
 # Operational effect state, deliberately outside the six lifecycle facts. A
 # release can be deployed and switched on while a known defect stops it working;
@@ -516,10 +518,10 @@ def trusted_payloads(rows,events=None):
     return trusted
 
 
-def project_facts(rows):
-    events=events_by_dimension(rows)
+def project_facts(rows,events=None):
+    if events is None:events=events_by_dimension(rows)
     trusted=trusted_payloads(rows,events)
-    history={entry['id']:entry['scopes'] for entry in scoped_evidence(rows,('deployed',LIVE))}
+    history={entry['id']:entry['scopes'] for entry in scoped_evidence(rows,('deployed',LIVE),events=events)}
     result=[]
     for row in rows:
         if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
@@ -599,7 +601,7 @@ def untrusted_reason(dim,labels,found,scope_trusted,orders):
     return None
 
 
-def scoped_evidence(rows,dimensions=('integrated',)):
+def scoped_evidence(rows,dimensions=('integrated',),events=None):
     """Per-scope trusted values for the named dimensions, newest scope first.
 
     ``project_facts`` reports only the newest scope and treats older evidence as
@@ -618,7 +620,7 @@ def scoped_evidence(rows,dimensions=('integrated',)):
     token is kept, so a recurring token cannot resurrect an older position.
     """
     dims=tuple(dimensions)
-    events=events_by_dimension(rows)
+    if events is None:events=events_by_dimension(rows)
     result=[]
     for row in rows:
         if not isinstance(row, dict) or row.get('issue_type')=='event' or row.get('malformed') or not row.get('id'):continue
@@ -755,7 +757,7 @@ def environment_liveness(scopes,environment):
     return (newest[1],newest[2]) if newest is not None else (None,None)
 
 
-def integration_evidence(rows):
+def integration_evidence(rows,events=None):
     """Per-scope ``integrated`` evidence, newest recorded scope first.
 
     Thin wrapper over ``scoped_evidence`` so every existing reader keeps exactly
@@ -763,7 +765,7 @@ def integration_evidence(rows):
     as integrated when ANY scope whose ``source_commit`` equals its full commit
     records ``integrated=passed``, regardless of scope order.
     """
-    return scoped_evidence(rows,('integrated',))
+    return scoped_evidence(rows,('integrated',),events=events)
 
 
 def evidence_owed(rows):
@@ -1006,6 +1008,60 @@ def review_chain_state(row, operators=None, journal=None):
     except (ValueError,KeyError,TypeError):return None
 
 
+def unreadable_hold_chain(row, operators=None, journal=None):
+    """Why ``row``'s review chain cannot be read (kittrial-5bb.297, fail closed), or None.
+
+    The fail-open of the design review of kittrial-5bb.252 DELIVERY2 item 3: a chain that
+    EXISTS but cannot be parsed may carry a hold this read cannot see, and the hold exists
+    to stop release selection, so every surface that selects or integrates treats such a
+    task as not integration-ready, with this reason naming the task and why. A row with no
+    chain comments at all has no holds to hide and is never flagged; neither is a missing
+    or non-task row. Read through the SAME voids and journal as every canonical reader
+    (kittrial-5bb.272 review item 1); nothing here changes what is recorded.
+    """
+    if not isinstance(row,dict) or not isinstance(row.get('id'),str):return None
+    from coordination import is_merge_slot
+    if row.get('issue_type') in ('event','gate') or is_merge_slot(row):return None
+    import re
+    from review_workflow import PREFIX, project, applied_review_voids
+    # kittrial-5bb.297 review item 'family-prefix-dos': ONLY the reserved any-version
+    # pattern 'Kind: contribution-review-v<N>' followed by a newline counts as a chain
+    # record - an ordinary look-alike comment ('Kind: contribution-reviewer note...',
+    # 'Kind: contribution-review-v1 (quoting...)') is not reserved and must never let a
+    # contributor stop another task's release. And the operator voids are applied
+    # BEFORE deciding, so a voided bad record no longer flags - the repair the
+    # refusal names works here too. Both reads use the caller's operators, exactly as
+    # every canonical reader does.
+    reserved=re.compile(r'Kind: contribution-review-v[0-9]+\n')
+    try:
+        voided=set(applied_review_voids(row,operators)[0])
+    except (ValueError,KeyError,TypeError):
+        voided=set()
+    comments=row.get('comments') or []
+    chain_comments=[comment for comment in comments
+                    if isinstance(comment,dict) and isinstance(comment.get('text'),str)
+                    and reserved.match(comment['text'])
+                    and str(comment.get('id')) not in voided]
+    if not chain_comments:
+        return None                                     # no chain at all: no holds to hide
+    if any(not comment['text'].startswith(PREFIX) for comment in chain_comments):
+        # A chain record of a version this kit does not know (review item 4b): the
+        # chain reader keys on the exact version and never sees it, so a hold may
+        # hide in it - unreadable, never 'no chain at all'.
+        return ('the review chain of %s holds a record of a contribution-review version this kit '
+                'cannot read, so a hold it may carry cannot be seen; an operator on the host '
+                'removes that record (a void cannot: the void target must be a record of a version '
+                'this kit reads), and until then the task is not integration-ready'
+                %row.get('id'))
+    try:
+        project(row,operators,journal)
+        return None
+    except (ValueError,KeyError,TypeError) as error:
+        return ('the review chain of %s cannot be read (%s), so a hold it may carry cannot be seen; '
+                'an operator repairs the chain (voids reconcile it), and until then the task is not '
+                'integration-ready'%(row.get('id'),str(error)[:120]))
+
+
 def held_tasks(rows, operators=None, journal=None):
     """``{task: sentence}`` for tasks whose CURRENT contribution is held (kittrial-5bb.10).
 
@@ -1117,12 +1173,23 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
     # selection skips the task with the sentence naming the open hold (or the failed
     # attestation) and who can release it, instead of offering it as a target.
     held=held_tasks(rows,operators,journal)
+    # kittrial-5bb.297, fail closed: a chain that exists but cannot be parsed may carry a
+    # hold this read cannot see, so such a target is skipped with the reason naming the
+    # task - and the skipped list is the release audit's report of it. A task with no
+    # chain at all is never flagged (no holds to hide).
+    unreadable={}
+    for row in rows:
+        reason=unreadable_hold_chain(row,operators,journal)
+        if reason is not None:unreadable[row.get('id')]=reason
     targets=[];skipped=[];flags=[];verifying=[];restoring=[]
     for entry in scoped_evidence(rows,('integrated','deployed','live-verified',LIVE)):
         task=entry['id'];scopes=entry['scopes']
         if wanted is not None and task not in wanted:continue
         if task in held:
             skipped.append({'task':task,'reason':'held from integration: '+held[task]})
+            continue
+        if task in unreadable:
+            skipped.append({'task':task,'reason':'unreadable hold chain: '+unreadable[task]})
             continue
         chosen=None;reason=entry['untrusted'].get('integrated')
         for candidate in sorted(scopes,key=lambda c:((c.get('integrated') or {}).get('order') or -1,
@@ -1384,6 +1451,141 @@ def read_event_rows(run):
                          % error) from None
 
 
+def _row_belongs_to(row,task):
+    """Is ``row`` one of ``task``'s OWN records: its native row or one of its events?
+
+    A bounded read also carries the named defect task's row(s) and whatever the
+    operation-id substring matched, and a full export carries every task. Only a
+    row whose id IS the task, or whose parent-child dependency names it, is
+    evidence about THIS task's view (kittrial-5bb.289 item 4b).
+    """
+    if not isinstance(row,dict):
+        return False
+    if row.get('id')==task:
+        return True
+    return any(isinstance(dep,dict) and dep.get('type')=='parent-child'
+               and dep.get('depends_on_id')==task for dep in row.get('dependencies') or [])
+
+
+def _recorded_stamps(row):
+    """The times one row carries: its own ``created_at`` and its own comments'."""
+    stamp=row.get('created_at')
+    if isinstance(stamp,str) and stamp.strip():
+        yield stamp
+    for comment in row.get('comments') or []:
+        if not isinstance(comment,dict):
+            continue
+        stamp=comment.get('created_at')
+        if isinstance(stamp,str) and stamp.strip():
+            yield stamp
+
+
+def newest_record_time(rows,task=None):
+    """The newest ``created_at`` among the records a comparison was made from.
+
+    An operator reads this as "the view this write was judged against knows
+    records up to T": a scope written after T cannot be in that view, which is
+    how a lagging export or a later scope write becomes visible instead of
+    hiding behind one fixed sentence (kittrial-5bb.289 item 1). ``None`` when no
+    row carries a time; the caller prints it as unknown rather than inventing one.
+
+    Given ``task``, only that task's OWN row, its own events and their comments
+    count. A row that merely matched the operation-id substring, or the named
+    defect task, records another task's work and must not become this task's view
+    time (kittrial-5bb.289 item 4b).
+    """
+    stamps=[]
+    for row in rows:
+        if not isinstance(row,dict):
+            continue
+        if task is not None and not _row_belongs_to(row,task):
+            continue
+        stamps.extend(_recorded_stamps(row))
+    # Native RFC3339 UTC stamps in one format sort as text; the newest is last.
+    return max(stamps) if stamps else None
+
+
+def scope_fields(scope):
+    """One line naming a scope's exact four fields, for an operator-facing refusal.
+
+    Each value is JSON-escaped, so a free-text ``release_id`` or ``environment``
+    cannot forge a second line or smuggle a control character into the refusal.
+    ``None`` (no trusted current scope) is named as such, never rendered as an
+    empty object an operator could mistake for a real scope.
+    """
+    if not isinstance(scope,dict):
+        return 'none recorded'
+    return '{'+', '.join('%s: %s'%(key,json.dumps(scope.get(key),ensure_ascii=False))
+                         for key in SCOPE_ORDER)+'}'
+
+
+def _native_array_rows(run,argv,what):
+    """One bounded native read, decoded as a JSON array; a failure is labelled."""
+    try:
+        text=run(argv)
+        return record_json.loads_array_rows(text or '[]')
+    except (ValueError,OSError,RecursionError,subprocess.SubprocessError) as error:
+        raise ValueError('%s cannot be read: %s' % (what,error)) from None
+
+
+def read_task_rows(run,task,operation_id=None,defect_task=None):
+    """A LIVE bounded view of one task: its row, its own events and its receipts.
+
+    A single-fact write compares against this instead of a full ``export --all``
+    (kittrial-5bb.289 item 2): one ``show`` of the task (with comments, so a host
+    correction that binds one of its events is consulted), one ``list --parent``
+    of its child events, one ``show`` of the named defect task when there is one,
+    and one ``list --desc-contains`` of the events that carry this operation id
+    (any task, so the reuse and void guards still see a conflicting receipt). The
+    cost follows the task, not the project.
+
+    A runner that cannot answer these reads raises; it is never silently given a
+    weaker check. ``apply_native`` decides which runners may take this path.
+    """
+    rows=[]
+    # The child events first: a runner that cannot serve this read fails here with
+    # its own labelled error rather than being mistaken for a missing task.
+    rows.extend(_native_array_rows(
+        run,['list','--all','--parent',task,'--limit','0','--json'],
+        "the lifecycle events of %s"%task))
+    # One show per task: a missing defect task must not hide the task's own row
+    # (the two absences are refused separately by ``_apply_fact``).
+    for name in dict.fromkeys([task] if defect_task in (None,task) else [task,defect_task]):
+        try:
+            rows.extend(_native_array_rows(
+                run,['show',name,'--json','--include-comments'],'the task row %s'%name))
+        except ValueError:
+            # bd answers a ``show`` of an unknown id with a failure (measured,
+            # kittrial-5bb.185). The row is simply absent then and the caller
+            # refuses with its unknown-task sentence; no weaker check runs.
+            pass
+    if operation_id:
+        rows.extend(_native_array_rows(
+            run,['list','--all','--desc-contains',operation_id,'--limit','0','--json'],
+            'the receipts of operation %s'%operation_id))
+    seen=set();unique=[]
+    for row in rows:
+        if not isinstance(row,dict):
+            continue
+        identity=row.get('id')
+        if isinstance(identity,str):
+            if identity in seen:
+                continue
+            seen.add(identity)
+        unique.append(row)
+    return unique
+
+
+def read_task_view(run,task,operation_id=None,defect_task=None):
+    """The bounded live view in the shape the readers take (one task's rows)."""
+    rows=read_task_rows(run,task,operation_id=operation_id,defect_task=defect_task)
+    try:
+        return host_snapshot(record_json.classify(rows,run,types=['event']), run=run)
+    except (ValueError,OSError,subprocess.SubprocessError) as error:
+        raise ValueError('The lifecycle view of %s cannot be read: %s; a fresh view is needed '
+                         'before recording facts'%(task,error)) from None
+
+
 def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=None):
     """One native fact write against an already-read export (``rows``).
 
@@ -1427,7 +1629,16 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=No
             raise ValueError('unknown defect_task: '+payload['defect_task'])
     if payload['dimension']!='lifecycle-scope' and current_scope!=payload['scope']:
         if recorded is None or content_hash(payload['scope']) not in recorded:
-            raise ValueError('set matching lifecycle scope before recording facts')
+            # Name what was compared and how old the view is (kittrial-5bb.289
+            # item 1). Without the two scopes and the newest record time an
+            # operator cannot tell a lagging view from a scope that moved, and a
+            # fact stays unrecorded behind one fixed sentence.
+            seen=newest_record_time(rows,payload['task'])
+            raise ValueError(
+                'set matching lifecycle scope before recording facts: the task\'s current scope is '
+                +scope_fields(current_scope)+', the payload names '+scope_fields(payload['scope'])
+                +', and the newest record in the view compared is '+(seen if seen else 'unknown')
+                +'; re-read the current scope and retry with it')
     dim,value=payload['dimension'],payload['value']
     if dim+':'+value in (issue.get('labels') or []):
         intermediate='pending' if value!='pending' else 'unknown'
@@ -1734,6 +1945,18 @@ def apply_release(payload,actor,run,operators=None,journal=None,lifecycle_author
         raise ValueError('Refusing a release that names %s: %s. A held contribution is not integration-ready; '
                          'the hold must be released (or a corrected attestation recorded) first.'
                          %(', '.join(refused[:5]),'; '.join('%s: %s'%(task,held[task]) for task in refused[:5])))
+    # kittrial-5bb.297, fail closed: naming a task whose chain cannot be read is refused
+    # the same way - a hold it may carry cannot be seen, so it is not integration-ready.
+    issues={row.get('id'):row for row in rows if isinstance(row,dict)}
+    unreadable_named={}
+    for task in named:
+        reason=unreadable_hold_chain(issues.get(task),operators,journal)
+        if reason is not None:unreadable_named[task]=reason
+    if unreadable_named:
+        raise ValueError('Refusing a release that names %s: %s.'
+                         %(', '.join(sorted(unreadable_named)[:5]),
+                           '; '.join('%s: %s'%(task,unreadable_named[task])
+                                     for task in sorted(unreadable_named)[:5])))
     if payload.get('rollback'):require_rollback_target_deployed(rows,payload['scope'])
     selected,plans,issues,evidence=_release_plan(rows,payload,operators,journal)
     superseded=_supersede_plan(rows,payload,issues,evidence)
@@ -1876,6 +2099,12 @@ def require_unheld_fact(issue, dimension, task, operators=None, journal=None):
             raise ValueError('Refusing to record %s for %s: %s. A held contribution is not '
                              'integration-ready; the hold must be released (or a corrected attestation '
                              'recorded) first.'%(dimension,task,sentence))
+        # kittrial-5bb.297, fail closed: a chain that exists but cannot be parsed may carry
+        # a hold this read cannot see, so the fact is refused with the reason naming the
+        # task and why. A task with no chain at all is not flagged.
+        unreadable=unreadable_hold_chain(issue,operators,journal)
+        if unreadable:
+            raise ValueError('Refusing to record %s for %s: %s.'%(dimension,task,unreadable))
 
 
 def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_authors=False,
@@ -1900,7 +2129,18 @@ def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_au
                              lifecycle_authors=lifecycle_authors,owners=owners)
     validate_payload(payload)
     if payload['actor']!=actor:raise ValueError('payload actor must match request actor')
-    rows=read_event_rows(run)
+    if getattr(run,'bounded_task_reads',False):
+        # The endpoint's host runner can answer a bounded per-task read, so a
+        # one-fact write compares against the task's LIVE rows instead of paying
+        # for `export --all` (kittrial-5bb.289 item 2). The rows are the ones
+        # `project_facts` needs, so an up-to-date view yields the same current
+        # scope the export yields, and a real mismatch is still refused. A bare
+        # callable - an offline tool or a synthetic test double - cannot answer
+        # the bounded reads and keeps the full export's answer.
+        rows=read_task_view(run,payload['task'],operation_id=payload['operation_id'],
+                            defect_task=payload.get('defect_task'))
+    else:
+        rows=read_event_rows(run)
     issues={row['id']:row for row in rows if row.get('issue_type')!='event' and not row.get('malformed')}
     state=next((r for r in project_facts(rows) if r['id']==payload['task']),None)
     current_scope=state['scope'] if state else None
@@ -2255,6 +2495,26 @@ def main():
             # caller-side journal. A dry run stays offline and views reverts locally
             # (pass --journal PROJECT for a host-accurate dry run).
             endpoint_reverts=None
+            # kittrial-5bb.297 review item 'operators-on-every-surface': the offline
+            # dry run consults the SAME configured operators the canonical readers
+            # use (from the config's runtime root), so an operator void that repairs
+            # an unreadable hold chain is seen here too. A config without a readable
+            # local root (a remote transport) degrades to no operators with a
+            # warning, exactly as an unreadable setting degrades elsewhere.
+            selection_operators=None
+            try:
+                # kittrial-5bb.297 review item (b): the name is admin.operators (an
+                # ImportError here was swallowed and left the operators silently
+                # unused). A malformed value or a config without a readable local
+                # root keeps the tolerance: no operators, with a warning.
+                from admin import ConfigurationUnreadable, operators as configured_operators
+                selection_operators=configured_operators(Path(config['root']))
+            except ConfigurationUnreadable as exc:
+                warnings.append('operator voids not applied: the configured operators are '
+                                'unreadable (%s)'%str(exc)[:120])
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                warnings.append('operator voids not applied: the configured operators could not be '
+                                'read from %s (%s)'%(config.get('root'),str(exc)[:80]))
             if not a.dry_run:
                 query=dict(data,dimension=RELEASE_QUERY,targets=[],live_verified=False,
                            operation_id=(data['operation_id'][:RELEASE_OPERATION_MAX-6]+'/query'))
@@ -2282,6 +2542,7 @@ def main():
             if data['rollback']:
                 selection=rollback_selection(rows,data['scope'],is_ancestor,
                                              reverted=endpoint_reverts,journal=journal,
+                                             operators=selection_operators,
                                              current_commits=current_contribution_commits(rows))
                 targets=selection['targets'];supersede=list(selection['supersede'])
                 # The scope-level list of what the rollback moves past (rev4 item 2):
@@ -2296,6 +2557,7 @@ def main():
                                             subset=set(subset) if subset else None,
                                             current_commits=current_contribution_commits(rows),
                                             live_verified=data['live_verified'],journal=journal,
+                                            operators=selection_operators,
                                             reverted=endpoint_reverts)
                 targets=selection['targets'];supersede=list(selection['supersede'])
                 supersede_scopes=[]

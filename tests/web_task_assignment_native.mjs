@@ -8,7 +8,7 @@ const requests=[];const api=createApi(async(method,path,headers,body)=>{
 });
 let renders=0;const ctx={api,setDirty(){},async render(){renders++;}};
 const section=assignmentForm(ctx,pid,tid,{assignee:old});document.body.append(section);
-const form=section.querySelector('form');const load=section.querySelectorAll('button').find(x=>x.textContent==='Load assignment roster');
+const form=section.querySelector('form');const load=Array.from(section.querySelectorAll('button')).find(x=>x.textContent==='Load assignment roster');
 await load.dispatch('click');const submit=form.querySelector('button[type=submit]');assert.equal(submit.disabled,false);
 form.querySelector('select').value=target;const reason='<img src=x onerror=alert(1)>\nLiteral native reason';form.querySelector('#reason').value=reason;
 await form.dispatch('submit');assert.match(section.textContent,/Reconcile identical assignment/);assert.equal(form.querySelector('#reason').disabled,true);

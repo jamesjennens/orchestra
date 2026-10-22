@@ -33,8 +33,10 @@ import hashlib
 import copy
 from contextlib import contextmanager
 import hmac
+from server_address import ps_quote, sh_quote
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -43,16 +45,22 @@ from contextlib import closing
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
-from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
+import claim_limit
+from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
-                            CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS, CAP_TASKS,
+                            CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_RECORDS,
+                            CAP_REVIEWS, CAP_TASKS,
                             CAP_COORDINATE, coordinator_grant,
                             GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
                             JOURNAL_MAX_SKEW_SECONDS, JOURNAL_SUSPECT_SETTLE_SECONDS,
+                            CREDENTIAL_EXPIRED_MESSAGE, CREDENTIAL_MAX_AGE_DAYS,
+                            CREDENTIAL_REVOKED_MESSAGE,
+                            credential_age_expired, credential_expiry_cap,
                             AuthorityDenied, authority_request, clock_advance,
                             clock_persist, clock_report, clock_state,
                             clock_trusted, decide, file_lock,
@@ -69,7 +77,26 @@ MIN_PASSWORD, MAX_PASSWORD = 8, 1024
 # at the Service boundary.
 SESSION_IDLE_SECONDS = 30 * 60
 SESSION_ABSOLUTE_SECONDS = 12 * 60 * 60
+#: The bounds of an installation's session limits (kittrial-5bb.330). The idle window is
+#: 5 minutes to 24 hours and the absolute limit 1 hour to 7 days, and the absolute limit is
+#: never shorter than the idle window. The settings are read in whole minutes and hours;
+#: the Service keeps and compares them in seconds. Nothing is clamped: a value outside the
+#: bounds is refused when the setting is read, and an installation that sets neither keeps
+#: the two defaults above exactly as they were.
+SESSION_IDLE_MIN_MINUTES, SESSION_IDLE_MAX_MINUTES = 5, 24 * 60
+SESSION_ABSOLUTE_MIN_HOURS, SESSION_ABSOLUTE_MAX_HOURS = 1, 7 * 24
+#: The one sentence both setting surfaces refuse with, so the web service's flags and the
+#: office configuration say the same thing and never clamp a value into the bounds.
+SESSION_LIMIT_SENTENCE = (
+    'Refusing the session limits: the idle limit must be a whole number of minutes from %d to '
+    '%d (5 minutes to 24 hours), the absolute limit a whole number of hours from %d to %d '
+    '(1 hour to 7 days), and the absolute limit must not be shorter than the idle limit '
+    '(got idle %r and absolute %r).')
 CREDENTIAL_TTL_SECONDS = 30 * 24 * 60 * 60
+AGENT_CREDENTIAL_DAYS_DEFAULT = 30
+#: The same ceiling the shared read cap applies (kittrial-5bb.294 item 4): one source.
+AGENT_CREDENTIAL_DAYS_MAX = CREDENTIAL_MAX_AGE_DAYS
+_AGENT_LIFETIME_DEFAULT = object()
 RESET_TTL_SECONDS = 30 * 60
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 LOGIN_WINDOW_SECONDS = 5 * 60
@@ -80,6 +107,8 @@ LOGIN_MAX_ATTEMPTS = 10
 LOOKUP_WINDOW_SECONDS = 10 * 60
 LOOKUP_MAX_PER_WINDOW = 20
 AUDIT_LIMIT = 10000
+#: An agent's history on the web (kittrial-5bb.365): at most this many events, newest first.
+AGENT_HISTORY_MAX = 50
 #: How long a committed canonical result stays replayable in the record store. It is a
 #: time-only retention: nothing is ever evicted by entry count or serialized bytes, and
 #: once this window has closed the record is dropped, after which the durable endpoint
@@ -108,6 +137,13 @@ AGENT_MAX_CREDENTIALS = 20
 AGENT_DEAD_CREDENTIALS_KEPT = 5
 AGENT_DEFAULT_SCOPES = ('tasks', 'checkpoints', 'reviews', 'feedback')
 AGENT_CONFIG_PATH = '.orchestra/agent.json'
+AGENT_GUIDE_PATH = '.orchestra/AGENT.md'
+AGENT_GITIGNORE_LINE = '.orchestra/'
+#: The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276). The
+#: default, the editable bounds and the wording live in ``claim_limit``, so the
+#: route, the owner's page and the gate cannot disagree about any of them.
+CLAIM_LIMIT_DEFAULT = claim_limit.DEFAULT_LIMIT
+
 AGENT_SECRET_ENV = 'ORCHESTRA_AGENT_SECRET'
 
 
@@ -172,8 +208,8 @@ def unauthenticated(message='Authentication required'):
     return HttpError(401, 'unauthenticated', message)
 
 
-def forbidden(message='Not permitted'):
-    return HttpError(403, 'forbidden', message)
+def forbidden(message='Not permitted', detail=None):
+    return HttpError(403, 'forbidden', message, detail)
 
 
 def not_found(message='Not found'):
@@ -909,6 +945,75 @@ class Store:
 
 
 # --------------------------------------------------------------------------- service
+AGENT_ROLES = ('worker', 'reviewer')
+
+
+def validate_claim_limit(value):
+    """The stored form of one owner-supplied per-agent claim limit.
+
+    ``None`` clears the setting back to the default; a whole number inside the
+    editable bounds is kept. Anything else names what was wrong, so the route can
+    answer 422 with the field and the bounds instead of storing a value that would
+    silently mean something else.
+    """
+    try:
+        return claim_limit.validate_limit(value)
+    except ValueError as error:
+        raise invalid(str(error)) from None
+
+
+def validate_agent_role(value):
+    """The stored form of an agent's role ('worker' or 'reviewer', or None to clear)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        clean = value.strip()
+        if clean in AGENT_ROLES:
+            return clean
+    raise invalid("role must be 'worker' or 'reviewer'")
+
+
+def validate_agent_credential_days(value):
+    """The installation's agent-only lifetime; changing it rewrites no credential."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= AGENT_CREDENTIAL_DAYS_MAX:
+        raise ValueError('agent_credential_days must be a whole number from 1 to 366')
+    return value
+
+
+def session_limit_refusal(idle_minutes=None, absolute_hours=None):
+    """The one sentence a refused session limit is refused with, naming what was given."""
+    return SESSION_LIMIT_SENTENCE % (SESSION_IDLE_MIN_MINUTES, SESSION_IDLE_MAX_MINUTES,
+                                     SESSION_ABSOLUTE_MIN_HOURS, SESSION_ABSOLUTE_MAX_HOURS,
+                                     idle_minutes, absolute_hours)
+
+
+def session_limit_seconds(idle_minutes=None, absolute_hours=None):
+    """The installation's session idle and absolute limits, in seconds (kittrial-5bb.330).
+
+    The surface of a setting is whole minutes for the idle window and whole hours for the
+    absolute limit; the ``Service`` keeps and compares them in seconds, which is what this
+    returns as ``(session_idle, session_absolute)``. ``None`` means the installation did not
+    set that limit, so the reviewed default applies unchanged.
+
+    A value outside its bounds, a value that is not a whole number, and an absolute limit
+    shorter than the idle window are all refused with the same one sentence
+    (:func:`session_limit_refusal`). Nothing is clamped: a caller that reads a setting
+    refuses it, and no state is opened or written before that refusal. Changing the limits
+    never rewrites a live session; a session issued before the change keeps the deadlines it
+    was stamped with, and the next log-in carries the new ones.
+    """
+    for value, low, high in ((idle_minutes, SESSION_IDLE_MIN_MINUTES, SESSION_IDLE_MAX_MINUTES),
+                             (absolute_hours, SESSION_ABSOLUTE_MIN_HOURS, SESSION_ABSOLUTE_MAX_HOURS)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                  or not low <= value <= high):
+            raise ValueError(session_limit_refusal(idle_minutes, absolute_hours))
+    session_idle = SESSION_IDLE_SECONDS if idle_minutes is None else idle_minutes * 60
+    session_absolute = SESSION_ABSOLUTE_SECONDS if absolute_hours is None else absolute_hours * 3600
+    if session_absolute < session_idle:
+        raise ValueError(session_limit_refusal(idle_minutes, absolute_hours))
+    return session_idle, session_absolute
+
+
 class Service:
     """The authenticated authorization boundary.
 
@@ -924,8 +1029,14 @@ class Service:
                  result_retention=RESULT_RETENTION_SECONDS,
                  login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None,
                  lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
-                 approval_by_another_party=False):
+                 approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT):
         self.store = store
+        #: Per-agent locks spanning the claim gate's held-set read and the claim write
+        #: (kittrial-5bb.276 revision; per-agent in kittrial-5bb.300). Keyed by the
+        #: agent id so concurrent claims by one agent serialize while unrelated agents'
+        #: claims do not wait for each other. One service process is the supported setup.
+        self._claim_gates_guard = threading.Lock()
+        self._claim_gates = {}
         #: The installation's setting "nobody approves work of their own party" (slice 1a of
         #: docs/WEB_COORDINATOR_DESIGN.md, kittrial-5bb.199). OFF unless the operator turns it
         #: on: with it off every review rule is exactly what it was.
@@ -933,12 +1044,22 @@ class Service:
         self.session_idle = session_idle
         self.session_absolute = session_absolute
         self.credential_ttl = credential_ttl
+        # Preserve the existing test/embedding injection of credential_ttl when no new
+        # option was supplied. The command line always supplies the installation days.
+        self.agent_credential_ttl = (credential_ttl if agent_credential_days is _AGENT_LIFETIME_DEFAULT
+                                     else validate_agent_credential_days(agent_credential_days) * 86400)
         self.reset_ttl = reset_ttl
         self.idempotency_ttl = idempotency_ttl
         self.result_retention = result_retention
         self.login_max_attempts = login_max_attempts
         #: Canonical base URL of this service, used only to render the copyable agent
         #: setup/resume snippets. It is deployment configuration, never request data.
+        # kittrial-5bb.360: the address goes into the set-up commands people paste into a shell.
+        if public_url:
+            from server_address import public_url_problem
+            problem = public_url_problem(public_url, 'the service start (--public-url)')
+            if problem:
+                raise ValueError(problem)
         self.public_url = (public_url or '').rstrip('/') or None
         self._failures = {}
         self._audit_defer_trim = 0
@@ -954,6 +1075,24 @@ class Service:
         self._lookups = {}
 
     # -- helpers ---------------------------------------------------------------
+    def claim_gate(self, agent_id):
+        """The per-agent lock spanning the claim gate's held-set read and write (kittrial-5bb.300).
+
+        Keyed by ``agent_id`` (the agent's stable id and actor namespace head), so two
+        concurrent claims or self-assignments by the SAME agent (including under a
+        ``<agent>/<label>`` sub-label) serialize while claims by unrelated agents proceed
+        concurrently without waiting for each other's tracker reads.
+        One service process is the supported setup; this lock is in-memory in that process.
+        """
+        key = str(agent_id or '')
+        if '/' in key:
+            key = key.split('/', 1)[0]
+        with self._claim_gates_guard:
+            gate = self._claim_gates.get(key)
+            if gate is None:
+                gate = self._claim_gates[key] = threading.RLock()
+            return gate
+
     @property
     def state(self):
         return self.store.state
@@ -1006,6 +1145,56 @@ class Service:
             return False
         return self._raw_now() - float(issued_raw) >= float(lifetime)
 
+    def _credential_expired(self, credential, moment):
+        """Agent deadlines belong to the key; worker/legacy clock rules stay unchanged.
+
+        Older kits cap issued_raw with their own fixed30-day rule. A longer-lived agent
+        key uses their existing legacy path (no issued_raw); this reader still enforces
+        BOTH its stored monotone expiry and its explicit raw deadline. Default30 keys
+        keep issued_raw too. New fields never change worker/session/reset expiry.
+
+        The stored expiry is additionally capped at 366 days from the most recent
+        legitimate write ON READ (kittrial-5bb.294 item 4): issuance and every extension
+        stamp ``agent_written_raw``, so a hand-edited store of years is not honoured here
+        and an owner's latest extension always buys its full lifetime. A record without
+        the field falls back to its issuance stamp. The same shared cap is applied by the
+        canonical endpoint.
+        """
+        if credential_age_expired(credential, moment):
+            return True
+        if credential.get('agent_id') and 'agent_raw_expires_at' in credential:
+            values = (credential.get('expires_at'), credential['agent_raw_expires_at'])
+            try:
+                if any(isinstance(x, bool) or not isinstance(x, (int, float)) or
+                       not math.isfinite(x) for x in values):
+                    return True
+                return moment >= values[0] or self._raw_now() >= values[1]
+            except (TypeError, ValueError, OverflowError):
+                return True
+        return self._expired(moment, expires_at=credential.get('expires_at'),
+                             issued_raw=credential.get('issued_raw'), lifetime=self.credential_ttl)
+
+    def _agent_expiry_metadata(self, moment=None):
+        """Calculate representable deadlines before any agent/credential write."""
+        moment = self._expiry_now() if moment is None else moment
+        raw = self._raw_now()
+        expires = moment + self.agent_credential_ttl
+        raw_expires = raw + self.agent_credential_ttl
+        try:
+            for stamp in (expires, raw_expires):
+                if not math.isfinite(stamp):
+                    raise ValueError('non-finite expiry')
+                if not 1 <= time.gmtime(stamp).tm_year <= 9999:
+                    raise ValueError('expiry year is outside RFC3339')
+                now_iso(stamp)
+        except (ValueError, OverflowError, OSError):
+            raise invalid('Agent credential expiry is outside the representable timestamp range') from None
+        result = {'expires_at': expires, 'agent_raw_expires_at': raw_expires,
+                  'agent_issued_raw': raw, 'agent_written_raw': raw}
+        if self.agent_credential_ttl <= self.credential_ttl:
+            result['issued_raw'] = raw
+        return result
+
     def _live_item_expired(self, moment, principal):
         """Whether the live session/credential behind ``principal`` is expired on either
         clock.
@@ -1026,9 +1215,7 @@ class Service:
                               lifetime=self.session_idle)
         if principal.via == 'credential':
             credential = self.state['credentials'].get(principal.credential_id)
-            if credential is None or credential.get('revoked') or self._expired(
-                    moment, expires_at=credential.get('expires_at'),
-                    issued_raw=credential.get('issued_raw'), lifetime=self.credential_ttl):
+            if credential is None or credential.get('revoked') or self._credential_expired(credential, moment):
                 return True
             if credential.get('agent_id'):
                 agent = self.state['agents'].get(credential['agent_id'])
@@ -1539,14 +1726,15 @@ class Service:
             credential_id = self.state['credential_tokens'].get(digest)
             credential = self.state['credentials'].get(credential_id) if credential_id else None
             if credential is not None:
-                if credential['revoked'] or self._expired(
-                        moment, expires_at=credential['expires_at'],
-                        issued_raw=credential.get('issued_raw'),
-                        lifetime=self.credential_ttl):
-                    raise unauthenticated('Credential expired or revoked')
+                # Revocation and expiry answer separately, and the expiry sentence names who
+                # can act without naming any other credential (kittrial-5bb.294 item 2).
+                if credential['revoked']:
+                    raise unauthenticated(CREDENTIAL_REVOKED_MESSAGE)
+                if self._credential_expired(credential, moment):
+                    raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
                 user = self.state['users'].get(credential['user_id'])
                 if user is None or user['disabled']:
-                    raise unauthenticated('Credential expired or revoked')
+                    raise unauthenticated('Authentication is no longer valid')
                 if required_scope and required_scope not in credential['scopes']:
                     raise forbidden('Credential scope does not permit this operation')
                 credential['last_used'] = moment
@@ -1604,11 +1792,12 @@ class Service:
             return user
         if principal.via == 'credential':
             credential = self.state['credentials'].get(principal.credential_id)
-            if credential is None or credential['revoked'] or self._expired(
-                    moment, expires_at=credential['expires_at'],
-                    issued_raw=credential.get('issued_raw'),
-                    lifetime=self.credential_ttl):
-                raise unauthenticated('Credential expired or revoked')
+            if credential is None:
+                raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
+            if credential['revoked']:
+                raise unauthenticated(CREDENTIAL_REVOKED_MESSAGE)
+            if self._credential_expired(credential, moment):
+                raise unauthenticated(CREDENTIAL_EXPIRED_MESSAGE)
             user = self.state['users'].get(credential['user_id'])
             if user is None or user['disabled']:
                 raise unauthenticated('Authentication is no longer valid')
@@ -1687,6 +1876,38 @@ class Service:
         """Refresh live authority or raise; used by the backend write boundary."""
         with self.store.lock:
             return self._refresh_authority(principal)
+
+    def session_expiry_view(self, principal):
+        """The caller's own session window and deadlines, or ``None`` (kittrial-5bb.330).
+
+        The authenticated session read is the light touch a browser keeps an open set-up
+        wizard alive with, so it answers what that page needs: the idle window this
+        installation configured (``idle_seconds``) and the live deadlines of this session
+        (``idle_expires_at``, refreshed by every authenticated request, and
+        ``absolute_expires_at``, which no use extends). Nothing about another session is
+        read and no secret is included. A credential (a worker or agent key) has no browser
+        session, so it gets ``None`` and the read answers exactly what it did before.
+        """
+        if principal is None or principal.via != 'session' or not principal.session_hash:
+            return None
+        session = self.state['sessions'].get(principal.session_hash)
+        if not isinstance(session, dict):
+            return None
+        view = {'idle_seconds': self.session_idle, 'absolute_seconds': self.session_absolute}
+        for key, stored in (('idle_expires_at', 'idle_expires'),
+                            ('absolute_expires_at', 'absolute_expires')):
+            deadline = session.get(stored)
+            if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
+                    or not math.isfinite(deadline):
+                # A damaged deadline is not invented: the read says nothing about it rather
+                # than a time nobody can rely on. Authentication has already refused the
+                # session itself when its own deadline is unusable.
+                return None
+            try:
+                view[key] = now_iso(deadline)
+            except (ValueError, OverflowError, OSError):
+                return None
+        return view
 
     def logout(self, principal, request_id=None):
         if principal is None or principal.session_hash is None:
@@ -2142,6 +2363,51 @@ class Service:
             answer['actor_waived'] = dict(credential['actor_waived'])
         return answer
 
+    def credential_effective_expiry(self, credential):
+        """The stored deadline AS READ, capped from the most recent legitimate write.
+
+        The cap is the shared :func:`http_authority.credential_expiry_cap`: 366 days from
+        ``agent_written_raw`` (issuance or the last extension), falling back to the
+        issuance stamp for a record written before the field existed (kittrial-5bb.294
+        item 4). Records with no readable stamp, or no numeric deadline, are returned
+        untouched, so the older legacy reader keeps its meaning.
+        """
+        expires = credential.get('expires_at')
+        cap = credential_expiry_cap(credential)
+        if cap is None or type(expires) is bool or not isinstance(expires, (int, float)):
+            return expires
+        if not math.isfinite(expires):
+            return expires
+        return min(float(expires), cap)
+
+    def credential_effective_raw_expiry(self, credential):
+        """The raw deadline AS READ, capped like :meth:`credential_effective_expiry`."""
+        raw = credential.get('agent_raw_expires_at')
+        cap = credential_expiry_cap(credential)
+        if cap is None or type(raw) is bool or not isinstance(raw, (int, float)):
+            return raw
+        if not math.isfinite(raw):
+            return raw
+        return min(float(raw), cap)
+
+    def agent_credential_expiry_view(self, credential):
+        """Secret-free expiry metadata, also safe for a project's owner controls."""
+        moment = self._expiry_now()
+        working = self._credential_live(credential, moment)
+        expires = self.credential_effective_expiry(credential)
+        deadline = expires if isinstance(expires, (int, float)) and \
+            not isinstance(expires, bool) else None
+        remaining = deadline - moment if deadline is not None else None
+        if credential.get('agent_id') and 'agent_raw_expires_at' in credential and working:
+            raw = self.credential_effective_raw_expiry(credential)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                raw_remaining = raw - self._raw_now()
+                remaining = raw_remaining if remaining is None else min(remaining, raw_remaining)
+        return {'id': credential['id'],
+                'expires_at': now_iso(deadline) if deadline is not None else None,
+                'working': bool(working), 'revoked': bool(credential.get('revoked')),
+                'expires_soon': bool(working and remaining is not None and remaining <= 7 * 86400)}
+
     def credential_view(self, credential):
         view = {'id': credential['id'], 'project': credential['project_id'],
                 'agent': credential.get('agent_id'),
@@ -2149,6 +2415,8 @@ class Service:
                 'actor': credential.get('actor'), 'revoked': credential['revoked'],
                 'created_at': credential['created_at'], 'last_used': credential.get('last_used'),
                 'expires_at': now_iso(credential['expires_at'])}
+        if credential.get('agent_id'):
+            view.update(self.agent_credential_expiry_view(credential))
         # A waived name is shown as allowed, by whom and when (kittrial-5bb.188 item 4): it is
         # not colliding and it does write. Never actor_rows_checked: the two are distinct.
         if isinstance(credential.get('actor_waived'), dict):
@@ -2503,17 +2771,115 @@ class Service:
                      'secret_file': agent_secret_file(name)['name']})
 
     @staticmethod
-    def _agent_text(value, field, limit):
+    def _has_forbidden_text_char(value):
+        for c in value:
+            code = ord(c)
+            if code < 32 or 0x7f <= code <= 0x9f or not c.isprintable():
+                return True
+            if unicodedata.category(c) in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp'):
+                return True
+        return False
+
+    @classmethod
+    def _agent_text(cls, value, field, limit):
         if value is None:
             return None
         if not isinstance(value, str):
             raise invalid('%s must be text' % field)
+        if cls._has_forbidden_text_char(value):
+            raise invalid('%s must be at most %d printable characters' % (field, limit))
         text = value.strip()
         if not text:
             return None
-        if len(text) > limit or any(ord(c) < 32 for c in text):
+        if len(text) > limit:
             raise invalid('%s must be at most %d printable characters' % (field, limit))
         return text
+
+    #: Bounded Windows/POSIX path root: POSIX `/`, home `~` (`~` or `~/...`), Windows drive
+    #: `[A-Za-z]:\` / `[A-Za-z]:/`, or UNC `\\host\share`.
+    _WORKING_DIR_ROOT = re.compile(
+        r'^(?:[A-Za-z]:[\\/]+|\\\\[A-Za-z0-9._-]+[\\/]+[A-Za-z0-9._$-]+(?:[\\/]+|$)|~(?:[\\/]+|$)|/+)'
+    )
+    #: Bounded folder segment: letters, digits, `.`, `_`, `-`, and single internal spaces,
+    #: never ending in `.`, never containing `..` or `. ` (sentence punctuation), and at most
+    #: 3 spaces per segment so prose sentences cannot masquerade as a folder path.
+    _WORKING_DIR_SEGMENT = re.compile(r'^[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+){0,3}$')
+
+    @classmethod
+    def _agent_working_directory(cls, value, *, allow_empty=True):
+        if value is None:
+            if allow_empty:
+                return None
+            raise invalid('working_directory must be a valid Windows or POSIX folder path (1-%d characters)'
+                          % AGENT_DIRECTORY_MAX)
+        if not isinstance(value, str):
+            raise invalid('working_directory must be text')
+        if cls._has_forbidden_text_char(value):
+            raise invalid('working_directory must not contain control, non-printable, or bidi characters')
+        text = value.strip()
+        if not text:
+            if allow_empty:
+                return None
+            raise invalid('working_directory must be a valid Windows or POSIX folder path (1-%d characters)'
+                          % AGENT_DIRECTORY_MAX)
+        if len(text) > AGENT_DIRECTORY_MAX:
+            raise invalid('working_directory must be at most %d printable characters' % AGENT_DIRECTORY_MAX)
+        match = cls._WORKING_DIR_ROOT.match(text)
+        if not match:
+            raise invalid('working_directory must be an absolute or home-relative Windows or POSIX path')
+        rest = text[match.end():].rstrip('/\\')
+        if rest:
+            segments = re.split(r'[\\/]+', rest)
+            for seg in segments:
+                if (not seg or len(seg) > 128 or seg in ('.', '..')
+                        or '..' in seg or '. ' in seg or seg.endswith('.')
+                        or not cls._WORKING_DIR_SEGMENT.fullmatch(seg)):
+                    raise invalid('working_directory must be a valid Windows or POSIX folder path, not prose')
+        return text
+
+    def _visible_project_ids(self, principal):
+        """Project ids ``principal`` may read, without raising.
+
+        The same visibility :meth:`list_projects` answers with: a superuser sees every
+        project, a session the projects its membership names, and a credential only the
+        projects its grant names while its issuer is still a member. Used where one
+        account is told something about ANOTHER account's memberships
+        (kittrial-5bb.355): the answer is intersected with this set, so it never names a
+        project the caller could not already see.
+        """
+        if principal is None:
+            return set()
+        projects = self.state['projects']
+        if principal.via == 'credential':
+            if principal.agent_id:
+                agent = self.state['agents'].get(principal.agent_id) or {}
+                named = [pid for pid in (agent.get('projects') or []) if pid in projects]
+            else:
+                pid = principal.credential_project
+                named = [pid] if pid in projects else []
+            return {pid for pid in named
+                    if principal.superuser or
+                    principal.user_id in self.state['memberships'].get(pid, {})}
+        if principal.superuser:
+            return set(projects)
+        return {pid for pid in projects
+                if principal.user_id in self.state['memberships'].get(pid, {})}
+
+    def _owner_grantable_projects(self, owner_id, principal):
+        """Projects the agent's owner may be granted, as THIS reader may learn them.
+
+        :meth:`_agent_projects` admits a project the owner is a live member of, or any
+        existing project when the owner is a superuser (the pre-existing owner rule).
+        The answer is limited to the projects ``principal`` may read, so a view of
+        another account's agent never reveals that its owner belongs to a project this
+        reader cannot see (kittrial-5bb.355, the coordinator's addition).
+        """
+        visible = self._visible_project_ids(principal)
+        owner = self.state['users'].get(owner_id) or {}
+        if owner.get('superuser'):
+            return sorted(visible)
+        return sorted(pid for pid in visible
+                      if owner_id in self.state['memberships'].get(pid, {}))
 
     def _agent_projects(self, principal, projects, owner_id=None):
         """Validate a requested agent grant against the *owner's* live membership.
@@ -2525,6 +2891,11 @@ class Service:
         be read. The stored list is a *ceiling*: the live role cap in
         :func:`http_authority.decide` is still applied on every request, and attention
         re-authorizes each project at read time.
+
+        The refusal is a plain ``404 Project not found`` for a caller who cannot see the
+        project (no leak). When the caller CAN see it (a superuser, or a member of that
+        project) the same not-found path says plainly that the agent's owner is not a
+        member (kittrial-5bb.355): the rule is unchanged, only the sentence is clearer.
         """
         if projects is None:
             return []
@@ -2545,8 +2916,24 @@ class Service:
                 raise not_found('Project not found')
             if not owner_is_superuser and \
                     owner_id not in self.state['memberships'].get(pid, {}):
+                # Only a caller who can already see the project is told whose
+                # membership is missing; everyone else keeps the plain sentence, so
+                # the answer never reveals a project it did not reveal before.
+                if pid in self._visible_project_ids(principal):
+                    raise not_found(self._owner_not_member_message(owner_id, pid))
                 raise not_found('Project not found')
         return granted
+
+    def _owner_not_member_message(self, owner_id, project_id):
+        """The clearer refusal for a caller who can see the project (kittrial-5bb.355).
+
+        Same 404 path as ``Project not found``; the sentence names the agent's owner
+        and the project, and the move that fixes it, because this caller already sees
+        both. It is never used for a caller who cannot see the project.
+        """
+        project = self.state['projects'].get(project_id) or {}
+        return "%s is not a member of %s: add them under the project's Members first" % (
+            self._owner_name(owner_id), project.get('name') or project_id)
 
     def check_agent_grant(self, principal, projects, owner_id=None):
         """Judge an agent grant without writing anything (kittrial-5bb.183 review item 1).
@@ -2588,9 +2975,7 @@ class Service:
     def _credential_live(self, credential, moment=None):
         """Whether a credential still works: not revoked, and not expired on either clock."""
         moment = self._expiry_now() if moment is None else moment
-        return not credential.get('revoked') and not self._expired(
-            moment, expires_at=credential.get('expires_at'), issued_raw=credential.get('issued_raw'),
-            lifetime=self.credential_ttl)
+        return not credential.get('revoked') and not self._credential_expired(credential, moment)
 
     def _scope_names(self, scopes):
         """A caller's list of scopes as a tuple in the order given, or None when none was sent.
@@ -2649,7 +3034,8 @@ class Service:
 
     @staticmethod
     def _credential_age(credential):
-        return (credential.get('issued_raw') or 0, credential.get('created_at') or '', credential.get('id') or '')
+        return (credential.get('agent_issued_raw', credential.get('issued_raw')) or 0,
+                credential.get('created_at') or '', credential.get('id') or '')
 
     def _prune_agent_credentials(self, agent):
         """Delete all but the newest few credentials of the agent that no longer work.
@@ -2677,6 +3063,144 @@ class Service:
         shown = sorted(live + dead, key=self._credential_age)
         return [dict(self.credential_view(c), working=self._credential_live(c, moment)) for c in shown]
 
+    # -- an agent's history (kittrial-5bb.365) ---------------------------------------
+    #: The audit actions that make an agent's history, and the word each is shown as.
+    AGENT_HISTORY_KINDS = {
+        'agents.created': 'created',
+        'agents.credentials.issued': 'credential issued',
+        'agents.credentials.revoked': 'credential revoked',
+        'agents.credentials.extended': 'credential extended',
+        'agents.disable': 'disabled',
+        'agents.enable': 'enabled',
+        'agents.update': 'changed',
+        'accounts.disable': 'owner account disabled',
+        'agents.project.granted': 'given the project',
+        'agents.project.revoke': 'removed from the project',
+        'agents.coordinator.grant': 'coordinator grant given',
+        'agents.coordinator.revoke': 'coordinator grant ended',
+    }
+    #: Project-bound kinds: a project's view lists them only for its own project.
+    AGENT_HISTORY_PROJECT_KINDS = ('agents.project.granted', 'agents.project.revoke',
+                                   'agents.coordinator.grant', 'agents.coordinator.revoke')
+    AGENT_HISTORY_DROPPED = ('Older history is no longer kept: the service keeps the last %d audit events '
+                             'for all projects together.' % AUDIT_LIMIT)
+    AGENT_HISTORY_GRANT_UNKNOWN = ('This agent was given this project before the time of a grant was recorded, so its '
+                                   'earlier history is not shown here; its owner sees it on My agents.')
+
+    def _audit_project_grants(self, principal, agent, added, request_id):
+        """One ``agents.project.granted`` event per newly granted project: the grant time a
+        project's view of the agent's history starts from (kittrial-5bb.365)."""
+        for project_id in added:
+            event = self.audit(request_id, principal, 'agents.project.granted', 'committed',
+                               project_id=project_id, actor=self.agent_actor(agent))
+            event.update(agent_id=agent['id'])
+
+    @staticmethod
+    def _names_agent(event, agent_id):
+        if event.get('agent_id') == agent_id or agent_id in (event.get('agent_ids') or []):
+            return True
+        reason = event.get('reason') or ''
+        return reason == 'agent ' + agent_id or reason.startswith('agent %s:' % agent_id)
+
+    def agent_history(self, principal, agent_id, project_id=None):
+        """The agent's history from the audit tail, newest first, at most
+        :data:`AGENT_HISTORY_MAX` rows.
+
+        With no ``project_id`` it is the agent's own view (its owner or a superuser, the
+        :meth:`_agent_owned` rule; anyone else gets the plain 404 an unknown id gets): every
+        committed event about the agent, with each credential's label and the scopes before
+        and after. With a ``project_id`` it is that project's view (the route holds
+        ``CAP_PROJECT_ADMIN``; an agent not granted the project is the same 404 as
+        :meth:`get_project_agent`): no label, no scopes, no other project's events, and only
+        events from the time the agent was given THIS project. That time is its newest
+        ``agents.project.granted`` event; where none is kept, only events strictly after the
+        agent's newest create or update are listed (either could have been the grant), and
+        the answer says so. Stored events are never changed.
+        """
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if project_id is None:
+                agent = self._agent_owned(principal, agent_id)
+            else:
+                agent = self._agent(agent_id)
+                if project_id not in (agent.get('projects') or []):
+                    raise not_found('Agent not found')
+            events = [(index, event) for index, event in enumerate(self.state['audit'])
+                      if event.get('outcome') == 'committed' and event.get('action') in self.AGENT_HISTORY_KINDS
+                      and self._names_agent(event, agent_id)]
+            notes = []
+            if project_id is not None:
+                events, note = self._since_project_grant(events, project_id)
+                if note:
+                    notes.append(note)
+            if not any(event.get('action') == 'agents.created' for _index, event in events) and project_id is None:
+                notes.append(self.AGENT_HISTORY_DROPPED)
+            newest = list(reversed(events))
+            shown = newest[:AGENT_HISTORY_MAX]
+            names = self.actor_names([event.get('user_id') for _index, event in shown])
+            labels = {cid: c.get('label') for cid, c in self.state['credentials'].items()
+                      if c.get('agent_id') == agent_id}
+            items = [self._history_row(event, names, labels, project_id is None) for _index, event in shown]
+            return {'agent': agent_id, 'project': project_id, 'items': items, 'total': len(events),
+                    'omitted': max(0, len(events) - len(shown)), 'notes': notes}
+
+    def _since_project_grant(self, events, project_id):
+        """The project's view: its own project events, and the rest only since the grant."""
+        own = [(i, e) for i, e in events if e.get('action') not in self.AGENT_HISTORY_PROJECT_KINDS
+               or e.get('project_id') == project_id]
+        grants = [i for i, e in own if e.get('action') == 'agents.project.granted' and e.get('project_id') == project_id]
+        if grants:
+            return [(i, e) for i, e in own if i >= grants[-1]], None
+        # No grant event is kept (a grant made before kittrial-5bb.365, or one the audit cap
+        # dropped). An earlier update event does not say which projects it changed, so no
+        # point in the log can be shown to follow the grant: nothing is listed, and the
+        # answer says why. It can show less, never the agent's history from another project.
+        return [], self.AGENT_HISTORY_GRANT_UNKNOWN
+
+    def _history_row(self, event, names, labels, full):
+        action = event.get('action')
+        row = {'at': event.get('time'), 'kind': self.AGENT_HISTORY_KINDS[action], 'action': action,
+               'by': names.get(event.get('user_id')) or event.get('user_id')}
+        if event.get('target_credential_id'):
+            row['credential'] = event['target_credential_id']
+        if event.get('target_credential_ids') is not None:
+            row['revoked_count'] = len(event.get('target_credential_ids') or [])
+        if action in self.AGENT_HISTORY_PROJECT_KINDS:
+            row['project'] = event.get('project_id')
+        if full:
+            if row.get('credential'):
+                # The label is read from the credential record, never stored in the audit
+                # (the audit carries no credential payload). A pruned record shows its id only.
+                row['label'] = labels.get(row['credential'])
+            if event.get('scopes_before') is not None or event.get('scopes_after') is not None:
+                row['scopes_before'] = event.get('scopes_before')
+                row['scopes_after'] = event.get('scopes_after')
+                if event.get('scopes_before') != event.get('scopes_after'):
+                    row['kind'] = 'scopes changed'
+        return row
+
+    def project_agent_audit(self, project_id):
+        """The project audit's agent rows (kittrial-5bb.365): the events of agents whose live
+        grant names ``project_id``, cut to the project's view, each tagged with its agent.
+        A view at read time: nothing stored is changed or gains a project."""
+        with self.store.lock:
+            agents = [a for a in self.state['agents'].values() if project_id in (a.get('projects') or [])]
+            rows = []
+            for agent in agents:
+                events = [(index, event) for index, event in enumerate(self.state['audit'])
+                          if event.get('outcome') == 'committed' and event.get('action') in self.AGENT_HISTORY_KINDS
+                          and self._names_agent(event, agent['id'])]
+                events, _note = self._since_project_grant(events, project_id)
+                # The project's own events (its grant, its coordinator grants) are already in
+                # the project audit under their project; only the agent's other events are added.
+                for _index, event in [(i, e) for i, e in events if e.get('project_id') != project_id]:
+                    rows.append({'time': event.get('time'), 'action': event.get('action'), 'outcome': 'committed',
+                                 'user_id': event.get('user_id'), 'project_id': None, 'reason': None,
+                                 'agent': {'id': agent['id'], 'name': agent['name']},
+                                 'revoked_count': (len(event.get('target_credential_ids') or [])
+                                                   if event.get('target_credential_ids') is not None else None)})
+            return rows
+
     def agent_view(self, agent, principal):
         """The owner-visible agent record. The path never leaks to anyone else."""
         owner_sees_path = bool(principal.superuser or
@@ -2689,6 +3213,11 @@ class Service:
             'notes': agent.get('notes'), 'enabled': bool(agent.get('enabled')),
             'actor': self.agent_actor(agent),
             'projects': list(agent.get('projects') or []),
+            # The projects the owner may be granted, as THIS reader may learn them
+            # (kittrial-5bb.355): the page greys out the rest and says why. Limited to
+            # projects the reader can already see, so another account's unseen
+            # memberships are never revealed.
+            'owner_grantable_projects': self._owner_grantable_projects(agent['owner'], principal),
             'created_at': agent.get('created_at'),
             'last_seen_at': agent.get('last_seen_at'),
             # Every credential that works (at most AGENT_MAX_CREDENTIALS) and the newest few that
@@ -2701,12 +3230,22 @@ class Service:
             # credentials, which all carry the same) or ``unknown``.
             'scopes': None if scopes is None else list(scopes),
             'scopes_source': source,
+            # The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276): the
+            # stored setting, or its default when the owner has not set one. A read
+            # and the gate use this one value, so a page cannot show 1 while the
+            # service enforces 3.
+            'claim_limit': claim_limit.default_limit(agent),
             # The different scope lists its WORKING credentials carry, when they do not all carry
             # the same; else []. A read for whoever reads the agent record: its account, a
             # superuser, and the agent itself on /v1/agents/me. It says only that they differ:
             # an account may have narrowed its agent on purpose and left the older credential.
             'scopes_differ': self.agent_scope_differences(agent),
         }
+        if agent.get('created_by'):
+            view['created_by'] = agent['created_by']
+            view['created_by_display_name'] = self._owner_name(agent['created_by'])
+        if agent.get('role') in AGENT_ROLES:
+            view['role'] = agent['role']
         if owner_sees_path:
             view['working_directory'] = agent.get('working_directory')
         else:
@@ -2722,7 +3261,9 @@ class Service:
         the response carries identity, attribution and liveness only. The
         ``working_directory`` hint never appears - and neither does
         ``working_directory_hidden``, which would still disclose that a path exists -
-        nor do the agent's other project grants, its machine/notes or its credentials.
+        nor do the agent's other project grants or its machine/notes. Credential rows
+        expose only id, expiry, working/revoked and seven-day warning, so this owner
+        can extend a live key without seeing its label, scopes, path, hash or secret.
         """
         view = {
             'id': agent['id'],
@@ -2733,6 +3274,9 @@ class Service:
             'enabled': bool(agent.get('enabled')),
             'last_seen_at': agent.get('last_seen_at'),
         }
+        shown = {c['id'] for c in self._agent_credentials_shown(agent)}
+        view['credentials'] = [self.agent_credential_expiry_view(c)
+                               for c in self._agent_credentials(agent) if c['id'] in shown]
         if project_id is not None:
             # Whether this agent coordinates THIS project (kittrial-5bb.209): who granted it and
             # when, and whether the grant has effect now (its account must itself be a
@@ -2978,30 +3522,37 @@ class Service:
             "#    in a text editor, then: chmod 600 %(posix)s (mode 600).\n"
             "# 2. Test it (success prints the agent's JSON; 401 means a wrong secret or header\n"
             "#    line; \"cannot read config\" means a wrong file name or a .txt extension):\n"
-            "#    PowerShell:  curl.exe -fsS -K \"%(ps)s\" %(server)s/v1/agents/me\n"
-            "#    macOS/Linux: curl -fsS -K %(posix)s %(server)s/v1/agents/me\n"
+            "#    PowerShell:  curl.exe -fsS -K \"%(ps)s\" %(me_ps)s\n"
+            "#    macOS/Linux: curl -fsS -K %(posix)s %(me_sh)s\n"
             "# 3. In the agent folder (shell shown; the web page can save these files for you):\n"
             "mkdir -p .orchestra\n"
             "cat > %(config_path)s <<'JSON'\n%(config)s\nJSON\n"
             "[ -f .gitignore ] && ! grep -qx '.orchestra/' .gitignore && printf '\\n.orchestra/\\n' >> .gitignore\n"
             "# Every call hands curl the config file (-K), so the secret never reaches a\n"
             "# command line, shell history or the process list:\n"
-            "curl -fsS -K %(posix)s %(server)s/v1/agents/me/next\n"
+            "curl -fsS -K %(posix)s %(next_sh)s\n"
             "# Secondary fallback only, for a machine where that file cannot be kept: the\n"
             "# %(env)s environment variable may hold the secret. Never write the secret\n"
             "# on a command line, in the agent folder, in agent.json or in Git.\n"
         ) % {'win': secret_file['windows'], 'ps': secret_file['windows_powershell'],
-             'posix': secret_file['posix'], 'server': server, 'config_path': AGENT_CONFIG_PATH,
+             'posix': secret_file['posix'], 'config_path': AGENT_CONFIG_PATH,
+             # kittrial-5bb.360: the address is single-quoted in every command (nothing in it expands).
+             'me_ps': ps_quote(server + '/v1/agents/me'), 'me_sh': sh_quote(server + '/v1/agents/me'),
+             'next_sh': sh_quote(server + '/v1/agents/me/next'),
              'config': json.dumps(config, indent=2, sort_keys=True), 'env': AGENT_SECRET_ENV}
         # Where each granted project's repository is, as its owner recorded it
         # (kittrial-5bb.118). A label for the person setting the agent up: it is listed
         # beside the setup text, never inside the commands, and nothing runs it.
         # Read once per project, as today's rule reads it: a stored value that no longer
         # passes is left out (kittrial-5bb.123).
-        readable = ((pid, self.stored_repository(self.state['projects'].get(pid))[0]) for pid in config['projects'])
-        repositories = [{'project': pid, 'repository': value} for pid, value in readable if value]
+        with self.store.lock:
+            readable = ((pid, self.stored_repository(self.state['projects'].get(pid))[0])
+                        for pid in config['projects'])
+            repositories = [{'project': pid, 'repository': value} for pid, value in readable if value]
         return {
             'config_path': AGENT_CONFIG_PATH,
+            'guide_path': AGENT_GUIDE_PATH,
+            'gitignore_line': AGENT_GITIGNORE_LINE,
             'config': config,
             'repositories': repositories,
             'repositories_note': self.REPOSITORY_NOTE,
@@ -3103,7 +3654,7 @@ class Service:
                      scopes_after=None if after[0] is None else list(after[0]),
                      scopes_source_before=before[1], scopes_source_after=after[1])
 
-    def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None):
+    def _issue_agent_credential_locked(self, principal, agent, scopes=None, label=None, expiry=None):
         """Create one agent credential. Caller holds ``store.lock`` and has authorized.
 
         With no list it carries exactly what the agent has (:meth:`agent_scopes`), and where
@@ -3133,6 +3684,7 @@ class Service:
         # Twenty that still work. A revoked or expired credential is not counted: counted,
         # the twentieth renewal of an agent was refused for good.
         moment = self._expiry_now()
+        expiry = self._agent_expiry_metadata(moment) if expiry is None else expiry
         if sum(1 for credential in self._agent_credentials(agent)
                if self._credential_live(credential, moment)) >= AGENT_MAX_CREDENTIALS:
             raise conflict('An agent may hold at most %d credentials that still work; revoke one first'
@@ -3143,7 +3695,6 @@ class Service:
             agent['scopes'], agent['scopes_source'] = list(has), 'set'
         requested = tuple(agent['scopes'])
         secret = new_token()
-        moment = self._expiry_now()
         credential = {
             'id': 'cred_' + secrets.token_hex(8),
             'user_id': agent['owner'],
@@ -3154,52 +3705,80 @@ class Service:
             'actor': self.agent_actor(agent),
             'token_hash': token_hash(secret),
             'created_at': now_iso(self._now()),
-            'issued_raw': self._raw_now(),
             'last_used': None,
-            'expires_at': moment + self.credential_ttl,
             'revoked': False,
         }
+        credential.update(expiry)
         self.state['credentials'][credential['id']] = credential
         self.state['credential_tokens'][token_hash(secret)] = credential['id']
         self._prune_agent_credentials(agent)
         return credential, secret
 
+    def agent_creation_owner(self, principal, owner):
+        """Resolve a real enabled account before inspecting any target grants."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to create an agent')
+        with self.store.lock:
+            self.check_authority(principal, None, CAP_AGENTS)
+            if not isinstance(owner, str) or not owner:
+                raise invalid('owner must be an account id')
+            if owner != principal.user_id and not principal.superuser:
+                raise forbidden('Only a superuser may create an agent for another account')
+            user = self._user(owner)
+            if user.get('disabled'):
+                raise conflict('A disabled account cannot receive an agent')
+            return owner
+
     def create_agent(self, principal, *, name, tool=None, working_directory=None,
                      machine=None, notes=None, projects=None, scopes=None,
-                     request_id=None):
+                     request_id=None, owner=None, claim_limit=None, role=None):
         """Create an owner-bound agent and its first (one-time) credential."""
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required to create an agent')
         clean_name = self._agent_name(name)
         tool = self._agent_text(tool, 'tool', AGENT_TOOL_MAX)
-        working_directory = self._agent_text(working_directory, 'working_directory',
-                                             AGENT_DIRECTORY_MAX)
+        working_directory = self._agent_working_directory(working_directory, allow_empty=True)
         machine = self._agent_text(machine, 'machine', AGENT_MACHINE_MAX)
         notes = self._agent_text(notes, 'notes', AGENT_NOTES_MAX)
+        clean_role = validate_agent_role(role)
         with self.store.lock:
             self._refresh_authority(principal)
+            owner_id = self.agent_creation_owner(principal, principal.user_id if owner is None else owner)
             owned = [a for a in self.state['agents'].values()
-                     if a['owner'] == principal.user_id]
+                     if a['owner'] == owner_id]
             if len(owned) >= AGENT_MAX_PER_OWNER:
                 raise conflict('At most %d agents per account' % AGENT_MAX_PER_OWNER)
-            self._check_agent_file_name(principal.user_id, clean_name)
-            granted = self._agent_projects(principal, projects)
+            self._check_agent_file_name(owner_id, clean_name)
+            granted = self._agent_projects(principal, projects, owner_id=owner_id)
             # What the agent may do is kept on its record from here on (kittrial-5bb.208): the
             # list asked for, or the default. Judged before anything is written.
             made_with = self._scope_names(scopes) or tuple(AGENT_DEFAULT_SCOPES)
+            expiry = self._agent_expiry_metadata()
             agent_id = 'agent_' + secrets.token_hex(8)
             agent = {
-                'id': agent_id, 'name': clean_name, 'owner': principal.user_id,
+                'id': agent_id, 'name': clean_name, 'owner': owner_id,
+                'created_by': principal.user_id,
                 'tool': tool, 'working_directory': working_directory,
                 'machine': machine, 'notes': notes, 'enabled': True,
                 'projects': granted, 'created_at': now_iso(self._now()),
+                # The per-agent claim limit (kittrial-5bb.276): one undelivered claim
+                # by default, editable by the owner.
+                'claim_limit': (CLAIM_LIMIT_DEFAULT if claim_limit is None
+                                else validate_claim_limit(claim_limit)),
                 'last_seen_at': None,
                 'scopes': list(made_with), 'scopes_source': 'set',
             }
+            if clean_role is not None:
+                agent['role'] = clean_role
             self.state['agents'][agent_id] = agent
-            credential, secret = self._issue_agent_credential_locked(principal, agent)
+            # The grants first, so a project's view of the history includes the first credential.
+            self._audit_project_grants(principal, agent, list(granted or []), request_id)
+            credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry)
             self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
                                          self.agent_scopes(agent), request_id)
+            event = self.audit(request_id, principal, 'agents.created', 'committed',
+                               actor=self.agent_actor(agent))
+            event.update(agent_id=agent_id, owner_id=owner_id, created_by=principal.user_id)
             self.store.save()
             # The one-time secret travels only in this response.
             public = {
@@ -3253,6 +3832,11 @@ class Service:
         with self.store.lock:
             self._refresh_authority(principal)
             agent = self._agent_owned(principal, agent_id)
+            # The limit is judged with the other fields, before any of them is applied.
+            if 'claim_limit' in payload:
+                validate_claim_limit(payload.get('claim_limit'))
+            if 'role' in payload:
+                validate_agent_role(payload.get('role'))
             # Validate every field first and apply nothing until all of them pass, so a
             # refused change (an ungranted project, an over-long field, a clashing name)
             # leaves the live record exactly as it was. A rename in particular must not
@@ -3263,17 +3847,31 @@ class Service:
                 self._check_agent_file_name(agent['owner'], new_name, exclude_id=agent['id'])
                 changes['name'] = new_name
             for field, limit in (('tool', AGENT_TOOL_MAX), ('machine', AGENT_MACHINE_MAX),
-                                 ('notes', AGENT_NOTES_MAX),
-                                 ('working_directory', AGENT_DIRECTORY_MAX)):
+                                 ('notes', AGENT_NOTES_MAX)):
                 if field in payload:
                     changes[field] = self._agent_text(payload.get(field), field, limit)
+            if 'working_directory' in payload:
+                changes['working_directory'] = self._agent_working_directory(
+                    payload.get('working_directory'), allow_empty=True)
             if 'projects' in payload:
                 changes['projects'] = self._agent_projects(
                     principal, payload.get('projects'), owner_id=agent['owner'])
             if 'enabled' in payload and payload.get('enabled') is not None:
                 changes['enabled'] = bool(payload.get('enabled'))
+            if 'claim_limit' in payload:
+                # Validated above; ``None`` clears it back to the default, which is what
+                # an owner who empties the field on My agents sends.
+                changes['claim_limit'] = validate_claim_limit(payload.get('claim_limit'))
             left = [pid for pid in (agent.get('projects') or []) if pid not in changes.get('projects', agent.get('projects') or [])]
+            added = [pid for pid in changes.get('projects', []) if pid not in (agent.get('projects') or [])]
             agent.update(changes)
+            self._audit_project_grants(principal, agent, added, request_id)
+            if 'role' in payload:
+                clean_role = validate_agent_role(payload.get('role'))
+                if clean_role is None:
+                    agent.pop('role', None)
+                else:
+                    agent['role'] = clean_role
             # An agent that leaves a project by THIS route leaves its coordinators too (review of
             # kittrial-5bb.209): the grant stayed in the state, unseen by the project's owner, and
             # took effect again when the project was put back, with no owner's decision.
@@ -3283,6 +3881,88 @@ class Service:
                 self._revoke_agent_credentials(agent)
             self.store.save()
             return self.agent_view(agent, principal)
+
+    def lower_own_claim_limit(self, principal, value):
+        """An agent credential lowers the claim limit on its OWN record (kittrial-5bb.302)."""
+        return self.update_own_agent(principal, {'claim_limit': value})
+
+    def update_own_agent(self, principal, payload):
+        """An agent credential updates allowed fields on its OWN record (kittrial-5bb.302, .329).
+
+        ``claim_limit`` may only be lowered (a whole number from 1 up to the CURRENT
+        effective limit; raising stays the owner's or a superuser's move, refused with a
+        sentence naming both and the My agents page). ``working_directory`` records the
+        folder the agent runs in, validated with :meth:`_agent_working_directory` as a
+        bounded Windows or POSIX folder path (1 to :data:`AGENT_DIRECTORY_MAX` characters,
+        no control/bidi characters or prose). ``role`` records whether the
+        agent runs as ``'worker'`` or ``'reviewer'``. Every requested field is validated
+        before any is applied, so a refused field leaves the record untouched. The identity
+        is the credential's own agent; no target id is taken, so this cannot reach another
+        agent's record.
+        """
+        if principal is None or principal.via != 'credential' or not principal.agent_id:
+            raise forbidden('An agent credential is required to change its own record')
+        has_limit = 'claim_limit' in payload
+        has_dir = 'working_directory' in payload
+        has_role = 'role' in payload
+        new_dir = None
+        if has_dir:
+            new_dir = self._agent_working_directory(payload.get('working_directory'),
+                                                    allow_empty=False)
+        new_role = None
+        if has_role:
+            new_role = validate_agent_role(payload.get('role'))
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(principal.agent_id)
+            current = claim_limit.default_limit(agent)
+            wanted = None
+            if has_limit:
+                value = payload.get('claim_limit')
+                try:
+                    wanted = claim_limit.validate_limit(value)
+                except ValueError as error:
+                    raise invalid(str(error)) from None
+                if wanted is None:
+                    # The owner's route clears a value back to the default; on the agent's own
+                    # route the body must be the number it will hold, never an absence. Name the
+                    # field's own range (1..50), not the current value: a null is a malformed
+                    # value, and the older sentence read "1 to <current>" (kittrial-5bb.303).
+                    raise invalid('claim_limit: expected a whole number from %d to %d; an agent '
+                                  'may only lower its own limit, so it must also be at most the '
+                                  'current %d' % (claim_limit.LIMIT_MIN, claim_limit.LIMIT_MAX,
+                                                  current))
+                if wanted > current:
+                    raise forbidden(claim_limit.raise_refusal(current, wanted),
+                                    {'claim_limit': current, 'requested': wanted,
+                                     'raise_by': claim_limit.RAISE_BY})
+            old_dir = agent.get('working_directory')
+            old_role = agent.get('role')
+            if has_limit:
+                agent['claim_limit'] = wanted
+            if has_dir:
+                agent['working_directory'] = new_dir
+            if has_role:
+                if new_role is None:
+                    agent.pop('role', None)
+                else:
+                    agent['role'] = new_role
+            self.store.save()
+            operation = ('agents.claim_limit.lower' if has_limit and not has_dir and not has_role
+                         else 'agents.working_directory.set' if has_dir and not has_limit and not has_role
+                         else 'agents.role.set' if has_role and not has_limit and not has_dir
+                         else 'agents.me.update')
+            result = {'operation': operation,
+                      'agent': self.agent_view(agent, principal)}
+            if has_limit:
+                result.update({'old_limit': current, 'new_limit': wanted,
+                               'raise_by': claim_limit.RAISE_BY})
+            if has_dir:
+                result.update({'old_working_directory': old_dir,
+                               'new_working_directory': new_dir})
+            if has_role:
+                result.update({'old_role': old_role, 'new_role': new_role})
+            return result
 
     def disable_agent(self, principal, agent_id):
         """Disable an agent and revoke every credential it holds, immediately."""
@@ -3330,6 +4010,84 @@ class Service:
                 'setup': self.agent_setup(agent, secret),
                 'secret_available': True,
             }
+
+    def agent_extension_target(self, principal, agent_id, credential_id, project_id=None):
+        """Recheck live authority and exact target even for an already completed retry.
+
+        Caller holds store.lock through this check, mutation, state save and receipt.
+        A project's owner only reaches agents still granted there. Coordinator roles,
+        grants and both credential kinds never confer this human authority.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to extend an agent credential')
+        with self.store.lock:
+            self.check_authority(principal, project_id,
+                                 CAP_AGENTS if project_id is None else CAP_PROJECT_ADMIN)
+            agent = self._agent_owned(principal, agent_id) if project_id is None else self._agent(agent_id)
+            if project_id is not None:
+                if project_id not in (agent.get('projects') or []):
+                    raise not_found('Agent not found')
+                # The owner's live account must still be entitled to this grant.
+                self._agent_projects(principal, [project_id], owner_id=agent['owner'])
+            owner = self.state['users'].get(agent['owner'])
+            if not owner or owner.get('disabled'):
+                raise conflict('A disabled or missing account cannot extend a credential')
+            if not agent.get('enabled'):
+                raise conflict('A disabled agent cannot extend a credential')
+            credential = self.state['credentials'].get(credential_id)
+            if not isinstance(credential, dict) or credential.get('agent_id') != agent['id'] or \
+                    credential.get('user_id') != agent['owner'] or credential.get('project_id') is not None:
+                raise not_found('Credential not found')
+            if not self._credential_live(credential):
+                raise conflict('An expired or revoked credential cannot be extended; issue a new secret')
+            return agent, credential
+
+    def extend_agent_credential(self, principal, agent_id, credential_id, *, project_id=None,
+                                request_id=None):
+        """Extend this same key to max(old expiry, now + configured life), never revive.
+
+        No secret is made or returned; identity, hash, scopes, actor, issuer and grants
+        remain unchanged. Existing route transaction owns persistence and rollback.
+
+        The extension is a legitimate write, so it stamps ``agent_written_raw`` with this
+        raw instant (kittrial-5bb.294 item 4). The read cap then measures from here, not
+        from first issuance, and the new expiry is at most ``now + lifetime`` (lifetime is
+        capped at 366 days), so a legitimately extended key is never cut by its own write.
+        """
+        with self.store.lock:
+            agent, credential = self.agent_extension_target(principal, agent_id, credential_id, project_id)
+            moment = self._expiry_now()
+            expiry = self._agent_expiry_metadata(moment)
+            previous = credential['expires_at']
+            expires = max(previous, expiry['expires_at'])
+            raw = self._raw_now()
+            old_raw = credential.get('agent_raw_expires_at')
+            if old_raw is None:
+                issued = credential.get('issued_raw')
+                old_raw = float(issued) + self.credential_ttl if issued is not None else raw + previous - moment
+            raw_expires = max(old_raw, raw + expires - moment)
+            try:
+                for stamp in (expires, raw_expires):
+                    if not math.isfinite(stamp) or not 1 <= time.gmtime(stamp).tm_year <= 9999:
+                        raise ValueError('unrepresentable expiry')
+                    now_iso(stamp)
+            except (ValueError, OverflowError, OSError):
+                raise invalid('Agent credential expiry is outside the representable timestamp range') from None
+            credential.update(expires_at=expires, agent_raw_expires_at=raw_expires,
+                              agent_written_raw=raw)
+            if 'agent_issued_raw' not in credential:
+                credential['agent_issued_raw'] = credential.get('issued_raw', raw)
+            # An older kit has a fixed raw-age cap: beyond that cap it must use its
+            # existing stored-expiry reader. Never forge a later issuance timestamp.
+            if 'issued_raw' in credential and raw_expires > float(credential['issued_raw']) + self.credential_ttl:
+                del credential['issued_raw']
+            event = self.audit(request_id, principal, 'agents.credentials.extended', 'committed',
+                               actor=self.agent_actor(agent), project_id=project_id)
+            event.update(agent_id=agent_id, target_credential_id=credential_id,
+                         expires_before=now_iso(previous), expires_after=now_iso(expires))
+            return {'operation': 'agents.credentials.extend', 'agent': agent_id,
+                    'credential': self.agent_credential_expiry_view(credential),
+                    'secret_available': False}
 
     def revoke_agent_credential(self, principal, agent_id, credential_id,
                                 request_id=None):

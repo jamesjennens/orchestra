@@ -53,9 +53,14 @@ class DirectionsSwitchTests(unittest.TestCase):
         data = fixture('closed')
         read = b.brief(data, PROJECT, TASK)
         self.assertEqual(read['directions']['total'], 0)
+        # Review B1: a closed task is not reported as the switch being off. The
+        # directions block's own `check` label says `closed` too, not only
+        # `directions_check` (kittrial-5bb.284 review S3, folded into
+        # kittrial-5bb.287); the same holds for the `newer` block and the
+        # `checkpoint --directions` page, and no next_action prefix is added.
         self.assertEqual(read['directions']['reason'], 'closed')
-        # Review B1: a closed task is not reported as the switch being off, and it
-        # carries no next_action prefix either.
+        self.assertEqual(read['directions']['check'], 'closed')
+        self.assertEqual(read['newer']['unresolved_directions']['check'], 'closed')
         self.assertEqual(read['directions_check']['state'], 'closed')
         self.assertEqual(read['directions_check']['reason'], 'closed')
         self.assertIn('CLOSED TASK', read['directions_check']['note'])
@@ -63,7 +68,13 @@ class DirectionsSwitchTests(unittest.TestCase):
         self.assertNotIn('DIRECTIONS CHECK OFF', read['next_action'])
         self.assertEqual(b.checkpoint_queue_fields(data, data[0])['unresolved_directions'], 0)
         page = b.direction_page(data, PROJECT, TASK)
-        self.assertEqual((page['total'], page['reason']), (0, 'closed'))
+        self.assertEqual((page['total'], page['check'], page['reason']), (0, 'closed', 'closed'))
+
+    def test_the_check_label_names_the_reason_that_applies(self):
+        """kittrial-5bb.287 review S3: the reader's `check` says `closed` for a closed
+        task; `off` names the installation switch only."""
+        self.assertEqual(b.directions_check_state('switch-off'), 'off')
+        self.assertEqual(b.directions_check_state('closed'), 'closed')
 
     def test_nothing_to_acknowledge_leaves_next_action_unchanged(self):
         """Review B1: a checkpointed task with no comment to acknowledge reads the same

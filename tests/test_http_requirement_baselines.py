@@ -118,7 +118,7 @@ class BaselineHttpTests(EndpointCase):
     def test_current_human_members_read_but_only_owner_can_cut_and_credentials_cannot_read(self):
         self.assertEqual(self.cut().status, 201)
         admin = self.admin_token()
-        for role in ('viewer', 'contributor'):
+        for role in ('viewer', 'contributor', 'coordinator'):
             account = self.create_account(admin, role, role + '-password-1')
             token = self.login(role, role + '-password-1')[0]
             self.assertEqual(self.request('PUT', self.base + '/members/' + account, {'role': role}, token=admin).status, 200)
@@ -135,6 +135,62 @@ class BaselineHttpTests(EndpointCase):
             for route in (self.collection, self.base + '/brd/export', self.base + '/brd/changes'):
                 refused = self.request('GET', route, token=token)
                 self.assertEqual(refused.status, 403, refused.data)
+        self.assertEqual(store.list_baselines(self.path, self.project)['total'], 1)
+
+    def test_canonical_cut_refuses_coordinator_and_granted_agent_before_reservation(self):
+        from http_authority import (AuthorityConfig, CAP_COORDINATE, NativeRunner,
+                                    authority_request, journal_path, run_guarded)
+        admin = self.admin_token()
+        account = self.create_account(admin, 'baseline-coordinator', 'baseline-coordinator-password')
+        coordinator = self.login('baseline-coordinator', 'baseline-coordinator-password')[0]
+        self.assertEqual(self.request('PUT', self.base + '/members/' + account,
+            {'role': 'coordinator'}, token=admin).status, 200)
+        agent = self.request('POST', '/v1/agents', {'name': 'Granted baseline helper',
+            'working_directory': '/tmp/synthetic-baseline-helper', 'projects': [self.project]},
+            token=self.owner_token)
+        self.assertEqual(agent.status, 201, agent.data)
+        agent_id = agent.data['agent']['id']
+        secret = agent.data['credential']['secret']
+        self.assertEqual(self.request('PUT', self.base + '/agents/' + agent_id + '/coordinator',
+            {}, token=self.owner_token).status, 200)
+        journal = journal_path(self.path)
+        before_journal = journal.read_bytes() if journal.exists() else None
+        before_calls = len(self.backend.native.calls)
+        def guarded(root, request, path, effect, **options):
+            return run_guarded(request, path, effect, **options)
+        for label, token in (('coordinator', coordinator), ('granted-agent', secret)):
+            principal = self.service.authenticate(token)
+            built = dict(project=self.project, actor=principal.user_id, action='owner-requirements',
+                args=['baseline'], attachments={'payload': {'flag': '--file',
+                    'text': json.dumps({'name': label})}}, operation_id='canonical-baseline-' + label,
+                authority=authority_request(principal, self.project, CAP_COORDINATE,
+                    now=self.service._expiry_now()), route='requirements.baseline')
+            with self.subTest(principal=label):
+                with self.assertRaisesRegex(ValueError, 'signed-in project owner'):
+                    requirements.web_action(self.canonical_root, self.path, self.project, built,
+                        AuthorityConfig(str(self.service.store.path)),
+                        NativeRunner(self.backend.native), guarded)
+                self.assertEqual(len(self.backend.native.calls), before_calls)
+                self.assertEqual(journal.read_bytes() if journal.exists() else None, before_journal)
+                self.assertFalse((self.path / store.DIRECTORY).exists())
+        refused = self.cut('agent-cut', 'granted-agent-cut', secret)
+        self.assertEqual(refused.status, 403, refused.data)
+
+    def test_owner_demoted_to_coordinator_cannot_replay_or_cut(self):
+        self.assertEqual(self.cut().status, 201)
+        frozen = self.frozen()
+        before_calls = len(self.backend.native.calls)
+        def demote():
+            self.service.state['memberships'][self.project][self.account] = 'coordinator'
+            self.service.store.save()
+        self.backend.before_owner = demote
+        replay = self.cut()
+        self.assertIn(replay.status, (403, 422), replay.data)
+        self.assertEqual(self.frozen(), frozen)
+        self.assertEqual(len(self.backend.native.calls), before_calls)
+        refused = self.cut('after-demotion', 'after-demotion')
+        self.assertEqual(refused.status, 403, refused.data)
+        self.assertEqual(self.request('GET', self.collection, token=self.owner_token).status, 200)
         self.assertEqual(store.list_baselines(self.path, self.project)['total'], 1)
 
     def test_cookie_requires_csrf_and_hostile_body_never_writes(self):
@@ -248,11 +304,15 @@ class BaselineHttpTests(EndpointCase):
         admin = self.admin_token(); account = self.create_account(admin, 'viewer', 'viewer-password-1')
         viewer = self.login('viewer', 'viewer-password-1')[0]
         self.assertEqual(self.request('PUT', self.base + '/members/' + account, {'role': 'viewer'}, token=admin).status, 200)
+        coordinator_id = self.create_account(admin, 'page-coordinator', 'page-coordinator-password')
+        coordinator = self.login('page-coordinator', 'page-coordinator-password')[0]
+        self.assertEqual(self.request('PUT', self.base + '/members/' + coordinator_id,
+            {'role': 'coordinator'}, token=admin).status, 200)
         root = Path(__file__).resolve().parents[1]
         output = run_node_module(self, node, 'await import(process.argv[1])',
             (root / 'tests/web_requirement_baselines.mjs').as_uri(),
             (root / 'web/js/api.js').as_uri(), (root / 'web/js/views/requirement_baselines.js').as_uri(),
             (root / 'web/js/views/owner_requirements.js').as_uri(), 'http://127.0.0.1:' + str(self.port),
-            self.project, self.owner_token, viewer, first['id'])
+            self.project, self.owner_token, viewer, first['id'], coordinator)
         self.assertEqual(output.returncode, 0, output.stderr)
         self.assertTrue(json.loads(output.stdout)['lostResponseReloadRetry'])

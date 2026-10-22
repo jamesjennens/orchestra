@@ -2,7 +2,8 @@
 import argparse
 import json
 import record_json
-from lifecycle import integration_evidence, project_facts
+from claim_limit import actor_holds
+from lifecycle import events_by_dimension, integration_evidence, project_facts
 from review_state import RECONCILIATION_STATE, next_actor, active_work
 
 CONTRACT_VERSION = 'cli-contract-v1'
@@ -87,7 +88,74 @@ def drop_internal_from_ready(rows):
     return shown
 
 
-def claimable(issue_type, status, assignee, contribution_id, review_state, record_anchor=False, labels=None):
+#: The dependency types that block a claim. ``parent-child`` and ``related`` do not
+#: (kittrial-5bb.293 item 3b: only the blocking type blocks).
+BLOCKING_DEPENDENCY_TYPES = frozenset({'blocks', 'blocked-by', 'depends'})
+
+
+def dependency_ref(dep):
+    """(other_id, type, other_status) from one dependency entry, in either native shape.
+
+    ``bd export`` writes ``depends_on_id``/``type`` and no status; ``bd show`` writes
+    expanded issues keyed ``id``/``dependency_type`` that DO carry the other end's
+    ``status`` (kittrial-5bb.293 rev3/rev4). All three are read so every surface
+    answers the same fact, and a single-task view can see the block without a
+    snapshot of the other end.
+    """
+    if not isinstance(dep, dict):
+        return None, None, None
+    other = dep.get('depends_on_id') or dep.get('id')
+    kind = dep.get('type') or dep.get('dependency_type')
+    status = dep.get('status') or dep.get('depends_on_status')
+    return other, kind, status
+
+
+def dependency_index(rows):
+    """One id -> row map for a snapshot, so per-row checks do not rebuild it."""
+    return {r.get('id'): r for r in rows or [] if isinstance(r, dict) and r.get('id')}
+
+
+def open_dependency_ids(row, rows, index=None):
+    """The ids of ``row``'s dependencies whose task is not closed (kittrial-5bb.293).
+
+    A bd dependency (``bd dep``) whose other end is still open blocks the task: it
+    must not look claimable. Only the blocking types block (kittrial-5bb.293 item 3b):
+    ``parent-child`` and ``related`` do not. ``rows`` is the snapshot the caller
+    already holds; ``index`` is its :func:`dependency_index` (built once per snapshot,
+    item 2a). A dependency whose task is missing from the snapshot is unknown and is
+    NOT counted as open (the claim can still be refused atomically).
+    """
+    if not isinstance(row, dict):
+        return []
+    by_id = index if index is not None else (dependency_index(rows) if rows is not None else None)
+    open_ids = []
+    for dep in row.get('dependencies') or []:
+        other_id, kind, dep_status = dependency_ref(dep)
+        if kind not in BLOCKING_DEPENDENCY_TYPES:
+            continue
+        other = by_id.get(other_id) if by_id is not None else None
+        if isinstance(other, dict):
+            status = other.get('status')
+        elif dep_status is not None:
+            status = dep_status
+        else:
+            continue
+        if status != 'closed':
+            open_ids.append(str(other_id))
+    return open_ids
+
+
+def open_dependency_sentence(open_ids):
+    """One plain sentence naming the open dependency a claim is refused for."""
+    if not open_ids:
+        return None
+    names = ', '.join('`%s`' % i for i in open_ids[:5])
+    more = '' if len(open_ids) <= 5 else ' (and %d more)' % (len(open_ids) - 5)
+    return 'Task is blocked by an open dependency: %s%s. Close it first.' % (names, more)
+
+
+def claimable(issue_type, status, assignee, contribution_id, review_state, record_anchor=False,
+              labels=None, open_dependencies=None, claiming='open'):
     """One bounded interpretation of claimable work (kittrial-5bb.6 deliverable b).
 
     Advisory only: claimability is not a reservation, and an atomic claim can still
@@ -100,6 +168,14 @@ def claimable(issue_type, status, assignee, contribution_id, review_state, recor
     or a requirement record by the `requirement`/`brd-section` LABEL (kittrial-5bb.277),
     which is never claimable whatever its status, assignee or contribution.
     """
+    if open_dependencies:
+        return False
+    # The per-project claiming setting (kittrial-5bb.352): under 'assigned' an
+    # unassigned task is never offered as claimable. A row assigned to the caller is
+    # already not claimable here (the assignee check below); the claim route separately
+    # lets its holder start it.
+    if str(claiming or 'open') == 'assigned' and not assignee:
+        return False
     if str(issue_type or 'task') in CLAIMABLE_EXCLUDED_TYPES:
         return False
     if record_anchor:
@@ -157,8 +233,21 @@ WHOSE_MOVE = ('you', 'reviewer', 'coordinator', 'unknown')
 UNKNOWN_MOVE_TEXT = 'Whose move this is cannot be told from the review state shown here.'
 
 
+def move_subject(caller, owner=None):
+    """The actor whose move a work read answers for (kittrial-5bb.288).
+
+    ``--owner ACTOR`` asks about ACTOR's queue, so its per-row ``whose_move``/``next``
+    and its top-level ``your_move`` count are ACTOR's; ``--mine`` and an unfiltered
+    scan answer for the caller (there ``next_actor`` names the role instead). This is
+    the ONE place that decides it, so the count can never read 0 while a row assigned
+    to the subject -- an open task with no checkpoint and no contribution by them --
+    is in ``items``. It infers nothing: it only fixes whose queue is being read.
+    """
+    return caller if owner is None else owner
+
+
 def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                 way_back=None):
+                 way_back=None, followon=None, checkpoint_available=True):
     """`(whose_move, next)`: the caller-relative half of the one whose-move decision.
 
     Derived only from the review state the
@@ -168,6 +257,13 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
     for it here: a reconciliation row's move stays its review state's move and
     ``next_actor`` comes from the same decision (review item 2/6 removed the branch
     that could never be taken).
+
+    ``followon`` is an APPLYING hand-back block (kittrial-5bb.343). It is the one
+    exception to the integrated task being the coordinator's move: an open,
+    host-journaled hand-back makes the move the assignee's and quotes the recorded
+    text as ``next``, escaped once. ``checkpoint_available`` is whether this
+    installation can write the disposition that ends it, so the sentence never
+    offers a command that would be refused.
 
     ``way_back`` is how the sentence tells the caller to read the review state. It
     defaults to the client command ``review TASK``; the HTTP next-actions answer passes
@@ -187,6 +283,9 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
         return 'you', 'This is your review: read %s and record your decision.' % back
     if not owned:
         return 'unknown', UNKNOWN_MOVE_TEXT
+    if isinstance(followon, dict) and followon.get('applies'):
+        from followon import next_text
+        return 'you', next_text(followon, checkpoint_available=checkpoint_available)
     if state == 'changes-requested':
         if redelivered:
             # A revision that supersedes the one the items were filed on is already
@@ -221,10 +320,20 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
                        'Read %s and deliver a new contribution that answers each item.'
                        % (items, plural, back))
     if state == 'integrated':
-        # An integrated revision does not finish a task deliberately kept open.
-        return 'you', ('This task stays open after its contribution was integrated. '
-                       'Read %s; continue the task\'s remaining scope if any, otherwise checkpoint '
-                       'that nothing remains for you. Deployment or verification may be the coordinator\'s move.' % back)
+        # kittrial-5bb.336: an integrated contribution on a task still open is NOT the
+        # assignee's move - it is the coordinator's (close the task, or record what
+        # remains). The old 'continue the remaining scope' answer put every
+        # integrated-but-open row in the worker's own queue, burying its real work, and
+        # nothing on the row can tell remaining scope from finished work - that judgement
+        # is the coordinator's, who closed 11 such rows on jjbp while each worker read
+        # them as its own.
+        return 'coordinator', ('Nothing is for you to do: this contribution is integrated; '
+                               'the coordinator closes the task or records what remains of it. '
+                               'A coordinator can record what remains as a hand-back that makes it '
+                               'the assignee\'s move (and shows here with its text); without a '
+                               'recorded hand-back this remains the coordinator\'s move. '
+                               'Read %s; if scope you owe remains, say so in a checkpoint and the '
+                               'coordinator records it.' % back)
     if state in (None, 'none'):
         return 'you', ('This is your work: no contribution has been delivered yet. Read %s '
                        'for its current state and deliver one.' % back)
@@ -232,7 +341,8 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
 
 
 def move_decision(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                  assignee=None, closed=False, claimable=None, way_back=None):
+                  assignee=None, closed=False, claimable=None, way_back=None, followon=None,
+                  checkpoint_available=True):
     """THE one whose-move decision (kittrial-5bb.6 review item 2): `(move, next, next_actor)`.
 
     One function gives all three answers, so no reader can be told one mover by
@@ -249,6 +359,10 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
     that role needs; they are the same facts the shared projection passes, so a
     ``work`` row and the ``review`` read of the same task cannot disagree.
 
+    ``followon`` is an APPLYING hand-back block (kittrial-5bb.343); it is the ONE
+    branch that makes an integrated task the assignee's move, and it forces
+    ``next_actor`` to ``'assignee'`` from the same decision.
+
     ``way_back`` is the reference the sentence tells the caller to follow, passed through
     to :func:`_caller_move`; it changes no word of the decision (kittrial-5bb.253 review,
     item 4).
@@ -256,21 +370,26 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
     if not active_work('closed' if closed else 'open', state, pending_items):
         return ('unknown', 'This task is closed; its review and lifecycle records remain in history.',
                 next_actor(state, assignee, closed, pending_items=pending_items, claimable=claimable))
+    applied=isinstance(followon,dict) and followon.get('applies')
     move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered,
-                             way_back=way_back)
+                             way_back=way_back, followon=followon,
+                             checkpoint_available=checkpoint_available)
+    if applied:
+        return move, text, 'assignee'
     return move, text, next_actor(state, assignee, closed, pending_items=pending_items,
                                   claimable=claimable)
 
 
 def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                way_back=None):
+                way_back=None, followon=None, checkpoint_available=True):
     """`(whose_move, next)`: one plain sentence from the validated review state alone.
 
     The public two-answer shape (kittrial-5bb.249), unchanged. The decision it comes
     from is :func:`move_decision`, which yields ``next_actor`` as well.
     """
     move, text, _ = move_decision(state, task, owned, named_reviewer, pending_items, redelivered,
-                                  way_back=way_back)
+                                  way_back=way_back, followon=followon,
+                                  checkpoint_available=checkpoint_available)
     return move, text
 
 
@@ -354,14 +473,14 @@ def checkpoint_wait(row, actor, state, delivered=False):
     """
     result = dict(status='unknown', checkpoint=None, author=None, is_current=None,
                   active=None, items=[], total=None, omitted=None, next_action=None)
-    if row.get('assignee') != actor or not actor:
+    if not actor_holds(row.get('assignee'), actor):
         result.update(status='not-owned', active=False)
         return result
     if state is None or state['invalid']:
         return result
     comments = {str(c.get('id')): c for c in row.get('comments') or [] if isinstance(c, dict)}
     own = [(cid, p) for cid, p in state['history']
-           if comments.get(str(cid), {}).get('author') == actor]
+           if actor_holds(comments.get(str(cid), {}).get('author'), actor)]
     if not own:
         result.update(status='none', is_current=False, active=False, total=0, omitted=0)
         return result
@@ -453,11 +572,13 @@ def help_payload(action='work'):
             'item_identity': 'items[].task is the native task ID; items[].contribution_id is the '
                              'contribution comment ID, not a Git commit or latest_comment_id',
             'item_move': 'items[].whose_move is you, reviewer, coordinator or unknown, relative to the '
-                         'calling actor, derived only from the validated review state the row already '
-                         'shows; items[].next is one plain sentence saying the same in words, and '
-                         'quotes the blocker or dependency entry of the caller\'s own checkpoint when that '
-                         'checkpoint records one (no person is inferred; the move stays the caller\'s). '
-                         'Items where the move is the caller\'s sort first; top-level your_move '
+                         'actor the queue is read for: the caller on --mine and an unfiltered scan, and '
+                         'ACTOR on --owner ACTOR (kittrial-5bb.288). An open task assigned to that '
+                         'actor with no checkpoint and no contribution by them is their move. '
+                         'items[].next is one plain sentence saying the same in words, and '
+                         'quotes the blocker or dependency entry of that actor\'s own checkpoint when '
+                         'it records one (no person is inferred; the move stays theirs). '
+                         'Items where the move is that actor\'s sort first; top-level your_move '
                          'carries their count for the filtered queue. Nothing is inferred from a title, a '
                          'comment or an actor name.',
             'item_select': 'items[].next_actor is the next-action actor as a ROLE (assignee, reviewer, '
@@ -490,7 +611,7 @@ def help_payload(action='work'):
                             'deployed_delivery', 'deployed_delivery_is_current_contribution',
                             'workflow_state', 'integration', 'integration_disagreements',
                             'integration_warnings', 'review_request', 'review_requests',
-                            'newer_activity_by_others', 'newer_activity_own',
+                            'newer_activity_marker', 'newer_activity_by_others', 'newer_activity_own',
                             'newer_activity_coverage', 'unresolved_directions',
                             'recommended', 'recommended_by', 'contribution_author'],
             'lanes': 'work lanes is the lanes board (kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md): ONE '
@@ -670,7 +791,8 @@ def approval_wait(state, task, actor, assignee, author, independent_approval=Fal
 
 
 def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_reverts=None,
-             actor=None,independent_approval=False,owners=None):
+             actor=None,independent_approval=False,owners=None,followon=None,
+             provenance_writes=True):
     from review_state import project as reviewed
     result=reviewed(issue,scopes,operators,reverts,journal,invalid_reverts)
     # Additive (kittrial-5bb.115): the standing reviewer recommendations for the current
@@ -685,10 +807,23 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
     result['waiting_for_approval']=approval_wait(result.get('review_state'),issue.get('id'),actor,
         issue.get('assignee'),(result.get('contribution') or {}).get('author'),
         independent_approval,owners,named)
+    # The coordinator's recorded hand-back (kittrial-5bb.343). ONE applicability
+    # function decides it, from the same projection and the task's lifecycle
+    # evidence; the block is additive and an applying one makes the shared
+    # next_actor the assignee's. A caller that already evaluated a whole page
+    # passes ``followon`` so the host journal is not re-read per task.
+    if followon is None and journal is not None:
+        import followon as followon_records
+        followon=followon_records.evaluate(issue,result,scopes or [],project=journal)
+    if isinstance(followon,dict) and followon.get('block') is not None:
+        result['followon']=followon['block']
+        if followon.get('applies'):
+            result['next_actor']='assignee'
     return result
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
-          reference_attention=False, verifiers=None,independent_approval=False,owners=None,provenance_writes=True):
+          reference_attention=False, verifiers=None,independent_approval=False,owners=None,provenance_writes=True,
+          identity_names=None):
     """One page of the work queue.
 
     ``reverts`` and ``scopes`` are PER TASK: each is a mapping of task id to that
@@ -716,6 +851,16 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     parser.add_argument('--capability-limit',type=int,default=20);parser.add_argument('--capability-offset',type=int,default=0)
     parser.add_argument('--json',action='store_true')  # output is always JSON; accepted for consistency
     a=parser.parse_args(args)
+    # The per-project claiming setting (kittrial-5bb.352). Read FRESH from the project
+    # directory on every queue read: it lives outside the tracker, so the tracker read
+    # cache (keyed on the dolt commit) would never see a setting change. No project
+    # directory means the default, today's `open`.
+    claiming_state={'claiming':'open','set_by':None,'set_at':None,'set_via':None,
+                    'previous':None,'history':[]}
+    if journal is not None:
+        from claiming import read as read_claiming
+        claiming_state=read_claiming(journal)
+    claiming_mode=claiming_state['claiming']
     from lifecycle_voids import Snapshot, snapshot
     if journal is not None and not isinstance(rows,Snapshot):
         rows=snapshot(rows,journal)
@@ -736,6 +881,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     if scopes is not None and not isinstance(scopes,dict):
         raise ValueError('scopes must be a mapping of task id to that task\'s integration scopes')
     owner=actor if a.mine else a.owner
+    # kittrial-5bb.288: the move is the QUEUE's, not the connection's. `--owner ACTOR`
+    # is ACTOR's queue, so an open task assigned to ACTOR on which ACTOR never posted
+    # reads `whose_move` 'you' and counts in `your_move`; `--mine` answers for the
+    # caller; an unfiltered scan keeps the caller-relative answer and `next_actor`.
+    subject=move_subject(actor,owner)
     journal_requests=[];journal_errors=[]
     if request_dir and request_dir.is_dir():
         request_files=sorted(request_dir.glob('*.json'))
@@ -748,16 +898,29 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                 journal_requests.append(request)
             except (OSError,json.JSONDecodeError,ValueError) as exc:
                 journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
-    facts={r['id']:r for r in project_facts(rows)};evidence={r['id']:r['scopes'] for r in integration_evidence(rows)};items=[]
+    # kittrial-5bb.339: the classified-events walk is computed ONCE for the whole
+    # page and shared by every lifecycle reader (it was paid four times per read on
+    # jjbp: 2.1 s of the 4.5 s join).
+    page_events=events_by_dimension(rows)
+    facts={r['id']:r for r in project_facts(rows,events=page_events)}
+    evidence={r['id']:r['scopes'] for r in integration_evidence(rows,events=page_events)}
+    items=[]
     checkpoint_states={}
     from review_state import is_integration_warning, reverts_by_task
     if reverts is None:
         revert_map,revert_problems=reverts_by_task(rows,operators,journal)
     else:
         revert_map,revert_problems=reverts,{}
+    # The host follow-on journal (kittrial-5bb.343) is read ONCE for the whole page,
+    # exactly like the revert journal, and separately from the export rows: the
+    # journal lives outside the tracker, so a journal write does not move the export
+    # and this read is never served from a cache keyed on it.
+    import followon as followon_records
+    followon_host=followon_records.host_journal(journal) if journal is not None else ({},[])
     from reserved_comments import is_record_anchor
     from review_workflow import author_key
     from coordination import is_merge_slot
+    dep_index=dependency_index(rows)
     malformed_named=[]
     unparseable_count=0
     for row in rows:
@@ -791,7 +954,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'review_request':False,'review_requests':[],
                           'recommended':False,'recommended_by':[],
                           'integration_disagreements':[],'integration_warnings':[],
-                          'newer_activity_by_others':None,'newer_activity_own':None,
+                          'newer_activity_marker':None,'newer_activity_by_others':None,'newer_activity_own':None,
                           'newer_activity_coverage':None,'unresolved_directions':None,
                           'waiting_for_approval':None,
                           'approval_requires_other_party':bool(independent_approval),
@@ -817,8 +980,23 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         task_reverts=revert_map.get(row['id'],[])
         task_scopes=evidence.get(row['id']) if scopes is None else scopes.get(row['id'])
         try:review=workflow(row,task_scopes,operators=operators,reverts=task_reverts,journal=journal,
-                            invalid_reverts=revert_problems.get(row['id']));state=review['review_state'];error=None
+                            invalid_reverts=revert_problems.get(row['id']),followon={},
+                            provenance_writes=provenance_writes);state=review['review_state'];error=None
         except ValueError as e:review={};state='error';error=str(e)[:300]
+        # The ONE applicability decision for this task (kittrial-5bb.343), from the
+        # review projection just made and the page's single fresh journal read. An
+        # applying hand-back makes the move the assignee's in the same shared review
+        # block the `review` read returns.
+        task_followon=None
+        if review and journal is not None:
+            try:
+                task_followon=followon_records.evaluate(row,review,task_scopes or [],host=followon_host)
+            except (ValueError,TypeError,KeyError):
+                task_followon=None
+            if task_followon and task_followon.get('block') is not None:
+                review=dict(review,followon=task_followon['block'])
+                if task_followon.get('applies'):
+                    review=dict(review,next_actor='assignee')
         # The state main decided the closed-row rule and `--state` on: the validated state
         # BEFORE the journal override (kittrial-5bb.6 review item 1). The override changes
         # what the row SHOWS; it never moves the row into another queue, and it never
@@ -832,6 +1010,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             state='error';error='Malformed handoff journal: '+json.dumps(journal_errors[:10],sort_keys=True)
             review=dict(review,work_state='error',next_actor='operator',
                         reconciliation_needed=False,reconciliation_reasons=[])
+            # An error row does not claim a hand-back's move (kittrial-5bb.343):
+            # the malformed journal makes the whole row an operator's to repair.
+            task_followon=None
+            review.pop('followon',None)
         if state=='error' and not review.get('next_actor'):
             # A malformed contribution-review chain (the ValueError above) reads error
             # too, and error is an operator's to repair: next_actor is never null
@@ -844,22 +1026,23 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         work_state=review.get('work_state',state)
         from task_assignment import notices as assignment_notices
         notices=assignment_notices(row,journal.name if journal is not None else '',actor)
-        if owner is not None and row.get('assignee')!=owner:
+        if owner is not None and not actor_holds(row.get('assignee'), owner):
 
             # A first-class review request (kittrial-5bb.94 item 4) puts the task in
             # the NAMED reviewer's queue even though they are not its assignee.
             named=[request for request in (review.get('pending_review_requests') or [])
                    if author_key(request.get('reviewer'))==author_key(owner)]
             if not named and not (a.mine and notices['total']):continue
-        # The caller's own named review requests, so a row that is in the queue only
-        # because they were named says so (kittrial-5bb.94 item 4). Computed for the
-        # CALLING actor, not the --owner filter.
+        # The named review requests OF THE SUBJECT: on `--mine` the caller's own, and on
+        # `--owner ACTOR` ACTOR's (the queue that read answers for; kittrial-5bb.288), so a
+        # row that is in the queue only because they were named says so and their move is
+        # named (kittrial-5bb.94 item 4).
         review_requests=[{'request':request.get('request'),'reviewer':request.get('reviewer'),
                           'contribution':request.get('contribution'),'summary':request.get('summary'),
                           'author':request.get('author'),'timestamp':request.get('timestamp')}
                          for request in (review.get('pending_review_requests') or [])
-                         if actor is not None and author_key(request.get('reviewer'))==author_key(actor)]
-        review_request=bool(review_requests) and row.get('assignee')!=actor
+                         if subject is not None and author_key(request.get('reviewer'))==author_key(subject)]
+        review_request=bool(review_requests) and not (subject and actor_holds(row.get('assignee'), subject))
         # The integration overlay's warnings (kittrial-5bb.52): the owner decision
         # keeps any-pass-wins, and a host-issued revert is always surfaced, so both
         # the disagreement and the revert warning travel with the row.
@@ -926,26 +1109,20 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # request-changes records still unresolved.
         checkpoint_at=None;newer_activity=None
         try:
-            from briefing import checkpoint_state, lane_state_record
+            from briefing import checkpoint_state, newer_comment_by_other
             checkpoint_states[row['id']]=checkpoint_state(row,normalize=False)
             latest_checkpoint=checkpoint_states[row['id']]['current']
             open_items=len(latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
             blocking_items=sum(item['kind'] in ('blocker','dependency')
                                for item in latest_checkpoint[0]['open_items']) if latest_checkpoint else 0
             if latest_checkpoint:
-                comments=row.get('comments') or []
-                position=next(index for index,comment in enumerate(comments)
-                              if str(comment.get('id'))==str(latest_checkpoint[1].get('id')))
                 checkpoint_at=latest_checkpoint[1].get('created_at')
                 # The lane-state record written WITH this checkpoint (same author, naming this
                 # checkpoint) is part of the checkpoint, not a later write by another actor: it
                 # must not wake the task (kittrial-5bb.263 review). A record naming an older
                 # checkpoint, or by another author, is ordinary activity and still wakes it.
-                checkpoint_id=str(latest_checkpoint[1].get('id'))
-                checkpoint_author=latest_checkpoint[1].get('author')
-                newer_activity=any(comment.get('author')!=row.get('assignee')
-                                   and not lane_state_record(comment,checkpoint_id,checkpoint_author)
-                                   for comment in comments[position+1:])
+                # ONE implementation, which brief's `activity` block reads too (kittrial-5bb.354).
+                newer_activity=newer_comment_by_other(row,latest_checkpoint[1])
         except (ValueError,TypeError,KeyError,StopIteration):
             open_items=None;blocking_items=None;checkpoint_at=None;newer_activity=None
         pending_change_requests=[]
@@ -961,17 +1138,23 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # The one bounded claimability answer for this row (kittrial-5bb.6 deliverable b).
         # It is computed before the move because next_actor needs it: an unassigned,
         # undelivered row may name `anyone` only when somebody could actually take it.
+        row_open_deps=open_dependency_ids(row,rows,index=dep_index)
         row_claimable=claimable(row.get('issue_type'),row.get('status'),row.get('assignee'),
                                 contribution.get('comment_id'),state,
-                                record_anchor=is_record_anchor(row),labels=row.get('labels'))
+                                record_anchor=is_record_anchor(row),labels=row.get('labels'),
+                                open_dependencies=row_open_deps,claiming=claiming_mode)
         # Whose move it is, one plain sentence saying so, and the caller-neutral ROLE of
         # that same decision -- ONE call, so a row can never name one mover and deny
         # another (kittrial-5bb.6 review item 2). Derived from the validated review state
-        # this row already shows; no further read.
-        move,move_text,role=move_decision(state,row['id'],bool(actor) and row.get('assignee')==actor,
+        # this row already shows; no further read. `owned` is the SUBJECT's (kittrial-
+        # 5bb.288): an open task assigned to the subject with no contribution and no
+        # checkpoint by them reads `you` and counts in `your_move`.
+        move,move_text,role=move_decision(state,row['id'],bool(subject) and actor_holds(row.get('assignee'), subject),
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
-                                          closed=row.get('status')=='closed',claimable=row_claimable)
+                                          closed=row.get('status')=='closed',claimable=row_claimable,
+                                          followon=task_followon.get('block') if task_followon else None,
+                                          checkpoint_available=provenance_writes)
         # A standing hold (or a failed attestation) is shown BESIDE the state the row
         # already reads (kittrial-5bb.10 item 7): a revision still awaiting review stays in
         # the reviewers' queue, and an author with open requested changes is told the
@@ -982,12 +1165,24 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             hold_sentence=integration_hold_sentence(review)
             if hold_sentence and hold_sentence not in move_text:
                 move_text=move_text+' Integration hold: '+hold_sentence+'.'
+        # DISPLAY ONLY (kittrial-5bb.333): the stored assignee is the actor id and is NOT
+        # interpreted here. `owner_name` is the actor's display name, added so a reader sees
+        # NAME (ACTOR id) now that an assignment stores the actor id; it never feeds an
+        # ownership or move decision.
+        row_owner=row.get('assignee')
+        owner_name=(identity_names or {}).get(row_owner) if isinstance(row_owner,str) and row_owner else None
         items.append({**({'assignment_notices':notices} if notices['total'] else {}),
                       'open_items':open_items,'blocking_items':blocking_items,
                       'checkpoint_at':checkpoint_at,'newer_activity':newer_activity,
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
-                      'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row.get('assignee'),'status':row.get('status'),'review_state':state,
+                      'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row_owner,'status':row.get('status'),'review_state':state,
+                      **({'owner_name':owner_name} if owner_name and owner_name!=row_owner else {}),
                       'whose_move':move,'next':move_text,
+                      # Additive (kittrial-5bb.343): the newest recorded hand-back and
+                      # whether it applies, so a reader sees why an unjournalled or
+                      # ended record does not move the task. Present only when the
+                      # task carries a follow-on comment.
+                      **({'followon':task_followon['block']} if task_followon and task_followon.get('block') is not None else {}),
                       # Additive selection facts (kittrial-5bb.6), all from the one shared
                       # projection: the next-action ROLE (never the assignee field), the
                       # filterable work state, the reconciliation signal with its mismatching
@@ -1060,13 +1255,14 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     # for all rows, so the move and `your_move` are the queue's, never the page's. The
     # heavier per-row checkpoint fields stay on the displayed page below.
     for item in items:
-        item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),actor,
+        item['checkpoint_wait']=checkpoint_wait(task_rows.get(item['task'],{}),subject,
             checkpoint_states.get(item['task']),
             delivered=bool(item['contribution_id']) or item['review_state'] not in (None,'none'))
         # (kittrial-5bb.219 addition c, revised for kittrial-5bb.249 item 1 and kittrial-5bb.253
-        # item 2) Where the caller's own current checkpoint records a blocker or dependency,
-        # `next` quotes that blocker or dependency ENTRY itself (its raw text, escaped once) and
-        # says no person was inferred. The move stays the caller's: `whose_move` is not rewritten
+        # item 2) Where the SUBJECT's own current checkpoint (the caller's on --mine, the
+        # owner's on --owner; kittrial-5bb.288) records a blocker or dependency, `next` quotes
+        # that blocker or dependency ENTRY itself (its raw text, escaped once) and says no
+        # person was inferred. The move stays the subject's: `whose_move` is not rewritten
         # and the row stays in `your_move`.
         if item['checkpoint_wait'].get('active'):
             wait_text=waiting_move(checkpoint_wait_move_text(checkpoint_states.get(item['task'])))
@@ -1084,6 +1280,15 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         coverage+=' %d unparseable issue row(s).'%unparseable_count
     result={'owner':owner,'total':len(items),'items':items[a.offset:a.offset+a.limit],'next_offset':a.offset+a.limit if a.offset+a.limit<len(items) else None,
             'coverage':coverage}
+    # Additive (kittrial-5bb.352): the project's claiming setting this page was built
+    # with, and the sentence an empty listing carries under `assigned` so a reader (and
+    # the Bridge's empty-list message) can say why nothing is offered.
+    result['claiming']=claiming_mode
+    if claiming_state.get('warning'):
+        result['claiming_warning']=claiming_state['warning']
+    if claiming_mode=='assigned' and not result['total']:
+        from claiming import EMPTY_SENTENCE
+        result['empty_message']=EMPTY_SENTENCE
     # A closed task stays out of the actionable queue. Its durable assignment
     # notice still reaches both holders as bounded metadata beside that queue.
     if a.mine and journal is not None:
@@ -1157,7 +1362,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
             independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False,
-            lanes_scope='all',provenance_writes=True):
+            lanes_scope='all',provenance_writes=True,identity_names=None):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
@@ -1177,12 +1382,51 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     if action in ('review','handoff'):
         # Structured output is already JSON; accept the flag consistently with brief/show/work.
         args=[token for token in args if token!='--json']
-    if action=='work':
-        rows=record_json.loads_rows(run(['export','--all']))
+    if action in ('work','wait'):
+        # kittrial-5bb.339: the export rows come from the generation-keyed cache when
+        # the tracker has not committed since they were parsed (a write IS visible to
+        # the next read: every write commits, so the key moves and the cache misses).
+        from read_cache import cached_export_rows
+        rows=cached_export_rows(path.parent.parent, path, run)
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
         from lifecycle import host_snapshot
         rows=host_snapshot(rows, run=run, project=path)
+        if action=='wait':
+            # The blocking wait's ONE read per poll (kittrial-5bb.285). The export is already
+            # in hand: the worker form needs no further read, and the coordinator form's lane
+            # board (kittrial-5bb.263) is derived from the SAME export, so a poll is one cheap
+            # read - never an export per form and never a read per task.
+            from waiting import parse_read_args as wait_read_args, worker_view, coordinator_view
+            parsed=wait_read_args(args)
+            if parsed.coordinator:
+                from lanes import read as lanes_read, LANES_LIMIT_MAX
+                from sessions import read_registry
+                lanes_payload=lanes_read(rows,actor,read_registry(path),
+                                         ['--idle-minutes',str(parsed.idle_minutes),
+                                          '--limit',str(LANES_LIMIT_MAX)],
+                                         operators=operators,journal=path,scope=lanes_scope)
+                queue_payload=queue(rows,actor,['--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
+                                    operators=operators,journal=path,reference_attention=False,
+                                    verifiers=verifiers,independent_approval=independent_approval,
+                                    owners=owners,provenance_writes=provenance_writes,
+                                    identity_names=identity_names)
+                return coordinator_view(queue_payload.get('items') or [],lanes_payload)
+            queue_payload=queue(rows,actor,['--mine','--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
+                                operators=operators,journal=path,reference_attention=False,
+                                verifiers=verifiers,independent_approval=independent_approval,
+                                owners=owners,provenance_writes=provenance_writes,
+                                identity_names=identity_names)
+            # The guidance acknowledgement is the caller's move too (kittrial-5bb.325): the
+            # shared block carries the one item, and it joins the rows this projection
+            # filters, so a worker waiting on `wait` WAKES for a new guidance version and
+            # the fingerprint changes with the version (and again when the ack clears it).
+            move_rows=list(queue_payload.get('items') or [])
+            guidance_item=(queue_payload.get('guidance') or {}).get('item')
+            if isinstance(guidance_item,dict):
+                move_rows.append(guidance_item)
+            return worker_view(move_rows,claiming=queue_payload.get('claiming'),
+                               empty_message=queue_payload.get('empty_message'))
         if args[:1]==['lanes']:
             # The lanes board (kittrial-5bb.263) reads the SAME export this action already
             # loaded, plus the project's session registry: one pass, no per-task comment
@@ -1195,7 +1439,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers,
                      independent_approval=independent_approval,owners=owners,
-                     provenance_writes=provenance_writes)
+                     provenance_writes=provenance_writes,identity_names=identity_names)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:
@@ -1207,7 +1451,8 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         issue=task_row(rows,task)
         from review_state import scopes_for
         return workflow(issue,scopes_for(rows,task),operators=operators,journal=path,
-                        actor=actor,independent_approval=independent_approval,owners=owners)
+                        actor=actor,independent_approval=independent_approval,owners=owners,
+                        provenance_writes=provenance_writes)
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
     item=attachments.get(args[1].partition(':')[2],{})
     if not isinstance(item,dict) or item.get('flag') not in ('--file','-f') or not isinstance(item.get('text'),str):raise ValueError('Invalid attachment')
@@ -1235,7 +1480,7 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
     result=review(rows,task,actor,payload,run, operators=operators, journal=path,
                   review_writes=review_writes, independent_approval=independent_approval,
                   coordinator_writes=coordinator_writes, owners=owners, verified_web_authority=verified_web_authority,
-                  verifiers=verifiers)
+                  verifiers=verifiers, identity_names=identity_names)
     if payload.get('operation')=='request-changes':
         # Retry repairs a label update interrupted after the durable review comment.
         run(['update',task,'--remove-label','review-ready','--json'])

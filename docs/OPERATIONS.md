@@ -333,6 +333,69 @@ with the capable kit and restore procedure. Older readers ignore marks, so they
 cannot recognize marked integrations as acceptable later bases. Perform recovery
 with the mark-capable kit and honor the renamed-destination warning above.
 
+### Assignee hand-backs: restore and rollback
+
+`admin.py backup` collects `<project>/.assignee-followons/` with the rest of the
+coordination sidecar and `restore-new` validates and restores it, so a restored
+project still honours an open hand-back. The journal is OUTSIDE the tracker: a
+backup taken by an older kit while the deployment is rolled back silently omits
+it, and every recorded hand-back then reads inert (the `.336` coordinator move
+stands) until it is re-recorded.
+
+**Recording one from the host.** An installation operator records or withdraws a
+hand-back without a bound coordinator key or a web account:
+
+```sh
+python3 admin.py --root /path/to/root followon --project PROJECT --actor OPERATOR --file payload.json
+```
+
+The payload's own `operation` chooses the write: `{"schema_version":1,"operation":
+"record","task":"TASK","text":"..."}` or `{"schema_version":1,"operation":"withdraw",
+"target":"FOLLOWON_COMMENT_ID","reason":"..."}` (the shapes and their bounds are in
+[CLI_CONTRACT.md](CLI_CONTRACT.md)). `--actor` must itself be on the installation's
+operator allowlist (`operators` in `deployment.private.json`, read strictly), the
+recorded actor is exactly that name, and a payload that carries its own `actor` must
+name the same one; a non-operator caller or a differing payload actor is refused
+before a lock is taken and nothing is written. The command calls `followon.apply`, the
+same function the web route and `coordinator followon` call, under the project's
+`.coordination.lock` (and the deployment configuration lock), so validation, fact
+derivation and the journal cannot drift between the routes.
+
+**A comment changes no move.** A comment does not change whose move an integrated-but-open task is: record a hand-back or close the task.
+
+**An older kit refuses to restore a backup that holds `.assignee-followons/`.**
+Its fixed coordination-sidecar path whitelist does not know the journal, so its
+`restore-new` fails for the whole project with
+`ValueError: Invalid coordination backup path` and leaves nothing behind.
+`--without-coordination` does not get around it: the older kit reads the sidecar
+as usable and refuses that flag, and the same path validation still fails. To restore
+such a backup into an older kit, either **restore with this kit or a newer one**
+(`admin.py` from a checkout is enough: it can restore while the deployment still
+serves the older kit), or **remove `.assignee-followons/` from a COPY of the
+backup** first and restore that copy — the hand-backs are then absent (inert),
+not silently half-applied. Before rolling back, take and retain a complete
+backup with this kit; after rolling forward, restore that sidecar or re-record
+the hand-backs.
+
+### The claiming setting: restore and rollback
+
+`<project>/.claiming.json` holds whether workers may claim open tasks (`open`, the
+default) or only the project's coordinators assign work (`assigned`). It is written
+by the web Settings page and by `admin.py project-setting PROJECT --claiming VALUE
+--actor OPERATOR`, collected by `admin.py backup` with the coordination sidecar,
+and validated and restored by `restore-new`. A damaged file is carried byte for byte
+and reads back restrictive (`assigned`), never as the permissive default.
+
+**Rollback:** an older kit ignores `.claiming.json` entirely. A project set to
+`assigned` therefore reads as **open** again as soon as the older kit serves it, and
+workers can claim unassigned tasks until the setting is written again by a kit that
+knows it. This is a behaviour change, not just a missing label: before rolling back,
+record the value (and, if it matters, take a complete backup with this kit), and after
+rolling forward set it again on the Settings page or with
+`admin.py project-setting`. An older kit also refuses to restore a backup that holds
+`.claiming.json` (its coordination-sidecar whitelist does not know the path); restore
+such a backup with this kit or a newer one, as with `.assignee-followons/`.
+
 ## Install on Linux
 
 Use an ordinary service account with a writable home, Python 3.10+, user systemd, and HTTPS access to GitHub release assets. Copy this kit to `/home/beads/beads-team-kit` in this example. Each deployment needs its own root, port and service name. Installation refuses unmanaged binaries or an existing service with the same name.
@@ -451,6 +514,11 @@ user site directory; not `-I`, which would also drop the script's directory from
 `sys.path`), and it refuses a `--python` outside the same bare-name-or-absolute-path
 character class as `--root`, so `--python '$(touch${IFS}/tmp/canary)python3'` is refused
 instead of printed into an entry the account shell would expand on every connection.
+Before printing, an absolute `--python` path must exist, be executable and report Python
+3.10 or newer to a short version probe; otherwise the helper refuses with one sentence.
+A bare interpreter name is left unchanged and resolved through the server account's `PATH`
+when SSH starts the forced command, so use an absolute path when the interpreter must be
+checked before the line is installed.
 
 Confinement binds the key to the endpoint, not to an actor. A confined key still
 self-declares its actor on every request, exactly as an unconfined one does; what the
@@ -1086,6 +1154,8 @@ owner.
 
 ## Operator commands
 
+**The read cache behind `work` and `wait` (kittrial-5bb.339).** A `work` or `wait` read on a project with Dolt server coordinates serves the previously parsed export from `.read-cache/` under the project when the tracker's HEAD hash has not moved, and re-exports when it has: one file holding the format version, the key and the rows, replaced by a single rename, mode 0600. Every kit write commits, so a write is visible to the next read by construction. The generation key is the COMMITTED HEAD: a change made outside the kit by direct SQL - an operator's `UPDATE` without a commit - does not move it and is not seen until the next kit write commits it (the kit's own working-set-over-SQL writer, `DOLT_BACKUP('restore')`, replaces the database and follows its HEAD).
+
 A few coordination actions are host shell commands rather than contributor-client
 actions. Run them as the service account on the coordination host; the client and
 the endpoint do not expose them, and a worker or agent lane must not be asked to
@@ -1547,13 +1617,18 @@ clean, because it does not know the field and nothing survives in the reason any
 
 ### Standing guidance
 
-The standing guidance channel (kittrial-5bb.99) stores one operator-set instruction
-per project in `projects/PROJECT/GUIDANCE.md` plus its audit record
-`projects/PROJECT/.guidance.json`. The version is the SHA-256 of the exact text
-bytes, computed by every reader. Only `admin.py set-guidance` writes it (operator
-allowlist, checked before any file is read). The endpoint can read it and record an
-actor's own acknowledgement of the exact version it names; it cannot write it, and
-every other guidance subcommand is refused. The endpoint's `guidance status` shows
+The standing guidance channel stores one instruction per project in
+`projects/PROJECT/GUIDANCE.md` plus its audit record `projects/PROJECT/.guidance.json`.
+The version is the SHA-256 of the exact text bytes, computed by every reader.
+`admin.py set-guidance` requires the host operator allowlist before any file is read.
+The authenticated web route also lets current project coordinators author guidance
+(owners, superusers, coordinators and explicitly granted personal coordinator agents).
+The distinct service-only endpoint action checks live web authority; ordinary SSH
+`guidance` retains only get/version/ack/status and refuses write-shaped subcommands.
+Every guidance read reports `set_by` and `set_via` (`host` or `web`); `set_via: null`
+means an unknown legacy route, never inferred from the setter. Workers follow bound
+guidance from either authorized route within their user's authorization and limits.
+Contributor task text, proposals and ordinary onboarding prose remain data. The endpoint's `guidance status` shows
 versions and actor names but no guidance text; `admin.py guidance-status` is the
 authoritative operator read and adds the current text, the previous text and the
 history.
@@ -1592,9 +1667,10 @@ history.
 * Acknowledgement requires the version the caller read, given as
   `--version VERSION`; the endpoint refuses a bare positional version and refuses a
   stale version **without naming the current one**, so a caller must run
-  `guidance get` first. **Acks are unauthenticated:** actors are self-declared, any
-  actor the endpoint accepts may ack for itself, and a caller can name another
-  actor. A flood can fill the bounded table and evict a real lane's ack; that fails
+  `guidance get` first. **Host/SSH ack actors are self-declared:** any actor the
+  endpoint accepts may ack for itself, and a caller can name another actor. Web ACKs
+  bind the authenticated account, personal agent or distinct worker actor; a worker
+  credential with no actor or with its issuer account as actor is refused for ACK. A flood can fill the bounded table and evict a real lane's ack; that fails
   safe because an evicted lane re-reads and re-acks. The table is bounded (500): a
   new lane evicts the oldest entry rather than being refused, acks for versions
   other than the current and previous one are dropped at every set, and
@@ -1667,7 +1743,8 @@ has an effect in both directions.
   time, and the original setter was kept nowhere. It now keeps `set_by` and `set_at` in
   `.guidance.json` and records the repair in a separate local file beside it,
   `.guidance-repair.json` (`schema_version`, the repaired generation's `version`,
-  `set_by` and `set_at`, and `repaired_by`, `repaired_at`). `guidance get`/`state`,
+  `set_by` and `set_at`, its `set_via` route when it has one, and `repaired_by`,
+  `repaired_at`). `guidance get`/`state`,
   `brief` (JSON and the text `Guidance:` line) and `guidance-status` show
   `repaired_by`/`repaired_at` from that file only while it names the record's current
   version, setter and time and the record is intact; a file for another generation or of
@@ -1690,12 +1767,27 @@ has an effect in both directions.
   anything (`Nothing was changed: ...`); remove it and set again. If the audit write
   itself fails after the record was repaired, the set succeeds and prints that the
   repair audit could not be written.
-* **Rolling back below kittrial-5bb.121.** Nothing to do for the repair audit. The
-  record keeps exactly the fields the older kit validates, so `guidance ack`,
-  `compact-guidance-acks`, `backup` and `restore-new` work there unchanged; the older kit
+* **Rolling back below kittrial-5bb.121 with a legacy record.** Nothing to do for
+  the repair audit itself. A legacy record without `set_via` keeps exactly the fields
+  the older kit validates, so its `guidance ack`, `compact-guidance-acks`, `backup`
+  and `restore-new` remain compatible; this does not apply to new route-bearing
+  generations (see the boundary below). The older kit
   never reads `.guidance-repair.json`. A set there that rewrites the record (new text,
   or its own same-text repair) changes the version or the setter and leaves the file
   behind, where this kit then ignores it.
+
+**Guidance setter-route rollout (.212 review).** New generations add optional
+`set_via` to the existing metadata and history entries. Strict older kits, including
+main `07a3de32182dee10319fbd6cf741b92d68bfebeb`, can read text and setter but cannot
+show the route. Their new acknowledgements and compaction refuse the field; their
+backup omits the guidance pair as degraded, and their restore refuses a new pair.
+Upgrade all guidance readers/writers and backup/restore tools together before
+setting a new generation. Installation alone does not migrate existing records;
+a legacy same-text repair keeps an absent route, and a new-record repair keeps its
+known route. Never strip route attribution or run old writers to force acceptance.
+Use the clear-and-clean-backup rollback steps below, retaining text and the route
+audit separately in approved operator evidence. See
+[HTTP deployment](HTTP_DEPLOYMENT.md#guidance-metadata-rollout-and-rollback).
 
 **Rollback gap and the exact step.** An older kit (at or before
 `dca96b9d`) validates the coordination sidecar against a fixed path set that does
@@ -1987,7 +2079,9 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime bac
 python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime backup --all
 ```
 
-This invokes Beads' native Dolt backup into `runtime/backups/example`. The native step is Dolt's own backup synchronization through the SQL client (`CALL DOLT_BACKUP('sync', ...)` over the loopback connection, bounded by an explicit 30-minute ceiling), not `bd backup sync`, whose fixed client read timeout of about ten seconds a large database cannot meet on a busy or stalled server; a project that carries no Dolt server metadata has no SQL coordinates and keeps the `bd backup sync` path. The password travels in the environment, never on a command line. One or more project names, or `--all` for every initialized project of the runtime, run in a single invocation; each project is backed up exactly as the single-project form does, one failing project does not stop the others, and the command exits non-zero when any targeted project's backup pair is not complete. The sync client runs in its own session/process group. A normal `SIGTERM` or Ctrl-C is turned into an error inside the critical section, so the kit runs its cleanup and then stops that whole process group before the backup lock is released: the `dolt` client and anything it spawned cannot keep writing `backups/PROJECT` after the lock is gone, the previous complete pair is kept, and the run exits non-zero. A `kill -9` (or OOM kill) of `admin.py` itself can run no cleanup at all, so that client can still finish writing `backups/PROJECT` after the lock is released — re-run `backup` for that project before relying on that generation, and prefer a normal stop. Same-host backups protect against some mistakes, not loss of the server. Arrange an ordinary scheduled, encrypted off-machine copy of completed backups using your existing backup system; `backup-copy` below is the kit's reference for the pair selection. The kit does not install a backup timer. Preserve the kit/version pins and a protected copy of deployment configuration separately; JSONL views are useful exports but are not a substitute for the native backup.
+This invokes Beads' native Dolt backup into `runtime/backups/example`. The native step is Dolt's own backup synchronization through the SQL client (`CALL DOLT_BACKUP('sync', ...)` over the loopback connection, bounded by an explicit 30-minute ceiling), not `bd backup sync`, whose fixed client read timeout of about ten seconds a large database cannot meet on a busy or stalled server; a project that carries no Dolt server metadata has no SQL coordinates and keeps the `bd backup sync` path. The password travels in the environment, never on a command line. One or more project names, or `--all` for every initialized project of the runtime, run in a single invocation; each project is backed up exactly as the single-project form does, one failing project does not stop the others, and the command exits non-zero when any targeted project's backup pair is not complete. The sync client runs in its own session/process group. A normal `SIGTERM` or Ctrl-C is turned into an error inside the critical section, so the kit runs its cleanup and then stops that whole process group before the backup lock is released: the `dolt` client and anything it spawned cannot keep writing `backups/PROJECT` after the lock is gone, the previous complete pair is kept, and the run exits non-zero. A `kill -9` (or OOM kill) of `admin.py` itself can run no cleanup at all, so that client can still finish writing `backups/PROJECT` after the lock is released — re-run `backup` for that project before relying on that generation, and prefer a normal stop. **The HTTP state pair is in every backup (kittrial-5bb.331).** Every `backup` run - a named project or `--all` - also copies the runtime's web-service state into `backups/`: `http-state.json` (users and password hashes, agents and credential hashes, memberships) as written, and `http-state.json.records.sqlite3` (sessions, audit) through a CONSISTENT SQLite copy (the `sqlite3` CLI's `.backup` when the CLI exists, else `Connection.backup`), both mode 0600, both written to a temporary name and renamed. The live path resolves in order: `backup --http-state PATH`, an optional `http_state` path in `deployment.private.json` (the office config is operator-private and has no fixed home, so the deployment records the same path), then the office default `<RUNTIME_ROOT>/http-state.json` when that file exists. A runtime with none of these records `http-state absent` in the status file - not an error; a DEGRADED copy (no consistent SQLite copy available - the office server runs Python 3.6, which lacks `Connection.backup`, so install the `sqlite3` CLI there) makes the run INCOMPLETE, because the accounts and agents are exactly what a lost disk must not lose. `backup-copy` carries the pair to the off-machine destination beside the completeness record, and the copy run record names the files. `restore-new` brings the pair back ONLY with `--restore-http-state`: both files return to the live path (mode 0600) and the command prints that every session in the restored state is INVALIDATED - password and credential hashes return, sign-ins do not survive the restore. Without the flag a restore never touches the live HTTP state and says so in one line.
+
+Same-host backups protect against some mistakes, not loss of the server. Arrange an ordinary scheduled, encrypted off-machine copy of completed backups using your existing backup system; `backup-copy` below is the kit's reference for the pair selection. The kit does not install a backup timer. Preserve the kit/version pins and a protected copy of deployment configuration separately; JSONL views are useful exports but are not a substitute for the native backup.
 
 Restore drills deliberately create a new project:
 
@@ -2180,18 +2274,23 @@ At deploy time, list the projects that already use an `open-item` label: `python
   - Re-adding the operator restores both. There is no other repair yet: `void-record` accepts reference and capability records (kittrial-5bb.74), but not proposal or settings records. Until then the submitter can submit a new proposal that supersedes the stuck one.
 - **After a restore,** re-check `operators list` and `proposal-settings` before recording anything: both the allowlist and the actor map decide what counts.
 
-**Acceptance evidence trusts the comment's native author.** A reference entry reads
-accepted when its acceptance evidence comment was written by an actor on the operator
-allowlist. Over SSH a comment's author is the actor the caller declared, so what stops
-a contributor writing such a comment is the reserved-prefix guard (the shared slice 0),
-not the author field.
+**Acceptance evidence trusts the comment's native author.** A reference or capability entry
+reads accepted (or superseded) when its acceptance evidence comment was written by an actor on
+the operator allowlist, or through the web service by a member holding `coordinate` (`usr_<16hex>`
+or `agent_<16hex>`, see [HTTP deployment](HTTP_DEPLOYMENT.md#reference-and-capability-records-over-http)).
+Over SSH a comment's author is the actor the caller declared, so what stops a contributor
+writing such a comment is the reserved-prefix guard (the shared slice 0) and the endpoint's
+refusal of the `usr_`/`agent_` actor namespace without a verified web authority block, not the
+author field alone.
 
 - **Residual risk.** A `Kind: reference-acceptance-v1` comment written on a kit older
   than the shared slice 0, or during a rollback below it, under an operator's actor
   name, would read as a real acceptance. The same applies to the other record kinds.
 - **Why acceptance is not bound to the host receipt.** Reading an accepted entry must
   not depend on a local journal: a restore may lose `.reference-requests/`, and the
-  evidence comment has to remain the authority.
+  evidence comment has to remain the authority. Likewise, an acceptance, retirement or
+  capability verification written by a web coordinator stays live if that member's role or
+  agent grant is later removed; removing the role or grant stops their next write (`403`).
 - **Before the first use of the catalog on an installation,** and after any rollback
   below the shared slice 0, scan each project for record comments that no writer of
   this kit made. Save `bd export --all` for the project as `export.jsonl`, then run:
@@ -2707,6 +2806,21 @@ from `bd export --all`, as in the scan above.
   up (kittrial-5bb.92 review `order-check-limits-and-rollback`). No sidecar path is
   added, so backups restore on either kit, and rolling forward restores the repair with
   nothing to clean up.
+- **Web coordinator acceptance and capability attestation (kittrial-5bb.213).**
+  Acceptance evidence (`Kind: reference-acceptance-v1`, `Kind: capability-acceptance-v1`)
+  and capability verification attestations (`Kind: capability-verification-v1` with
+  `submitter.identity: "attested"` and a non-zero 40-hex `commit`) recorded by a web
+  coordinator (`usr_<16hex>` or `agent_<16hex>`) stay live if that coordinator is later
+  demoted or has their agent's coordinator grant removed (`acceptance_inert: false`,
+  `verification_state: "attested"`), while their next coordinator write or replay is
+  refused (`403`). Keeping an attestation's `attested` label after author demotion or
+  grant removal is safe because it is honestly labelled `attested` (`trusted: false`,
+  `checkout_validated: false`) and never clears a trusted host failure (`drifted`): only a
+  trusted `admin.py capability-verify --repo <PATH>` pass (`submitter.identity:
+  "verified"`) at an integrated commit clears an open failure. On rollback to a kit before
+  kittrial-5bb.213, an agent whose stored `scopes` or working credentials include
+  `'records'` reads as `scopes_source: "unknown"` (`scopes: null`) on that older kit until
+  an explicit scope list recognized by the older kit is set.
 - **Limits.** A record of a version this kit does not read (`Kind: reference-entry-v4`,
   `Kind: capability-entry-v2`) or of an unknown kind of the family cannot be a void
   target: the target must claim a prefix this kit reads for the declared kind (v1, and
@@ -2995,6 +3109,64 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime ser
 If a client times out, inspect the task before retrying a mutation: the write may have committed. Do not replace a lost response with an assumed failure.
 
 To retire the service, back up first, then `systemctl --user disable --now beads-team.service`. Preserve the runtime until recovery is no longer needed. Remove only the exact unit installed for that deployment and run `systemctl --user daemon-reload`. Linger is an account-wide setting: leave it enabled if other user services need it.
+
+### How long the audit keeps events
+
+The web service keeps ONE audit list for the whole installation: every account, agent,
+credential and project event, with who, when and the outcome (`http_auth.audit`; never a
+secret or a payload).
+- **Where it lives:** in the service's state file (`--state`, for example `http-state.json`),
+  and so in every backup of it.
+- **How much:** the last `AUDIT_LIMIT` = 10,000 events, for all projects together. Older ones
+  are dropped first, so how far back it reaches depends on how busy the service is.
+- **What reads it:**
+  - a project's "Recent activity (audit)" panel (`GET /v1/projects/{id}/audit`), which also
+    lists its granted agents' events (kittrial-5bb.365);
+  - an agent's History (on Agents, and on the project's Members & settings).
+- **When events have gone:** the History says older history is no longer kept, rather than
+  show a partial list as whole.
+- **Keeping more:** copy the state file's `audit` list before it rolls over; the kit does not
+  ship a longer archive.
+
+### Leftover atomic temporaries
+
+Most coordination files are written with a temporary file beside the target and one
+`os.replace` (`coordination.atomic`). Since the 2026-10-13 kit a shared writer names its
+temporary uniquely - `<name>.tmp-<pid>-<16 hex>` - so two writers never truncate each
+other's file; a private family (mode 0600) keeps the fixed `<name>.tmp`. A crash between
+the temporary's creation and its rename leaves the temporary behind. Readers that list a
+family by `*.json`, or read one record by its exact path, never see it; the readers that
+enumerate every name are listed below.
+
+Remove the leftovers, older than an hour, from one project's own directory and families:
+
+```sh
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+    sweep-temporaries example
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+    sweep-temporaries example --dry-run          # name them, remove nothing
+python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime \
+    sweep-temporaries example --min-age-minutes 120
+```
+
+Only a name `coordination.is_temporary` recognizes exactly, only a regular file (a symlink
+or a directory that merely wears the name is left alone) and only one older than the bound;
+each directory it sweeps must be a real directory, so the sweep cannot be pointed outside
+the project. It sweeps the project directory itself (where the single-file records -
+`.sessions.json`, `.merge-context.json`, the guidance pair - leave their temporary) and
+each family subdirectory. `--min-age-minutes` refuses a bound under 5 minutes: a live writer
+renames its temporary within one write, and only an old file is a crash's leftover. The
+command reads no tracker, takes no lock and calls no `bd`, and it rewrites nothing. Deleting
+such a file by hand is equally safe: it is a temporary, never a record.
+
+**Which readers enumerate a family, and what a leftover temporary does to each:**
+
+| Family (reader) | What it does with `<name>.tmp-<pid>-<hex>` |
+| --- | --- |
+| `.lifecycle-voids` (`lifecycle_voids.read_journal`) | Enumerates every name and skips both the fixed `.tmp` and anything `is_temporary` recognizes, so a leftover is ignored and the family stays readable. |
+| `.web-lifecycle-marks` (`web_lifecycle_marks.read_journal`) | Enumerates every name and requires `[a-f0-9]{64}\.json`; ANY other name, a temporary included, makes the whole family read `invalid` (fail-closed). Its writer uses the private `mode=` form, so the unique shape this sweep removes is not produced there; the fixed `<name>.tmp` a cut there can leave is not a shape this sweep removes. |
+| `.coordination-requests`, `.handoffs`, `.handoff-requests`, `.handoff-recoveries`, `.requirement-requests`, `.requirement-backfills`, `.integration-reverts`, `.assignee-followons`, `.reference-requests`, `.proposal-requests`, `.capability-requests`, `.open-item-requests`, `.requirement-owner-requests`, `.owner-answers` | Read by one exact path, or listed through `*.json` (a temporary ends in hex, so `*.json` never matches it): a leftover is invisible to every one of them, including `admin.py backup`. |
+| `.history-snapshots` (`briefing.py`) | Read by the exact `<digest>.json` a cursor names; never enumerated. |
 
 ## Repeat validation
 

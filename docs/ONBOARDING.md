@@ -39,6 +39,8 @@ The project entry point should explicitly supersede obsolete checkout-local coor
 
 `setup_assistant.py` writes the private `client.local.json`-shaped config that `client.py` reads (`transport`, `host`, `endpoint`, `root`, `python`; `client.py` also reads the optional `forced_command` boolean, which this tool does not set) and, only when asked, stores a secret in the operating system's credential store instead of in a file:
 
+For a contributor key confined to the endpoint, pass `--forced-command` when setting up its SSH client config. This writes `"forced_command": true`, so the client sends only the configured endpoint; keep the option paired with that key's server-side `authorized_keys` forced command. Omit it for ordinary SSH keys.
+
 ```sh
 python3 setup_assistant.py --help
 python3 setup_assistant.py --project example --config /private/example/client.local.json \
@@ -96,6 +98,13 @@ another task until this one is delivered. The Delivery section is supplied by th
 separate onboarding-template dependency (.36); if it is absent or unclear in the
 server-owned entry, ask the coordinator rather than guessing.
 
+A project may be set so that only its coordinators assign work (`claiming: assigned`).
+Then `ready`, `work --claimable`, the agent's `next` list and `wait` offer no
+unassigned task, and a claim of one is refused with one sentence naming the setting. A
+task already assigned to you can still be started; an empty listing carries "Only the
+project's coordinators assign work here; nothing is assigned to you yet." Do not
+claim an unassigned task in that project: wait for the coordinator to assign it.
+
 Run ready/work through the installed client, not as bare shell commands. Example
 after replacing the client, config, project and actor with the printed values:
 
@@ -123,3 +132,17 @@ another coordination database.
 ```
 
 For workers already connected, use the client `onboard` command in that prompt. The longer [worker prompt](../templates/WORKER_PROMPT.md) remains a reference, but no longer needs to be pasted into every new session.
+
+## Web personal-agent setup wizard
+
+For personal agents created on the website (`My agents` or `#/setup`, [design note](ONBOARDING_DESIGN.md) slice 4, `kittrial-5bb.329`; one action per screen since `kittrial-5bb.348`), setup runs as a wizard showing ONE action per screen: a short title, at most two short sentences, one button, choice or command with its Copy button, and `Back` / `Next`, with any explanation behind "More about this":
+
+- **Your computer, first:** the operating system (auto-detected `Windows (PowerShell)`, `macOS`, `Linux`) and whether its VS Code has **Orchestra Bridge 0.14 or later**; then what the agent does (worker first).
+- **With Orchestra Bridge 0.14 or later** the path is short: save your secret (the lines to paste, including the server address, so the extension's Set up finds the server itself), restrict the file on macOS/Linux, run `Orchestra Bridge: Set up` in the agent's folder (it checks the certificate, tests the connection, writes `.orchestra/agent.json` and `.orchestra/AGENT.md`, and compares `working_directory`, updatable via `PATCH /v1/agents/me`), then paste the resume prompt.
+- **With an older extension, or curl only**, the longer path adds: save and move the certificate (when the service has its own), the rewrite command that writes the certificate's real path, the self-check, and **Save to agent folder…** with the agent's folder path printed beside it.
+- **Without a secret** (opened from the agent's card) the secret screen says in one line why and has the **Issue a new secret** button right there; the new secret appears on that screen at once. Errors raised while the wizard is open are shown inside it, on the current screen.
+- **Behind a command-line proxy:** every curl the wizard gives carries `--noproxy HOST --max-time 20`, and the self-check says in one sentence when a proxy probably answered instead of Orchestra.
+- `Next` on the test and VS Code screens checks `GET /v1/agents/{id}` (`last_seen_at`) to confirm the agent reached Orchestra. While the last screen is open and visible, a 3-second check watches for the agent's first connection and stops on success.
+
+A web project's coordinator must not give its worker CLI-only kit commands: a worker with a web credential has no kit and no command line. It reaches Orchestra only through the Orchestra Bridge tools (`#orchestraNext`, `#orchestraBrief`, `#orchestraHistory`, `#orchestraClaim`, `#orchestraCheckpoint`, `#orchestraReview`, `#orchestraRelease`) and the HTTP routes in its `.orchestra/AGENT.md`. For task text and the latest checkpoint with all open items, name `#orchestraBrief` or `GET /v1/projects/PROJECT/tasks/TASK/brief`; for comments, `#orchestraHistory` or `GET /v1/projects/PROJECT/tasks/TASK/history`; for its own work, `#orchestraNext` or `GET /v1/agents/me/next`. Never tell it to install the kit.
+

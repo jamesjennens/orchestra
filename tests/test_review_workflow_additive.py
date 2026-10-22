@@ -1074,13 +1074,14 @@ class EndpointReviewSwitchTests(unittest.TestCase):
         def fake_work(path, actor, action, args, attachments, runner, operators=None,
                       verifiers=None, review_writes=None, independent_approval=False,
                       coordinator_writes=False, owners=None, verified_web_authority=False,
-                      lanes_scope='all', provenance_writes=True):
+                      lanes_scope='all', provenance_writes=True, identity_names=None):
             seen['review_writes'] = review_writes
             seen['provenance_writes'] = provenance_writes
             seen['independent_approval'] = independent_approval
             seen['coordinator_writes'] = coordinator_writes
             seen['owners'] = owners
             seen['verified_web_authority'] = verified_web_authority
+            seen['identity_names'] = identity_names
             return {'task': 'example-1', 'review_state': 'awaiting-review'}
 
         with patch.object(work, 'execute', side_effect=fake_work):
@@ -1091,6 +1092,10 @@ class EndpointReviewSwitchTests(unittest.TestCase):
     def test_the_endpoint_reads_the_switch_from_the_deployment(self):
         seen, _ = self._run(False)
         self.assertFalse(seen['review_writes'])
+        # kittrial-5bb.333: the endpoint also supplies the actor -> display-name map used
+        # for labels. This probe project has no session registry and no authority store,
+        # so the map is empty; the stub must still receive it (it is a new keyword).
+        self.assertEqual(seen['identity_names'], {})
         seen, _ = self._run(True)
         self.assertTrue(seen['review_writes'])
 

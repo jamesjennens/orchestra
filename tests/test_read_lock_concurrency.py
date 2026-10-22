@@ -12,6 +12,7 @@ and the concurrency of the first history-snapshot write.
 import contextlib
 import inspect
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -104,6 +105,62 @@ class EndpointReadLockTests(unittest.TestCase):
             [endpoint.fcntl.LOCK_EX])
 
 
+class SharedFileLockBoundTests(unittest.TestCase):
+    """kittrial-5bb.291 item 5: the shared wait has the same bound as the exclusive one.
+
+    The roster read takes the authority lock SHARED (two reads at once, a writer
+    still excluded) but used to wait forever. file_lock(shared=True) now uses the
+    same deadline as the exclusive lock.
+    """
+
+    @unittest.skipIf(os.name == 'nt', 'msvcrt.locking has no shared lock: on Windows file_lock(shared=True) '
+                     'takes the exclusive lock, as its docstring states (coordinator guard, 1015d)')
+    def test_a_shared_hold_allows_a_second_shared_hold(self):
+        import threading
+        from http_authority import file_lock
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / 'authority.lock'
+            done = threading.Event(); error = []
+            def second():
+                try:
+                    with file_lock(lock, timeout=5, shared=True):
+                        done.set()
+                except BaseException as caught:
+                    error.append(caught); done.set()
+            with file_lock(lock, timeout=5, shared=True):
+                thread = threading.Thread(target=second, daemon=True)
+                thread.start()
+                self.assertTrue(done.wait(5), 'a second shared hold queued behind a shared hold')
+            thread.join(5)
+            self.assertFalse(error, error)
+
+    def test_a_shared_wait_behind_an_exclusive_holder_refuses_after_the_bound(self):
+        import threading
+        from http_authority import file_lock
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / 'authority.lock'
+            ready = threading.Event(); outcome = []
+            def shared_wait():
+                ready.set()
+                try:
+                    with file_lock(lock, timeout=0.2, poll=0.01, shared=True):
+                        outcome.append('acquired')
+                except TimeoutError as waited:
+                    outcome.append('timeout')
+                except BaseException as caught:
+                    outcome.append(type(caught).__name__)
+            holder = threading.Thread(target=lambda: (
+                ready.set(),
+                __import__('time').sleep(1.0)), daemon=True)
+            with file_lock(lock, timeout=5):
+                thread = threading.Thread(target=shared_wait, daemon=True)
+                thread.start()
+                ready.wait(5)
+                thread.join(3)
+            self.assertEqual(outcome, ['timeout'],
+                             'a shared wait behind an exclusive holder must refuse after the bound')
+
+
 class GuardedReadLockTests(unittest.TestCase):
     """run_guarded takes the installation-wide authority lock only when it is needed."""
 
@@ -169,7 +226,9 @@ WRITE_ACTIONS = ('checkpoint', 'review', 'handoff', 'coordinate', 'lifecycle', '
 #: The actions that are read-only always.
 READ_ACTIONS = ('brief', 'history', 'requirements', 'work')
 #: The actions whose shared/exclusive choice is the payload operation.
-READ_OPERATIONS = (('web-lifecycle', 'read'), ('web-merge-slot', 'check'))
+READ_OPERATIONS = (('web-lifecycle', 'read'), ('web-merge-slot', 'check')) + tuple(
+    ('web-guidance', operation) for operation in
+    ('read', 'status', 'onboarding', 'onboarding-edit', 'coordinate-check'))
 
 
 @POSIX
@@ -197,6 +256,15 @@ class ReadOnlyActionTableTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertTrue(shared({'actor': 'a'}, action, args=[], operation=operation))
                 self.assertFalse(shared({'actor': 'a'}, action, args=[], operation='apply'))
+
+    def test_guidance_read_identities_and_all_guidance_writes_are_exclusive(self):
+        for operation in ('read', 'status', 'onboarding', 'onboarding-edit', 'coordinate-check'):
+            self.assertFalse(endpoint.coordination_lock_shared(
+                {'actor': 'a', 'operation_id': 'op-guidance-0001'}, 'web-guidance',
+                args=[], operation=operation))
+        for operation in ('ack', 'set', 'clear', None, 'unknown'):
+            self.assertFalse(endpoint.coordination_lock_shared(
+                {'actor': 'a'}, 'web-guidance', args=[], operation=operation))
 
     def test_an_operation_identity_is_exclusive(self):
         # Review item 2(2): the identity reservation must be serialized as on main.

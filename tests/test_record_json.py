@@ -188,22 +188,37 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (25, 'bd output and files on the coordination host, in operator commands; the export row reads '
+        'admin.py': (26, 'bd output and files on the coordination host, in operator commands; the export row reads '
                          'of credential-actors (kittrial-5bb.184) and adopt-actor\'s tracker check (kittrial-5bb.194 '
                          'revision 2) go through record_json.loads_rows (kittrial-5bb.221 revision 2): rows nested '
                          'to 750 read normally and any unreadable row fails the read as a whole; two more '
                          '(kittrial-5bb.202) read a project\'s .beads/metadata.json and one bd merge-slot check '
-                         'answer in project_merge_slot_state, whose caller catches OSError/ValueError itself'),
+                         'answer in project_merge_slot_state, whose caller catches OSError/ValueError itself; the '
+                         'twenty-sixth (kittrial-5bb.343) reads one .assignee-followons entry before its own '
+                         'validator checks it, exactly as the .integration-reverts entry beside it is read'),
         'artifacts.py': (1, 'the artifact index the kit writes'),
         'bootstrap.py': (2, 'bd output on the host'),
         'bd_refusals.py': (1, "bd's own answer to one command; it catches RecursionError itself"),
         'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
         'capabilities.py': (1, "a graph.json in the caller's own checkout; it catches RecursionError itself"),
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
-        'client.py': (10, "the endpoint's own answer, on the caller's machine"),
+        'claiming.py': (2, 'the project\'s own .claiming.json, written by this kit on the coordination host; '
+                           'a damaged, unreadable or nested file is caught and read as the restrictive '
+                           '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
+                           'permissive default'),
+        'client.py': (13, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
+                         'kittrial-5bb.285 added two of the thirteen: the wait read\'s answer from the endpoint and the '
+                         'wait command\'s own read of the config file (both the same kind of text as the other ten, '
+                         "and neither is a record comment or a caller's payload). The thirteenth (kittrial-5bb.327 "
+                         "review 2) is the wait's own small state file: text this client wrote beside its config, "
+                         'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
+                         'treated as absent'),
         'coordination.py': (7, 'bd output'),
-        'endpoint.py': (5, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
-                           'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own)'),
+        'endpoint.py': (6, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
+                           'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own); the sixth '
+                           'is the claim guard\'s read of the other ends of a blocking dependency '
+                           '(kittrial-5bb.293 rev5), parsed inside a try that turns unreadable bd output '
+                           'into fail-closed refusal rather than a crash'),
         'export_requirements.py': (3, 'offline native export rows are first parsed through the row guard '
                                   '(750 levels), then reparsed with duplicate-field refusal; syntax checking '
                                   'of a malformed row runs only within the same bound and catches parser '
@@ -239,6 +254,9 @@ class NoUnguardedParseTests(unittest.TestCase):
                                      'host-written file itself and refuses a file it cannot read, a deeply nested '
                                      'one included'),
         'version.py': (1, "the kit's own version file"),
+        'waiting.py': (1, "the wait's own small state file beside the caller's config (kittrial-5bb.327 "
+                          'review 2): text this kit wrote, read at most 64 KiB at a time, and any unreadable, '
+                          'nested or corrupt value is caught and treated as absent'),
         'work.py': (1, 'the request files the kit writes'),
         'worker.py': (2, "the endpoint's answer, on the caller's machine"),
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
@@ -293,6 +311,17 @@ class NoUnguardedParseTests(unittest.TestCase):
             # not just write itself, so a deeply nested one is described rather than
             # crashing the copy out of the guard.
             'admin.py': 9,
+            # kittrial-5bb.339: read_cache parses the kit's own cached export rows
+            # through the guard (corrupt = a miss and a fresh export). The second
+            # (kittrial-5bb.346 r2/r4) is the cache file's HEADER line, read by both
+            # the serving parse and the waiter's header-only compare: a planted or
+            # deeply nested header reads as no header, never a traceback. The third
+            # (kittrial-5bb.354) is the header of one task's cached `bd history` file, read
+            # the same way.
+            'read_cache.py': 3,
+            # field_history.py (kittrial-5bb.354): one `bd history --json` answer, which
+            # carries other people's field text; a nested answer is "not determined".
+            'field_history.py': 1,
             # endpoint.py's fifth (kittrial-5bb.195): the JSON payload of a coordinator
             # acceptance command, which the caller transports as a file attachment. It is
             # the caller's text, so it is parsed through the guard.
@@ -300,7 +329,12 @@ class NoUnguardedParseTests(unittest.TestCase):
             # record_json.loads_rows (the row bound); the web merge-slot payload adds a fifth guarded parse; lifecycle adds a sixth.
             # kittrial-5bb.290: ready's JSON listing is parsed through the guard (the
             # seventh) so a deeply nested bd answer cannot raise RecursionError.
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 9, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            # kittrial-5bb.301 revision: endpoint.py's tenth guards the closed release
+            # request body (a task id and a reason) that a worker transports.
+            # kittrial-5bb.343: the eleventh guards the web hand-back payload (a text or a
+            # reason this caller transports) before the SAME library call the coordinator
+            # command makes.
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 11, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
@@ -317,6 +351,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # B2 frozen snapshot bytes and sidecar records are bounded untrusted
             # text, parsed through the nesting guard with duplicate-key refusal.
             'requirement_baseline_records.py': 1, 'requirement_baselines.py': 1,
+
+            # Service-only guidance bodies are caller text, parsed through the nesting guard.
+            'web_guidance.py': 2,
             'web_merge_slot.py': 4,
             # office_service.py (kittrial-5bb.168 review item 2) reads the /healthz answer of
             # whatever holds the port through the guard, not bare json.loads: the mark check
@@ -333,6 +370,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # abandonment store beside the family (kittrial-5bb.271 item 1) is read
             # through the guard as well, so a deeply nested store is a refusal.
             'lifecycle_voids.py': 7,
+            # kittrial-5bb.343: followon.py parses the reserved record body carried by any
+            # actor's comment, its host journal entry files and the bd comments-add
+            # receipts of both writes through the guard (four).
+            'followon.py': 4,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

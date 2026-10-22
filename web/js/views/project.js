@@ -3,7 +3,10 @@ import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { setupHint } from './setup.js';
 import { mergeSlotPanel } from './merge_slot.js';
+import { guidancePanel } from './guidance.js';
 import { coordinationPanel } from './coordination.js';
+import { expiryLine, extensionButton } from '../credentialLifetime.js';
+import { historyPanel } from '../agentHistory.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
@@ -36,6 +39,135 @@ function archivedBanner(project) {
 export function unusableBanner(project) {
   return project.usable === false ? h('div', { class: 'banner crit', role: 'alert' }, project.unusable_reason || 'This project cannot be used on this server.',
     ' Nothing that grants access is accepted on it; removing a member, revoking a credential and archiving still work.') : null;
+}
+
+// -- the lanes board (kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md section 4) -------------
+// ONE read answers this panel: the canonical `work lanes` read, through
+// GET /v1/projects/<pid>/lanes. No age and no flag is computed here -- not the state age,
+// not the last-write age, not waiting_too_long/expect_by_passed/your_move_idle -- because
+// a second implementation of either on this side is exactly what the design forbids. The
+// threshold below is an argument of THIS page: it travels with every read, and it is not a
+// setting the page could inherit.
+export const LANES_PAGE = 10;
+export const LANES_DEFAULT_IDLE_MINUTES = 15;
+export const LANES_IDLE_MINUTES_MIN = 1;
+export const LANES_IDLE_MINUTES_MAX = 10080;
+const LANE_FLAGS = [
+  ['waiting_too_long', 'Waiting too long'],
+  ['expect_by_passed', 'Expect-by passed'],
+  ['your_move_idle', "Holder's move idle"],
+];
+
+// The server's ages are whole seconds; said as a rough span, never re-derived from a clock.
+export function ageText(seconds) {
+  if (seconds === null || seconds === undefined) return 'unknown';
+  if (seconds < 60) return 'under a minute';
+  if (seconds < 3600) return Math.floor(seconds / 60) + ' min';
+  if (seconds < 86400) return Math.floor(seconds / 3600) + ' h';
+  const days = Math.floor(seconds / 86400);
+  return days + (days === 1 ? ' day' : ' days');
+}
+
+export function lanesPanel(ctx, project) {
+  const panel = h('section', { class: 'panel', 'data-panel': 'lanes', 'aria-label': 'Lanes' });
+  const state = { idle_minutes: LANES_DEFAULT_IDLE_MINUTES, cursor: null, stack: [] };
+  const minutes = h('input', { type: 'number', id: 'lanes-idle-minutes', min: LANES_IDLE_MINUTES_MIN,
+    max: LANES_IDLE_MINUTES_MAX, value: String(LANES_DEFAULT_IDLE_MINUTES),
+    'aria-label': 'Idle minutes (1 to 10080)' });
+  const message = h('span', { class: 'small muted', role: 'status' });
+  // The threshold is the page's argument: changing it reads the board again from its first
+  // page, because a cursor belongs to the query (limit and threshold) that minted it.
+  function readAgain(value) {
+    const chosen = Number(value);
+    if (!Number.isInteger(chosen) || chosen < LANES_IDLE_MINUTES_MIN || chosen > LANES_IDLE_MINUTES_MAX) {
+      message.textContent = `Idle minutes must be a whole number from ${LANES_IDLE_MINUTES_MIN} to ${LANES_IDLE_MINUTES_MAX}.`;
+      return;
+    }
+    message.textContent = '';
+    state.idle_minutes = chosen; state.cursor = null; state.stack = [];
+    draw();
+  }
+  const apply = h('button', { type: 'button', onclick: () => readAgain(minutes.value) }, 'Read with this threshold');
+  const head = () => h('div', { class: 'panel-head' },
+    h('h2', { class: 'small' }, 'Lanes'),
+    h('span', { class: 'small muted hide-narrow' }, 'Who holds what, who is free, how long each has been that way, and the three flags: all of it from one board read on the server.'));
+  const threshold = () => h('div', { class: 'toolbar' },
+    h('label', { class: 'check', for: 'lanes-idle-minutes' }, 'Idle minutes'), minutes, apply, message);
+
+  function taskLine(entry) {
+    const flags = LANE_FLAGS.filter(([key]) => (entry.flags || []).includes(key));
+    return h('li', { class: 'lane-task', 'data-task': entry.task, 'data-inferred': entry.inferred ? 'true' : null },
+      h('a', { class: 'title', href: ctx.href(`/p/${project.id}/t/${entry.task}`) }, entry.title || entry.task),
+      h('div', { class: 'sub' }, h('span', { class: 'mono' }, entry.task),
+        ' · review ', h('span', { class: 'mono' }, entry.review_state || 'none'),
+        ' · whose move ', h('span', { class: 'mono' }, entry.whose_move || 'unknown'),
+        ' · next ', h('span', { class: 'mono' }, entry.next_actor || 'unknown')),
+      h('div', { class: 'sub' },
+        'State ', entry.state ? h('span', { class: 'mono' }, entry.state) : h('span', { class: 'muted' }, 'not declared'),
+        entry.waiting_on ? [' · waiting on ', h('span', { class: 'mono' }, entry.waiting_on)] : null,
+        entry.expect_by ? [' · expect by ', h('span', { class: 'mono' }, entry.expect_by)] : null,
+        ' · in that state ', ageText(entry.state_age_seconds),
+        ' · holder last wrote ', ageText(entry.holder_last_write_seconds)),
+      // A row the read could not declare is GUESSED from the checkpoint text, and says so.
+      entry.inferred ? h('div', { class: 'small', 'data-inferred': 'true' },
+        h('span', { class: 'chip plain', title: 'The state is guessed from the checkpoint text, not declared by a lane-state record' }, 'Guessed')) : null,
+      flags.length ? h('div', { class: 'small' }, flags.map(([key, label]) =>
+        h('span', { class: 'chip warn', 'data-flag': key }, label))) : null);
+  }
+
+  function laneBlock(lane) {
+    const held = lane.held || [];
+    const raised = LANE_FLAGS.filter(([key]) => lane[key]);
+    return h('div', { class: 'lane', 'data-lane': lane.lane, 'data-actor': lane.actor,
+      'data-inferred': lane.inferred ? 'true' : null },
+      h('div', { class: 'event-head' },
+        h('strong', null, lane.lane), ' ', h('span', { class: 'mono small muted' }, lane.actor),
+        ' ',
+        lane.idle ? h('span', { class: 'chip', 'data-idle': 'true', title: 'This lane holds nothing' }, 'Free')
+          : h('span', { class: 'chip plain' }, held.length === 1 ? '1 task held' : held.length + ' tasks held'),
+        lane.inferred ? h('span', { class: 'chip plain', 'data-inferred': 'true', title: 'Guessed, not declared' }, 'Guessed') : null,
+        h('span', { class: 'small muted' }, ' last write ', ageText(lane.last_write_age_seconds))),
+      // Raised flags, each naming the tasks the read put under it (`flag_tasks`).
+      raised.length ? h('div', { class: 'small' }, raised.map(([key, label]) => h('span', { class: 'chip warn', 'data-flag': key },
+        label, (lane.flag_tasks && lane.flag_tasks[key] ? ': ' + lane.flag_tasks[key].join(', ') : '')))) : null,
+      held.length ? h('ul', { class: 'lane-tasks' }, held.map((entry) => taskLine(entry))) : null,
+      lane.idle ? h('p', { class: 'small muted' }, 'Holds nothing; free to take work. Last write ', ageText(lane.last_write_age_seconds), ' ago.') : null);
+  }
+
+  function pager(data) {
+    const shown = (data.items || []).length;
+    return h('div', { class: 'pager' },
+      h('span', { class: 'num' }, data.total ? `${shown} of ${data.total} lane${data.total === 1 ? '' : 's'} on this page` : ''),
+      h('div', { class: 'actions' },
+        h('button', { type: 'button', disabled: !state.stack.length, onclick: () => { state.cursor = state.stack.pop() || null; draw(); } }, 'Previous'),
+        h('button', { type: 'button', disabled: !data.next_cursor, onclick: () => { state.stack.push(state.cursor); state.cursor = data.next_cursor; draw(); } }, 'Next')));
+  }
+
+  async function draw() {
+    panel.setAttribute('aria-busy', 'true');
+    let data;
+    try {
+      data = await ctx.api.lanes(project.id, { idle_minutes: state.idle_minutes, limit: LANES_PAGE, cursor: state.cursor });
+    } catch (error) {
+      // A refused read says why and offers to read again, as the neighbouring panels do.
+      // A server older than this route answers 404/501: the panel then simply is not there.
+      if ([404, 501].includes(error.status)) { panel.replaceChildren(); return; }
+      panel.replaceChildren(head(), threshold(), errorState(error, draw));
+      return;
+    } finally { panel.removeAttribute('aria-busy'); }
+    const lanes = data.items || [];
+    const counts = data.flags || {};
+    panel.replaceChildren(head(), threshold(),
+      h('p', { class: 'small muted', role: 'note' },
+        'Reading with ', String(data.idle_minutes), ' idle minutes: ',
+        LANE_FLAGS.map(([key, label]) => `${counts[key] || 0} ${label.toLowerCase()}`).join(' · '),
+        data.scope === 'own' ? '. You see your own lanes; owners and coordinators see every lane.' : '.'),
+      lanes.length ? h('div', { class: 'stack' }, lanes.map(laneBlock))
+        : empty('No lanes to show', 'No session holds work in this project right now.'),
+      pager(data));
+  }
+  draw();
+  return panel;
 }
 
 export async function overview(ctx, { pid }) {
@@ -152,6 +284,11 @@ export async function overview(ctx, { pid }) {
     unusableBanner(project),
     setupLine,
     mergeSlotPanel(ctx, project),
+    guidancePanel(ctx, project),
+    // The lane board (kittrial-5bb.263). Every member sees it: the route scopes a viewer
+    // who is not an owner or coordinator to their own agents' lanes, so a lane always sees
+    // its own row here, and the cross-lane view is never inherited from the transport.
+    lanesPanel(ctx, project),
     strip,
     h('div', { class: 'toolbar' }, search, statusSeg, reviewSel, requirementToggle),
     tableHost);
@@ -251,10 +388,58 @@ export async function feedback(ctx, { pid }) {
     list);
 }
 
+// The per-project claiming setting (kittrial-5bb.352). Owners and coordinators set it;
+// every member sees the value and who set it, and the page explains what each value
+// means. The server reads the value fresh from the project's own file, so the answer
+// here is not a cached tracker read.
+export function claimingPanel(ctx, project) {
+  const host = h('section', { class: 'panel', 'data-panel': 'claiming' });
+  const block = project.claiming || { claiming: 'open', set_by: null, set_at: null, set_via: null };
+  // The SERVER's answer, not the page's role guess (kittrial-5bb.352 review item S2):
+  // GET /v1/projects/PID answers can_coordinate from the same live CAP_COORDINATE check
+  // the PUT route uses, so the control appears exactly when the save would be allowed
+  // (a superuser who is neither a member nor a granted agent is the case that differed).
+  const canSet = Boolean(project.can_coordinate) && !project.archived && project.usable !== false;
+  function draw(value) {
+    const chosen = value || block.claiming || 'open';
+    const warned = block.source === 'damaged' ? block.warning : null;
+    const select = h('select', { id: 'claiming-value', 'aria-label': 'How work is handed out' },
+      h('option', { value: 'open', selected: chosen === 'open' }, 'Workers may claim open tasks'),
+      h('option', { value: 'assigned', selected: chosen === 'assigned' }, 'Only coordinators assign work'));
+    const save = h('button', { type: 'button', class: 'primary', onclick: async (e) => {
+      try {
+        const result = await act(e.currentTarget, () => ctx.api.setProjectClaiming(project.id, select.value),
+          { success: 'Claiming setting saved' });
+        if (result && result.claiming) Object.assign(block, result);
+        draw(select.value);
+      } catch { /* the refusal is shown beside the control */ }
+    } }, 'Save');
+    host.replaceChildren(
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'How work is handed out')),
+      h('div', { class: 'panel-body' },
+        h('p', { class: 'muted' }, chosen === 'assigned'
+          ? 'Only this project’s coordinators assign work: unassigned tasks are not offered as claimable and a claim of one is refused. A task already assigned to you can still be started.'
+          : 'Any member who may write tasks can claim an open, unassigned task. That is the default.'),
+        canSet ? h('div', { class: 'toolbar' }, h('label', { class: 'check', for: 'claiming-value' }, 'Claiming'), select, save) : null,
+        h('p', { class: 'small muted' },
+          (chosen === 'assigned' ? 'Set to “only coordinators assign”' : 'Set to “workers may claim open tasks”'),
+          block.set_by ? [' by ', h('span', { class: 'mono' }, block.set_by)] : null,
+          block.set_at ? [' ', time(block.set_at)] : null,
+          block.set_via ? [' (', block.set_via, ')'] : null,
+          block.source === 'default' ? ' — the default; nobody has changed it.' : '.'),
+        warned ? h('p', { class: 'small', role: 'status' }, warned) : null,
+        h('p', { class: 'small muted' }, 'This setting is stored with the project and carried by its backup. An older kit that does not know it reads the project as open, so after a rollback to an older release claiming is open again until it is set here again.')));
+  }
+  draw();
+  return host;
+}
+
 export async function settings(ctx, { pid }) {
   const project = await load(ctx, pid);
   const owner = isOwner(project);
-  const membersHost = h('div', { class: 'panel' });
+  // Its own selector: the role options belong to the members list, never to another
+  // panel's control (the claiming setting has data-panel="claiming" instead).
+  const membersHost = h('div', { class: 'panel', 'data-panel': 'members' });
   const agentsHost = h('div');
   const credsHost = h('div');
   const auditHost = h('div');
@@ -325,7 +510,7 @@ export async function settings(ctx, { pid }) {
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Agents in this project ', h('span', { class: 'nav-count' }, rows.length)),
         h('span', { class: 'small muted hide-narrow' }, 'A coordinating agent may approve other accounts’ work here; never its own account’s')),
       rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
-        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, 'Agent credentials'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
         h('tbody', null, rows.map((a) => {
           const grant = a.coordinator;
           const change = async (e, call, done) => {
@@ -333,12 +518,17 @@ export async function settings(ctx, { pid }) {
             drawAgents(); coordination.draw();
           };
           return h('tr', { 'data-agent': a.id, 'data-coordinator': grant ? String(grant.effective) : 'none' },
-            h('td', null, a.name, a.enabled ? null : h('div', { class: 'sub' }, 'Disabled')),
+            h('td', null, a.name, a.enabled ? null : h('div', { class: 'sub' }, 'Disabled'),
+              historyPanel(() => ctx.api.projectAgentHistory(pid, a.id))),
             h('td', null, a.owner_display_name || a.owner),
             h('td', null, !grant ? h('span', { class: 'muted' }, 'No') :
               [h('span', { class: 'chip ' + (grant.effective ? 'ok' : 'plain') }, grant.effective ? 'Coordinates' : 'Granted, no effect'),
                 h('div', { class: 'sub' }, 'by ', grant.granted_by_display_name || grant.granted_by, ' ', time(grant.granted_at),
                   grant.effective ? null : (NO_EFFECT[grant.no_effect_because] || NO_EFFECT['account-role']))]),
+            h('td', null, (a.credentials || []).map((c) => h('div', { class: 'stack', 'data-credential': c.id },
+              h('code', { class: 'small' }, c.id), expiryLine(c),
+              !project.archived && a.enabled && c.working ? extensionButton(a, c,
+                () => ctx.api.extendProjectAgentCredential(pid, a.id, c.id), drawAgents) : null))),
             h('td', null, project.archived ? null : grant ?
               h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the coordinator grant from ' + a.name,
                 onclick: (e) => change(e, () => ctx.api.revokeCoordinator(pid, a.id), `${a.name} no longer coordinates`) }, 'Remove grant') :
@@ -402,5 +592,5 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
-    membersHost, coordination.node, agentsHost, credsHost, auditHost, danger);
+    membersHost, claimingPanel(ctx, project), coordination.node, agentsHost, credsHost, auditHost, danger);
 }

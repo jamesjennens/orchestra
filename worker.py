@@ -73,6 +73,11 @@ Worker setup:
   checking matters. A harness
   that cannot wait or schedule tells its user so in one line instead of refusing. Use
   the full client prefix and printed config, project and actor for each command.
+- Before you rely on being woken, build your waker from the kit's `tools/wake/`: copy
+  the script for your platform into your own private directory, set its one wake
+  command to what starts a new turn of your harness, and test it once - show that it
+  woke you. Record in a checkpoint how you are woken. A lane must not end its turn to
+  wait without a waker; if the harness cannot be woken, say so in one line.
 """
 
 def main():

@@ -283,6 +283,34 @@ class Client:
             raise UncertainOutcome(0,'uncertain','Connection lost; reconcile the identical assignment',
                                    None,None,identity) from None
 
+    def guidance(self, project):
+        return self.request('GET', '/v1/projects/%s/guidance' % quote(project, safe=''))
+
+    def guidance_status(self, project, offset=0, limit=50):
+        return self.request('GET', '/v1/projects/%s/guidance/status?%s'
+                            % (quote(project, safe=''), urlencode(dict(offset=offset, limit=limit))))
+
+    def member_onboarding(self, project):
+        return self.request('GET', '/v1/projects/%s/onboarding/read' % quote(project, safe=''))
+
+    def _write_guidance(self, project, method, suffix, body, key):
+        identity = key or new_idempotency_key()
+        try:
+            return self.request(method, '/v1/projects/%s/guidance%s' % (quote(project, safe=''), suffix),
+                                body, key=identity)
+        except OSError:
+            raise UncertainOutcome(0, 'uncertain', 'Connection lost; reconcile the identical guidance request',
+                                   None, None, identity) from None
+
+    def acknowledge_guidance(self, project, version, key=None):
+        return self._write_guidance(project, 'POST', '/ack', {'version': version}, key)
+
+    def set_guidance(self, project, text, key=None):
+        return self._write_guidance(project, 'PUT', '', {'text': text}, key)
+
+    def clear_guidance(self, project, key=None):
+        return self._write_guidance(project, 'DELETE', '', {}, key)
+
     def merge_slot(self, project):
         return self.request('GET', '/v1/projects/%s/merge-slot' % quote(project, safe=''))
 
@@ -349,6 +377,26 @@ class Client:
         return self.request('DELETE', '/v1/projects/%s/members/%s'
                             % (quote(project, safe=''), quote(user_id, safe='')), key=key)
 
+    # -- personal agents -------------------------------------------------------
+    def create_agent(self, name, *, owner=None, key=None, **fields):
+        body = dict(fields, name=name)
+        if owner is not None:
+            body['owner'] = owner
+        return self.request('POST', '/v1/agents', body, key=key)
+
+    def extend_agent_credential(self, agent_id, credential_id, *, project=None, key=None):
+        stem = '/v1/agents' if project is None else '/v1/projects/%s/agents' % quote(project, safe='')
+        return self.request('POST', '%s/%s/credentials/%s/extend' %
+                            (stem, quote(agent_id, safe=''), quote(credential_id, safe='')), {}, key=key)
+
+    def set_my_claim_limit(self, value, key=None):
+        """Lower the CALLING agent's own claim limit (``PATCH /v1/agents/me``).
+
+        The caller must authenticate as the agent itself; ``value`` is a whole number
+        from 1 up to the limit that agent holds now. Raising it is the owner's move.
+        """
+        return self.request('PATCH', '/v1/agents/me', {'claim_limit': value}, key=key)
+
     # -- worker credentials ----------------------------------------------------
     def issue_credential(self, project, label=None, scopes=None, actor=None, key=None):
         return self.request('POST', '/v1/projects/%s/worker-credentials' % quote(project, safe=''),
@@ -358,6 +406,61 @@ class Client:
         return self.request('POST', '/v1/projects/%s/worker-credentials/%s/revoke'
                             % (quote(project, safe=''), quote(credential_id, safe='')),
                             key=key)
+
+    # -- the project's own requirements (kittrial-5bb.278; WEB_COORDINATOR_DESIGN slice 10)
+    #
+    # An agent holding the project's coordinator grant does everything its owner does to
+    # requirements through these: create, revise, accept, withdraw, supersede and batch
+    # accept, and read the BRD. The accepting party stays the agent's own human account;
+    # the agent and its grant are recorded in the service audit. Every write takes an
+    # ``expected_revision`` + ``expected_sha256`` pair from the read that produced it.
+    def list_requirements(self, project):
+        return self.request('GET', '/v1/projects/%s/requirements' % quote(project, safe=''))
+
+    def get_requirement(self, project, requirement):
+        return self.request('GET', '/v1/projects/%s/requirements/%s'
+                            % (quote(project, safe=''), quote(requirement, safe='')))
+
+    def brd(self, project):
+        """The generated BRD: the project's narrative sections and accepted requirements."""
+        return self.request('GET', '/v1/projects/%s/brd' % quote(project, safe=''))
+
+    def create_requirement(self, project, body, key=None):
+        return self.request('POST', '/v1/projects/%s/requirements' % quote(project, safe=''),
+                            body, key=key)
+
+    def revise_requirement(self, project, requirement, body, key=None):
+        return self.request('PATCH', '/v1/projects/%s/requirements/%s'
+                            % (quote(project, safe=''), quote(requirement, safe='')), body, key=key)
+
+    def accept_requirement(self, project, requirement, body, key=None):
+        return self.request('POST', '/v1/projects/%s/requirements/%s/accept'
+                            % (quote(project, safe=''), quote(requirement, safe='')), body, key=key)
+
+    def withdraw_requirement(self, project, requirement, body, key=None):
+        return self.request('POST', '/v1/projects/%s/requirements/%s/withdraw'
+                            % (quote(project, safe=''), quote(requirement, safe='')), body, key=key)
+
+    def supersede_requirement(self, project, requirement, body, key=None):
+        return self.request('POST', '/v1/projects/%s/requirements/%s/supersede'
+                            % (quote(project, safe=''), quote(requirement, safe='')), body, key=key)
+
+    def accept_requirements(self, project, items, stop_on_error=False, key=None):
+        """Accept many requirements in one action (the plan's ``accept_batch``).
+
+        ``items`` is a list of ``{'id', 'expected_revision', 'expected_sha256'}``. The
+        answer lists ``accepted`` and ``refused`` (a reason each) plus a ``summary``; one
+        refused item changes nothing and does not roll back the rest. ``key`` matters: an
+        exact replay accepts nothing twice.
+        """
+        return self.request('POST', '/v1/projects/%s/requirements/accept-batch'
+                            % quote(project, safe=''),
+                            {'items': items, 'stop_on_error': bool(stop_on_error)}, key=key)
+
+    def requirements_recoveries(self, project):
+        """Failed creations this caller may clear; editing is a coordinator's, so is this."""
+        return self.request('GET', '/v1/projects/%s/requirements/recoveries'
+                            % quote(project, safe=''))
 
     # -- tasks, checkpoints, reviews, history ---------------------------------
     def create_task(self, project, title, description=None, attachments=None, key=None):
@@ -383,6 +486,19 @@ class Client:
         return self.request('POST', '/v1/projects/%s/tasks/%s/claim'
                             % (quote(project, safe=''), quote(task, safe='')),
                             {'actor': actor}, key=key)
+
+    def release_task(self, project, task, reason, key=None):
+        """Release the caller's own claimed, undelivered task, with a short reason.
+
+        The holder is the authenticated caller, so the client never sends an actor:
+        the server refuses a task the caller does not hold, a contribution awaiting
+        review or changes requested, and the merge slot (kittrial-5bb.301). A
+        checkpoint and its open items stay on the task, and the claim stops counting
+        against the caller's ``claim_limit`` at once.
+        """
+        return self.request('POST', '/v1/projects/%s/tasks/%s/release'
+                            % (quote(project, safe=''), quote(task, safe='')),
+                            {'reason': reason}, key=key)
 
     def add_comment(self, project, task, text, key=None):
         """Append literal text under the authenticated actor; no author override."""
@@ -473,6 +589,109 @@ class Client:
         return self.request('GET', '/v1/projects/%s/audit%s'
                             % (quote(project, safe=''), _query(limit, cursor)))
 
+    # -- reference and capability records -------------------------------------
+    def _write_record(self, method, path, body, key=None):
+        identity = key or new_idempotency_key()
+        try:
+            return self.request(method, path, body, key=identity)
+        except OSError:
+            raise UncertainOutcome(0, 'uncertain', 'Connection lost; reconcile the identical record request',
+                                   None, None, identity) from None
+
+    def list_references(self, project, *, tag=None, owner=None, state=None, due=None,
+                        authority=None, waiting=False, limit=None, cursor=None):
+        params = {}
+        if tag:
+            params['tag'] = tag if isinstance(tag, str) else ','.join(tag)
+        for name, val in (('owner', owner), ('state', state), ('due', due), ('authority', authority)):
+            if val:
+                params[name] = val
+        if waiting:
+            params['waiting'] = '1'
+        if limit is not None:
+            params['limit'] = str(limit)
+        if cursor is not None:
+            params['cursor'] = cursor
+        qs = ('?' + urlencode(params)) if params else ''
+        return self.request('GET', '/v1/projects/%s/references%s' % (quote(project, safe=''), qs))
+
+    def find_references(self, project, q, limit=5):
+        qs = '?' + urlencode({'q': q, 'limit': str(limit)})
+        return self.request('GET', '/v1/projects/%s/references/find%s' % (quote(project, safe=''), qs))
+
+    def get_reference(self, project, ref_key):
+        return self.request('GET', '/v1/projects/%s/references/%s'
+                            % (quote(project, safe=''), quote(ref_key, safe='')))
+
+    def propose_reference(self, project, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/references' % quote(project, safe=''), body, key)
+
+    def revise_reference(self, project, ref_key, body, key=None):
+        return self._write_record('PATCH', '/v1/projects/%s/references/%s'
+                                  % (quote(project, safe=''), quote(ref_key, safe='')), body, key)
+
+    def accept_reference(self, project, ref_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/references/%s/accept'
+                                  % (quote(project, safe=''), quote(ref_key, safe='')), body, key)
+
+    def retire_reference(self, project, ref_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/references/%s/retire'
+                                  % (quote(project, safe=''), quote(ref_key, safe='')), body, key)
+
+    def list_capabilities(self, project, *, tag=None, owner=None, state=None,
+                          pointers=False, waiting=False, limit=None, cursor=None):
+        params = {}
+        if tag:
+            params['tag'] = ','.join(tag) if isinstance(tag, (list, tuple)) else str(tag)
+        for name, val in (('owner', owner), ('state', state)):
+            if val:
+                params[name] = val
+        if pointers:
+            params['pointers'] = '1'
+        if waiting:
+            params['waiting'] = '1'
+        if limit is not None:
+            params['limit'] = str(limit)
+        if cursor is not None:
+            params['cursor'] = cursor
+        qs = ('?' + urlencode(params)) if params else ''
+        return self.request('GET', '/v1/projects/%s/capabilities%s' % (quote(project, safe=''), qs))
+
+    def find_capabilities(self, project, q, limit=5):
+        qs = '?' + urlencode({'q': q, 'limit': str(limit)})
+        return self.request('GET', '/v1/projects/%s/capabilities/find%s' % (quote(project, safe=''), qs))
+
+    def get_capability(self, project, cap_key):
+        return self.request('GET', '/v1/projects/%s/capabilities/%s'
+                            % (quote(project, safe=''), quote(cap_key, safe='')))
+
+    def propose_capability(self, project, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities' % quote(project, safe=''), body, key)
+
+    def revise_capability(self, project, cap_key, body, key=None):
+        return self._write_record('PATCH', '/v1/projects/%s/capabilities/%s'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def accept_capability(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/accept'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def retire_capability(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/retire'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def verify_capability(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/verify'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def propose_capability_alias(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/aliases'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
+    def reject_capability_alias(self, project, cap_key, body, key=None):
+        return self._write_record('POST', '/v1/projects/%s/capabilities/%s/aliases/reject'
+                                  % (quote(project, safe=''), quote(cap_key, safe='')), body, key)
+
 
 def new_idempotency_key():
     """A fresh key; keep it to retry an uncertain mutation exactly."""
@@ -493,7 +712,9 @@ def _build_parser():
     parser = argparse.ArgumentParser(description='Orchestra office HTTP client')
     parser.add_argument('--base-url', default=os.environ.get('ORCHESTRA_HTTP_URL'),
                         help='service base URL (or ORCHESTRA_HTTP_URL)')
-    parser.add_argument('--token', help='bearer session or worker credential')
+    parser.add_argument('--token',
+                        help='bearer session or worker credential; pass it as --token=VALUE '
+                             'so a secret beginning with "-" is not read as an option')
     parser.add_argument('--ca-file', help='CA bundle for TLS verification')
     parser.add_argument('--insecure', action='store_true', help='skip TLS verification (tests only)')
     parser.add_argument('--use-cookie', action='store_true',
@@ -505,6 +726,12 @@ def _build_parser():
                        help='environment variable holding the password (default ORCHESTRA_PASSWORD)')
     sub.add_parser('logout', help='revoke the current session')
     sub.add_parser('whoami', help='show the authenticated principal')
+    mine = sub.add_parser('my-claim-limit',
+                          help="lower the calling agent's own claim limit")
+    mine.add_argument('--claim-limit', type=int, required=True,
+                      help='the new limit: a whole number from 1 up to the current one')
+    mine.add_argument('--idempotency-key',
+                      help='reuse exactly this key and request after an uncertain result')
     slot = sub.add_parser('merge-slot', help='read or coordinate the project merge slot')
     slot.add_argument('project')
     slot.add_argument('operation', choices=('read', 'acquire', 'release', 'force-release', 'create'))
@@ -530,18 +757,57 @@ def _build_parser():
     assignment.add_argument('--allow-pending-review', action='store_true')
     assignment.add_argument('--allow-held-slot', action='store_true')
     assignment.add_argument('--idempotency-key', help='reuse exactly this key and request after an uncertain result')
+    release = sub.add_parser('release-task', help='release your own claimed, undelivered task with a reason')
+    release.add_argument('project')
+    release.add_argument('task')
+    release.add_argument('--reason', required=True)
+    release.add_argument('--idempotency-key', help='reuse exactly this key and request after an uncertain result')
     life = sub.add_parser('lifecycle', help='read or record task scope and lifecycle facts')
     life.add_argument('project');life.add_argument('task')
     life.add_argument('operation', choices=('read','scope','fact'))
     life.add_argument('--dimension', choices=('implemented','tested','reviewed','integrated','deployed','live-verified'))
     life.add_argument('--file', help='UTF-8 JSON HTTP request body for scope or fact')
     life.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
+    ref = sub.add_parser('ref', help='read or mutate project reference records')
+    ref.add_argument('project')
+    ref.add_argument('operation', choices=('list', 'find', 'get', 'propose', 'revise', 'accept', 'retire'))
+    ref.add_argument('--key', dest='record_key', help='reference key for get/revise/accept/retire')
+    ref.add_argument('--q', help='search phrase for find')
+    ref.add_argument('--tag', action='append', default=[], help='filter by tag (repeatable)')
+    ref.add_argument('--owner')
+    ref.add_argument('--state')
+    ref.add_argument('--due')
+    ref.add_argument('--authority')
+    ref.add_argument('--waiting', action='store_true', help='only records waiting to be accepted')
+    ref.add_argument('--limit', type=int)
+    ref.add_argument('--cursor')
+    ref.add_argument('--file', help='UTF-8 JSON HTTP request body for mutations')
+    ref.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
+    cap = sub.add_parser('capability', help='read or mutate project capability records')
+    cap.add_argument('project')
+    cap.add_argument('operation', choices=(
+        'list', 'find', 'get', 'propose', 'revise', 'accept', 'retire', 'verify',
+        'propose-alias', 'reject-alias'))
+    cap.add_argument('--key', dest='record_key', help='capability key')
+    cap.add_argument('--q', help='search phrase for find')
+    cap.add_argument('--tag', action='append', default=[], help='filter by tag (repeatable)')
+    cap.add_argument('--owner')
+    cap.add_argument('--state')
+    cap.add_argument('--pointers', action='store_true', help='include pointers in list output')
+    cap.add_argument('--waiting', action='store_true', help='only records waiting to be accepted')
+    cap.add_argument('--limit', type=int)
+    cap.add_argument('--cursor')
+    cap.add_argument('--file', help='UTF-8 JSON HTTP request body for mutations')
+    cap.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
     call = sub.add_parser('call', help='issue one raw JSON request')
     call.add_argument('method')
     call.add_argument('path')
     call.add_argument('--body', help='JSON request body')
     call.add_argument('--idempotency-key', help='reuse a key to reconcile an uncertain write')
-    call.add_argument('--credential', help='use this worker credential for the call')
+    call.add_argument('--credential',
+                      help='use this worker credential for the call; pass it as '
+                           '--credential=VALUE so a secret beginning with "-" is not read '
+                           'as an option')
     return parser
 
 
@@ -570,6 +836,10 @@ def main(argv=None):
         if args.command == 'whoami':
             print(json.dumps(client.whoami(), indent=2))
             return 0
+        if args.command == 'my-claim-limit':
+            print(json.dumps(client.set_my_claim_limit(args.claim_limit,
+                                                       key=args.idempotency_key), indent=2))
+            return 0
         if args.command == 'assignment-roster':
             print(json.dumps(client.assignment_roster(args.project,args.limit,args.cursor),indent=2))
             return 0
@@ -577,6 +847,10 @@ def main(argv=None):
             result=client.assign_task(args.project,args.task,args.expected_assignee,args.assignee,args.reason,
                 allow_pending_review=args.allow_pending_review,allow_held_slot=args.allow_held_slot,
                 key=args.idempotency_key)
+            print(json.dumps(result,indent=2))
+            return 0
+        if args.command == 'release-task':
+            result=client.release_task(args.project,args.task,args.reason,key=args.idempotency_key)
             print(json.dumps(result,indent=2))
             return 0
         if args.command == 'merge-slot':
@@ -600,6 +874,71 @@ def main(argv=None):
                 result = client._write_lifecycle(args.project, args.task, args.operation, body,
                                                  args.idempotency_key, args.dimension)
             print(json.dumps(result, indent=2));return 0
+        if args.command == 'ref':
+            op = args.operation
+            if op == 'list':
+                result = client.list_references(
+                    args.project, tag=args.tag, owner=args.owner, state=args.state,
+                    due=args.due, authority=args.authority, waiting=args.waiting,
+                    limit=args.limit, cursor=args.cursor)
+            elif op == 'find':
+                if not args.q:
+                    parser.error('find requires --q')
+                result = client.find_references(args.project, args.q, args.limit or 5)
+            elif op == 'get':
+                if not args.record_key:
+                    parser.error('get requires --key')
+                result = client.get_reference(args.project, args.record_key)
+            else:
+                if not args.file:
+                    parser.error('%s requires --file' % op)
+                body = _lifecycle_body_file(args.file)
+                if op == 'propose':
+                    result = client.propose_reference(args.project, body, args.idempotency_key)
+                else:
+                    rk = args.record_key or body.pop('key', None)
+                    if not rk:
+                        parser.error('%s requires --key or key in body' % op)
+                    fn = getattr(client, op + '_reference')
+                    result = fn(args.project, rk, body, args.idempotency_key)
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.command == 'capability':
+            op = args.operation
+            if op == 'list':
+                result = client.list_capabilities(
+                    args.project, tag=args.tag, owner=args.owner, state=args.state,
+                    pointers=args.pointers, waiting=args.waiting,
+                    limit=args.limit, cursor=args.cursor)
+            elif op == 'find':
+                if not args.q:
+                    parser.error('find requires --q')
+                result = client.find_capabilities(args.project, args.q, args.limit or 5)
+            elif op == 'get':
+                if not args.record_key:
+                    parser.error('get requires --key')
+                result = client.get_capability(args.project, args.record_key)
+            else:
+                if not args.file:
+                    parser.error('%s requires --file' % op)
+                body = _lifecycle_body_file(args.file)
+                if op == 'propose':
+                    result = client.propose_capability(args.project, body, args.idempotency_key)
+                else:
+                    rk = args.record_key or body.pop('key', None)
+                    if not rk:
+                        parser.error('%s requires --key or key in body' % op)
+                    method_map = {
+                        'revise': client.revise_capability,
+                        'accept': client.accept_capability,
+                        'retire': client.retire_capability,
+                        'verify': client.verify_capability,
+                        'propose-alias': client.propose_capability_alias,
+                        'reject-alias': client.reject_capability_alias,
+                    }
+                    result = method_map[op](args.project, rk, body, args.idempotency_key)
+            print(json.dumps(result, indent=2))
+            return 0
         if args.credential:
             client.use_credential(args.credential)
         body = json.loads(args.body) if args.body else None

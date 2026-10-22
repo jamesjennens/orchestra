@@ -271,6 +271,7 @@ def cut(project_path, context, name, operation_id, run, at, operators=None):
     from requirement_http import OwnerContext
     name = schema.baseline_name(name); identifier(operation_id)
     if (not isinstance(context, OwnerContext) or not owner.HUMAN.fullmatch(context.account_id)
+            or context.role != 'owner' or context.agent_id is not None
             or context.governance['mode'] != 'simple'
             or governance.current(project_path, context.project) != context.governance):
         raise ValueError('Owner baseline context is stale or unavailable')

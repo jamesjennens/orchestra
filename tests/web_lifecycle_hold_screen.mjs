@@ -19,8 +19,8 @@ for (let i=0;i<200;i++) {
   await new Promise(r=>setTimeout(r,20));
   if (!pending && panel.textContent.includes('Lifecycle facts')) break;
 }
-const dimension = panel.querySelectorAll('select').find(x=>x.getAttribute('aria-label')==='Lifecycle dimension');
-const record = panel.querySelectorAll('button').find(x=>x.textContent==='Record fact');
+const dimension = Array.from(panel.querySelectorAll('select')).find(x=>x.getAttribute('aria-label')==='Lifecycle dimension');
+const record = Array.from(panel.querySelectorAll('button')).find(x=>x.textContent==='Record fact');
 for (const value of ['reviewed','integrated']) {
   dimension.value = value;await dimension.dispatch('change');
   assert.equal(record.disabled, true);

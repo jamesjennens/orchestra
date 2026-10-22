@@ -31,6 +31,7 @@ import hashlib
 import ipaddress
 import json
 import os
+from server_address import ps_quote, sh_quote
 import record_json
 import re
 import secrets
@@ -46,18 +47,22 @@ from urllib.parse import parse_qs, urlsplit
 import actor_names
 import agent_prompts
 import bd_refusals
+import claim_limit
 import project_setup
 import project_coordination
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
-from http_auth import (AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENTS, CAP_APPROVE,
+from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
+                       CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
-                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_REVIEWS,
+                       CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
+                       CAP_RECORDS, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
-                       not_implemented, now_iso, request_hash, unauthenticated,
-                       uncertain, unsupported)
+                       not_implemented, now_iso, request_hash, session_limit_seconds, unauthenticated,
+                       uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
+                       validate_claim_limit)
 from version import report as version_report
 
 KIT_VERSION = '0.1.0'
@@ -132,8 +137,9 @@ ATTACHMENT_MEDIA_TYPES = ('text/plain', 'text/markdown')
 # hyphens and dots (``kittrial-5bb.19``), which the original ``[A-Za-z0-9_]+``
 # rejected. The first character must be alphanumeric, so ``.``/``..`` never match.
 ID = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}'
-# A reference catalog key (reference_records.KEY): lowercase and dotted.
+# A reference or capability catalog key (reference_records.KEY, capability_records.KEY): lowercase and dotted.
 REFERENCE_KEY = r'[a-z][a-z0-9]*(?:\.[a-z0-9][a-z0-9-]*)+'
+CAPABILITY_KEY = REFERENCE_KEY
 PROPOSAL_KEY = r'p-[0-9a-f]{12}'
 SAFE_ID = re.compile(r'^' + ID + r'$')
 REQUEST_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
@@ -473,6 +479,7 @@ class InProcessBackend:
     # Contributed requirement proposals are native records behind the canonical endpoint;
     # this service-local backend has no store for them (the routes answer 501).
     PROPOSALS = False
+    RECORDS = False
     # Everything here is service-local, so a project is created by the HTTP route itself.
     PROJECT_CREATE = 'create'
     #: This backend has no host tracker, so a credential's name is judged by its shape and the
@@ -500,6 +507,55 @@ class InProcessBackend:
         import actor_names
         service = (self.actor_namespace, actor_names.SERVICE_NAMESPACE)
         return {name: actor_names.collision(name, service=service) for name in names}
+
+    def guidance_state(self, project_id, actor):
+        """No guidance store in this backend: answer ``None``, never an error.
+
+        This service-local backend has no host project directory, so it cannot hold the
+        standing guidance at all. ``None`` means "not readable here" and the agent
+        routes add no guidance item; the canonical endpoint backend
+        (:meth:`EndpointBackend.guidance_state`) is the one that reads it.
+        """
+        return None
+
+    #: The per-project claiming setting (kittrial-5bb.352) this backend remembers in
+    #: its canonical state when it has no host project directory. Absent means open.
+    CLAIMING_DEFAULT = {'claiming': 'open', 'set_by': None, 'set_at': None,
+                        'set_via': None, 'previous': None, 'history': [],
+                        'source': 'default'}
+
+    def claiming_state(self, project_id):
+        values = self.state.get('claiming')
+        entry = values.get(project_id) if isinstance(values, dict) else None
+        if not isinstance(entry, dict) or entry.get('claiming') not in ('open', 'assigned'):
+            return dict(self.CLAIMING_DEFAULT)
+        result = {key: entry.get(key) for key in
+                  ('claiming', 'set_by', 'set_at', 'set_via', 'previous', 'history')}
+        result['source'] = 'record'
+        return result
+
+    def set_claiming(self, project_id, value, actor, via='web'):
+        if value not in ('open', 'assigned'):
+            raise ValueError("The claiming setting must be 'open' or 'assigned'")
+        current = self.claiming_state(project_id)
+        previous = None
+        history = list(current.get('history') or [])
+        if current.get('source') == 'record':
+            previous = {key: current.get(key) for key in
+                        ('claiming', 'set_by', 'set_at', 'set_via')}
+            history.append(previous)
+        import datetime
+        record = {'claiming': value, 'set_by': actor, 'set_via': via,
+                  'set_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                  'previous': previous, 'history': history[-20:]}
+        values = self.state.setdefault('claiming', {})
+        if not isinstance(values, dict):
+            values = self.state['claiming'] = {}
+        values[project_id] = record
+        result = {key: record.get(key) for key in
+                  ('claiming', 'set_by', 'set_at', 'set_via', 'previous', 'history')}
+        result['source'] = 'record'
+        return result
 
     @property
     def state(self):
@@ -721,6 +777,9 @@ class InProcessBackend:
         claimant = payload.get('actor') or principal.actor
         if task['status'] != 'open':
             raise conflict('Task is not open')
+        # The claim ROUTE gates the open dependency (kittrial-5bb.293 rev4): the
+        # backend does not repeat the check, so removing the route refusal is caught
+        # by the route test (mutant g4).
         if task['assignee'] is not None and task['assignee'] == claimant:
             # One's own task, claimed again: answered as a real installation answers it (bd's
             # claim), 200 and nothing changed (kittrial-5bb.187). It was 409 here.
@@ -1088,6 +1147,21 @@ class InProcessBackend:
     def reference(self, project_id, key):
         raise not_found('Reference not found')
 
+    def references_find(self, project_id, phrase, limit=5):
+        return {'schema_version': 1, 'phrase': phrase, 'total': 0, 'items': [],
+                'coverage': 'the in-process backend holds no native reference records'}
+
+    def capabilities(self, project_id, options):
+        return {'schema_version': 1, 'total': 0, 'items': [], 'next_offset': None,
+                'coverage': 'the in-process backend holds no native capability records'}
+
+    def capability(self, project_id, key):
+        raise not_found('Capability not found')
+
+    def capabilities_find(self, project_id, phrase, limit=5):
+        return {'schema_version': 1, 'phrase': phrase, 'total': 0, 'items': [],
+                'coverage': 'the in-process backend holds no native capability records'}
+
     def read_tasks(self, project_id):
         """One full canonical snapshot of every in-project row.
 
@@ -1113,12 +1187,31 @@ class InProcessBackend:
     def get_task(self, project_id, task_id):
         return dict(self._task(project_id, task_id))
 
-    def task_history(self, project_id, task_id, limit, offset, canonical=None):
+    def task_history(self, project_id, task_id, limit, offset, canonical=None,
+                     recent=False, since_checkpoint=False):
+        """The task's events, oldest first or (``recent``) newest first. This backend has no
+        continuation cursor, so only the first page is reachable: the route says so in
+        ``truncated`` when more exists (kittrial-5bb.353). ``since_checkpoint`` keeps the
+        events after the newest ``checkpoint-added`` (all of them when there is none)."""
         self._task(project_id, task_id)
         events = [e for e in self.state.get('events', [])
                   if e.get('project') == project_id and e.get('task') == task_id]
-        return {'items': events[offset:offset + limit], 'total': len(events),
-                'canonical_cursor': None, 'activity_cursor': None}
+        checkpoint = None
+        if since_checkpoint:
+            marks = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added']
+            if marks:
+                checkpoint = events[marks[-1]]
+                events = events[marks[-1] + 1:]
+        if recent:
+            events = events[::-1]
+        result = {'items': events[offset:offset + limit], 'total': len(events),
+                  'canonical_cursor': None, 'activity_cursor': None}
+        if since_checkpoint:
+            result.update({'since_checkpoint': checkpoint.get('time') if checkpoint else None,
+                           'checkpoint_author': checkpoint.get('actor') if checkpoint else None,
+                           'checkpoint_timestamp': checkpoint.get('time') if checkpoint else None,
+                           'checkpoint_coverage': None, 'unverified_entries': 0})
+        return result
 
     def list_feedback(self, project_id, limit, offset):
         items = self.state.get('feedback', {}).get(project_id, [])
@@ -1166,12 +1259,16 @@ class InProcessBackend:
         checkpoint = None
         if checkpoints:
             last = checkpoints[-1]
+            items = [{'id': item.get('id'),
+                      'kind': item.get('kind') or 'item',
+                      'text': item.get('text'), 'source': item.get('source')}
+                     for item in last.get('open_items') or []]
             checkpoint = {'id': last['id'], 'at': last['created_at'], 'author': last['actor'],
                           'summary': last['summary'], 'next_action': last.get('next_action'),
-                          'open_items': [{'id': item.get('id'),
-                                          'kind': item.get('kind') or 'item',
-                                          'text': item.get('text'), 'source': item.get('source')}
-                                         for item in last.get('open_items') or []]}
+                          'open_items': items,
+                          # This backend holds the checkpoint in memory and always reads
+                          # every item, so the shown list is the whole list, with no note.
+                          'open_items_shown': len(items), 'open_items_total': len(items)}
         return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
                 'carry_open_items': [dict(item) for item in checkpoints[-1].get('open_items') or []
                                      if isinstance(item, dict)] if checkpoints else [],
@@ -1180,7 +1277,45 @@ class InProcessBackend:
                 'lifecycle': {}, 'depends_on': [],
                 # This backend keeps no activity cursor; its checkpoints need none.
                 'activity_cursor': None,
-                'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None}
+                'newer': self._agent_activity_summary(task, checkpoints[-1]) if checkpoints else None,
+                **self._activity_blocks(task, checkpoints[-1] if checkpoints else None)}
+
+    def _activity_blocks(self, task, checkpoint):
+        """The task read's ``activity`` and ``changes_since_checkpoint`` (kittrial-5bb.354).
+
+        ``activity`` is the very block this backend's agent rows carry
+        (:meth:`_agent_fields`), so the task read and next/wait cannot disagree. This
+        model keeps no per-entry digests and no tracker history, so the section lists the
+        events after the checkpoint event (coverage unknown) and says the task fields are
+        not known here; the canonical backend reads both from the tracker.
+        """
+        from briefing import changes_since_checkpoint
+        import field_history as field_versions
+        if checkpoint is None:
+            return {'activity': None,
+                    'changes_since_checkpoint': changes_since_checkpoint(
+                        {'task': task['id'], 'entries': []}, None, None, None)}
+        review = self._review_view(task)
+        fields = self._agent_fields(task, review)
+        activity = {name: fields.get(name) for name in (
+            'newer_activity', 'newer_activity_marker', 'newer_activity_by_others', 'newer_activity_own',
+            'newer_activity_coverage', 'unresolved_directions')}
+        events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
+        anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
+                   and e.get('actor') == checkpoint.get('actor')
+                   and e.get('time', '') >= checkpoint.get('created_at', '')]
+        after = events[anchors[-1] + 1:] if anchors else []
+        entries = [{'entry_id': '%s-e%d' % (task['id'], index), 'kind': e.get('action') or 'event',
+                    'author': e.get('actor') or 'unknown', 'timestamp': e.get('time'),
+                    'body': e.get('detail') or e.get('action') or ''}
+                   for index, e in enumerate(after, start=(anchors[-1] + 1) if anchors else 0)]
+        section = changes_since_checkpoint(
+            {'task': task['id'], 'entries': entries}, None,
+            {'comment_id': checkpoint.get('id'), 'author': checkpoint.get('actor'),
+             'timestamp': checkpoint.get('created_at')},
+            task.get('assignee') or checkpoint.get('actor'), current=bool(anchors) and not entries,
+            fields_note=field_versions.UNKNOWN_NOTE % 'this backend keeps no tracker history')
+        return {'activity': activity, 'changes_since_checkpoint': section}
 
     #: The disposable backend is cheap to read and tests expect fresh reads.
     READ_CACHE_SECONDS = 0
@@ -1204,9 +1339,10 @@ class InProcessBackend:
         """
         if queue is not None:
             return own_queue_tasks(queue, actor)
+        from claim_limit import actor_holds
         rows = []
         for task in self._project_rows(project_id):
-            if not task.get('assignee') or (actor is not None and task.get('assignee') != actor):
+            if not task.get('assignee') or (actor is not None and not actor_holds(task.get('assignee'), actor)):
                 continue
             review = self._review_view(task)
             from review_state import active_work
@@ -1234,13 +1370,22 @@ class InProcessBackend:
         # The one rule from work.py, not a copy (kittrial-5bb.264 item 4).
         from work import is_redelivery
         redelivered=is_redelivery(contribution_id, open_requests)
+        # This disposable model keeps no per-entry checkpoint digests, so its coverage
+        # is unknown and the stable marker is honestly null (kittrial-5bb.351); the
+        # counts are the same summary its brief route already answers with.
+        activity=self._agent_activity_summary(task,last) if last and not unreadable else None
         return {'pending_change_requests':[r['id'] for r in review['requests'] if r['status']=='open'][:20],
                 'open_items':None if unreadable else (len(last.get('open_items') or []) if last else 0),
                 'blocking_items':None if unreadable else sum(item.get('kind') in ('blocker','dependency')
                                                             for item in (last.get('open_items') or []) if isinstance(item,dict)) if last else 0,
                 'redelivered':redelivered,
                 'checkpoint_at':at,
-                'newer_activity':self._other_agent_activity(task,last) if last and not unreadable else None}
+                'newer_activity':self._other_agent_activity(task,last) if last and not unreadable else None,
+                'newer_activity_marker':None,
+                'newer_activity_by_others':(activity or {}).get('other_count'),
+                'newer_activity_own':(activity or {}).get('own_count'),
+                'newer_activity_coverage':(activity or {}).get('coverage'),
+                'unresolved_directions':None}
 
     def _other_agent_activity(self, task, checkpoint):
         events=[e for e in self.state.get('events') or [] if e.get('task')==task['id']]
@@ -1285,6 +1430,23 @@ class InProcessBackend:
                 'omitted': max(0, len(remaining) - NEWER_MAX),
                 'note': 'Event history has no per-entry digests. Reading clears nothing; reconcile with task history.'}
 
+    def lanes_read(self, project_id, args, actor, scope='own'):
+        """One page of the lanes board over this backend's own rows (kittrial-5bb.263).
+
+        The board's aging and its three flags live in ``lanes.py`` only, so this backend
+        feeds that ONE read with its own rows and computes neither itself. It keeps no
+        session registry, so every lane is keyed by its assignee actor -- exactly how the
+        read treats a task that has no registered lane -- and an actor's lane therefore
+        carries the same name and id.
+        """
+        from lanes import read as lanes_read
+        rows = [dict(task, issue_type=task.get('issue_type') or 'task',
+                     labels=task.get('labels') or [], dependencies=task.get('dependencies') or [],
+                     comments=task.get('comments') or [])
+                for task in self._project_rows(project_id)]
+        return lanes_read(rows, actor, {'schema_version': 1, 'records': {}}, list(args),
+                          journal=None, scope=scope)
+
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
 
@@ -1292,7 +1454,11 @@ class InProcessBackend:
         still active. The project is read once; the route pages the result.
         """
         items = []
-        for task in self.read_tasks(project_id)['items']:
+        snapshot = self.read_tasks(project_id)['items']
+        from work import dependency_index, open_dependency_ids
+        dep_index = dependency_index(snapshot)
+        for task in snapshot:
+            task = dict(task, open_dependencies=open_dependency_ids(task, snapshot, index=dep_index))
             review = self._review_view(task)
             from review_state import active_work
             if not active_work(task.get('status'), review['state'], review['open_requests']):
@@ -1305,7 +1471,8 @@ class InProcessBackend:
                 attention=self._agent_fields(task, review),
                 recommended_by=[r['author'] for r in review['recommendations']],
                 contribution_author=(review['contribution'] or {}).get('author'),
-                claimable=claimable_task(task, review)))
+                claimable=claimable_task(task, review,
+                                          claiming=self.claiming_state(project_id)['claiming'])))
         items.sort(key=queue_order)
         return {'items': items, 'complete': True, 'warnings': []}
 
@@ -1397,7 +1564,7 @@ def queue_order(item):
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
                integration_warnings=None, attention=None, recommended_by=None, contribution_author=None,
-               claimable=None):
+               claimable=None, followon=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -1434,6 +1601,10 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             # the request-changes record ids, and the latest checkpoint's open items,
             # time and whether anything is newer. None where the backend does not say.
             'attention': attention,
+            # Additive (kittrial-5bb.343): the newest recorded hand-back block from the
+            # canonical `work` row, so a web queue row says why the move is the
+            # assignee's (or why an inert record does not move it).
+            'followon': followon,
             # Additive (kittrial-5bb.115): reviewers who recommend approving the current
             # contribution while nobody has decided. Never an approval.
             'recommended': bool(recommended_by),
@@ -1443,7 +1614,7 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'contribution_author': contribution_author}
 
 
-def claimable_task(task, review):
+def claimable_task(task, review, claiming='open'):
     """One in-process task's bounded claimability, from the shared ``work.claimable``.
 
     The disposable backend knows each row's issue type directly; the canonical backend
@@ -1455,7 +1626,9 @@ def claimable_task(task, review):
     return claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
                      (contribution or {}).get('id'),
                      review.get('state') if isinstance(review, dict) else None,
-                     labels=task.get('labels'))
+                     labels=task.get('labels'),
+                     open_dependencies=task.get('open_dependencies') or None,
+                     claiming=claiming)
 
 
 def attention_blocking_items(fields):
@@ -1468,16 +1641,60 @@ def attention_blocking_items(fields):
     return value if type(value) is int and value >= 0 else None
 
 
+def attention_field(row, name):
+    """One attention field from a queue row itself, else from its nested attention block.
+
+    A canonical ``work`` row carries the checkpoint attention fields at the top level;
+    the web service's queue row carries them under ``attention``. The wait route reads
+    either shape, so a bridge and the SSH client see one marker (kittrial-5bb.351).
+    """
+    if isinstance(row, dict):
+        value = row.get(name)
+        if value is not None:
+            return value
+        attention = row.get('attention')
+        if isinstance(attention, dict):
+            return attention.get(name)
+    return None
+
+
+def holder_move(status, task_id, assignee, review_state, open_requests, contribution_id,
+                redelivered=None, claimable_value=None):
+    """The HOLDER's move reading for a projection row, from the ONE shared decision.
+
+    A page shows a task's move for the actor who holds it, and the work row that names
+    the same reading is ``work --owner ACTOR``. This calls the same
+    ``work.move_decision`` the queue and the lane board use with the holder as the
+    subject, so an open task assigned to the holder with no checkpoint and no
+    contribution by them reads ``you``/``assignee`` on the page exactly as it does in
+    the queue (kittrial-5bb.288) and the two readings cannot drift apart.
+    """
+    from work import move_decision
+    pending = open_requests if type(open_requests) is int and open_requests >= 0 else 0
+    return move_decision(review_state, task_id, True, pending_items=pending,
+                         redelivered=bool(redelivered), assignee=assignee,
+                         closed=status == 'closed', claimable=claimable_value)
+
+
 def own_queue_tasks(queue, actor=None):
     """Split one current review snapshot by assignee, retaining unknown checkpoint state."""
+    from claim_limit import actor_holds
     tasks=[]
     for row in queue.get('items') or []:
-        if not isinstance(row,dict) or not row.get('assignee') or (actor is not None and row['assignee']!=actor):
+        if not isinstance(row,dict) or not row.get('assignee') or (actor is not None and not actor_holds(row.get('assignee'), actor)):
             continue
         fields=row.get('attention') if isinstance(row.get('attention'),dict) else {}
+        move, move_text, move_role = holder_move(
+            row.get('status'), row.get('id'), row.get('assignee'), row.get('review_state'),
+            row.get('open_requests'), (row.get('contribution') or {}).get('id'),
+            fields.get('redelivered'), row.get('claimable'))
         tasks.append({'id':row.get('id'),'title':row.get('title'),'status':row.get('status'),
                       'assignee':row.get('assignee'),'review_state':row.get('review_state'),
                       'contribution_id':(row.get('contribution') or {}).get('id'),
+                      # The holder's own move reading, from the same decision as the
+                      # canonical `work --owner ACTOR` row (kittrial-5bb.288), so the
+                      # agents page and the bridge show what the queue row shows.
+                      'whose_move':move,'next':move_text,'next_actor':move_role,
                       'pending_change_requests':list(fields.get('pending_change_requests') or [])[:20],
                       # The canonical item count, so the move sentence says the same N as the
                       # `work` row it came from (kittrial-5bb.249).
@@ -1488,7 +1705,14 @@ def own_queue_tasks(queue, actor=None):
                       # (kittrial-5bb.253 item 1), for `review_move`.
                       'redelivered':fields.get('redelivered'),
                       'checkpoint_at':fields.get('checkpoint_at'),
-                      'newer_activity':fields.get('newer_activity')})
+                      'newer_activity':fields.get('newer_activity'),
+                      # The stable marker and its counts (kittrial-5bb.351): a wait row
+                      # carries them, so a marker change alone moves the fingerprint.
+                      'newer_activity_marker':fields.get('newer_activity_marker'),
+                      'newer_activity_by_others':fields.get('newer_activity_by_others'),
+                      'newer_activity_own':fields.get('newer_activity_own'),
+                      'newer_activity_coverage':fields.get('newer_activity_coverage'),
+                      'unresolved_directions':fields.get('unresolved_directions')})
         if row.get('lifecycle_reasons'):
             tasks[-1]['lifecycle_reasons'] = dict(row['lifecycle_reasons'])
     return {'tasks':tasks,'complete':bool(queue.get('complete'))}
@@ -1519,8 +1743,17 @@ class EndpointBackend:
     flight is surfaced as an uncertain outcome, never as success.
     """
 
-    ROUTES = InProcessBackend.ROUTES + ('tasks.assign', 'merge-slot.acquire', 'merge-slot.release',
-                                      'merge-slot.force-release', 'merge-slot.create')
+    ROUTES = InProcessBackend.ROUTES + (
+        'tasks.assign', 'tasks.release', 'merge-slot.acquire',
+        'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create',
+        # The coordinator's recorded hand-back (kittrial-5bb.343). Both operations run
+        # the one canonical `assignee-followon` action, which calls the same library
+        # function as `coordinator followon`.
+        'followons.record', 'followons.withdraw',
+        'references.propose', 'references.revise', 'references.accept', 'references.retire',
+        'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
+        'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
+    )
     #: Routes with no canonical command yet, and why. Fails closed rather than
     #: pretending the service store is canonical.
     UNRESOLVED = {
@@ -1530,6 +1763,7 @@ class EndpointBackend:
         'list_feedback': 'the canonical feedback command ships with kittrial-5bb.13',
     }
     PROPOSALS = True
+    RECORDS = True
     #: The endpoint owns the project's tracker rows and reads them when asked to
     #: (kittrial-5bb.188 item 1): a credential issued through this backend records that the
     #: name was verified row-free, so its ordinary writes need no such read.
@@ -1778,7 +2012,7 @@ class EndpointBackend:
         reply = self._endpoint(action, project, actor, args, attachments,
                                operation_id=operation_id, authority=authority,
                                require_authority=require_authority, route=route, extra=extra)
-        if (action in ('assignment-roster','task-assign') and isinstance(reply, dict)
+        if (action in ('assignment-roster','task-assign','task-release') and isinstance(reply, dict)
                 and reply.get('returncode') == 2 and reply.get('assignment_status') in (403, 404, 409, 422, 503)):
             status = reply['assignment_status']
             error = HttpError(status, 'unavailable' if status == 503 else 'forbidden' if status == 403
@@ -1800,13 +2034,25 @@ class EndpointBackend:
                               (reply.get('stderr') or 'Lifecycle state cannot be read').strip())
             error.nothing_done = True
             raise error
+        if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
+            status = reply['records_status']
+            text = (reply.get('stderr') or 'Record operation refused').strip().split('\n')[-1]
+            for prefix in ('ValueError: ', 'RecordsRefusal: '):
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                    break
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid'}.get(status, 'unavailable'),
+                              text)
+            error.nothing_done = True
+            raise error
         # Without a descriptor the service only reads (every write it sends carries one).
         return self._checked(reply, action, reading=authority is None)
 
     #: How much of a canonical refusal's last line is handed on. A checkpoint refusal lists
     #: every problem with the record (kittrial-5bb.113), so it gets room for all of them.
     DETAIL_LIMIT = 200
-    DETAIL_LIMITS = {'checkpoint': 6000}
+    DETAIL_LIMITS = {'checkpoint': 6000, 'ref': 600, 'capability': 600}
     #: The follow-on base refusal is handed on whole (kittrial-5bb.158): cut at 200 it lost the
     #: reason, the recorder's name and what an operator must do.
     BASE_REFUSAL_LIMIT = 1500
@@ -1934,6 +2180,23 @@ class EndpointBackend:
                 if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str) \
                         and detail.startswith('ValueError: '):
                     raise invalid(detail[len('ValueError: '):], detail)
+                if action in ('ref', 'capability') and isinstance(detail, str):
+                    clean = detail
+                    for prefix in ('ValueError: ', 'RecordsRefusal: '):
+                        if clean.startswith(prefix):
+                            clean = clean[len(prefix):]
+                            break
+                    if (clean.startswith(('Unknown reference key ', 'Unknown capability key '))
+                            or 'no revision record yet' in clean):
+                        raise not_found(clean)
+                    if any(token in clean for token in (
+                            'already exists', 'is not the newest', 'does not match',
+                            'is retired', 'already accepted', 'different result',
+                            'collides with', 'has no revision', 'No pending alias',
+                            'already carries', 'already matches', 'was rejected for',
+                            'has no proposed draft')):
+                        raise conflict(clean)
+                    raise invalid(clean, detail)
                 if reply.get('refused') == 'not-found':
                     # bd found no row of that name (bd_refusals): the thing asked about is not there.
                     raise not_found('Task not found')
@@ -2115,6 +2378,9 @@ class EndpointBackend:
             # re-check cannot revive an item expired by a backward step.
             authority = authority_request(principal, project_id, capability,
                                           now=self.service._expiry_now())
+            if self.service.approval_by_another_party and (
+                    route.startswith('references.') or route.startswith('capabilities.')):
+                authority['approval_by_another_party'] = True
         try:
             result = self._run(action, project, payload.get('actor') or self._actor(principal),
                                args, attachments, operation_id=operation_id,
@@ -2197,6 +2463,14 @@ class EndpointBackend:
         require — including ``schema_version`` and ``operation_id`` — and no
         operation-inappropriate nulls.
         """
+        if route == 'tasks.release':
+            # The canonical release action derives the holder from the authenticated
+            # caller; the route sends the task, the reason and the row's current assignee
+            # when held under a sub-label (kittrial-5bb.301, kittrial-5bb.300).
+            body = {'task_id': payload['task_id'], 'reason': payload['reason']}
+            if payload.get('expected_assignee') is not None:
+                body['expected_assignee'] = payload['expected_assignee']
+            return 'task-release', project_id, [json.dumps(body, ensure_ascii=False)], {}
         if route == 'tasks.assign':
             from task_assignment import REQUEST_FIELDS
             fields={k:payload[k] for k in REQUEST_FIELDS if k not in ('operation_id','task','schema_version')}
@@ -2209,6 +2483,19 @@ class EndpointBackend:
                       if key in payload}
             fields.update(operation=operation, task=payload['task_id'])
             return 'web-lifecycle', project_id, [json.dumps(fields)], {}
+        if route.startswith('followons.'):
+            # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
+            # `assignee-followon` action derives every record fact under the project
+            # lock, so only the operation, the caller's text/reason and the route's
+            # own task/target travel.
+            operation = route.split('.', 1)[1]
+            body = {'schema_version': 1, 'operation': operation, 'task': payload['task_id']}
+            if operation == 'record':
+                body['text'] = payload['text']
+            else:
+                body['target'] = payload['target']
+                body['reason'] = payload['reason']
+            return 'assignee-followon', project_id, [json.dumps(body, ensure_ascii=False)], {}
         if route.startswith('merge-slot.'):
 
             operation = route.split('.', 1)[1]
@@ -2357,6 +2644,16 @@ class EndpointBackend:
                 raise invalid('Send an Idempotency-Key header or an operation_id')
             return ('proposal', project_id, [payload['command'], '@attachment:0'],
                     {'0': {'flag': '--file', 'text': json.dumps(body)}})
+        if route.startswith('references.') or route.startswith('capabilities.'):
+            body = dict(payload['body'])
+            body['operation_id'] = body.get('operation_id') or operation_id
+            if not body['operation_id']:
+                raise invalid('Send an Idempotency-Key header or an operation_id')
+            if isinstance(body.get('acceptance'), dict) and not body['acceptance'].get('decision_id'):
+                body['acceptance'] = dict(body['acceptance'], decision_id=body['operation_id'])
+            action_name = 'ref' if route.startswith('references.') else 'capability'
+            return (action_name, project_id, [payload['command'], '@attachment:0'],
+                    {'0': {'flag': '--file', 'text': json.dumps(body, ensure_ascii=False)}})
         raise invalid('Backend route is not implemented for the canonical endpoint: %s' % route)
 
     # -- reads (no canonical mutation) ----------------------------------------
@@ -2378,11 +2675,56 @@ class EndpointBackend:
         for name in ('owner', 'state', 'due', 'authority'):
             if options.get(name):
                 args += ['--' + name, caller_arg(options[name], name)]
+        if options.get('waiting'):
+            args.append('--waiting')
         return self._ref_read(project_id, args)
 
     def reference(self, project_id, key):
         """One entry through `ref get`; an unknown or unfinished key is a 404."""
         return self._ref_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
+
+    def references_find(self, project_id, phrase, limit=5):
+        return self._ref_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
+
+    def capabilities(self, project_id, options):
+        """One page of the capability catalog through the endpoint's read-only `capability list`."""
+        args = ['list', '--limit', str(options['limit']), '--offset', str(options['offset'])]
+        for tag in options.get('tags') or []:
+            args += ['--tag', caller_arg(tag, 'tag')]
+        for name in ('owner', 'state'):
+            if options.get(name):
+                args += ['--' + name, caller_arg(options[name], name)]
+        if options.get('pointers'):
+            args.append('--pointers')
+        if options.get('waiting'):
+            args.append('--waiting')
+        return self._capability_read(project_id, args)
+
+    def capability(self, project_id, key):
+        """One entry through `capability get`; an unknown or unfinished key is a 404."""
+        return self._capability_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
+
+    def capabilities_find(self, project_id, phrase, limit=5):
+        return self._capability_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
+
+    def lanes_read(self, project_id, args, actor, scope):
+        """One page of the lanes board through the endpoint's ``work lanes`` action.
+
+        ``args`` are the read's own arguments -- ``--idle-minutes``, ``--limit``,
+        ``--offset`` -- handed on unchanged, so the threshold the page asked for is the
+        threshold the ONE read of the board ages and flags by (kittrial-5bb.263; there is no
+        second implementation of either on this side). ``scope`` is the ROUTE's isolation,
+        not the transport's: this service calls the endpoint without a bound key, so the
+        endpoint would answer ``'all'`` for it, and the request's ``lanes_scope`` asks for
+        ``'own'`` instead. The endpoint honours only that narrowing, and its own routes keep
+        computing their scope themselves.
+        """
+        reply = self._endpoint('work', project_id, actor, ['lanes'] + list(args),
+                               extra={'lanes_scope': scope})
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('The canonical lanes read returned an unexpected shape')
+        return payload
 
     def requirements_read(self, project_id, args):
         reply=self._endpoint('requirements',project_id,self.actor_namespace+'/read',args)
@@ -2396,7 +2738,10 @@ class EndpointBackend:
 
     def owner_requirements(self, principal, project_id, action, fields, key, task=None):
         operation_id=self._result_key(principal,project_id,'requirements.'+action,key,task)
-        authority=authority_request(principal,project_id,CAP_PROJECT_ADMIN,now=self.service._expiry_now())
+        # `coordinate`: an owner holds it, a coordinator holds it by role, and an agent
+        # credential holds it only through the project's coordinator grant
+        # (kittrial-5bb.278). The endpoint re-decides the same capability.
+        authority=authority_request(principal,project_id,CAP_COORDINATE,now=self.service._expiry_now())
         args=[action]+([task] if task is not None else [])
         attachment={'payload':{'flag':'--file','text':json.dumps(fields,ensure_ascii=False)}}
         reply=self._endpoint('owner-requirements',project_id,principal.user_id,args,attachment,
@@ -2410,7 +2755,7 @@ class EndpointBackend:
         return self._checked(reply)
 
     def owner_requirement_recoveries(self, principal, project_id):
-        authority=authority_request(principal,project_id,CAP_PROJECT_ADMIN,now=self.service._expiry_now())
+        authority=authority_request(principal,project_id,CAP_COORDINATE,now=self.service._expiry_now())
         reply=self._endpoint('owner-requirements',project_id,principal.user_id,['recoveries'],
                              authority=authority,require_authority=True,route='requirements.recoveries')
         return self._checked(reply,reading=True)
@@ -2444,9 +2789,24 @@ class EndpointBackend:
         if code == 2 and missing and ('Unknown reference key' in stderr
                                       or 'no revision record yet' in stderr):
             raise not_found('Reference not found')
-        payload = self._checked(reply)
+        payload = self._checked(reply, 'ref', reading=True)
         if not isinstance(payload, dict):
             raise uncertain('Canonical reference read returned an unexpected shape')
+        return payload
+
+    def _capability_read(self, project_id, args, missing=False):
+        reply = self._endpoint('capability', project_id, self.actor_namespace + '/read', args)
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
+        if code == 2 and 'Unknown action' in stderr:
+            raise not_implemented('The canonical endpoint is older than this HTTP service and has '
+                                  'no capability catalog; install the same kit for both')
+        if code == 2 and missing and ('Unknown capability key' in stderr
+                                      or 'no revision record yet' in stderr):
+            raise not_found('Capability not found')
+        payload = self._checked(reply, 'capability', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical capability read returned an unexpected shape')
         return payload
 
     def read_tasks(self, project_id):
@@ -2534,8 +2894,14 @@ class EndpointBackend:
             raise not_found('Task not found')
         return self._with_record_comments(project_id, [row])[0]
 
-    def task_history(self, project_id, task_id, limit, offset, canonical=None):
+    def task_history(self, project_id, task_id, limit, offset, canonical=None,
+                     recent=False, since_checkpoint=False):
         """Page the canonical snapshot cursor, never asking for more than its limit.
+
+        ``recent`` reads the same snapshot newest first (the canonical ``--recent``, whose
+        cursor walks toward older entries and keeps a long comment's fragments together in
+        body order); ``since_checkpoint`` passes ``--since-checkpoint``, whose boundary the
+        canonical cursor carries (kittrial-5bb.353).
 
         The canonical ``history`` action accepts 1..20 entries per call and binds its
         continuation cursor to a snapshot digest. Accumulating exact-size canonical
@@ -2560,10 +2926,14 @@ class EndpointBackend:
         cursor = canonical
         total = 0
         activity = None
+        selection = {}
         pages = 0
         while len(collected) < needed and pages < 100:
             pages += 1
-            argv = [str(task_id), '--limit', str(min(20, needed - len(collected))), '--json']
+            argv = [str(task_id), '--recent' if recent else '--limit',
+                    str(min(20, needed - len(collected))), '--json']
+            if since_checkpoint:
+                argv.append('--since-checkpoint')
             if cursor:
                 argv += ['--cursor', cursor]
             reply = self._run('history', project_id, self.actor_namespace + '/read', argv)
@@ -2575,13 +2945,17 @@ class EndpointBackend:
             entries = reply.get('entries') or []
             if reply.get('activity_cursor'):
                 activity = reply['activity_cursor']
+            if since_checkpoint:
+                selection = {key: reply.get(key) for key in (
+                    'since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
+                    'checkpoint_coverage', 'unverified_entries')}
             collected.extend(entries)
             total = reply.get('total_entries', len(collected))
             cursor = reply.get('next_cursor')
             if cursor is None:
                 break
-        return {'items': (collected[:limit] if canonical else collected[offset:offset + limit]),
-                'total': total, 'canonical_cursor': cursor, 'activity_cursor': activity}
+        return dict({'items': (collected[:limit] if canonical else collected[offset:offset + limit]),
+                     'total': total, 'canonical_cursor': cursor, 'activity_cursor': activity}, **selection)
 
     def list_feedback(self, project_id, limit, offset):
         raise not_implemented('Canonical backend has no feedback read yet: %s'
@@ -2631,6 +3005,10 @@ class EndpointBackend:
                 'id': current.get('comment_id'), 'commit': current.get('commit'),
                 'revision': (review.get('prior_contributions_total') or 0) + 1,
                 'at': current.get('timestamp')}
+        # The coordinator's recorded hand-back (kittrial-5bb.343) travels with the
+        # brief's review projection; My work merges it onto the queue row.
+        if isinstance(data.get('followon'), dict):
+            detail['followon'] = data['followon']
         return detail
 
     def task_brief(self, project_id, task_id):
@@ -2651,6 +3029,24 @@ class EndpointBackend:
             point = data['checkpoint']
             unresolved = data.get('unresolved') or {}
             carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved)
+            shown_items = [{'id': item.get('id'), 'kind': item.get('kind'),
+                            'text': item.get('text'), 'source': item.get('source')}
+                           for item in unresolved.get('items') or []
+                           if isinstance(item, dict)]
+            shown = len(shown_items)
+            total = unresolved.get('total')
+            # The page shows the first ten; carry_open_items is the complete list. Say
+            # which is which, or an agent reads the first ten as the whole set
+            # (kittrial-5bb.356). The note appears when a list was cut, or when the
+            # complete list could not be read at all.
+            note = None
+            if isinstance(total, int) and shown < total:
+                note = ('The first %d of %d; carry_open_items %s' % (
+                    shown, total,
+                    'has all %d, in order, to carry forward unchanged.' % total
+                    if carry is not None else 'could not all be read: read the brief again.'))
+            elif carry is None:
+                note = 'carry_open_items could not all be read: read the brief again.'
             checkpoint = {'id': point.get('comment_id'), 'at': point.get('timestamp'),
                           'author': point.get('author'), 'summary': data.get('current_position'),
                           'next_action': data.get('next_action'),
@@ -2658,11 +3054,10 @@ class EndpointBackend:
                           'intent': (data.get('intent') or {}).get('text'),
                           'acceptance': (data.get('acceptance') or {}).get('text'),
                           'newer_activity': point.get('newer_activity'),
-                          'open_items': [{'id': item.get('id'), 'kind': item.get('kind'),
-                                          'text': item.get('text'), 'source': item.get('source')}
-                                         for item in unresolved.get('items') or []
-                                         if isinstance(item, dict)],
-                          'open_items_total': unresolved.get('total')}
+                          'open_items': shown_items,
+                          'open_items_shown': shown,
+                          'open_items_total': total,
+                          **({'open_items_note': note} if note else {})}
         review = data.get('review') or {}
         current = review.get('contribution')
         priors = review.get('prior_contributions_total') or 0
@@ -2724,6 +3119,14 @@ class EndpointBackend:
                 lifecycle[dimension]['reason']=fact['reason']
                 lifecycle[dimension]['note']=fact['reason']
         dependencies = (data.get('dependencies') or {}).get('items') or []
+        # kittrial-5bb.293 item 1: when a field is cut, the HTTP brief names the GET
+        # route that returns the full description and carries the link. Like the
+        # canonical brief, the block is present ONLY when a field was actually cut,
+        # so an uncut brief carries no pointer bytes on either route.
+        read_whole = ({'route': 'GET /v1/projects/%s/tasks/%s' % (project_id, task),
+                       'link': '/v1/projects/%s/tasks/%s' % (project_id, task),
+                       'note': 'The complete text: GET /v1/projects/%s/tasks/%s.' % (project_id, task)}
+                      if data.get('read_whole') else None)
         return {**({'assignment_records':data['assignment_records']} if data.get('assignment_records') else {}),
                 'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
@@ -2772,10 +3175,32 @@ class EndpointBackend:
                 # checkpoint from the brief alone (kittrial-5bb.113).
                 'next_action': data.get('next_action'),
                 'activity_cursor': data.get('activity_cursor'),
+                # The coordinator's recorded hand-back (kittrial-5bb.343), the same
+                # additive block a work row carries.
+                'followon': data.get('followon'),
+                # kittrial-5bb.293 item 1: the pointer block built above is carried
+                # only when a field was actually cut.
+                **({'read_whole': read_whole} if read_whole else {}),
                 'warnings': data.get('warnings') or [],
                 # The canonical brief already bounds refs, authors and omissions;
                 # preserve its coverage/unknown counts rather than infer from time.
-                'newer': data.get('newer')}
+                'newer': data.get('newer'),
+                # kittrial-5bb.354: the ONE newer-activity definition (the same fields a
+                # work row, next and wait carry) and the bounded 'changes since your
+                # checkpoint' section, exactly as the canonical brief computed them. An
+                # older endpoint omits both: null, never inferred here.
+                'activity': data.get('activity') if isinstance(data.get('activity'), dict) else None,
+                'changes_since_checkpoint': data.get('changes_since_checkpoint')
+                if isinstance(data.get('changes_since_checkpoint'), dict)
+                else self._no_checkpoint_section(task_id) if data.get('checkpoint') is None else None}
+
+    @staticmethod
+    def _no_checkpoint_section(task):
+        """The section's own sentence for a task with no checkpoint: the canonical brief
+        leaves the block out then (it keeps the compact size), and that is true of an older
+        endpoint's brief too."""
+        from briefing import changes_since_checkpoint
+        return changes_since_checkpoint({'task': task, 'entries': []}, None, None, None)
 
     def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
@@ -2916,18 +3341,48 @@ class EndpointBackend:
     CREATION_FAILED = ('The project could not be created, or was only partly made. Ask an operator of the server '
                        'to look before you try again.')
 
+    def guidance_command(self, principal, project_id, operation, body=None, text=None, key=None):
+        """One canonical guidance operation, with the real authenticated identity."""
+        import web_guidance
+        capability = web_guidance.CAPABILITIES[operation]
+        writing = operation in ('set', 'clear', 'ack')
+        operation_id = self._result_key(principal, project_id, 'guidance.' + operation, key, None) if writing else None
+        if writing:
+            self._settle_actor_rows(principal, project_id)
+        payload = dict(body or {}, operation=operation)
+        attachments = {'text': {'flag': '--file', 'text': text}} if operation == 'set' else {}
+        try:
+            reply = self._endpoint('web-guidance', project_id, self._actor(principal), [json.dumps(payload)],
+                                   attachments, operation_id=operation_id,
+                                   authority=authority_request(principal, project_id, capability,
+                                                               now=self.service._expiry_now()),
+                                   require_authority=True, route='guidance.' + operation)
+        except HttpError as error:
+            if not writing and error.status == 503 and error.code == 'uncertain':
+                refused = HttpError(503, 'unavailable', 'Guidance or onboarding could not be read. Nothing was changed; try again shortly.')
+                refused.nothing_done = True
+                raise refused from None
+            raise
+        return self._checked(reply, reading=not writing)
+
+    def guidance_replay_guard(self, principal, project_id, operation):
+        # Re-check live canonical authority before a service-cache replay. A revoked
+        # coordinator grant must not replay a cached coordinate operation.
+        return self.guidance_command(principal, project_id,
+                                     'read' if operation == 'ack' else 'coordinate-check')
+
     def set_onboarding(self, principal, project_id, text, key):
         """An owner sets (``text``) or clears (``None``) the project's onboarding text.
 
         One service-only ``set-onboarding`` endpoint action. The endpoint re-checks the
-        project-administration capability under the authority lock and applies the same
+        coordination capability under the authority lock and applies the same
         size limit as ``admin.py set-onboarding`` plus the plain-text rule. The text
         travels as an attachment, never on a command line.
         """
         operation_id = self._result_key(principal, project_id, 'projects.onboarding', key, None)
-        authority = authority_request(principal, project_id, CAP_PROJECT_ADMIN, now=self.service._expiry_now())
+        authority = authority_request(principal, project_id, CAP_COORDINATE, now=self.service._expiry_now())
         attachments = {} if text is None else {'text': {'flag': '--file', 'text': text}}
-        reply = self._endpoint('set-onboarding', project_id, principal.user_id,
+        reply = self._endpoint('set-onboarding', project_id, self._actor(principal),
                                ['clear'] if text is None else ['set'], attachments, operation_id=operation_id,
                                authority=authority, require_authority=True, route='projects.onboarding')
         if isinstance(reply, dict) and reply.get('returncode') == 2:
@@ -3027,6 +3482,41 @@ class EndpointBackend:
         """
         return self._run('setup-status', project_id, self.actor_namespace + '/read', [])
 
+    def guidance_state(self, project_id, actor):
+        """One actor's guidance version block (kittrial-5bb.325).
+
+        Read from the project's coordination sidecar under this service's runtime root
+        (``<root>/projects/<project>``), the same files the host's ``setup-status`` read
+        uses, with the same module the endpoint uses, so the web agent routes cannot
+        disagree with ``work``, ``brief`` or ``session resume`` about the current version,
+        this actor's acknowledgement, or the one move item. It costs no endpoint read, so
+        the one-cheap-read rule of the polled routes (kittrial-5bb.281/.285) still holds.
+        Version and command only: the guidance TEXT never enters an agent answer.
+        """
+        import guidance as guidance_module
+        project_path = Path(self.root) / 'projects' / project_id
+        return guidance_module.brief_block(project_path, actor)
+
+    def claiming_state(self, project_id):
+        """The project's claiming setting, read FRESH from its directory (kittrial-5bb.352).
+
+        It lives outside the tracker, so the tracker's read cache (keyed on the dolt
+        commit) must never be used for it: every listing and every claim gate reads the
+        file again. An absent file is open; a damaged one reads as the restrictive
+        'assigned' with a warning, never as the permissive default.
+        """
+        import claiming as claiming_module
+        return claiming_module.read(Path(self.root) / 'projects' / project_id)
+
+    def set_claiming(self, project_id, value, actor, via='web'):
+        """Record the setting under the project's coordination lock (kittrial-5bb.352)."""
+        import fcntl
+        import claiming as claiming_module
+        project_path = Path(self.root) / 'projects' / project_id
+        with (project_path / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return claiming_module.write(project_path, value, actor, via=via)
+
     #: How long the host's session names of one project are reused (kittrial-5bb.198). A task
     #: list names its assignees on every read, and a session registered just now may show by
     #: its id for this long.
@@ -3100,7 +3590,21 @@ class EndpointBackend:
                 # (kittrial-5bb.253 item 1).
                 'redelivered': redelivered if type(redelivered) is bool else None,
                 'checkpoint_at': row.get('checkpoint_at') if isinstance(row.get('checkpoint_at'), str) else None,
-                'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None}
+                'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None,
+                # The stable marker and the counts it was computed with (kittrial-5bb.351):
+                # the bridge wakes on a marker change even while the boolean stays true.
+                # A legacy checkpoint (unknown coverage) yields a null marker, so a
+                # reader falls back to `newer_activity`.
+                'newer_activity_marker': row.get('newer_activity_marker')
+                if isinstance(row.get('newer_activity_marker'), str) else None,
+                'newer_activity_by_others': row.get('newer_activity_by_others')
+                if type(row.get('newer_activity_by_others')) is int and row.get('newer_activity_by_others') >= 0 else None,
+                'newer_activity_own': row.get('newer_activity_own')
+                if type(row.get('newer_activity_own')) is int and row.get('newer_activity_own') >= 0 else None,
+                'newer_activity_coverage': row.get('newer_activity_coverage')
+                if isinstance(row.get('newer_activity_coverage'), str) else None,
+                'unresolved_directions': row.get('unresolved_directions')
+                if type(row.get('unresolved_directions')) is int and row.get('unresolved_directions') >= 0 else None}
 
     def agent_tasks(self, project_id, actor=None, queue=None):
         """The tasks one actor holds, from the canonical ``work --owner ACTOR`` view.
@@ -3142,7 +3646,14 @@ class EndpointBackend:
                              # The superseding-redelivery fact (kittrial-5bb.253 item 1).
                              'redelivered': attention.get('redelivered'),
                              'checkpoint_at': attention.get('checkpoint_at'),
-                             'newer_activity': attention.get('newer_activity')})
+                             'newer_activity': attention.get('newer_activity'),
+                             # The stable newer-activity marker and its counts
+                             # (kittrial-5bb.351), carried exactly as `work` read them.
+                             'newer_activity_marker': attention.get('newer_activity_marker'),
+                             'newer_activity_by_others': attention.get('newer_activity_by_others'),
+                             'newer_activity_own': attention.get('newer_activity_own'),
+                             'newer_activity_coverage': attention.get('newer_activity_coverage'),
+                             'unresolved_directions': attention.get('unresolved_directions')})
                 if item.get('lifecycle_reasons'):
                     rows[-1]['lifecycle_reasons'] = dict(item['lifecycle_reasons'])
             return {'tasks': rows, 'complete': bool(queue.get('complete'))}
@@ -3157,8 +3668,9 @@ class EndpointBackend:
                              owner + ['--limit', str(MAX_PAGE), '--offset', str(offset), '--json'])
             if not isinstance(page, dict):
                 raise uncertain('Canonical work queue returned an unexpected shape')
+            from claim_limit import actor_holds
             for row in page.get('items') or []:
-                if not isinstance(row, dict) or row.get('owner') != actor:
+                if not isinstance(row, dict) or not actor_holds(row.get('owner'), actor):
                     continue
                 rows.append(dict({'id': row.get('task'), 'title': row.get('title'), 'status': row.get('status'),
                                   'assignee': row.get('owner'), 'review_state': row.get('review_state'),
@@ -3217,7 +3729,9 @@ class EndpointBackend:
                                         contribution_author=row.get('contribution_author')
                                         if isinstance(row.get('contribution_author'), str) else None,
                                         claimable=row.get('claimable')
-                                        if isinstance(row.get('claimable'), bool) else None))
+                                        if isinstance(row.get('claimable'), bool) else None,
+                                        followon=row.get('followon')
+                                        if isinstance(row.get('followon'), dict) else None))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -3436,7 +3950,7 @@ def _canonical_payload(stdout):
 REQUIREMENT_DECISION_LABEL = 'owner-requirement-decision:'
 
 
-def next_action(task):
+def next_action(task, claiming='open'):
     """Who acts next on a task, derived only from its status, assignee and review state."""
     state = task.get('review_state')
     from review_state import active_work
@@ -3447,7 +3961,9 @@ def next_action(task):
         # rather than invite a claim or delivery on work that may be under review.
         return None
     if state == 'integrated':
-        return {'who': 'owner', 'text': 'Follow the release workflow for the integrated work'}
+        # kittrial-5bb.336: the coordinator's move - close the task or record what
+        # remains - never the agent's own action list.
+        return {'who': 'owner', 'text': 'The contribution is integrated; close the task or record what remains'}
     if state in ('awaiting-review', 'legacy-review-ready'):
         return {'who': 'owner', 'text': 'Review the delivered contribution'}
     if state == 'changes-requested':
@@ -3464,9 +3980,16 @@ def next_action(task):
     # queue, the agent attention list and the claim route use (kittrial-5bb.277 review
     # item 2). A requirement record, an epic, a decision or another row the queue never
     # offers says what it is for instead of inviting a claim the route refuses with 409.
-    from work import claimable, requirement_record
+    from work import claimable, open_dependency_sentence, requirement_record
+    open_deps = task.get('open_dependencies') or []
     if not claimable(task.get('issue_type'), task.get('status'), task.get('assignee'),
-                     task.get('contribution_id'), state, labels=task.get('labels')):
+                     task.get('contribution_id'), state, labels=task.get('labels'),
+                     open_dependencies=open_deps, claiming=claiming):
+        if open_deps:
+            return {'who': 'owner', 'text': open_dependency_sentence(open_deps) or 'Blocked'}
+        if str(claiming or 'open') == 'assigned' and not task.get('assignee'):
+            from claiming import EMPTY_SENTENCE
+            return {'who': 'coordinator', 'text': EMPTY_SENTENCE}
         if requirement_record(task.get('labels')):
             return {'who': 'owner',
                     'text': "Requirement record: edit it on the project's Requirements page"}
@@ -3581,6 +4104,33 @@ def route(method, pattern, *, anonymous=False, csrf=True):
         ROUTES.append((method, compiled, handler.__name__, anonymous, csrf))
         return handler
     return register
+
+
+#: What an HTTP agent needs before a guidance item is a move it can actually make: a
+#: read of the project's guidance and an acknowledgement of a version
+#: (kittrial-5bb.212). The probes below are matched against this service's own route
+#: table, so the item returns BY ITSELF the day those routes ship and cannot come back
+#: before (kittrial-5bb.334). One place to extend if .212 chooses another ack path.
+GUIDANCE_READ_PROBE = '/v1/projects/probe/guidance'
+GUIDANCE_ACK_PROBES = ('/v1/projects/probe/guidance/ack',
+                       '/v1/projects/probe/guidance/acknowledge')
+
+
+def serves_web_guidance(routes=None):
+    """(read, ack): does this service serve both agent guidance routes over HTTP?
+
+    The registered route table is the authority, not a hand-kept flag: an installation
+    whose kit serves the two routes shows the item exactly as kittrial-5bb.325 made it,
+    and one that does not is spared an item its web agents cannot clear. ``routes`` is
+    for tests and defaults to the table this module has registered.
+    """
+    read = ack = False
+    for verb, pattern, _name, _anonymous, _csrf in (ROUTES if routes is None else routes):
+        if verb == 'GET' and pattern.match(GUIDANCE_READ_PROBE):
+            read = True
+        elif verb == 'POST' and any(pattern.match(probe) for probe in GUIDANCE_ACK_PROBES):
+            ack = True
+    return read, ack
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -4189,6 +4739,27 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _project(self, ctx, capability=CAP_READ):
         return self.service.check_authority(ctx.principal, ctx.params['pid'], capability)
 
+    #: What an answer is when a backend (a test double from an older slice) has no
+    #: claiming setting: absent means open, today's behaviour.
+    CLAIMING_DEFAULT = {'claiming': 'open', 'set_by': None, 'set_at': None,
+                        'set_via': None, 'previous': None, 'history': [],
+                        'source': 'default'}
+
+    def _claiming_state(self, project_id):
+        """The project's claiming setting from the backend, or the open default.
+
+        Both shipped backends implement ``claiming_state`` (kittrial-5bb.352); a backend
+        double that predates it keeps answering as an open project rather than failing
+        a listing, exactly as a project with no file reads.
+        """
+        read = getattr(self.backend, 'claiming_state', None)
+        if read is None:
+            return dict(self.CLAIMING_DEFAULT)
+        return read(project_id)
+
+    def _claiming_mode(self, project_id):
+        return self._claiming_state(project_id)['claiming']
+
     def _task_payload(self, ctx):
         payload = dict(ctx.payload or {})
         payload['task_id'] = ctx.params['tid']
@@ -4203,13 +4774,25 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: review, project PATCH, onboarding and proposals routes already refuse the same way.
     TASK_CREATE_FIELDS = ('title', 'description', 'priority', 'attachments', 'actor')
     TASK_CLAIM_FIELDS = ('actor',)
+    #: What a claim release takes from the caller's own body (kittrial-5bb.301): a short
+    #: reason, and nothing else. The holder is derived from the authenticated caller, never
+    #: submitted, so no caller can release somebody else's claim by naming them.
+    TASK_RELEASE_FIELDS = ('reason',)
+    #: The longest reason a release may carry. Short by design: it is a note to the next
+    #: holder, not a message.
+    CLAIM_RELEASE_REASON_MAX = 120
     CHECKPOINT_BODY_FIELDS = EndpointBackend.CHECKPOINT_FIELDS + ('actor',)
     MEMBER_FIELDS = ('role',)
     CREDENTIAL_ISSUE_FIELDS = ('label', 'scopes', 'actor', 'allow_actor', 'allow_actor_reason')
     AGENT_CREATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
-                           'projects', 'scopes')
+                           'projects', 'scopes', 'owner', 'claim_limit', 'role')
     AGENT_UPDATE_FIELDS = ('name', 'tool', 'working_directory', 'machine', 'notes',
-                           'projects', 'enabled')
+                           'projects', 'enabled', 'claim_limit', 'role')
+    #: The agent's OWN route (``PATCH /v1/agents/me``, kittrial-5bb.302, .329) takes the
+    #: fields an agent may change on its own record: its claim limit (downward only),
+    #: its working_directory (when the extension or agent records the open workspace folder),
+    #: and its role ('worker' or 'reviewer').
+    AGENT_ME_UPDATE_FIELDS = ('claim_limit', 'working_directory', 'role')
     AGENT_CREDENTIAL_FIELDS = ('label', 'scopes')
     ACCOUNT_CREATE_FIELDS = ('username', 'display_name')
 
@@ -4285,7 +4868,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         body.update(extra)
         return body
 
-    def _task_view(self, task, names):
+    def _task_view(self, task, names, tasks=None, project_id=None, claiming=None):
         """A task row plus presentation fields (assignee name, next action, requirement
         marker and claimability). Additive: every field a route already returned stays.
 
@@ -4295,21 +4878,39 @@ class ApiHandler(BaseHTTPRequestHandler):
         tasks list cannot disagree with the queue about what is claimable work
         (kittrial-5bb.277). The list route feeds its rows through here, so a web Tasks
         page can mark a requirement record plainly instead of offering it as a task.
+
+        ``claiming`` is the project's claiming setting (kittrial-5bb.352), read fresh
+        when the caller does not pass it; under ``assigned`` an unassigned row is not
+        claimable and its next action names the coordinators instead of inviting a claim.
         """
         from work import claimable, requirement_record
+        if claiming is None:
+            claiming = (self._claiming_mode(project_id)
+                        if project_id else 'open')
         view = dict(task)
         assignee = view.get('assignee')
         view['assignee_name'] = names.get(assignee, assignee) if assignee else None
-        view['next_action'] = next_action(view)
+        view['next_action'] = next_action(view, claiming=claiming)
         view['requirement_record'] = requirement_record(view.get('labels'))
+        from work import dependency_index, open_dependency_ids
+        # A list view passes its snapshot; a single-task view passes none, and the
+        # dependency entries themselves carry the other end's status (bd show),
+        # so the block is visible with no extra read (kittrial-5bb.293 rev4).
+        snapshot = tasks if isinstance(tasks, list) else None
+        view['open_dependencies'] = open_dependency_ids(task, snapshot,
+            index=dependency_index(snapshot) if snapshot is not None else None)
         view['claimable'] = claimable(view.get('issue_type'), view.get('status'), assignee,
                                       view.get('contribution_id'), view.get('review_state'),
-                                      labels=view.get('labels'))
+                                      labels=view.get('labels'),
+                                      open_dependencies=view['open_dependencies'] or None,
+                                      claiming=claiming)
         return view
 
     def _task_views(self, tasks, project_id=None):
         names = self._actor_names([t.get('assignee') for t in tasks], project_id)
-        return [self._task_view(t, names) for t in tasks]
+        claiming = (self._claiming_mode(project_id)
+                    if project_id else 'open')
+        return [self._task_view(t, names, tasks=tasks, claiming=claiming) for t in tasks]
 
     def _actor_names(self, actors, project_id=None):
         """Display names, as :meth:`Service.actor_names` gives them, and a host session's too.
@@ -4636,6 +5237,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'project_create': (
                     'create' if getattr(self.backend, 'PROJECT_CREATE', 'create') == 'create' else
                     'register' if principal.superuser and principal.via != 'credential' else 'operator-only')}
+        if principal.credential_id:
+            expiry = self._credential_expiry_view(principal)
+            if expiry is not None:
+                body['credential_expiry'] = expiry
+        # Additive (kittrial-5bb.330): a browser session also reads the installation's idle
+        # window and this session's deadlines here. This read is the light authenticated
+        # touch the agent set-up wizard keeps the session alive with, and the deadline is
+        # what it warns before. A credential has no browser session and adds nothing.
+        session_expiry = self.service.session_expiry_view(principal)
+        if session_expiry is not None:
+            body.update(session_expiry)
         # Additive (kittrial-5bb.118 part 2): whether this account may create a project
         # on the host from here, with its limit and how many it has. Only where the
         # backend has a host.
@@ -4651,6 +5263,21 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('DELETE', r'/v1/sessions/current')
     def sessions_delete(self, ctx):
         return 204, self.service.logout(ctx.principal, request_id=ctx.request_id)
+
+    def _credential_expiry_view(self, principal):
+        """The caller's own credential expiry, or ``None`` when it has none to show.
+
+        The same secret-free shape both ``GET /v1/sessions/current`` and
+        ``GET /v1/agents/me`` answer (kittrial-5bb.294 item 1). A worker credential has
+        no agent identity and no view, exactly as before; an agent credential reads its
+        own stored deadline, capped at 366 days from issuance on read (item 4). This
+        never looks at any other credential.
+        """
+        credential_id = getattr(principal, 'credential_id', None)
+        credential = self.service.state['credentials'].get(credential_id) if credential_id else None
+        if credential and credential.get('agent_id'):
+            return self.service.agent_credential_expiry_view(credential)
+        return None
 
     @route('POST', r'/v1/accounts')
     def accounts_create(self, ctx):
@@ -5399,6 +6026,63 @@ class ApiHandler(BaseHTTPRequestHandler):
                             capability=capability, serialize=False, canonical=True,
                             audit_success=False, replay_check=replay_check)
 
+    def _followon_write(self, ctx, operation):
+        """Record or withdraw the coordinator's hand-back (kittrial-5bb.343).
+
+        Both routes take the SAME ``CAP_COORDINATE`` gate as every other coordinator
+        write and both call the canonical `assignee-followon` action, which runs the
+        one library function the confined coordinator command runs. The record's
+        authority is its host journal entry, so a plain comment posted by any other
+        route stays inert even if it carries the reserved prefix.
+
+        ``record`` takes exactly ``text``; ``withdraw`` takes exactly ``reason`` and
+        names the follow-on in the path. The server derives the contribution, the
+        integration record it cites and the native order under the project lock; the
+        caller never supplies those.
+        """
+        pid = ctx.params['pid']
+        if operation == 'record':
+            route_name = 'followons.record'
+            fields = ('text',)
+            status = 201
+            where = 'A hand-back'
+        else:
+            route_name = 'followons.withdraw'
+            fields = ('reason',)
+            status = 200
+            where = 'A hand-back withdrawal'
+        if not hasattr(self.backend, 'ROUTES') or route_name not in self.backend.ROUTES:
+            raise not_implemented('Recording a hand-back is unavailable on this server')
+        self._project(ctx, CAP_COORDINATE)
+
+        def write():
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request '
+                              'after an uncertain outcome')
+            payload = dict(ctx.payload or {})
+            refuse_unknown_fields(payload, fields, where)
+            if set(payload) != set(fields):
+                raise invalid('Supply exactly ' + ', '.join(fields))
+            body = {'task_id': ctx.params['tid'], fields[0]: payload[fields[0]]}
+            if operation == 'withdraw':
+                body['target'] = ctx.params['fid']
+            result = self.backend.invoke(route_name, ctx.principal, pid, body,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_COORDINATE)
+            return result, result
+        return self._mutate(ctx, route_name, pid, write, capability=CAP_COORDINATE,
+                            status=status, serialize=False, canonical=True)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID
+                  + r')/assignee-followon')
+    def task_followon_record(self, ctx):
+        return self._followon_write(ctx, 'record')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID
+                  + r')/assignee-followon/(?P<fid>' + ID + r')/withdraw')
+    def task_followon_withdraw(self, ctx):
+        return self._followon_write(ctx, 'withdraw')
+
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/merge-slot/acquire')
     def merge_slot_acquire(self, ctx):
         return self._merge_slot_write(ctx, 'acquire')
@@ -5418,7 +6102,40 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')')
     def project_get(self, ctx):
         self._project(ctx, CAP_READ)
-        return 200, self._usable(self.service.project_view(ctx.principal, ctx.params['pid']))
+        result = self._usable(self.service.project_view(ctx.principal, ctx.params['pid']))
+        # The per-project claiming setting (kittrial-5bb.352), read FRESH from the
+        # project's directory: it lives outside the tracker and is not cached. The
+        # Settings page also learns whether this caller may change it.
+        result['claiming'] = self._claiming_state(ctx.params['pid'])
+        result['can_coordinate'] = self._guidance_can_coordinate(ctx)
+        return 200, result
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/claiming')
+    def project_claiming(self, ctx):
+        """Set the project's claiming mode (kittrial-5bb.352).
+
+        Owners and coordinators (CAP_COORDINATE, which includes an owner and an agent
+        holding the coordinator grant) may set it; workers, reviewers and viewers may
+        not. The write records who set it, when and by which route, is audited, and is
+        carried by the coordination backup.
+        """
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'claiming'}:
+            raise invalid("Send exactly the field to change: claiming")
+        value = payload['claiming']
+        if value not in ('open', 'assigned'):
+            raise invalid("claiming must be 'open' or 'assigned'")
+        actor = self.service.bind_actor(ctx.principal, None)
+        write = getattr(self.backend, 'set_claiming', None)
+        if write is None:
+            raise not_implemented('This server cannot store the claiming setting')
+
+        def update():
+            result = write(ctx.params['pid'], value, actor, via='web')
+            return result, result
+        return self._mutate(ctx, 'projects.claiming', ctx.params['pid'], update,
+                            capability=CAP_COORDINATE,
+                            audit_metadata={'claiming': value})
 
     @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')')
     def project_update(self, ctx):
@@ -5434,11 +6151,92 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'projects.update', ctx.params['pid'], update,
                             capability=CAP_PROJECT_ADMIN)
 
+    def _guidance_project(self, ctx, capability=CAP_READ):
+        self._project(ctx, capability)
+        if not hasattr(self.backend, 'guidance_command'):
+            raise not_implemented('This server has no canonical guidance adapter')
+
+    def _guidance_can_coordinate(self, ctx):
+        try:
+            self.service.check_authority(ctx.principal, ctx.params['pid'], CAP_COORDINATE)
+            return True
+        except HttpError:
+            return False
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/guidance')
+    def project_guidance(self, ctx):
+        self._guidance_project(ctx)
+        result = self.backend.guidance_command(ctx.principal, ctx.params['pid'], 'read')
+        return 200, dict(result, can_coordinate=self._guidance_can_coordinate(ctx))
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/guidance/status')
+    def project_guidance_status(self, ctx):
+        self._guidance_project(ctx, CAP_COORDINATE)
+        pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(pairs) - {'offset', 'limit'} or any(len(v) != 1 for v in pairs.values()):
+            raise invalid('Use only one offset and limit')
+        try:
+            offset = int(pairs.get('offset', ['0'])[0])
+            limit = int(pairs.get('limit', ['50'])[0])
+        except (ValueError, TypeError):
+            raise invalid('Use an integer offset and limit') from None
+        if not 0 <= offset <= 500 or not 1 <= limit <= 100:
+            raise invalid('Use offset 0..500 and limit 1..100')
+        return 200, self.backend.guidance_command(ctx.principal, ctx.params['pid'], 'status',
+                                                  body=dict(offset=offset, limit=limit))
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/onboarding/read')
+    def project_onboarding_read(self, ctx):
+        """Every current project member reads the WHOLE document, including operator text."""
+        self._guidance_project(ctx)
+        result = self.backend.guidance_command(ctx.principal, ctx.params['pid'], 'onboarding')
+        return 200, dict(result, can_coordinate=self._guidance_can_coordinate(ctx))
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/guidance')
+    def project_guidance_set(self, ctx):
+        return self._guidance_write(ctx, 'set')
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/guidance')
+    def project_guidance_clear(self, ctx):
+        return self._guidance_write(ctx, 'clear')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/guidance/ack')
+    def project_guidance_ack(self, ctx):
+        return self._guidance_write(ctx, 'ack')
+
+    def _guidance_write(self, ctx, operation):
+        capability = CAP_READ if operation == 'ack' else CAP_COORDINATE
+        self._guidance_project(ctx, capability)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        fields = {'set': {'text'}, 'ack': {'version'}, 'clear': set()}[operation]
+        if set(payload) != fields or (ctx.payload is not None and not isinstance(ctx.payload, dict)):
+            raise invalid('Send exactly: ' + (', '.join(sorted(fields)) or 'an empty object'))
+        import web_guidance
+        body = {k: v for k, v in payload.items() if k != 'text'}
+        try:
+            web_guidance.validate(dict(body, operation=operation),
+                {'text': {'flag': '--file', 'text': payload['text']}} if operation == 'set' else {})
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        key = ctx.idempotency_key or ctx.request_id
+        def write():
+            try:
+                result = self.backend.guidance_command(ctx.principal, ctx.params['pid'], operation,
+                                                        body=body, text=payload.get('text'), key=key)
+            except HttpError as failure:
+                if failure.status == 503 and not getattr(failure, 'nothing_done', False):
+                    raise UncertainOutcome() from None
+                raise
+            return result, result
+        def replay_check():
+            self.backend.guidance_replay_guard(ctx.principal, ctx.params['pid'], operation)
+        return self._mutate(ctx, 'guidance.' + operation, ctx.params['pid'], write, capability=capability,
+                            serialize=False, canonical=True, reason=operation, replay_check=replay_check)
+
     def _onboarding_owner(self, ctx):
-        # Project administration is refused for every credential by the authority rule itself
-        # (CREDENTIAL_FORBIDDEN_CAPABILITIES), so no second check for a credential stands here:
-        # one stood, could not be reached, and no test could pin it (review 01a109cc).
-        self._project(ctx, CAP_PROJECT_ADMIN)
+        # The existing edit route retains operator-text withholding; the member read
+        # is a distinct route. Granted personal coordinator agents may edit too.
+        self._project(ctx, CAP_COORDINATE)
         if not hasattr(self.backend, 'set_onboarding'):
             raise not_implemented('This server has no host project behind it, so there is no onboarding text to set')
 
@@ -5451,6 +6249,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         document is reported as set, with its size, and is not returned here.
         """
         self._onboarding_owner(ctx)
+        if hasattr(self.backend, 'guidance_command'):
+            return 200, self.backend.guidance_command(ctx.principal, ctx.params['pid'], 'onboarding-edit')
         from onboarding import PROJECT_LIMIT, WEB_HEADER, split_web
         document = self.backend.read_onboarding(ctx.params['pid'])
         if document is None:
@@ -5484,6 +6284,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def project_onboarding_clear(self, ctx):
         """Remove onboarding text an owner set here. The operator's own text is not removable here."""
         self._onboarding_owner(ctx)
+        if ctx.payload is not None and (not isinstance(ctx.payload, dict) or ctx.payload):
+            raise invalid('Send an empty object to clear onboarding')
         return self._onboarding_write(ctx, None)
 
     def _onboarding_write(self, ctx, text):
@@ -5509,8 +6311,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self.service.store.save()
             return result, result
         size = 'cleared' if text is None else 'set %d bytes' % len(text.encode('utf-8'))
-        return self._mutate(ctx, 'projects.onboarding', ctx.params['pid'], write, capability=CAP_PROJECT_ADMIN,
-                            serialize=False, canonical=True, reason='account=%s %s' % (ctx.principal.user_id, size))
+        def replay_check():
+            if hasattr(self.backend, 'guidance_replay_guard'):
+                self.backend.guidance_replay_guard(ctx.principal, ctx.params['pid'], 'onboarding')
+        return self._mutate(ctx, 'projects.onboarding', ctx.params['pid'], write, capability=CAP_COORDINATE,
+                            serialize=False, canonical=True, reason='account=%s %s' % (ctx.principal.user_id, size),
+                            replay_check=replay_check)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/setup')
     def project_setup(self, ctx):
@@ -5714,13 +6520,78 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/agents/me')
     def agents_me(self, ctx):
         agent = self.service.agent_for_credential(ctx.principal)
-        return 200, {'agent': agent, 'attention': self._agent_attention_view(agent),
-                     'generated_at': now_iso(self.service._now())}
+        # The agent record only (kittrial-5bb.303): this route is a polled whoami, so it
+        # makes NO work read. The counted limit/held/available view needs the bounded
+        # current-work snapshot, so it stays on ``/v1/agents/me/next``, which already
+        # reads it; here the limit and who may raise it come from the record and one
+        # constant (kittrial-5bb.276/302). The secretless ``setup`` bundle (kittrial-5bb.329)
+        # is built from the in-memory record and project metadata only, so the VS Code
+        # extension can write ``.orchestra/agent.json``, ``.orchestra/AGENT.md`` and
+        # ``.gitignore`` into the open workspace folder directly from this route.
+        body = {'agent': agent,
+                'setup': self.service.agent_setup(agent, None),
+                'claim_limit': self._agent_claim_limit_record_view(agent),
+                'links': {'self': '/v1/agents/me', 'next': '/v1/agents/me/next'},
+                'generated_at': now_iso(self.service._now())}
+        # The calling credential's OWN expiry, in exactly the shape /v1/sessions/current
+        # answers (kittrial-5bb.294 item 1): the agent set-up prompt and the bridge
+        # extension read this route, and the read caps the stored expiry at 366 days from
+        # issuance (item 4). No new disclosure: it is the caller's credential only, never
+        # another credential's.
+        expiry = self._credential_expiry_view(ctx.principal)
+        if expiry is not None:
+            body['credential_expiry'] = expiry
+            body['expires_soon'] = bool(expiry.get('expires_soon'))
+        return 200, body
+
+    @route('PATCH', r'/v1/agents/me')
+    def agents_me_update(self, ctx):
+        """The agent's own record updates (kittrial-5bb.302, .329).
+
+        Takes ``claim_limit`` (lowering only: a whole number from 1 up to the value the
+        agent holds now; raising it stays the owner's move, refused with a sentence that
+        names the owner's account or a superuser and the My agents page) and/or
+        ``working_directory`` (so the extension or agent can record or update the open
+        workspace folder). The identity is the caller's own credential, never a body
+        field, so this route cannot touch another agent's record; the owner's route
+        (``PATCH /v1/agents/{id}``) is unchanged.
+        """
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, self.AGENT_ME_UPDATE_FIELDS, 'An agent self-change')
+        if not any(field in payload for field in self.AGENT_ME_UPDATE_FIELDS):
+            raise invalid('Nothing to change. An agent self-change takes: %s'
+                          % ', '.join(self.AGENT_ME_UPDATE_FIELDS))
+        has_limit = 'claim_limit' in payload
+        has_dir = 'working_directory' in payload
+        has_role = 'role' in payload
+        action = ('agents.claim_limit.lower' if has_limit and not has_dir and not has_role
+                  else 'agents.working_directory.set' if has_dir and not has_limit and not has_role
+                  else 'agents.role.set' if has_role and not has_limit and not has_dir
+                  else 'agents.me.update')
+        metadata = {}
+
+        def update_self():
+            result = self.service.update_own_agent(ctx.principal, payload)
+            # Who changed what, on the committed audit event (kittrial-5bb.302 item 4, .329).
+            metadata.update({'agent': result['agent']['id'], 'actor': ctx.principal.actor})
+            if has_limit:
+                metadata.update({'old_limit': result['old_limit'],
+                                 'new_limit': result['new_limit']})
+            if has_dir:
+                metadata.update({'old_working_directory': result['old_working_directory'],
+                                 'new_working_directory': result['new_working_directory']})
+            if has_role:
+                metadata.update({'old_role': result['old_role'],
+                                 'new_role': result['new_role']})
+            return result, result
+        return self._mutate(ctx, action, None, update_self,
+                            capability=CAP_AGENT_SELF, audit_metadata=metadata)
 
     @route('GET', r'/v1/agents/me/next')
     def agents_me_next(self, ctx):
+        role_override = validate_agent_role(ctx.query['role']) if 'role' in ctx.query else None
         agent = self.service.agent_for_credential(ctx.principal)
-        attention = self._agent_attention(ctx.principal, agent)
+        attention = self._agent_attention(ctx.principal, agent, role=role_override)
         # `repository` is where the project's owner says its code lives (kittrial-5bb.118):
         # a label, null when not recorded. Data for the agent, never an instruction.
         projects = [{'id': p['id'], 'name': p['name'], 'repository': p.get('repository')}
@@ -5728,6 +6599,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, {
             'agent': agent,
             'attention': self._agent_attention_view(agent, attention),
+            # The agent's own claim limit and what holds it (kittrial-5bb.276), so an
+            # agent can see what is in the way without reading the queue itself.
+            'claim_limit': self._agent_claim_limit_view(agent, attention),
             'next_action': attention['actions'][0] if attention['actions'] else None,
             'next_actions': attention['actions'],
             'projects': projects,
@@ -5739,6 +6613,90 @@ class ApiHandler(BaseHTTPRequestHandler):
             'generated_at': now_iso(self.service._now()),
         }
 
+    @route('GET', r'/v1/agents/me/wait')
+    def agents_me_wait(self, ctx):
+        """The agent's own move read for a blocking wait (kittrial-5bb.285).
+
+        The bridge extension (or any web agent) polls this route and blocks in ITS own
+        loop; the SSH client's ``client.py wait`` blocks in the client and polls the
+        endpoint's ``wait`` action. Both compute the same projection with
+        ``waiting.worker_view`` over the canonical rows, so one task's fingerprint means
+        the same fact on either route: the caller decides whether to sleep, the server
+        never does, and nothing is scheduled.
+
+        ONE cheap read per granted project (the same bounded current-work snapshot
+        ``/v1/agents/me/next`` already uses, reused within the request); the whose-move
+        decision is the ONE ``work.move_decision``, so this route cannot offer a task the
+        canonical queue would not call the agent's move.
+        """
+        import waiting
+        from work import move_decision
+        agent = self.service.agent_for_credential(ctx.principal)
+        actor = agent.get('actor') or agent.get('id')
+        rows = []
+        #: The claiming setting of every project this read covered (kittrial-5bb.352
+        #: review item S1): the same fresh per-project read the endpoints and
+        #: /v1/agents/me/next use, so an empty wait under 'assigned' carries the
+        #: sentence saying who hands work out instead of looking idle.
+        claiming_modes = {}
+        for project_id in agent.get('projects') or []:
+            if not self._agent_may_read(ctx.principal, project_id):
+                continue
+            claiming_modes[project_id] = self._claiming_mode(project_id)
+            # The guidance acknowledgement is a move row too (kittrial-5bb.325), so a web
+            # agent's wait wakes for a new version and its fingerprint changes with it;
+            # the row is the same one /v1/agents/me/next shows as its first next_action.
+            # Withheld while this service has no HTTP guidance read/ack route to clear it
+            # (kittrial-5bb.334): a row that cannot be acted on must not be a wake.
+            item = self._agent_guidance_item(project_id, actor)
+            if item is not None:
+                rows.append(dict(item, project=project_id))
+            read = self._agent_project_tasks(project_id)
+            for task in read.get('tasks') or []:
+                if not isinstance(task, dict):
+                    continue
+                state = task.get('review_state')
+                pending = task.get('pending_review_items')
+                if not isinstance(pending, int):
+                    pending = task.get('open_requests')
+                if not isinstance(pending, int):
+                    pending = 0
+                move, _text, next_actor_value = move_decision(
+                    state, task.get('id'), claim_limit.actor_holds(task.get('assignee'), actor),
+                    pending_items=pending, redelivered=bool(task.get('redelivered')),
+                    assignee=task.get('assignee'), closed=task.get('status') == 'closed',
+                    claimable=task.get('claimable') if isinstance(task.get('claimable'), bool) else None)
+                if move == 'you':
+                    rows.append(dict(task, task=task.get('id'), project=project_id,
+                                     whose_move=move, next_actor=next_actor_value,
+                                     # The wait row carries the marker and its counts
+                                     # (kittrial-5bb.351): a new other-party entry, or an
+                                     # edit to it, moves the fingerprint even while the
+                                     # boolean stays true.
+                                     newer_activity_marker=attention_field(task, 'newer_activity_marker'),
+                                     newer_activity_by_others=attention_field(task, 'newer_activity_by_others'),
+                                     newer_activity_own=attention_field(task, 'newer_activity_own'),
+                                     newer_activity_coverage=attention_field(task, 'newer_activity_coverage'),
+                                     unresolved_directions=attention_field(task, 'unresolved_directions')))
+        # The project's claiming setting on the wait read (kittrial-5bb.352 review item
+        # S1). The wait can span projects, so report one mode only when they agree;
+        # under any 'assigned' project an empty wait carries the empty-list sentence,
+        # exactly as the agent next/attention loop decides it.
+        modes = set(claiming_modes.values())
+        claiming = (next(iter(modes)) if len(modes) == 1
+                    else ('assigned' if 'assigned' in modes else None))
+        empty_message = None
+        if not rows and 'assigned' in modes:
+            from claiming import EMPTY_SENTENCE
+            empty_message = EMPTY_SENTENCE
+        view = waiting.worker_view(rows, claiming=claiming, empty_message=empty_message)
+        view['agent'] = agent.get('id')
+        view['generated_at'] = now_iso(self.service._now())
+        view['manual_cadence'] = ('Read this route again to see a change; it never blocks, '
+                                  'never sleeps and schedules nothing. --since is the caller\'s '
+                                  'own memory of the last fingerprint it acted on.')
+        return 200, view
+
     @route('POST', r'/v1/agents')
     def agents_create(self, ctx):
         payload = dict(ctx.payload or {})
@@ -5749,18 +6707,28 @@ class ApiHandler(BaseHTTPRequestHandler):
             # caller cannot see keeps the service's own 404, exactly as the same body
             # without the unknown field does. Only then is a field the route does not
             # take refused, not dropped (kittrial-5bb.183 item 2).
-            self._require_grantable(ctx.principal, payload.get('projects'), ())
-            self.service.check_agent_grant(ctx.principal, payload.get('projects'))
+            owner = self.service.agent_creation_owner(ctx.principal, payload.get('owner', ctx.principal.user_id))
+            self._require_grantable(ctx.principal, payload.get('projects'), (), owner_id=owner)
+            self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=owner)
             refuse_unknown_fields(payload, self.AGENT_CREATE_FIELDS, 'An agent creation')
+            claim_limit_value = (validate_claim_limit(payload.get('claim_limit'))
+                                 if 'claim_limit' in payload else None)
+            role_value = (validate_agent_role(payload.get('role'))
+                          if 'role' in payload else None)
             result = self.service.create_agent(
                 ctx.principal, name=payload.get('name'), tool=payload.get('tool'),
                 working_directory=payload.get('working_directory'),
                 machine=payload.get('machine'), notes=payload.get('notes'),
                 projects=payload.get('projects'), scopes=payload.get('scopes'),
-                request_id=ctx.request_id)
+                request_id=ctx.request_id, owner=owner, claim_limit=claim_limit_value,
+                role=role_value)
             return result, _redact_agent_secret(result)
+        def replay_check():
+            owner = self.service.agent_creation_owner(ctx.principal, payload.get('owner', ctx.principal.user_id))
+            self._require_grantable(ctx.principal, payload.get('projects'), (), owner_id=owner)
+            self.service.check_agent_grant(ctx.principal, payload.get('projects'), owner_id=owner)
         return self._mutate(ctx, 'agents.create', None, create, status=201,
-                            capability=CAP_AGENTS, replay_status=200)
+                            capability=CAP_AGENTS, replay_status=200, replay_check=replay_check)
 
     def _agent_items(self, principal, agents=None):
         items = []
@@ -5788,6 +6756,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         items = self._agent_items(ctx.principal)
         return 200, {'items': items, 'total': len(items),
                      'generated_at': now_iso(self.service._now())}
+
+    @route('GET', r'/v1/agents/(?P<aid>' + ID + r')/history')
+    def agents_history(self, ctx):
+        """The agent's history, its owner's view (kittrial-5bb.365): credentials issued,
+        revoked, extended; disabled, enabled, changed; projects given and taken. Readable by
+        the agent's owner or a superuser; anyone else gets the plain 404 an unknown id gets.
+        A credential cannot read it (``agents.manage`` is never a credential's)."""
+        self.require(ctx, CAP_AGENTS)
+        return 200, dict(self.service.agent_history(ctx.principal, ctx.params['aid']),
+                         generated_at=now_iso(self.service._now()))
 
     @route('GET', r'/v1/agents/(?P<aid>' + ID + r')')
     def agents_get(self, ctx):
@@ -5826,6 +6804,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             refuse_unknown_fields(payload, self.AGENT_UPDATE_FIELDS, 'An agent change')
             if 'enabled' in payload and payload['enabled'] is not None and not bool(payload['enabled']):
                 metadata.update(self._revocation_metadata(agent_id=ctx.params['aid']))
+            # The event names its agent (kittrial-5bb.365), so the agent's history lists it.
+            metadata.setdefault('agent_ids', [ctx.params['aid']])
             result = self.service.update_agent(ctx.principal, ctx.params['aid'], payload,
                                                request_id=ctx.request_id)
             return result, result
@@ -5884,6 +6864,99 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, 'agents.enable', None, enable, capability=CAP_AGENTS)
 
+    #: How many claims one bulk release takes off an agent in one request. A
+    #: release is one canonical assignment each; the bound keeps one request from
+    #: walking a very large held set, and the answer says when it was cut.
+    CLAIM_RELEASE_LIMIT = 20
+
+    @route('POST', r'/v1/agents/(?P<aid>[^/]+)/release-claims')
+    def agents_release_claims(self, ctx):
+        """Release an agent's claimed, undelivered tasks from the web (kittrial-5bb.276).
+
+        The owner incident's second half: a claim could be released only on the host.
+        A single claim is released through the ordinary assignment route
+        (``POST /v1/projects/{pid}/tasks/{tid}/assign`` with ``assignee: null``); this
+        route releases every held, undelivered claim of one agent across every project
+        it is granted, so a person need not walk the queue. It uses the same canonical
+        ``tasks.assign`` each single release uses, under the caller's own authority, so
+        nothing here invents a second way to clear an assignee.
+
+        The caller must hold the coordinate capability in every project it is about to
+        release in (one check per project, before any write). A caller who may
+        administer the agent but not one of its projects is refused with that project
+        named, which is the move to ask its owner; no partial release is made under a
+        caller who may release in only some of them.
+
+        ``dry_run`` answers how many claims it would release, per project, and writes
+        nothing.
+        """
+        aid = ctx.params['aid']
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, ('dry_run',), 'An agent claim release')
+        dry_run = bool(payload.get('dry_run'))
+        if ctx.idempotency_key is None and not dry_run:
+            raise invalid('Send an Idempotency-Key: releasing claims writes')
+        # The record's ownership is judged before what the server can do with it,
+        # so a caller with no right to the agent keeps the service's own 404.
+        agent = self.service.get_agent(ctx.principal, aid)
+        if 'tasks.assign' not in self.backend.ROUTES:
+            raise not_implemented('Canonical task assignment is unavailable on this server')
+        actor = agent.get('actor') or agent.get('id')
+        from claim_limit import held_undelivered
+        projects = list(agent.get('projects') or [])
+        # Authority over every project first, so a caller who may release in only
+        # some of them cannot half-release the agent.
+        for project_id in projects:
+            try:
+                self.service.check_authority(ctx.principal, project_id, CAP_COORDINATE)
+            except HttpError as refusal:
+                raise conflict(
+                    'You cannot release claims in %s, so nothing was released: %s'
+                    % (project_id, refusal.message),
+                    {'project': project_id, 'released': []}) from None
+        planned, released, failed = [], [], []
+        truncated = False
+        for project_id in projects:
+            read = self.backend.agent_tasks(project_id, actor)
+            held = held_undelivered(read.get('tasks') or [])
+            if not read.get('complete'):
+                raise conflict('The agent\'s held tasks could not be read completely, so no claim '
+                               'was released.', {'project': project_id, 'held_readable': False})
+            if len(held) > self.CLAIM_RELEASE_LIMIT:
+                truncated = True
+            counts = {'project': project_id, 'held': len(held),
+                      'tasks': [row.get('id') for row in held]}
+            planned.append(counts)
+            for row in held[:self.CLAIM_RELEASE_LIMIT]:
+                if dry_run:
+                    continue
+                key = '%s/%s' % (ctx.idempotency_key, row.get('id'))
+                try:
+                    self.backend.invoke('tasks.assign', ctx.principal, project_id,
+                                        {'task_id': row.get('id'), 'expected_assignee': row.get('assignee') or actor,
+                                         'assignee': None,
+                                         # The full closed body the canonical assignment takes:
+                                         # _command indexes these two directly, so a release
+                                         # without them raised a KeyError and answered 500 on the
+                                         # endpoint backend (revision, review item 3a). Both
+                                         # false: a release clears an undelivered claim that is
+                                         # already this agent's, so neither exception applies.
+                                         'allow_pending_review': False, 'allow_held_slot': False,
+                                         'reason': 'Owner released the agent\'s claims (%s)' % aid},
+                                        key, target=row.get('id'), authorize=ctx.authorize,
+                                        capability=CAP_COORDINATE)
+                except HttpError as refusal:
+                    # One row that cannot be released does not stop the rest; it is
+                    # reported by name with the canonical sentence.
+                    failed.append({'project': project_id, 'task': row.get('id'),
+                                   'message': refusal.message})
+                    continue
+                released.append({'project': project_id, 'task': row.get('id')})
+        return 200, {'operation': 'agents.claims.release', 'agent': aid,
+                     'released': released, 'failed': failed, 'planned': planned,
+                     'dry_run': dry_run, 'truncated': truncated,
+                     'candidate_total': sum(entry['held'] for entry in planned)}
+
     @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials')
     def agents_credential_issue(self, ctx):
         payload = dict(ctx.payload or {})
@@ -5924,7 +6997,43 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate_agent_credential(ctx, 'agents.credentials.revoke', revoke, status=204)
 
-    def _mutate_agent_credential(self, ctx, operation, fn, **options):
+    @route('POST', r'/v1/agents/(?P<aid>' + ID + r')/credentials/'
+                  r'(?P<cid>' + ID + r')/extend')
+    def agents_credential_extend(self, ctx):
+        return self._extend_agent_credential(ctx)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/credentials/'
+                  r'(?P<cid>' + ID + r')/extend')
+    def project_agent_credential_extend(self, ctx):
+        return self._extend_agent_credential(ctx, ctx.params['pid'])
+
+    def _extend_agent_credential(self, ctx, project_id=None):
+        def check():
+            agent, _ = self.service.agent_extension_target(
+                ctx.principal, ctx.params['aid'], ctx.params['cid'], project_id)
+            for pid in ([project_id] if project_id is not None else agent.get('projects') or []):
+                self._require_usable(pid)
+            refuse_unknown_fields(dict(ctx.payload or {}), (), 'An agent credential extension')
+        def extend():
+            check()
+            result = self.service.extend_agent_credential(
+                ctx.principal, ctx.params['aid'], ctx.params['cid'], project_id=project_id,
+                request_id=ctx.request_id)
+            return result, result
+        # The route's own capability is the coarse gate; the precise extension authority
+        # is decided once, in Service.agent_extension_target: CAP_AGENTS (the agent's own
+        # account or a superuser) for the agent route, CAP_PROJECT_ADMIN (that project's
+        # owner or a superuser) for the project route, and any credential caller refused
+        # first there. The project route's gate is therefore the authenticated project
+        # READ the caller already needs to see the agent, never a second, shadowing copy
+        # of the precise check: each guard is load-bearing and pinned by its own route
+        # test (kittrial-5bb.294 item 3).
+        return self._mutate_agent_credential(
+            ctx, 'agents.credentials.extend', extend, project_id=project_id,
+            capability=CAP_AGENTS if project_id is None else CAP_READ, replay_check=check)
+
+    def _mutate_agent_credential(self, ctx, operation, fn, *, project_id=None,
+                                 capability=CAP_AGENTS, **options):
         """Save the credential and its route audit in one atomic JSON replacement.
 
         Issuance rolls back before a successful state save. Revocation stays effective
@@ -5934,7 +7043,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         with self.service.store.lock:
             agent = self.service.state['agents'].get(ctx.params['aid'])
             if not isinstance(agent, dict):
-                return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS, **options)
+                return self._mutate(ctx, operation, project_id, fn, capability=capability, **options)
             saved = [False]
             with self.service._agent_credential_transaction(
                     agent, rollback=operation != 'agents.credentials.revoke') as mark_saved:
@@ -5942,13 +7051,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     mark_saved()
                     saved[0] = True
                 try:
-                    return self._mutate(ctx, operation, None, fn, capability=CAP_AGENTS,
+                    return self._mutate(ctx, operation, project_id, fn, capability=capability,
                                         audit_success=False, state_saved=state_saved, **options)
                 except HttpError:
                     raise  # _mutate already releases a refused reservation and audits it
                 except Exception:
                     if not saved[0] and ctx.idempotency_key is not None:
-                        digest = self.service._idempotency_key(ctx.principal, None,
+                        digest = self.service._idempotency_key(ctx.principal, project_id,
                             '%s %s' % (operation, ctx.route_target), ctx.idempotency_key)
                         self.service.idempotency_release(digest)
                     raise
@@ -5974,6 +7083,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                ctx.params['aid'])
         return 200, {'project': ctx.params['pid'], 'agent': agent,
                      'generated_at': now_iso(self.service._now())}
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/history')
+    def project_agent_history(self, ctx):
+        """The agent's history as this project's owners see it (kittrial-5bb.365): no
+        credential label, no scopes, nothing about another project, and nothing from before
+        the agent was given this project. An agent not granted here is the same 404 as the
+        project's agent read."""
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        return 200, dict(self.service.agent_history(ctx.principal, ctx.params['aid'], project_id=ctx.params['pid']),
+                         generated_at=now_iso(self.service._now()))
 
     @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/coordinator')
     def project_agent_coordinator_grant(self, ctx):
@@ -6055,7 +7174,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         read = cache[key]
         if not many:
             return read
-        return {'tasks': [task for task in read['tasks'] if task.get('assignee') == actor],
+        from claim_limit import actor_holds
+        return {'tasks': [task for task in read['tasks'] if actor_holds(task.get('assignee'), actor)],
                 'complete': read['complete']}
 
     #: At most this many reviewer actions are listed per read; the counts stay exact.
@@ -6206,7 +7326,143 @@ class ApiHandler(BaseHTTPRequestHandler):
         cache[key] = result
         return result
 
-    def _agent_attention(self, principal, agent, many=False):
+    def _refuse_claim_over_limit(self, ctx, task, claimant):
+        """Refuse a claim that would take an agent past its own limit or hard cap (kittrial-5bb.276/.300).
+
+        The limit is the claimed agent's own setting (``claim_limit`` on its record),
+        default one undelivered claim; the hard cap over all undelivered claims
+        (active plus blocked) is :func:`claim_limit.hard_cap` (``claim_limit + 3``).
+        A person is not limited. Re-claiming the task the agent already holds changes
+        nothing and is not counted again.
+
+        The held set comes from the same bounded ``work`` snapshot the agent's own
+        attention reads, across EVERY project the agent is granted, so the gate and
+        ``GET /v1/agents/me/next`` count the same rows. It fails CLOSED: if any of
+        those reads is incomplete, or the review state or blocking count of a held
+        row is not known, the claim is refused with a distinct sentence instead of
+        being let through, because an unreadable count must never read as "no
+        limit". A row whose latest checkpoint left a blocker or a dependency does
+        not count toward ``claim_limit`` itself, while still counting toward
+        :func:`claim_limit.hard_cap`: see :func:`claim_limit.blocked`.
+        """
+        from claim_limit import actor_holds, check, hard_cap, held_against_limit, held_blocked
+        if not isinstance(claimant, str) or not claimant:
+            return
+        agents = self.service.state.get('agents') or {}
+        owner = None
+        agent_id = getattr(getattr(ctx, 'principal', None), 'agent_id', None)
+        if agent_id:
+            record = agents.get(agent_id)
+            if isinstance(record, dict) and actor_holds(claimant, self.service.agent_actor(record)):
+                owner = record
+        if owner is None:
+            for record in agents.values():
+                # The attribution label an agent's own writes carry is its id
+                # (http_auth.Service.agent_actor), or a <agent>/<label> sub-label
+                # under it (kittrial-5bb.300 r2).
+                if isinstance(record, dict) and actor_holds(claimant, self.service.agent_actor(record)):
+                    owner = record
+                    break
+        if owner is None:
+            # A person's own session actor: not limited unless the owner set a limit
+            # on their record, and no person record carries one.
+            return
+        limit = self._agent_claim_limit_view(owner, None)['limit']
+        if limit is None:
+            return
+        cap = hard_cap(limit)
+        # The task being claimed is already this agent's own row when the backend
+        # would treat the claim as a no-op; only a NEW row counts.
+        if isinstance(task, dict) and task.get('assignee') == claimant:
+            return
+        agent_actor = self.service.agent_actor(owner)
+        project_id = ctx.params['pid']
+        # Every project the agent is granted is read, not only the one being claimed
+        # (kittrial-5bb.276 revision, review item 2b). Reading this project alone and
+        # treating "the agent has another project" as an incomplete set made a phantom
+        # held task, so an agent granted two projects could never claim at all while
+        # /v1/agents/me/next said it held nothing. It is the same set the attention
+        # view walks, so the gate and the read cannot disagree about held and
+        # available.
+        projects = []
+        for pid in [project_id] + list(owner.get('projects') or []):
+            if isinstance(pid, str) and pid not in projects:
+                projects.append(pid)
+        held, blocked_tasks, complete = [], [], True
+        for pid in projects:
+            try:
+                read = self.backend.agent_tasks(pid, agent_actor)
+            except Exception as error:
+                # Any failure at all is an unknown held set, never "no limit": the claim
+                # is refused with a sentence that says the read failed, rather than
+                # turning a tracker error into an unlimited agent.
+                raise conflict(
+                    'This agent\'s held tasks could not be read, so the claim is refused: %s'
+                    % error, {'claim_limit': limit, 'hard_cap': cap, 'held_readable': False}) from None
+            if not read.get('complete'):
+                complete = False
+            rows = read.get('tasks') or []
+            held.extend(held_against_limit(rows))
+            blocked_tasks.extend(held_blocked(rows))
+        sentence = check(limit, held, more=0 if complete else 1, blocked=blocked_tasks)
+        if sentence is None:
+            return
+        raise conflict(sentence, {'claim_limit': limit,
+                                  'hard_cap': cap,
+                                  'held': [row.get('id') for row in held],
+                                  'blocked': [row.get('id') for row in blocked_tasks],
+                                  'held_readable': complete,
+                                  # The claim route reads this to attach the same
+                                  # bounded claimable-candidate fall-through an
+                                  # ordinary held refusal carries, so an agent at
+                                  # its limit is still handed somewhere to go.
+                                  'claim_limit_refusal': True})
+
+    def _agent_guidance_item(self, project_id, actor):
+        """This actor's guidance move item for one project, or None (kittrial-5bb.325).
+
+        Only when this service serves BOTH routes a web agent needs to clear it - reading
+        the guidance and acknowledging a version over HTTP (:func:`serves_web_guidance`,
+        kittrial-5bb.212). Until then the item is withheld: .325 made a web agent stop and
+        ask, correctly, because over HTTP there is nothing it can run to clear the item
+        (kittrial-5bb.334). The SSH/endpoint reads keep it unchanged.
+
+        A backend with no guidance store (the in-process test backend) or a guidance
+        read that fails answers None: a guidance read never turns another read into an
+        error, exactly as an unreadable guidance record keeps its own repaired shape.
+        The item carries the version and the command, never the guidance text.
+        """
+        if not all(serves_web_guidance()):
+            return None
+        reader = getattr(self.backend, 'guidance_state', None)
+        if reader is None:
+            return None
+        try:
+            block = reader(project_id, actor)
+        except Exception:
+            return None
+        item = block.get('item') if isinstance(block, dict) else None
+        return item if isinstance(item, dict) else None
+
+    @staticmethod
+    def _guidance_action(project_id, actor, item):
+        """The one guidance acknowledgement as the agent's first next_action.
+
+        Priority 0 puts it ahead of every task action: the coordinator cannot reach a run
+        prompt that never calls `guidance get`, so a changed guidance version is the
+        agent's own move on its queue (kittrial-5bb.325). It carries the version and the
+        command the endpoint's own item names, and no task link, because it is not a task.
+        """
+        return {'priority': 0, 'kind': 'guidance', 'project': project_id,
+                'task': item.get('task') or 'guidance',
+                'title': item.get('title'), 'status': None,
+                'review_state': item.get('review_state'),
+                'assignee': actor, 'reason': item.get('text'),
+                'command': item.get('command'),
+                'guidance_version': item.get('guidance_version'),
+                'links': {'project': '/v1/projects/%s' % project_id}}
+
+    def _agent_attention(self, principal, agent, many=False, role=None):
         """Owner/agent-visible attention, computed at read time from bounded reads.
 
         Each granted project is re-authorized with the same live-authority check the
@@ -6232,19 +7488,47 @@ class ApiHandler(BaseHTTPRequestHandler):
         review state and does not count as blocked, regardless of open items.
         """
         actor = agent.get('actor') or agent.get('id')
+        effective_role = role if role is not None else agent.get('role')
         from work import review_move                                            # one move sentence for both answers (kittrial-5bb.249)
+        from claim_limit import actor_holds, held_against_limit, held_blocked   # the one counted-held rule the claim gate uses
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
                   'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
-                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0}
+                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0, 'guidance': 0}
+        #: The rows that count against this agent's claim limit and hard cap, by the one
+        #: rule the gate uses, so /v1/agents/me/next and the gate cannot disagree about
+        #: held and available (kittrial-5bb.276 revision; hard cap in kittrial-5bb.300).
+        claim_held = 0
+        claim_blocked = 0
         own_actions = []
+        guidance_actions = []
         claimable_actions = []
         review_actions = []
         truncated = False
         snapshot_truncated = own_tasks_truncated = actions_truncated = False
+        claiming_modes = {}
         for project_id in agent.get('projects') or []:
             if not self._agent_may_read(principal, project_id):
                 continue
+            # The per-project claiming setting (kittrial-5bb.352), read FRESH here (it
+            # lives outside the tracker, so the tracker read cache would not see it) and
+            # used by every claimability answer and next-action sentence below.
+            claiming_mode = self._claiming_mode(project_id)
+            claiming_modes[project_id] = claiming_mode
+            # The guidance acknowledgement (kittrial-5bb.325) is this agent's own move in
+            # every project it may read: one row per project whose current version this
+            # actor has not acknowledged. No guidance set means no row, and no row while
+            # this service has no HTTP guidance read/ack route to clear it
+            # (kittrial-5bb.334, one gate in _agent_guidance_item).
+            #
+            # Single-agent reads only: this item is the calling agent's own move, so the
+            # owner's multi-agent listing (``many``) does not pay one extra host read per
+            # agent per project for a row its reader cannot act on.
+            if not many:
+                item = self._agent_guidance_item(project_id, actor)
+                if item is not None:
+                    counts['guidance'] += 1
+                    guidance_actions.append(self._guidance_action(project_id, actor, item))
             try:
                 read = self._agent_project_tasks(project_id,many=many)
                 own = self._agent_own_tasks(project_id, actor, many=many)
@@ -6261,6 +7545,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             own_tasks_truncated |= not own['complete']
             for task in own['tasks']:
                 counts['claimed'] += 1
+                claim_held += len(held_against_limit([task]))
+                claim_blocked += len(held_blocked([task]))
                 review = task.get('review_state')
                 is_open = task.get('status') != 'closed'
                 open_items = task.get('open_items',0)
@@ -6282,7 +7568,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
                            'blocking_items':blocking_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
-                           'newer_activity': task.get('newer_activity') if blocked or in_progress else None}
+                           'newer_activity': task.get('newer_activity') if blocked or in_progress else None,
+                           # A stable marker of the newest other-party activity after the
+                           # checkpoint, plus the counts it was read with (kittrial-5bb.351).
+                           # Held actions only, exactly like the boolean it refines; a
+                           # legacy checkpoint yields null and a reader falls back to it.
+                           'newer_activity_marker': task.get('newer_activity_marker')
+                           if blocked or in_progress else None,
+                           'newer_activity_by_others': task.get('newer_activity_by_others')
+                           if blocked or in_progress else None,
+                           'newer_activity_own': task.get('newer_activity_own')
+                           if blocked or in_progress else None,
+                           'newer_activity_coverage': task.get('newer_activity_coverage')
+                           if blocked or in_progress else None,
+                           'unresolved_directions': task.get('unresolved_directions')
+                           if blocked or in_progress else None}
                 # Whose move it is, in the same words as the canonical `work --mine` row
                 # (kittrial-5bb.249): one helper, so the two answers cannot disagree about the
                 # move, the item count or the redelivery fact. The one deliberate difference is
@@ -6295,19 +7595,22 @@ class ApiHandler(BaseHTTPRequestHandler):
                     item_count = len(details['requests'])
                 task_base = '/v1/projects/%s/tasks/%s' % (project_id, task.get('id'))
                 move, move_text = review_move(review, task.get('id'),
-                                              task.get('assignee') == actor,
+                                              actor_holds(task.get('assignee'), actor),
                                               pending_items=item_count,
                                               redelivered=bool(task.get('redelivered')),
                                               way_back='`%s`' % (task_base + '/brief'))
                 details['whose_move'], details['next'] = move, move_text
-                if review != 'changes-requested':
+                if review != 'changes-requested' and not in_progress:
                     # The task asked for the two fields only where the kind is
                     # changes-requested (review item 2b): every other kind has a mover who is
                     # not this agent (an operator reconciles a review error or an unreadable
                     # checkpoint; a reviewer or the coordinator holds awaiting work), so it
                     # carries neither field instead of pairing `who: operator` with
                     # `whose_move: you` or contradicting the queue row's blocked/waiting
-                    # sentence.
+                    # sentence. `in-progress` is the agent's OWN undelivered, assigned task,
+                    # so it carries its move too (kittrial-5bb.288): a lane assigned a task
+                    # it never touched is told it is that lane's move, in the same words as
+                    # the canonical `work --owner ACTOR` row.
                     details.pop('whose_move', None)
                     details.pop('next', None)
                 if review == 'changes-requested':
@@ -6342,8 +7645,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                         'Approved; waiting for the coordinator to integrate it. Nothing for the agent to do.',
                         **details))
                 elif is_open or review in ACTIVE_REVIEW_STATES:
-                    action = (next_action(task) if review in ('withdrawn', 'superseded', 'integrated',
-                                                             'legacy-review-ready') else None)
+                    action = (next_action(task, claiming=claiming_mode)
+                              if review in ('withdrawn', 'superseded', 'integrated',
+                                            'legacy-review-ready') else None)
                     action = action or {'who': 'owner', 'text': 'Check the task and its review history'}
                     own_actions.append(self._agent_action(
                         5, 'review-state', project_id, task,
@@ -6361,7 +7665,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                             4, 'claimable-task', project_id, task,
                             'Open, unclaimed work the agent may take.'))
             # Review work for this agent, from the same snapshot (kittrial-5bb.115): one call.
-            review_actions += self._agent_review_actions(principal, agent, project_id, read['tasks'], counts)
+            # When the agent is configured (or queried) as a worker, omit other people's
+            # deliveries awaiting review while keeping CAP_REVIEWS for its own deliveries.
+            if effective_role != 'worker':
+                review_actions += self._agent_review_actions(principal, agent, project_id, read['tasks'], counts)
         # Counts cover the read pages; incomplete-source counts are lower bounds.
         # Only the collected suggestions are capped,
         # so a long claimable list can never hide the agent's own feedback.
@@ -6372,7 +7679,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if counts['review_recommended'] + counts['to_review'] > len(review_actions):
             truncated = True
             actions_truncated = True
-        actions = own_actions + review_actions + claimable_actions
+        actions = guidance_actions + own_actions + review_actions + claimable_actions
         actions.sort(key=lambda a: (a['priority'], self.AGENT_KIND_ORDER.get(a['kind'], 0),
                                    0 if a['kind'] == 'in-progress' and a.get('newer_activity') is True else 1,
                                    a['project'], a['task']))
@@ -6400,16 +7707,33 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'unknown'
         else:
             state = 'idle'
-        return {'state': state, 'summary': self._agent_summary(
-                    state, counts, snapshot_truncated, own_tasks_truncated)
-                    + self._agent_review_summary(counts, snapshot_truncated)
-                    + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
-                        % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
-                       if counts['newer_activity'] else ''),
-                'counts': counts, 'actions': actions, 'truncated': truncated,
-                'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
-                'actions_truncated':actions_truncated,
-                'computed_at': now_iso(self.service._now())}
+        summary = (self._agent_summary(state, counts, snapshot_truncated, own_tasks_truncated)
+                   + self._agent_review_summary(counts, snapshot_truncated)
+                   + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
+                       % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
+                      if counts['newer_activity'] else ''))
+        if guidance_actions:
+            # A changed guidance version leads, because it changes what the agent should do
+            # next and no run prompt is guaranteed to run `guidance get` (kittrial-5bb.325).
+            summary = ('The project guidance changed since this agent last acknowledged it; read it and '
+                       'record the read before other work. ' + summary)
+        empty_message = None
+        if not actions and 'assigned' in claiming_modes.values():
+            from claiming import EMPTY_SENTENCE
+            empty_message = EMPTY_SENTENCE
+        result = {'state': state, 'summary': summary,
+                  'counts': counts, 'claim_limit_held': claim_held,
+                  'claim_limit_blocked': claim_blocked, 'actions': actions,
+                  'truncated': truncated,
+                  'snapshot_truncated':snapshot_truncated,'own_tasks_truncated':own_tasks_truncated,
+                  'actions_truncated':actions_truncated,
+                  'computed_at': now_iso(self.service._now())}
+        # The empty-list sentence (kittrial-5bb.352 adjustment 4): under 'assigned', an
+        # empty answer says who hands work out, so the Bridge's empty-list message can
+        # show it instead of "nothing to do".
+        if empty_message:
+            result['empty_message'] = empty_message
+        return result
 
     @staticmethod
     def _agent_summary(state, counts, snapshot_truncated=False, own_tasks_truncated=False):
@@ -6442,6 +7766,52 @@ class ApiHandler(BaseHTTPRequestHandler):
         return ('Idle: %s claimable task(s), nothing in flight.' % claimable)
 
     @staticmethod
+    def _agent_claim_limit_record_view(agent):
+        """The limit and who may raise it, from the agent record only (kittrial-5bb.303).
+
+        No work read: ``claim_limit`` is on the record and ``raise_by`` is one constant.
+        The counted ``held``/``available`` view needs the bounded current-work snapshot,
+        so it is answered only where that snapshot is already read, on
+        ``GET /v1/agents/me/next`` (:meth:`_agent_claim_limit_view`).
+        """
+        from claim_limit import RAISE_BY, default_limit
+        return {'limit': default_limit(agent), 'raise_by': RAISE_BY}
+
+    @staticmethod
+    def _agent_claim_limit_view(agent, attention):
+        """The per-agent claim limit and what holds it (kittrial-5bb.276/.300).
+
+        Exactly the value the claim route enforces, from the same helper and the
+        same held set the attention snapshot already counted, so /v1/agents/me/next
+        can never report a different limit or a different held set than the gate.
+        The held count is ``claim_limit.held_against_limit`` over the agent's own
+        rows, not the raw ``counts.claimed``: a delivered or a blocked task is not
+        the agent's move and holds no active claim slot (revision, review items
+        2b/3b), while ``available`` is also bounded by ``claim_limit.hard_cap`` over
+        all undelivered claims (active plus blocked, kittrial-5bb.300).
+        An incomplete own read is a lower bound, so it reports no availability,
+        exactly as the gate refuses, rather than reading as "no limit".
+
+        ``raise_by`` names who may RAISE the limit (kittrial-5bb.302): the owner's account
+        or a superuser on the My agents page. An agent can only lower it itself, so a
+        client that follows the server shows the same names and page the refusal sentence
+        does.
+        """
+        from claim_limit import RAISE_BY, default_limit, hard_cap
+        attention = attention or {}
+        counts = attention.get('counts') or {}
+        limit = default_limit(agent)
+        cap = hard_cap(limit)
+        held = int(attention.get('claim_limit_held') or 0)
+        blocked = int(attention.get('claim_limit_blocked') or 0)
+        complete = not (attention.get('own_tasks_truncated') or counts.get('read_errors'))
+        available = min(max(0, limit - held), max(0, cap - (held + blocked))) if complete else 0
+        return {'limit': limit, 'hard_cap': cap, 'held': held, 'blocked': blocked,
+                'available': available,
+                'counts_task': counts.get('in_progress'),
+                'raise_by': RAISE_BY}
+
+    @staticmethod
     def _agent_attention_view(agent, attention=None):
         if attention is None:
             attention = {'state': 'unknown', 'summary': 'Not computed.',
@@ -6449,19 +7819,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                          'snapshot_truncated': False, 'own_tasks_truncated': False,
                          'actions_truncated': False,
                          'computed_at': None}
-        return {key: attention[key] for key in
+        view = {key: attention[key] for key in
                 ('state', 'summary', 'counts', 'truncated', 'snapshot_truncated',
                  'own_tasks_truncated', 'actions_truncated', 'computed_at')}
+        # kittrial-5bb.352 review item S1: the empty-list sentence the attention read
+        # computed under 'assigned' must travel on the route, not be dropped here.
+        if attention.get('empty_message'):
+            view['empty_message'] = attention['empty_message']
+        return view
 
     def _agent_resume_prompt(self, agent, attention):
         """A copyable prompt for the owner's local assistant. No secret is included."""
         server = self.service.public_url or '<ORCHESTRA_SERVER_URL>'
         directory = agent.get('working_directory')
-        where = (' in %s' % directory) if directory else ''
+        where = (' (recorded folder path data: %s)' % json.dumps(directory)) if directory else ''
         first = attention['actions'][0] if attention['actions'] else None
         if first:
-            what = ('Next: %s on %s in project %s.'
-                    % (first['kind'], first['task'], first['project']))
+            if first.get('kind') == 'guidance':
+                # The guidance row is not a task (kittrial-5bb.325): name the command.
+                what = ('Next: the project guidance changed; %s.'
+                        % (first.get('command') or 'run guidance get, then guidance ack --version VERSION'))
+            else:
+                what = ('Next: %s on %s in project %s.'
+                        % (first['kind'], first['task'], first['project']))
         else:
             what = 'There is nothing queued right now.'
         # kittrial-5bb.48: the secret never reaches curl's argv. curl reads the header
@@ -6470,10 +7850,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         secret_file = agent_secret_file(agent['name'])
         return ("Open your agent folder%s for agent '%s' (%s). %s\n"
                 "Your secret is in %s (never print or copy it). Then run:\n"
-                "  PowerShell:  curl.exe -fsS -K \"%s\" %s/v1/agents/me/next\n"
-                "  macOS/Linux: curl -fsS -K %s %s/v1/agents/me/next"
+                "  PowerShell:  curl.exe -fsS -K \"%s\" %s\n"
+                "  macOS/Linux: curl -fsS -K %s %s"
                 % (where, agent['name'], agent['id'], what, secret_file['windows'],
-                   secret_file['windows_powershell'], server, secret_file['posix'], server))
+                   # kittrial-5bb.360: the address single-quoted, so nothing in it expands.
+                   secret_file['windows_powershell'], ps_quote(server + '/v1/agents/me/next'),
+                   secret_file['posix'], sh_quote(server + '/v1/agents/me/next')))
 
     # -- task routes -----------------------------------------------------------
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks')
@@ -6546,13 +7928,93 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             raise invalid(str(error)) from None
         payload['task_id']=ctx.params['tid']
+        # An AGENT assigning a task to ITSELF through tasks.assign is a claim and takes
+        # the same per-agent limit as the claim route (revision, review item 5a): a
+        # granted coordinator agent at its limit held a second task this way. A PERSON
+        # assigning a task to an agent stays allowed even at the limit: that is the
+        # owner's explicit choice, not the agent taking work. docs/HTTP_DEPLOYMENT.md
+        # states both.
+        claim_gate = (ctx.principal.actor if getattr(ctx.principal, 'via', None) == 'credential'
+                      else None)
         def assign():
-            result=self.backend.invoke('tasks.assign',ctx.principal,ctx.params['pid'],payload,
-                                       ctx.idempotency_key,target=ctx.route_target,
-                                       authorize=ctx.authorize,capability=CAP_COORDINATE)
-            return result,result
+            def write():
+                result=self.backend.invoke('tasks.assign',ctx.principal,ctx.params['pid'],payload,
+                                           ctx.idempotency_key,target=ctx.route_target,
+                                           authorize=ctx.authorize,capability=CAP_COORDINATE)
+                return result,result
+            if claim_gate is not None and claim_limit.actor_holds(payload.get('assignee'), claim_gate):
+                with self.service.claim_gate(ctx.principal.agent_id or claim_gate):
+                    self._refuse_claim_over_limit(
+                        ctx, self.backend.get_task(ctx.params['pid'], ctx.params['tid']), payload.get('assignee'))
+                    return write()
+            return write()
         return self._mutate(ctx,'tasks.assign',ctx.params['pid'],assign,capability=CAP_COORDINATE,
                             serialize=False,canonical=True,audit_metadata={'task':ctx.params['tid']})
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/release')
+    def task_release(self, ctx):
+        """Release the caller's own claimed, undelivered task (kittrial-5bb.301).
+
+        The owner's own worker held three tasks and could not take other work, because
+        it could not release one of its own claims: only the owner's account or a
+        superuser could clear an assignee (kittrial-5bb.276). This route lets the HOLDER
+        release its own claim with a short reason. The holder is the authenticated
+        caller, never a submitted field, so no caller can release another actor's claim
+        by naming it.
+
+        It builds the same canonical assignment with ``assignee: null`` that every other
+        release uses, so it invents no second way to clear an assignee; the canonical
+        ``task-release`` action permits the ordinary task authority for exactly this
+        operation and nothing else (see endpoint.py). The release is recorded as the
+        canonical assignment notice: who, when and the reason. A checkpoint and its open
+        items stay on the task, and the claim stops counting against the holder's
+        ``claim_limit`` at once.
+
+        Refused: a task the caller does not hold (409); a record anchor (404) or the merge
+        slot (409, as every task write route); a task with ANY current contribution (409,
+        the canonical check: awaiting review, changes requested, approved or integrated);
+        a body field other than the reason, a blank reason or one over
+        :data:`CLAIM_RELEASE_REASON_MAX` (422); a missing Idempotency-Key (422). On a
+        backend without canonical assignment: 501. An exact retry of a committed release is
+        answered from the stored result, before the holder check, so a lost response
+        reconciles instead of reading the now-unassigned task as somebody else's.
+        """
+        self._project(ctx, CAP_TASKS)
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, self.TASK_RELEASE_FIELDS, 'A claim release')
+        reason = payload.get('reason')
+        if not isinstance(reason, str) or not reason.strip():
+            raise invalid('A claim release needs a short reason')
+        if len(reason) > self.CLAIM_RELEASE_REASON_MAX:
+            raise invalid('A claim release reason is at most %d characters'
+                          % self.CLAIM_RELEASE_REASON_MAX)
+        if ctx.idempotency_key is None:
+            raise invalid('Send an Idempotency-Key: releasing a claim writes')
+        if 'tasks.release' not in self.backend.ROUTES:
+            raise not_implemented('Canonical claim release is unavailable on this server')
+        actor = self.service.bind_actor(ctx.principal, None)
+        request = {'task_id': ctx.params['tid'], 'reason': reason.strip()}
+
+        def release():
+            # These checks run INSIDE the mutation, after _mutate has answered an exact retry
+            # from the stored result (kittrial-5bb.301 review item 2). They used to run
+            # before it, so a retry after a lost response read the now-unassigned task as
+            # "not claimed by you" instead of replaying the committed release. A different
+            # body under the same key is still refused by the wrapper's key-reuse check,
+            # which runs before this.
+            task = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+            self._refuse_record_anchor(task, write=True)
+            assignee = (task.get('assignee') or None) if isinstance(task, dict) else None
+            if not isinstance(task, dict) or not claim_limit.actor_holds(assignee, actor):
+                raise conflict('That task is not claimed by you; only its holder can release it')
+            result = self.backend.invoke('tasks.release', ctx.principal, ctx.params['pid'],
+                                         dict(request, expected_assignee=assignee),
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_TASKS)
+            return result, result
+        return self._mutate(ctx, 'tasks.release', ctx.params['pid'], release, capability=CAP_TASKS,
+                            serialize=False, canonical=True,
+                            audit_metadata={'task': ctx.params['tid']})
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/comments')
     def tasks_comment(self, ctx):
@@ -6701,6 +8163,48 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise not_found('Task not found')
 
     @staticmethod
+    def _refuse_open_dependency(row, snapshot):
+        """A task blocked by an open dependency is not claimable (kittrial-5bb.293).
+
+        The claim route refuses it with one sentence naming the open dependency, the
+        same rule ``work.claimable()`` applies so ``work --claimable`` and
+        ``/v1/agents/me/next`` never offer it. ``ready`` already excludes blocked
+        tasks; this matches it. Only the blocking dependency types block (item 3b)."""
+        from work import dependency_index, open_dependency_ids, open_dependency_sentence
+        open_deps = open_dependency_ids(row, snapshot, index=dependency_index(snapshot))
+        if open_deps:
+            raise conflict(open_dependency_sentence(open_deps) or 'Task is blocked by an open dependency')
+
+    def _refuse_open_dependency_closed(self, row, backend, project_id):
+        """Like :meth:`_refuse_open_dependency` but fails CLOSED (kittrial-5bb.293 item 3c).
+
+        The claim route must never offer a claim the queue would refuse. When the
+        other ends' statuses cannot be read, the claim is refused with one sentence
+        naming that, rather than being allowed through."""
+        from work import BLOCKING_DEPENDENCY_TYPES, dependency_index, dependency_ref, open_dependency_ids, open_dependency_sentence
+        deps = []
+        ids = []
+        for d in row.get('dependencies') or []:
+            other_id, kind, _ = dependency_ref(d)
+            if kind in BLOCKING_DEPENDENCY_TYPES and other_id:
+                deps.append(d)
+                ids.append(other_id)
+        if not deps:
+            return
+        try:
+            snapshot = backend.read_tasks(project_id)['items'] if hasattr(backend, 'read_tasks') else []
+        except Exception:
+            snapshot = []
+        by_id = dependency_index(snapshot)
+        # Fail CLOSED: a blocking dependency whose other end is not in the snapshot
+        # cannot be shown to be closed, so the claim is refused.
+        missing = [i for i in ids if i not in by_id]
+        if missing:
+            raise conflict('Task is blocked by an open dependency: `%s`. Its status cannot be read, '
+                           'so the claim is refused.' % '`, `'.join(missing[:5]))
+        self._refuse_open_dependency(row, snapshot)
+
+    @staticmethod
     def _refuse_requirement_record(row):
         """A requirement record is a readable, visible row, never claimable work
         (kittrial-5bb.277): it is NOT a record anchor and is NOT hidden (kittrial-5bb.276
@@ -6727,15 +8231,306 @@ class ApiHandler(BaseHTTPRequestHandler):
                        'page (or requirement_records.py draft|revise), and an operator accepts it with '
                        'admin.py requirement-apply.' % label)
 
+    # -- reference and capability records over the web (kittrial-5bb.213) -----
+    REF_PROPOSE_FIELDS = ('key', 'revision', 'expected_sha256', 'title', 'statement', 'authority',
+                          'owner', 'review_by', 'tags', 'decisions')
+    REF_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'title', 'statement',
+                         'authority', 'owner', 'review_by', 'tags', 'decisions')
+    REF_ACCEPT_FIELDS = ('key', 'revision', 'expected_revision', 'record_sha256', 'expected_sha256',
+                         'acceptance_state', 'acceptance', 'decision', 'evidence', 'decision_id',
+                         'owners', 'approvers', 'policy', 'unverified_pointer_reason')
+    REF_RETIRE_FIELDS = ('key', 'revision', 'expected_revision', 'record_sha256', 'expected_sha256',
+                         'successor', 'superseded_by', 'acceptance_state', 'acceptance', 'decision',
+                         'evidence', 'reason', 'decision_id', 'owners', 'approvers', 'policy')
+
+    CAP_PROPOSE_FIELDS = ('key', 'revision', 'expected_sha256', 'name', 'aliases', 'summary',
+                          'requirements', 'anchors', 'code', 'tests', 'owner', 'tags')
+    CAP_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'name', 'aliases',
+                         'summary', 'requirements', 'anchors', 'code', 'tests', 'owner', 'tags')
+    CAP_ACCEPT_FIELDS = REF_ACCEPT_FIELDS
+    CAP_RETIRE_FIELDS = REF_RETIRE_FIELDS
+    CAP_VERIFY_FIELDS = ('key', 'revision', 'entry_revision', 'record_sha256', 'expected_sha256',
+                         'entry_sha256', 'commit', 'checked_at', 'source', 'graph_built_at_commit',
+                         'tool', 'results', 'passed', 'summary', 'method', 'command',
+                         'unverified_pointer_reason')
+    CAP_ALIAS_PROPOSE_FIELDS = ('key', 'alias', 'evidence')
+    CAP_ALIAS_REJECT_FIELDS = ('key', 'alias', 'reason')
+
+    def _records_backend(self):
+        if not getattr(self.backend, 'RECORDS', False):
+            raise not_implemented('Reference and capability mutations require the canonical endpoint backend')
+
+    def _require_record_membership(self, ctx, coordinator=False):
+        pid = ctx.params['pid']
+        role = self.service.state.get('memberships', {}).get(pid, {}).get(ctx.principal.user_id)
+        if coordinator:
+            if role not in ('owner', 'coordinator'):
+                raise forbidden('Record coordination requires project membership as an owner or coordinator; '
+                                'a superuser without project membership must add themselves to the project first.')
+        else:
+            if role not in ('contributor', 'coordinator', 'owner'):
+                raise forbidden('Record mutations require project membership; '
+                                'a superuser without project membership must add themselves to the project first.')
+
+    def _records_standing(self, ctx, pid, capabilities):
+        role = self.service.state.get('memberships', {}).get(pid, {}).get(ctx.principal.user_id)
+
+        def holds(cap):
+            if cap in capabilities:
+                return True
+            try:
+                self.service.check_authority(ctx.principal, pid, cap)
+                return True
+            except HttpError:
+                return False
+        can_propose = role in ('contributor', 'coordinator', 'owner') and holds(CAP_RECORDS)
+        can_coordinate = role in ('coordinator', 'owner') and holds(CAP_COORDINATE)
+        return can_propose, can_coordinate
+
+    def _enrich_record_view(self, ctx, pid, capabilities, item):
+        if not isinstance(item, dict):
+            return item
+        item = dict(item)
+        can_propose, can_coordinate = self._records_standing(ctx, pid, capabilities)
+        actors = [item.get('proposer'), item.get('acceptor'), item.get('proposed_by'),
+                  item.get('accepted_by'), item.get('accepted_proposer'), item.get('verifier')]
+        for block_name, field_names in (('draft', ('proposer',)),
+                                        ('acceptance', ('operator', 'proposer')),
+                                        ('retirement', ('operator',)),
+                                        ('verification', ('verifier',))):
+            block = item.get(block_name)
+            if isinstance(block, dict):
+                actors.extend(block.get(f) for f in field_names)
+        for alias_item in item.get('aliases_pending') or []:
+            if isinstance(alias_item, dict):
+                actors.append(alias_item.get('actor'))
+        names = self._actor_names(actors, pid)
+        for field in ('proposer', 'acceptor', 'proposed_by', 'accepted_by', 'accepted_proposer', 'verifier'):
+            val = item.get(field)
+            if isinstance(val, str) and val:
+                item[field + '_name'] = names.get(val, val)
+        if isinstance(item.get('draft'), dict):
+            draft = dict(item['draft'])
+            if isinstance(draft.get('proposer'), str):
+                draft['proposer_name'] = names.get(draft['proposer'], draft['proposer'])
+            item['draft'] = draft
+        if isinstance(item.get('acceptance'), dict):
+            acc = dict(item['acceptance'])
+            if isinstance(acc.get('operator'), str):
+                acc['operator_name'] = names.get(acc['operator'], acc['operator'])
+            if isinstance(acc.get('proposer'), str):
+                acc['proposer_name'] = names.get(acc['proposer'], acc['proposer'])
+            item['acceptance'] = acc
+        if isinstance(item.get('retirement'), dict):
+            ret = dict(item['retirement'])
+            if isinstance(ret.get('operator'), str):
+                ret['operator_name'] = names.get(ret['operator'], ret['operator'])
+            item['retirement'] = ret
+        if isinstance(item.get('verification'), dict):
+            ver = dict(item['verification'])
+            if isinstance(ver.get('verifier'), str):
+                ver['verifier_name'] = names.get(ver['verifier'], ver['verifier'])
+            item['verification'] = ver
+        if isinstance(item.get('aliases_pending'), list):
+            item['aliases_pending'] = [
+                dict(entry, actor_name=names.get(entry.get('actor'), entry.get('actor')))
+                if isinstance(entry, dict) else entry
+                for entry in item['aliases_pending']
+            ]
+        by_agent = ctx.principal.via == 'credential'
+        caller_names = [ctx.principal.actor or ctx.principal.user_id, ctx.principal.user_id]
+        draft_proposer = (
+            item.get('proposed_by')
+            or (item.get('draft') or {}).get('proposer')
+            or (item.get('proposer')
+                if item.get('state') in ('draft-only', 'draft', 'proposed')
+                or item.get('waiting_acceptance') or item.get('has_pending_draft')
+                else None)
+        )
+        draft_authors = [a for a in (item.get('draft_authors') or []) if isinstance(a, str) and a]
+        if not draft_authors and isinstance(draft_proposer, str) and draft_proposer:
+            draft_authors = [draft_proposer]
+        item['self_accept_blocked'] = bool(
+            can_coordinate and draft_authors
+            and (self.service.approval_by_another_party or by_agent)
+            and not self._independent_all(caller_names, draft_authors, pid, by_agent))
+        verify_proposer = (
+            (item.get('accepted_proposer')
+             or (item.get('acceptance') or {}).get('proposer')
+             or item.get('proposed_by')
+             or item.get('proposer'))
+            if item.get('record') is not None
+            else (item.get('proposed_by') or item.get('proposer'))
+        )
+        verify_authors_raw = (
+            item.get('accepted_draft_authors')
+            if item.get('record') is not None
+            else item.get('draft_authors')
+        )
+        verify_authors = [a for a in (verify_authors_raw or []) if isinstance(a, str) and a]
+        if not verify_authors and isinstance(verify_proposer, str) and verify_proposer:
+            verify_authors = [verify_proposer]
+        item['self_verify_blocked'] = bool(
+            can_coordinate and verify_authors
+            and (self.service.approval_by_another_party or by_agent)
+            and not self._independent_all(caller_names, verify_authors, pid, by_agent))
+        item['can_propose'] = can_propose
+        item['can_coordinate'] = can_coordinate
+        item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
+        return item
+
+    def _enrich_records_list(self, ctx, pid, result):
+        capabilities = self.service.capabilities_for(ctx.principal, pid)
+        can_propose, can_coordinate = self._records_standing(ctx, pid, capabilities)
+        result = dict(result)
+        for list_key in ('items', 'records', 'candidates'):
+            if isinstance(result.get(list_key), list):
+                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item)
+                                    for item in result[list_key]]
+        if 'items' not in result and isinstance(result.get('records'), list):
+            seen = {r.get('key') for r in result['records'] if isinstance(r, dict)}
+            extra = [c for c in (result.get('candidates') or [])
+                     if isinstance(c, dict) and c.get('key') not in seen]
+            result['items'] = list(result['records']) + extra
+        result['can_propose'] = can_propose
+        result['can_coordinate'] = can_coordinate
+        result['approval_by_another_party'] = bool(self.service.approval_by_another_party)
+        return result
+
+    def _normalize_record_payload(self, ctx, command, body, operation_id):
+        body = dict(body)
+        if command == 'revise':
+            if 'revision' not in body and 'expected_revision' in body:
+                er = body.pop('expected_revision')
+                body['revision'] = (er + 1) if (isinstance(er, int) and not isinstance(er, bool)) else er
+            else:
+                body.pop('expected_revision', None)
+        elif command in ('accept', 'retire'):
+            body.setdefault('acceptance_state', 'accepted' if command == 'accept' else 'superseded')
+            if 'revision' not in body and 'expected_revision' in body:
+                body['revision'] = body.pop('expected_revision')
+            else:
+                body.pop('expected_revision', None)
+            if 'record_sha256' not in body and 'expected_sha256' in body:
+                body['record_sha256'] = body.pop('expected_sha256')
+            else:
+                body.pop('expected_sha256', None)
+            if command == 'retire':
+                if 'successor' not in body and 'superseded_by' in body:
+                    body['successor'] = body.pop('superseded_by')
+                else:
+                    body.pop('superseded_by', None)
+            pid = ctx.params['pid']
+            account_id = 'account:' + ctx.principal.user_id
+            with self.service.store.lock:
+                memberships = dict((self.service.state.get('memberships') or {}).get(pid) or {})
+            member_owners = [
+                'account:' + uid for uid, role in sorted(memberships.items())
+                if role in ('owner', 'coordinator')
+            ]
+            if account_id not in member_owners:
+                member_owners.append(account_id)
+            if ctx.principal.via == 'credential' and ctx.principal.actor:
+                agent_tag = 'agent:' + ctx.principal.actor
+                actual_approvers = [account_id, agent_tag]
+                actual_owners = member_owners + [agent_tag]
+                allowed_approvers = {account_id, ctx.principal.user_id, agent_tag, ctx.principal.actor}
+            else:
+                actual_approvers = [account_id]
+                actual_owners = member_owners
+                allowed_approvers = {account_id, ctx.principal.user_id}
+            allowed_owners = set(actual_owners) | set(memberships.keys()) | {'account:' + u for u in memberships}
+            acc_in = body.get('acceptance') if isinstance(body.get('acceptance'), dict) else {}
+            supplied_approvers = body.get('approvers') if 'approvers' in body else acc_in.get('approvers')
+            if supplied_approvers is not None:
+                if (not isinstance(supplied_approvers, list) or not supplied_approvers
+                        or not all(isinstance(x, str) and x in allowed_approvers for x in supplied_approvers)):
+                    raise invalid('approvers on the web may only name the authenticated principal performing this acceptance')
+            supplied_owners = body.get('owners') if 'owners' in body else acc_in.get('owners')
+            if supplied_owners is not None:
+                if (not isinstance(supplied_owners, list) or not supplied_owners
+                        or not all(isinstance(x, str) and x in allowed_owners for x in supplied_owners)):
+                    raise invalid('owners on the web must come from project membership')
+            if 'acceptance' not in body:
+                ev = body.pop('evidence', None)
+                if ev is None:
+                    ev = body.pop('reason', None)
+                else:
+                    body.pop('reason', None)
+                dec = body.pop('decision', None)
+                if ev is None and isinstance(dec, dict):
+                    ev = dec.get('why_satisfied') or dec.get('checked')
+                body.pop('owners', None)
+                body.pop('approvers', None)
+                policy = body.pop('policy', None) or 'any-owner'
+                decision_id = body.pop('decision_id', None) or operation_id
+                body.pop('unverified_pointer_reason', None)
+                if ev is not None or dec is not None:
+                    body['acceptance'] = {
+                        'decision_id': decision_id,
+                        'owners': list(actual_owners),
+                        'approvers': list(actual_approvers),
+                        'policy': policy,
+                        'evidence': ev if ev is not None else '',
+                    }
+            else:
+                for extra in ('evidence', 'reason', 'decision', 'decision_id',
+                              'owners', 'approvers', 'policy', 'unverified_pointer_reason'):
+                    body.pop(extra, None)
+                if isinstance(body['acceptance'], dict):
+                    acc = dict(body['acceptance'])
+                    if 'decision' in acc and 'evidence' not in acc:
+                        dec = acc.pop('decision')
+                        if isinstance(dec, dict):
+                            acc['evidence'] = dec.get('why_satisfied') or dec.get('checked') or ''
+                    acc['owners'] = list(actual_owners)
+                    acc['approvers'] = list(actual_approvers)
+                    acc.setdefault('policy', 'any-owner')
+                    acc.setdefault('decision_id', operation_id)
+                    body['acceptance'] = acc
+        return body
+
+    def _records_write(self, ctx, route_name, command, allowed_fields, where, *,
+                       coordinator=False, key_param=True, status=200):
+        self._records_backend()
+        needed = CAP_COORDINATE if coordinator else CAP_RECORDS
+        self._project(ctx, needed)
+        self._require_record_membership(ctx, coordinator=coordinator)
+        fields, operation_id = self._proposal_body(ctx, allowed_fields, where)
+        pid = ctx.params['pid']
+        if key_param and 'key' in fields and fields['key'] != ctx.params['key']:
+            raise invalid('key in body must match the route key')
+        body = dict(fields, schema_version=1, operation_id=operation_id)
+        if key_param:
+            body['key'] = ctx.params['key']
+        body = self._normalize_record_payload(ctx, command, body, operation_id)
+
+        def mutate_record():
+            result = self.backend.invoke(route_name, ctx.principal, pid,
+                                         {'command': command, 'body': body},
+                                         ctx.idempotency_key,
+                                         target=ctx.route_target,
+                                         authorize=ctx.authorize,
+                                         capability=needed)
+            capabilities = self.service.capabilities_for(ctx.principal, pid)
+            if isinstance(result, dict):
+                result = self._enrich_record_view(ctx, pid, capabilities, result)
+            return result, result
+        return self._mutate(ctx, route_name, pid, mutate_record, status=status,
+                            capability=needed, serialize=False, canonical=True,
+                            reason='%s %s' % (command, body.get('key') or ''))
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):
-        """The reference catalog (.41 slice 1), read-only at CAP_READ.
+        """The reference catalog (.41 slice 1, .213 slice 5), read-only at CAP_READ.
 
         Query: `tag` (comma-separated, all must match), `owner`, `state`, `due`,
-        `authority` (repository, url or attested), `limit` and the page `cursor`. Statements are untrusted text: they are returned as data
+        `authority` (repository, url or attested), `waiting` (1/true), `limit` and the
+        page `cursor`. Statements are untrusted text: they are returned as data
         and never placed in an error body or an audit record.
         """
         self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
         limit, state = self._page(ctx, ctx.query)
         args = ['--limit', str(limit), '--offset', str(state['o'])]
         for tag in [t for t in (ctx.query.get('tag') or '').split(',') if t]:
@@ -6743,44 +8538,237 @@ class ApiHandler(BaseHTTPRequestHandler):
         for name in ('owner', 'state', 'due', 'authority'):
             if ctx.query.get(name):
                 args += ['--' + name, ctx.query[name]]
+        if 'waiting' in ctx.query:
+            if ctx.query['waiting'] in ('1', 'true'):
+                args.append('--waiting')
+            elif ctx.query['waiting'] not in ('0', 'false', ''):
+                raise invalid('waiting must be 1, 0, true or false')
         import reference_records
         try:
-            options = reference_records.parse_list_options(args)
+            options = reference_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('ref list: ', ''))
-        result = dict(self.backend.references(ctx.params['pid'], options))
-        result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
+        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options))
+        result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit)
                                  if result.get('next_offset') is not None else None)
         return 200, result
 
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references/find')
+    def references_find(self, ctx):
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        q = ctx.query.get('q')
+        if not isinstance(q, str) or not q.strip():
+            raise invalid('q is required')
+        caller_arg(q, 'q')
+        limit_raw = ctx.query.get('limit', '5')
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            raise invalid('limit must be an integer')
+        import reference_records
+        try:
+            phrase, parsed_limit = reference_records.parse_find_options([q, '--limit', str(limit)])
+        except ValueError as error:
+            raise invalid(str(error).replace('ref find: ', ''))
+        result = self.backend.references_find(pid, phrase, parsed_limit)
+        return 200, self._enrich_records_list(ctx, pid, result)
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')')
     def references_get(self, ctx):
         self._project(ctx, CAP_READ)
-        return 200, self.backend.reference(ctx.params['pid'], ctx.params['key'])
+        pid = ctx.params['pid']
+        capabilities = self.service.capabilities_for(ctx.principal, pid)
+        return 200, self._enrich_record_view(
+            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']))
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references')
+    def references_propose(self, ctx):
+        return self._records_write(ctx, 'references.propose', 'propose',
+                                   self.REF_PROPOSE_FIELDS, 'A reference proposal',
+                                   coordinator=False, key_param=False, status=201)
+
+    @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/revisions')
+    def references_revise(self, ctx):
+        return self._records_write(ctx, 'references.revise', 'revise',
+                                   self.REF_REVISE_FIELDS, 'A reference revision',
+                                   coordinator=False, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/accept')
+    def references_accept(self, ctx):
+        return self._records_write(ctx, 'references.accept', 'accept',
+                                   self.REF_ACCEPT_FIELDS, 'A reference acceptance',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/retire')
+    def references_retire(self, ctx):
+        return self._records_write(ctx, 'references.retire', 'retire',
+                                   self.REF_RETIRE_FIELDS, 'A reference retirement',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
+    def capabilities_list(self, ctx):
+        """The capability catalog (.56, .213 slice 5), read-only at CAP_READ."""
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        limit, state = self._page(ctx, ctx.query)
+        args = ['--limit', str(limit), '--offset', str(state['o'])]
+        for tag in [t for t in (ctx.query.get('tag') or '').split(',') if t]:
+            args += ['--tag', tag]
+        for name in ('owner', 'state'):
+            if ctx.query.get(name):
+                args += ['--' + name, ctx.query[name]]
+        if 'pointers' in ctx.query:
+            if ctx.query['pointers'] in ('1', 'true'):
+                args.append('--pointers')
+            elif ctx.query['pointers'] not in ('0', 'false', ''):
+                raise invalid('pointers must be 1, 0, true or false')
+        if 'waiting' in ctx.query:
+            if ctx.query['waiting'] in ('1', 'true'):
+                args.append('--waiting')
+            elif ctx.query['waiting'] not in ('0', 'false', ''):
+                raise invalid('waiting must be 1, 0, true or false')
+        import capability_records
+        try:
+            options = capability_records.parse_list_options(args, web_service=True)
+        except ValueError as error:
+            raise invalid(str(error).replace('capability list: ', ''))
+        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options))
+        result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
+                                             state['o'] + limit)
+                                 if result.get('next_offset') is not None else None)
+        return 200, result
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/find')
+    def capabilities_find(self, ctx):
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        q = ctx.query.get('q')
+        if not isinstance(q, str) or not q.strip():
+            raise invalid('q is required')
+        caller_arg(q, 'q')
+        limit_raw = ctx.query.get('limit', '5')
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            raise invalid('limit must be an integer')
+        import capability_records
+        try:
+            phrase, parsed_limit = capability_records.parse_find_options([q, '--limit', str(limit)])
+        except ValueError as error:
+            raise invalid(str(error).replace('capability find: ', ''))
+        result = self.backend.capabilities_find(pid, phrase, parsed_limit)
+        return 200, self._enrich_records_list(ctx, pid, result)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')')
+    def capabilities_get(self, ctx):
+        self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        capabilities = self.service.capabilities_for(ctx.principal, pid)
+        return 200, self._enrich_record_view(
+            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']))
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
+    def capabilities_propose(self, ctx):
+        return self._records_write(ctx, 'capabilities.propose', 'propose',
+                                   self.CAP_PROPOSE_FIELDS, 'A capability proposal',
+                                   coordinator=False, key_param=False, status=201)
+
+    @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/revisions')
+    def capabilities_revise(self, ctx):
+        return self._records_write(ctx, 'capabilities.revise', 'revise',
+                                   self.CAP_REVISE_FIELDS, 'A capability revision',
+                                   coordinator=False, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/accept')
+    def capabilities_accept(self, ctx):
+        return self._records_write(ctx, 'capabilities.accept', 'accept',
+                                   self.CAP_ACCEPT_FIELDS, 'A capability acceptance',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/retire')
+    def capabilities_retire(self, ctx):
+        return self._records_write(ctx, 'capabilities.retire', 'retire',
+                                   self.CAP_RETIRE_FIELDS, 'A capability retirement',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/verify')
+    def capabilities_verify(self, ctx):
+        return self._records_write(ctx, 'capabilities.verify', 'web-verify',
+                                   self.CAP_VERIFY_FIELDS, 'A capability verification',
+                                   coordinator=True, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/aliases')
+    def capabilities_alias_propose(self, ctx):
+        return self._records_write(ctx, 'capabilities.alias.propose', 'propose-alias',
+                                   self.CAP_ALIAS_PROPOSE_FIELDS, 'A capability alias proposal',
+                                   coordinator=False, key_param=True, status=201)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')/aliases/reject')
+    def capabilities_alias_reject(self, ctx):
+        return self._records_write(ctx, 'capabilities.alias.reject', 'reject-alias',
+                                   self.CAP_ALIAS_REJECT_FIELDS, 'A capability alias rejection',
+                                   coordinator=True, key_param=True, status=200)
 
     # -- direct owner requirements, slice A -------------------------------------
     def _requirements_backend(self):
         if not hasattr(self.backend,'requirements_read') or not hasattr(self.backend,'owner_requirements'):
             raise not_implemented('Requirements editing needs the canonical tracker backend')
 
+    def _requirement_editor_here(self, ctx, pid=None):
+        """The requirement editor this caller is here, or None (kittrial-5bb.278).
+
+        One rule with the canonical endpoint: `http_authority.requirement_editor` reads
+        the live membership or the live coordinator grant, so a page render and the
+        effect-time check cannot disagree about who may write.
+        """
+        import http_authority
+        try:
+            return http_authority.requirement_editor(
+                self.service.state, pid or ctx.params['pid'],
+                {'via': ctx.principal.via, 'user_id': ctx.principal.user_id,
+                 'credential_id': ctx.principal.credential_id})
+        except http_authority.AuthorityDenied:
+            return None
+
     def _requirements_owner(self, ctx):
-        pid=ctx.params['pid']
-        self._project(ctx,CAP_PROJECT_ADMIN)
-        if (ctx.principal.via!='session' or ctx.principal.credential_id or ctx.principal.agent_id
-                or self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)!='owner'):
-            raise forbidden('Requirements editing needs the signed-in project owner')
+        """Authorize one requirements route: a project's owner OR coordinator may write.
+
+        `coordinate` is the live capability (an owner holds it, a coordinator holds it by
+        role, and an agent credential holds it only through the project's coordinator
+        grant). The capability check runs first so a non-member keeps the service's own
+        answer (404, never a hint that the project exists) and an expired or revoked
+        credential keeps its own sentence; a member or credential that is merely not the
+        project's editor gets one sentence naming the rule. The membership/grant rule
+        itself is :func:`http_authority.requirement_editor`: the same function the
+        canonical endpoint re-checks at effect time.
+        """
+        pid = ctx.params['pid']
+        import http_authority
+        try:
+            self._project(ctx, CAP_COORDINATE)
+        except HttpError as error:
+            if error.status != 403:
+                raise
+            raise forbidden(http_authority.REQUIREMENT_EDITOR_REFUSED) from None
+        editor = self._requirement_editor_here(ctx, pid)
+        if editor is None:
+            raise forbidden(http_authority.REQUIREMENT_EDITOR_REFUSED)
+        return editor
 
     def _requirements_state_only(self, ctx, result):
         """A member who cannot finish the transition reads the state, not its handles.
 
-        A current owner still receives the exact operation id and receipt hash its
-        finish/abandon route needs; contributors and viewers receive the state,
-        reason and a sentence naming who can act.
+        A current owner OR coordinator still receives the exact operation id and receipt
+        hash its finish/abandon route needs (kittrial-5bb.278: a coordinator may finish
+        what it may also start); contributors and viewers receive the state, reason and a
+        sentence naming who can act.
         """
         pid=ctx.params['pid']
-        owner=(ctx.principal.via=='session' and not ctx.principal.agent_id
-               and self.service.state.get('memberships',{}).get(pid,{}).get(ctx.principal.user_id)=='owner')
+        owner=self._requirement_editor_here(ctx,pid) is not None
         if owner:
             return result
         def without_operation(record):
@@ -6839,7 +8827,14 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _requirements_write(self, ctx, action, status=200):
         self._requirements_backend()
-        self._requirements_owner(ctx)
+        editor=self._requirements_owner(ctx)
+        if action == 'baseline' and (editor.get('role') != 'owner' or editor.get('agent_id')
+                or ctx.principal.via != 'session' or ctx.principal.credential_id):
+            raise forbidden('Baseline cuts need the current signed-in project owner')
+        if action=='governance' and editor.get('role')!='owner':
+            # The coordinator's decision 11(i) of kittrial-5bb.278: the governance-mode
+            # switch changes the rules, not requirement text, so it stays the owner's.
+            raise forbidden('Switching requirements governance needs the signed-in project owner')
         fields,operation_id=self._proposal_body(ctx,{
             'baseline':('name',),
             'create':('kind','parent','title','description','key'),
@@ -6882,12 +8877,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                         recorded[token]=ctx.request_id
             return result,result
         return self._mutate(ctx,'requirements.'+action,pid,write,status=status,
-                            capability=CAP_PROJECT_ADMIN,serialize=False,canonical=True,
+                            capability=CAP_COORDINATE,serialize=False,canonical=True,
                             # Terminal replay authority belongs to the canonical
                             # owner adapter. Its durable identity still deduplicates
                             # effects; a service response must not bypass that check.
                             idempotent=action not in ('baseline','withdraw','supersede','finish','abandon'),
-                            audit_success=action not in ('withdraw','supersede','finish','abandon'))
+                            audit_success=action not in ('withdraw','supersede','finish','abandon'),
+                            audit_metadata=self._requirement_agent_audit(ctx))
+
+    def _requirement_agent_audit(self, ctx):
+        """The agent that acted, and its grant, recorded beside the human account.
+
+        A person's own write adds nothing: the audit entry already carries the account.
+        For an agent credential the accepting party stays the human account (owner
+        decision 11(ii) of kittrial-5bb.278), so the entry names the agent and the exact
+        grant it acted on. Bounded, redacted values only.
+        """
+        editor = self._requirement_editor_here(ctx, ctx.params.get('pid'))
+        if not editor or not editor.get('agent_id'):
+            return None
+        grant = editor.get('grant') or {}
+        return {'acting_agent': editor['agent_id'],
+                'coordinator_grant': {'granted_by': grant.get('granted_by'),
+                                      'granted_at': grant.get('granted_at')}}
 
     # Named snapshots are human member reads; no new agent/worker authority.
     def _requirements_baseline_member(self, ctx):
@@ -6895,7 +8907,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         if (ctx.principal.via != 'session' or ctx.principal.credential_id or ctx.principal.agent_id
                 or self.service.state.get('memberships', {}).get(pid, {}).get(ctx.principal.user_id)
-                not in ('owner', 'contributor', 'viewer')):
+                not in ('owner', 'coordinator', 'contributor', 'viewer')):
             raise forbidden('Requirements baselines need a current signed-in project member')
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines')
@@ -6961,13 +8973,141 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['items']=[self._requirement_author(ctx,item) for item in result.get('items',[])]
         result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
-        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
-                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        result['can_edit']=self._requirements_page_editor(ctx)
+        result['can_cut_baseline']=(ctx.principal.via == 'session'
+            and not ctx.principal.credential_id and not ctx.principal.agent_id
+            and self.service.state.get('memberships', {}).get(ctx.params['pid'], {}).get(ctx.principal.user_id) == 'owner'
+            and result.get('governance', {}).get('mode') == 'simple')
         return 200,result
+
+    def _requirements_page_editor(self,ctx):
+        """Whether this page is editable IN THE BROWSER for this caller.
+
+        A person's page (owner or coordinator, kittrial-5bb.278); an agent credential uses
+        the routes and http_client. Unchanged for an owner, so no owner sees a difference.
+        """
+        if ctx.principal.via!='session' or ctx.principal.agent_id:
+            return False
+        return self._requirement_editor_here(ctx,ctx.params['pid']) is not None
 
     @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements')
     def requirements_create(self,ctx):
         return self._requirements_write(ctx,'create',status=201)
+
+    #: One batch acceptance is bounded (kittrial-5bb.278): one action, many requirements.
+    REQUIREMENT_BATCH_MAX = 200
+    #: Said of every item a stopped batch never reached, so none is silently dropped.
+    REQUIREMENT_BATCH_NOT_ATTEMPTED = ('Not attempted: stop_on_error stopped this batch after an '
+                                       'earlier item was refused.')
+
+    def _requirements_batch_items(self, ctx):
+        """Validate the whole batch before ANY effect; a bad item refuses the request."""
+        payload = dict(ctx.payload or {})
+        operation_id = payload.pop('operation_id', None)
+        if operation_id is not None:
+            raise invalid('Use the Idempotency-Key header for requirements writes')
+        unknown = sorted(set(payload) - {'items', 'stop_on_error'})
+        if unknown:
+            raise invalid('A batch acceptance does not take: %s' % ', '.join(unknown)[:200])
+        stop = payload.get('stop_on_error', False)
+        if not isinstance(stop, bool):
+            raise invalid('stop_on_error must be true or false')
+        items = payload.get('items')
+        if not isinstance(items, list) or not items:
+            raise invalid('A batch acceptance needs 1 to %d items' % self.REQUIREMENT_BATCH_MAX)
+        if len(items) > self.REQUIREMENT_BATCH_MAX:
+            raise invalid('A batch acceptance takes at most %d items' % self.REQUIREMENT_BATCH_MAX)
+        import requirement_governance as governance
+        seen, checked = set(), []
+        for item in items:
+            if not isinstance(item, dict):
+                raise invalid('Each batch item is an object with id, expected_revision and '
+                              'expected_sha256')
+            unknown = sorted(set(item) - {'id', 'expected_revision', 'expected_sha256'})
+            if unknown:
+                raise invalid('A batch item does not take: %s' % ', '.join(unknown)[:200])
+            rid = item.get('id')
+            if not isinstance(rid, str) or not SAFE_ID.match(rid):
+                raise invalid('Each batch item needs a requirement id')
+            if rid in seen:
+                raise invalid('A batch acceptance names requirement %s twice' % rid)
+            seen.add(rid)
+            expected_revision = item.get('expected_revision')
+            if type(expected_revision) is not int or expected_revision < 1:
+                raise invalid('Invalid expected requirements revision for %s' % rid)
+            try:
+                governance.digest(item.get('expected_sha256'))
+            except ValueError:
+                raise invalid('Expected requirements hash is required for %s; reload and try again'
+                              % rid) from None
+            checked.append({'id': rid, 'expected_revision': expected_revision,
+                            'expected_sha256': item['expected_sha256']})
+        return checked, stop
+
+    @staticmethod
+    def _requirement_batch_reason(error):
+        """The refused item's own sentence: the canonical detail when there is one.
+
+        ``_checked`` keeps a canonical refusal's own words in ``detail`` and a generic
+        sentence in ``message``. A batch answer must say WHY an item was not accepted, so
+        the detail wins, bounded, with the endpoint's ``ValueError:`` prefix removed.
+        """
+        for text in (error.detail, error.message):
+            if isinstance(text, str) and text.strip():
+                said = text.strip()
+                if said.startswith('ValueError: '):
+                    said = said[len('ValueError: '):]
+                return said[:300]
+        return 'Not accepted'
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/accept-batch')
+    def requirements_accept_batch(self,ctx):
+        """Accept many requirements in one action (kittrial-5bb.278, slice 10).
+
+        Per item, and no rollback (the coordinator's decision 11(iii)): a native acceptance
+        cannot be undone, so a refused item changes nothing while the items around it stay
+        accepted. Each item runs the SAME canonical adapter as a single acceptance, with its
+        own operation id derived from this request's Idempotency-Key and the item id, so an
+        exact replay of the batch accepts nothing twice. `stop_on_error` (optional, default
+        false) stops after the first refusal, and every item it never reached is listed as
+        refused with the reason it was not attempted: nothing is dropped silently.
+        """
+        self._requirements_backend()
+        self._requirements_owner(ctx)
+        items, stop = self._requirements_batch_items(ctx)
+        pid = ctx.params['pid']
+        if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
+            raise invalid('This project uses governed requirements. Ask its owner to enable simple editing.')
+        key = ctx.idempotency_key or ctx.request_id
+
+        def write():
+            accepted, refused = [], []
+            for position, item in enumerate(items):
+                fields = {'expected_revision': item['expected_revision'],
+                          'expected_sha256': item['expected_sha256']}
+                try:
+                    result = self.backend.owner_requirements(ctx.principal, pid, 'accept', fields,
+                                                             key, item['id'])
+                except HttpError as error:
+                    # The words of a refusal are the answer (kittrial-5bb.156); an uncertain
+                    # outcome is not, and must stop the batch instead of being reported as a
+                    # per-item refusal.
+                    if error.status >= 500:
+                        raise
+                    refused.append({'id': item['id'],
+                                    'reason': self._requirement_batch_reason(error)})
+                    if stop:
+                        refused.extend({'id': rest['id'],
+                                        'reason': self.REQUIREMENT_BATCH_NOT_ATTEMPTED}
+                                       for rest in items[position + 1:])
+                        break
+                else:
+                    accepted.append(result)
+            answer = {'accepted': accepted, 'refused': refused,
+                      'summary': {'accepted': len(accepted), 'refused': len(refused)}}
+            return answer, answer
+        return self._mutate(ctx,'requirements.accept-batch',pid,write,capability=CAP_COORDINATE,
+                            serialize=False,audit_metadata=self._requirement_agent_audit(ctx))
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/(?P<rid>'+ID+r')')
     def requirements_get(self,ctx):
@@ -6977,8 +9117,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         result['governance']=self.backend.requirements_read(ctx.params['pid'],['governance'])
-        result['can_edit']=(ctx.principal.via=='session' and not ctx.principal.agent_id
-                            and self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(ctx.principal.user_id)=='owner')
+        result['can_edit']=self._requirements_page_editor(ctx)
         return 200,result
 
     def _requirement_author(self,ctx,item):
@@ -6992,7 +9131,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         account=author.get('text')
         user=self.service.state.get('users',{}).get(account)
         role=self.service.state.get('memberships',{}).get(ctx.params['pid'],{}).get(account)
-        if not isinstance(user,dict) or role!='owner':
+        if not isinstance(user,dict) or role not in ('owner','coordinator'):
             result['pending_author']={'kind':'unknown','text':'', 'omitted_chars':0,'at':author.get('at')}
             return result
         name=user.get('display_name') or user.get('username')
@@ -7400,7 +9539,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         actors += [entry.get('author') for entry in advice]
         names = self._actor_names(actors, pid)
         task = dict(brief['task'], review_state=review.get('state') or 'none')
-        brief['task'] = self._task_view(task, names)
+        brief['task'] = self._task_view(task, names, project_id=ctx.params['pid'])
         if checkpoint:
             checkpoint['author_name'] = names.get(checkpoint.get('author'))
         if contribution:
@@ -7427,7 +9566,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         brief['project_repository'] = self.service.project_view(ctx.principal, pid).get('repository')
         # The same note wherever the value reaches an agent: it is a label, not an instruction.
         brief['project_repository_note'] = self.service.REPOSITORY_NOTE if brief['project_repository'] else None
-        brief['checkpoint_template'] = self._checkpoint_template(brief, base, brief.pop('carry_open_items', []))
+        # The page needs the complete list, not the first ten: keep carry_open_items in
+        # the answer and build the template from it (kittrial-5bb.356).
+        brief['checkpoint_template'] = self._checkpoint_template(brief, base, brief.get('carry_open_items', []))
         brief['generated_at'] = now_iso(self.service._now())
         return 200, brief
 
@@ -7495,16 +9636,49 @@ class ApiHandler(BaseHTTPRequestHandler):
         # A requirement record is readable and visible, but never claimable work
         # (kittrial-5bb.277). Refused here so no agent takes one as a task.
         self._refuse_requirement_record(task)
+        # A task blocked by an open dependency is not claimable (kittrial-5bb.293).
+        # The claim route fails CLOSED when the dependencies cannot be read (item 3c):
+        # it never offers a claim the queue would refuse. No extra read_tasks (item 2b):
+        # the task row already carries its dependencies, and the check needs only the
+        # other ends' statuses, which one bounded read of those ids provides.
+        self._refuse_open_dependency_closed(task, self.backend, ctx.params['pid'])
         payload['task_id'] = ctx.params['tid']
         actor = self.service.bind_actor(ctx.principal, payload.pop('actor', None))
         payload['actor'] = actor
 
         def claim():
+            # The per-project claiming setting (kittrial-5bb.352): under 'assigned' a
+            # claim of an UNASSIGNED task is refused with one sentence naming the
+            # setting. A task already assigned to the caller is not refused here: its
+            # holder may still start it, as before. Read FRESH: the setting lives
+            # outside the tracker, so the tracker cache must not answer for it. This is
+            # inside the mutation, after the idempotency reserve, so an exact retry
+            # replays its stored answer instead of being refused again.
+            if not (isinstance(task, dict) and task.get('assignee')):
+                if self._claiming_mode(ctx.params['pid']) == 'assigned':
+                    from claiming import CLAIM_REFUSAL
+                    raise conflict(CLAIM_REFUSAL)
+            # The per-agent limit on claimed, undelivered tasks (kittrial-5bb.276)
+            # is judged here, before the write is sent, so one gate covers the web
+            # page, orchestra-client.py and any other client of this route. It is
+            # inside the mutation, after the idempotency reserve, so an exact retry
+            # still replays its stored answer instead of being refused again.
+            #
+            # ONE per-agent lock spans the held-set read and the claim write (kittrial-5bb.276
+            # revision; per-agent in kittrial-5bb.300). The held set is a separate endpoint
+            # read, so without a lock two concurrent claims by one agent both saw the set
+            # before either wrote and both passed a limit of one. Keying the lock by the
+            # agent id serializes one agent's claims while unrelated agents' claims do not
+            # wait for each other. One service process is the supported setup; the refusal
+            # handling below runs after the lock is released, so the bounded candidate read
+            # it may make cannot hold the claim path.
             try:
-                result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
-                                             payload, ctx.idempotency_key,
-                                             target=ctx.route_target, authorize=ctx.authorize,
-                                             capability=CAP_TASKS)
+                with self.service.claim_gate(ctx.principal.agent_id or actor):
+                    self._refuse_claim_over_limit(ctx, task, actor)
+                    result = self.backend.invoke('tasks.claim', ctx.principal, ctx.params['pid'],
+                                                 payload, ctx.idempotency_key,
+                                                 target=ctx.route_target, authorize=ctx.authorize,
+                                                 capability=CAP_TASKS)
             except HttpError as refusal:
                 held_by = getattr(refusal, 'held_by', None)
                 if held_by is None and refusal.code != 'conflict':
@@ -7521,12 +9695,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # Advisory: claimability is not a reservation and the next claim is still
                 # atomic. When there is nothing to fall through to, the refusal is
                 # re-raised byte for byte, so every existing sentence and detail is kept.
+                limit_refusal = (isinstance(refusal.detail, dict)
+                                 and refusal.detail.get('claim_limit_refusal'))
                 candidates, truncated = [], False
                 if str((task or {}).get('status')) != 'closed':
                     candidates, truncated = self._claim_candidates(ctx.params['pid'], ctx.params['tid'])
-                if not candidates and held_by is None:
+                if not candidates and held_by is None and not limit_refusal:
                     raise
                 detail = dict(refusal.detail) if isinstance(refusal.detail, dict) else {}
+                if limit_refusal:
+                    # An agent at its limit keeps its own sentence (which names the
+                    # limit and the held tasks) and gains the candidates: the move
+                    # is to finish or release one of those, or to take another row
+                    # once it has.
+                    if candidates:
+                        detail['candidates'] = candidates
+                        if truncated:
+                            detail['candidates_truncated'] = True
+                            detail['candidates_notice'] = ('More claimable tasks remain; at most %d '
+                                                           'candidates are listed.' % CLAIM_CANDIDATES_LIMIT)
+                    raise conflict(refusal.message, detail) from None
                 if held_by is not None:
                     detail['held_by'] = held_by
                 if candidates:
@@ -7730,7 +9918,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
     def tasks_history(self, ctx):
-        """The task's history, oldest first, in exact cursor-bound pages.
+        """The task's history in exact cursor-bound pages, oldest first or newest first.
 
         Every page is exact for any ``limit``: a page continued from ``next_cursor``
         resumes at the first entry the previous page did not return, and ``total`` counts
@@ -7739,12 +9927,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         whole body) and ``continued`` (true when more of the same body follows).
         Concatenating them in page order reconstructs the body, so a page boundary may
         split a comment without losing text (kittrial-5bb.273).
+
+        ``recent=N`` (1..100, kittrial-5bb.353; the CLI's ``history --recent``) is the
+        page size of a NEWEST-FIRST read of the same snapshot: the newest N logical
+        entries first, and ``next_cursor`` continuing toward older ones. A long comment's
+        fragments still arrive together and in body order. It replaces ``limit`` (giving
+        both is refused). ``since_checkpoint=true`` selects the entries the task's newest
+        valid checkpoint did not incorporate, in either order. The cursor is bound to the
+        query, so it continues only the same direction and selection. ``order`` says
+        which direction a page is in, and ``truncated`` is true when entries exist that
+        this answer neither returned nor can continue to (a backend that cannot page).
         """
         self._project(ctx, CAP_READ)
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
-        limit, state = self._page(ctx, ctx.query)
+        recent, since_checkpoint = self._history_selection(ctx.query)
+        if recent is not None:
+            limit = recent
+            state = read_cursor(ctx.principal, ctx.params.get('pid'), ctx.query, ctx.query.get('cursor'))
+        else:
+            limit, state = self._page(ctx, ctx.query)
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
-                                           state['o'], canonical=state['x'])
+                                           state['o'], canonical=state['x'],
+                                           recent=recent is not None, since_checkpoint=since_checkpoint)
         who = lambda e: (e.get('user_id') or e.get('author')) if isinstance(e, dict) else None
         # (A canonical entry's author may be structured; ActorNames.get ignores it.)
         names = self._actor_names([who(e) for e in result['items']], ctx.params['pid'])
@@ -7757,7 +9961,39 @@ class ApiHandler(BaseHTTPRequestHandler):
             make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
                         state['o'] + len(result['items']), continuation)
             if continuation else None)
+        body['order'] = 'newest-first' if recent is not None else 'oldest-first'
+        # Entries this answer neither returned nor can continue to: a backend without a
+        # continuation cursor (the in-process one) cannot page past its first page, so the
+        # answer says so instead of looking complete (kittrial-5bb.353).
+        returned = state['o'] + len(result['items'])
+        body['truncated'] = body['next_cursor'] is None and returned < result['total']
+        if body['truncated']:
+            body['truncated_note'] = (
+                '%d of %d entries are not in this answer and this server cannot page to them: '
+                'read them with the client\'s history command.' % (result['total'] - returned, result['total']))
+        if since_checkpoint:
+            for key in ('since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
+                        'checkpoint_coverage', 'unverified_entries'):
+                body[key] = result.get(key)
         return 200, body
+
+    @staticmethod
+    def _history_selection(query):
+        """``recent`` (1..MAX_PAGE, or None) and ``since_checkpoint`` (a bool) of a history read."""
+        recent = query.get('recent')
+        if recent is not None:
+            if 'limit' in query:
+                raise invalid('Give limit or recent, not both: recent is the page size of a newest-first read')
+            try:
+                recent = int(recent)
+            except (TypeError, ValueError):
+                raise invalid('recent must be an integer')
+            if not 1 <= recent <= MAX_PAGE:
+                raise invalid('recent must be between 1 and %d' % MAX_PAGE)
+        since = query.get('since_checkpoint', 'false')
+        if since not in ('true', 'false'):
+            raise invalid('since_checkpoint must be true or false')
+        return recent, since == 'true'
 
     # -- review queue and personal work ---------------------------------------
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/queue')
@@ -7781,6 +10017,100 @@ class ApiHandler(BaseHTTPRequestHandler):
                            generated_at=now_iso(self.service._now()))
         body['items'] = self._task_views(body['items'], ctx.params['pid'])
         return 200, body
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/lanes')
+    def project_lanes(self, ctx):
+        """Who holds what, who is free, and the three flags of the lane board.
+
+        Readable by any project member (``CAP_READ``); a non-member or a member of another
+        project is refused by ``_project`` before anything is read, exactly as the queue
+        route refuses them. The aging and the flags are computed in ONE place, the
+        canonical ``work lanes`` read (``lanes.py``), which this route only pages and
+        scopes: the threshold (``idle_minutes``, 1..10080, default 15) is an argument of the
+        page and reaches that read unchanged, and it is never an installation setting.
+
+        ``offset`` is taken from the page's cursor, as the neighbouring reads take the
+        cursor's offset, but the page itself is cut by the read (its own ``next_offset``),
+        so the cursor the answer carries is minted from that, never from a second cut here.
+        """
+        self._project(ctx, CAP_READ)
+        limit, state = self._page(ctx, ctx.query)
+        idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        scope = self._lanes_scope(ctx.principal, ctx.params['pid'])
+        read = self.backend.lanes_read(
+            ctx.params['pid'],
+            ['--idle-minutes', str(idle_minutes), '--limit', str(limit), '--offset', str(state['o'])],
+            self._lanes_actor(ctx.principal), scope)
+        body = dict(read)
+        continuation = body.get('next_offset')
+        body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation)
+                               if type(continuation) is int and continuation > state['o'] else None)
+        return 200, body
+
+    def _lanes_idle_minutes(self, raw):
+        """The page's threshold argument, or the refusal that names the read's own range.
+
+        A bad threshold is a malformed request (400), not an unprocessable payload: it names
+        the ONE read's own range, so the page cannot ask for a value the read would refuse.
+        """
+        from lanes import DEFAULT_IDLE_MINUTES, IDLE_MINUTES_MIN, IDLE_MINUTES_MAX
+        if raw is None or raw == '':
+            return DEFAULT_IDLE_MINUTES
+        try:
+            minutes = int(raw)
+        except (TypeError, ValueError):
+            raise HttpError(400, 'invalid_request',
+                            'idle_minutes must be a whole number of minutes, %d to %d'
+                            % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
+        if not IDLE_MINUTES_MIN <= minutes <= IDLE_MINUTES_MAX:
+            raise HttpError(400, 'invalid_request',
+                            'idle_minutes must be %d to %d (one minute to seven days)'
+                            % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
+        return minutes
+
+    @staticmethod
+    def _lanes_actor(principal):
+        """The actor the board is read as: the caller's own canonical attribution label.
+
+        The same value ``Service.bind_actor`` accepts on a claim, so a task a person claimed
+        from this page is in the lane ``scope='own'`` finds for them.
+        """
+        return principal.actor or principal.user_id
+
+    def _lanes_scope(self, principal, project_id):
+        """The lanes panel's own isolation of the read (kittrial-5bb.263, design section 4).
+
+        This service calls the endpoint WITHOUT a bound key, so the endpoint's own
+        ``lanes_scope_for`` answers ``'all'`` for it. That is a property of the transport,
+        not an authority the page may inherit, so the route decides for its own viewer:
+        an owner or coordinator reads every lane, and everybody else is scoped to their
+        own agents' lanes -- the contributor route's rule, ``scope='own'`` in ``lanes.read``.
+
+        "Owner or coordinator" is the kit's ONE operator definition,
+        ``review_workflow.listed_operator_actor``, given the same inputs the endpoint itself
+        uses: the installation's operator allowlist and the project's actor -> principal
+        map, both read from the host through the read-only ``host-coordination`` action. A
+        host that cannot answer is not an operator list, so the read is then SCOPED: this
+        falls back to the narrower view, never to the wider one.
+        """
+        from review_workflow import listed_operator_actor
+        actor = self._lanes_actor(principal)
+        read = getattr(self.backend, 'host_coordination', None)
+        document = {}
+        if read is not None:
+            try:
+                document = read(project_id) or {}
+            except HttpError:
+                document = {}
+        operators = [name for name in (document.get('operators') or []) if isinstance(name, str)]
+        owners = {item.get('actor'): item.get('principal')
+                  for item in (document.get('sessions') or [])
+                  if isinstance(item, dict) and isinstance(item.get('principal'), str)}
+        try:
+            allowed = listed_operator_actor(actor, operators, owners)
+        except (ValueError, OSError):
+            allowed = actor in set(operators)
+        return 'all' if allowed else 'own'
 
     @route('GET', r'/v1/me/work')
     def me_work(self, ctx):
@@ -7969,6 +10299,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._project(ctx, CAP_PROJECT_ADMIN)
         limit, state = self._page(ctx, ctx.query)
         events = [e for e in self.service.state['audit'] if e.get('project_id') == ctx.params['pid']]
+        # The events of agents granted this project, cut to the project's view and only since
+        # the agent was given this project (kittrial-5bb.365). Stored events are not changed.
+        agent_rows = self.service.project_agent_audit(ctx.params['pid'])
+        if agent_rows:
+            events = sorted(events + agent_rows, key=lambda event: event['time'])
         if hasattr(self.backend, 'requirement_operator_audits'):
             operator_events = self.backend.requirement_operator_audits(ctx.params['pid'])
             if operator_events:
@@ -8636,6 +10971,14 @@ def main(argv=None):
                         help='log-ins one client address may have in flight at once, of the %d in all '
                              '(default %d; 1 to %d)' % (Service.LOGINS_AT_ONCE, Service.LOGINS_PER_ADDRESS,
                                                         Service.LOGINS_AT_ONCE))
+    parser.add_argument('--agent-credential-days', type=int, default=30, metavar='DAYS',
+                        help='future agent credential lifetime: 1 to 366 whole days (default 30; office may choose 90)')
+    parser.add_argument('--session-idle-minutes', type=int, default=None, metavar='MINUTES',
+                        help='session idle limit: 5 to 1440 whole minutes (default 30). A session unused for '
+                             'this long signs out')
+    parser.add_argument('--session-absolute-hours', type=int, default=None, metavar='HOURS',
+                        help='session absolute limit: 1 to 168 whole hours (default 12), never shorter than '
+                             '--session-idle-minutes. No use extends it')
     parser.add_argument('--approval-by-another-party', action='store_true',
                         help='nobody approves (or recommends) work of their own party: an account, its agents '
                              'and the worker credentials it issued. Off unless given')
@@ -8656,6 +10999,15 @@ def main(argv=None):
     web.add_argument('--no-web', action='store_true',
                      help='serve only the JSON API; do not serve the browser interface')
     args = parser.parse_args(argv)
+    try:
+        validate_agent_credential_days(args.agent_credential_days)
+        # Refused here, before the state store is opened: a limit that is out of bounds, not
+        # a whole number, or shorter than the idle window is one sentence and a non-zero exit,
+        # never a clamped value (kittrial-5bb.330). An omitted flag keeps 30 min / 12 h.
+        session_idle, session_absolute = session_limit_seconds(args.session_idle_minutes,
+                                                               args.session_absolute_hours)
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.list_unconfirmed_projects:
         # Read-only: the state document is read as JSON, without opening the store (which
@@ -8720,6 +11072,12 @@ def main(argv=None):
     if not 1 <= args.logins_per_address <= Service.LOGINS_AT_ONCE:
         parser.error('--logins-per-address must be a whole number from 1 to %d (the log-ins in flight in all)'
                      % Service.LOGINS_AT_ONCE)
+    if args.public_url:
+        # kittrial-5bb.360: one sentence, before the state is opened or a port is bound.
+        from server_address import public_url_problem
+        problem = public_url_problem(args.public_url, 'the service start (--public-url)')
+        if problem:
+            parser.error(problem)
     store = Store(args.state)
     if args.backend == 'endpoint' and (not args.endpoint or not args.root):
         parser.error('--backend endpoint requires --endpoint and --root '
@@ -8727,7 +11085,9 @@ def main(argv=None):
     trusted = list(args.trusted_proxy)
     if args.trust_proxy and 'localhost' not in trusted:
         trusted.append('localhost')
-    service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party)
+    service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party,
+                      agent_credential_days=args.agent_credential_days,
+                      session_idle=session_idle, session_absolute=session_absolute)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)
     for line in operator_allowlist_warnings(args.root if args.backend == 'endpoint' else None):

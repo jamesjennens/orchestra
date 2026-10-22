@@ -43,8 +43,10 @@ Every request is one JSON object on stdin; every response is one JSON object on 
   `stdout` to `FILE` as UTF-8 with LF line endings and no BOM instead, and leaves its
   own stdout empty.
 - On validation or transport failure, `returncode` is nonzero (`2` for endpoint
-  validation), `stdout` is empty, and `stderr` starts with the error type
-  (`ValueError: ...`). Automation should parse stdout only when the exit code is `0`.
+  validation), `stdout` is empty, and kit refusal `stderr` starts with `ValueError: `.
+  For kit-specific `ValueError` subclasses, the concrete class name follows that prefix,
+  except `ConfigurationUnreadable` retains its existing exact output for compatibility.
+  Automation should parse stdout only when the exit code is `0`.
 - **The server's time of a write** (additive). The answer of a write that was carried
   out has one more field, `"server_time": "2026-10-06T07:50:12+00:00"`: the endpoint
   host's clock, UTC with its offset, whole seconds. Cite it where a record says when
@@ -230,6 +232,85 @@ unchanged).
 project, whose own work goes into tasks, comments and requirements. Changes requested on
 a delivery are a *review request*, never "feedback".
 
+## `wait`: block until it is your move, then print the next wait
+
+`wait` is a client-side command: the client blocks and polls the endpoint's cheap wait
+read once per `--interval` (300 s by default, never less than 60), and returns as soon
+as something is the caller's move. It never asks the endpoint for a blocking call.
+`--timeout SECONDS` bounds the whole wait (omitted: no bound); `--since FINGERPRINT` is
+the state the caller already acted on, so a restart that finds the same state keeps
+blocking instead of returning it twice. Without `--since` the client uses the fingerprint
+it remembers in its small local state file; `--fresh` ignores it and asks for the whole
+baseline again.
+
+A waiting agent should not invent its next wait. With `--idle-since TIME` (an ISO-8601
+instant with an offset: when the caller's current idle spell began) and a bounded
+`--timeout`, the result of every timeout with the fingerprint unchanged carries:
+
+- `next_timeout`: the timeout of the next wait, in seconds. It starts at `--timeout`,
+  doubles after two empty returns in a row, is never above `--max-timeout` (the default
+  cap is 3600 s), and is never below the base `--timeout`.
+- `next_command`: the exact full wait command to run next - this client, config,
+  project and actor, `--since FINGERPRINT`, `--idle-since TIME`, the new `--timeout`,
+  and the form, cadence and bounds the caller used. Run that line; do not retype a wait.
+- `give_up`: `false` while the idle spell is inside `--give-up-after` (12 h by
+  default); `true` once it reaches the limit. Then `message` is exactly
+  `checkpoint and stop: nothing has been your move since TIME`. Checkpoint the task and
+  stop; do not run the printed wait again.
+
+A return with items (exit 0) is work: the schedule resets. Its `next_command` starts
+again at the base `--timeout`, with a fresh `--idle-since` (the return time) and the
+fingerprint just printed.
+
+The fingerprint covers `newer_activity_marker` as well as the `newer_activity`
+boolean. A second other-party comment after the checkpoint, an edit to the newest one,
+or an edit of the title, description or acceptance therefore wakes a waiting agent even
+while the boolean stays `true`; a claim or a status change does not (kittrial-5bb.354).
+When the marker is `null` (no checkpoint, or legacy unknown coverage) the boolean alone
+decides, exactly as before. The fields are defined once in docs/BRIEFINGS.md, "Newer
+activity: one definition".
+
+**The changed block.** The client keeps a small local state file beside its config (the
+same directory as the `--config` file, derived from that path - never a hard-coded
+`~/.orchestra`; one file per project, actor and form). It holds only the last
+fingerprint and the last item list. On a wake (exit 0) the result also carries
+`changed`:
+
+- `tasks`: one `{task, fields}` entry per item whose fields differ from the last list,
+  each field as `{field, old, new}` (a lane row is named by its `lane`);
+- `added` / `removed`: the task ids present in only one of the two lists.
+
+The block is additive: no existing key, exit code or ordering guarantee changes, and a
+caller that does not know it ignores it. A first call with no state reports the whole
+baseline as added. The file holds only the work fields already printed - no config value
+and no credential - and is bounded (100 items); an unreadable, corrupt or foreign file
+is treated as absent and rewritten by the next return, so a wait never fails because of
+it.
+
+**`--since` and `--fresh`.** A call without `--since` uses the last fingerprint the
+client remembers in that state file, so a restarted session does not re-read the
+baseline; the first call ever (or after the file is lost) returns the whole baseline.
+`--fresh` ignores the remembered fingerprint, returns the whole baseline again and
+refreshes the state. An explicit `--since` always wins.
+
+**The stateless backoff.** The client's backoff remembers nothing between runs, so "two
+empty returns in a row" is recomputed from the flags: it assumes the idle spell was
+spent in waits of the schedule's own durations (base, base, 2x, 4x, ... up to the cap),
+counts how many of them fit in the time between `--idle-since` and the moment this wait
+timed out (the wait that just ended included), and prints the next one. A caller that
+runs each printed `next_command` therefore sees the timeout double exactly after two
+empty returns in a row. Set `--idle-since` to the moment the spell began - not the
+moment the first wait started - so the count reflects the whole idle time.
+
+A caller that passes none of `--idle-since`, `--max-timeout` or `--give-up-after` keeps
+the same existing fields, the same values and the same exit codes as before this change;
+`--max-timeout` and `--give-up-after` alone change nothing (the schedule needs
+`--idle-since` and a bounded `--timeout`). The additive `changed` block and the
+remembered default for `--since` (with `--fresh` to ignore it) apply to every call.
+Exit codes are unchanged: 0 something is your move, 1 the timeout ran
+out, 2 the arguments or the endpoint refused the read, 3 the service could not be
+reached.
+
 ## `work`: list/queue shape
 
 `work` returns:
@@ -345,6 +426,16 @@ whose checkpoint was the baseline and what it could not be shown. `brief --full`
 `full_context` with the same additive rule; its `omission_counts` are the compact
 read's clips and its `full_omitted_chars`/`truncated`/`complete` are the bound's own.
 
+The web service's `GET /v1/projects/{id}/tasks/{task}/history` gives the same two
+directions (kittrial-5bb.353):
+- its `recent=N` (1..100) is this `--recent`/`--last`, read newest first over the same
+  snapshot, with the same fragment order and a cursor toward older entries;
+- its `since_checkpoint=true` is this `--since-checkpoint`.
+
+The route assembles each page from canonical pages of at most 20, so its page size may be
+larger than the canonical `--recent` range. Its answer carries `order` and the checkpoint
+keys above; see docs/HTTP_DEPLOYMENT.md ("Reading a task's history, newest first").
+
 `brief` and each `work` item also carry three additive lifecycle delivery fields
 (kittrial-5bb.107 item 7, rev2 item 6.1). `deployed_delivery` is the delivery a passed
 `deployed` fact belongs to, or `null` when the task has no trusted `deployed=passed`
@@ -379,8 +470,19 @@ still reads `unknown` and its `event_id` names the event that caused it.
 references, own/other counts and explicit unknown/windowed coverage; the latter
 keeps other-actor comment directions visible until explicit resolution or
 supersession. Reading never acknowledges or completes them.
-`work --mine` adds `newer_activity_by_others`, `newer_activity_own`,
-`newer_activity_coverage` and `unresolved_directions` to displayed task rows.
+`work --mine` adds `newer_activity_marker`, `newer_activity_by_others`,
+`newer_activity_own`, `newer_activity_coverage` and `unresolved_directions` to
+displayed task rows. They are defined once, for every route, in docs/BRIEFINGS.md
+("Newer activity: one definition", kittrial-5bb.354). In short, `newer_activity_marker`
+is `<entry_id>:<16 hex>` for the newest other-party entry the current checkpoint did
+not incorporate, or `fields:<16 hex>` when there is none. The hex also covers the
+current title, description and acceptance, so an edit of one of those moves it and a
+claim never does. It is never a timestamp, and it is `null` only without a valid
+checkpoint or for a legacy one (a client then falls back to the `newer_activity`
+boolean, which keeps its released rule). `brief` carries the same six fields in its
+`activity` block, its `newer` block carries the same marker, and its
+`changes_since_checkpoint` section lists the entries and the changed fields (from
+`bd history`, read-only, cached per tracker generation) newest first.
 `session resume` records a resume event and returns session, resume and guidance
 metadata; it returns neither task IDs nor task rows. Read `work --mine` for tasks
 and checkpoint attention. The `worker.py resume` wrapper also runs onboarding,
@@ -510,7 +612,11 @@ and are not already listed as `reference-review` items:
   exist, so the exact number is not shown. To see drafts, run `ref find` yourself; each
   is marked not accepted there.
 
-`brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`;
+`brief` decodes unresolved items as `open_items[]` with `id`, `kind`, `text`, `source`.
+`checkpoint.open_items` holds only the first ten and carries `open_items_shown`,
+`open_items_total` and, when the list is cut, a one-sentence `open_items_note`;
+`carry_open_items` is the complete list, in order, and is null when it could not all be
+read. Copy `carry_open_items`, not the first ten.
 `history` pages entries with `entry_id`, `body`, `body_offset`, `body_total_chars` and
 `continued`, so a long body is reassembled by concatenating fragments in offset order.
 
@@ -533,6 +639,8 @@ The local commands:
 The client loads `capabilities.py` from its own directory by path. A standalone
 client copied without that file refuses with exit `2`; copy `capabilities.py` from
 the same kit next to it. The module also runs on its own as `python capabilities.py ...`.
+This is the only companion file a client-side command needs: a stand-alone `client.py`,
+with no other kit file beside it, runs `wait` and the rest of the local commands on its own.
 
 `capabilities.py` is **not** covered by `provenance.json`: `--version` and onboarding
 parity vouch for `client.py`, `version.py` and `VERSION` only. Whoever can write the
@@ -1658,6 +1766,7 @@ is not sent to `bd`.
 | `proposal-review --file FILE` | `admin.py proposal-review` |
 | `proposal-decide --file FILE` | `admin.py proposal-decide` |
 | `handoff --file FILE` | `admin.py handoff` (the operator's transfer) |
+| `followon --file FILE` | the coordinator's recorded hand-back (`followon.py`): `record` with task and text, or `withdraw` with the follow-on and reason |
 | `set-onboarding --file FILE` | `admin.py set-onboarding` |
 
 **Authority.** The action is refused unless all of these hold: the request arrives over a key
@@ -1693,7 +1802,42 @@ coordination lock, as the host command does. A `capability-verify` whose every i
 recorded wrote nothing and carries no `server_time`.
 
 **Refusals.** An unknown subcommand, or a host-only command named here, is refused with
-"Unknown coordinator command" and the list of the ten. A refused operation changes nothing.
+"Unknown coordinator command" and the list of the eleven. A refused operation changes nothing.
+
+**`followon` (kittrial-5bb.343).** Records the coordinator's hand-back of an
+integrated-but-open task to its assignee, or withdraws one. The payload is one JSON
+object: `{"schema_version":1,"operation":"record","task":"TASK","text":"..."}` or
+`{"schema_version":1,"operation":"withdraw","target":"FOLLOWON_COMMENT_ID","reason":"..."}`.
+The caller supplies only those facts; the server derives the current contribution, the
+native integration record it cites and that record's order under the project
+coordination lock, and refuses unless the contribution currently reads integrated, the
+task is open, the text is within 600 characters, and no other hand-back is open. The
+native comment is paired with a host journal entry in
+`<project>/.assignee-followons/<sha256>.json`; without it the comment is inert. The
+recorded text is quoted once (escaped as checkpoint wait text is) in `work`/`brief`
+`next` while the hand-back applies. It ends when the assignee disposes it in a
+checkpoint's `directions` (where `checkpoint_provenance_writes` is on), the coordinator
+withdraws it, a new contribution becomes current, or the task closes. The web route is
+`POST /v1/projects/{pid}/tasks/{tid}/assignee-followon` (body `text`) and
+`POST .../assignee-followon/{fid}/withdraw` (body `reason`), both gated on
+`CAP_COORDINATE`. Every refusal ends "Nothing was written."
+
+**The host route (kittrial-5bb.358).** An installation operator records and withdraws
+the same records without a bound coordinator key or a web account:
+
+```sh
+python3 admin.py --root /path/to/root followon --project PROJECT --actor OPERATOR --file payload.json
+```
+
+The payload is the same JSON object as `coordinator followon` above; its own
+`operation` chooses record or withdraw. `--actor` must itself be on the installation's
+operator allowlist (`operators` in `deployment.private.json`, read strictly), the
+recorded actor is exactly that name, and a payload that carries its own `actor` must
+name the same one; a non-operator caller or a differing payload actor is refused
+before a lock is taken and nothing is written. The command takes the project's
+`.coordination.lock` and calls `followon.apply`, the same library function the
+`coordinator followon` and web routes call, so its validation, fact derivation and
+journal are identical.
 
 ## `docs` and `onboard`: the installed documents
 
@@ -1799,6 +1943,7 @@ it by failing.
 | `capability resolve` | pointers | 1..100, each <= 400 characters |
 | `capability` | `--max-graph-mb` | 1..512 (default 64); at most 500,000 nodes and 2,000,000 links |
 | `capability` | indexed files | first 20,000 files; files over 2 MB skipped; 256 MB in total |
+| `capability` | index build time | 60 seconds overall; on expiry the command stops with one sentence naming the tree and the work reached, and suggests `--repo <path>` (one checkout) or `--source graphify` |
 | `capability` | entries | 200,000 in total; 2,000 headings per Markdown file and 5,000 definitions per Python file (the rest counted as `entry-limit`, `heading-limit`, `definition-limit`, each with a warning); `resolve` still reads a whole file |
 | `capability` | Python nesting | source decoded with its declared encoding (UTF-7 cookie cannot hide operators); parsed on a 512 MB (Windows: 255 MB) worker stack, trusted to at most 50,000 levels, retrying 255 MB if the 512 MB thread cannot start; a flat or statement-dense file over 300,000 expression tokens (operators, brackets, commas, NAME tokens and depth-zero statement separators) is `too-complex`; fallback guard 5,000 levels per logical line (Windows: 2,000) with a 16 MB per-run tokenize budget (`too-complex`); `parse-error` skips warn with counts |
 | `capability` | Markdown | heading lines over 1,000 characters are text; a summary is looked for in the 40 lines after its heading |
@@ -1979,7 +2124,9 @@ replacement are refused before native writes, independently of optional policy
 rules. Ordinary event creation and task prose remain writable. Contributor raw
 updates cannot change a row to or from `event`, even without lifecycle content:
 that would change which tasks the readers include. Making an existing row
-ephemeral is also refused because native exports omit it. Create a child of a
+ephemeral is also refused because a plain native export (without `--all`) omits
+ephemeral rows, so the row would disappear from any read that uses one; the kit's
+own exports all pass `--all` and keep it (kittrial-5bb.260 F2). Create a child of a
 scoped task with `--no-inherit-labels`; inherited lifecycle labels are refused.
 Type membership alone never makes readable event content a trusted fact. Configured operators
 and structured host writers keep their existing routes and legacy readers.

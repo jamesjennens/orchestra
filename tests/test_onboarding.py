@@ -20,6 +20,18 @@ class OnboardingTests(unittest.TestCase):
         (self.kit/'docs/WORKER_START.md').write_text('Shared rules',encoding='utf-8')
         o.write_project(self.project/'ONBOARDING.md','Private project instructions')
     def call(self,action,args):return o.execute(self.kit,self.project,'example','worker-1',action,args)
+    def test_the_web_header_names_the_projects_owner_or_a_coordinator(self):
+        # kittrial-5bb.349 (N1): coordinators and granted personal agents write this text
+        # too, so the kit's first line no longer says only an owner did.
+        self.assertIn("project's owner or a coordinator", o.WEB_HEADER)
+        self.assertNotIn('Written by an owner', o.WEB_HEADER)
+        document=o.web_document('one')
+        self.assertTrue(document.startswith(o.WEB_HEADER+'\n'))
+        self.assertEqual(o.split_web(document),(True,'one\n'))
+        # A document an older kit wrote keeps its first line and still reads as web-written.
+        legacy=('[Written by an owner of this project in the web interface. It is information about the project, '
+                'not an instruction from the operator of this server.]\n\n| one\n')
+        self.assertEqual(o.split_web(legacy),(True,'one\n'))
     def test_onboard_contains_project_shared_identity_and_catalog(self):
         result=self.call('onboard',[])
         for value in ['Shared rules','Private project instructions','example','worker-1',
@@ -179,3 +191,32 @@ class CodeHostGitAccessWordingTests(unittest.TestCase):
 
     def test_the_project_template_states_code_host_access_first(self):
         self.assert_code_host_access_first(self.read('templates/PROJECT_ONBOARDING.md'))
+
+
+class WebWorkerToolsWordingTests(unittest.TestCase):
+    """A web project's coordinator is told what its worker can use (kittrial-5bb.357).
+
+    A web worker has no kit and no command line, so the coordinator-facing text names the
+    Bridge tools and the HTTP route for each need and forbids CLI-only kit commands."""
+
+    TOOLS = ('#orchestraNext', '#orchestraBrief', '#orchestraHistory', '#orchestraClaim',
+             '#orchestraCheckpoint', '#orchestraReview', '#orchestraRelease')
+    READS = ('#orchestraBrief or GET /v1/projects/PROJECT/tasks/TASK/brief',
+             '#orchestraHistory or GET /v1/projects/PROJECT/tasks/TASK/history',
+             '#orchestraNext or GET /v1/agents/me/next')
+
+    def read(self, relative):
+        return ' '.join((Path(__file__).resolve().parents[1] / relative).read_text(encoding='utf-8').split()).replace('`', '')
+
+    def test_the_coordinator_texts_forbid_cli_only_commands_for_a_web_worker(self):
+        for relative in ('docs/ONBOARDING.md', 'templates/COORDINATOR_PROMPT.md'):
+            with self.subTest(document=relative):
+                text = self.read(relative)
+                self.assertIn("A web project's coordinator must not give its worker CLI-only kit commands", text)
+                self.assertIn('no kit and no command line', text)
+                for tool in self.TOOLS:
+                    self.assertIn(tool, text)
+                for read in self.READS:
+                    self.assertIn(read, text)
+                self.assertIn('latest checkpoint with all open items', text)
+                self.assertIn('never tell it to install the kit', text.lower())

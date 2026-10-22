@@ -9,16 +9,18 @@ import * as project from './views/project.js';
 import * as task from './views/task.js';
 import * as admin from './views/admin.js';
 import * as reqs from './views/requirements.js';
+import * as records from './views/records.js';
 import * as agents from './views/agents.js';
 import * as setup from './views/setup.js';
 import * as how from './views/how.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
-  home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list,
+  home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list, agentSetup: agents.setupWizardPage,
   project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings, setup: setup.page, how: how.page,
   newTask: task.create, task: task.detail,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
+  records: records.page, referenceRecord: records.referencePage, capabilityRecord: records.capabilityPage,
   users: admin.users, account: admin.account,
 };
 
@@ -54,10 +56,15 @@ export async function start(root, options = {}) {
   };
   ctx.signOut = async () => {
     try { await api.logout(); } catch { /* the session is gone either way */ }
+    agents.clearWizardStorage();
     ctx.me = null; ctx.projects = [];
     showLogin();
   };
-  ctx.sessionLost = () => { ctx.me = null; showLogin('Your session has ended. Sign in again to continue.'); };
+  ctx.sessionLost = () => {
+    agents.clearWizardStorage();
+    ctx.me = null;
+    showLogin('Your session has ended. Sign in again to continue.');
+  };
 
   function showLogin(message) {
     mount(root, auth.login(ctx, message));
@@ -92,6 +99,7 @@ export async function start(root, options = {}) {
             link('/p/' + pid, 'Tasks'),
             link('/p/' + pid + '/reviews', 'Reviews'),
             ctx.features.requirements ? link('/p/' + pid + '/requirements', 'Requirements') : null,
+            link('/p/' + pid + '/records', 'Records'),
             ctx.features.records ? link('/p/' + pid + '/decisions', 'Decisions') : null,
             link('/p/' + pid + '/feedback', 'Orchestra feedback'),
             link('/p/' + pid + '/settings', 'Members & settings'),

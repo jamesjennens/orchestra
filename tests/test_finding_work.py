@@ -22,6 +22,7 @@ import onboarding
 import test_agent_attention
 import test_bd_label_aliases as rb
 import test_claim_held as held_stack
+import claim_limit
 import test_http_agents
 import test_http_review_fixes as fixes
 from test_http_agents import BASE, BUNDLE, COMMIT
@@ -59,29 +60,54 @@ class ServedTextTests(unittest.TestCase):
         self.assertIn('Only when none of its own tasks needs action: the ready list', heads[2])
         self.assertIn('assigned to somebody else is held', heads[3])
         for said in ('**exactly one** task that nobody holds', 'is not an inbox', 'Silence is not a handoff',
-                     'it cannot read the guidance yet', '**In the web interface today: no.**',
+                     'GET /v1/projects/PROJECT/guidance', '**In the web interface today: yes.**',
                      'set-guidance PROJECT --actor OPERATOR --file FILE', '`update TASK --assignee ACTOR --json`',
                      '`comments add TASK --file note.md --json`', 'kittrial-5bb.211', 'kittrial-5bb.212'):
             with self.subTest(said=said):
                 self.assertIn(said, ' '.join(text.split()))
         # Three ways to reach a worker, each with what the web can do today and a command.
         reach = text.split('## How to reach a worker', 1)[1].split('\n## ', 1)[0]
-        self.assertEqual(reach.count('**In the web interface today:'), 3)
+        self.assertEqual(reach.count('**In the web interface today: yes.**'), 3)
         self.assertEqual(reach.count('**The command today,**'), 3)
         # Written in what the page renders: no table, and no list whose items wrap.
         self.assertNotIn('\n|', text)
         self.assertIsNone(re.search(r'^\s*[-*]\s', text, re.M))
 
-    def test_what_the_text_says_is_not_there_is_not_there(self):
-        """The text says three things the web cannot do yet. When a route for one of them arrives, this
-        fails, and the text is to be corrected with it."""
+    def test_the_text_names_a_web_workers_tools_and_the_route_for_each_need(self):
+        """kittrial-5bb.357: a coordinator can quote a tool or route instead of a kit command."""
+        text = ' '.join((KIT / 'docs' / 'FINDING_WORK.md').read_text(encoding='utf-8').split()).replace('`', '')
+        self.assertIn('A worker with a web credential has no kit and no command line', text)
+        for tool in ('#orchestraNext', '#orchestraBrief', '#orchestraHistory', '#orchestraClaim',
+                     '#orchestraCheckpoint', '#orchestraReview', '#orchestraRelease'):
+            with self.subTest(tool=tool):
+                self.assertIn(tool, text)
+        for need in ('#orchestraBrief or GET /v1/projects/PROJECT/tasks/TASK/brief',
+                     '#orchestraHistory or GET /v1/projects/PROJECT/tasks/TASK/history',
+                     '#orchestraNext or GET /v1/agents/me/next',
+                     '#orchestraClaim or POST /v1/projects/PROJECT/tasks/TASK/claim',
+                     '#orchestraCheckpoint or POST /v1/projects/PROJECT/tasks/TASK/checkpoints',
+                     '#orchestraReview or POST /v1/projects/PROJECT/tasks/TASK/reviews',
+                     '#orchestraRelease or POST /v1/projects/PROJECT/tasks/TASK/release'):
+            with self.subTest(need=need):
+                self.assertIn(need, text)
+        self.assertIn('latest checkpoint with all open items', text)
+        for read_name in ('the brief read', 'the history read', 'the me/next read'):
+            with self.subTest(read=read_name):
+                self.assertIn(read_name, text)
+        self.assertIn('Never tell it to install the kit', text)
+        self.assertIn('never give it a CLI-only kit command', text)
+
+    def test_the_documented_guidance_comment_and_assignment_routes_exist(self):
+        """Check actual compiled routes: source fragments missed paths assembled with ID."""
         import http_service
-        source = Path(http_service.__file__).read_text(encoding='utf-8')
-        declared = re.findall(r"@route\('([A-Z]+)', r'([^']*)'", source)
-        self.assertGreater(len(declared), 50)
-        self.assertEqual([path for _, path in declared if 'guidance' in path], [])
-        self.assertEqual([path for _, path in declared if 'comments' in path], [])
-        self.assertEqual([path for _, path in declared if path.endswith("/assign'") or '/assignee' in path], [])
+        for method, path in [('GET', '/v1/projects/pp/guidance'),
+                             ('PUT', '/v1/projects/pp/guidance'),
+                             ('POST', '/v1/projects/pp/guidance/ack'),
+                             ('POST', '/v1/projects/pp/tasks/pp-1/comments'),
+                             ('POST', '/v1/projects/pp/tasks/pp-1/assign')]:
+            with self.subTest(method=method, path=path):
+                self.assertTrue(any(verb == method and pattern.fullmatch(path)
+                                    for verb, pattern, _, _, _ in http_service.ROUTES))
         self.assertEqual(http_service.ApiHandler.TASK_CHANGES, ('title', 'description', 'status', 'priority'))      # no assignee
 
     def test_a_prompt_is_the_fenced_block_up_to_the_last_fence(self):
@@ -169,10 +195,13 @@ class ServedTextTests(unittest.TestCase):
         doc = ' '.join((KIT / 'docs/FINDING_WORK.md').read_text(encoding='utf-8').split())
         prompt = onboarding.member_document(KIT, 'poll-prompt-agent')['prompt']
         guide = (KIT / 'web/js/agentSetup.js').read_text(encoding='utf-8')
-        self.assertIn('it cannot read the guidance yet. No route', doc)
-        self.assertIn('for owners and superusers only', doc)
-        self.assertIn('does not reach you over the web yet', prompt)
-        self.assertIn('does not reach you over this API yet', guide)
+        self.assertIn('GET /v1/projects/PROJECT/guidance', doc)
+        self.assertIn('editing it requires coordinate authority', doc)
+        self.assertIn('unknown legacy route', prompt)
+        self.assertIn('Reading never acknowledges', prompt)
+        self.assertIn('/v1/projects/PROJECT/guidance', guide)
+        self.assertIn('unknown legacy route', guide)
+        self.assertIn('Reading never acknowledges', guide)
         for text in (doc, prompt, guide):
             self.assertIn('Blocked and in-progress tasks', text)
             self.assertIn('reading acknowledges nothing', text.lower())
@@ -206,7 +235,8 @@ class Members(test_http_agents.AgentHarness):
             self.assertEqual(200, self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, self.ids[name]),
                                                {'role': role}, token=self.alex).status)
             self.tokens[name] = self.login(name, name + '-password-1')[0]
-        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.project], name='Kestrel')
+        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.project], name='Kestrel',
+                                                          claim_limit=claim_limit.LIMIT_MAX)
 
     def task(self, title):
         made = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': title}, token=self.alex)
@@ -335,7 +365,11 @@ class OrderTests(Members):
         self.assertEqual((built['order'], built['steps']), (['guidance', 'own-tasks', 'ready-list', 'held', 'checkpoint'], 5))
         numbered = re.findall(r'^(\d)\. (.{0,60})', guide, re.M)
         self.assertEqual([number for number, _ in numbered], ['1', '2', '3', '4', '5', '6', '7'])
-        self.assertTrue(numbered[0][1].startswith("The coordinator's standing guidance does not"), numbered[0])
+        self.assertTrue(numbered[0][1].startswith('Read GET https://office.example/v1/projects/PROJECT/guidance'), numbered[0])
+        for sentence in ('set_by and set_via', 'unknown legacy route',
+                         'Reading never acknowledges', '/guidance/ack',
+                         'exact version read', 'stable Idempotency-Key'):
+            self.assertIn(sentence, guide)
         self.assertTrue(numbered[1][1].startswith('Your own tasks: GET https://office.example/v1'), numbered[1])
         self.assertTrue(numbered[2][1].startswith('Only when none of your own tasks needs'), numbered[2])
         self.assertTrue(numbered[3][1].startswith('A task assigned to somebody else is held'), numbered[3])
@@ -389,7 +423,8 @@ class RealStackOrderTests(held_stack.RealStackTests):
                          'set ORCHESTRA_ATTENTION_SCALE=1 for the282-task native activity fixture')
     def test_flagged_task_is_not_hidden_by_282_owned_native_tasks(self):
         import time
-        made = self.request('POST', '/v1/agents', {'name': 'Scale reader', 'projects': ['pp']},
+        made = self.request('POST', '/v1/agents', {'name': 'Scale reader', 'projects': ['pp'],
+                                                    'claim_limit': claim_limit.LIMIT_MAX},
                             token=self.tokens['casey'])
         self.assertEqual(201, made.status, made.data)
         secret = made.data['credential']['secret']; actor = made.data['agent']['actor']
@@ -464,7 +499,8 @@ class RealStackOrderTests(held_stack.RealStackTests):
         self.assertIn('Review this <script> literally', json.dumps(history.data, ensure_ascii=False))
 
     def test_own_feedback_comes_before_free_work_and_a_held_task_is_not_offered(self):
-        made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/x/kestrel', 'projects': ['pp']},
+        made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/x/kestrel', 'projects': ['pp'],
+                                                    'claim_limit': claim_limit.LIMIT_MAX},
                             token=self.tokens['casey'])
         self.assertEqual(201, made.status, made.data)
         agent = made.data['credential']['secret']
@@ -519,7 +555,7 @@ class PageTests(Members):
         self.assertEqual(viewer['headings'], wanted)
         self.assertEqual(viewer['howText'], owner['howText'])
         for said in ('1. The coordinator\'s standing guidance', '3. Only when none of its own tasks needs action: the ready list',
-                     'In the web interface today: no.', 'comments add TASK --file note.md --json', 'Served by the kit as docs finding-work.'):
+                     'In the web interface today: yes.', 'comments add TASK --file note.md --json', 'Served by the kit as docs finding-work.'):
             with self.subTest(said=said):
                 self.assertIn(said, owner['howText'])
         self.assertNotIn('**', owner['howText'])                                 # rendered, not shown as marks

@@ -132,6 +132,7 @@ Windows workstation and a Linux office host.
 """
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -323,6 +324,9 @@ CAP_APPROVE = 'reviews.approve'
 #: member or an agent can propose. Triage and decisions need CAP_APPROVE, which no
 #: credential ever holds.
 CAP_PROPOSALS = 'proposals.write'
+#: Propose or revise reference and capability records (.201 slice 5, kittrial-5bb.213).
+#: Contributors, coordinators and owners hold it, and the `tasks` credential scope grants it.
+CAP_RECORDS = 'records'
 #: What a project's coordinator may do beyond approving (slice 1b of docs/WEB_COORDINATOR_DESIGN.md,
 #: kittrial-5bb.209). Web merge-slot acquire/release use it; lifecycle facts follow separately.
 CAP_COORDINATE = 'coordinate'
@@ -340,6 +344,11 @@ GRANT_LIMIT_DEFAULT = 5
 #: authenticated session may manage the agents it owns, while no worker/agent
 #: credential ever holds it (an agent cannot create or widen another identity).
 CAP_AGENTS = 'agents.manage'
+#: An agent credential's authority over its OWN record (kittrial-5bb.302): it may lower
+#: its own claim limit, and nothing else. Deliberately not project-scoped and never held
+#: by a session or a worker credential: the route that needs it takes no target agent id
+#: at all, so it can only ever reach the caller's own record.
+CAP_AGENT_SELF = 'agent.self'
 
 ROLES = ('viewer', 'contributor', 'coordinator', 'owner')
 RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
@@ -347,6 +356,7 @@ RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
 SCOPE_CAPABILITIES = {
     'read': frozenset({CAP_READ}),
     'tasks': frozenset({CAP_TASKS}),
+    'records': frozenset({CAP_RECORDS}),
     'checkpoints': frozenset({CAP_CHECKPOINTS}),
     'reviews': frozenset({CAP_REVIEWS}),
     'feedback': frozenset({CAP_FEEDBACK}),
@@ -358,23 +368,129 @@ CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 
 ROLE_CAPABILITIES = {
     'viewer': frozenset({CAP_READ}),
-    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                              CAP_PROPOSALS}),
+    'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
+                              CAP_FEEDBACK, CAP_PROPOSALS}),
     # Between contributor and owner: approves and coordinates; does not administer the
     # project (members, worker credentials, archive and the audit stay the owner's).
-    'coordinator': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                              CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE}),
-    'owner': frozenset({CAP_READ, CAP_TASKS, CAP_CHECKPOINTS, CAP_REVIEWS, CAP_FEEDBACK,
-                        CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE, CAP_PROJECT_ADMIN}),
+    'coordinator': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
+                              CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE}),
+    'owner': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
+                        CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE,
+                        CAP_PROJECT_ADMIN}),
 }
 #: What the coordinator grant adds to an agent's credential in the project of the grant.
-GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE})
+GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE, CAP_RECORDS})
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
                                                CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,
                                                CAP_AGENTS})
 ALL_CAPABILITIES = frozenset(ROLE_CAPABILITIES['owner'] | {CAP_PROJECT_CREATE,
                                                            CAP_ACCOUNTS_ADMIN,
                                                            CAP_AGENTS})
+
+#: The longest a credential's STORED expiry is honoured for after the most recent
+#: LEGITIMATE WRITE, ON READ (kittrial-5bb.294 item 4): 366 days, the same ceiling the
+#: ``--agent-credential-days`` setting allows. Issuance and every extension stamp the
+#: write in ``agent_written_raw``, so effective expiry is
+#: ``min(stored expiry, agent_written_raw + 366 days)``. A record written before the field
+#: existed falls back to its issuance stamp, so it still caps. A store whose expiry was
+#: hand-edited to years reads as capped here, so the web service and the canonical
+#: endpoint both refuse it once the last legitimate write is older than this, whatever the
+#: store says. The field sits in the same store as the expiry and is exactly as editable:
+#: this stops careless or stale edits, not a host user who can rewrite the state. A read
+#: never rewrites the store.
+CREDENTIAL_MAX_AGE_DAYS = 366
+CREDENTIAL_MAX_AGE_SECONDS = CREDENTIAL_MAX_AGE_DAYS * 86400
+
+#: The 401 at credential expiry names who can act (kittrial-5bb.294 item 2) and says
+#: nothing about any other credential: no id, secret, label or count. A revocation keeps
+#: reading as a revocation.
+CREDENTIAL_EXPIRED_MESSAGE = (
+    "Credential expired. An owner can extend an agent credential before it expires; "
+    "after it expires the owner's account or a superuser issues a new secret.")
+CREDENTIAL_REVOKED_MESSAGE = (
+    "Credential revoked. The owner's account or a superuser issues a new secret.")
+
+
+def credential_issued_raw(credential):
+    """The credential's raw issuance instant, or ``None`` when it carries no readable stamp.
+
+    ``agent_issued_raw`` is the agent key's real issue time (the older kit's fixed raw-age
+    cap makes it the field to read); ``issued_raw`` is the worker/default30 stamp. A
+    hand-edited non-number reads as no stamp rather than crashing a read.
+    """
+    for key in ('agent_issued_raw', 'issued_raw'):
+        value = credential.get(key)
+        if type(value) is bool or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(value):
+            continue
+        return float(value)
+    return None
+
+
+def credential_written_raw(credential):
+    """The credential's most recent legitimate-write instant, or ``None``.
+
+    Issuance and every extension record this raw-clock stamp, so it is what the 366-day
+    read cap is measured from. A missing, hand-edited non-number or non-finite value
+    reads as no stamp: :func:`credential_expiry_cap` then falls back to the issuance
+    stamp rather than failing open.
+    """
+    value = credential.get('agent_written_raw')
+    if type(value) is bool or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def credential_expiry_cap(credential):
+    """The latest instant a credential's stored expiry may be honoured, or ``None``.
+
+    Measured from the most recent LEGITIMATE WRITE (:func:`credential_written_raw`):
+    issuance, or the last extension. A record without that field - one written before it
+    existed - falls back to its issuance stamp so it still caps. ``None`` means neither
+    stamp is readable, so nothing is capped: a record from before either stamp existed
+    keeps the reader it always had.
+    """
+    written = credential_written_raw(credential)
+    if written is None:
+        written = credential_issued_raw(credential)
+    return None if written is None else written + CREDENTIAL_MAX_AGE_SECONDS
+
+
+def credential_age_expired(credential, moment):
+    """Whether a credential is past the 366-day read cap (kittrial-5bb.294 item 4).
+
+    The cap is measured from the most recent legitimate write, not the first issuance
+    (:func:`credential_expiry_cap`), so an owner's latest extension always buys the full
+    configured lifetime. ``moment`` is the caller's decision clock, which is never
+    earlier than the raw clock, so this can only ever refuse early: a hand-edited store
+    expiry of years is never honoured beyond the cap.
+    """
+    cap = credential_expiry_cap(credential)
+    if cap is None:
+        return False
+    try:
+        return float(moment) >= cap
+    except (TypeError, ValueError, OverflowError):
+        return True
+
+
+def credential_stored_expired(credential, moment):
+    """Whether the credential's own stored ``expires_at`` has passed; fail closed.
+
+    A missing, non-numeric or unreadable value counts as expired, exactly as the previous
+    ``credential.get('expires_at', 0) <= moment`` intent, without the ``TypeError`` a
+    hand-edited ``null`` used to raise.
+    """
+    expires = credential.get('expires_at', 0)
+    if type(expires) is bool or not isinstance(expires, (int, float)):
+        return True
+    try:
+        return float(moment) >= float(expires)
+    except (TypeError, ValueError, OverflowError):
+        return True
 
 
 class AuthorityDenied(Exception):
@@ -493,6 +609,96 @@ def coordinator_grant_capabilities(state, credential, project_id, held):
     return frozenset(cap for cap in GRANT_CAPABILITIES if cap in held)
 
 
+#: Who may write and accept a project's own requirements on the web (kittrial-5bb.278,
+#: slice 10). A signed-in member needs one of these current roles; an agent needs the
+#: project's coordinator grant beside its own account holding coordinate here.
+REQUIREMENT_EDITOR_ROLES = ('owner', 'coordinator')
+
+#: Said to everyone who may not edit a project's requirements, whatever name they sent.
+#: It names the rule and the people who can act; it never names the operator allowlist,
+#: which is not consulted on this path at all.
+REQUIREMENT_EDITOR_REFUSED = (
+    "Editing a project's requirements needs its owner or a coordinator: a signed-in "
+    "member with the coordinator or owner role, or an agent holding the project's "
+    "coordinator grant.")
+
+
+def requirement_editor(state, project_id, request):
+    """``{'account_id', 'agent_id', 'grant', 'role'}`` of a project's requirement editor.
+
+    A project's coordinator edits, accepts, withdraws and supersedes requirements on the
+    web exactly as its owner does (kittrial-5bb.278; owner decision 01a13b6f allows
+    self-acceptance). Two shapes are accepted, both read from LIVE state on every call:
+
+    * a signed-in person whose current membership of the project is ``owner`` or
+      ``coordinator`` (the membership is required, as it always has been here: a superuser
+      who is not a member of the project is not its requirements editor);
+    * an agent credential whose agent holds the project's coordinator grant while the
+      credential's own human account still holds ``coordinate`` there. The account named
+      in the record stays that human account (the party owner decision 11(ii) settled);
+      the agent and its grant are recorded beside it in the service audit. That account's
+      authority is read from its own membership, exactly as the session shape above reads
+      it: superuser is not membership of a project, so the agent of a superuser who is not
+      a member of this project is refused just as that superuser's own session is
+      (kittrial-5bb.318 item 3; slice 10 said "refuse both").
+
+    Anything else is denied with :data:`REQUIREMENT_EDITOR_REFUSED`. No operator
+    allowlist is read here: the host commands keep their own.
+
+    ``request`` is an :func:`authority_request` descriptor (or the ``authority`` block the
+    service sends the canonical endpoint), so both the web service and the endpoint judge
+    the same fields.
+    """
+    if not isinstance(state, dict):
+        raise deny(401, 'unauthenticated', 'Service authority state is unavailable')
+    via = request.get('via')
+    user_id = request.get('user_id')
+    if not isinstance(user_id, str) or not user_id:
+        raise deny(401, 'unauthenticated', 'Authentication required')
+    if via == 'session':
+        user = state.get('users', {}).get(user_id)
+        if not isinstance(user, dict) or user.get('disabled'):
+            raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
+        # The project's own membership is what counts here, exactly as before this slice:
+        # a superuser who is not a member of the project is not its requirements editor.
+        # (Every other route reads a superuser as the project's owner; this one has always
+        # required the membership, and slice 10 does not widen it.)
+        role = state.get('memberships', {}).get(project_id, {}).get(user_id)
+        if role not in REQUIREMENT_EDITOR_ROLES:
+            raise deny(403, 'forbidden', REQUIREMENT_EDITOR_REFUSED)
+        return {'account_id': user_id, 'agent_id': None, 'grant': None, 'role': role}
+    if via != 'credential':
+        raise deny(401, 'unauthenticated', 'Authentication required')
+    credential = state.get('credentials', {}).get(request.get('credential_id'))
+    if not isinstance(credential, dict):
+        raise deny(401, 'unauthenticated', CREDENTIAL_EXPIRED_MESSAGE)
+    agent_id = credential.get('agent_id')
+    grant = coordinator_grant(state, project_id, agent_id) if agent_id else None
+    if agent_id is None or grant is None:
+        raise deny(403, 'forbidden', REQUIREMENT_EDITOR_REFUSED)
+    agent = state.get('agents', {}).get(agent_id)
+    if not isinstance(agent, dict) or not agent.get('enabled'):
+        raise deny(401, 'unauthenticated', 'Agent is disabled')
+    if project_id not in (agent.get('projects') or []):
+        raise deny(404, 'not_found', 'Project not found')
+    issuer = state.get('users', {}).get(credential.get('user_id'))
+    if not isinstance(issuer, dict) or issuer.get('disabled'):
+        raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
+    # The SAME membership rule as the session branch above (kittrial-5bb.318 item 3):
+    # accounts administration is not membership of this project, so a superuser's
+    # superuser flag does not stand in for it here either. An agent is its account's hand
+    # in this project, and the project refuses that account's own session when it is not a
+    # member; admitting the agent would give one principal two opposite answers about the
+    # same project. A superuser who owns or coordinates the project IS a member, so their
+    # agent keeps editing there.
+    held = ROLE_CAPABILITIES.get(
+        state.get('memberships', {}).get(project_id, {}).get(issuer['id']), frozenset())
+    if CAP_COORDINATE not in held:
+        raise deny(403, 'forbidden', REQUIREMENT_EDITOR_REFUSED)
+    return {'account_id': credential['user_id'], 'agent_id': agent_id, 'grant': grant,
+            'role': 'coordinator'}
+
+
 def project_grant(user):
     """The account's "may create projects" grant as ``{'limit', 'granted_by', 'granted_at'}``, or None.
 
@@ -545,15 +751,34 @@ def decide(state, request, *, now=None, allow_self_user=None):
 
     if via == 'credential':
         credential = state.get('credentials', {}).get(request.get('credential_id'))
-        if not isinstance(credential, dict) or credential.get('revoked') or \
-                credential.get('expires_at', 0) <= moment:
-            raise deny(401, 'unauthenticated', 'Credential expired or revoked')
+        if not isinstance(credential, dict):
+            raise deny(401, 'unauthenticated', CREDENTIAL_EXPIRED_MESSAGE)
+        # Revocation and expiry are two answers, so the caller is told which one it met and
+        # who can act (kittrial-5bb.294 item 2). The stored expiry is capped at 366 days
+        # from issuance ON READ (item 4): a hand-edited store of years is not honoured.
+        if credential.get('revoked'):
+            raise deny(401, 'unauthenticated', CREDENTIAL_REVOKED_MESSAGE)
+        if credential_stored_expired(credential, moment) or \
+                credential_age_expired(credential, moment):
+            raise deny(401, 'unauthenticated', CREDENTIAL_EXPIRED_MESSAGE)
         issuer = state.get('users', {}).get(credential.get('user_id'))
         if not isinstance(issuer, dict) or issuer.get('disabled'):
             raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
         if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE, CAP_AGENTS, CAP_PROJECT_HOST_CREATE):
             raise deny(403, 'forbidden',
                        'A worker credential cannot perform administrative operations')
+        if capability == CAP_AGENT_SELF:
+            # An agent credential's authority over its OWN record only (kittrial-5bb.302).
+            # It is not project-scoped: the route it authorizes takes no project and no
+            # target agent id, so this can never reach another agent's record. A worker
+            # credential (no agent identity) and every session are refused.
+            if not credential.get('agent_id'):
+                raise deny(403, 'forbidden',
+                           'An agent credential is required to change its own claim limit')
+            agent = state.get('agents', {}).get(credential.get('agent_id'))
+            if not isinstance(agent, dict) or not agent.get('enabled'):
+                raise deny(401, 'unauthenticated', 'Agent is disabled')
+            return {'role': 'agent'}
         if credential.get('agent_id'):
             # An agent credential is a personal identity: it is refused the moment the
             # agent record is gone or disabled, and its project reach is the agent's
@@ -584,6 +809,11 @@ def decide(state, request, *, now=None, allow_self_user=None):
     if not isinstance(user, dict) or user.get('disabled'):
         raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
 
+    if capability == CAP_AGENT_SELF:
+        # Only an agent credential holds this (kittrial-5bb.302). A person acts on an
+        # agent as its owner through PATCH /v1/agents/{id}, not as the agent itself.
+        raise deny(403, 'forbidden',
+                   'An agent credential is required to change its own claim limit')
     if allow_self_user is not None and user_id == allow_self_user:
         return {'role': 'self'}
     if capability == CAP_ACCOUNTS_ADMIN:
@@ -627,8 +857,15 @@ _LOCAL = threading.local()
 
 
 @contextmanager
-def file_lock(path, timeout=60.0, poll=0.02):
-    """Cross-process exclusive lock on ``path`` (``fcntl`` or ``msvcrt``).
+def file_lock(path, timeout=60.0, poll=0.02, shared=False):
+    """Cross-process lock on ``path`` (``fcntl`` or ``msvcrt``).
+
+    Exclusive by default. ``shared=True`` takes the lock SHARED so two reads can
+    hold it at once and a writer is still excluded (kittrial-5bb.291 item 5: the
+    roster read needs the same 60 s bound as the exclusive wait, not an unlimited
+    shared wait and not an exclusive lock). On Windows ``msvcrt.locking`` has no
+    shared lock, so ``shared=True`` there takes the exclusive lock and this is
+    stated rather than pretended.
 
     Re-entrant *per thread* so nested persistence calls in one mutation cannot
     deadlock against themselves, while a second process (the canonical endpoint)
@@ -652,10 +889,13 @@ def file_lock(path, timeout=60.0, poll=0.02):
                 handle.seek(0)
                 if os.name == 'nt':
                     import msvcrt
+                    # msvcrt.locking is exclusive-only; a shared hold is the
+                    # exclusive lock on Windows (stated, not pretended).
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(),
+                                (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
                 break
             except OSError:
                 if time.monotonic() >= deadline:
@@ -790,7 +1030,10 @@ class PreEffectFailure(Exception):
 #: allowlist: an unrecognized verb is treated as a write, so an unknown future
 #: mutation can never be mistaken for a read and released.
 READ_ONLY_BD_VERBS = frozenset({'export', 'list', 'show', 'ready', 'search',
-                                'count', 'state', 'lint'})
+                                'count', 'state', 'lint',
+                                # kittrial-5bb.354: one task's version history (the Dolt log
+                                # of its row); it reads and the kit always adds --readonly.
+                                'history'})
 
 #: Exceptions the canonical effect layer raises to refuse a request (bad attachment,
 #: task mismatch, malformed payload, unknown flag). They release the identity only
@@ -957,10 +1200,13 @@ class NativeRunner:
     """
 
     __slots__ = ('_dispatch', 'attempted_write', 'calls', 'wrote',
-                 'lifecycle_project', '_lifecycle_void_journal', '_web_lifecycle_mark_journal')
+                 'lifecycle_project', 'bounded_task_reads', '_bounded',
+                 '_lifecycle_void_journal', '_web_lifecycle_mark_journal')
 
-    def __init__(self, dispatch, project=None):
+    def __init__(self, dispatch, project=None, bounded_task_reads=False, bounded=None):
         self._dispatch = dispatch
+        #: A read whose stdout is stopped at a byte cap (kittrial-5bb.362), or None.
+        self._bounded = bounded
         self.attempted_write = False
         self.calls = 0
         #: Set by an effect that wrote something that is not a bd row (the kit's handoff
@@ -968,6 +1214,12 @@ class NativeRunner:
         #: (kittrial-5bb.97). It says nothing about refusals, which `attempted_write` decides.
         self.wrote = False
         self.lifecycle_project = project
+        #: Whether this runner is the pinned ``bin/bd`` host boundary and can answer
+        #: the bounded per-task reads a one-fact lifecycle write uses instead of a
+        #: full `export --all` (kittrial-5bb.289 item 2). The lifecycle routes set
+        #: it; a runner built anywhere else (or a bare callable) leaves it false and
+        #: keeps the full export's answer.
+        self.bounded_task_reads = bounded_task_reads
         self._lifecycle_void_journal = None
         self._web_lifecycle_mark_journal = None
 
@@ -976,6 +1228,21 @@ class NativeRunner:
         if is_mutating_invocation(argv):
             self.attempted_write = True
         return self._dispatch(argv)
+
+    @property
+    def bounded(self):
+        """``bounded(argv, max_bytes)``: a READ whose output stops at ``max_bytes``
+        (kittrial-5bb.362), or None when this runner has none. A write is refused here: the
+        cap would cut its receipt, so writes always go through the call itself."""
+        if self._bounded is None:
+            return None
+
+        def read(argv, max_bytes):
+            if is_mutating_invocation(argv):
+                raise ValueError('A bounded native read cannot run a write: %s' % (argv[:1],))
+            self.calls += 1
+            return self._bounded(argv, max_bytes)
+        return read
 
 
 def read_legacy_journal(path):
@@ -2221,6 +2488,7 @@ BLOCK_CAPABILITIES = {
            'comments': CAP_TASKS},         # tasks.comment; raw reserved guards still apply
     'checkpoint': CAP_CHECKPOINTS,         # checkpoints.add
     'task-assign': CAP_COORDINATE,         # dedicated assignee-only guarded operation
+    'task-release': CAP_TASKS,             # releasing your OWN claim (kittrial-5bb.301)
     'assignment-roster': CAP_COORDINATE,   # project-scoped existing assignment targets
     'coordinate': {'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
                    'merge-release': CAP_COORDINATE, 'merge-create': CAP_PROJECT_ADMIN},
@@ -2228,11 +2496,24 @@ BLOCK_CAPABILITIES = {
                        'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
                        'create': CAP_PROJECT_ADMIN},
     'web-lifecycle': {'read': CAP_READ, 'scope': CAP_COORDINATE, 'fact': CAP_COORDINATE},
+    'web-guidance': {'read': CAP_READ, 'ack': CAP_READ, 'onboarding': CAP_READ,
+                     'set': CAP_COORDINATE, 'clear': CAP_COORDINATE, 'status': CAP_COORDINATE,
+                     'coordinate-check': CAP_COORDINATE, 'onboarding-edit': CAP_COORDINATE},
+    # The coordinator's recorded hand-back (kittrial-5bb.343): both operations are
+    # coordinator writes, and the record's own journal still has to exist for a read
+    # to honour it.
+    'assignee-followon': {'record': CAP_COORDINATE, 'withdraw': CAP_COORDINATE},
     'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
                None: CAP_REVIEWS},         # reviews.add, every other operation
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
                  'review': CAP_APPROVE,                               # proposals.dispose, triage
                  'decide': CAP_PROJECT_ADMIN},                        # proposals.dispose, the owner decision
+    'ref': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
+            'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE},
+    'capability': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
+                   'propose-alias': CAP_RECORDS, 'verify': CAP_RECORDS,
+                   'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE,
+                   'reject-alias': CAP_COORDINATE, 'web-verify': CAP_COORDINATE},
 }
 
 
@@ -2253,10 +2534,14 @@ def required_capability(request):
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle'):
+    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-guidance', 'assignee-followon'):
         if len(args) != 1:
             return None
         item = {'text': args[0]}
+    elif action in ('ref', 'capability'):
+        if len(args) < 2:
+            return None
+        return needed.get(args[0])
     elif action != 'review':
         return needed.get(args[0])
     else:
@@ -2387,7 +2672,9 @@ def run_guarded(request, journal_path, effect, authority_config=None,
             try:
                 identity_check()
             except ValueError as denied:
-                return _envelope(2, stderr=str(denied) + '\n')
+                status = getattr(denied, 'status', None)
+                return _envelope(2, stderr=str(denied) + '\n',
+                                 **({'records_status': status} if isinstance(status, int) else {}))
         journal = (OperationJournal(journal_path, **(journal_options or {}))
                    if operation_id else None)
         # The principal half of the identity comes from the request descriptor only

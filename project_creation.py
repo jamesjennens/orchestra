@@ -886,8 +886,13 @@ def registrable(root, name):
 #: started with the service's authority arguments AND the request carries a
 #: live-authority descriptor that passes for exactly the capability named here.
 SERVICE_ACTIONS = {'create-project': 'project.host-create', 'project-creations': 'accounts.admin',
-                   'set-onboarding': 'project.admin', 'owner-requirements': 'project.admin',
+                   'set-onboarding': 'coordinate', 'owner-requirements': 'coordinate',
                    'creation-standing': 'project.host-create'}
+#: Service actions a credential may carry (kittrial-5bb.278): a project's coordinator edits
+#: requirements on the web, and an agent holding that project's coordinator grant reaches
+#: the same adapter through its own credential. Every other service action stays the
+#: signed-in account's alone.
+CREDENTIAL_SERVICE_ACTIONS = frozenset({'owner-requirements'})
 CREATION_JOURNAL = 'operations.sqlite3'
 
 
@@ -907,7 +912,16 @@ def service_descriptor(request, authority_config, action):
     if not isinstance(authority, dict):
         raise ValueError('%s needs the live-authority descriptor of a signed-in account' % action)
     descriptor = {key: value for key, value in authority.items() if key not in ('store', 'lock')}
-    if descriptor.get('capability') != SERVICE_ACTIONS[action] or descriptor.get('via') != 'session':
+    if descriptor.get('capability') != SERVICE_ACTIONS[action]:
+        raise ValueError('%s needs a session descriptor for %s' % (action, SERVICE_ACTIONS[action]))
+    # A session descriptor for every action; a credential descriptor only for the one
+    # action a granted agent may reach (kittrial-5bb.278), and then the descriptor names
+    # the credential's own human account, which is also the actor below. Every other
+    # action keeps the sentence it has always answered.
+    if descriptor.get('via') == 'credential':
+        if action not in CREDENTIAL_SERVICE_ACTIONS:
+            raise ValueError('%s needs a session descriptor for %s' % (action, SERVICE_ACTIONS[action]))
+    elif descriptor.get('via') != 'session':
         raise ValueError('%s needs a session descriptor for %s' % (action, SERVICE_ACTIONS[action]))
     actor = request.get('actor')
     if not isinstance(actor, str) or http_actor_id(actor) != actor or actor != descriptor.get('user_id'):

@@ -39,6 +39,10 @@ HISTORY_CURSOR_EXTRA={'order','entry_kind','scp'}
 HISTORY_CURSOR_KEYS=HISTORY_CURSOR_BASE|HISTORY_CURSOR_EXTRA
 FIELD_NAME_LIMIT=60
 FIELD_NAME_COUNT=8
+#: The minimal worked payload for disposing of ONE outstanding direction while carrying
+#: the open items (kittrial-5bb.287). The name is referenced by the `checkpoint` help and
+#: by docs/BRIEFINGS.md, so one name is spelled in one place.
+DIRECTION_EXAMPLE_FILE='example-direction-resolution.json'
 BRIEF_MISTAKEN_FLAGS={
     '--limit':'use --items-limit for the unresolved-item page size',
     '--offset':'use --items-offset for the unresolved-item page offset',
@@ -104,7 +108,12 @@ def snapshot(rows,project,task,exclude=None):
     # checkpoint/snapshot distinguish edited entries and late backdated arrivals
     # that a whole-snapshot hash or timestamp filter cannot separate.
     digests={e['entry_id']:content_hash(e) for e in entries}
-    return {'project':project,'task':task,'state_sha256':content_hash(state),'entries':entries,'entry_digests':digests}
+    # kittrial-5bb.293 item 2 (rev3): field_sizes is NOT a key in the snapshot data at
+    # all -- the legacy whole-data cursor shape hashes every key, so excluding it in
+    # activity_cursor is not enough. It is computed beside the snapshot (the brief
+    # caller does it); state_sha256 already covers the three fields.
+    return {'project':project,'task':task,'state_sha256':content_hash(state),
+            'entries':entries,'entry_digests':digests}
 
 def entry_digests(data):
     """Digests for snapshots predating the embedded entry_digests field."""
@@ -114,7 +123,11 @@ def entry_digests(data):
 def activity_cursor(data):
     # entry_digests is derived entirely from entries, not extra activity. Keep
     # the released hash shape so staged writes remain fresh on older readers.
-    compatible={k:v for k,v in data.items() if k!='entry_digests'}
+    # kittrial-5bb.293 item 2 (rev2): field_sizes is NOT part of the hashed snapshot
+    # and NOT in the cursor token -- a cursor written by 0133e8e reads fresh on this
+    # kit and the other way round. The lengths ride beside the cursor (the brief's
+    # field_changes carries them); state_sha256 already covers the three fields.
+    compatible={k:v for k,v in data.items() if k not in ('entry_digests','field_sizes')}
     return token({'v':1,'kind':'activity','project':data['project'],'task':data['task'],'sha256':content_hash(compatible)})
 
 #: A project name as ``admin.validate_name`` accepts it.
@@ -328,11 +341,89 @@ def validate_checkpoint(p,task,require_digests=True):
     problems=checkpoint_problems(p,task)
     if problems:raise ValueError(problems_message(problems))
 
-def transition(previous,current):
+def id_list(ids,limit=FIELD_NAME_COUNT):
+    """The ids of one refusal, bounded the way a field-name list is.
+
+    A refusal must name what it compared, or a caller cannot act on it
+    (kittrial-5bb.287); it must also stay bounded, so a pathological payload
+    cannot make one sentence unbounded. Every id in the delta is named when they
+    fit, and the rest are counted.
+    """
+    shown=sorted(ids)
+    if len(shown)<=limit:return ', '.join(shown)
+    return ', '.join(shown[:limit])+' (+%d more)'%(len(shown)-limit)
+
+def transition(previous,current,called_from='request',current_id=None):
+    """Follow one linked pair: every unresolved item is carried or resolved.
+
+    The rule itself is unchanged: the items open in the parent and absent now
+    must be exactly the ids the current record resolves. What changed
+    (kittrial-5bb.287) is the refusal: it names the ids it compared, and it says
+    which of its two callers is refusing. `save_checkpoint` refuses THIS REQUEST,
+    which the caller can fix by editing the payload; `checkpoint_state` refuses a
+    STORED PAIR while it walks the chain, which no caller can fix by editing a
+    payload - the task needs reconciliation by an operator before it reads or
+    writes again. Without the ids, three different caller mistakes (an item
+    dropped without a resolution, an item resolved and still carried, an id that
+    was never open) produced one identical sentence and six payload shapes could
+    not find the way out.
+
+    ``current_id`` is the comment id of the record being compared, and is named
+    only in the stored-pair refusal: a chain is read from records, so that
+    refusal can point the operator at the pair to reconcile.
+    """
     old={x['id'] for x in previous['open_items']} if previous else set()
     now={x['id'] for x in current['open_items']}
     resolved={x['id'] for x in current['resolved']}
-    if old-now!=resolved:raise ValueError('Carry every unresolved item forward or explicitly resolve/supersede it with reason and evidence')
+    if old-now!=resolved:
+        # Three different caller mistakes reach this one rule, and they used to share
+        # one sentence that named nothing (kittrial-5bb.287):
+        #   1. an id open in the parent that this record neither carries nor resolves;
+        #   2. an id this record RESOLVES and still carries in open_items, so the pair
+        #      (dropped, resolved) does not match;
+        #   3. an id this record resolves that is not open in the parent at all - the
+        #      parent already resolves it, or it was never an open item. A direction is
+        #      dispositioned with `directions` and never with `resolved`, so this case
+        #      must say so rather than send the caller hunting for an item problem that
+        #      may not exist.
+        # Named ids are bounded like a field-name list so one sentence stays bounded.
+        dropped=id_list(old-now)
+        carried=id_list((old|now)&resolved)
+        not_open=id_list(resolved-old-now)
+        parts=[]
+        if old-now:
+            parts.append('open in the previous checkpoint and neither carried in open_items nor resolved: %s; '
+                         'resolve or supersede every id named here, or carry each forward unchanged' % (dropped,))
+        if (old|now)&resolved:
+            parts.append('%s in resolved and also in open_items; an item is resolved by omitting its id from '
+                         'open_items, or carried unchanged by leaving it out of resolved'
+                         % (('%s are'%carried) if len((old|now)&resolved)>1 else ('%s is'%carried)))
+        if resolved-old-now:
+            many=len(resolved-old-now)>1
+            parts.append('%s in resolved and not open in the previous or the current record: the previous '
+                         'checkpoint already resolves %s, or %s never an open item. A direction is '
+                         'dispositioned with directions, never with resolved; a genuinely unresolved item is '
+                         're-opened under a new id'
+                         % (('%s are'%not_open) if many else ('%s is'%not_open),
+                            'them' if many else 'it','they were' if many else 'it was'))
+        if not parts:
+            # Cannot happen while old-now != resolved with both sides read from the
+            # same two records; kept so the refusal is never empty.
+            parts.append('the items open in the previous checkpoint and the ids this record resolves differ')
+        if called_from=='chain':
+            parent=current.get('previous')
+            raise ValueError('Checkpoint history is unreadable: stored pair %s -> %s does not carry every '
+                             'unresolved item forward: %s. This is a stored pair, not this request: reconcile '
+                             'the history before reading, writing or briefing this task (an operator preserves '
+                             'the original evidence in a correction record and publishes a re-anchoring '
+                             'checkpoint)'
+                             % (parent if parent is not None else '(none)',
+                                current_id if current_id is not None else '(unknown)', '; '.join(parts)))
+        raise ValueError('Carry every unresolved item forward or explicitly resolve/supersede it with reason '
+                         'and evidence: '+'. '.join(parts)
+                         +'. Compared here: the previous checkpoint\'s open_items, this record\'s open_items '
+                         'and this record\'s resolved. No client update is required: the refusal names the ids '
+                         'in this request that do not match, and the same ids fix it')
     old_items={x['id']:x for x in previous['open_items']} if previous else {}
     if any(item['id'] in old_items and item!=old_items[item['id']] for item in current['open_items']):raise ValueError('Carry unresolved items unchanged; explicitly resolve/supersede changed items with new IDs')
 
@@ -361,7 +452,7 @@ def checkpoint_state(issue,normalize=True):
         if len(following)!=1:raise ValueError('Conflicting checkpoint branches; reconcile history before briefing')
         cid,p,c=following[0]
         if cid in visited:raise ValueError('Checkpoint cycle')
-        transition(current[0] if current else None,p)
+        transition(current[0] if current else None,p,'chain',cid)
         current=(p,c);parent=cid;visited.add(cid)
         history.append((cid,p))
         if normalize:provenance[cid]=normalize_provenance(p)
@@ -441,6 +532,48 @@ def fitting_prefix(text,budget):
     return text[:lo]
 
 NEWER_MAX=5
+# A stable newer-activity marker is the newest other-party entry's ID plus this many
+# hex characters of that entry's current content digest. The digest is what makes an
+# EDIT to that same entry move the marker; the ID alone would not (kittrial-5bb.351).
+MARKER_DIGEST=16
+#: The task fields whose edits move the marker (kittrial-5bb.354). Never status, assignee,
+#: priority, notes or labels: a claim must not wake the agent that made it.
+MARKER_FIELDS=('title','description','acceptance_criteria')
+
+def fields_digest(row):
+    """Digest of the CURRENT title, description and acceptance of one task row."""
+    return content_hash({name:str(row.get(name) or '') for name in MARKER_FIELDS})
+
+def activity_marker(newest_other,digest):
+    """The stable newer-activity marker (kittrial-5bb.351, fields folded in by kittrial-5bb.354).
+
+    ``<entry_id>:<16 hex>`` names the newest other-party entry the checkpoint did not
+    incorporate; ``fields:<16 hex>`` stands when there is none. The hex covers that
+    entry's current content AND the current title, description and acceptance, so a new
+    other-party entry, an edit to the newest one and an edit of one of those three fields
+    each move it, while a claim, a status change or the owner's own comment never does.
+    Never a timestamp.
+    """
+    combined=content_hash({'entry':content_hash(newest_other) if newest_other is not None else None,'fields':digest})
+    return (newest_other['entry_id'] if newest_other is not None else 'fields')+':'+combined[:MARKER_DIGEST]
+
+def newer_comment_by_other(row,checkpoint_comment):
+    """The released ``newer_activity`` boolean, in ONE place (kittrial-5bb.354).
+
+    True when a comment by anyone other than the assignee was written after the
+    checkpoint comment, the lane-state record written with that checkpoint excepted
+    (kittrial-5bb.263). Unchanged from the rule ``work`` rows carried since
+    kittrial-5bb.114, so older clients read what they always read; the counts and the
+    marker are the precise signals. Raises StopIteration when the checkpoint comment is
+    not on the row.
+    """
+    comments=row.get('comments') or []
+    position=next(index for index,comment in enumerate(comments)
+                  if str(comment.get('id'))==str(checkpoint_comment.get('id')))
+    checkpoint_id=str(checkpoint_comment.get('id'));checkpoint_author=checkpoint_comment.get('author')
+    return any(comment.get('author')!=row.get('assignee')
+               and not lane_state_record(comment,checkpoint_id,checkpoint_author)
+               for comment in comments[position+1:])
 # Bounded provenance window: a checkpoint records exact digests for the most
 # recent incorporated entries and a rolling chain hash covering all older ones,
 # so the record stays within the checkpoint size cap on long-lived tasks while
@@ -474,6 +607,16 @@ def directions_counted(provenance_writes,status):
     if status=='closed':return False,'closed'
     if not provenance_writes:return False,'switch-off'
     return True,None
+
+def directions_check_state(reason):
+    """The ``check`` label a direction reader carries when the check cannot apply.
+
+    ``off`` while the installation switch is off (the pre-existing label), and
+    ``closed`` for a closed task: a reader must not say the switch is off when it
+    is on and the task is simply closed (kittrial-5bb.284 review S3, folded into
+    kittrial-5bb.287). ``reason`` is ``directions_counted``'s second value.
+    """
+    return 'off' if reason=='switch-off' else reason
 ZERO_HASH='0'*64
 
 def provenance_chain(digests):
@@ -623,10 +766,14 @@ def unresolved_directions(entries,direction_idx,owner,counted=True):
     outstanding direction that no reader could ever resolve.
     """
     if not counted:return []
+    import followon
     outstanding=[]
     for e in entries:
         if e['kind']!='comment' or e['author']==owner:continue
         if str(e.get('body','')).startswith(('Kind: task-checkpoint-v1','Kind: contribution-review-v1')):continue
+        # A follow-on WITHDRAWAL record is the coordinator's own "superseded"
+        # disposition of the direction, not a direction of its own (kittrial-5bb.343).
+        if followon.withdrawal_text(str(e.get('body',''))):continue
         d=direction_idx.get(e['entry_id'])
         if d is None or d['state'] not in RESOLUTION_STATES or d.get('digest')!=content_hash(e):
             outstanding.append(e)
@@ -688,7 +835,53 @@ def retained_provenance(state,upto=None):
     return dict(latest,digests=exact,older=trunc,verifiable=len(exact)+len(trunc),
                 complete=not trunc and len(exact)>=latest['covered'])
 
-def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True):
+def field_changes_since(recorded_fields, current_fields, only_if_unexplained=False):
+    """What changed in title/description/acceptance since a checkpoint (kittrial-5bb.293).
+
+    ``recorded_fields`` is the ``fields`` map a checkpoint's activity cursor carried
+    (name -> length at checkpoint time; ``None`` on an older cursor). ``current_fields``
+    is the same map from the live snapshot. A field whose length differs is reported
+    with its old and new length; an older cursor reports the field names only.
+    """
+    if not isinstance(current_fields, dict):
+        return []
+    if not isinstance(recorded_fields, dict):
+        # An older cursor carries no lengths: the caller reports a change ONLY when
+        # nothing else explains the stale flag, and then without old_length (rev2).
+        if not only_if_unexplained:
+            return []
+        # Never all three fields with old_length None: one summary entry instead
+        # (kittrial-5bb.293 item 2 rev2).
+        return [{'field': 'task_fields', 'old_length': None, 'new_length': None,
+                 'note': 'The task fields changed after this checkpoint; their lengths were not recorded.'}]
+    changed = []
+    for name in ('title', 'description', 'acceptance_criteria'):
+        old_len = recorded_fields.get(name)
+        new_len = current_fields.get(name)
+        if old_len is None and new_len is None:
+            continue
+        if old_len != new_len:
+            changed.append({'field': name, 'old_length': old_len, 'new_length': new_len})
+    return changed
+
+
+def newer_selection(data,prov,checkpoint_timestamp):
+    """The ONE selection of what a checkpoint did not incorporate (kittrial-5bb.354).
+
+    Returns (coverage, entries, fresh, changed_or_late, unverified_count). The counts,
+    the marker, the boolean and the 'changes since your checkpoint' section all read
+    this, so no route can count differently. With recorded provenance the selection is
+    exact (new, edited and late entries); a legacy checkpoint has none, so the released
+    timestamp rule applies and coverage is 'unknown'.
+    """
+    coverage='unknown' if prov is None else ('snapshot' if prov['complete'] else 'windowed')
+    if prov is None and checkpoint_timestamp:
+        data=dict(data,entries=[e for e in data['entries']
+                               if parse_moment(e['timestamp'])>=parse_moment(checkpoint_timestamp)])
+    entries,fresh,changed_late,unverified=unincorporated(data,prov)
+    return coverage,entries,fresh,changed_late,unverified
+
+def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off',field_changes=None,marker_fields=None):
     """Bounded, per-entry view of activity the current checkpoint did not incorporate.
 
     `prov` is the checkpoint's normalized provenance, so edited entries (same ID,
@@ -699,14 +892,23 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     are tracked to an explicit acknowledged/resolved/superseded disposition; every
     collection is bounded with an explicit omitted count. Reading changes nothing.
     """
-    coverage='unknown' if prov is None else ('snapshot' if prov['complete'] else 'windowed')
-    if prov is None and checkpoint_timestamp:
-        data=dict(data,entries=[e for e in data['entries']
-                               if parse_moment(e['timestamp'])>=parse_moment(checkpoint_timestamp)])
-    entries,fresh,changed_late,unverified=unincorporated(data,prov)
+    coverage,entries,fresh,changed_late,unverified=newer_selection(data,prov,checkpoint_timestamp)
     own=[e for e in entries if e['author']==owner]
     others=[e for e in entries if e['author']!=owner]
     authors=sorted({e['author'] for e in others})
+    # A stable marker of the newest OTHER-party entry, so a bridge wakes on the
+    # second coordinator comment too, not only when the `newer_activity` boolean
+    # first flips false->true (kittrial-5bb.351). The content digest is part of
+    # it: an edit to that entry (same ID, new body) must move the marker. Never a
+    # timestamp. Null when there is nothing newer, or when coverage is unknown:
+    # the marker is a precise claim, so a reader falls back to the boolean then.
+    # kittrial-5bb.354: with ``marker_fields`` (the current fields digest) the marker is
+    # the shared activity_marker, so it also moves on a title/description/acceptance edit.
+    marker=None
+    if coverage!='unknown' and (others or marker_fields is not None):
+        newest=max(others,key=lambda e:(parse_moment(e['timestamp']),e['entry_id'])) if others else None
+        marker=(activity_marker(newest,marker_fields) if marker_fields is not None
+                else newest['entry_id']+':'+content_hash(newest)[:MARKER_DIGEST])
     refs=[{'entry_id':e['entry_id'],'kind':e['kind'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
            'changed':any(c is e for c in changed_late)} for e in entries[:NEWER_MAX]]
     history='history '+data['task']
@@ -719,6 +921,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
         note+=(' Coverage is WINDOWED: '+str(unverified)+' older entries have no per-entry evidence recorded by this checkpoint, so their current content is unverified and they are excluded from the fresh/changed counts. '
                'Run "checkpoint '+data['task']+' --verify" for the classification supported by evidence retained across the task\'s checkpoints (entries no checkpoint ever recorded stay unknown).')
     result={'own_count':len(own),'other_count':len(others),
+            'newer_activity_marker':marker,
             'fresh_count':len(fresh),'changed_or_late_count':len(changed_late),
             'unverified_count':unverified,
             'coverage':coverage,
@@ -727,6 +930,7 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
             'history':history,
             'history_new':'history '+data['task']+' --since '+utc_text(parse_moment(checkpoint_timestamp,'checkpoint timestamp')) if checkpoint_timestamp else history,
             'verify':'checkpoint '+data['task']+' --verify',
+            'field_changes':field_changes or [],
             'note':note}
     if direction_idx is not None:
         outstanding=unresolved_directions(data['entries'] if direction_data is None else direction_data,direction_idx,owner,counted)
@@ -734,15 +938,34 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
             'items':[{'entry_id':e['entry_id'],'timestamp':e['timestamp'],'author':clip(e['author'],96),
                       'state':(direction_idx.get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
             'omitted':max(0,len(outstanding)-NEWER_MAX)}
-        if not counted:result['unresolved_directions']['check']='off'
+        if not counted:result['unresolved_directions']['check']=directions_check_state(directions_reason)
     return result
 
+def compact_integration(value):
+    """One integration block without the two additive native-identity keys.
+
+    ``review_state.integration`` gained ``record_id``/``order`` for the recorded
+    hand-back's write gate and reader (kittrial-5bb.343). The compact brief is a
+    bounded projection (its long-chain size is held below 6000 bytes), so it drops
+    exactly those two keys; every key the brief already carried stays.
+    """
+    if not isinstance(value,dict):
+        return value
+    return {key:item for key,item in value.items() if key not in ('record_id','order')}
+
+
 def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifiers=None,actor=None,full=False,
-          independent_approval=False,owners=None,provenance_writes=True):
+          independent_approval=False,owners=None,provenance_writes=True,identity_names=None,
+          field_history=None):
     if type(offset) is not int or offset<BRIEF_ITEM_OFFSET_MIN or type(limit) is not int or not BRIEF_ITEM_LIMIT_MIN<=limit<=BRIEF_ITEM_LIMIT_MAX:
         raise ValueError('Invalid unresolved-item page: --items-offset must be >= %d and --items-limit must be %d..%d' % (BRIEF_ITEM_OFFSET_MIN,BRIEF_ITEM_LIMIT_MIN,BRIEF_ITEM_LIMIT_MAX))
     issue=task_row(rows,task);state=checkpoint_state(issue);current=state['current'];invalid=state['invalid']
-    if issue.get('issue_type')=='event':raise ValueError('Use history/show for an event; brief requires a task or job')
+    # DISPLAY ONLY (kittrial-5bb.333): the stored assignee is the actor id and `owner` stays
+    # exactly that value. `owner_name`/`assigned_to` are labels built from an actor id the
+    # caller already knows; they never turn a stored name into an actor.
+    owner_raw=issue.get('assignee')
+    owner_name=(identity_names or {}).get(owner_raw) if isinstance(owner_raw,str) and owner_raw else None
+    assigned_to='%s (%s)' % (owner_name,owner_raw) if owner_name and owner_name!=owner_raw else (owner_raw or 'unassigned')
     data=snapshot(rows,project,task);p,c=current if current else (None,None)
     facts=next(r for r in project_facts(rows) if r['id']==task)
     items=p['open_items'] if p else []
@@ -752,7 +975,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     from review_state import RECONCILIATION_WARNING_PREFIX, is_integration_warning, scopes_for
     from guidance import brief_block
     review=workflow(issue,scopes_for(rows,task),operators=operators,journal=journal,
-                    actor=actor,independent_approval=independent_approval,owners=owners)
+                    actor=actor,independent_approval=independent_approval,owners=owners,
+                    provenance_writes=provenance_writes)
     # ORIGINAL meaning: does the scope currently shown in `lifecycle`/`lifecycle_scope`
     # (the newest recorded scope) belong to the current contribution? The ANY-scope
     # answer is additive as `review.integration.matches_contribution`.
@@ -777,6 +1001,13 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # says whether a replaced revision is integrated without re-reading review TASK.
     bounded_priors=[{key:c[key] for key in ('comment_id','commit','relation','timestamp','integration')}
                     for c in priors[-PRIOR_BRIEF_LIMIT:]]
+    # The compact brief keeps its released size bound (kittrial-5bb.6 item 2a and the
+    # long-chain test). The additive integration record identity/order (kittrial-
+    # 5bb.343) is carried by `review TASK` and `work` rows, where the follow-on write
+    # gate and the reader need it; the compact brief's bounded prior slice drops those
+    # two keys so a long chain does not grow past 6000 bytes.
+    for entry in bounded_priors:
+        entry['integration']=compact_integration(entry.get('integration'))
     review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record a review request or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
@@ -837,7 +1068,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                            'state':(dispositions.get(e['entry_id']) or {}).get('state','unacknowledged')} for e in outstanding[:NEWER_MAX]],
                  'omitted':max(0,len(outstanding)-NEWER_MAX)}
         if not counted:
-            dir_out['check']='off';dir_out['reason']=directions_off_reason
+            dir_out['check']=directions_check_state(directions_off_reason);dir_out['reason']=directions_off_reason
         if dir_out['total']:
             ids=', '.join(i['entry_id'] for i in dir_out['items'][:NEWER_MAX])
             ids+=(f' (+{dir_out["omitted"]} more)' if dir_out['omitted'] else '')
@@ -847,7 +1078,24 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         excluded_cursor=activity_cursor(excluded)
         stale=not cursor_matches(p['activity_cursor'],excluded,compatible=excluded_cursor)
         if stale:
-            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted)
+            # kittrial-5bb.293 item 2: a title/description/acceptance change is newer
+            # activity too. The checkpoint's cursor carries the field lengths it saw;
+            # the live snapshot carries the current ones.
+            try:
+                recorded=untoken(p['activity_cursor'])
+            except ValueError:
+                recorded=None
+            recorded_fields=(recorded or {}).get('fields') if isinstance(recorded,dict) else None
+            current_sizes={k:len(str(issue.get(k) or '')) for k in ('title','description','acceptance_criteria')}
+            changes=field_changes_since(recorded_fields, current_sizes)
+            newer=newer_activity_summary(excluded,retained_provenance(state),c.get('created_at'),context[0],dispositions,direction_data,counted,directions_off_reason,field_changes=changes,marker_fields=fields_digest(issue))
+            if not recorded_fields and not changes and not newer.get('entries'):
+                # An older cursor carries no lengths and no entry explains the stale
+                # flag: the change is in the task fields (state_sha256). Report that
+                # without old_length, never all three fields with old_length None
+                # (kittrial-5bb.293 item 2 rev2).
+                changes=field_changes_since(None, current_sizes, only_if_unexplained=True)
+                newer['field_changes']=changes
             if review['review_state'] not in review_next:
                 dirs=newer.get('unresolved_directions')
                 dir_note='' if not dirs else '; '+str(dirs['total'])+' outstanding direction(s) not yet resolved/superseded'
@@ -856,6 +1104,41 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                              +('' if newer['coverage']!='unknown' else ', coverage UNKNOWN — reconcile with history before trusting counts')
                              +'). Read newer activity first: '+newer['history']
                              +'. The recorded checkpoint next action was: '+p['next_action'])
+    # The one newer-activity definition (kittrial-5bb.354): brief carries the SAME fields
+    # the work rows and the agent routes carry, from the same function, beside the
+    # released `checkpoint.newer_activity` (which means "the checkpoint is stale", own
+    # entries and task-state changes included).
+    activity=None
+    if p is not None:
+        try:
+            activity=activity_fields(issue,c,retained_provenance(state),fields_digest(issue),newer if stale else None,
+                                     dir_out['total'])
+        except StopIteration:
+            activity=None
+    # Which of title, description and acceptance changed: only the tracker's version
+    # history knows (field_history.py), read ONLY when the checkpoint is stale and only
+    # here - never on a wait or next poll. ``field_history`` is the caller's bounded,
+    # read-only, cached reader; without one the section says the fields are not known.
+    changed_fields=[];fields_note=None
+    if p is not None and stale:
+        import field_history as field_versions
+        if field_history is None:
+            fields_note=field_versions.UNKNOWN_NOTE%'this route does not read the tracker history'
+        else:
+            try:
+                history_text=field_history(task)
+            except field_versions.TooLarge:
+                history_text=False
+            except Exception:
+                history_text=None
+            if history_text is False:
+                changed_fields,fields_note=[],field_versions.TOO_LARGE_NOTE
+            else:
+                changed_fields,fields_note=field_versions.changes(history_text,issue,c.get('created_at'))
+    section=changes_since_checkpoint(
+        excluded if p is not None else data, retained_provenance(state) if p is not None else None,
+        {'comment_id':c['id'],'author':c.get('author'),'timestamp':c.get('created_at')} if p is not None else None,
+        context[0],fields=changed_fields,current=p is not None and not stale,fields_note=fields_note)
     # The project the checkpoint was taken in, when it is not this one (kittrial-5bb.136):
     # after restore-new under another name an unchanged task reads current, which is true
     # of the copy, but the restore is still worth reconciling before trusting the
@@ -891,8 +1174,21 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                       prior_contributions=bounded_priors,prior_contributions_total=len(priors),
                       prior_contributions_more='review '+task if len(priors)>PRIOR_BRIEF_LIMIT else None,
                       reverts=reverts[-REVERT_BRIEF_LIMIT:],reverts_total=len(reverts),
-                      reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None)
+                      reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None,
+                      integration=compact_integration(review.get('integration')))
     brief_review.pop('reconciliation_needed',None)
+    # The coordinator's recorded hand-back (kittrial-5bb.343): the same additive
+    # block a work row carries. An APPLYING one is the assignee's move, so `next`
+    # quotes the recorded text once and the shared review block names the role.
+    followon_block=review.get('followon')
+    if followon_block is not None:
+        result_followon=followon_block
+    else:
+        result_followon=None
+    if isinstance(followon_block,dict) and followon_block.get('applies'):
+        import followon as followon_records
+        next_action=followon_records.next_text(followon_block,checkpoint_available=provenance_writes)
+        brief_review['next_actor']='assignee'
     # Avoid adding off-state bytes to compact long-chain briefs. The setting
     # is carried only when ON; absence means false, including older endpoints.
     if not brief_review.get('approval_requires_other_party'):
@@ -900,16 +1196,21 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     from task_assignment import notices as assignment_notices
     notice_block=assignment_notices(issue,project,actor)
     notice_records=assignment_notices(issue,project,None,limit=20)
-    result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(issue.get('assignee') or 'unassigned',96),'status':issue.get('status'),
+    result={**({'assignment_records':notice_records} if notice_records['total'] else {}),**({'assignment_notices':notice_block} if notice_block['total'] else {}),**attention,'reference_drafts_matching':reference_drafts,'task':task,'title':clip(issue.get('title'),200),'owner':clip(owner_raw or 'unassigned',96),**({'owner_name':clip(owner_name,96),'assigned_to':clip(assigned_to,200)} if owner_name and owner_name!=owner_raw else {}),'status':issue.get('status'),
             'activity_cursor':activity_cursor(data),'checkpoint':None if p is None else {'comment_id':str(c['id']),'author':clip(c.get('author'),96),'timestamp':c.get('created_at'),'source_commit':p['source_commit'],'branch':p['branch'],'incorporated_activity_cursor':p['activity_cursor'],
                 'newer_activity':stale,**({'taken_in_project':taken_in} if taken_in else {})},
             'newer':newer,
+            # kittrial-5bb.354: only with a checkpoint, so a task without one keeps the
+            # compact size the long-chain brief holds; the text form and the web task
+            # read still say there is no checkpoint (SECTION_NO_CHECKPOINT).
+            **({'activity':activity,'changes_since_checkpoint':section} if p is not None else {}),
             'directions':dir_out,
             'intent':clip(p['intent'] if p else issue.get('description'),600),'acceptance':clip(p['acceptance'] if p else issue.get('acceptance_criteria'),1000),
             'current_position':p['summary'] if p else 'No checkpoint yet; current position and unresolved items have not been summarized.',
             'next_action':next_action,
             'unresolved':{'coverage':'explicit checkpoint items only; unsummarized prose is not classified','total':len(items) if p else None,'items':items[offset:offset+limit],'next_offset':offset+limit if offset+limit<len(items) else None},
             'review':brief_review,
+            **({'followon':result_followon} if result_followon is not None else {}),
             'lifecycle_matches_contribution':matches_contribution,
             'deployed_delivery':deployed_delivery,
             'deployed_delivery_is_current_contribution':deployed_current,
@@ -942,6 +1243,17 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
         # carries the current version; a direct library call with no project path
         # cannot read the guidance and omits the block.
         result['guidance']=brief_block(journal,actor)
+    # kittrial-5bb.293 item 1: when a compact field is cut, say how to read the whole
+    # over the route the caller uses. The endpoint names `show TASK`; the HTTP brief
+    # rewrites this to the GET route and carries the link. The block is present ONLY
+    # when a field was actually cut: an uncut brief then carries exactly the bytes it
+    # carried before this pointer existed, which is what keeps the long prior chain
+    # under the 6000-byte bound the follow-on test holds (kittrial-5bb.293 r6 item 2).
+    if (result.get('title') or {}).get('omitted_chars') or \
+            (result.get('intent') or {}).get('omitted_chars') or \
+            (result.get('acceptance') or {}).get('omitted_chars'):
+        result['read_whole'] = {'route': 'show %s' % task,
+                                'note': 'The complete text: show %s.' % task}
     if full:
         # The explicit fuller-context read (kittrial-5bb.8): the compact brief stays
         # compact, and a caller that needs the whole text asks for it and is told how
@@ -1146,7 +1458,7 @@ def save_checkpoint(rows,project,task,p,actor,run,provenance_writes=False):
     previous=str(current[1]['id']) if current else None
     if p['previous']!=previous:raise ValueError('Stale previous checkpoint; read brief again')
     if p['activity_cursor']!=activity_cursor(snap):raise ValueError('Activity changed; read/reconcile history and obtain a fresh activity cursor')
-    transition(current[0] if current else None,payload)
+    transition(current[0] if current else None,payload,'request')
     result=json.loads(run(['comments','add',task,PREFIX+canonical_bytes(payload).decode(),'--json']))
     answer={'comment_id':str(result['id']),'reconciled':False,'covered':payload.get('provenance',{}).get('covered',0),'bytes':size}
     if lane is not None:
@@ -1200,9 +1512,79 @@ def verify_checkpoint(rows,project,task):
                     +'There is no shortcut that verifies never-recorded entries: publish a checkpoint to record '
                     'current evidence; reconcile history manually via history/show.')}
 
+#: The 'changes since your checkpoint' section (kittrial-5bb.354): at most this many
+#: entries, newest first, each body clipped to SECTION_BODY_CHARS, and all bodies
+#: together within SECTION_BUDGET encoded bytes; what does not fit is counted.
+SECTION_ENTRIES_MAX=10
+SECTION_BODY_CHARS=300
+SECTION_BUDGET=3000
+SECTION_NO_CHECKPOINT=('This task has no checkpoint yet, so there is nothing to compare with: '
+                       'everything on it is new to you. Read its history.')
+
+def entry_state(entry,fresh,checkpoint_timestamp):
+    """new, edited or late: how one unincorporated entry relates to the checkpoint."""
+    if not any(e is entry for e in fresh):return 'edited'
+    if checkpoint_timestamp and parse_moment(entry['timestamp'])<parse_moment(checkpoint_timestamp):return 'late'
+    return 'new'
+
+def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=False,fields_note=None):
+    """The bounded 'changes since your checkpoint' section (kittrial-5bb.354).
+
+    ``checkpoint`` is {comment_id, author, timestamp} of the newest valid checkpoint, or
+    None. The entries are the SAME selection the counts and the marker read
+    (:func:`newer_selection`), newest first, each with its author, time, entry id,
+    whether it is the owner's own and whether it is new, edited or a late arrival; the
+    body is untrusted text, so it is made terminal-safe and clipped. ``fields`` are the
+    changed task fields, already in their reported shape, and ``fields_note`` says why
+    they could not be determined when that is so (None when the reading is exact).
+    ``current`` says the
+    checkpoint's cursor matches the task as it is now: nothing is listed and coverage
+    reads 'current', as on the queue rows. Reading clears nothing.
+    """
+    history='history '+data['task']+' --since-checkpoint'
+    if checkpoint is None:
+        return {'checkpoint':None,'coverage':None,'total':None,'own_count':None,'other_count':None,
+                'unverified_count':None,'entries':[],'omitted':0,'fields':[],'fields_note':None,
+                'history':'history '+data['task'],'note':SECTION_NO_CHECKPOINT}
+    stamp=checkpoint.get('timestamp')
+    if current:coverage,entries,fresh,unverified='current',[],[],0
+    else:coverage,entries,fresh,_changed,unverified=newer_selection(data,prov,stamp)
+    newest=sorted(entries,key=lambda e:(parse_moment(e['timestamp']),e['entry_id']),reverse=True)
+    shown=[];spent=0
+    for entry in newest[:SECTION_ENTRIES_MAX]:
+        body=clip(plain_text(entry.get('body')),SECTION_BODY_CHARS)
+        cost=encoded_size(body['text'])
+        if shown and spent+cost>SECTION_BUDGET:break
+        spent+=cost
+        shown.append({'entry_id':entry['entry_id'],'kind':entry['kind'],'author':clip(entry['author'],96),
+                      'timestamp':entry['timestamp'],'own':entry['author']==owner,
+                      'state':entry_state(entry,fresh,stamp),'body':body})
+    own=sum(1 for e in entries if e['author']==owner)
+    note=('Newest first; read these before acting on the checkpoint. Bodies are clipped; read the whole '
+          'entries with '+history+'. Reading clears nothing: a new checkpoint incorporates them.')
+    if coverage=='unknown':
+        note+=' Coverage is UNKNOWN (the checkpoint predates per-entry digests): entries are selected by time, so an edit to an older entry is not seen.'
+    elif coverage=='windowed':
+        note+=' Coverage is WINDOWED: '+str(unverified)+' older entries cannot be re-verified and are not listed.'
+    return {'checkpoint':{'comment_id':str(checkpoint.get('comment_id')),'author':clip(checkpoint.get('author'),96),
+                          'timestamp':stamp},
+            'coverage':coverage,'total':len(entries),'own_count':own,'other_count':len(entries)-own,
+            'unverified_count':unverified,'entries':shown,'omitted':len(entries)-len(shown),
+            'fields':list(fields or []),'fields_note':None if current else fields_note,
+            'history':history,'note':note}
+
 def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
-    """Bounded queue fields; share the brief's linked state and full-row snapshot."""
-    empty={'newer_activity_by_others':None,'newer_activity_own':None,
+    """Bounded queue fields; share the brief's linked state and full-row snapshot.
+
+    This is the ONE computation of the newer-activity fields (kittrial-5bb.354,
+    docs/BRIEFINGS.md "Newer activity: one definition"): the work rows carry its answer,
+    and so, unchanged, do brief's ``activity`` block, the agent routes and the web task
+    read. ``newer_activity`` keeps its released rule (:func:`newer_comment_by_other`);
+    the counts and the marker are the precise signals, and the marker also moves on an
+    edit of the title, description or acceptance (:func:`activity_marker`). On a read
+    that fails, every field is null and the caller keeps its own ``newer_activity``.
+    """
+    empty={'newer_activity_marker':None,'newer_activity_by_others':None,'newer_activity_own':None,
            'newer_activity_coverage':None,'unresolved_directions':None}
     try:
         if state is None:state=checkpoint_state(row)
@@ -1214,15 +1596,38 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
         dispositions=chain_dispositions(state['history'])
         context=direction_context(row,state);direction_data=direction_entries(data,context)
         counted,_directions_off_reason=directions_counted(provenance_writes,row.get('status'))
-        if cursor_matches(p['activity_cursor'],data):own=others=0;coverage='current'
-        else:
-            newer=newer_activity_summary(data,retained_provenance(state),c.get('created_at'),
-                                         context[0],dispositions,direction_data,counted)
-            own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
-        return {'newer_activity_by_others':others,'newer_activity_own':own,
-                'newer_activity_coverage':coverage,
-                'unresolved_directions':len(unresolved_directions(direction_data,dispositions,context[0],counted))}
-    except (ValueError,TypeError,KeyError):return empty
+        prov=retained_provenance(state);digest=fields_digest(row)
+        newer=None
+        if not cursor_matches(p['activity_cursor'],data):
+            newer=newer_activity_summary(data,prov,c.get('created_at'),
+                                         context[0],dispositions,direction_data,counted,_directions_off_reason,
+                                         marker_fields=digest)
+        return activity_fields(row,c,prov,digest,newer,
+                               len(unresolved_directions(direction_data,dispositions,context[0],counted)))
+    except (ValueError,TypeError,KeyError,StopIteration):return empty
+
+def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved):
+    """The six newer-activity fields from one read's own results (kittrial-5bb.354).
+
+    ``newer`` is that read's :func:`newer_activity_summary` (computed with
+    ``marker_fields=digest``), or None when the checkpoint's cursor is current. brief and
+    the queue rows both call this, each with what it already computed, so the fields
+    cannot differ and brief reads nothing twice. Raises StopIteration when the checkpoint
+    comment is not on the row.
+    """
+    if newer is None:
+        # Nothing newer: the marker still stands, so a later claim, which makes the cursor
+        # stale but adds no entry and no field edit, reads the same marker. A legacy
+        # checkpoint (no per-entry digests) has none.
+        own=others=0;coverage='current';marker=None if prov is None else activity_marker(None,digest)
+    else:
+        own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
+        marker=newer['newer_activity_marker']
+    return {'newer_activity':newer_comment_by_other(row,checkpoint_comment),
+            'newer_activity_marker':marker,
+            'newer_activity_by_others':others,'newer_activity_own':own,
+            'newer_activity_coverage':coverage,
+            'unresolved_directions':unresolved}
 
 def snapshot_checkpoints(data):
     """Valid checkpoints of one snapshot in linked order, exactly as ``checkpoint`` reads them.
@@ -1494,6 +1899,37 @@ def parse_args(action,args):
             parsed.since_checkpoint=True
     return parsed
 
+def format_changes(section,activity):
+    """Text lines of the 'changes since your checkpoint' section (kittrial-5bb.354)."""
+    if not section:return []
+    if section['checkpoint'] is None:return ['Changes since your checkpoint: '+section['note']]
+    lines=[]
+    if activity:
+        lines.append('Newer activity: newer_activity=%s marker=%s by_others=%s own=%s coverage=%s unresolved_directions=%s'%(
+            activity.get('newer_activity'),activity.get('newer_activity_marker'),activity.get('newer_activity_by_others'),
+            activity.get('newer_activity_own'),activity.get('newer_activity_coverage'),activity.get('unresolved_directions')))
+    if not section['total'] and not section['fields']:
+        return lines+['Changes since your checkpoint: none (coverage %s).'%section['coverage']
+                      +(' '+section['fields_note'] if section.get('fields_note') else '')]
+    lines.append('Changes since your checkpoint (READ THESE FIRST): %d entries, %d by others, %d own; coverage %s.'%(
+        section['total'],section['other_count'],section['own_count'],section['coverage']))
+    for entry in section['entries']:
+        body=re.sub(r'[\r\n]+',' / ',entry['body']['text'])
+        more=' [+%d characters]'%entry['body']['omitted_chars'] if entry['body']['omitted_chars'] else ''
+        lines.append('  %s %s [%s, %s%s] by %s: %s%s'%(entry['timestamp'],entry['entry_id'],entry['kind'],entry['state'],
+                                                     ', own' if entry['own'] else '',entry['author']['text'],body,more))
+    if section['omitted']:lines.append('  ... %d more; read them with: %s'%(section['omitted'],section['history']))
+    for field in section['fields']:
+        lines.append('  field %s changed%s: now %s%s'%(field['field'],
+                     '' if field.get('author') else ' (who made the change is not recorded)',
+                     json.dumps(field['current']['text'],ensure_ascii=False),
+                     ' [+%d characters]'%field['current']['omitted_chars'] if field['current']['omitted_chars'] else '')
+                     +('; previous %s'%json.dumps(field['previous']['text'],ensure_ascii=False) if field.get('previous')
+                       else '; previous value not recorded'))
+    if section.get('fields_note'):lines.append('  '+section['fields_note'])
+    lines.append('  '+section['note'])
+    return lines
+
 def format_brief(result):
     def excerpt(value):return value['text']+(f' [excerpt; {value["omitted_chars"]} characters omitted — use show/history]' if value['omitted_chars'] else '')
     lines=[f'{result["task"]}: {excerpt(result["title"])}',f'Owner: {excerpt(result["owner"])} | Status: {result["status"]}',
@@ -1510,10 +1946,14 @@ def format_brief(result):
         repaired=(' (repaired by %s at %s)'%(guidance['repaired_by'],guidance.get('repaired_at') or 'unknown')
                   if guidance.get('repaired_by') else '')
         lines.append('Guidance: version %s set by %s at %s%s | acknowledged: %s | attention: %s'%(
-            guidance['version'],guidance.get('set_by') or 'unknown',guidance.get('set_at') or 'unknown',repaired,
+            guidance['version'],guidance.get('set_by') or 'unknown',guidance.get('set_at') or 'unknown',repaired + ' via ' + (guidance.get('set_via') or 'unknown legacy route'),
             guidance.get('acknowledged'),guidance.get('attention')))
     if guidance and guidance.get('warning'):
         lines.append('Guidance warning: '+guidance['warning'])
+    if isinstance(guidance,dict) and isinstance(guidance.get('item'),dict):
+        # kittrial-5bb.325: the unacknowledged version is a MOVE, not only a flag, and the
+        # line names the version and the command. The text is still read through guidance get.
+        lines.append('Guidance action: '+guidance['item']['text'])
     cp=result['checkpoint']
     if cp:lines += [f'Checkpoint: {cp["comment_id"]} by {excerpt(cp["author"])} at {cp["timestamp"]}',f'Branch: {cp["branch"] or "unknown"} | Source commit: {cp["source_commit"] or "unknown"}',
                     'Newer/changed activity: '+str(cp['newer_activity']), 'Incorporated activity cursor: '+cp['incorporated_activity_cursor']]
@@ -1528,6 +1968,8 @@ def format_brief(result):
         lines += ['  '+e['entry_id']+' ['+e['kind']+(' changed' if e['changed'] else '')+'] '+e['timestamp']+' by '+e['author']['text'] for e in newer['entries']]
         if newer['omitted']:lines += [f'  ... {newer["omitted"]} more; fresh activity: '+newer['history_new']+'; full: '+newer['history']]
         lines += ['Read newer activity: '+newer['history_new'], newer['note']]
+    lines += (format_changes(result.get('changes_since_checkpoint'),result.get('activity')) if result['checkpoint']
+              else ['Changes since your checkpoint: '+SECTION_NO_CHECKPOINT])
     dirs=result['directions']
     if dirs:
         ids=', '.join(i['entry_id'] for i in dirs['items'])
@@ -1672,6 +2114,19 @@ def help_notes(action):
             'more a numbered list of the same sentences ("Invalid checkpoint (N problems): [1] ... [2] ..."), at '
             'most %d of them. A stale previous and a changed activity cursor are separate refusals.'
             % CHECKPOINT_PROBLEMS_MAX,
+            'The carry refusal names the ids it compared (kittrial-5bb.287): the ids open in the previous '
+            'checkpoint that this record neither carries nor resolves, the ids in `resolved` that are also in '
+            '`open_items`, and the ids in `resolved` that are not open items at all. An item is resolved by '
+            'OMITTING its id from `open_items` and adding it to `resolved`; naming it in `resolved` while still '
+            'carrying it does not resolve it. A direction is NEVER resolved by `resolved`: a direction is another '
+            'actor\'s ordinary comment, dispositioned with `directions` (installations with the provenance write '
+            'switch off cannot record one, so none is outstanding there). No client update is required: the '
+            'refusal names the ids in the request that do not match, and those ids are what fix it.',
+            'Minimal example payload that disposes of ONE outstanding direction while carrying the open items '
+            '(templates/%s): "open_items" repeats every unresolved id and text byte for byte, "resolved" is empty, '
+            'and "directions" holds the direction\'s id, its full digest from `checkpoint TASK --directions`, and '
+            'the disposition. Write it with `checkpoint TASK --file %s`.'
+            % (DIRECTION_EXAMPLE_FILE, DIRECTION_EXAMPLE_FILE),
             '--json is accepted in any position; the saved checkpoint is always returned as JSON on stdout.',
             '--provenance, --verify and --directions are read-only alternatives to --file; they change no checkpoint or direction disposition.',
             'checkpoint_provenance_writes is off by default: writers emit the older-kit shape until an operator enables new writes after a reader-first rollout.',
@@ -1715,7 +2170,7 @@ def direction_page(rows,project,task,offset=0,limit=50,provenance_writes=True):
             'next_offset':offset+limit if offset+limit<len(entries) else None,
             'coverage':'Current full digests for outstanding directions, including entries outside stored provenance windows. '
                        'Pages are fresh reads; compare activity_cursor across pages and restart if it changes.'}
-    if not counted:page['check']='off';page['reason']=directions_off_reason
+    if not counted:page['check']=directions_check_state(directions_off_reason);page['reason']=directions_off_reason
     return page
 
 def latest_checkpoint_read(rows,project,task,include_provenance=False):
@@ -1750,7 +2205,7 @@ def latest_checkpoint_read(rows,project,task,include_provenance=False):
             'evidence':{'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id'])}}
 
 def execute(root,path,project,actor,action,args,attachments,run,operators=None,verifiers=None,
-            independent_approval=False,owners=None):
+            independent_approval=False,owners=None,identity_names=None):
     """Endpoint holds project coordination lock. History caches are disposable."""
     from work import help_payload,help_requested
     if help_requested(args):
@@ -1805,10 +2260,33 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
     else:
         rows=exported_rows(run)
         if action=='brief':
+            def field_history(task_id):
+                # One bounded read-only `bd history` per stale brief, through the read
+                # cache under the tracker's generation (kittrial-5bb.354), stopped at
+                # HISTORY_MAX_BYTES while it is read (kittrial-5bb.362); one smaller
+                # read follows a refused one, and a second refusal raises TooLarge.
+                import field_history as field_versions
+                from read_cache import cached_task_history
+                def bounded(limit):
+                    argv=field_versions.command(task_id,limit)
+                    reader=getattr(run,'bounded',None)
+                    if reader is not None:
+                        return reader(argv,field_versions.HISTORY_MAX_BYTES)
+                    text=run(argv)          # a runner without a bounded read (a test double)
+                    if len(text.encode('utf-8'))>field_versions.HISTORY_MAX_BYTES:
+                        raise field_versions.TooLarge('history answer over the cap')
+                    return text
+                def fetch():
+                    try:
+                        return bounded(field_versions.HISTORY_LIMIT)
+                    except field_versions.TooLarge:
+                        return bounded(field_versions.RETRY_LIMIT)
+                return cached_task_history(root,path,task_id,fetch,name=project)
             result=brief(rows,project,a.task,a.items_offset,a.items_limit,operators=operators,journal=path,
                          verifiers=verifiers,actor=actor,full=a.full,
                          independent_approval=independent_approval,owners=owners,
-                         provenance_writes=checkpoint_writes_enabled(root))
+                         provenance_writes=checkpoint_writes_enabled(root),
+                         identity_names=identity_names,field_history=field_history)
             return json.dumps(result,ensure_ascii=False,indent=2)+'\n' if a.json else format_brief(result)
         data=snapshot(rows,project,a.task);digest=content_hash(data);cache.mkdir(exist_ok=True)
         file=cache/(digest+'.json')

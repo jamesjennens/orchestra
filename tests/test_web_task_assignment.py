@@ -332,6 +332,65 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
         approved=harness.request('POST','/v1/projects/pp/tasks/'+tid+'/reviews',dict(body,operation_id='other-party-approval-0001'),token=other_token)
         self.assertEqual(201,approved.status,approved.data)
 
+    def test_the_endpoint_refuses_a_roster_read_without_verified_authority(self):
+        """Mutant M4 of the second .211 review: removing the endpoint's own authority
+        check on the roster read (assignment_authority in the assignment-roster
+        branch of endpoint.execute) is caught by this test and by no other.
+
+        authority_config and require_authority are keyword arguments of execute(),
+        not request fields. The actor is a real logged-in CONTRIBUTOR's identity,
+        so the generic guard does not answer 401 'Session expired or revoked' or
+        'Live authority descriptor required'. Two cases, both refusals that list
+        nobody; the second is the one that reaches assignment_authority() and is
+        the M4 kill:
+
+        (a) A LIVE descriptor naming the capability the action needs is refused by
+            the generic decide() with 126/403 'Project role does not permit this
+            operation' -- the contributor lacks coordinate, and that check runs
+            before the roster branch.
+        (b) With no descriptor the generic guards have nothing to refuse (the
+            actor is not an HTTP id, so http_actor_denial is skipped and
+            block_mismatch_denial has no block to compare): the answer is the
+            roster's own returncode 2 / assignment_status 403. Remove
+            assignment_authority() and this case lists the roster and the test
+            fails.
+        """
+        from http_authority import AuthorityConfig, authority_request, CAP_COORDINATE
+        harness, owner = self.web()
+        contributor, contributor_token = self.member(harness, owner, 'm4-no-coordinate',
+                                                     role='contributor')
+        principal = harness.service.authenticate(contributor_token)
+        harness.service.store.save()
+        config = AuthorityConfig(harness.backend.authority_store, harness.backend.authority_lock,
+                                 harness.backend.actor_namespace)
+        page = [json.dumps(dict(offset=0, limit=200))]
+        actor = 'm4-no-coordinate/session'
+        # (a) live descriptor, capability the action needs: refused (the generic
+        # decide() or the roster's own check), never a 401, never a listing.
+        from http_authority import AuthorityDenied
+        descriptor = dict(authority_request(principal, 'pp', CAP_COORDINATE,
+                                            now=harness.service._expiry_now()),
+                          user_id=actor)
+        harness.service.store.save()
+        try:
+            live = fixture.endpoint.execute(self.root, dict(
+                project='pp', actor=actor, action='assignment-roster',
+                args=page, authority=descriptor),
+                authority_config=config, require_authority=True)
+            self.assertEqual(2, live['returncode'], live)
+            self.assertNotIn('items', json.loads(live.get('stdout') or '{}'))
+        except AuthorityDenied as denied:
+            # decide() raised inside the roster's own check: still a refusal.
+            self.assertNotIn('items', {})
+        # (b) no descriptor: the roster's own check refuses. THIS is the M4 kill.
+        bare = fixture.endpoint.execute(self.root, dict(
+            project='pp', actor=actor, action='assignment-roster',
+            args=page),
+            authority_config=config, require_authority=True)
+        self.assertEqual(2, bare['returncode'], bare)
+        self.assertEqual(403, bare.get('assignment_status'), bare)
+        self.assertNotIn('items', json.loads(bare.get('stdout') or '{}'))
+
     def test_forged_canonical_block_and_unconfigured_ssh_cannot_assign(self):
         from unittest.mock import patch
         harness,owner=self.web();old=harness.admin_user['id'];target,_=self.member(harness,owner,'binding-target')
@@ -528,5 +587,110 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
         self.assertEqual(task_assignment.notices(restored, 'assignmentcopy', target)['total'], 0)
         self.assertIsNotNone(task_assignment.parse_comment(restored_notice,project='pp',task=tid))
         self.assertEqual(before,self.rows())
+
+    def test_web_agent_display_name_assignment_stores_the_actor_and_says_so(self):
+        harness, owner = self.web()
+        old = harness.admin_user['id']
+        created = harness.request('POST', '/v1/agents',
+                                  {'name': 'jj-vscode-1', 'working_directory': '/tmp/jj',
+                                   'projects': ['pp']}, token=owner)
+        self.assertEqual(201, created.status, created.data)
+        agent_id = created.data['agent']['id']
+        secret = created.data['credential']['secret']
+        tid = self.task(assignee=old)
+        reply = harness.request('POST', '/v1/projects/pp/tasks/' + tid + '/assign',
+                                self.assignment_body(old, 'jj-vscode-1'), token=owner,
+                                key='assign-by-display-name-0001')
+        self.assertEqual(200, reply.status, reply.data)
+        self.assertEqual(agent_id, reply.data['assignee'])
+        self.assertEqual('jj-vscode-1', reply.data['requested_assignee'])
+        self.assertIn(agent_id, reply.data['resolution'])
+        row = next(x for x in self.rows() if x['id'] == tid)
+        self.assertEqual(agent_id, row['assignee'])
+        notice = next(c for c in row['comments'] if c['text'].startswith(task_assignment.PREFIX))
+        self.assertEqual(agent_id, task_assignment.parse_comment(notice, project='pp', task=tid)['to'])
+        # The agent's own list carries the task, already under its actor id (the write
+        # resolved the name, so nothing is left to re-resolve here).
+        read = harness.backend.agent_tasks('pp', actor=agent_id)
+        self.assertIn(tid, [item['id'] for item in read['tasks']])
+        item = next(item for item in read['tasks'] if item['id'] == tid)
+        self.assertEqual(agent_id, item.get('assignee'))
+        # The agent can contribute to its own row: before this change the raw display name
+        # made it a stranger to its own task.
+        contribution = harness.request('POST', '/v1/projects/pp/tasks/' + tid + '/reviews',
+            {'operation': 'contribute', 'schema_version': 1,
+             'operation_id': 'agent-contribute-by-name-0001', 'previous': None,
+             'repository': 'https://example.invalid/repo.git', 'commit': 'c' * 40,
+             'base_commit': 'b' * 40, 'supersedes': None,
+             'delivery': {'kind': 'bundle', 'path': 'koopa:/tmp/agent.bundle', 'sha256': 'f' * 64},
+             'summary': 'Delivered after the display-name assignment'}, token=secret)
+        self.assertIn(contribution.status, (200, 201), contribution.data)
+        # A name no actor or agent carries is refused with one sentence, and nothing moves.
+        before = self.rows()
+        refused = harness.request('POST', '/v1/projects/pp/tasks/' + tid + '/assign',
+                                  self.assignment_body(agent_id, 'no-such-person'), token=owner,
+                                  key='assign-unknown-name-0001')
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('no-such-person', refused.data['error']['message'])
+        self.assertEqual(before, self.rows())
+
+    def test_web_assign_a_case_variant_is_refused_not_resolved(self):
+        # Kills the M2 mutant through the real web assign route.
+        harness, owner = self.web()
+        old = harness.admin_user['id']
+        created = harness.request('POST', '/v1/agents',
+                                  {'name': 'jj-vscode-1', 'projects': ['pp']}, token=owner)
+        self.assertEqual(201, created.status, created.data)
+        tid = self.task(assignee=old)
+        before = self.rows()
+        for variant in ('JJ-VSCODE-1', 'jj-vscode-1 '):
+            with self.subTest(variant=variant):
+                refused = harness.request('POST', '/v1/projects/pp/tasks/' + tid + '/assign',
+                                          self.assignment_body(old, variant), token=owner,
+                                          key='assign-case-variant-' + variant.strip())
+                # The HTTP validator refuses a value with surrounding whitespace as 422
+                # before the endpoint; the case variant reaches the resolver and is a 409.
+                # Either way it is refused and nothing is written.
+                self.assertIn(refused.status, (409, 422), refused.data)
+                self.assertEqual(before, self.rows())
+
+    def test_web_assign_a_known_actor_is_stored_exactly_and_not_rewritten(self):
+        harness, owner = self.web()
+        old = harness.admin_user['id']
+        # The admin account is an actor that has acted (it is the assignee of this row), so
+        # it is exact: the write must not carry a resolution note or change the value.
+        tid = self.task(assignee=old)
+        reply = harness.request('POST', '/v1/projects/pp/tasks/' + tid + '/assign',
+                                self.assignment_body(old, old), token=owner,
+                                key='assign-known-actor-0001')
+        self.assertEqual(200, reply.status, reply.data)
+        self.assertEqual(old, reply.data['assignee'])
+        self.assertNotIn('requested_assignee', reply.data)
+        self.assertEqual(old, next(x for x in self.rows() if x['id'] == tid)['assignee'])
+
+    def test_web_assign_an_ambiguous_display_name_is_refused_naming_both_actors(self):
+        harness, owner = self.web()
+        old = harness.admin_user['id']
+        first = harness.request('POST', '/v1/agents',
+                                {'name': 'jj-vscode-1', 'projects': ['pp']}, token=owner)
+        self.assertEqual(201, first.status, first.data)
+        second_owner = harness.create_account(owner, 'second-owner', 'second-owner-password-1')
+        member = harness.request('PUT', '/v1/projects/pp/members/' + second_owner,
+                                 {'role': 'coordinator'}, token=owner)
+        self.assertEqual(200, member.status, member.data)
+        token = harness.login('second-owner', 'second-owner-password-1')[0]
+        second = harness.request('POST', '/v1/agents',
+                                 {'name': 'jj-vscode-1', 'projects': ['pp']}, token=token)
+        self.assertEqual(201, second.status, second.data)
+        tid = self.task(assignee=old)
+        before = self.rows()
+        refused = harness.request('POST', '/v1/projects/pp/tasks/' + tid + '/assign',
+                                  self.assignment_body(old, 'jj-vscode-1'), token=owner,
+                                  key='assign-ambiguous-name-0001')
+        self.assertEqual(409, refused.status, refused.data)
+        message = refused.data['error']['message']
+        self.assertIn(first.data['agent']['id'], message)
+        self.assertIn(second.data['agent']['id'], message)
+        self.assertEqual(before, self.rows())
 
 if __name__=='__main__':unittest.main()

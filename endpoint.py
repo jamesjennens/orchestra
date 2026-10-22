@@ -38,13 +38,13 @@ from coordination import is_merge_slot, merge_slot_sentence
 from render import render
 from lifecycle import apply_native
 from version import report
-from reserved_comments import (carries_record_label, check_raw_request, comment_target,
+from reserved_comments import (bd_flag_values, carries_record_label, check_raw_request, comment_target,
                                first_reserved_label, is_record_anchor, label_guard_request,
                                operator_only_in_args, raw_file_flag_in_args,
                                is_merge_slot_id, shown_token, write_targets, MERGE_SLOT_LABEL, MERGE_SLOT_SUFFIX,
                                reserved_label_in_args, refuse_http_actor, status_change_targets, title_change_targets,
                                unresolved_bd_flags)
-from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_PROJECT_ADMIN, verified_web_authority, block_mismatch_denial, required_capability, descriptor_actor_denial, http_actor_denial, is_mutating_invocation, journal_path, run_guarded, stamp_write
+from http_authority import AuthorityConfig, NativeRunner, CAP_APPROVE, CAP_COORDINATE, CAP_PROJECT_ADMIN, CAP_RECORDS, verified_web_authority, block_mismatch_denial, required_capability, descriptor_actor_denial, http_actor_denial, is_mutating_invocation, journal_path, run_guarded, stamp_write
 
 #: One warning per line on stderr (kittrial-5bb.197 review request 01a12894, item 6):
 #: the configuration warnings and the native warnings are collected in one list, and
@@ -222,6 +222,131 @@ def _native_anchor_rows(root,path,actor,tokens):
         resolved[token]=(rid,row)
     return resolved
 
+#: The claiming guards' two flags, in both the long and the shorthand spelling the
+#: shared parser reports (kittrial-5bb.352 B1/B2).
+_ASSIGNEE_FLAGS = ('--assignee', '-a')
+_STATUS_FLAGS = ('--status', '-s')
+
+
+def _claims_the_row(args):
+    """True when the bd invocation claims the row or makes it in_progress (kittrial-5bb.293).
+
+    Flags are matched by PARSED argument, not substring: a ``--notes`` text that
+    contains ``in_progress`` never triggers this (rev3). The parse is the shared
+    pflag-aware ``bd_flag_values`` (kittrial-5bb.352 B2), so a status shorthand inside
+    a boolean cluster (``-qs in_progress``, ``-qsin_progress``, ``-s=in_progress``,
+    ``-sin_progress``) is seen exactly as bd sees it. A bare ``--claim`` (or any
+    ``--claim=VALUE``) counts conservatively, as before.
+    """
+    for name,_value in bd_flag_values(list(args or [])):
+        if name=='--claim':
+            return True
+        if name in _STATUS_FLAGS and _value=='in_progress':
+            return True
+    return False
+
+
+def _names_assignee(args):
+    """True when the bd invocation itself assigns the row (``--assignee``/``-a``).
+
+    Every spelling bd 1.2.2 accepts is recognised (kittrial-5bb.352 review item B1),
+    through the shared pflag-aware ``bd_flag_values``: ``--assignee W``,
+    ``--assignee=W``, ``-a W``, ``-a=W``, the joined ``-aW``, and ``-a`` at the end of a
+    run of boolean shorthands (``-qa W``, ``-qaW``, ``-va=W``, ``-qva W``). The scan
+    stops at ``--`` because after it bd takes positionals, not flags. ``-a`` is the
+    assignee shorthand on ``create``/``update`` only, which is where this is asked.
+    """
+    return any(name in _ASSIGNEE_FLAGS for name,_value in bd_flag_values(list(args or [])))
+
+
+def _guard_claiming_on_claim(path, row):
+    """Refuse a claim of an UNASSIGNED task while the project is set to ``assigned``.
+
+    The per-project claiming setting (kittrial-5bb.352) is read fresh from the project
+    directory here: it lives outside the tracker, so no cached row can hide a change.
+    A task already assigned to its holder is not this guard's business: its holder may
+    still start it, and a different claimant is refused by bd itself.
+    """
+    if row.get('assignee'):
+        return
+    from claiming import CLAIM_REFUSAL, mode
+    if mode(path) == 'assigned':
+        raise ValueError('Refusing to claim %s: %s' % (row.get('id'), CLAIM_REFUSAL))
+
+
+def _may_assign_work(root, path, actor, authority_config=None, request=None):
+    """Whether this caller may hand work out while the project is ``assigned``.
+
+    The two authorities the setting names (kittrial-5bb.352 review item B1): a listed
+    installation operator (the host route), or the same live ``CAP_COORDINATE`` check
+    the web uses for its own assign/claiming routes. A descriptor is judged against the
+    live authority store by ``verified_web_authority``; it never authorises itself.
+    """
+    if _listed_operator(actor, root, path):
+        return True
+    if authority_config is None or not isinstance(request, dict):
+        return False
+    if not isinstance(request.get('authority'), dict):
+        return False
+    try:
+        return bool(verified_web_authority(request, authority_config,
+                                           CAP_COORDINATE, path.name))
+    except Exception:                      # a refused or unreadable descriptor is no authority
+        return False
+
+
+def _guard_claiming_on_assignment(root, path, actor, authority_config, request, args):
+    """Refuse ``--assignee``/``-a`` on create/update under ``assigned`` (review B1).
+
+    Under ``assigned`` only a coordinator hands work out. The host bd passthrough let a
+    plain worker take an unassigned task by naming itself as the assignee - directly
+    (``update T --assignee W``) or in the same call as a claim (``update T --claim
+    --assignee W``, ``update T --status in_progress --assignee W``). Any assignee
+    spelling is refused unless the caller is a listed operator or holds
+    ``CAP_COORDINATE`` in this project, with the one setting-naming sentence. Creating
+    and assigning in one call is the same hand-out and is refused the same way.
+    """
+    if not args or args[0] not in ('create', 'update') or not _names_assignee(args):
+        return
+    from claiming import CLAIM_REFUSAL, mode
+    if mode(path) != 'assigned':
+        return
+    if _may_assign_work(root, path, actor, authority_config, request):
+        return
+    raise ValueError('Refusing to assign work through bd here: %s' % CLAIM_REFUSAL)
+
+
+def _guard_open_dependency_on_claim(root,path,actor,row):
+    """Refuse a claim on a task blocked by an open dependency (kittrial-5bb.293 item 3a)."""
+    from work import BLOCKING_DEPENDENCY_TYPES, dependency_index, dependency_ref, open_dependency_ids, open_dependency_sentence
+    deps=[]
+    ids=[]
+    for d in row.get('dependencies') or []:
+        other_id,kind,_=dependency_ref(d)
+        if kind in BLOCKING_DEPENDENCY_TYPES and other_id:
+            deps.append(d);ids.append(other_id)
+    if not deps:return
+    # Fail CLOSED: read the other ends in ONE native read; a missing one is open.
+    completed=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,
+                             'show',*ids,'--json'],env=environment(root),
+                            capture_output=True,text=True,encoding='utf-8',timeout=60)
+    try:
+        others=json.loads(completed.stdout or '[]')
+    except ValueError:
+        others=[]
+    if isinstance(others,dict):others=[others]
+    by_id=dependency_index([r for r in others if isinstance(r,dict)])
+    missing=[i for i in ids if i not in by_id]
+    if missing:
+        raise ValueError('Refusing to claim %s: it is blocked by an open dependency: `%s`. '
+                         'Its status cannot be read, so the claim is refused.'
+                         %(row.get('id'),'`, `'.join(missing[:5])))
+    open_deps=open_dependency_ids(row,[r for r in others if isinstance(r,dict)],index=by_id)
+    if open_deps:
+        raise ValueError('Refusing to claim %s: %s'
+                         %(row.get('id'),open_dependency_sentence(open_deps) or 'it is blocked by an open dependency'))
+
+
 def _guard_record_anchor_status(root,path,args,actor):
     """Read-before-write guard: a status change never moves a record anchor.
 
@@ -255,6 +380,19 @@ def _guard_record_anchor_status(root,path,args,actor):
         if is_merge_slot(row):
             raise ValueError('Refusing to %s %s: %s. Its holder changes only through `coordinate`.'
                              %(command,canonical,merge_slot_sentence(canonical)))
+        # A claim (or an assignee/status change that makes the row in_progress) on a
+        # task blocked by an open dependency is refused, the same rule the HTTP claim
+        # route and work.claimable() apply (kittrial-5bb.293 item 3a). Fails CLOSED
+        # when the other ends cannot be read (item 3c).
+        if command in ('claim', 'update') and _claims_the_row(args):
+            _guard_open_dependency_on_claim(root,path,actor,row)
+            # The per-project claiming setting (kittrial-5bb.352): under 'assigned' a
+            # bare claim of an unassigned task is refused on the host route too. A call
+            # that ALSO names an assignee is the hand-out case, judged by
+            # `_guard_claiming_on_assignment` below (review item B1): it is not a bare
+            # claim, and it is not a claim at all when the caller may assign.
+            if not _names_assignee(args):
+                _guard_claiming_on_claim(path,row)
 
 def _guard_record_anchor_title(root,path,args,actor,rows=None):
     """Read-before-write guard: the title of a record anchor is not changed through bd (kittrial-5bb.97).
@@ -308,8 +446,10 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     "ambiguous ID" on stderr, and no row has exactly ``p-ab``, so the create proceeds as it
     did before kittrial-5bb.135; any other non-zero exit still fails closed. The object means
     absent only at exactly rc 1 and only when ``resolver_absence`` asks for it: rc 0 with an
-    error object is a failed read, and no other guard read reads the object as absence
-    (kittrial-5bb.138 items ``rc0`` and ``absence-pins``).
+    error object is a failed read. A strict guard read also reads the object at rc 1 as an
+    absence (kittrial-5bb.260 F1), only so that its refusal can name the token: every strict
+    caller turns an absence into a refusal, so no write follows from it (kittrial-5bb.138
+    items ``rc0`` and ``absence-pins``).
     """
     try:
         p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=60)
@@ -318,6 +458,11 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     said=(p.stderr or '').strip()
     if not (p.stdout or '').strip():
         if p.returncode and 'no issue found' in said:
+            # kittrial-5bb.260 (mutants): this branch and the no-match-object branch
+            # below are REDUNDANT layers by design - one answer shape comes on stderr
+            # with no stdout, the other as the resolver's rc-1 object on stdout - and
+            # nothing pins them separately because they fail closed together in the
+            # native tests; a change to one must keep its sibling in step.
             return [],said                      # bd's own "that id does not exist" answer
         if p.returncode:
             return None,'bd could not read the tasks (%s)'%(said[-200:] or 'exit %d'%p.returncode)
@@ -336,6 +481,13 @@ def _bd_read(root,path,actor,argv,resolver_absence=False,strict=False):
     rows=[answer] if isinstance(answer,dict) else answer
     if not isinstance(rows,list):return None,'bd gave an unreadable answer'
     if strict and any(not isinstance(row,dict) or not isinstance(row.get('id'),str) for row in rows):
+        if resolver_answer and p.returncode==1:
+            # kittrial-5bb.260 F1: bd's exact no-match object at rc 1 is an ABSENCE, not
+            # a failed read - reading it as absence here (exactly as the create --id
+            # existence check below does) lets _resolve_rows name the token in its
+            # refusal instead of answering 'an incomplete answer'. The guarded write
+            # still refuses; only the sentence changes.
+            return [],said
         return None,'bd gave an incomplete answer'
     rows=[row for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str)]
     if p.returncode and not rows and 'no issue found' not in said and not (resolver_absence and resolver_answer and p.returncode==1):
@@ -423,7 +575,11 @@ def _guard_named_rows(root,path,name,args,attachments,actor,strict=False):
     if not request['targets']:return
     rows,problem=_resolve_rows(root,path,actor,request['targets'],strict=strict)
     if problem:
-        advice=(' '+raw_lifecycle.ADVICE) if strict else ''
+        # kittrial-5bb.260 F1: a RESOLUTION problem (a mistyped or ambiguous id) gets no
+        # lifecycle advice - naming the token is the whole remedy for a typo; the advice
+        # stays on every other strict problem, where the dedicated lifecycle action is.
+        resolution=('does not name exactly one task' in problem or 'is not a task id' in problem)
+        advice=(' '+raw_lifecycle.ADVICE) if strict and not resolution else ''
         refusal=raw_lifecycle.Refusal if strict else ValueError
         raise refusal('Refusing %s: %s, so the rows this would write are not known. Name each task by its id. Nothing was written.%s'%(command,problem,advice))
     slot=name+MERGE_SLOT_SUFFIX
@@ -573,12 +729,195 @@ def reserved_actors(root,path,rows=False,own=()):
         names['authors']=sorted(tracker_actors(root,path,None if rows is True else rows,own))
     return names
 
+def assignee_identities(root,path,authority_config=None,web_state=True):
+    """The identities an assignee display name may be resolved against (kittrial-5bb.333).
+
+    ``{'entries': [{'actor', 'name', 'kind'}, ...], 'complete': bool}``. The project's
+    session registry is always read. When ``web_state`` is true and the live authority
+    document is readable -- the service store the HTTP service already passes, else the
+    installation's default ``http-state.json`` -- the accounts, agents and worker
+    credentials of this project are added. This list is consulted ONLY when a new
+    assignment is written, never to interpret a stored row.
+    """
+    entries=[]
+    try:
+        from sessions import read_registry
+        registry=read_registry(path)
+    except (ValueError,OSError):
+        registry=None
+    for record in ((registry or {}).get('records') or {}).values():
+        if isinstance(record,dict):
+            entries.append({'actor':record.get('actor'),'name':record.get('name'),'kind':'session'})
+    state=None
+    if web_state:
+        store=authority_config.store if authority_config is not None else (root/'http-state.json')
+        try:
+            import http_authority
+            state=http_authority.read_state(store)
+        except Exception:                # absent, unreadable or unsupported: sessions only
+            state=None
+    complete=isinstance(state,dict)
+    if complete:
+        project=path.name
+        members=(state.get('memberships') or {}).get(project) or {}
+        for user_id,user in (state.get('users') or {}).items():
+            if isinstance(user,dict) and (user_id in members or user.get('superuser')):
+                entries.append({'actor':user_id,
+                                'name':user.get('display_name') or user.get('username'),
+                                'kind':'account'})
+        for agent_id,agent in (state.get('agents') or {}).items():
+            if not isinstance(agent,dict):
+                continue
+            if agent.get('enabled',True) and (agent.get('owner') in members
+                                              or project in (agent.get('projects') or [])):
+                entries.append({'actor':agent_id,'name':agent.get('name'),'kind':'agent'})
+        for credential in (state.get('credentials') or {}).values():
+            if not isinstance(credential,dict) or credential.get('agent_id'):
+                continue
+            if credential.get('project_id')!=project or credential.get('revoked'):
+                continue
+            entries.append({'actor':credential.get('actor') or credential.get('user_id'),
+                            'name':credential.get('name'),'kind':'worker'})
+    return {'entries':entries,'complete':complete}
+
+def assignee_display_names(root,path,authority_config=None):
+    """``{actor id: display name}`` for LABELS only (kittrial-5bb.333).
+
+    Actor -> name. It is used to render ``NAME (ACTOR id)`` now that an assignment stores
+    the actor id; it is never consulted for an ownership, claim or move decision. No
+    tracker read: the identities come from the registry and the live authority document.
+    """
+    found=assignee_identities(root,path,authority_config)
+    return {entry['actor']:entry['name'] for entry in found['entries']
+            if isinstance(entry.get('actor'),str) and entry.get('actor')
+            and isinstance(entry.get('name'),str) and entry.get('name')}
+
+def _assignee_export_rows(root,path):
+    """One COMPLETE read of the project's tracker rows, or a refusal.
+
+    The "has ever acted" set is built from these rows, so a partial read is a refusal:
+    a row that cannot be parsed might be the one that carries the requested value as its
+    assignee or author, and resolving past it could rename an actor that has acted here.
+    """
+    from admin import run_bd
+    try:
+        text=run_bd(root,path.name,['export','--all'])
+        rows=record_json.loads_rows(text)
+    except (subprocess.SubprocessError,OSError,ValueError,RecursionError) as error:
+        raise ValueError('the project rows could not be read (%s)' % type(error).__name__) from None
+    if not isinstance(rows,list) or any(not isinstance(row,dict) or row.get('malformed') for row in rows):
+        raise ValueError('the project rows could not be read completely')
+    return rows
+
+def assignee_name_index(root,path,authority_config=None,rows=None,web_state=True):
+    """The one assignment-time resolver index.
+
+    Every actor that has ever acted in the project -- anything stored as an assignee, an
+    author or a ``created_by``, plus every registry actor -- is added as an EXACT actor
+    id, so a display name that spells one of them can never rename it. This index is used
+    only to resolve a value that is about to be WRITTEN; no reader of a stored assignee
+    consults it.
+    """
+    import assignee_names
+    found=assignee_identities(root,path,authority_config,web_state)
+    if rows is None:
+        rows=_assignee_export_rows(root,path)
+    from sessions import used_actors
+    actors={entry.get('actor') for entry in found['entries'] if entry.get('actor')}
+    for row in rows:
+        actors.update(used_actors(row))
+    index=assignee_names.index(found['entries'],actors)
+    index['complete']=found['complete']
+    return index
+
+def _listed_operator(actor,root,path):
+    """Whether ``actor`` is a listed operator of this installation (the host assignment case)."""
+    from review_workflow import listed_operator_actor, operator_owners
+    try:
+        return bool(listed_operator_actor(actor,configured_operators(root),operator_owners(path)))
+    except (ValueError,OSError):
+        return False
+
+def _resolved_bd_assignee(root,path,actor,authority_config,args):
+    """Resolve one raw ``create``/``update --assignee NAME`` at assignment time, or refuse.
+
+    Returns ``(argv, note)``. Only the long ``--assignee VALUE`` and ``--assignee=VALUE``
+    spellings are recognised; the short ``-a`` is left to bd. An exact actor id is stored
+    unchanged (that is what stops P5, a listed operator's ``--assignee w1`` being
+    redirected to a session that later registers the name ``w1``); a display name that
+    exactly one identity of this project carries is stored as that identity's actor id.
+
+    Strictness follows the review of kittrial-5bb.333: the web route and a LISTED
+    OPERATOR refuse a value that is neither a known actor nor exactly one identity's
+    display name, before the native write. Any other host caller keeps the pre-.333
+    pass-through: the value is written exactly as given and no roster is read first, so
+    a plain host reassignment costs no extra native call. A value that is a known actor
+    is never rewritten, whoever writes it.
+    """
+    if not args or args[0] not in ('create','update'):
+        return args,None
+    if not any(token=='--assignee' or token.startswith('--assignee=') for token in args):
+        return args,None
+    import assignee_names
+    strict=authority_config is not None or _listed_operator(actor,root,path)
+    if not strict:
+        # Other host callers keep the pre-.333 pass-through: the assignment is written
+        # exactly as given, and no roster is read before a plain host reassignment (the
+        # kit-wide endpoint guard counts one native call per mutation; .333 r3).
+        return args,None
+    try:
+        index=assignee_name_index(root,path,authority_config)
+    except ValueError as error:
+        if not strict:
+            # The old host behaviour is the safe answer when the rows cannot be read: do
+            # not guess a rewrite, and do not block a write that never needed the read.
+            return args,None
+        raise ValueError('The assignee cannot be checked against the actors that have acted '
+                         'in this project: %s. Nothing was written; write one exact actor id, '
+                         'or retry when the project can be read.' % error) from None
+    rewritten=list(args)
+    notes=[]
+    position=1
+    while position<len(rewritten):
+        token=rewritten[position]
+        if token=='--':
+            break
+        value=None
+        slot=None
+        if token=='--assignee':
+            if position+1>=len(rewritten):
+                break
+            value=rewritten[position+1]
+            slot=position+1
+        elif token.startswith('--assignee='):
+            value=token.partition('=')[2]
+            slot=position
+        if value not in (None,''):
+            picked=None
+            if value in index.get('by_actor',{}):
+                pass                                   # a known actor: never rewritten
+            else:
+                try:
+                    picked=assignee_names.resolve(value,index)
+                except assignee_names.NameRefusal:
+                    # An ambiguous name is refused for anyone: two identities carrying it
+                    # can never be told apart. A miss is refused only where the review
+                    # asked for the strict rule.
+                    if strict or len((index.get('by_name') or {}).get(value) or [])>1:
+                        raise
+                    picked=None
+                if picked is not None and picked['resolved']:
+                    rewritten[slot]=('--assignee='+picked['actor']) if slot==position else picked['actor']
+                    notes.append(picked['sentence'])
+        position+=2 if token=='--assignee' else 1
+    return rewritten,(' '.join(notes) if notes else None)
+
 #: The actions that exist only for the web service: they name no existing project.
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle',
-                      'host-coordination','host-projects','assignment-roster','task-assign')
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-guidance',
+                      'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -623,6 +962,18 @@ def lanes_scope_for(actor,operators,key_principal,owners=None):
         allowed=actor in set(operators or ())
     return 'all' if allowed else 'own'
 
+def lanes_scope_requested(scope,requested):
+    """``scope``, narrowed to ``'own'`` when the request asks for it (kittrial-5bb.263).
+
+    A caller that already holds the cross-lane view may ask for the CONTRIBUTOR view of it:
+    the web service calls this endpoint without a bound key, so its own route asks for
+    ``'own'`` explicitly when its viewer is neither an owner nor a coordinator. Only the
+    narrowing is honoured -- ``'all'``, a missing field or anything else leaves the scope
+    this endpoint computed for its own caller alone -- so no request data can widen a bound
+    key's view of the board.
+    """
+    return 'own' if requested=='own' else scope
+
 def key_principal_refusal(request,path,key_principal):
     """Refuse, for a key bound to a principal, a request whose actor that principal does not own.
 
@@ -654,7 +1005,7 @@ def key_principal_refusal(request,path,key_principal):
 #: deliberately absent (James's answer to question 5, 2026-10-07).
 COORDINATOR_COMMANDS=('guidance-set','guidance-clear','guidance-status','reference-apply',
                       'capability-apply','capability-verify','proposal-review','proposal-decide',
-                      'handoff','set-onboarding')
+                      'handoff','set-onboarding','followon')
 #: The coordinator commands that only read (no journal, no server time; the read takes the
 #: project's coordination lock, exactly as the host command does).
 COORDINATOR_READS=('guidance-status',)
@@ -799,14 +1150,26 @@ def coordinator_payload(args,request):
 def _read_only_always(args,operation):
     return True
 
+def _web_guidance_read_only(args,operation):
+    from web_guidance import READ_OPERATIONS
+    return operation in READ_OPERATIONS
+
 READ_ONLY_ACTIONS={
     'brief':_read_only_always,
     'history':_read_only_always,
     'requirements':_read_only_always,
     'work':_read_only_always,
+    # kittrial-5bb.285: the blocking wait's per-poll read. It is one work read (one export)
+    # and nothing is written, so it takes the project lock SHARED like the work read itself.
+    'wait':_read_only_always,
     'bd':lambda args,operation:not is_mutating_invocation(args),
     'web-lifecycle':lambda args,operation:operation=='read',
     'web-merge-slot':lambda args,operation:operation=='check',
+    'web-guidance':_web_guidance_read_only,
+    # kittrial-5bb.291 item 1: the roster read takes the project lock shared through
+    # the one table, not a hand-coded LOCK_SH at its own call site. task-assign is
+    # deliberately absent: it is a write and stays exclusive.
+    'assignment-roster':_read_only_always,
 }
 
 def coordination_lock_shared(request,action=None,args=None,operation=None):
@@ -855,7 +1218,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','task-assign','assignment-roster'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-guidance','assignee-followon','task-assign','assignment-roster','task-release'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -921,7 +1284,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         return answer
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
-    if action in ('handoff','review','work'):
+    if action in ('handoff','review','work','wait'):
         from work import execute as work_execute
         args=request.get('args',[])
         if not isinstance(args,list) or any(not isinstance(x,str) or '\0' in x for x in args):raise ValueError('Expected argument list')
@@ -981,6 +1344,13 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 return sessions.owners(path)
             lanes_owners=load_lanes_owners
         lanes_scope=lanes_scope_for(actor,operators,key_principal,lanes_owners)
+        # A caller may ASK for the contributor view of the lanes board (kittrial-5bb.263
+        # section 4): the web service calls this endpoint without a bound key, so its own
+        # route asks for `own` explicitly when its viewer is neither an owner nor a
+        # coordinator. Only the narrowing is honoured (see `lanes_scope_requested`), so the
+        # scope this endpoint computed for its own callers stays authoritative for them.
+        lanes_scope=lanes_scope_requested(
+            lanes_scope,request.get('lanes_scope') if isinstance(request,dict) else None)
         def work_effect():
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,
@@ -991,7 +1361,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                 coordinator_writes=rules['coordinator_writes'],
                                 owners=owners,
                                 verified_web_authority=verified_web_authority(request,authority_config,CAP_APPROVE,name),
-                                lanes_scope=lanes_scope)
+                                lanes_scope=lanes_scope,
+                                identity_names=assignee_display_names(root,path,authority_config))
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.
@@ -1066,10 +1437,16 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         if request.get('args',[]) not in ([],None):raise ValueError('Use setup-status without arguments')
         from admin import project_setup_status
         return {'returncode':0,'stdout':json.dumps(project_setup_status(root,name))+'\n','stderr':''}
+    if action=='web-guidance':
+        from web_guidance import request_operation, web_action
+        args=request.get('args',[])
+        operation=request_operation(request)
+        with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args,operation)):
+            return web_action(path,name,request,authority_config,configured_operators(root))
     if action=='guidance':
         # The standing guidance channel (kittrial-5bb.99 slice 1, revised). The
-        # endpoint is read-only except for the caller's own acknowledgement: the only
-        # guidance writer is the operator host command `admin.py set-guidance`, and
+        # host/SSH guidance action is read-only except for the caller's acknowledgement.
+        # Authenticated web writes use the distinct service-only action above, and
         # this allowlist refuses every other subcommand, so adding a write route here
         # cannot pass unnoticed (review `tests`: the test enumerates the accepted
         # subcommands and fails on any not in the read+ack set). `ack` names the
@@ -1084,7 +1461,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         if subcommand not in ('get','version','ack','status'):
             raise ValueError('Unknown guidance action %r: the endpoint can only read guidance (get, version), '
                              'acknowledge the version the caller read (ack), or, for an operator, read status. '
-                             'The only writer is the operator host command admin.py set-guidance.'%subcommand)
+                             'Host writes use admin.py set-guidance; authenticated web writes use the separate web service action.'%subcommand)
         if subcommand=='ack':
             version=_guidance_ack_version(args[1:])
             with (path/'.coordination.lock').open('a') as lock:
@@ -1150,6 +1527,59 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         classified=record_json.classify(raw_rows,anchor_run,sorted(RECORD_ANCHOR_LABELS)) if raw_rows else []
         if anchor_warnings:warnings=(warnings+'\n'+'\n'.join(anchor_warnings)).strip()
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(classified)})+'\n','stderr':warnings}
+    if action in ('ref','capability'):
+        class RecordsRefusal(ValueError):
+            def __init__(self,status,message):
+                super().__init__(message)
+                self.status=status
+        def _records_http_context(coordinator,warnings):
+            if not (authority_config is not None and require_authority):
+                return None,None,None
+            from http_authority import actor_parties,CAP_COORDINATE,CAP_RECORDS,read_state
+            from review_workflow import approval_owners,CoordinatorRuleRefusal,same_party
+            needed=CAP_COORDINATE if coordinator else CAP_RECORDS
+            authority=request.get('authority') if isinstance(request.get('authority'),dict) else {}
+            user_id=authority.get('user_id') if isinstance(authority.get('user_id'),str) else None
+            rules=configured_coordinator_rules(root,warnings=warnings)
+            def identity_check():
+                if not verified_web_authority(request,authority_config,needed,name):
+                    raise RecordsRefusal(403,'Verified web authority required in this project')
+                state=read_state(authority_config.store)
+                role=((state.get('memberships') or {}).get(name) or {}).get(user_id) if user_id else None
+                if coordinator:
+                    if role not in ('owner','coordinator'):
+                        raise RecordsRefusal(403,'Record coordination requires project membership as an owner or coordinator; '
+                                                 'a superuser without project membership must add themselves to the project first.')
+                elif role not in ('contributor','coordinator','owner'):
+                    raise RecordsRefusal(403,'Record mutations require project membership; '
+                                             'a superuser without project membership must add themselves to the project first.')
+            def party_check(proposer):
+                state=read_state(authority_config.store)
+                by_agent=authority.get('via')=='credential'
+                settings_seen=state.get('settings_seen') if isinstance(state.get('settings_seen'),dict) else {}
+                approval_by_another=bool(settings_seen.get('approval_by_another_party')
+                                         or authority.get('approval_by_another_party')
+                                         or rules.get('independent_approval'))
+                if not by_agent and not approval_by_another:
+                    return
+                caller_parties=set(actor_parties(state,actor,name))
+                if user_id:caller_parties.add(user_id)
+                proposer_parties=set(actor_parties(state,proposer,name)) if isinstance(proposer,str) and proposer else set()
+                same_session_owner=False
+                if rules.get('independent_approval') and isinstance(proposer,str) and proposer:
+                    try:
+                        owners=approval_owners(owner_loader(path,'independent_approval'))
+                    except CoordinatorRuleRefusal as error:
+                        raise RecordsRefusal(409,str(error)) from None
+                    same_session_owner=same_party(actor,proposer,owners)
+                if (not isinstance(proposer,str) or not proposer or actor==proposer
+                        or bool(caller_parties & proposer_parties) or same_session_owner):
+                    if by_agent:
+                        raise RecordsRefusal(403,'An agent holding a coordinator grant may not accept or verify a record '
+                                                 'whose draft was proposed by its own party.')
+                    raise RecordsRefusal(403,'A coordinator may not accept or verify a record whose draft was proposed '
+                                             'by the same party while approval_by_another_party is enabled.')
+            return identity_check,(party_check if coordinator else None),user_id
     if action=='ref':
         # The reference catalog (.41 slice 1, kittrial-5bb.66). Reads (get, list, find, help)
         # read their own key, or the catalog in two native reads (reference_records), take no
@@ -1164,7 +1594,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        if not args or args[0] not in reference_records.CONTRIBUTOR_OPERATIONS:
+        by_service=authority_config is not None and require_authority
+        writes=reference_records.CONTRIBUTOR_OPERATIONS+(reference_records.HTTP_WRITE_COMMANDS if by_service else ())
+        if not args or args[0] not in writes:
             import capability_misses
             log=capability_misses.REFERENCE
             def counted(phrase,found):
@@ -1180,7 +1612,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=capability_misses.report(path,lambda:reference_records.NowAnswered(reference_records.read_rows(run),configured_operators(root)),limit,log)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
             looked_up=reference_records.miss_phrase(args)
-            try:result=reference_records.read(args,run,configured_operators(root))
+            try:result=reference_records.read(args,run,configured_operators(root),web_service=authority_config is not None)
             except ValueError as error:
                 # `ref get` of a key nobody has recorded is a lookup that missed.
                 if looked_up is not None and str(error).startswith('Unknown reference key'):counted(looked_up,False)
@@ -1189,16 +1621,25 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 counted(result.get('normalized'),result['found'])
             elif looked_up is not None:counted(looked_up,True)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
-        payload=reference_records.write_payload(args,request.get('attachments',{}))
+        coordinator=args[0] in reference_records.HTTP_WRITE_COMMANDS
+        identity_check,party_check,_=_records_http_context(coordinator,run_warnings)
+        payload=reference_records.write_payload(args,request.get('attachments',{}),commands=writes)
         runner=NativeRunner(run, project=path)
         def ref_effect():
-            result=reference_records.apply_native(payload,actor,runner,path,operators=configured_operators(root))
+            try:
+                result=reference_records.apply_native(payload,actor,runner,path,operator=coordinator,
+                                                      operators=configured_operators(root),
+                                                      web_coordinator=coordinator,party_check=party_check,
+                                                      web_service=by_service)
+            except RecordsRefusal as error:
+                return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),ref_effect,
-                               authority_config=authority_config,
-                               require_authority=require_authority,runner=runner)
+                                 authority_config=authority_config,
+                                 require_authority=require_authority,runner=runner,
+                                 identity_check=identity_check)
     if action=='capability':
         # The capability index (.60 slices 1a and 1b, kittrial-5bb.67/.69). get, list, find
         # and help are reads (one label-filtered bd list plus bd show; no lock, not
@@ -1215,7 +1656,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        if not args or args[0] not in capability_records.WRITE_COMMANDS:
+        by_service=authority_config is not None and require_authority
+        writes=capability_records.WRITE_COMMANDS+(capability_records.HTTP_WRITE_COMMANDS if by_service else ())
+        if not args or args[0] not in writes:
             if args[:1]==['misses'] and not any(token in ('--help','-h') for token in args):
                 # The lookup-miss log (kittrial-5bb.77): read-only, no lock, not run_guarded.
                 # It reads the telemetry file, and the records once (only when the log holds
@@ -1226,7 +1669,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=capability_misses.report(path,lambda:capability_records.exact_index(capability_records.read_catalog(run)[0],configured_operators(root)),limit)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
             result=capability_records.read(args,run,configured_operators(root),
-                                           verifiers=configured_verifiers(root),journal=path)
+                                           verifiers=configured_verifiers(root),journal=path,
+                                           web_service=authority_config is not None)
             if args[:1]==['find'] and isinstance(result,dict) and isinstance(result.get('found'),bool):
                 # Telemetry (kittrial-5bb.77): count the find and, with no exact match, its
                 # normalised phrase. Its own non-blocking lock file, never .coordination.lock;
@@ -1236,17 +1680,25 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     capability_misses.record_find(path,result.get('normalized'),result['found'])
                 except Exception:pass
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        coordinator=args[0] in capability_records.HTTP_WRITE_COMMANDS
+        identity_check,party_check,user_id=_records_http_context(coordinator,run_warnings)
         operators=configured_operators(root)
         runner=NativeRunner(run, project=path)
         def capability_effect():
-            result=capability_records.write(args,request.get('attachments',{}),actor,runner,path,operators,
-                                            verifiers=configured_verifiers(root))
+            try:
+                result=capability_records.write(args,request.get('attachments',{}),actor,runner,path,operators,
+                                                verifiers=configured_verifiers(root),
+                                                web_coordinator=coordinator,party_check=party_check,person=user_id,
+                                                web_service=by_service)
+            except RecordsRefusal as error:
+                return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             return guarded_write(root,request,journal_path(path),capability_effect,
-                               authority_config=authority_config,
-                               require_authority=require_authority,runner=runner)
+                                 authority_config=authority_config,
+                                 require_authority=require_authority,runner=runner,
+                                 identity_check=identity_check)
     if action=='proposal':
         # Contributed requirement proposals (.58 slices 1a and 1b, kittrial-5bb.68/.70).
         # get, list, mine and help are reads (no lock, not run_guarded); submit and
@@ -1423,6 +1875,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             elif command=='handoff':
                 from handoff import execute as handoff_execute
                 result=handoff_execute(path,actor,payload,runner,operator=True)
+            elif command=='followon':
+                # The confined coordinator's recorded hand-back (kittrial-5bb.343). The
+                # operator gate above has already run; this is the SAME library call the
+                # web action makes, so the two authority gates cannot drift apart. The
+                # library derives the contribution, integration evidence and native order
+                # under this lock and writes the native comment plus its host journal entry.
+                import followon
+                result=followon.apply(payload,actor,runner,path,operators=operators)
             elif command=='reference-apply':
                 import reference_records
                 if isinstance(payload,dict) and 'items' in payload:
@@ -1485,7 +1945,16 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(run, project=path)
+        def bounded(argv,max_bytes):
+            # kittrial-5bb.362: the field-history read stops reading bd's pipe at the cap.
+            completed,over=native.run_bounded(native.argv(root,path,actor,argv),environment(root),max_bytes)
+            if over:
+                import field_history
+                raise field_history.TooLarge('bd answered more than %d bytes' % max_bytes)
+            stdout,warnings=native.split(completed)
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(run, project=path, bounded=bounded)
         def briefing_effect():
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             return {'returncode':0,'stdout':briefing_execute(root,path,name,actor,action,args,request.get('attachments',{}),runner,
@@ -1493,13 +1962,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                                              verifiers=configured_verifiers(root),
                                                              independent_approval=rules['independent_approval'],
                                                              owners=owner_loader(path,'independent_approval')
-                                                             if rules['independent_approval'] else None),'stderr':''.join(run_warnings)}
+                                                             if rules['independent_approval'] else None,
+                                                             identity_names=assignee_display_names(root,path,authority_config)),'stderr':''.join(run_warnings)}
         with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
             return guarded_write(root,request,journal_path(path),briefing_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
-    if action in ('assignment-roster','task-assign'):
-        from http_authority import CAP_COORDINATE, read_state, server_time
+    if action in ('assignment-roster','task-assign','task-release'):
+        from http_authority import CAP_COORDINATE, CAP_TASKS, read_state, server_time
         from task_assignment import AssignmentError, eligible_roster, standing_allowed, validate_request, apply as assignment_apply
         from sessions import read_registry
         args=request.get('args', [])
@@ -1513,6 +1983,34 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         or type(page['offset']) is not int or page['offset']<0
                         or type(page['limit']) is not int or not 1<=page['limit']<=200):
                     raise AssignmentError(422,'Assignment roster requires a nonnegative offset and limit 1-200.')
+            elif action=='task-release':
+                # The holder releases its OWN claim (kittrial-5bb.301). The body carries
+                # the task, the reason, and (when held under a <agent>/<label> sub-label,
+                # kittrial-5bb.300) the row's current assignee as expected_assignee, verified
+                # by claim_limit.actor_holds against the authenticated caller so no caller
+                # can clear another actor's assignee. It is the same canonical assignment the
+                # owner's bulk release uses, so there is one way to clear an assignee. The
+                # canonical change check below refuses a task the caller does not hold, ANY
+                # delivered contribution (awaiting review, changes requested, approved or
+                # integrated), and the merge slot.
+                if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                    raise AssignmentError(422,'A claim release takes one closed JSON request.')
+                fields=record_json.loads(args[0])
+                if (not isinstance(fields,dict)
+                        or not set(fields).issubset({'task_id','reason','expected_assignee'})
+                        or not {'task_id','reason'}.issubset(fields)):
+                    raise AssignmentError(422,'A claim release takes one task id and one reason.')
+                from claim_limit import actor_holds
+                expected_assignee=fields.get('expected_assignee') if 'expected_assignee' in fields else actor
+                if not actor_holds(expected_assignee,actor):
+                    raise AssignmentError(409,'That task is not claimed by you; only its holder can release it')
+                payload={'schema_version':1,'operation_id':request.get('operation_id'),
+                         'task':fields['task_id'],'expected_assignee':expected_assignee,'assignee':None,
+                         'reason':fields['reason'],'allow_pending_review':False,
+                         'allow_held_slot':False}
+                validate_request(payload)
+                if not request.get('operation_id') or payload['operation_id']!=request['operation_id']:
+                    raise AssignmentError(422,'A claim release requires the same stable operation identity in its envelope and body.')
             else:
                 if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
                     raise AssignmentError(422,'Assignment takes one closed JSON request.')
@@ -1521,7 +2019,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 if not request.get('operation_id') or payload['operation_id']!=request['operation_id']:
                     raise AssignmentError(422,'Assignment requires the same stable operation identity in its envelope and body.')
             def assignment_authority():
-                if not verified_web_authority(request,authority_config,CAP_COORDINATE,name):
+                # A claim release needs only the ordinary task authority: it can only
+                # clear the caller's own assignee (kittrial-5bb.301). Every other
+                # assignee-only change still needs coordinate authority, so nobody gains
+                # the power to take another actor's task.
+                if action=='task-release':
+                    if not verified_web_authority(request,authority_config,CAP_TASKS,name):
+                        raise AssignmentError(403,'Verified task authority is required in this project.')
+                elif not verified_web_authority(request,authority_config,CAP_COORDINATE,name):
                     raise AssignmentError(403,'Verified coordinate authority is required in this project.')
                 for denied in (http_actor_denial(request,authority_config),
                                descriptor_actor_denial(request,authority_config,
@@ -1549,15 +2054,40 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             runner=NativeRunner(assignment_run,project=path)
             def effect():
                 actors={item['actor'] for item in roster()}
-                result=assignment_apply(payload,actor,runner,path,eligible=lambda target:target in actors,
-                                        operators=configured_operators(root),at=server_time())
+                # kittrial-5bb.333: the ONLY place a requested assignee is resolved is here,
+                # when the assignment is written. A value that is already an actor that has
+                # acted in the project is stored unchanged; a display name carried by exactly
+                # one identity is stored as its actor id; zero or several matches are refused
+                # before the native write. A stored row is never resolved again.
+                fields=dict(payload);resolution=None
+                if fields.get('assignee') is not None:
+                    import assignee_names
+                    try:
+                        picked=assignee_names.resolve(
+                            fields['assignee'],assignee_name_index(root,path,authority_config))
+                    except assignee_names.NameRefusal as error:
+                        raise AssignmentError(409,str(error)) from None
+                    except ValueError as error:
+                        raise AssignmentError(503,'The assignee cannot be checked against the '
+                                              'actors that have acted in this project: %s. '
+                                              'Nothing was assigned.' % error) from None
+                    if picked['resolved']:
+                        fields['assignee']=picked['actor'];resolution=picked['sentence']
+                result=assignment_apply(fields,actor,runner,path,eligible=lambda target:target in actors,
+                                        operators=configured_operators(root),at=server_time(),
+                                        refuse_delivered=(action=='task-release'))
+                if resolution:
+                    result=dict(result,requested_assignee=payload['assignee'],resolution=resolution)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(warnings)}
-            with (path/'.coordination.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_SH if action=='assignment-roster' else fcntl.LOCK_EX)
+            with held_coordination_lock(path,shared=coordination_lock_shared(request,action,args)):
                 if action=='assignment-roster':
                     if authority_config is None:raise AssignmentError(403,'Verified coordinate authority is required in this project.')
-                    with Path(authority_config.lock).open('a') as authority_lock:
-                        fcntl.flock(authority_lock,fcntl.LOCK_SH)
+                    # SHARED and bounded: two roster reads can hold it at once and a
+                    # writer is still excluded, with the same 60 s limit as the
+                    # exclusive wait (kittrial-5bb.291 item 5). The old flock(LOCK_SH)
+                    # was shared but waited forever.
+                    from http_authority import file_lock
+                    with file_lock(authority_config.lock, shared=True):
                         assignment_authority();actors=roster();offset=page['offset'];limit=page['limit']
                         result={'schema_version':1,'items':actors[offset:offset+limit],'total':len(actors),
                                 'more':offset+limit<len(actors),'offset':offset,
@@ -1586,7 +2116,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(lifecycle_run,project=path)
+        # The web lifecycle write compares a fact against the task's LIVE bounded
+        # rows rather than a full export (kittrial-5bb.289 item 2).
+        runner=NativeRunner(lifecycle_run,project=path,bounded_task_reads=True)
         denied_status=[]
         try:
             if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
@@ -1683,6 +2215,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         or (operation in ('create','force-release') and descriptor.get('via')!='session')):
                     denied_status.append(403)
                     raise SlotError(403,'Verified web authority required for this merge-slot operation in this project')
+            def hold_slot_operators(root, warnings):
+                # kittrial-5bb.297 review item (c): the web acquire reads the operator
+                # allowlist ALWAYS now, and a malformed value keeps the old tolerance
+                # (nobody, with a warning) instead of refusing an acquire that
+                # answered 200 before the fix.
+                try:
+                    return configured_operators(root)
+                except ConfigurationUnreadable as error:
+                    warnings.append('deployment operators unreadable, so operator voids are not '
+                                    'applied: '+str(error)[:160])
+                    return None
             def slot_identity():
                 slot_authority()
                 if operation=='acquire':
@@ -1691,15 +2234,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     rows=read_event_rows(runner)
                     issue=next((row for row in rows if row.get('id')==payload['task']),None)
                     try:
+                        # kittrial-5bb.297 review item 'operators-on-every-surface':
+                        # the configured operators ALWAYS, not only when
+                        # independent_approval is on - an operator void that repairs
+                        # the chain must be seen here exactly as the canonical
+                        # readers see it, or the acquire stays refused while the
+                        # coordinate route and the release accept.
                         require_unheld_merge_task(issue,payload['task'],
-                            configured_operators(root) if rules['independent_approval'] else None,path)
+                                                  hold_slot_operators(root,run_warnings),path)
                     except CoordinatorRuleRefusal:
                         denied_status.append(409)
                         raise
             rules=configured_coordinator_rules(root,warnings=run_warnings)
             def slot_effect():
                 result=slot_apply(payload,actor,runner,path,request.get('operation_id'),
-                                  operators=(configured_operators(root) if rules['independent_approval'] else None),
+                                  operators=hold_slot_operators(root,run_warnings),
                                   coordinator_writes=rules['coordinator_writes'],
                                   independent_approval=rules['independent_approval'],
                                   owners=owner_loader(path,'independent_approval'),
@@ -1724,6 +2273,43 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     'merge_slot_status':409,'refused':'coordinator-rule'}
         except SlotError as error:
             return {'returncode':2,'stdout':'','stderr':str(error)+'\n','merge_slot_status':error.status}
+    if action=='assignee-followon':
+        # The web route's recorded hand-back (kittrial-5bb.343). It runs through the same
+        # live-authority boundary every canonical web write uses, and then calls the SAME
+        # library function as `coordinator followon`, so the two gates cannot drift apart.
+        import followon
+        args=request.get('args',[])
+        run_warnings=[]
+        def followon_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(followon_run, project=path)
+        if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+            raise ValueError('Expected one hand-back JSON payload. Nothing was written.')
+        try:
+            body=record_json.loads(args[0])
+        except ValueError:
+            raise ValueError('The hand-back payload is not valid JSON; supply one JSON object. '
+                             'Nothing was written.') from None
+        if not isinstance(body,dict):
+            raise ValueError('The hand-back payload must be a JSON object. Nothing was written.')
+        capability=required_capability(request)
+        if capability is None:
+            raise ValueError('This hand-back operation has no endpoint capability binding. '
+                             'Nothing was written.')
+        def followon_authority():
+            if not verified_web_authority(request,authority_config,capability,name):
+                raise ValueError('Verified web authority required for this hand-back in this '
+                                 'project. Nothing was written.')
+        def followon_effect():
+            result=followon.apply(body,actor,runner,path,operators=configured_operators(root))
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                    'stderr':warning_text(run_warnings)}
+        with held_coordination_lock(path):
+            return guarded_write(root,request,journal_path(path),followon_effect,
+                                 authority_config=authority_config,require_authority=True,
+                                 runner=runner,identity_check=followon_authority)
     if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
@@ -1733,7 +2319,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings:run_warnings.append(warnings)
             return stdout
-        runner=NativeRunner(run, project=path)
+        # The canonical lifecycle write compares a fact against the task's LIVE
+        # bounded rows rather than a full export (kittrial-5bb.289 item 2).
+        runner=NativeRunner(run, project=path, bounded_task_reads=True)
         # Slices 6 and 7 (kittrial-5bb.197): the three rules are read once, from the
         # installation's own file, and an installation that configures nothing reads
         # them all as OFF. A malformed value reads as OFF with a warning, as
@@ -1746,8 +2334,18 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # malformed `operators` value must not stop `coordinate`, and a damaged
         # registry must not stop the reads or a listed operator's operation
         # (kittrial-5bb.197 review request 01a12894, item 4).
-        coordinate_operators=(configured_operators(root)
-                              if (rules['coordinator_writes'] or rules['independent_approval']) else None)
+        # kittrial-5bb.297 review item 'operators-everywhere-really' (a): the operator
+        # allowlist is passed ALWAYS for the coordinate write's hold check (one
+        # operator void that repairs a chain is seen here exactly as the canonical
+        # readers see it), not only when a rule is on; the rules still gate what they
+        # gated. (c) A malformed value keeps the old tolerance: it reads as nobody
+        # WITH a warning, exactly as a malformed rules value does, so a broken
+        # setting never refuses a coordinate write that answered 200 before.
+        coordinate_operators=None
+        try:coordinate_operators=configured_operators(root)
+        except ConfigurationUnreadable as error:
+            run_warnings.append('deployment operators unreadable, so operator voids are not applied: '
+                               +str(error)[:160])
         def lifecycle_effect():
             if action=='lifecycle':result=apply_native(payload,actor,runner,
                                                        operators=configured_operators(root),journal=path,
@@ -1765,11 +2363,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            return guarded_write(root,request,journal_path(path),lifecycle_effect,
-                               authority_config=authority_config,
-                               require_authority=require_authority,runner=runner)
+        # kittrial-5bb.297 review item 'rc2-scope-and-test-order': ONLY the coordinate
+        # merge-acquire refusal answers rc 2 (the answer shape the web merge-slot
+        # route returns). Every other CoordinatorRuleRefusal - a lifecycle write's
+        # rule refusal included - keeps raising exactly as before: no contract
+        # change beyond the one the item asked for.
+        from review_workflow import MergeHoldRefusal
+        try:
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                return guarded_write(root,request,journal_path(path),lifecycle_effect,
+                                   authority_config=authority_config,
+                                   require_authority=require_authority,runner=runner)
+        except MergeHoldRefusal as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','refused':'coordinator-rule'}
     if action == 'feedback':
         from feedback import execute as feedback_execute
         args=request.get('args',[])
@@ -1865,6 +2472,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 final.extend([item['flag'],str(dest)])
             else: final.append(a)
         with held_coordination_lock(path,shared=coordination_lock_shared(request,'bd',args)):
+            # kittrial-5bb.333: a NEW assignment's display name is resolved to the actor id
+            # before bd sees it, and only here. A value that is already an actor that has
+            # acted in this project is left exactly as it is (P5: an operator's
+            # `--assignee w1` must keep w1, not a session that later registers the name w1).
+            final,assignment_note=_resolved_bd_assignee(root,path,actor,authority_config,final)
+            # kittrial-5bb.352 review item B1: under 'assigned' only a coordinator hands
+            # work out, so an assignee spelling on create/update is refused unless the
+            # caller is a listed operator or holds live coordinate authority here. This
+            # is checked BEFORE the guards below (which may read the rows) and uses the
+            # resolved argv, so every spelling the resolver knows is covered.
+            _guard_claiming_on_assignment(root,path,actor,authority_config,request,final)
             # First the rows the write names (an existing id given to create, a write that names
             # none, the merge slot); then the guards that read what those rows carry.
             from review_workflow import listed_operator_actor, operator_owners
@@ -1929,14 +2547,28 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         rows=None
                     if isinstance(rows,list):
                         from work import drop_internal_from_ready
-                        stdout=json.dumps(drop_internal_from_ready(rows))+'\n'
+                        rows=drop_internal_from_ready(rows)
+                        # The per-project claiming setting (kittrial-5bb.352): under
+                        # 'assigned' no unassigned task is offered as claimable here.
+                        from claiming import mode as claiming_mode
+                        if claiming_mode(path)=='assigned':
+                            rows=[]
+                        stdout=json.dumps(rows)+'\n'
                     elif isinstance(rows,dict) and isinstance(rows.get('items'),list):
                         from work import drop_internal_from_ready
                         rows=dict(rows);rows['items']=drop_internal_from_ready(rows['items'])
+                        from claiming import mode as claiming_mode
+                        if claiming_mode(path)=='assigned':
+                            rows['items']=[]
                         stdout=json.dumps(rows)+'\n'
                 return {'returncode':p.returncode,'stdout':stdout,'stderr':p.stderr}
             runner=NativeRunner(bd_dispatch, project=path)
-            def bd_effect():return runner(final)
+            def bd_effect():
+                answer=runner(final)
+                if assignment_note and isinstance(answer,dict):
+                    answer=dict(answer)
+                    answer['stderr']=(answer.get('stderr') or '')+assignment_note+'\n'
+                return answer
             return guarded_write(root,request,journal_path(path),bd_effect,
                                authority_config=authority_config,
                                require_authority=require_authority,runner=runner)
@@ -1956,6 +2588,7 @@ CONTRIBUTOR_COMMANDS = (
     ('history TASK', "the task's comments and review records, newest first"),
     ('checkpoint TASK --file FILE', 'record where you are on a task, for the next run'),
     ('work', 'the tasks whose move is yours, and the ones you may claim'),
+    ('wait', 'block until something is your move, then print it and its fingerprint'),
     ('ready', 'the tasks nobody holds that you may claim'),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
     ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
@@ -2004,7 +2637,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
 CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','work',
-                  'feedback','requirement','requirements','ref','capability','proposal','guidance',
+                  'wait','feedback','requirement','requirements','ref','capability','proposal','guidance',
                   'coordinator')
 
 
@@ -2048,13 +2681,35 @@ def contributor_help_text(unknown=None):
     return '\n'.join(lines)
 
 
+def client_out_of_date_sentence(name):
+    """One plain sentence for a command the CLIENT runs, sent to the endpoint by mistake.
+
+    An older ``client.py`` (before CLIENT_ACTIONS) passes ``guidance`` or ``feedback``
+    through as an action; the endpoint refused it with the contributor command list,
+    which lists those same commands -- a contradiction that sent one lane looking for
+    the cause for hours (kittrial-5bb.299). The answer now says the command is the
+    client's own, that this client is older than the installation's kit, and how to
+    update it. The endpoint still refuses; it never runs a client-side action.
+    """
+    from version import KIT_VERSION
+    return ('`%s` is run by the client itself, not by the server. This client is older than '
+            'the installation\'s kit (version %s). Update it by copying client.py from the kit; '
+            'it carries its own wait logic, so wait needs no other kit file beside it (the '
+            'capability commands still need capabilities.py).'
+            % (name, KIT_VERSION))
+
+
 def outside_contributor_interface(name):
     """Refuse ``name`` with the commands a contributor may run (kittrial-5bb.283).
 
     One place so the answer cannot drift from the table above, and so the refusal is what a test
     can call without a runtime: the caller is still refused - the endpoint refuses everything
-    outside the contributor interface - it is only told what it may run instead.
+    outside the contributor interface - it is only told what it may run instead. A name the
+    CURRENT client dispatches locally (CLIENT_ACTIONS) is answered with one plain out-of-date
+    sentence instead of the refusal-plus-list contradiction (kittrial-5bb.299).
     """
+    if name in CLIENT_ACTIONS:
+        raise ValueError(client_out_of_date_sentence(name))
     raise ValueError(contributor_help_text(None if name in ('help', '-h', '--help') else name))
 
 

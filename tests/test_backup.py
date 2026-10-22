@@ -889,3 +889,162 @@ class RequirementJournalBackupTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class HttpStateBackupTests(unittest.TestCase):
+    """kittrial-5bb.331: the web-service state joins every backup, 0600, consistent."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'backups').mkdir()
+
+    def state(self, with_records=True):
+        live = self.root / 'http-state.json'
+        live.write_text(json.dumps({'schema_version': 1, 'users': [{'id': 'usr_x',
+                                    'password': 'hash-of-x'}]}), encoding='utf-8')
+        if with_records:
+            import sqlite3
+            records = Path(str(live) + '.records.sqlite3')
+            connection = sqlite3.connect(str(records))
+            connection.execute('CREATE TABLE sessions (token TEXT, user TEXT)')
+            connection.execute("INSERT INTO sessions VALUES ('tok-1', 'usr_x')")
+            connection.commit()
+            connection.close()
+        return live
+
+    def entry(self, **more):
+        return dict({'status': 'complete', 'path': '/x', 'files': [{'name': 'a'}]}, **more)
+
+    def test_the_path_resolves_flag_deployment_default_then_none(self):
+        self.assertEqual(admin.resolve_http_state_path(self.root, '/flag/state.json'),
+                         (Path('/flag/state.json'), 'flag'))
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'http_state': str(self.root / 'configured.json')}),
+            encoding='utf-8')
+        self.assertEqual(admin.resolve_http_state_path(self.root),
+                         (Path(str(self.root / 'configured.json')), 'deployment'))
+        (self.root / 'deployment.private.json').unlink()
+        self.state(with_records=False)
+        self.assertEqual(admin.resolve_http_state_path(self.root),
+                         (self.root / 'http-state.json', 'default'))
+        other = Path(self.temp.name)  # same root; remove the file to answer none
+        (self.root / 'http-state.json').unlink()
+        self.assertEqual(admin.resolve_http_state_path(self.root), (None, None))
+
+    def test_a_present_state_is_copied_0600_and_the_records_query(self):
+        live = self.state()
+        entry = admin.backup_http_state(self.root)
+        self.assertEqual(entry['status'], 'complete')
+        self.assertEqual(entry['path'], str(live))
+        copied_json = self.root / 'backups' / admin.HTTP_STATE_JSON
+        copied_records = self.root / 'backups' / admin.HTTP_STATE_RECORDS
+        self.assertEqual(copied_json.read_text(encoding='utf-8'), live.read_text(encoding='utf-8'))
+        # kittrial-5bb.331 review item 'posix-mode-asserts': Windows has no POSIX
+        # modes (0600 reads as 0666 there); the mode assertions run on POSIX only,
+        # everything else in this test runs everywhere.
+        if os.name != 'nt':
+            self.assertEqual(oct(copied_json.stat().st_mode & 0o777), '0o600')
+            self.assertEqual(oct(copied_records.stat().st_mode & 0o777), '0o600')
+        # The reader is closed (review item 'windows-sqlite-handle'): an open handle
+        # locks the file on Windows and fails the fixture clean-up.
+        import sqlite3
+        reader = sqlite3.connect(str(copied_records))
+        try:
+            rows = reader.execute('SELECT token, user FROM sessions').fetchall()
+        finally:
+            reader.close()
+        self.assertEqual(rows, [('tok-1', 'usr_x')])
+
+    def test_an_absent_state_records_absent(self):
+        entry = admin.backup_http_state(self.root)
+        self.assertEqual(entry['status'], 'absent')
+
+    def test_a_running_service_still_gets_a_committed_snapshot(self):
+        import sqlite3
+        live = self.state()
+        records = Path(str(live) + '.records.sqlite3')
+        writer = sqlite3.connect(str(records))     # the "running service" connection
+        try:
+            writer.execute("INSERT INTO sessions VALUES ('tok-2', 'usr_y')")
+            writer.commit()
+            entry = admin.backup_http_state(self.root)   # copied while the writer is open
+        finally:
+            writer.close()
+        self.assertEqual(entry['status'], 'complete')
+        # Closed explicitly (review item 'windows-sqlite-handle'): an open handle
+        # locks the copy on Windows and fails the fixture clean-up with WinError 32.
+        copied = sqlite3.connect(str(self.root / 'backups' / admin.HTTP_STATE_RECORDS))
+        try:
+            tokens = sorted(row[0] for row in copied.execute('SELECT token FROM sessions'))
+            self.assertEqual(tokens, ['tok-1', 'tok-2'])
+            self.assertTrue(copied.execute('PRAGMA integrity_check').fetchone()[0])
+        finally:
+            copied.close()
+
+    def test_a_degraded_copy_makes_the_whole_run_incomplete(self):
+        degraded = {'status': 'degraded', 'reason': 'no consistent SQLite copy'}
+        record = admin.backup_status_record(
+            [{'name': 'example', 'status': 'complete', 'completed_at': '2026-10-17T00:00:00Z'}],
+            'all', '2026-10-17T00:00:00Z', http_state=degraded)
+        self.assertEqual(record['status'], 'incomplete')
+        admin.validate_backup_status(record)          # the entry validates
+        complete = admin.backup_status_record(
+            [{'name': 'example', 'status': 'complete', 'completed_at': '2026-10-17T00:00:00Z'}],
+            'all', '2026-10-17T00:00:00Z',
+            http_state={'status': 'complete', 'path': '/x',
+                        'files': [{'name': admin.HTTP_STATE_JSON, 'bytes': 10}]})
+        self.assertEqual(complete['status'], 'complete')
+        admin.validate_backup_status(complete)
+        absent = admin.backup_status_record(
+            [{'name': 'example', 'status': 'complete', 'completed_at': '2026-10-17T00:00:00Z'}],
+            'all', '2026-10-17T00:00:00Z', http_state={'status': 'absent'})
+        self.assertEqual(absent['status'], 'complete')
+        admin.validate_backup_status(absent)
+
+    def test_restore_returns_the_pair_0600_and_names_the_invalidation(self):
+        live = self.state()
+        admin.backup_http_state(self.root)
+        live.unlink()
+        Path(str(live) + '.records.sqlite3').unlink()
+        sentence = admin.restore_http_state(self.root)
+        self.assertIn('INVALIDATED', sentence)
+        self.assertEqual(live.read_text(encoding='utf-8'),
+                         (self.root / 'backups' / admin.HTTP_STATE_JSON).read_text(encoding='utf-8'))
+        # POSIX-only mode assertions (review item 'posix-mode-asserts').
+        if os.name != 'nt':
+            self.assertEqual(oct(live.stat().st_mode & 0o777), '0o600')
+            self.assertEqual(oct(Path(str(live) + '.records.sqlite3').stat().st_mode & 0o777), '0o600')
+
+    def test_restore_refuses_without_a_pair_and_targets_the_default(self):
+        with self.assertRaisesRegex(ValueError, 'no HTTP state pair'):
+            admin.restore_http_state(self.root)
+        # Back up the default-path state FIRST (no deployment config yet) ...
+        self.state()                                 # the live files exist at the default
+        admin.backup_http_state(self.root)            # the pair lands in backups/
+        (self.root / 'http-state.json').unlink()      # the disaster: the live file is gone
+        Path(str(self.root / 'http-state.json') + '.records.sqlite3').unlink()
+        # ... then configure a different live path: the restore targets IT.
+        (self.root / 'deployment.private.json').write_text(
+            json.dumps({'password': 'x', 'http_state': str(self.root / 'configured.json')}),
+            encoding='utf-8')
+        sentence = admin.restore_http_state(self.root)
+        self.assertIn('INVALIDATED', sentence)
+        self.assertTrue((self.root / 'configured.json').is_file())
+        self.assertTrue(Path(str(self.root / 'configured.json') + '.records.sqlite3').is_file())
+
+    def test_restore_new_touches_the_state_only_through_the_flag(self):
+        # Source pin: the dispatch calls restore_http_state only under the flag, and
+        # the no-flag path prints the one-line refusal that names it.
+        source = (Path(admin.__file__).read_text(encoding='utf-8'))
+        start = source.index("elif args.command=='restore-new'")
+        body = source[start:]
+        # the block runs to the next elif at the same indent, or to the end of main
+        nxt = body.find('\n    elif ')
+        if nxt != -1:
+            body = body[:nxt]
+        self.assertIn("if getattr(args,'restore_http_state',False):", body)
+        self.assertIn('print(restore_http_state(root))', body)
+        self.assertIn('was left ', body)
+        self.assertEqual(body.count('restore_http_state(root)'), 1)

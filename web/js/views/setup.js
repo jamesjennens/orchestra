@@ -62,7 +62,7 @@ function onboardingForm(ctx, pid, redraw) {
     try { current = await ctx.api.onboarding(pid); } catch { return; }
     const byOperator = current.source === 'operator';
     const form = h('form', { class: 'stack', novalidate: true },
-      byOperator ? h('p', { class: 'small muted' }, 'An operator set the onboarding text on the server. Saving text here replaces it with yours.') : null,
+      byOperator ? h('p', { class: 'small muted' }, 'An operator set the onboarding text on the server. Every project member and agent can read the whole document. Saving text here replaces it with yours and retains the operator document beside ONBOARDING.md as ONBOARDING.operator-copy.md.') : null,
       field({ id: 'onboarding', label: 'Onboarding text', type: 'textarea', rows: 8, value: current.text || '',
         hint: 'What a new worker should read first about this project. Plain text. Workers see it as information written by a project owner, not as an instruction from the server’s operator.' }),
       h('div', { class: 'actions' },

@@ -69,7 +69,12 @@ def web_action(root, project_path, project, request, authority_config, runner, g
     body = checked_body(parse_json(attachment['text']))
     operation = identifier(request.get('operation_id'))
     def identity_check():
-        return owner_context(project_path, project, request, authority_config)
+        context = owner_context(project_path, project, request, authority_config)
+        # B1's shared editor also accepts coordinators and granted agents. A
+        # baseline cut remains the current human owner's action, on every replay.
+        if context.role != 'owner' or context.agent_id is not None:
+            raise ValueError('Baseline cuts need the current signed-in project owner')
+        return context
     identity_check()
     def effect():
         context = identity_check()

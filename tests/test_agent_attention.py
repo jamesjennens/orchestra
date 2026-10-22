@@ -17,6 +17,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
+import claim_limit
 import http_service
 import test_http_agents
 import test_http_proposals
@@ -44,8 +45,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
                                  token=self.admin)
             self.assertIn(added.status, (200, 201), added.data)
             self.people[name] = self.login(name, name + '-password-1')[0]
+        # These tests drive an agent holding several tasks at once; the per-agent claim
+        # limit (kittrial-5bb.276) is exercised in tests/test_claim_limit.py, so this
+        # fixture sets one wide enough not to change what is under test here.
         made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/home/alex/kestrel',
-                                                   'projects': [self.project]}, token=self.people['alex'])
+                                                   'projects': [self.project], 'claim_limit': claim_limit.LIMIT_MAX},
+                            token=self.people['alex'])
         self.assertEqual(201, made.status, made.data)
         self.agent_id, self.secret = made.data['agent']['id'], made.data['credential']['secret']
         self.tasks = [self.create_task(self.people['blair'], self.project, 'task %d' % index).data['id']
@@ -177,15 +182,41 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(sorted(kinds(data)[-2:]), [('awaiting-integration', third), ('awaiting-review', first)])
         self.assertEqual([action['priority'] for action in data['next_actions']], [2, 4, 5, 5])
 
-    def test_only_changes_requested_carries_the_move_and_from_the_one_queue_helper(self):
+    def test_an_assigned_untouched_task_is_offered_as_the_agents_own_move(self):
+        """kittrial-5bb.288: a task assigned to the agent that it never touched is offered.
+
+        It is kind ``in-progress`` (the agent's own undelivered work), it carries the
+        same move reading as the canonical ``work --owner ACTOR`` row in the same words,
+        and the "cannot be told" sentence is gone for that case.
+        """
+        task = self.tasks[0]
+        self.claim(task)                          # the claim sets the agent's actor as assignee
+        actor = self.next()['agent']['actor']
+        data = self.next()
+        action = next(item for item in data['next_actions'] if item['task'] == task)
+        self.assertEqual(action['kind'], 'in-progress')
+        self.assertEqual(action['whose_move'], 'you')
+        self.assertNotIn(work.UNKNOWN_MOVE_TEXT, action['next'])
+        self.assertIn('no contribution has been delivered yet', action['next'])
+        # The words are the canonical work row's, with only the way back changed to the
+        # brief route a web agent can actually open.
+        row = next(r for r in work.queue(self.canonical_rows(), actor, ['--mine'])['items']
+                   if r['task'] == task)
+        route = '/v1/projects/%s/tasks/%s/brief' % (self.project, task)
+        self.assertEqual(action['whose_move'], row['whose_move'])
+        self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % task), row['next'])
+
+    def test_the_move_rides_the_agents_own_actions_and_comes_from_the_one_queue_helper(self):
         """Item 2b: the two answers cannot disagree, so the fields are restricted.
 
-        The task asked for `whose_move`/`next` only where the kind is changes-requested. Every
-        other kind has a mover who is not the agent (an operator reconciles a review error or an
-        unreadable checkpoint; a reviewer or the coordinator holds awaiting work), so it carries
-        neither field: kind `checkpoint-error` can no longer pair `who: operator` with
+        The move rides the kinds whose mover IS the agent: `changes-requested` (a
+        revision is owed) and, since kittrial-5bb.288, `in-progress` (assigned or
+        claimed and not delivered yet). Every other kind has a mover who is not the
+        agent (an operator reconciles a review error or an unreadable checkpoint; a
+        reviewer or the coordinator holds awaiting work), so it carries neither field:
+        kind `checkpoint-error` can no longer pair `who: operator` with
         `whose_move: you`, and kind `blocked` no longer contradicts the queue's own sentence.
-        Where the kind IS changes-requested, the words are the canonical work ROW's, compared
+        Where a kind DOES carry the move, the words are the canonical work ROW's, compared
         against that row rather than against a second call to the helper (kittrial-5bb.253 item 1).
         """
         first, second, third, spare = self.tasks
@@ -202,7 +233,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertIn('review-error', kinds_seen)
         self.assertNotIn('changes-requested', kinds_seen)
         for action in data['next_actions']:
-            if action['kind'] == 'changes-requested':
+            if action['kind'] in ('changes-requested', 'in-progress'):
                 self.assertIn('whose_move', action)
             else:
                 with self.subTest(kind=action['kind']):
@@ -223,7 +254,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(action['whose_move'], row['whose_move'])
         self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % first), row['next'])
         for other in data['next_actions']:
-            if other['kind'] != 'changes-requested':
+            if other['kind'] not in ('changes-requested', 'in-progress'):
                 with self.subTest(kind=other['kind']):
                     self.assertNotIn('whose_move', other)
                     self.assertNotIn('next', other)
@@ -431,6 +462,34 @@ class EndpointAttentionTests(fixes.EndpointCase):
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
         self.assertTrue(action['newer_activity'])
 
+    def test_the_held_action_and_the_wait_row_carry_the_marker_and_its_counts(self):
+        """kittrial-5bb.351: the same newer-activity read rides next and wait."""
+        task=self.tasks[0];self.claim(task)
+        self.checkpoint(task,[])
+        self.native('blair')(['comments','add',task,'First direction after the checkpoint.'])
+        action=next(x for x in self.next()['next_actions'] if x['task']==task)
+        self.assertEqual(action['kind'],'in-progress')
+        self.assertTrue(action['newer_activity'])
+        for name in ('newer_activity_marker','newer_activity_by_others','newer_activity_own',
+                     'newer_activity_coverage','unresolved_directions'):
+            self.assertIn(name,action)
+        self.assertEqual(action['newer_activity_by_others'],1)
+        self.assertEqual(action['newer_activity_coverage'],'unknown')
+        # This installation has provenance writes off, so the checkpoint cannot make a
+        # precise per-entry claim: the marker is null and the boolean is the fallback.
+        self.assertIsNone(action['newer_activity_marker'])
+        wait=self.request('GET','/v1/agents/me/wait',token=self.secret)
+        self.assertEqual(200,wait.status,wait.data)
+        row=next(x for x in wait.data['items'] if x['task']==task)
+        self.assertIsNone(row['newer_activity_marker'])
+        self.assertEqual(row['newer_activity_by_others'],1)
+        self.assertEqual(row['newer_activity_own'],0)
+        self.assertEqual(row['newer_activity_coverage'],'unknown')
+        # The stub counts the one other-party comment as a direction (its work path
+        # defaults provenance writes on); the exact count is not what this pins.
+        self.assertIsInstance(row['unresolved_directions'],int)
+        self.assertGreaterEqual(row['unresolved_directions'],0)
+
     @patch.dict(os.environ, {'PYTHONUTF8': '1'})
     def test_in_progress_activity_and_web_summary_are_read_only(self):
         task = self.tasks[0]; self.claim(task)
@@ -567,7 +626,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
             # An older/omitted field reads unknown, which `review_move` treats as not
             # redelivered (kittrial-5bb.253 item 1).
             'redelivered': None,
-            'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True})
+            'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True,
+            # This page is an older endpoint's canonical row: it omits the stable
+            # marker and its counts, which honestly read unknown (kittrial-5bb.351).
+            'newer_activity_marker': None, 'newer_activity_by_others': None,
+            'newer_activity_own': None, 'newer_activity_coverage': None,
+            'unresolved_directions': None})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
                                  ['--owner', 'me', '--limit', '100', '--offset', '100', '--json']])
         # Unfiltered (the owners' list): every HELD task, never an unassigned one, from the
@@ -602,7 +666,8 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.create_account(admin, 'alex', 'alex-password-1')
         self.alex = self.login('alex', 'alex-password-1')[0]
         self.project = self.create_project(self.alex, 'Alpha')
-        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.project])
+        self.agent_id, self.secret, _ = self.agent_secret(self.alex, projects=[self.project],
+                                                          claim_limit=claim_limit.LIMIT_MAX)
 
     def task(self, title):
         created = self.request('POST', '/v1/projects/%s/tasks' % self.project, {'title': title}, token=self.alex)
@@ -649,9 +714,11 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         # count the move sentence needs, carried by both backends alike. `redelivered` is
         # additive too (kittrial-5bb.253 item 1).
         self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
+                                       'newer_activity_by_others', 'newer_activity_coverage',
+                                       'newer_activity_marker', 'newer_activity_own',
                                        'open_items', 'pending_change_requests', 'pending_review_items',
                                        'redelivered',
-                                       'review_state', 'status', 'title'])
+                                       'review_state', 'status', 'title', 'unresolved_directions'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
     def test_actor_filter_excludes_somebody_elses_work(self):
@@ -741,6 +808,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         self.request('POST','/v1/projects/%s/tasks/%s/claim'%(self.project,task),token=self.secret)
         row=dict(id=task,title='held',status='in_progress',assignee=actor,
                  contribution_id='delivery',open_items=0,pending_change_requests=[])
+        texts = {'integrated': 'close the task or record what remains'}  # kittrial-5bb.336
         for state,who in [('legacy-review-ready','owner'),('integrated','owner'),
                           ('withdrawn','assignee'),('superseded','assignee'),
                           ('future-state','owner'),('error','operator')]:
@@ -749,6 +817,8 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
                 action=next(x for x in self.next()['next_actions'] if x['task']==task)
                 self.assertEqual((action['review_state'],action['who']),(state,who))
                 self.assertIn(state,action['reason'])
+                if state in texts:
+                    self.assertIn(texts[state], action['reason'])
 
     def test_independent_counts_and_work_before_waiting(self):
         actor=self.next()['agent']['actor']
@@ -793,8 +863,10 @@ class RefusedClaimTests(test_http_agents.AgentHarness):
                          {'role': 'contributor'}, token=admin)
         self.alex_token = self.login('alex', 'alex-password-1')[0]
         self.blair_token = self.login('blair', 'blair-password-1')[0]
-        self.A = self.agent_secret(self.alex_token, name='Kestrel', projects=[self.project])[1]
-        self.B = self.agent_secret(self.blair_token, name='Merlin', projects=[self.project])[1]
+        self.A = self.agent_secret(self.alex_token, name='Kestrel', projects=[self.project],
+                                   claim_limit=claim_limit.LIMIT_MAX)[1]
+        self.B = self.agent_secret(self.blair_token, name='Merlin', projects=[self.project],
+                                   claim_limit=claim_limit.LIMIT_MAX)[1]
         self.tasks = '/v1/projects/%s/tasks' % self.project
         self.reads = []
         original = self.backend.review_queue

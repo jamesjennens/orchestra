@@ -567,9 +567,9 @@ class NothingGrantedTests(Grants):
         self.assertEqual(caps, {'read', 'tasks.write', 'checkpoints.write', 'reviews.write', 'feedback.write'})
         self.assertEqual(200, self.grant().status)
         self.assertEqual(http_authority.credential_capabilities(state, credential, issuer, self.project) - caps,
-                         {'reviews.approve', 'coordinate'})
+                         {'records', 'reviews.approve', 'coordinate'})
         self.assertEqual(http_authority.credential_capabilities(state, credential, dict(issuer, superuser=True), self.project) - caps,
-                         {'reviews.approve', 'coordinate'})
+                         {'records', 'reviews.approve', 'coordinate'})
 
 
 class ProposalTests(test_http_proposals.ProposalHarness):
@@ -872,14 +872,24 @@ class PageTests(Grants):
         self.assertEqual(0, done.returncode, done.stderr[-3000:])
         seen = json.loads(done.stdout.strip().splitlines()[-1])
         self.assertEqual(seen['roles'], ['Viewer', 'Contributor', 'Coordinator', 'Owner'])
+        # kittrial-5bb.352: the claiming setting has its own panel and control; its two
+        # choices are not part of the members list's role options.
+        self.assertEqual(seen['claiming'], {
+            'options': ['Workers may claim open tasks', 'Only coordinators assign work'],
+            'select': True})
+        # kittrial-5bb.352 review item S2: the control follows the server's answer, so a
+        # superuser-shaped role without can_coordinate does NOT get it, and a contributor
+        # role WITH can_coordinate does. A page that went back to canApprove(project)
+        # would answer True for the owner case and fail here.
+        self.assertEqual(seen['claimingCan'], {'serverYes': True, 'serverNo': False})
         self.assertIn('Agents in this project 2', seen['head'])
         self.assertEqual(sorted((row['coordinator'], row['buttons']) for row in seen['before']),
-                         [('none', ['Make coordinator']), ('none', ['Make coordinator'])])
+                         [('none', ['Extend existing credential', 'Make coordinator']), ('none', ['Extend existing credential', 'Make coordinator'])])
         self.assertEqual((seen['granted']['agent'], seen['granted']['coordinator'], seen['granted']['buttons']),
-                         (self.agent_id, 'true', ['Remove grant']))
+                         (self.agent_id, 'true', ['Extend existing credential', 'Remove grant']))
         self.assertIn('Coordinates', seen['granted']['text'])
         self.assertEqual((seen['refused']['agent'], seen['refused']['coordinator']), (worker_id, 'none'))
-        self.assertEqual((seen['removed']['coordinator'], seen['removed']['buttons']), ('none', ['Make coordinator']))
+        self.assertEqual((seen['removed']['coordinator'], seen['removed']['buttons']), ('none', ['Extend existing credential', 'Make coordinator']))
         self.assertIs(seen['coordinatorSeesPanel'], False)
         # kittrial-5bb.198: who coordinates, read only, for the owner and for a coordinator who is not one.
         before, granted, other = seen['coordinationBefore'], seen['coordinationGranted'], seen['coordinationOfCoordinator']

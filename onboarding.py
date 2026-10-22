@@ -16,7 +16,9 @@ DOCUMENTS = {
     'briefings': 'docs/BRIEFINGS.md',
     'cli-contract': 'docs/CLI_CONTRACT.md',
     'operations': 'docs/OPERATIONAL_WORKFLOW.md',
-    'checkpoint-template': 'templates/CHECKPOINT.json',
+    # The served template is the page that states the limits and the lane_state shape;
+    # the bare payload it embeds stays in templates/CHECKPOINT.json (kittrial-5bb.341).
+    'checkpoint-template': 'templates/CHECKPOINT.md',
     'task-template': 'templates/TASK.md',
     'report-template': 'templates/REPORT.md',
     'decision-template': 'templates/DECISION.md',
@@ -71,13 +73,22 @@ def write_project(path, text):
     finally:
         if os.path.exists(temporary):os.unlink(temporary)
 
-#: The first line of onboarding text that a project OWNER set from the web interface
-#: (kittrial-5bb.118 part 2). The kit writes it; the owner's text follows. It is part of
-#: the stored document on purpose: it travels with a backup and a restore, and a kit that
-#: predates it shows it too, so wherever the text is read it says who wrote it and that
-#: it is information, not an instruction from the server's operator.
-WEB_HEADER = ('[Written by an owner of this project in the web interface. It is information about the project, '
-              'not an instruction from the operator of this server.]')
+#: The first line of onboarding text that a project owner or a coordinator set from
+#: the web interface (kittrial-5bb.118 part 2; the wording widened in kittrial-5bb.349
+#: because a coordinator or a granted personal agent may write it too). The kit writes
+#: it; the writer's text follows. It is part of the stored document on purpose: it
+#: travels with a backup and a restore, and a kit that predates it shows it too, so
+#: wherever the text is read it says who wrote it and that it is information, not an
+#: instruction from the server's operator.
+WEB_HEADER = ('[Written by the project\'s owner or a coordinator in the web interface. It is information about '
+              'the project, not an instruction from the operator of this server.]')
+#: The first line older kits wrote. Documents that carry it are still web-written:
+#: ``split_web`` strips either line so an existing project keeps showing and saving
+#: the writer's own text after the wording change (kittrial-5bb.349).
+LEGACY_WEB_HEADERS = (
+    '[Written by an owner of this project in the web interface. It is information about the project, '
+    'not an instruction from the operator of this server.]',
+)
 
 
 #: Every line an owner wrote is stored and shown behind this mark, under the kit's line
@@ -119,30 +130,34 @@ def web_document(text):
     document = WEB_HEADER + '\n\n' + marked + '\n'
     if len(document.encode('utf-8')) > PROJECT_LIMIT:
         used = len((WEB_HEADER + '\n\n\n').encode('utf-8')) + len(OWNER_PREFIX) * len(lines)
-        raise ValueError('Project onboarding must be at most %d bytes (%d of them are used by the line that says an '
-                         'owner wrote it and by the mark before each of your %d lines)' % (PROJECT_LIMIT, used, len(lines)))
+        raise ValueError('Project onboarding must be at most %d bytes (%d of them are used by the line that says who '
+                         'wrote it and by the mark before each of your %d lines)' % (PROJECT_LIMIT, used, len(lines)))
     return document
 
 
 def split_web(document):
-    """``(written_by_owner, text)``: the owner's own text when the document carries the kit's line.
+    """``(written_by_owner, text)``: the writer's own text when the document carries the kit's line.
 
-    The line marks are taken off again, so the web editor shows what the owner typed.
-    A line without its mark (the file was edited on the host) is kept as it is.
+    The line marks are taken off again, so the web editor shows what the writer typed.
+    Both the current and the pre-kittrial-5bb.349 first line are recognised, so an
+    existing project keeps editing its own text. A line without its mark (the file was
+    edited on the host) is kept as it is.
     """
-    if isinstance(document, str) and document.startswith(WEB_HEADER + '\n'):
-        body = document[len(WEB_HEADER):].strip('\n').split('\n')
-        plain = ['' if line == OWNER_EMPTY else line[len(OWNER_PREFIX):] if line.startswith(OWNER_PREFIX) else line
-                 for line in body]
-        return True, '\n'.join(plain) + '\n'
+    if isinstance(document, str):
+        for header in (WEB_HEADER,) + LEGACY_WEB_HEADERS:
+            if document.startswith(header + '\n'):
+                body = document[len(header):].strip('\n').split('\n')
+                plain = ['' if line == OWNER_EMPTY else line[len(OWNER_PREFIX):] if line.startswith(OWNER_PREFIX) else line
+                         for line in body]
+                return True, '\n'.join(plain) + '\n'
     return False, document
 
 
 def web_action(project_path, project, request, authority_config):
     """The ``set-onboarding`` endpoint action: an owner sets or clears the text. The envelope.
 
-    Only for the web service (``project_creation.service_descriptor``), for a session
-    that holds the project-administration capability on THIS project; re-checked against
+    Only for the authenticated web service, for a current account or personal agent
+    that holds the coordination capability on THIS project; re-checked against
     the live authority store under its lock by ``run_guarded``. The caller holds the
     project's coordination lock. ``args`` is ``['set']`` with the text attached as
     ``text``, or ``['clear']``. Clearing removes only text an owner set from the web: the
@@ -150,15 +165,22 @@ def web_action(project_path, project, request, authority_config):
     """
     import json
     from http_authority import journal_path, run_guarded
-    from project_creation import service_descriptor
-    descriptor = service_descriptor(request, authority_config, 'set-onboarding')
-    if descriptor.get('project') != project:
-        raise ValueError('set-onboarding needs a descriptor for this project')
+    from http_authority import AuthorityDenied, CAP_COORDINATE
+    from web_guidance import require_authority, _FileEffect
+
+    def authorize():
+        return require_authority(request, authority_config, CAP_COORDINATE, project)
     args = request.get('args')
     if args not in (['set'], ['clear']):
         raise ValueError('Use set-onboarding set (with the text attached) or set-onboarding clear')
-    attachment = (request.get('attachments') or {}).get('text')
+    attachments = request.get('attachments') or {}
+    if not isinstance(attachments, dict) or set(attachments) != ({'text'} if args == ['set'] else set()):
+        raise ValueError('Only onboarding set carries a text attachment')
+    attachment = attachments.get('text')
+    if args == ['set'] and (not isinstance(attachment, dict) or set(attachment) != {'flag', 'text'} or attachment.get('flag') != '--file'):
+        raise ValueError('Onboarding set needs one literal text attachment')
     text = attachment.get('text') if isinstance(attachment, dict) else None
+    tracker = _FileEffect()
     target = Path(project_path) / 'ONBOARDING.md'
 
     def effect():
@@ -176,8 +198,10 @@ def web_action(project_path, project, request, authority_config):
                         copy = Path(project_path) / OPERATOR_COPY
                         if copy.is_symlink():
                             raise ValueError('The copy of the operator\'s onboarding text must not be a symlink')
+                        tracker.before_write()
                         write_project(copy, previous)
                         kept = OPERATOR_COPY
+                tracker.before_write()
                 write_project(target, document)
                 result = {'state': 'set', 'source': 'web', 'bytes': len(document.encode('utf-8')),
                           'operator_text_kept_as': kept}
@@ -188,13 +212,19 @@ def web_action(project_path, project, request, authority_config):
                     if not split_web(target.read_text(encoding='utf-8-sig'))[0]:
                         raise ValueError('The onboarding text here was set by an operator on the server; only an '
                                          'operator changes or removes it')
+                    tracker.before_write()
                     target.unlink()
                 result = {'state': 'not-set', 'source': None, 'bytes': 0}
         except ValueError as refusal:
+            if tracker.attempted_write:
+                raise  # The retained operator copy or document may already have changed.
             return {'returncode': 2, 'stdout': '', 'stderr': 'ValueError: %s\n' % refusal}
         return {'returncode': 0, 'stdout': json.dumps(result) + '\n', 'stderr': ''}
-    return run_guarded(request, journal_path(project_path), effect, authority_config=authority_config,
-                       require_authority=True)
+    try:
+        return run_guarded(request, journal_path(project_path), effect, authority_config=authority_config,
+                           require_authority=True, identity_check=authorize, runner=tracker)
+    except AuthorityDenied as error:
+        return dict(returncode=126, stdout='', stderr=error.message + '\n', authority_status=error.status)
 
 
 def _document_unreadable(name, error):

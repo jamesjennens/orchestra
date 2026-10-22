@@ -20,8 +20,8 @@ const transport=async(method,path,headers,body)=>{
 async function settle(){for(let i=0;i<200;i++){await new Promise(r=>setTimeout(r,20));if(!inFlight){await new Promise(r=>setTimeout(r,30));if(!inFlight)return;}}throw new Error('Lifecycle page did not settle');}
 const project={id:pid,role:'superuser',archived:false},task={id:tid};
 const context=api=>({api,href:path=>path});
-const byLabel=(panel,label,tag)=>panel.querySelectorAll(tag).find(e=>e.getAttribute('aria-label')===label);
-const button=(panel,text)=>panel.querySelectorAll('button').find(e=>e.textContent===text);
+const byLabel=(panel,label,tag)=>Array.from(panel.querySelectorAll(tag)).find(e=>e.getAttribute('aria-label')===label);
+const button=(panel,text)=>Array.from(panel.querySelectorAll('button')).find(e=>e.textContent===text);
 let api=createApi(transport),panel=lifecyclePanel(context(api),project,task);
 document.body.append(panel);await settle();
 for(const [name,value] of Object.entries({source_commit:'a'.repeat(40),integration_commit:'b'.repeat(40),release_id:'browser-proof',environment:'<img src=x onerror=alert(1)>'}))byLabel(panel,name,'input').value=value;

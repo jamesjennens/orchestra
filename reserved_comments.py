@@ -211,6 +211,14 @@ COORDINATOR_DECISION_PREFIX = 'Kind: coordinator-decision-v1\n'
 # RECORD_ANCHOR_FAMILIES or RECORD_COMMENT_FAMILIES, so it anchors no row and every
 # surface -- an older kit included -- reads it as an ordinary comment.
 LANE_STATE_PREFIX = 'Kind: lane-state-v1\n'
+# kittrial-5bb.343. The coordinator's recorded hand-back of an integrated task to
+# its assignee. Reserved so the raw `comments add` path can never plant one; the
+# record is honoured only with its host journal entry
+# (``<project>/.assignee-followons/``), so a reserved-prefix write without one is
+# inert even before this guard. Deliberately NOT a record-anchor family: it anchors
+# no row and every surface -- an older kit included -- reads it as an ordinary
+# comment.
+ASSIGNEE_FOLLOWON_PREFIX = 'Kind: assignee-followon-v1\n'
 
 RESERVED = (
     (TASK_ASSIGNMENT_PREFIX, 'task assignment notice', 'the dedicated coordinate assignment operation'),
@@ -245,6 +253,8 @@ RESERVED = (
     (COORDINATOR_DECISION_PREFIX, 'coordinator decision',
      'decisions record on the coordination host or in the web interface'),
     (LANE_STATE_PREFIX, 'lane state', 'checkpoint TASK --file checkpoint.json (the lane_state key)'),
+    (ASSIGNEE_FOLLOWON_PREFIX, 'assignee follow-on record',
+     'coordinator followon on the coordination host or the web route'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
@@ -1216,6 +1226,30 @@ def _bd_scan(args, command):
         operands.append(token)
         index += 1
     return flags, operands, unknown
+
+
+def bd_flag_values(args):
+    """(name, value) for every flag of a `create`/`update` argv, as pflag parses it.
+
+    The ONE shorthand-aware reader the claiming guards share (kittrial-5bb.352 review
+    items B1/B2). The stock endpoint scans only matched a token that started with the
+    short letter, so pflag's boolean-cluster form (`-qa W`, `-qaW`, `-qsin_progress`)
+    hid the assignee and status flags from them. This delegates to `_bd_scan`, whose
+    inventory is the pinned bd 1.2.2 one: a single-dash token is a run of shorthand
+    letters, a value-taking letter consumes the rest of the token (`-aW`, `-sin_progress`)
+    or the next argv token (`-a W`, `-qs in_progress`), `=value` is accepted
+    (`-a=W`, `-s=in_progress`), and `--` ends flag parsing. A shorthand is reported as
+    ``-<letter>``; long flags keep their ``--name`` spelling. Unknown flags are not
+    guessed at: the caller of this function (the raw create/update path) has already
+    refused them with `unresolved_bd_flags` before any guard runs.
+    """
+    if not isinstance(args, list) or not args:
+        return []
+    command = args[0] if isinstance(args[0], str) else None
+    if command not in ('create', 'update'):
+        return []
+    flags, _, _ = _bd_scan(args, command)
+    return flags
 
 
 def unresolved_bd_flags(args):

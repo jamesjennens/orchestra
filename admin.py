@@ -4084,6 +4084,37 @@ RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-request
 #: validated by its reader's own validator, open_items.validate_owner_entry, exactly
 #: like `.integration-reverts`.
 OWNER_ANSWERS_JOURNAL='.owner-answers'
+#: Every directory inside one project this kit writes through the shared ``atomic`` form
+#: (a unique ``<name>.tmp-<pid>-<hex>`` temporary beside the target), so a cut can leave
+#: one behind. ``'.'`` is the project directory itself, where the single-file records
+#: leave their temporary (.sessions.json, .merge-context.json, the guidance pair); the
+#: rest are the one-file-per-key and cache families. A family whose writer uses the
+#: private ``mode=`` form (``.web-lifecycle-marks``) is named too; its fixed
+#: ``<name>.tmp`` does not match the sweep's shape, so sweeping it is a no-op.
+ATOMIC_SWEEP_DIRECTORIES=('.',)+RESERVATION_JOURNALS+( '.handoffs','.handoff-recoveries',
+    '.requirement-backfills','.integration-reverts','.assignee-followons','.lifecycle-voids',
+    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL)
+
+def sweep_project_temporaries(root,name,*,dry_run=False,min_age_seconds=None):
+    """Sweep the project directory and every atomic family in it; never touches a live write.
+
+    The bound (``coordination.TEMPORARY_MIN_AGE_SECONDS`` by default) is what makes this
+    safe beside a running service: a writer renames its temporary within one write, so an
+    old file is a crash's leftover. Only the project's own directory and its family
+    subdirectories (``ATOMIC_SWEEP_DIRECTORIES``) are swept, and nothing is read or
+    rewritten. A directory that does not exist contributes nothing. Returns the names
+    removed per directory, keyed by ``'.'`` for the project directory.
+    """
+    from coordination import sweep_temporaries, TEMPORARY_MIN_AGE_SECONDS
+    path=project_dir(root,name)
+    if not (path/'.beads'/'metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    if min_age_seconds is None:min_age_seconds=TEMPORARY_MIN_AGE_SECONDS
+    swept={}
+    for directory in ATOMIC_SWEEP_DIRECTORIES:
+        swept[directory]=sweep_temporaries(path/directory,min_age_seconds=min_age_seconds,dry_run=dry_run)
+    return {'project':name,'dry_run':bool(dry_run),'min_age_seconds':min_age_seconds,
+            'directories':list(ATOMIC_SWEEP_DIRECTORIES),'swept':swept,
+            'removed_total':sum(len(names) for names in swept.values())}
 
 def validate_record_receipt(name,record):
     """Frozen slice-0 receipt schema for one record-journal entry.
@@ -4118,9 +4149,9 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
         baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
-        if name not in ('.merge-context.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
+        if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -4157,6 +4188,14 @@ def validate_coordination_files(files):
         if name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])
+        if name.startswith('.assignee-followons/'):
+            # The host-issued assignee follow-on journal (kittrial-5bb.343). Its
+            # record shape and its <sha256>.json path/hash binding are validated by
+            # the reader's own validator, so a backup can never carry an entry the
+            # reader would have to guess about; a restore that dropped it would
+            # silently make every recorded hand-back inert.
+            from followon import validate_entry as validate_followon_entry
+            validate_followon_entry(record,name.partition('/')[2])
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
         if name=='GUIDANCE.md':
             from guidance import validate_text
@@ -4176,6 +4215,12 @@ def validate_coordination_files(files):
             from feedback import validate_feed_text
             if set(record) != {'text'}:raise ValueError('Invalid feedback backup')
             validate_feed_text(record['text'])
+        if name=='.claiming.json':
+            # The per-project claiming setting (kittrial-5bb.352): a validated record,
+            # or the verbatim text/bytes of a damaged file that must read back damaged
+            # (restrictive) after a restore, never as the permissive default.
+            from claiming import restore_record as validate_claiming_backup
+            validate_claiming_backup(record)
         if quarantine:
             from feedback import validate_quarantine_record
             validate_quarantine_record(name,record)
@@ -4664,6 +4709,23 @@ def backup_project(root,name):
         for record in revert_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Integration revert journal entry must not be a symlink')
             files['.integration-reverts/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The host-issued assignee follow-on journal (kittrial-5bb.343). It is the
+        # proof a hand-back was recorded on this host, so a restore that dropped it
+        # would silently make every recorded hand-back inert: it is backed up,
+        # validated and restored exactly like the revert journal.
+        followon_journal=path/'.assignee-followons'
+        if followon_journal.is_symlink():raise ValueError('Assignee follow-on journal must not be a symlink')
+        for record in followon_journal.glob('*.json'):
+            if record.is_symlink():raise ValueError('Assignee follow-on journal entry must not be a symlink')
+            files['.assignee-followons/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The per-project claiming setting (kittrial-5bb.352). It lives outside the
+        # tracker, so a backup that dropped it would silently open claiming again after
+        # a restore. A damaged file is carried byte for byte and reads back restrictive.
+        claiming_file=path/'.claiming.json'
+        if claiming_file.is_symlink():raise ValueError('Claiming setting must not be a symlink')
+        from claiming import backup_record as claiming_backup_record
+        claiming_record=claiming_backup_record(path)
+        if claiming_record is not None:files['.claiming.json']=claiming_record
         # The owner answers journal (kittrial-5bb.126): written by no kit yet, collected
         # only when present, so a backup of a runtime with open-item writes off is
         # byte-for-byte what the previous kit takes.
@@ -4889,6 +4951,76 @@ def merge_slot_report(root,names=None):
              'not_healthy':sorted(groups['missing']+groups['damaged']+groups['unknown'])},
             bool(report) and not groups['missing'] and not groups['damaged'] and not groups['unknown'])
 
+def assignee_name_report(root,names=None,state=None):
+    """Read-only check: rows whose assignee is not an exact actor id (kittrial-5bb.333).
+
+    An assignee is an actor id; a tracker row that stores a display name is undeliverable
+    by the agent that owns it because every ownership check compares the actor id. This
+    report lists every such row for a PERSON to decide, with ``candidates``: the actor ids
+    that currently carry that display name (empty when no identity does).
+
+    It deliberately does NOT emit a single resolved actor or recommend writing it back. A
+    display name can be claimed by a newly registered session or agent that has never
+    acted, so the candidate list is evidence, not an answer; the task's review showed that
+    a write-back recommendation would make such a takeover permanent. It also never writes.
+
+    ``state`` is the web service's live authority document (default
+    ``root/http-state.json``); the accounts, agents and worker credentials there are what
+    make an agent's display name visible. A project whose metadata does not record the Dolt
+    server coordinates is not read at all, as in ``open-item-label-check``. Returns
+    ``(report, clean)``; ``clean`` is true only when every project was read and no row was
+    listed. No lock, no write.
+    """
+    import endpoint
+    import assignee_names
+    state_path=Path(state) if state is not None else (root/'http-state.json')
+    class _Store:
+        store=str(state_path)
+    authority=_Store() if state_path.is_file() else None
+    report={}
+    for name in (names or initialized_projects(root)):
+        path=project_dir(root,name)
+        try:
+            metadata=project_metadata_state(root,name)
+        except (ValueError,OSError):metadata='absent'
+        if metadata=='absent':
+            report[name]={'error':'unknown or uninitialized project'};continue
+        if metadata!='server':
+            report[name]={'error':'.beads/metadata.json does not record the Dolt server coordinates, so bd '
+                                   'was not run (it would create an embedded database here and list nothing)'}
+            continue
+        try:
+            rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
+            if not isinstance(rows,list) or any(not isinstance(row,dict) or row.get('malformed') for row in rows):
+                raise ValueError('the project rows could not be read completely')
+            # The IDENTITY roster only (sessions, accounts, agents, worker credentials). The
+            # assignment-time writer additionally treats any stored assignee/author as exact;
+            # this report deliberately does not, because its job is to surface a value that
+            # is not a registered identity for a person to judge.
+            found=endpoint.assignee_identities(root,path,authority)
+            index=assignee_names.index(found['entries'])
+            index['complete']=found['complete']
+        except (subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,ValueError,TypeError) as error:
+            report[name]={'error':'could not read the project: %s'%type(error).__name__};continue
+        exact=[];listed=[]
+        for row in rows:
+            if not isinstance(row,dict):continue
+            assignee=row.get('assignee')
+            if not isinstance(assignee,str) or not assignee:continue
+            if assignee in index['by_actor']:
+                exact.append(assignee);continue
+            listed.append({'id':row.get('id'),'assignee':assignee,
+                           'candidates':list(index['by_name'].get(assignee) or []),
+                           'needs_decision':True})
+        report[name]={'rows':listed,
+                      'with_candidates':[item for item in listed if item['candidates']],
+                      'no_candidate':[item for item in listed if not item['candidates']],
+                      'exact_actor_rows':len(exact),
+                      'roster_complete':bool(index.get('complete'))}
+    listed=sorted(name for name,entry in report.items() if entry.get('rows'))
+    unreadable=sorted(name for name,entry in report.items() if 'error' in entry)
+    return ({'schema_version':1,'projects':report,'not_actor':listed,'unreadable':unreadable},not listed and not unreadable)
+
 def _revoked_list(found,limit):
     """One revocation list: the first `limit` entries, or every entry when limit is None.
 
@@ -5056,8 +5188,13 @@ def backup_pair_state(root,name):
         return False,'coordination sidecar status is %r, not complete'%(data.get('status'),)
     return True,None
 
-def backup_status_record(results,scope,generated_at):
-    """Build the schema-1 status record for one run (see validate_backup_status)."""
+def backup_status_record(results,scope,generated_at,http_state=None):
+    """Build the schema-1 status record for one run (see validate_backup_status).
+
+    ``http_state`` (kittrial-5bb.331) is this run's HTTP-state entry; a copy that is
+    neither complete nor absent makes the whole run incomplete - the accounts and
+    agents are exactly what a lost disk must not lose.
+    """
     projects=[]
     for item in results:
         entry={'name':item['name'],'status':item['status']}
@@ -5070,9 +5207,15 @@ def backup_status_record(results,scope,generated_at):
         else:
             entry['reason']=item['reason']
         projects.append(entry)
-    return {'schema_version':1,'scope':scope,'generated_at':generated_at,
-            'status':'complete' if projects and all(p['status']=='complete' for p in projects) else 'incomplete',
+    complete=bool(projects) and all(p['status']=='complete' for p in projects)
+    if http_state is not None and http_state.get('status') not in (None,'complete','absent'):
+        complete=False
+    record={'schema_version':1,'scope':scope,'generated_at':generated_at,
+            'status':'complete' if complete else 'incomplete',
             'projects':projects}
+    if http_state is not None:
+        record['http_state']=http_state
+    return record
 
 def validate_backup_status(record):
     """Validate a scheduled-backup status record (schema 1).
@@ -5125,6 +5268,20 @@ def validate_backup_status(record):
             if 'degraded' in entry:
                 raise ValueError('Incomplete backup status for %s must not carry a degraded message'%name)
     expected='complete' if complete==len(projects) else 'incomplete'
+    http_state=record.get('http_state')
+    if http_state is not None:
+        if not isinstance(http_state,dict) or http_state.get('status') not in ('complete','absent','degraded'):
+            raise ValueError('Backup status http_state must be complete, absent or degraded')
+        if http_state['status']=='complete':
+            if not isinstance(http_state.get('files'),list) or not http_state['files']:
+                raise ValueError('A complete http_state entry must name the files it copied')
+            if not isinstance(http_state.get('path'),str) or not http_state['path'].strip():
+                raise ValueError('A complete http_state entry must name the live path it copied')
+        if http_state['status']=='degraded' and (not isinstance(http_state.get('reason'),str)
+                                                 or not http_state['reason'].strip()):
+            raise ValueError('A degraded http_state entry must say why')
+        if http_state['status'] in ('complete','degraded') and expected=='complete':
+            expected='complete' if http_state['status'] in ('complete','absent') else 'incomplete'
     if record.get('status')!=expected:
         raise ValueError('Backup status run status must be %s for its project entries'%expected)
 
@@ -5814,6 +5971,20 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
             if journal_staged is not None:
                 print('Copied %s journal snapshot: %s -> %s'%(
                     name,journal_snapshot_path(root,name),destination/journal_staged.name))
+        # kittrial-5bb.331: the HTTP-state pair joins every copy that publishes the
+        # completeness record - the off-machine copy is what survives the lost disk,
+        # and the accounts and agents are exactly what it must not lose. Copied
+        # through the same staging rename, mode 0600, and named per file.
+        http_state_copied=[]
+        for name in (HTTP_STATE_JSON,HTTP_STATE_RECORDS):
+            source=backups/name
+            if source.is_file():
+                staged_file=staging/('.http-'+name)
+                _atomic_copy(source,staged_file)
+                os.chmod(str(staged_file),0o600)
+                _replace_with(staged_file,destination/name)
+                http_state_copied.append({'name':name,'bytes':source.stat().st_size})
+                print('Copied the HTTP state: %s -> %s'%(source,destination/name))
         if not skipped:
             _atomic_copy(backups/BACKUP_STATUS_NAME,staging/BACKUP_STATUS_NAME)
             _replace_with(staging/BACKUP_STATUS_NAME,target_status)
@@ -5831,6 +6002,7 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
             run_record=backup_copy_run_record(backup_copy_full_record(target_status),copied_meta,
                                               [{'name':name,'reason':reason} for name,reason in skipped],
                                               all_or_nothing,generated_at)
+            run_record['http_state']=http_state_copied
             validate_backup_copy_run(run_record)
             _atomic_write_bytes(staging/BACKUP_COPY_RUN_NAME,
                                 (json.dumps(run_record,sort_keys=True,indent=2)+'\n').encode('utf-8'))
@@ -5879,7 +6051,179 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
           %(len(copied),journals,len(initialized_projects(root)),destination))
     return copied
 
-def backup_projects(root,names,all_projects=False):
+#: The runtime-level HTTP/web-service state, backed up with every run (kittrial-5bb.331).
+#: The live files are the service's JSON state and, beside it, its SQLite records file
+#: (users and password hashes, agents and credential hashes, memberships, sessions,
+#: audit); the office default is <RUNTIME_ROOT>/http-state.json (office_service.py).
+HTTP_STATE_JSON='http-state.json'
+HTTP_STATE_RECORDS='http-state.json.records.sqlite3'
+
+def resolve_http_state_path(root, named=None):
+    """(path, where-from) of the runtime's live HTTP state file, or (None, None).
+
+    In order: an explicit --http-state PATH; an optional ``http_state`` path in
+    deployment.private.json (the office config is operator-private and has no fixed
+    home, so the deployment records the same path for the backup); the office default
+    ``<root>/http-state.json`` when that file exists. A runtime with none of these has
+    no web state to back up (kittrial-5bb.331).
+    """
+    if named is not None:
+        if not isinstance(named,str) or not named.strip():
+            raise ValueError('--http-state must be a path to the live HTTP state file')
+        return Path(named),'flag'
+    try:
+        value=config(root).get('http_state')
+    except (ValueError,OSError):
+        value=None
+    if isinstance(value,str) and value.strip():
+        return Path(value),'deployment'
+    default=root/HTTP_STATE_JSON
+    if default.is_file():
+        return default,'default'
+    return None,None
+
+def copy_sqlite_consistently(source, destination):
+    """Copy a SQLite database consistently while others may use it; None or the reason.
+
+    The sqlite3 CLI's ``.backup`` first (independent of the Python version), then
+    ``sqlite3.Connection.backup`` (Python 3.7+; the office server runs 3.6). A host
+    with neither answers a reason instead of taking a torn file silently
+    (kittrial-5bb.331).
+    """
+    import shutil
+    cli=shutil.which('sqlite3')
+    if cli is not None:
+        try:
+            done=subprocess.run([cli,str(source),'.backup '+str(destination)],
+                                capture_output=True,text=True,timeout=120)
+        except (OSError,subprocess.SubprocessError) as error:
+            return 'the sqlite3 CLI could not run: %s'%str(error)[:120]
+        if done.returncode==0 and destination.is_file():
+            return None
+        return 'the sqlite3 CLI could not copy the records file: %s'%((done.stderr or done.stdout or '').strip()[:120])
+    import sqlite3
+    if hasattr(sqlite3.Connection,'backup'):
+        # kittrial-5bb.331 review item 'windows-sqlite-handle': EVERY connection is
+        # closed in finally - an open handle keeps the file locked on Windows, long
+        # after this function returns, failing the caller's clean-up with WinError 32.
+        holder=sqlite3.connect(str(source))
+        try:
+            target=sqlite3.connect(str(destination))
+            try:
+                holder.backup(target)
+            finally:
+                target.close()
+        except sqlite3.Error as error:
+            return 'the consistent SQLite copy failed: %s'%str(error)[:120]
+        finally:
+            holder.close()
+        return None
+    return ('no consistent SQLite copy is available on this host: no sqlite3 CLI and this '
+            'Python lacks Connection.backup (the office server runs Python 3.6)')
+
+def backup_http_state(root, named=None):
+    """The runtime's HTTP state into backups/, mode 0600; the status entry for the report.
+
+    The JSON is copied as written; the records file through the consistent copy. Both
+    are written to a temporary name and renamed, so a reader never sees a half copy.
+    ``absent`` means the runtime has no web state to back up - not an error
+    (kittrial-5bb.331).
+    """
+    backups=root/'backups'
+    backups.mkdir(exist_ok=True)
+    source,origin=resolve_http_state_path(root,named)
+    if source is None:
+        return {'status':'absent'}
+    entry={'status':'absent','path':str(source)}
+    if not source.is_file():
+        return entry
+    if source.is_symlink():
+        raise ValueError('The HTTP state file %s must not be a symlink'%source)
+    import shutil
+    import tempfile
+    json_target=backups/HTTP_STATE_JSON
+    handle,temp=tempfile.mkstemp(dir=str(backups),prefix='.http-state-')
+    os.close(handle)
+    os.unlink(temp)
+    try:
+        shutil.copyfile(str(source),temp)
+        os.chmod(temp,0o600)
+        os.replace(temp,str(json_target))
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+    files=[{'name':HTTP_STATE_JSON,'bytes':json_target.stat().st_size}]
+    records=Path(str(source)+'.records.sqlite3')
+    if records.is_file():
+        if records.is_symlink():
+            raise ValueError('The HTTP state records file %s must not be a symlink'%records)
+        records_target=backups/HTTP_STATE_RECORDS
+        handle,temp=tempfile.mkstemp(dir=str(backups),prefix='.http-state-records-')
+        os.close(handle)
+        os.unlink(temp)
+        try:
+            reason=copy_sqlite_consistently(records,Path(temp))
+            if reason is None:
+                os.chmod(temp,0o600)
+                os.replace(temp,str(records_target))
+                files.append({'name':HTTP_STATE_RECORDS,'bytes':records_target.stat().st_size})
+            else:
+                entry.update(status='degraded',reason=reason,files=files)
+                return entry
+        finally:
+            if os.path.exists(temp):os.unlink(temp)
+    entry.update(status='complete',files=files,origin=origin)
+    return entry
+
+def restore_http_state(root, named=None):
+    """Restore the backed-up HTTP state pair to the live path; the sentence to print.
+
+    The ONLY caller is ``restore-new --restore-http-state`` (kittrial-5bb.331): the
+    accounts, agents and memberships come back with their password and credential
+    hashes, and every SESSION in the restored state is invalidated - the hashes
+    return, the sign-ins do not survive the restore. Mode 0600, copied to a temporary
+    name and renamed, never by default.
+    """
+    backups=root/'backups'
+    source_json=backups/HTTP_STATE_JSON
+    if not source_json.is_file():
+        raise ValueError('This backup set has no HTTP state pair to restore (no %s in %s); '
+                         'nothing was changed'%(HTTP_STATE_JSON,backups))
+    live,origin=resolve_http_state_path(root,named)
+    if live is None:
+        # The disaster this restores from is exactly the live file being GONE, so the
+        # office default is the target even when nothing exists there yet: the service
+        # will look for it there (kittrial-5bb.331).
+        live=root/HTTP_STATE_JSON
+    live.parent.mkdir(parents=True,exist_ok=True)
+    import shutil
+    import tempfile
+    handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-restore-')
+    os.close(handle);os.unlink(temp)
+    try:
+        shutil.copyfile(str(source_json),temp)
+        os.chmod(temp,0o600)
+        os.replace(temp,str(live))
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+    restored=[HTTP_STATE_JSON]
+    records=backups/HTTP_STATE_RECORDS
+    if records.is_file():
+        records_live=Path(str(live)+'.records.sqlite3')
+        handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-records-restore-')
+        os.close(handle);os.unlink(temp)
+        try:
+            shutil.copyfile(str(records),temp)
+            os.chmod(temp,0o600)
+            os.replace(temp,str(records_live))
+            restored.append(HTTP_STATE_RECORDS)
+        finally:
+            if os.path.exists(temp):os.unlink(temp)
+    return ('Restored the HTTP state pair (%s) to %s (mode 0600). Every session in it is '
+            'INVALIDATED: users and agents must sign in again; password and credential hashes '
+            'are back as they were at the backup.'%(', '.join(restored),live))
+
+
+def backup_projects(root,names,all_projects=False,named_http_state=None):
     """Back up one or more projects in one run and publish the run's status file.
 
     ``admin.py backup PROJECT`` keeps its existing output and exit behaviour: the
@@ -5934,20 +6278,47 @@ def backup_projects(root,names,all_projects=False):
         else:
             results.append({'name':name,'status':'failed','reason':reason})
             incomplete.append(name)
-    write_backup_status(root,merged_backup_status(root,backup_status_record(results,scope,generated_at)))
+    # kittrial-5bb.331: the runtime's HTTP state joins EVERY backup run (named or
+    # --all); a copy that is neither complete nor absent makes the run incomplete.
+    try:
+        http_state=backup_http_state(root,named_http_state)
+    except Exception as error:
+        http_state={'status':'degraded','reason':failure_reason(error)}
+    write_backup_status(root,merged_backup_status(root,backup_status_record(
+        results,scope,generated_at,http_state=http_state)))
     for entry in results:
         if entry['status']!='complete':
             print('backup %s for %s: %s'%(entry['status'],entry['name'],entry['reason']),file=sys.stderr)
+    if http_state.get('status')=='degraded':
+        print('backup of the HTTP state is degraded: %s'%http_state.get('reason'),file=sys.stderr)
     degraded=[(entry['name'],entry['degraded']) for entry in results if entry.get('degraded')]
+    # kittrial-5bb.331: the summary NAMES the HTTP state, so a run that skipped or
+    # degraded it never reads like a clean one.
+    http_note=''
+    if http_state.get('status')=='complete':
+        http_note='; http-state complete (%s)'%http_state.get('path')
+    elif http_state.get('status')=='absent':
+        http_note='; no http-state to back up'
+    else:
+        http_note='; http-state %s'%http_state.get('status')
     if len(targets)>1:
         # The count of degraded projects is IN the summary line: a run that is complete
         # and degraded used to read exactly like a clean one (kittrial-5bb.105).
-        print('Backed up %d of %d project(s)%s; %s is %s.'%(
+        print('Backed up %d of %d project(s)%s%s; %s is %s.'%(
             len(targets)-len(incomplete),len(targets),
-            ', '+degraded_summary(degraded) if degraded else '',root/'backups'/BACKUP_STATUS_NAME,
-            'complete' if not incomplete else 'incomplete'))
-    elif degraded:
-        print('Backup of %s is complete but degraded: %s'%degraded[0])
+            ', '+degraded_summary(degraded) if degraded else '',http_note,
+            root/'backups'/BACKUP_STATUS_NAME,
+            'complete' if not incomplete and http_state.get('status') in (None,'complete','absent') else 'incomplete'))
+    else:
+        # kittrial-5bb.331: the single-project form keeps its single stdout line; the
+        # HTTP state rides it only when it was actually copied or needs attention
+        # (absent stays silent - a runtime without the web service changed nothing).
+        if http_state.get('status')=='complete':
+            print('Backup of %s; http-state complete (%s).'%(targets[0],http_state.get('path')))
+        elif http_state.get('status')=='degraded':
+            print('Backup of %s; http-state degraded: %s'%(targets[0],http_state.get('reason')))
+        elif degraded:
+            print('Backup of %s is complete but degraded: %s'%(degraded[0][0],degraded[0][1]))
     if incomplete:
         raise SystemExit('backup incomplete for: '+' '.join(incomplete)+
                          ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME)+unfinished_creation_hint(root,incomplete))
@@ -6343,6 +6714,12 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name.startswith('.integration-reverts/'):
             from review_workflow import validate_revert_journal_entry
             validate_revert_journal_entry(record,name.partition('/')[2])
+        elif name.startswith('.assignee-followons/'):
+            # The host-issued assignee follow-on journal (kittrial-5bb.343): validate
+            # every entry BEFORE the first write, so a bad entry refuses the whole
+            # restore rather than silently making an open hand-back inert.
+            from followon import validate_entry as validate_followon_entry
+            validate_followon_entry(record,name.partition('/')[2])
         elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])
@@ -6358,6 +6735,11 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name=='.guidance-clear.json':
             from guidance import validate_clear_record
             validate_clear_record(record)
+        elif name=='.claiming.json':
+            # The per-project claiming setting (kittrial-5bb.352): validated before the
+            # first write, so a bad entry refuses the whole restore.
+            from claiming import restore_record as validate_claiming_backup
+            validate_claiming_backup(record)
     # The guidance text and its audit record are one generation: refuse to restore a
     # mismatched pair rather than installing text that cannot be attributed.
     if 'GUIDANCE.md' in files or '.guidance.json' in files:
@@ -6393,6 +6775,22 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
             from guidance import validate_meta
             validate_meta(record)
             atomic(target,record)
+        elif name=='.claiming.json':
+            # A validated record is written as record JSON; the verbatim form of a
+            # damaged file is written back byte for byte, so it still reads restrictive.
+            from claiming import restore_record as validate_claiming_backup
+            validate_claiming_backup(record)
+            if set(record)=={'text'}:
+                temporary=target.with_suffix('.tmp')
+                temporary.write_text(record['text'],encoding='utf-8',newline='')
+                os.replace(temporary,target)
+            elif set(record)=={'base64'}:
+                import base64
+                temporary=target.with_suffix('.tmp')
+                temporary.write_bytes(base64.b64decode(record['base64'],validate=True))
+                os.replace(temporary,target)
+            else:
+                atomic(target,record)
         elif name=='.feedback.jsonl':
             temporary=target.with_suffix('.tmp')
             temporary.write_text(record['text'],encoding='utf-8',newline='\n')
@@ -6706,8 +7104,9 @@ AUTHORIZED_KEY_TYPES=('ssh-ed25519','ssh-rsa','ecdsa-sha2-nistp256','ecdsa-sha2-
 # `restrict` comes first: OpenSSH documents it as switching off pty, port forwarding, agent
 # forwarding, X11 forwarding *and* the user rc file (~/.ssh/rc), so a capability OpenSSH adds
 # later is off for this key by default rather than granted until someone edits this list. The
-# four explicit options follow so a stock sshd that predates `restrict` still gets them, and
-# so a reader sees exactly what the entry closes.
+# explicit no-* options are redundant with `restrict`; keep them so a reader can see exactly
+# what the entry closes. An sshd too old to recognize `restrict` refuses the entire key line;
+# these options are not a compatibility fallback.
 CONTRIBUTOR_KEY_OPTIONS=('restrict','no-pty','no-port-forwarding','no-agent-forwarding',
                          'no-X11-forwarding')
 # The character class --root, the kit directory and --python must all satisfy: sshd hands
@@ -6781,13 +7180,36 @@ def _authorized_key_python(value):
 
     The same character class as --root and the kit directory. sshd hands `command=` to the
     account shell, so `--python '$(touch${IFS}/tmp/canary)python3'` would run the substitution
-    on every connection; a value outside this class is refused rather than printed.
+    on every connection; a value outside this class is refused rather than printed. The
+    authorized-keys command separately verifies absolute paths; bare names stay unresolved
+    until the server account shell resolves them through PATH at connection time.
     """
     text=str(value)
     if not AUTHORIZED_KEY_PYTHON.fullmatch(text):
         raise ValueError('--python must be one interpreter name or absolute path using only '
                          'letters, digits, dot, underscore, dash and slash, to be usable '
                          'inside an authorized_keys command=')
+    return text
+
+AUTHORIZED_KEY_PYTHON_REFUSAL='--python path must be an executable Python 3.10+ interpreter.'
+
+def _verified_authorized_key_python(value):
+    text=_authorized_key_python(value)
+    if not text.startswith('/'):
+        return text
+    if not os.path.isfile(text) or not os.access(text,os.X_OK):
+        raise ValueError(AUTHORIZED_KEY_PYTHON_REFUSAL)
+    try:
+        result=subprocess.run(
+            [text,'-c','import sys; print("%d.%d" % (sys.version_info[0], sys.version_info[1]))'],
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
+            text=True,timeout=3,check=False)
+    except (OSError,subprocess.SubprocessError,UnicodeError):
+        raise ValueError(AUTHORIZED_KEY_PYTHON_REFUSAL) from None
+    output=result.stdout if isinstance(result.stdout,str) else ''
+    version=re.fullmatch(r'(\d+)\.(\d+)\s*',output) if len(output)<=32 else None
+    if result.returncode!=0 or version is None or tuple(map(int,version.groups()))<(3,10):
+        raise ValueError(AUTHORIZED_KEY_PYTHON_REFUSAL)
     return text
 
 def _authorized_key_comment(comment):
@@ -7467,6 +7889,7 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
     if (projects or principal is not None) and role=='operator':
         raise ValueError('--project and --principal bind the confined contributor line; an unrestricted operator '
                          'key has a shell and cannot be bound to projects or to a principal')
+    python=_verified_authorized_key_python(default_authorized_key_python() if python is None else python)
     if role in ('contributor','both') and (not projects or principal is None) and bound_keys_only(root):
         # This installation set `bound-keys-only`: the forced command refuses such a line, so
         # printing it would hand the operator a line that cannot work (kittrial-5bb.196).
@@ -7498,7 +7921,10 @@ def authorized_keys(root,key_file,role='both',python=None,comment=None,projects=
                       'The endpoint in the contributor line goes through the installation\'s '
                       'install/current link where it has one. Put that exact path in the contributor\'s '
                       'client config: the wrapper compares it as one token, and a releases/<ID> spelling '
-                      'would keep that key on the release that printed it.']}
+                      'would keep that key on the release that printed it.',
+                      'A bare --python name is left unchanged and resolved through the server account\'s '
+                      'PATH when SSH starts the forced command; use an absolute path to verify the '
+                      'interpreter while printing the line.']}
     if projects or principal is not None:
         # Rules 1 and 2 of docs/COORDINATORS_PER_PROJECT_DESIGN.md. Only the bound line is
         # printed: the operator line is a shell, and a shell is every project.
@@ -9518,6 +9944,10 @@ def main():
     a=sub.add_parser('remove-creation',help='remove a project creation that did not finish (operator allowlist); refuses a finished project and a running creation')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
     a=sub.add_parser('set-onboarding');a.add_argument('project');a.add_argument('--file',required=True)
+    a=sub.add_parser('project-setting',help='read a project setting, or set the claiming setting: open (workers may claim open tasks) or assigned (only coordinators assign); setting needs --actor on the operator allowlist')
+    a.add_argument('project')
+    a.add_argument('--claiming',choices=['open','assigned'],default=None)
+    a.add_argument('--actor')
     a=sub.add_parser('set-guidance',help='set the standing coordinator guidance every actor reads each run (operator allowlist, audited)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('guidance-status',help='which actors have acknowledged which guidance version (operator allowlist)')
@@ -9527,6 +9957,8 @@ def main():
     a=sub.add_parser('compact-guidance-acks',help='drop guidance acknowledgements for versions no longer current or previous (operator allowlist, audited)')
     a.add_argument('project');a.add_argument('--actor',required=True)
     a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('followon',help='record or withdraw a coordinator hand-back of an integrated-but-open task (operator allowlist, host journal)')
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-reconcile');a.add_argument('project');a.add_argument('--operation-id',required=True)
@@ -9547,6 +9979,13 @@ def main():
     a.add_argument('project')
     a=sub.add_parser('reference-misses-clear',help='delete a project\'s reference lookup-miss log (telemetry; not backed up)')
     a.add_argument('project')
+    a=sub.add_parser('sweep-temporaries',help='remove leftover atomic temporaries '
+                     '(<name>.tmp-<pid>-<hex>: a crash between the temporary and its rename) from one '
+                     'project\'s own coordination families; the write path is unchanged')
+    a.add_argument('project')
+    a.add_argument('--dry-run',action='store_true',dest='dry_run',help='name the files without removing them')
+    a.add_argument('--min-age-minutes',type=int,dest='min_age_minutes',default=60,
+                   help='only remove a temporary at least this old (default 60; minimum 5)')
     a=sub.add_parser('reference-apply',help='accept a reference catalog entry, or a batch of them with items (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('proposal-review',help='record a coordinator disposition on a requirement proposal (operator allowlist)')
@@ -9697,7 +10136,10 @@ def main():
     a.add_argument('--key-file',required=True,help='a file holding one plain OpenSSH public key line')
     a.add_argument('--role',choices=['contributor','operator','both'],default='both',
                    help='which line(s) to print (default: both, for different keys)')
-    a.add_argument('--python',default=None,help='interpreter in the contributor forced command (default: this interpreter, or /usr/bin/python3)')
+    a.add_argument('--python',default=None,
+                   help='interpreter in the contributor forced command (absolute paths are checked for '
+                        'executable Python 3.10+; a bare name is resolved through the server account PATH '
+                        'at connection time; default: this interpreter, or /usr/bin/python3)')
     a.add_argument('--comment',default=None,help='replace the key line comment')
     a.add_argument('--project',action='append',default=None,metavar='NAME',
                    help='bind the contributor line to this project (repeatable): the endpoint then refuses every '
@@ -9743,6 +10185,11 @@ def main():
     a=sub.add_parser('backup');a.add_argument('projects',nargs='*',metavar='project')
     a.add_argument('--all',action='store_true',dest='all_projects',
                    help='back up every initialized project in this runtime in one run')
+    a.add_argument('--http-state',default=None,metavar='PATH',action=_OnceFlag,
+                   help='the live HTTP/web-service state file to back up with this run (the JSON and its '
+                        'SQLite records file, copied consistently, mode 0600); without it the http_state '
+                        'path recorded in deployment.private.json is used, then the office default '
+                        '<RUNTIME_ROOT>/http-state.json when that file exists (kittrial-5bb.331)')
     a=sub.add_parser('backup-schedule',help='record, as an operator, that this runtime\'s backups are scheduled '
                                              'elsewhere (the project setup step then reads done; a systemd user '
                                              'unit that covers the project still wins) (operator allowlist)')
@@ -9764,6 +10211,12 @@ def main():
     a=sub.add_parser('merge-slot-report',help='read only: the projects whose merge slot is missing, damaged or cannot '
                                               'be read, with the merge-create repair (exit 1 when any is not healthy)')
     a.add_argument('projects',nargs='*',metavar='project')
+    a=sub.add_parser('assignee-names',help='read only: rows whose assignee is not an exact actor id, with the '
+                                           'identity candidates that currently carry that name (exit 1 when any '
+                                           'is listed; a person decides the repair)')
+    a.add_argument('projects',nargs='*',metavar='project')
+    a.add_argument('--state',default=None,
+                   help='the web service live authority document (default: ROOT/http-state.json)')
     a=sub.add_parser('backup-status')
     a.add_argument('--require-complete',action='store_true',dest='require_complete',
                    help='exit non-zero unless the last run covered every project (--all) and every initialized '
@@ -9806,6 +10259,11 @@ def main():
                    help='restore only the native tracker data of a backup whose coordination sidecar exists but '
                         'cannot be used (restore-new refuses such a backup without this flag); its sessions, '
                         'handoffs, requests, merge context and recorded operators and verifiers are not restored')
+    a.add_argument('--restore-http-state',action='store_true',dest='restore_http_state',
+                   help='ALSO restore the runtime HTTP state pair this backup set carries (accounts, agents, '
+                        'memberships; mode 0600). The ONLY way it comes back: without the flag a restore never '
+                        'touches the live HTTP state. Restoring it INVALIDATES every session recorded in it - '
+                        'users and agents must sign in again (kittrial-5bb.331)')
     a.epilog=('Exit status: 0 restored; 3 restored, but --restore-operators/--restore-verifiers could not '
               're-grant (another change held the deployment lock, or the authority-changes audit is damaged): '
               'the last lines say what, with the commands to re-grant it; 1 failed. --actor OPERATOR and '
@@ -9912,6 +10370,26 @@ def main():
         for warning in probe_endpoints(text,args.project,Path(__file__).resolve().parent):
             print(warning,file=sys.stderr)
         print('Project onboarding installed; back up the project after changes.')
+    elif args.command=='project-setting':
+        import fcntl
+        from claiming import read as read_claiming, write as write_claiming
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        if args.claiming is None:
+            print(json.dumps(read_claiming(path),sort_keys=True,indent=2))
+        else:
+            from keyed_records import require_configured_operator
+            # The operator allowlist is checked before the project is read or any file
+            # is written, as set-guidance does, so a contributor actor cannot set it
+            # even if it reaches the host command line.
+            require_configured_operator(args.actor,operators(root,strict=True),
+                                        'set the project claiming setting')
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                result=write_claiming(path,args.claiming,args.actor,via='host')
+            print('Project claiming setting set to %s; back up the project after changes.'
+                  %result['claiming'])
+            print(json.dumps(result,sort_keys=True))
     elif args.command=='set-guidance':
         import fcntl
         from guidance import write_guidance
@@ -10054,6 +10532,48 @@ def main():
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             print(json.dumps(handoff(path,args.actor,payload,run,operator=True)))
+    elif args.command=='followon':
+        # The installation operator's host route for the coordinator's recorded
+        # hand-back (kittrial-5bb.358): the confined coordinator's `coordinator
+        # followon` and the web route both refuse on this host when no coordinator
+        # key is bound. It calls the SAME followon.apply the endpoint calls at
+        # endpoint.py:1801 and :2213, under the SAME project coordination lock as the
+        # other host writes, so validation, fact derivation and the journal cannot
+        # drift. The payload's own `operation` decides record or withdraw.
+        import fcntl
+        import followon as followon_records
+        from keyed_records import require_configured_operator
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        if not isinstance(payload,dict):
+            raise ValueError('The hand-back payload must be a JSON object. Nothing was written.')
+        # A payload may repeat the command's actor, but only to AGREE with it: the
+        # recorded actor is exactly the --actor given to this command (kittrial-5bb.358
+        # coordinator addition). A differing value is refused, never silently ignored.
+        # An agreeing one is dropped, because the request shape followon.apply takes
+        # does not carry an actor at all (it derives the recorded fact from this name).
+        if 'actor' in payload and payload['actor']!=args.actor:
+            raise ValueError('The hand-back payload names actor %r but --actor is %r; the recorded actor is the '
+                             '--actor given to this command, so the two must match. Nothing was written.'
+                             %(payload['actor'],args.actor))
+        # Authority is the deployment allowlist, read strictly, and it is checked BEFORE
+        # the lock: a non-operator creates no coordination-lock file and reserves nothing.
+        # Inside the lock it is read again and handed to the library, exactly as the
+        # endpoint hands its configured set on (endpoint.py:1801, :2213).
+        require_configured_operator(args.actor,operators(root,strict=True),
+                                    'record or withdraw a hand-back')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        request=dict(payload)
+        request.pop('actor',None)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            authority=operators(root,strict=True)
+            require_configured_operator(args.actor,authority,'record or withdraw a hand-back')
+            print(json.dumps(followon_records.apply(request,args.actor,run,path,operators=authority),
+                             ensure_ascii=False))
     elif args.command=='requirement-backfill':
         import fcntl
         from requirement_records import backfill
@@ -10167,6 +10687,17 @@ def main():
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         which=capability_misses.REFERENCE if args.command=='reference-misses-clear' else capability_misses.CAPABILITY
         print(json.dumps(dict(capability_misses.clear(path,which),project=args.project)))
+    elif args.command=='sweep-temporaries':
+        # Only a crash's leftover temporary: a unique <name>.tmp-<pid>-<hex> named exactly as
+        # coordination.temporary_name makes it, only inside this project's own families, and
+        # only older than the bound. No tracker write, no coordination lock, no bd call and no
+        # allowlist; no family is read or rewritten.
+        if args.min_age_minutes<5:
+            raise ValueError('--min-age-minutes must be at least 5: a live writer renames its temporary within one '
+                             'write, and a shorter bound could remove a temporary that is still in use')
+        print(json.dumps(sweep_project_temporaries(root,args.project,dry_run=args.dry_run,
+                                                   min_age_seconds=args.min_age_minutes*60),
+                         sort_keys=True,indent=1))
     elif args.command=='capability-verify':
         import contextlib
         import fcntl
@@ -10608,7 +11139,8 @@ def main():
               'now, with the operator and reason recorded on it%s. The reader says: %s'
               %('' if kept is None else '; the history this replaced was kept beside the runtime as %s'%kept.name,
                 note),file=sys.stderr)
-    elif args.command=='backup':backup_projects(root,args.projects,args.all_projects)
+    elif args.command=='backup':backup_projects(root,args.projects,args.all_projects,
+                                                   getattr(args,'http_state',None))
     elif args.command=='backup-schedule':
         from keyed_records import require_configured_operator
         require_configured_operator(args.actor,operators(root,strict=True),'record a backup schedule note')
@@ -10655,6 +11187,22 @@ def main():
                 print('The merge slot of %s could not be read at all, and no merge-create run mends that: check '
                       'the project\'s database, its Dolt server coordinates and the name itself first.'
                       %', '.join(report['unreadable']),file=sys.stderr)
+            raise SystemExit(1)
+    elif args.command=='assignee-names':
+        report,clean=assignee_name_report(root,args.projects,args.state)
+        print(json.dumps(report,sort_keys=True))
+        if not clean:
+            names=report['not_actor']
+            print('assignee-names: %d project(s) have rows whose assignee is not an exact actor id: %s.'
+                  %(len(names),', '.join(names)),file=sys.stderr)
+            if names:
+                print('These rows are listed for a person to decide; this report does NOT recommend a rewrite. '
+                      '`candidates` are the actor ids that currently carry that display name, and a name can be '
+                      'claimed by a newly registered identity that has never acted, so confirm the right owner '
+                      'before any `bd update TASK --assignee ACTOR`.',file=sys.stderr)
+            if report['unreadable']:
+                print('The project(s) %s could not be read at all; check the database, the Dolt server coordinates '
+                      'and the name first.'%', '.join(report['unreadable']),file=sys.stderr)
             raise SystemExit(1)
     elif args.command=='backup-status':
         record=read_backup_status(root)
@@ -10813,6 +11361,15 @@ def main():
             finally:
                 restoring.close()
         print('Restored only into the newly created project; retained original issue IDs. Never use this clone as a second live tracker.')
+        # kittrial-5bb.331: the HTTP state pair comes back ONLY on the explicit request.
+        if getattr(args,'restore_http_state',False):
+            print(restore_http_state(root))
+        else:
+            # 'left unrestored', never 'NOT restored': a restore prints that phrase for
+            # capability verifiers (tests pin its absence), and this line must not collide.
+            print('The HTTP state pair in this backup set (accounts, agents, memberships) was left '
+                  'unrestored: pass --restore-http-state to restore it. Restoring it INVALIDATES every '
+                  'session recorded in it - users and agents must sign in again.')
         # A backup recorded degraded restores its tracker, and nothing says what is
         # missing unless this does (kittrial-5bb.105). The run record is advisory here:
         # an unreadable one must not fail a restore that has already succeeded.
@@ -10934,16 +11491,19 @@ def kit_refusal(error):
 def run_main():
     """``main()`` with the command-line exits: a failure is one line, never a traceback.
 
-    A refusal (``ValueError``) ends with the same last line a traceback would have,
-    ``ValueError: <message>``, so anything that reads that line is unaffected. Only the
-    kit's own refusals are shortened (``kit_refusal``): any other error, including a
-    ``ValueError`` subclass from the standard library such as ``JSONDecodeError``, keeps
-    its traceback, because the traceback is the only thing that says where it came from.
+    Kit refusals keep the ``ValueError: `` prefix; concrete kit exception names follow it,
+    except for ``ConfigurationUnreadable`` whose existing one-line text is a compatibility
+    contract. Embedded line breaks are escaped. Only the kit's own refusals are shortened
+    (``kit_refusal``): any other error, including a ``ValueError`` subclass from the
+    standard library such as ``JSONDecodeError``, keeps its traceback, because the traceback
+    is the only thing that says where it came from.
     """
     try: main()
     except ValueError as e:
         if not kit_refusal(e):raise
-        raise SystemExit('ValueError: %s'%e)
+        message=str(e).replace('\r','\\r').replace('\n','\\n')
+        class_name = '' if type(e) in (ValueError, ConfigurationUnreadable) else type(e).__name__ + ': '
+        raise SystemExit('ValueError: %s%s'%(class_name,message))
     except subprocess.CalledProcessError as e:
         # Never echo credential-bearing command input or the environment.
         raise SystemExit(f'Command failed ({e.returncode}): {e.stderr[:2000]}')

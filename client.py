@@ -16,14 +16,17 @@ if sys.version_info < (3, 10):
                      % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
     sys.exit(2)
 import argparse
+import datetime
 import difflib
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
 import re
+import time
 from pathlib import Path
 
 CLIENT_VERSION = "0.1.0"
@@ -263,6 +266,644 @@ def _capabilities_module():
         sys.dont_write_bytecode = write_bytecode
     return module
 
+def _load_sibling_waiting(module_path):
+    """A sibling ``waiting.py`` loaded by path under a name of its own, bytecode off.
+
+    Used only when an unrelated ``waiting`` module shadows the sibling on ``sys.path``:
+    the file beside the client is what the client means, never the other module.
+    """
+    import importlib.util
+    if not module_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location('orchestra_waiting', module_path)
+    module = importlib.util.module_from_spec(spec)
+    write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = write_bytecode
+    return module
+
+def _waiting_module():
+    """``waiting.py`` from this client's own directory, or None for the inlined copy.
+
+    A worker machine is handed ``client.py`` ON ITS OWN, so the wait logic cannot live
+    only in the separate module; a stand-alone copy has no ``waiting.py`` beside it and
+    uses :class:`_InlineWait` instead. When the sibling file IS there (the kit's own
+    checkout and the kit's tests) that module is used, so inside the kit there is one
+    implementation in play. An unrelated ``waiting`` module elsewhere on ``sys.path`` is
+    never used: the sibling file must exist, and an import that resolved elsewhere is
+    replaced by the sibling loaded by path.
+    """
+    sibling = Path(__file__).resolve().parent/'waiting.py'
+    if not sibling.is_file():
+        return None
+    try:
+        import waiting
+    except ImportError:
+        return _load_sibling_waiting(sibling)
+    module_file = getattr(waiting,'__file__',None)
+    if module_file and Path(module_file).resolve() == sibling:
+        return waiting
+    return _load_sibling_waiting(sibling)
+
+class _InlineWait:
+    """The wait view, fingerprint and poll loop, inlined so a stand-alone client can wait.
+
+    A worker machine is handed ``client.py`` ON ITS OWN (docs/CLI_CONTRACT.md), but the
+    wait logic of kittrial-5bb.285 lived only in ``waiting.py``, which such a copy does
+    not have, so every stand-alone ``client.py wait`` failed with
+    ``ModuleNotFoundError: No module named 'waiting'`` (kittrial-5bb.304). This class is
+    the client's own copy of the projection, the fingerprint and the loop, used when no
+    sibling ``waiting.py`` is present (:func:`_waiting_module`).
+
+    It is a full implementation, not a silent degradation: a stand-alone client answers
+    exactly what a kit client answers. ``waiting.py`` stays the module the endpoint and
+    the kit's own tests use, and ``tests/test_standalone_client_wait.py`` drives both
+    over one corpus of rows and fails if the view, the fingerprint, the bounds or the
+    loop's answers differ, so the two copies cannot drift apart.
+    """
+    WAIT_SCHEMA = 'wait-v1'
+    DEFAULT_INTERVAL = 300
+    MIN_INTERVAL = 60
+    DEFAULT_IDLE_MINUTES = 15
+    IDLE_MINUTES_MIN, IDLE_MINUTES_MAX = 1, 10080
+    EXIT_WORK = 0
+    EXIT_TIMEOUT = 1
+    EXIT_USAGE = 2
+    EXIT_UNREACHABLE = 3
+    MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor',
+                   'contribution_id', 'pending_review_items', 'open_items', 'blocking_items',
+                   'checkpoint_at', 'newer_activity', 'newer_activity_marker',
+                   'redelivered', 'guidance_version')
+    COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
+                            'checkpoint-to-coordinator', 'lane-quiet')
+    LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')
+    AWAITING_REVIEW_STATES = ('awaiting-review', 'legacy-review-ready')
+    AWAITING_INTEGRATION_STATES = ('awaiting-integration', 'approved')
+    FINGERPRINT = 'wait1:'
+    DEFAULT_MAX_TIMEOUT = 3600
+    DEFAULT_GIVE_UP_AFTER = 12 * 60 * 60
+    DOUBLING_AFTER = 2
+    WAIT_STATE_SCHEMA = 'wait-state-v1'
+    WAIT_STATE_NAME = '.orchestra-wait-state.json'
+    MAX_STATE_ITEMS = 100
+    MAX_STATE_TEXT = 200
+    MAX_STATE_LIST = 20
+    MAX_STATE_BYTES = 64 * 1024
+    _INSTANT = re.compile(r'^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})'
+                          r'(?:\.(\d{1,6}))?(?:[Zz]|([+-])(\d{2}):?(\d{2}))$')
+    _INSTANT_ADVICE = ('Invalid wait: --idle-since takes an ISO-8601 time with an offset '
+                       '(for example 2026-10-17T15:00:00-04:00)')
+    _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+    class Parser(argparse.ArgumentParser):
+        def error(self, message):
+            raise ValueError(message)
+
+    class WaitUnreachable(Exception):
+        """The service could not be reached, or did not answer a wait read (exit 3)."""
+
+    class WaitRefused(Exception):
+        """The endpoint reached but refused the read (exit 2)."""
+
+    @staticmethod
+    def _scalar(value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        return str(value)
+
+    @staticmethod
+    def normalize_item(item):
+        if not isinstance(item, dict):
+            return {}
+        row = {name: _InlineWait._scalar(item.get(name)) for name in _InlineWait.MOVE_FIELDS}
+        attention = item.get('attention')
+        if isinstance(attention, dict):
+            for name in ('open_items', 'blocking_items', 'checkpoint_at', 'newer_activity',
+                         'newer_activity_marker', 'redelivered', 'pending_review_items'):
+                if row.get(name) is None and name in attention:
+                    row[name] = _InlineWait._scalar(attention.get(name))
+        if not isinstance(row.get('pending_review_items'), int):
+            pending = item.get('open_requests')
+            if isinstance(pending, int):
+                row['pending_review_items'] = pending
+            else:
+                ids = item.get('pending_request_ids')
+                if isinstance(ids, (list, tuple)):
+                    row['pending_review_items'] = len(ids)
+        if row.get('contribution_id') is None:
+            contribution = item.get('contribution')
+            if isinstance(contribution, dict) and contribution.get('id') is not None:
+                row['contribution_id'] = _InlineWait._scalar(contribution.get('id'))
+        for name in ('newer_activity_by_others', 'newer_activity_own',
+                     'newer_activity_coverage', 'unresolved_directions'):
+            if row.get(name) is None:
+                value = item.get(name)
+                if value is None and isinstance(attention, dict):
+                    value = attention.get(name)
+                row[name] = _InlineWait._scalar(value)
+        return row
+
+    @staticmethod
+    def _fingerprinted(row):
+        return {name: row.get(name) for name in _InlineWait.MOVE_FIELDS}
+
+    @staticmethod
+    def _canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+
+    @staticmethod
+    def _sorted_rows(rows):
+        return sorted(rows, key=lambda row: (str(row.get('task') or row.get('lane') or ''),
+                                             _InlineWait._canonical(row)))
+
+    @staticmethod
+    def digest(value):
+        return _InlineWait.FINGERPRINT + hashlib.sha256(
+            _InlineWait._canonical(value).encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def fingerprint(items):
+        return _InlineWait.digest(_InlineWait._sorted_rows(
+            [_InlineWait._fingerprinted(_InlineWait.normalize_item(item))
+             for item in items if isinstance(item, dict)]))
+
+    @staticmethod
+    def is_fingerprint(value):
+        return bool(isinstance(value, str) and len(value) == len(_InlineWait.FINGERPRINT) + 64
+                    and value.startswith(_InlineWait.FINGERPRINT)
+                    and all(character in '0123456789abcdef'
+                            for character in value[len(_InlineWait.FINGERPRINT):]))
+
+    @staticmethod
+    def state_path(config_path, project=None, actor=None, form='worker'):
+        """The client's small wait cache beside its config (Python 3.6 syntax)."""
+        if not config_path:
+            return None
+        directory = os.path.dirname(os.path.abspath(config_path))
+        identity = '\x00'.join(str(value or '') for value in (project, actor, form))
+        suffix = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
+        stem, extension = os.path.splitext(_InlineWait.WAIT_STATE_NAME)
+        return os.path.join(directory, '%s-%s%s' % (stem, suffix, extension))
+
+    @staticmethod
+    def _state_value(value, depth=0):
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value[:_InlineWait.MAX_STATE_TEXT]
+        if isinstance(value, (list, tuple)):
+            if depth >= 4:
+                return str(value)[:_InlineWait.MAX_STATE_TEXT]
+            return [_InlineWait._state_value(item, depth + 1)
+                    for item in list(value)[:_InlineWait.MAX_STATE_LIST]]
+        text = str(value)
+        return text[:_InlineWait.MAX_STATE_TEXT]
+
+    @staticmethod
+    def _state_row(row):
+        return dict((name, _InlineWait._state_value(row[name])) for name in sorted(row))
+
+    @staticmethod
+    def read_state(path):
+        """The state last written at ``path``, or ``None`` (a bad file is absent)."""
+        if not path:
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                text = handle.read(_InlineWait.MAX_STATE_BYTES + 1)
+            if len(text) > _InlineWait.MAX_STATE_BYTES:
+                return None
+            value = json.loads(text)
+        except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
+            return None
+        if not isinstance(value, dict) or value.get('schema') != _InlineWait.WAIT_STATE_SCHEMA:
+            return None
+        remembered = value.get('fingerprint')
+        if not _InlineWait.is_fingerprint(remembered):
+            remembered = None
+        items = value.get('items')
+        if not isinstance(items, list):
+            items = []
+        items = [_InlineWait._state_row(item) for item in items[:_InlineWait.MAX_STATE_ITEMS]
+                 if isinstance(item, dict)]
+        return {'schema': _InlineWait.WAIT_STATE_SCHEMA,
+                'fingerprint': remembered, 'items': items}
+
+    @staticmethod
+    def write_state(path, fingerprint, items):
+        """Write the cache atomically; a failure is ignored so a wait never fails."""
+        if not path or not _InlineWait.is_fingerprint(fingerprint) or not isinstance(items, list):
+            return False
+        payload = {'schema': _InlineWait.WAIT_STATE_SCHEMA, 'fingerprint': fingerprint,
+                   'items': [_InlineWait._state_row(item)
+                             for item in items[:_InlineWait.MAX_STATE_ITEMS]
+                             if isinstance(item, dict)]}
+
+        def encoded(value):
+            return json.dumps(value, ensure_ascii=True, sort_keys=True,
+                              separators=(',', ':'))
+
+        try:
+            text = encoded(payload)
+        except (ValueError, TypeError):
+            return False
+        if len(text) > _InlineWait.MAX_STATE_BYTES:
+            payload['items'] = []
+            try:
+                text = encoded(payload)
+            except (ValueError, TypeError):
+                return False
+            if len(text) > _InlineWait.MAX_STATE_BYTES:
+                return False
+        temporary = '%s.%d.tmp' % (path, os.getpid())
+        try:
+            with open(temporary, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+                handle.write('\n')
+            os.replace(temporary, path)
+        except (OSError, ValueError, TypeError, UnicodeError):
+            try:
+                if os.path.exists(temporary):
+                    os.remove(temporary)
+            except OSError:
+                pass
+            return False
+        return True
+
+    @staticmethod
+    def _item_key(row):
+        for name in ('task', 'lane'):
+            if row.get(name) is not None:
+                return str(row.get(name))
+        return _InlineWait.digest(row)
+
+    @staticmethod
+    def _keyed_items(items):
+        keyed = {}
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            key = _InlineWait._item_key(item)
+            if key in keyed:
+                number = 2
+                while '%s#%d' % (key, number) in keyed:
+                    number += 1
+                key = '%s#%d' % (key, number)
+            keyed[key] = _InlineWait._state_row(item)
+        return keyed
+
+    @staticmethod
+    def changed_items(old_items, new_items):
+        """Changed fields old -> new, and the items added and removed (item 6)."""
+        old = _InlineWait._keyed_items(old_items)
+        new = _InlineWait._keyed_items(new_items)
+        tasks = []
+        for key in sorted(set(old) & set(new)):
+            fields = []
+            for name in sorted(set(old[key]) | set(new[key])):
+                before, after = old[key].get(name), new[key].get(name)
+                if before != after:
+                    fields.append({'field': name, 'old': before, 'new': after})
+            if fields:
+                tasks.append({'task': key, 'fields': fields})
+        return {'tasks': tasks,
+                'added': sorted(set(new) - set(old)),
+                'removed': sorted(set(old) - set(new))}
+
+    @staticmethod
+    def parse_instant(text):
+        """The epoch seconds of an ISO-8601 instant with an offset (Python 3.6 syntax)."""
+        if not isinstance(text, str):
+            raise ValueError(_InlineWait._INSTANT_ADVICE)
+        match = _InlineWait._INSTANT.match(text.strip())
+        if match is None:
+            raise ValueError(_InlineWait._INSTANT_ADVICE)
+        if match.group(8) is not None:
+            hours, minutes = int(match.group(9)), int(match.group(10))
+            if hours > 23 or minutes > 59:
+                raise ValueError(_InlineWait._INSTANT_ADVICE)
+            offset = datetime.timedelta(hours=hours, minutes=minutes)
+            if match.group(8) == '-':
+                offset = -offset
+        else:
+            offset = datetime.timedelta(0)
+        fraction = match.group(7) or ''
+        micro = int((fraction + '000000')[:6])
+        try:
+            moment = datetime.datetime(int(match.group(1)), int(match.group(2)),
+                                       int(match.group(3)), int(match.group(4)),
+                                       int(match.group(5)), int(match.group(6)), micro,
+                                       tzinfo=datetime.timezone(offset))
+        except (ValueError, OverflowError):
+            raise ValueError(_InlineWait._INSTANT_ADVICE) from None
+        return (moment - _InlineWait._EPOCH).total_seconds()
+
+    @staticmethod
+    def format_instant(epoch):
+        """The ISO-8601 UTC spelling of an epoch; fractional only when it is there."""
+        moment = _InlineWait._EPOCH + datetime.timedelta(seconds=float(epoch))
+        if moment.microsecond:
+            return moment.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        return moment.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    @staticmethod
+    def _seconds(value):
+        value = float(value)
+        return int(value) if value.is_integer() else value
+
+    @staticmethod
+    def timeout_cap(base, max_timeout):
+        cap = _InlineWait.DEFAULT_MAX_TIMEOUT if max_timeout is None else max_timeout
+        return max(base, cap)
+
+    @staticmethod
+    def schedule_timeout(index, base, cap):
+        if base <= 0:
+            return 0
+        if index <= _InlineWait.DOUBLING_AFTER:
+            return base
+        if index - _InlineWait.DOUBLING_AFTER > 62:
+            return cap
+        return min(base * float(2 ** (index - _InlineWait.DOUBLING_AFTER)), cap)
+
+    @staticmethod
+    def empty_returns(elapsed, base, cap):
+        if base <= 0:
+            return 0
+        remaining = max(0.0, float(elapsed))
+        count = 0
+        index = 1
+        while True:
+            step = _InlineWait.schedule_timeout(index, base, cap)
+            if step >= cap:
+                if remaining >= step:
+                    count += int(remaining // step)
+                return count
+            if remaining < step:
+                return count
+            remaining -= step
+            count += 1
+            index += 1
+
+    @staticmethod
+    def wait_command(prefix, fingerprint, idle_since, timeout,
+                     interval=DEFAULT_INTERVAL, form='worker',
+                     idle_minutes=DEFAULT_IDLE_MINUTES, max_timeout=None,
+                     give_up_after=DEFAULT_GIVE_UP_AFTER):
+        parts = [prefix, 'wait']
+        if form == 'coordinator':
+            parts += ['--coordinator', '--idle-minutes', str(idle_minutes)]
+        parts += ['--interval', str(_InlineWait._seconds(interval))]
+        if fingerprint:
+            parts += ['--since', fingerprint]
+        parts += ['--idle-since', idle_since, '--timeout',
+                  str(_InlineWait._seconds(timeout))]
+        if max_timeout is not None:
+            parts += ['--max-timeout', str(_InlineWait._seconds(max_timeout))]
+        if give_up_after != _InlineWait.DEFAULT_GIVE_UP_AFTER:
+            parts += ['--give-up-after', str(_InlineWait._seconds(give_up_after))]
+        return ' '.join(parts)
+
+    @staticmethod
+    def movement(items):
+        return _InlineWait._sorted_rows([_InlineWait.normalize_item(item) for item in items or []
+                                         if isinstance(item, dict)
+                                         and item.get('whose_move') == 'you'])
+
+    @staticmethod
+    def worker_view(items):
+        rows = _InlineWait.movement(items)
+        return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'worker', 'items': rows,
+                'fingerprint': _InlineWait.digest(_InlineWait._sorted_rows(
+                    [_InlineWait._fingerprinted(row) for row in rows]))}
+
+    @staticmethod
+    def _lane_row(lane, entry=None):
+        if entry is None:
+            return {'lane': _InlineWait._scalar(lane.get('lane')),
+                    'actor': _InlineWait._scalar(lane.get('actor')),
+                    'task': None, 'state': _InlineWait._scalar(lane.get('state')),
+                    'waiting_on': _InlineWait._scalar(lane.get('waiting_on')),
+                    'whose_move': None, 'next_actor': None, 'review_state': None,
+                    'flags': sorted(set(lane.get('flag_tasks') or {}))}
+        return {'lane': _InlineWait._scalar(lane.get('lane')),
+                'actor': _InlineWait._scalar(lane.get('actor')),
+                'task': _InlineWait._scalar(entry.get('task')),
+                'state': _InlineWait._scalar(entry.get('state')),
+                'waiting_on': _InlineWait._scalar(entry.get('waiting_on')),
+                'whose_move': _InlineWait._scalar(entry.get('whose_move')),
+                'next_actor': _InlineWait._scalar(entry.get('next_actor')),
+                'review_state': _InlineWait._scalar(entry.get('review_state')),
+                'flags': sorted(set(entry.get('flags') or []))}
+
+    @staticmethod
+    def coordinator_view(queue_items, lanes_payload):
+        lanes = lanes_payload if isinstance(lanes_payload, dict) else {}
+        triggers = {name: [] for name in _InlineWait.COORDINATOR_TRIGGERS}
+        for item in queue_items or []:
+            if not isinstance(item, dict):
+                continue
+            state = item.get('review_state') or item.get('work_state')
+            if state in _InlineWait.AWAITING_REVIEW_STATES and item.get('contribution_id'):
+                triggers['awaiting-review'].append(_InlineWait.normalize_item(item))
+            elif state in _InlineWait.AWAITING_INTEGRATION_STATES:
+                triggers['awaiting-integration'].append(_InlineWait.normalize_item(item))
+        for lane in lanes.get('items') or []:
+            if not isinstance(lane, dict):
+                continue
+            lane_flags = set()
+            for name in _InlineWait.LANE_FLAGS:
+                if lane.get(name):
+                    lane_flags.add(name)
+            lane_flags.update(name for name in (lane.get('flag_tasks') or {})
+                              if name in _InlineWait.LANE_FLAGS)
+            if lane_flags:
+                row = _InlineWait._lane_row(lane)
+                row['flags'] = sorted(lane_flags)
+                triggers['lane-quiet'].append(row)
+            for entry in lane.get('held') or []:
+                if not isinstance(entry, dict):
+                    continue
+                addressed = (entry.get('state') == 'waiting-on-coordinator'
+                             or entry.get('waiting_on') == 'coordinator'
+                             or entry.get('next_actor') == 'coordinator')
+                if addressed:
+                    triggers['checkpoint-to-coordinator'].append(_InlineWait._lane_row(lane, entry))
+        grouped = {name: _InlineWait._sorted_rows(rows) for name, rows in triggers.items()}
+        flat = [dict(row, trigger=name) for name in _InlineWait.COORDINATOR_TRIGGERS
+                for row in grouped[name]]
+        fingerprinted = {name: _InlineWait._sorted_rows(
+            [_InlineWait._fingerprinted(row) for row in rows])
+            for name, rows in triggers.items()}
+        return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
+                'items': flat, 'fingerprint': _InlineWait.digest(fingerprinted)}
+
+    @staticmethod
+    def parse_read_args(args):
+        parser = _InlineWait.Parser(prog='wait', add_help=False)
+        parser.add_argument('--coordinator', action='store_true')
+        parser.add_argument('--idle-minutes', type=int, default=_InlineWait.DEFAULT_IDLE_MINUTES,
+                            dest='idle_minutes')
+        parser.add_argument('--json', action='store_true')
+        parsed = parser.parse_args(args)
+        if not _InlineWait.IDLE_MINUTES_MIN <= parsed.idle_minutes <= _InlineWait.IDLE_MINUTES_MAX:
+            raise ValueError('Invalid wait read: --idle-minutes must be %d..%d'
+                             % (_InlineWait.IDLE_MINUTES_MIN, _InlineWait.IDLE_MINUTES_MAX))
+        return parsed
+
+    @staticmethod
+    def parse_client_args(args):
+        parser = _InlineWait.Parser(prog='wait', add_help=False)
+        parser.add_argument('--coordinator', action='store_true')
+        parser.add_argument('--idle-minutes', type=int, default=_InlineWait.DEFAULT_IDLE_MINUTES,
+                            dest='idle_minutes')
+        parser.add_argument('--interval', type=int, default=_InlineWait.DEFAULT_INTERVAL)
+        parser.add_argument('--timeout', type=float, default=None)
+        parser.add_argument('--since')
+        parser.add_argument('--fresh', action='store_true')
+        parser.add_argument('--idle-since')
+        parser.add_argument('--max-timeout', type=float, default=None, dest='max_timeout')
+        parser.add_argument('--give-up-after', type=float,
+                            default=_InlineWait.DEFAULT_GIVE_UP_AFTER, dest='give_up_after')
+        parser.add_argument('--json', action='store_true')
+        parsed = parser.parse_args(args)
+        if parsed.interval < _InlineWait.MIN_INTERVAL:
+            raise ValueError('Invalid wait: --interval must be at least %d seconds (the default is %d)'
+                             % (_InlineWait.MIN_INTERVAL, _InlineWait.DEFAULT_INTERVAL))
+        if parsed.timeout is not None and parsed.timeout < 0:
+            raise ValueError('Invalid wait: --timeout must be zero or more seconds')
+        if parsed.since is not None and not _InlineWait.is_fingerprint(parsed.since):
+            raise ValueError('Invalid wait: --since takes a fingerprint this kit printed '
+                             '(wait1:<64 hex>)')
+        if parsed.idle_since is not None:
+            _InlineWait.parse_instant(parsed.idle_since)
+        if parsed.max_timeout is not None and parsed.max_timeout <= 0:
+            raise ValueError('Invalid wait: --max-timeout must be more than zero seconds')
+        if parsed.give_up_after <= 0:
+            raise ValueError('Invalid wait: --give-up-after must be more than zero seconds')
+        if not _InlineWait.IDLE_MINUTES_MIN <= parsed.idle_minutes <= _InlineWait.IDLE_MINUTES_MAX:
+            raise ValueError('Invalid wait: --idle-minutes must be %d..%d'
+                             % (_InlineWait.IDLE_MINUTES_MIN, _InlineWait.IDLE_MINUTES_MAX))
+        return parsed
+
+    @staticmethod
+    def read_args(options):
+        args = []
+        if options.coordinator:
+            args += ['--coordinator', '--idle-minutes', str(options.idle_minutes)]
+        return args
+
+    @staticmethod
+    def run_wait(read, since=None, timeout=None, interval=DEFAULT_INTERVAL,
+                 clock=None, sleep=None, form=None, idle_since=None, max_timeout=None,
+                 give_up_after=DEFAULT_GIVE_UP_AFTER, command_prefix='client.py',
+                 idle_minutes=DEFAULT_IDLE_MINUTES, now=None, state_file=None, fresh=False):
+        clock = time.monotonic if clock is None else clock
+        sleep = time.sleep if sleep is None else sleep
+        form = form or 'worker'
+        started = clock()
+        polls = 0
+        state = _InlineWait.read_state(state_file)
+        previous = state.get('items') if state else []
+        remembered = None if fresh or state is None else state.get('fingerprint')
+        resumed = since if since is not None else remembered
+        scheduled = idle_since is not None and timeout is not None
+        if scheduled:
+            idle_started = _InlineWait.parse_instant(idle_since)
+            wall_now = time.time() if now is None else now
+            idle_before = max(0.0, wall_now - idle_started)
+            cap = _InlineWait.timeout_cap(timeout, max_timeout)
+
+        def with_schedule(view, elapsed, reset):
+            if not scheduled:
+                return view
+            fingerprint = view.get('fingerprint')
+            if reset:
+                fields = {
+                    'next_timeout': _InlineWait._seconds(timeout),
+                    'next_command': _InlineWait.wait_command(
+                        command_prefix, fingerprint, _InlineWait.format_instant(wall_now + elapsed),
+                        timeout, interval, form, idle_minutes, max_timeout, give_up_after),
+                    'give_up': False,
+                }
+                return dict(view, **fields)
+            idle_elapsed = idle_before + elapsed
+            done = _InlineWait.empty_returns(idle_elapsed, timeout, cap)
+            upcoming = _InlineWait.schedule_timeout(done + 1, timeout, cap)
+            give_up = idle_elapsed >= give_up_after
+            fields = {
+                'next_timeout': _InlineWait._seconds(upcoming),
+                'next_command': _InlineWait.wait_command(
+                    command_prefix, fingerprint, idle_since, upcoming, interval, form,
+                    idle_minutes, max_timeout, give_up_after),
+                'give_up': give_up,
+            }
+            if give_up:
+                fields['message'] = ('checkpoint and stop: nothing has been your move since %s'
+                                     % idle_since)
+            return dict(view, **fields)
+
+        def remember(view):
+            if state_file is not None:
+                _InlineWait.write_state(state_file, view.get('fingerprint'),
+                                        view.get('items') or [])
+
+        def with_changes(view):
+            if state_file is None:
+                return view
+            return dict(view, changed=_InlineWait.changed_items(
+                previous, view.get('items') or []))
+
+        while True:
+            polls += 1
+            try:
+                view = read()
+            except _InlineWait.WaitUnreachable as error:
+                return _InlineWait.EXIT_UNREACHABLE, {
+                    'schema': _InlineWait.WAIT_SCHEMA, 'form': form,
+                    'fingerprint': None, 'items': [],
+                    'error': 'the service cannot be reached: %s' % str(error)[:240],
+                    'polls': polls}
+            except _InlineWait.WaitRefused as error:
+                return _InlineWait.EXIT_USAGE, {
+                    'schema': _InlineWait.WAIT_SCHEMA, 'form': form,
+                    'fingerprint': None, 'items': [],
+                    'error': str(error)[:300], 'polls': polls}
+            if not isinstance(view, dict):
+                return _InlineWait.EXIT_UNREACHABLE, {
+                    'schema': _InlineWait.WAIT_SCHEMA, 'form': form,
+                    'fingerprint': None, 'items': [],
+                    'error': 'the service cannot be reached: it did not answer a wait read',
+                    'polls': polls}
+            if resumed is None:
+                if view.get('items'):
+                    answer = with_changes(with_schedule(
+                        dict(view, polls=polls), clock() - started, reset=True))
+                    remember(answer)
+                    return _InlineWait.EXIT_WORK, answer
+            elif view.get('fingerprint') != resumed:
+                answer = with_changes(with_schedule(
+                    dict(view, polls=polls), clock() - started,
+                    reset=bool(view.get('items'))))
+                remember(answer)
+                return _InlineWait.EXIT_WORK, answer
+            elapsed = clock() - started
+            if timeout is not None and elapsed >= timeout:
+                answer = with_schedule(dict(view, polls=polls, timed_out=True), elapsed,
+                                       reset=False)
+                remember(answer)
+                return _InlineWait.EXIT_TIMEOUT, answer
+            nap = interval if timeout is None else min(interval, max(0.0, timeout - elapsed))
+            if nap <= 0:
+                answer = with_schedule(dict(view, polls=polls, timed_out=True), elapsed,
+                                       reset=False)
+                remember(answer)
+                return _InlineWait.EXIT_TIMEOUT, answer
+            sleep(nap)
+
 def _emit(code,stdout,stderr,out):
     """Same client-owned capture as the endpoint actions: UTF-8, LF, no BOM, and no
     file at all on a nonzero exit."""
@@ -272,6 +913,92 @@ def _emit(code,stdout,stderr,out):
                 capture.write(stdout)
         sys.stderr.write(stderr);return code
     sys.stdout.write(stdout);sys.stderr.write(stderr);return code
+
+def _wait_client_prefix(config_path,project,actor):
+    """How this caller invokes the client, as the prefix of the printed ``next_command``.
+
+    ``wait`` runs on the worker's machine, so the command it prints must name the same
+    interpreter, client, config, project and actor this invocation used; otherwise an
+    agent copying the line would wait on the wrong project. Paths are shell-quoted for
+    POSIX, where the wait loop's examples live (a Windows wrapper is a process, not this
+    one line, on that platform).
+    """
+    tokens = [sys.executable or 'python3',str(Path(__file__).resolve())]
+    if config_path:
+        tokens += ['--config',str(config_path)]
+    if project:
+        tokens += ['--project',str(project)]
+    if actor:
+        tokens += ['--actor',str(actor)]
+    return ' '.join(shlex.quote(token) for token in tokens)
+
+def _wait_command(args,config,project,actor,out,config_path=None):
+    """``client.py wait``: block until something is the caller's move (kittrial-5bb.285).
+
+    The blocking is HERE, in the client, because the harness that wakes a model holds the
+    process; the endpoint is asked for one cheap read per poll (the ``wait`` action, one
+    ``work`` read, the shared project lock of kittrial-5bb.281) and never for a blocking
+    call, so the same read serves an agent over HTTP.
+
+    The loop, the projection and the fingerprint are the sibling :mod:`waiting` when it is
+    beside this client (the kit's own checkout and tests); a stand-alone ``client.py``
+    has no such module and uses the inlined :class:`_InlineWait` copy instead, which
+    ``tests/test_standalone_client_wait.py`` holds to ``waiting.py`` (kittrial-5bb.304).
+    This function is only the transport around whichever of the two is in play.
+
+    The exit codes are the task's: 0 something is the caller's move (rows and fingerprint
+    on stdout), 1 the ``--timeout`` ran out, 2 the arguments or the endpoint refused, 3 the
+    service could not be reached. ``--since FINGERPRINT`` is the state the caller already
+    saw, so a restart whose read has not changed blocks instead of returning it again.
+    """
+    wait = _waiting_module() or _InlineWait
+    try:
+        options = wait.parse_client_args(args)
+    except ValueError as error:
+        sys.stderr.write('ValueError: %s\n' % error)
+        return wait.EXIT_USAGE
+    endpoint_args = wait.read_args(options)
+
+    def read():
+        try:
+            result = request(config,project,actor,endpoint_args,'wait')
+        except (RuntimeError,ValueError,OSError) as error:
+            # The transport said the service could not be reached: not a usage error.
+            raise wait.WaitUnreachable(str(error)[:300]) from None
+        if not isinstance(result,dict):
+            raise wait.WaitUnreachable('the service did not answer a wait read')
+        if result.get('returncode'):
+            detail = (result.get('stderr') or '').strip().split('\n')[-1:] or ['the endpoint refused the wait read']
+            raise wait.WaitRefused(server_text(detail[-1])[:300])
+        try:
+            return json.loads(result.get('stdout') or '')
+        except (ValueError,TypeError) as error:
+            raise wait.WaitUnreachable('Invalid wait response: %s' % str(error)[:200]) from None
+
+    form = 'coordinator' if options.coordinator else 'worker'
+    code,view = wait.run_wait(read,since=options.since,timeout=options.timeout,
+                              interval=options.interval,
+                              form=form,
+                              idle_since=options.idle_since,
+                              max_timeout=options.max_timeout,
+                              give_up_after=options.give_up_after,
+                              command_prefix=_wait_client_prefix(config_path,project,actor),
+                              idle_minutes=options.idle_minutes,
+                              state_file=wait.state_path(config_path,project,actor,form),
+                              fresh=options.fresh)
+    text = json.dumps(view,ensure_ascii=True,indent=2)+'\n'
+    if out:
+        # The wait result is a result at every exit code, so --out writes it too; a
+        # failure to write it is the only usage error here.
+        try:
+            with open(out,'w',encoding='utf-8',newline='') as capture:
+                capture.write(text)
+        except OSError as error:
+            sys.stderr.write('ValueError: --out: %s\n' % error)
+            return wait.EXIT_USAGE
+    else:
+        sys.stdout.write(text)
+    return code
 
 def _capability(args,out):
     """Client-side, read-only capability lookup over the caller's own checkout.
@@ -532,6 +1259,7 @@ CONTRIBUTOR_COMMANDS = (
     ('history TASK', "the task's comments and review records, newest first"),
     ('checkpoint TASK --file FILE', 'record where you are on a task, for the next run'),
     ('work', 'the tasks whose move is yours, and the ones you may claim'),
+    ('wait', 'block until something is your move, then print it and its fingerprint'),
     ('ready', 'the tasks nobody holds that you may claim'),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
     ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
@@ -580,7 +1308,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
 CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','work',
-                  'feedback','requirement','requirements','ref','capability','proposal','guidance',
+                  'wait','feedback','requirement','requirements','ref','capability','proposal','guidance',
                   'coordinator')
 
 
@@ -659,6 +1387,12 @@ def main():
     if args[0] not in contributor_command_names():
         print(server_text(contributor_help_text(args[0])), file=sys.stderr)
         return 1
+    # wait blocks HERE, in the client, and polls the endpoint's wait read (kittrial-5bb.285);
+    # the endpoint is therefore asked per poll, never for one blocking call, so an agent over
+    # HTTP can use the same read.
+    if args[0]=='wait':
+        return _wait_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out,
+                             config_path=a.config)
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:

@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb213-web-records-0001",
+  "key": "records.web-reference-and-capability",
+  "name": "Reference and capability records over the web for members and coordinators",
+  "aliases": [
+    "web reference records",
+    "web capability records",
+    "records page",
+    "waiting to be accepted",
+    "two-step revise then accept",
+    "web coordinator slice 5",
+    "pointers_validation",
+    "web capability verify",
+    "web capability retire"
+  ],
+  "summary": "Project members with the records capability (contributors, coordinators and owners, or their agents and worker credentials with tasks scope) propose and revise reference and capability records and propose capability aliases over HTTP and on #/p/NAME/records; every project reader lists, finds and inspects records. Signed-in coordinators and owners, and personal agents with the project's coordinator grant while their account coordinates, accept, retire and verify records and reject capability aliases under coordinate; a superuser without project membership is refused on writes, and decide() has no superuser path. Revising an accepted key writes a draft revision under proposed (waiting_acceptance: true); accepting writes the F3 Kind: *-acceptance-v1 evidence and the next accepted revision. Both proposer and acceptor/verifier are recorded; a granted agent never accepts/verifies its own party's draft, and with approval_by_another_party on a human coordinator is also refused on their own party's draft. Capability responses carry pointers_validation, and web acceptances, retirements and verifications stay live after role or grant revocation.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#reference-and-capability-records-over-http",
+    "docs/OPERATIONS.md#reference-and-capability-records"
+  ],
+  "code": [
+    "http_authority.py::required_capability",
+    "http_authority.py::verified_web_authority",
+    "keyed_entries.py::evidence_is_live",
+    "keyed_entries.py::AnchoredKind.entry_view",
+    "keyed_entries.py::AnchoredKind.apply_native",
+    "keyed_entries.py::AnchoredKind.write_spec",
+    "keyed_records.py::apply_native",
+    "reference_records.py::get",
+    "capability_records.py::pointers_validation_of",
+    "capability_records.py::get",
+    "capability_verification.py::verify",
+    "capability_verification.py::is_trusted",
+    "capability_verification.py::build",
+    "http_service.py::ApiHandler.references_list",
+    "http_service.py::ApiHandler.references_find",
+    "http_service.py::ApiHandler.references_get",
+    "http_service.py::ApiHandler.references_propose",
+    "http_service.py::ApiHandler.references_revise",
+    "http_service.py::ApiHandler.references_accept",
+    "http_service.py::ApiHandler.references_retire",
+    "http_service.py::ApiHandler.capabilities_list",
+    "http_service.py::ApiHandler.capabilities_find",
+    "http_service.py::ApiHandler.capabilities_get",
+    "http_service.py::ApiHandler.capabilities_propose",
+    "http_service.py::ApiHandler.capabilities_revise",
+    "http_service.py::ApiHandler.capabilities_accept",
+    "http_service.py::ApiHandler.capabilities_retire",
+    "http_service.py::ApiHandler.capabilities_verify",
+    "http_service.py::ApiHandler.capabilities_alias_propose",
+    "http_service.py::ApiHandler.capabilities_alias_reject",
+    "http_client.py::Client.propose_reference",
+    "http_client.py::Client.propose_capability"
+  ],
+  "tests": [
+    "tests/test_web_records.py",
+    "tests/test_reference_records.py",
+    "tests/test_capability_records.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "web",
+    "records",
+    "reviews"
+  ]
+}

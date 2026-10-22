@@ -131,7 +131,7 @@ class NativeBaselineTests(fixture.RealBdLabelAliasTests):
 
             # Every current human member reads; other identities gain no authority.
             principals = []
-            for role in ('viewer', 'contributor'):
+            for role in ('viewer', 'contributor', 'coordinator'):
                 user = harness.create_account(admin, 'baseline-' + role, 'baseline-' + role + '-password')
                 member_token = harness.login('baseline-' + role, 'baseline-' + role + '-password')[0]
                 assigned = harness.request('PUT', base + '/members/' + user, {'role': role}, token=admin)
@@ -144,6 +144,9 @@ class NativeBaselineTests(fixture.RealBdLabelAliasTests):
             agent = harness.request('POST', '/v1/agents', {'name': 'Native baseline helper',
                 'working_directory': '/tmp/synthetic-worker', 'projects': ['pp']}, token=token)
             self.assertEqual(agent.status, 201, agent.data)
+            grant = harness.request('PUT', base + '/agents/' + agent.data['agent']['id'] + '/coordinator',
+                                    {}, token=token)
+            self.assertEqual(grant.status, 200, grant.data)
             admin_id = harness.service.authenticate(admin).user_id
             self.assertEqual(harness.request('PUT', base + '/members/' + admin_id, {'role': 'contributor'}, token=admin).status, 200)
             before = self.rows()
@@ -171,7 +174,7 @@ class NativeBaselineTests(fixture.RealBdLabelAliasTests):
                                    token=token, key='native-baseline-simple-again')
             self.assertEqual(back.status, 200, back.data)
             self.assertEqual(harness.request('PUT', base + '/members/' + admin_id, {'role': 'owner'}, token=admin).status, 200)
-            self.assertEqual(harness.request('PUT', base + '/members/' + account, {'role': 'contributor'}, token=admin).status, 200)
+            self.assertEqual(harness.request('PUT', base + '/members/' + account, {'role': 'coordinator'}, token=admin).status, 200)
             denied = harness.request('POST', collection, {'name': 'Native-1'}, token=token, key='native-baseline-cut-one')
             self.assertEqual(denied.status, 403, denied.data)
             self.assertEqual(harness.request('PUT', base + '/members/' + account, {'role': 'owner'}, token=admin).status, 200)

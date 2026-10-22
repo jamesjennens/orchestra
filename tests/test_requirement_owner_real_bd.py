@@ -1091,7 +1091,148 @@ except ValueError as error:
             harness._stop_server(); harness.doCleanups()
 
 
+class NativeCoordinatorTests(fixture.RealBdLabelAliasTests):
+    """kittrial-5bb.278 on the pinned tracker: who may write, and who the record names.
+
+    A project's coordinator (a person with the Coordinator role, and an agent holding the
+    project's coordinator grant) creates and accepts requirements through the real HTTP
+    service, the canonical endpoint and the real bd. The acceptance evidence is read back
+    from the native row: its author and its ``account_id`` are the acting human account,
+    and an agent's write names its own human account, never the agent. An agent with no
+    grant is refused with the rule's sentence and writes nothing.
+    """
+    EXPECTED_REFUSAL = ("Editing a project's requirements needs its owner or a coordinator: a "
+                        "signed-in member with the coordinator or owner role, or an agent holding "
+                        "the project's coordinator grant.")
+
+    def rows(self):
+        exported = self.bd('export', '--all')
+        self.assertEqual(exported.returncode, 0, exported.stderr)
+        return record_json.loads_rows(exported.stdout)
+
+    def test_coordinator_person_and_granted_agent_accept_on_the_real_tracker(self):
+        import http_service
+        import requirement_owner_records as owner
+        import test_http_review_fixes as fixes
+        root = self.root
+        for key, value in fixture.admin.PROJECT_SETTINGS:
+            configured = self.bd('config', 'set', key, value)
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+        if self.bd('show', 'pp-merge-slot', '--json').returncode:
+            made = self.bd('create', 'Merge Slot', '--id', 'pp-merge-slot', '--labels', 'gt:slot', '--json')
+            self.assertEqual(made.returncode, 0, made.stderr)
+        made = self.bd('create', 'Coordinator job', '--type', 'epic', '--json')
+        self.assertEqual(made.returncode, 0, made.stderr)
+        job = json.loads(made.stdout)['id']
+
+        class Harness(fixes.Harness):
+            def make_backend(self):
+                return http_service.EndpointBackend(sys.executable, str(KIT/'endpoint.py'),
+                                                    str(root), service=self.service)
+        harness = Harness(methodName='runTest'); harness.setUp()
+        try:
+            admin = harness.admin_token()
+            base = '/v1/projects/pp'
+            owner_account = harness.create_account(admin, 'board-owner', 'board-owner-pw-1')
+            owner_token = harness.login('board-owner', 'board-owner-pw-1')[0]
+            registered = harness.request('POST', '/v1/projects', {'project_id': 'pp',
+                                                                  'name': 'Coordinator flow'}, token=admin)
+            self.assertEqual(registered.status, 201, registered.data)
+            self.assertEqual(harness.request('PUT', base+'/members/'+owner_account,
+                                             {'role': 'owner'}, token=admin).status, 200)
+            coordinator = harness.create_account(admin, 'board-coordinator', 'board-coordinator-pw-1')
+            coordinator_token = harness.login('board-coordinator', 'board-coordinator-pw-1')[0]
+            self.assertEqual(harness.request('PUT', base+'/members/'+coordinator,
+                                             {'role': 'coordinator'}, token=admin).status, 200)
+            # The owner's own agent, in this project, with the coordinator grant.
+            agent = harness.request('POST', '/v1/agents', {
+                'name': 'Heron', 'working_directory': '/tmp/synthetic-heron',
+                'projects': ['pp']}, token=owner_token)
+            self.assertEqual(agent.status, 201, agent.data)
+            agent_id = agent.data['agent']['id']
+            agent_secret = agent.data['credential']['secret']
+            self.assertEqual(harness.request('PUT', base+'/agents/'+agent_id+'/coordinator',
+                                             {}, token=owner_token).status, 200)
+            # A second agent of the same owner with NO grant: refused.
+            plain = harness.request('POST', '/v1/agents', {
+                'name': 'Plover', 'working_directory': '/tmp/synthetic-plover',
+                'projects': ['pp']}, token=owner_token)
+            self.assertEqual(plain.status, 201, plain.data)
+            plain_secret = plain.data['credential']['secret']
+            mode = harness.request('GET', base+'/requirements/governance', token=owner_token)
+            self.assertEqual(mode.status, 200, mode.data)
+            # The borrowed fixture is an existing tracker, not new project provisioning, so
+            # it carries no governance sidecar and reads as governed. The owner switches it
+            # to simple first - the same start the owner flow takes - and that switch stays
+            # the owner's alone (checked below).
+            self.assertEqual(mode.data['mode'], 'governed')
+            # The switch is the owner's alone (owner decision 11(i)), on the real stack too.
+            refused_mode = harness.request('PUT', base+'/requirements/governance', {
+                'mode': 'simple', 'expected_revision': mode.data['revision'],
+                'expected_sha256': mode.data['sha256']}, token=coordinator_token,
+                key='bd278-coordinator-mode')
+            self.assertEqual(refused_mode.status, 403, refused_mode.data)
+            switched = harness.request('PUT', base+'/requirements/governance', {
+                'mode': 'simple', 'expected_revision': mode.data['revision'],
+                'expected_sha256': mode.data['sha256']}, token=owner_token, key='bd278-simple-mode')
+            self.assertEqual(switched.status, 200, switched.data)
+            expected = lambda item: dict(expected_revision=item['revision'],
+                                         expected_sha256=item['sha256'])
+
+            def draft(token, title, key):
+                made = harness.request('POST', base+'/requirements', {
+                    'kind': 'requirement', 'parent': job, 'title': title,
+                    'description': 'Written on the site.'}, token=token, key=key)
+                self.assertEqual(made.status, 201, made.data)
+                return made.data
+
+            def accept(item, token, key):
+                return harness.request('POST', base+'/requirements/'+item['id']+'/accept',
+                                       expected(item), token=token, key=key)
+
+            def evidence(item, revision):
+                row = next(r for r in self.rows() if r['id'] == item['id'])
+                return row, owner.existing_acceptances(row).get(revision)
+
+            # 1. A coordinator person creates and accepts its own draft.
+            coord_item = draft(coordinator_token, 'Coordinator draft', 'bd278-coord-create')
+            coord_accept = accept(coord_item, coordinator_token, 'bd278-coord-accept')
+            self.assertEqual(coord_accept.status, 200, coord_accept.data)
+            row, record = evidence(coord_item, coord_accept.data['revision'])
+            self.assertIsNotNone(record, row.get('labels'))
+            self.assertEqual(record['account_id'], coordinator)
+            self.assertEqual(record['decision']['owners'], [coordinator])
+
+            # 2. The granted agent accepts, and the record names its HUMAN account.
+            agent_item = draft(agent_secret, 'Agent draft', 'bd278-agent-create')
+            agent_accept = accept(agent_item, agent_secret, 'bd278-agent-accept')
+            self.assertEqual(agent_accept.status, 200, agent_accept.data)
+            row, record = evidence(agent_item, agent_accept.data['revision'])
+            self.assertIsNotNone(record, row.get('labels'))
+            self.assertEqual(record['account_id'], owner_account)
+            self.assertEqual(record['decision']['owners'], [owner_account])
+            # The service audit names the agent and its grant beside that account.
+            events = [event for event in harness.service.state['audit']
+                      if event['action'] == 'requirements.accept'
+                      and event.get('acting_agent') == agent_id]
+            self.assertEqual(len(events), 1, harness.service.state['audit'][-5:])
+            self.assertEqual(events[0]['user_id'], owner_account)
+            self.assertEqual(events[0]['coordinator_grant']['granted_by'], owner_account)
+
+            # 3. The agent with no grant is refused with the rule's sentence, and the
+            #    tracker is left exactly as it was.
+            owner_item = draft(owner_token, 'Owner draft', 'bd278-owner-create')
+            before = self.rows()
+            refused = accept(owner_item, plain_secret, 'bd278-plain-accept')
+            self.assertEqual(refused.status, 403, refused.data)
+            self.assertEqual(refused.data['error']['message'], self.EXPECTED_REFUSAL)
+            self.assertEqual(self.rows(), before)
+        finally:
+            harness._stop_server(); harness.doCleanups()
+
+
 def load_tests(loader, tests, pattern):
-    return unittest.TestSuite([NativeOwnerTests('test_owner_without_operator_grant_accepts_and_preserves_native_history'),
+    return unittest.TestSuite([NativeCoordinatorTests('test_coordinator_person_and_granted_agent_accept_on_the_real_tracker'),
+                              NativeOwnerTests('test_owner_without_operator_grant_accepts_and_preserves_native_history'),
                               NativeTerminalTests('test_terminal_routes_recovery_browser_restore_and_previous_reader'),
                               NativeTerminalTests('test_terminal_late_state_beside_a_fresh_completed_decision_is_superseded')])

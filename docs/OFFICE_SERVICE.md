@@ -259,6 +259,8 @@ Create an operator-owned mode-0600 JSON file outside source control:
 
 ```json
 {"schema_version":1,"http_host":"127.0.0.1","http_state":"<RUNTIME_ROOT>/http-state.json","trusted_proxies":["127.0.0.1"],"public_url":"https://<APPROVED_HOST>"}
+
+The `http_state` path and its `.records.sqlite3` beside it are backed up with EVERY `admin.py backup` run (mode 0600; the records file through a consistent SQLite copy) and carried by `backup-copy` - a lost disk keeps every task AND every account and agent. The office server runs Python 3.6, which lacks `Connection.backup`, so the consistent copy uses the `sqlite3` CLI when installed - install it, or every backup of this runtime is recorded degraded and incomplete. The pair comes back ONLY through `restore-new --restore-http-state`, which invalidates every session in the restored state (users and agents sign in again). Record the same path in `deployment.private.json` as `http_state` so backups find it without the flag (kittrial-5bb.331).
 ```
 
 By default the HTTP listener is loopback only, and a separately approved
@@ -402,9 +404,19 @@ none of the settings below behaves as it always did.
   Passwords and session cookies cross the network unencrypted. Use cert and
   key for HTTPS.` The setting together with loopback, or together with a
   certificate, is refused: it would do nothing there.
-- A `cert` or `key` that is not a string, and a `public_url` that is not an
-  `http` or `https` URL with a host, are refused before anything starts, each
-  with a sentence naming the setting. `strict_transport_security` must be
+- A `cert` or `key` that is not a string is refused before anything starts,
+  with a sentence naming the setting.
+- **`public_url`** is copied into the set-up commands people paste into a shell, so it
+  must be a plain address (kittrial-5bb.360): `http` or `https`, a host (a DNS name,
+  an IPv4 address or a bracketed IPv6 address), an optional port and an optional path
+  of letters, digits, `. _ ~ - /` and `%XX` escapes. The three forms `orc.sh` writes
+  (`http://localhost:PORT`, `https://ADDRESS:PORT`, `http://ADDRESS:PORT`) all pass.
+  - Anything else is refused before anything starts, in one sentence naming the
+    setting, this file and the first character refused: quotes, `$`, a backtick,
+    `;`, `|`, `&`, brackets, whitespace, userinfo, a query, a fragment, or a `%XX`
+    escape of one of those.
+  - The service applies the same rule to `--public-url`.
+  - The commands quote the address as well. `strict_transport_security` must be
   `true` or `false` (see below).
 - **A relative `cert` or `key` is relative to the runtime root**, because the
   web service is started with the runtime root as its working directory. The
@@ -776,3 +788,35 @@ SIGKILL/restart outcome, disposable restore/export comparison, install/rollback
 round trip, and any skipped check with its reason. The coordinator reviews this
 record and the support runbook before a production release. Contact and
 escalation names belong in the private support ticket.
+
+## Agent credential lifetime configuration
+
+The kit-side service JSON accepts `"agent_credential_days": 90` (a whole number from
+1 through 366); omission retains30 days. It is passed as `--agent-credential-days`.
+The external office `orc.sh` must translate the named `orc.conf` line
+`AGENT_CREDENTIAL_DAYS=90` to this JSON key. That wrapper is maintained outside this
+kit by the coordinator; this contribution does not change it. Upgrade the kit before
+adding the key: an older `office_service.py` refuses an unknown setting. 90 is the
+office choice, not a special value in the implementation. Existing credentials are
+not rewritten when configuration changes.
+
+## Session idle and absolute limit configuration
+
+The same private office JSON accepts the browser session's two limits, and
+`office_service.py` forwards each as the web service's own flag:
+
+| JSON key | Flag | Value | Default |
+| --- | --- | --- | --- |
+| `session_idle_minutes` | `--session-idle-minutes` | whole minutes, 5 to 1440 (5 minutes to 24 hours) | 30 |
+| `session_absolute_hours` | `--session-absolute-hours` | whole hours, 1 to 168 (1 hour to 7 days) | 12 |
+
+Omission of both keeps 30 minutes and 12 hours, exactly as before the setting existed. The
+absolute limit must not be shorter than the idle window, including when only one key is
+given (the other keeps its default). A value outside its bounds, a value that is not a whole
+number, and an inverted pair are refused by `service_config` with one sentence before
+anything is started, the same sentence the web service's flags refuse with; nothing is
+clamped. Upgrade the kit before adding either key: an older `office_service.py` refuses an
+unknown setting. Changing a limit rewrites no session that is already signed in; the next
+sign-in carries the new one. See docs/HTTP_DEPLOYMENT.md ("Session idle and absolute
+limits") for the deadlines and the page's keep-alive.
+

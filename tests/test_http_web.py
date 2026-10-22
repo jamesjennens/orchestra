@@ -1036,6 +1036,7 @@ class RouteTableCase(unittest.TestCase):
         self.assertEqual(('project', {'pid': 'jjbp'}), self.match('/p/jjbp'))
         self.assertEqual(('record', {'pid': 'p', 'id': 'kittrial-5bb.20.1'}),
                          self.match('/p/p/records/kittrial-5bb.20.1'))
+        self.assertEqual(('agentSetup', {}), self.match('/setup'))
         for bad in ('/p/../t/x', '/p/x/t/.hidden', '/p/x/t/', '/p/x/t/a/b', '/p/x y'):
             self.assertIsNone(self.match(bad), bad)
 
@@ -1050,14 +1051,15 @@ class RouteTableCase(unittest.TestCase):
             self.skipTest('node is not installed; the Python checks above still apply')
         script = ("import(process.argv[1]).then((r) => console.log(JSON.stringify(["
                   "r.matchRoute('/p/kittrial/t/kittrial-5bb.20'), r.projectOf('/p/a.b/reviews'),"
-                  "r.matchRoute('/p/x/t/../y')])))")
+                  "r.matchRoute('/p/x/t/../y'), r.matchRoute('/setup')])))")
         out = run_node_module(self, node, script, self.ROUTES_JS.as_uri())
         self.assertEqual(0, out.returncode, out.stderr)
-        task, project, bad = json.loads(out.stdout)
+        task, project, bad, setup_route = json.loads(out.stdout)
         self.assertEqual({'name': 'task', 'params': {'pid': 'kittrial',
                                                       'tid': 'kittrial-5bb.20'}}, task)
         self.assertEqual('a.b', project)
         self.assertIsNone(bad)
+        self.assertEqual({'name': 'agentSetup', 'params': {}}, setup_route)
 
 
 class LookupThrottleCase(TeamHarness):
@@ -1663,24 +1665,31 @@ class AgentSetupDialogCase(unittest.TestCase):
             self.assertNotIn('secret', built)
             self.assertNotIn('created', built)
             self.assertIn('payload', built)
-        # In the dialog the secret is only handed to secretSection(), the single place
-        # that renders one; everything else is built from the secretless payload.
+        # kittrial-5bb.348: in the dialog the secret is only kept as the state's secretValue, never
+        # stored and never handed anywhere but secretLinesBlock(), the single place that renders one,
+        # on the "Save your secret" screen; everything else is built from the secretless payload.
         uses = [line.strip() for line in dialog.splitlines()
-                if re.search(r'\bsecret\b', self.unquoted(line))]
+                if not line.strip().startswith('//') and re.search(r'\bsecret\b', self.unquoted(line))]
         self.assertIn('function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {', code)
-        self.assertEqual(["secret ? secretSection(secret, 'Secret (shown once)', payload, { hasCertificate }) : "
-                          "reissueSection(ctx, source.agent || {}, payload, { hasCertificate })),"], uses)
-        section = self.function_body(code, 'secretSection')
-        self.assertIn("copyButton('Copy', secret", section)
-        self.assertIn("h('div', { class: 'secret' }, secret)", section)
-        # Step 1's body is the only other thing built from the secret, and only here.
-        self.assertIn('secretSteps(payload, secret, { withSecret: true, hasCertificate })', section)
-        self.assertEqual(1, code.count('secretSteps(payload, secret,'))
-        steps = self.function_body(code, 'secretSteps')
-        # secretSteps builds the pasted body from the value it is handed; it never
-        # reads a credential record or a .secret property (kittrial-5bb.275).
-        self.assertIsNone(re.search(r'\.secret\b|\.credential\b|\bcredential\.', self.unquoted(steps)))
-        self.assertNotIn('created', steps)
+        # (the second line is the screen's own name, the key of its builder, not the value)
+        self.assertEqual(['secretValue: secret,', 'secret: () => ['], uses)
+        # (the first line only opens the dialog on the screen that shows a fresh secret)
+        self.assertEqual(['if (state.secretValue) {', 'state.secretValue = value;', 'state.secretValue',
+                          '? secretLinesBlock(payload, state.secretValue, state.os)'],
+                         [line.strip() for line in dialog.splitlines() if 'secretValue' in line and not line.strip().startswith('//')
+                          and not line.strip().startswith('secretValue:')])
+        self.assertEqual(2, code.count('secretLinesBlock('))          # the definition and the one call
+        block = self.function_body(code, 'secretLinesBlock')
+        self.assertIn('setupText.credentialFileLines(address, fingerprint, secretValue)', block)
+        self.assertIn("copyButton('Copy', lines, { ariaLabel: 'Copy the credential file text with the secret'", block)
+        # It builds the lines from the value it is handed; it never reads a credential record or a
+        # .secret property (kittrial-5bb.275).
+        self.assertIsNone(re.search(r'\.secret\b|\.credential\b|\bcredential\.', self.unquoted(block)))
+        self.assertNotIn('created', block)
+        # The wizard's stored state holds no secret.
+        stored = self.function_body(code, 'writeWizardStorage')
+        self.assertIsNone(re.search(r'secret', self.unquoted(stored).replace("'Secretless:", '').split('//')[0], re.I))
+        self.assertNotIn('secretValue', stored)
 
     @staticmethod
     def unquoted(line):
@@ -1693,8 +1702,9 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertIn('ctx.api.agent(agentId)', reopen)
         self.assertIn('setupDialog(ctx, { agent }, { secret: null, certificate: await agentCertificate(ctx) })', reopen)
         self.assertIsNone(re.search(r'credential|\.secret\b', reopen))
-        # Losing the secret means issuing a NEW credential; only its fresh secret is shown.
-        reissue = self.function_body(code, 'reissueSection')
+        # Losing the secret means issuing a NEW credential; only its fresh secret is shown, on the
+        # "Save your secret" screen, at once (kittrial-5bb.348).
+        reissue = self.function_body(code, 'issueBlock')
         self.assertIn('ctx.api.issueAgentCredential(agent.id)', reissue)
         # The confirmation has nested template literals for inferred versus stored
         # scopes. The simple quoted-text stripper cannot parse those; check the
@@ -1706,13 +1716,16 @@ class AgentSetupDialogCase(unittest.TestCase):
         uses = [line.strip() for line in reissue.splitlines()
                 if not line.strip().startswith('body:')
                 and re.search(r'\bsecret\b', self.unquoted(line))]
-        self.assertEqual(['if (!credential.secret) {',
-                          "section.replaceChildren(secretSection(credential.secret, 'New secret (shown once)', payload, { hasCertificate }),"],
-                         uses)
-        # What the new credential carries is shown with it, and the confirmation says what a renewal keeps
-        # (kittrial-5bb.208: the page sends no scope list, and the server used to answer the default four).
-        self.assertIn("'data-scopes': (credential.scopes || []).join(' ')", reissue)
-        self.assertIn("'This credential carries' + (scopeList(credential.scopes) || ': nothing beyond reading') + '.'", reissue)
+        self.assertEqual(['if (!credential.secret) {', 'wizard.secretIssued(credential.secret, credential, agent);'], uses)
+        # An error is shown inside the wizard, never as a toast behind it.
+        self.assertIn("{ success: 'New secret issued', onError: wizard.showError }", reissue)
+        # Opened without a secret, the screen says why in one line, with the issue button right there.
+        self.assertIn("'The secret is shown only once, when it is issued; issue a new one to continue.'", reissue)
+        # What the new credential carries is shown with it (kittrial-5bb.208), and the confirmation
+        # says what a renewal keeps.
+        dialog = self.function_body(code, 'setupDialog')
+        self.assertIn("'data-scopes': ((state.issued.credential && state.issued.credential.scopes) || []).join(' ')", dialog)
+        self.assertIn("'This credential carries' + (scopeList(state.issued.credential && state.issued.credential.scopes) || ': nothing beyond reading') + '.'", dialog)
         self.assertIn('It carries what the agent has now${scopeList(agent.scopes)}.', reissue)
         # What the agent may do is on its card, and "What it may do" on the Agents page is the one place
         # that sends a list (the page is run in tests/test_http_agents.py AgentsPageTests).
@@ -1724,8 +1737,6 @@ class AgentSetupDialogCase(unittest.TestCase):
                       (WEB / 'js' / 'api.js').read_text(encoding='utf-8'))
         self.assertEqual(code.count('ctx.api.issueAgentCredential('), 2)
         self.assertIn('ctx.api.issueAgentCredential(agent.id, chosen)', code)
-        # Without a fresh secret the steps show the placeholder line only.
-        self.assertIn('secretSteps(payload, null, { withSecret: false, hasCertificate })', reissue)
         older = self.function_body(code, 'olderCredentials')
         self.assertIsNone(re.search(r'\bsecret\b', self.unquoted(older)))
         self.assertIn('ctx.api.revokeAgentCredential(agent.id, c.id)', older)
@@ -1741,21 +1752,23 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertIn("manages(ctx, raw) ? h('div'", card)
         self.assertIn('reopenSetup(ctx, raw.id', card)
 
-    def test_dialog_is_three_numbered_steps(self):
+    def test_the_wizard_is_one_action_per_screen_on_two_paths(self):
+        # kittrial-5bb.348 (James at the office): one action per screen; a computer with Orchestra
+        # Bridge 0.14 or later takes the short path, any other the longer one with the
+        # certificate, rewrite, self-check and save-files screens.
+        setup = self.code(self.SETUP_JS)
+        plan = self.function_body(setup, 'screenPlan')
+        self.assertIn("if (bridge) return ['system', 'role', 'secret', ...(posix ? ['restrict'] : []), 'vscode', 'resume'];", plan)
+        self.assertIn("return ['system', 'role', ...(hasCertificate ? ['cert-save', 'cert-move'] : []), 'secret',", plan)
         dialog = self.function_body(self.code(self.AGENTS_JS), 'setupDialog')
-        order = [dialog.index("step(1, 'Store the secret'"), dialog.index("step(2, 'Set up the folder'"),
-                 dialog.index("step(3, 'Start the agent'")]
-        self.assertEqual(sorted(order), order)
-        step3 = dialog[order[2]:]
-        self.assertIn("copyLine('Resume prompt:', resume", step3)
-        steps = self.function_body(self.code(self.AGENTS_JS), 'secretSteps')
-        for text in ('Open Notepad', 'Save as type', 'All files (*.*)', 'file.windows', 'file.posix',
-                     'test.posixChmod', 'test.powershell', 'test.posix', '.txt'):
-            self.assertIn(text, steps)
-        # kittrial-5bb.275: each curl error the person may see gets one line, and the
-        # certificate is saved BEFORE the test.
-        self.assertIn('Save the service’s certificate FIRST', steps)
-        self.assertIn("'data-curl-error': code", steps)
+        # Only the current screen is in the dialog: the screen node is replaced, not hidden.
+        self.assertIn('screenNode.replaceChildren(...screens[state.screen]()', dialog)
+        self.assertNotIn('.hidden = !active', dialog)
+        # The resume prompt is the last screen's one command.
+        self.assertIn("commandLine(setupText.resumePrompt(payload.name), 'resume prompt')", dialog)
+        # kittrial-5bb.275: each curl error the person may see gets one line (behind "More about this"
+        # on the test screen).
+        self.assertIn("'data-curl-error': code", dialog)
         agents = self.AGENTS_JS.read_text(encoding='utf-8')
         for line in ('curl exit 60', 'curl exit 35', 'curl exit 26', 'HTTP 401'):
             self.assertIn(line, agents)
@@ -1790,9 +1803,10 @@ class AgentSetupDialogCase(unittest.TestCase):
     def test_owner_facing_labels(self):
         agents = self.AGENTS_JS.read_text(encoding='utf-8')
         self.assertIn("export const SETUP_PROMPT_LABEL = 'Copy setup prompt (creates the files)';", agents)
-        self.assertIn('Set up the agent’s folder in one of two ways: Save to agent folder, or paste '
-                      'the setup prompt into the agent’s chat. Copy path is only for saving the '
-                      'files by hand.', agents)
+        # kittrial-5bb.348: one action per screen, each with a short title.
+        for title in ("system: 'Your computer'", "secret: 'Save your secret'", "files: 'Save the agent’s files'",
+                      "vscode: 'Set up in VS Code'", "resume: 'Start the agent'"):
+            self.assertIn(title, agents)
         self.assertIn("'Resume prompt (after setup)'", agents)
         self.assertIn("'Needs .orchestra/agent.json in the folder; use Set up folder first.'", agents)
         self.assertIn("}, 'Set up folder')", agents)
@@ -1856,12 +1870,12 @@ console.log(JSON.stringify({
   promptResumes: m.setupPrompt(p).includes('Read .orchestra/AGENT.md in this folder'),
   reopenedJson: JSON.parse(m.agentJson(reopened)),
   guideNamesFile: m.agentGuide(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc')
-    && m.agentGuide(p).includes('curl.exe -fsS -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" http://127.0.0.1:1/v1/')
-    && m.agentGuide(p).includes('curl -fsS -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/'),
+    && m.agentGuide(p).includes('curl.exe -fsS --noproxy 127.0.0.1 --max-time 60 -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" \'http://127.0.0.1:1/v1/')
+    && m.agentGuide(p).includes('curl -fsS --noproxy 127.0.0.1 --max-time 60 -K ~/.orchestra-agent-kestrel.curlrc \'http://127.0.0.1:1/v1/'),
   promptNamesFile: m.setupPrompt(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'),
   placeholder: m.headerLine(), real: m.headerLine('S3'),
   tests: m.testCommands(p),
-  promptWritesSettings: /settings\.json|orchestraBridge|caFile/.test(withCert),
+  promptWritesSettings: /\.vscode\/settings\.json|settings\.json|VSCODE_SETTINGS_PATH|mergeSettings/.test(withCert),
   promptCarriesPem: withCert.includes('MIIB'),
   promptAddressLine: withCert.includes('# server = https://office.example.invalid:7443'),
   promptFingerprintLine: withCert.includes('# server certificate sha256 = AB:CD'),
@@ -1885,7 +1899,7 @@ console.log(JSON.stringify({
     { certFile: m.certificateFile('Kestrel'), hasCertificate: true }).posix,
   testHasCacert: /--cacert/.test(m.testCommands(p).posix + m.testCommands(p).powershell),
   guideWithCert: m.agentGuide(p, { hasCertificate: true }),
-  guideWithCertIsKOnly: m.agentGuide(p, { hasCertificate: true }).includes('curl -fsS -K')
+  guideWithCertIsKOnly: m.agentGuide(p, { hasCertificate: true }).includes('curl -fsS --noproxy 127.0.0.1 --max-time 60 -K')
     && !/curl[^\\n]*--cacert/.test(m.agentGuide(p, { hasCertificate: true })),
   paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
           m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
@@ -1909,10 +1923,11 @@ console.log(JSON.stringify({
         self.assertEqual('header = "Authorization: Bearer <your secret>"', result['placeholder'])
         self.assertEqual('header = "Authorization: Bearer S3"', result['real'])
         self.assertEqual({
-            'powershell': 'curl.exe -fsS -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" '
-                          'http://127.0.0.1:1/v1/agents/me',
+            # kittrial-5bb.348: past a command-line proxy for this host only, and never hanging.
+            'powershell': 'curl.exe -fsS --noproxy 127.0.0.1 --max-time 20 -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" '
+                          "'http://127.0.0.1:1/v1/agents/me'",   # kittrial-5bb.360: single-quoted
             'posixChmod': 'chmod 600 ~/.orchestra-agent-kestrel.curlrc',
-            'posix': 'curl -fsS -K ~/.orchestra-agent-kestrel.curlrc http://127.0.0.1:1/v1/agents/me'},
+            'posix': "curl -fsS --noproxy 127.0.0.1 --max-time 20 -K ~/.orchestra-agent-kestrel.curlrc 'http://127.0.0.1:1/v1/agents/me'"},
             result['tests'])
         self.assertEqual([
             {'path': 'C:\\Users\\james\\zcode-x\\.orchestra\\agent.json', 'relative': False},
@@ -2049,6 +2064,196 @@ console.log(JSON.stringify({
             self.assertEqual(1, again.count('cacert ='))
             self.assertEqual(1, again.count('# server ='))
             self.assertEqual(1, again.count('header ='))
+
+    def test_wizard_helpers_and_check_commands(self):
+        # kittrial-5bb.329: OS detection, single-OS paths, Downloads move command, self-check
+        # commands (kittrial-5bb.328 item 4) and working_directory comparison.
+        agents = self.AGENTS_JS.read_text(encoding='utf-8')
+        for code in ('2', '60', '35', '26', '401'):
+            self.assertIn("  %s: '" % code, agents)
+        # kittrial-5bb.348: the first screen asks whether this computer's VS Code has the Bridge 0.14+.
+        self.assertIn("choice('setup-bridge', 'yes', 'Orchestra Bridge 0.14 or later'", agents)
+        self.assertIn("choice('setup-bridge', 'no', 'An older extension, or none'", agents)
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the static checks above still apply')
+        script = r"""
+const m = await import(process.argv[1]);
+const p = m.secretlessPayload({
+  agent: { id: 'agent_1', name: 'Kestrel', owner_display_name: 'Olive',
+           working_directory: 'C:\\Users\\olive\\kestrel', projects: ['p1'] },
+  setup: { config: { server_url: 'https://127.0.0.1:8765', agent_id: 'agent_1',
+                     projects: ['p1'], name: 'Kestrel' } }
+}, 'https://127.0.0.1:8765');
+console.log(JSON.stringify({
+  osChoices: m.OS_CHOICES,
+  winUa: m.detectOs({ userAgentData: { platform: 'Windows' } }),
+  macUa: m.detectOs({ platform: 'MacIntel' }),
+  linuxUa: m.detectOs({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64)' }),
+  kinds: [m.osKind('windows'), m.osKind('macos'), m.osKind('linux')],
+  osSecWin: m.osSecretFile(m.secretFile('Kestrel'), 'windows'),
+  osSecPos: m.osSecretFile(m.secretFile('Kestrel'), 'macos'),
+  osCertWin: m.osCertificateFile(m.certificateFile('Kestrel'), 'windows'),
+  osCertPos: m.osCertificateFile(m.certificateFile('Kestrel'), 'linux'),
+  move: m.certificateMoveCommands(m.certificateFile('Kestrel')),
+  checkWithCert: m.checkCommands(p, { hasCertificate: true }),
+  checkPlain: m.checkCommands(p, { hasCertificate: false }),
+  mismatchSame: m.workingDirectoryMismatch('C:\\Users\\olive\\kestrel\\', 'c:/users/olive/kestrel'),
+  mismatchDiff: m.workingDirectoryMismatch('/home/olive/a', '/home/olive/b'),
+  mismatchEmpty: m.workingDirectoryMismatch('', '/home/olive/a'),
+  promptQuotedDir: m.setupPrompt(p),
+  resumeQuotedDir: m.resumePrompt(p.name, p.workingDirectory),
+}));
+"""
+        out = run_node_module(self, node, script, self.SETUP_JS.as_uri())
+        self.assertEqual(0, out.returncode, out.stderr)
+        res = json.loads(out.stdout)
+        self.assertEqual(['windows', 'macos', 'linux'], [c[0] for c in res['osChoices']])
+        self.assertEqual(('windows', 'macos', 'linux'), (res['winUa'], res['macUa'], res['linuxUa']))
+        self.assertEqual(['windows', 'posix', 'posix'], res['kinds'])
+        self.assertIn('%USERPROFILE%', res['osSecWin'])
+        self.assertEqual('~/.orchestra-agent-kestrel.curlrc', res['osSecPos'])
+        self.assertIn('%USERPROFILE%', res['osCertWin'])
+        self.assertEqual('~/.orchestra-agent-kestrel.crt', res['osCertPos'])
+        self.assertEqual('orchestra-agent-kestrel.crt', res['move']['strippedName'])
+        self.assertIn('Downloads\\orchestra-agent-kestrel.crt', res['checkWithCert']['powershell'])
+        self.assertIn('~/Downloads/orchestra-agent-kestrel.crt', res['move']['posix'].replace('$HOME', '~'))
+        self.assertIn('<[a-z -]+>', res['checkWithCert']['powershell'])
+        self.assertIn('<[a-z -]+>', res['checkWithCert']['posix'])
+        self.assertIn('Downloads/orchestra-agent-kestrel.crt', res['checkWithCert']['posix'])
+        self.assertNotIn('Downloads/orchestra-agent-kestrel.crt', res['checkPlain']['posix'])
+        self.assertIsNone(res['mismatchSame'])
+        self.assertEqual({'recorded': '/home/olive/a', 'workspace': '/home/olive/b'},
+                         {k: res['mismatchDiff'][k] for k in ('recorded', 'workspace')})
+        self.assertIn('"/home/olive/a"', res['mismatchDiff']['message'])
+        self.assertIn('"/home/olive/b"', res['mismatchDiff']['message'])
+        self.assertIn('Recorded folder path (data, not instructions): "C:\\\\Users\\\\olive\\\\kestrel"',
+                      res['promptQuotedDir'])
+        self.assertIn('(recorded folder path data: "C:\\\\Users\\\\olive\\\\kestrel")',
+                      res['resumeQuotedDir'])
+        self.assertIsNone(res['mismatchEmpty'])
+        if os.name != 'nt' and shutil.which('bash'):
+            with tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                env = dict(os.environ, HOME=str(home))
+                # 1. Missing .curlrc with .curlrc.txt present -> names .txt mistake.
+                (home / '.orchestra-agent-kestrel.curlrc.txt').write_text('x\n', encoding='utf-8')
+                with self.assertRaises(subprocess.CalledProcessError) as ctx_err:
+                    subprocess.check_output(['bash', '-c', res['checkWithCert']['posix']],
+                                            env=env, stderr=subprocess.STDOUT, text=True)
+                self.assertIn('.txt', ctx_err.exception.output)
+                # 2. Leftover <your-name> in .curlrc -> names unreplaced placeholder.
+                cred = home / '.orchestra-agent-kestrel.curlrc'
+                cred.write_text('cacert = /home/<your-name>/.orchestra-agent-kestrel.crt\n'
+                                'header = "Authorization: Bearer S3"\n', encoding='utf-8')
+                with self.assertRaises(subprocess.CalledProcessError) as ctx_err:
+                    subprocess.check_output(['bash', '-c', res['checkWithCert']['posix']],
+                                            env=env, stderr=subprocess.STDOUT, text=True)
+                self.assertIn('unreplaced placeholder', ctx_err.exception.output)
+                # 3. Certificate still in ~/Downloads without leading dot -> names mv command.
+                cred.write_text('cacert = %s/.orchestra-agent-kestrel.crt\n'
+                                'header = "Authorization: Bearer S3"\n' % home, encoding='utf-8')
+                downloads = home / 'Downloads'
+                downloads.mkdir()
+                (downloads / 'orchestra-agent-kestrel.crt').write_text('PEM\n', encoding='utf-8')
+                with self.assertRaises(subprocess.CalledProcessError) as ctx_err:
+                    subprocess.check_output(['bash', '-c', res['checkWithCert']['posix']],
+                                            env=env, stderr=subprocess.STDOUT, text=True)
+                self.assertIn('Downloads/orchestra-agent-kestrel.crt', ctx_err.exception.output)
+
+    def test_wizard_one_action_per_screen_under_node(self):
+        # kittrial-5bb.348: the real wizard of agents.js under Node with web_dom_shim.mjs and the
+        # real createApi (tests/web_setup_wizard.mjs). Both paths in order with Back and Next, one
+        # action per screen (another screen's command is absent, not hidden), short text, worker
+        # first, the issue button and the issued secret on the secret screen, an error shown inside
+        # the dialog and no toast behind it, the check before Next, a reload resuming the screen,
+        # the curl flags, a toast drawn inside an open modal, and what the three-step wizard's test
+        # pinned: the keep-alive and its warning, the online line only while visible, the picker's
+        # remembered folder and the stored state cleared on sign-out.
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the static checks above still apply')
+        tests = Path(__file__).resolve().parent
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (tests / 'web_setup_wizard.mjs').as_uri(), (tests / 'web_dom_shim.mjs').as_uri(),
+                               (WEB / 'js' / 'api.js').as_uri(), self.AGENTS_JS.as_uri(), (WEB / 'js' / 'dom.js').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        observed = json.loads(done.stdout.strip().splitlines()[-1])
+        for name, value in observed.items():
+            self.assertIs(True, value, 'the wizard reported %s=%r' % (name, value))
+        self.assertEqual({
+            'atMostTwoSentencesPerScreen',
+            'backHiddenOnTheFirstScreen',
+            'backRetracesTheShortPath',
+            'checkHoldsNextUntilSeen',
+            'checkPassesOnceSeen',
+            'choiceKeepsTheSameRadioSoFocusStays',
+            'confirmationIsAboveTheWizard',
+            'eachScreenOnlyItsOwnCommand',
+            'errorClearedAfterSuccess',
+            'errorHasNoNullText',
+            'errorShownInsideTheDialog',
+            'folderPathBesideTheSaveButton',
+            'hiddenTabDoesNotPoll',
+            'idleWarningShownInTheWizard',
+            'issueButtonRightThere',
+            'issuedSecretShownAtOnce',
+            'keepSessionOpenTouchesTheSession',
+            'longCommandIsCopyAndCollapsed',
+            'longPathPlanWithCertificateOnPosix',
+            'longPathWalksInOrder',
+            'longPathWithoutCertificateRestricts',
+            'moveCommandIsThePosixOne',
+            'nextHiddenAndDonePrimaryOnTheLast',
+            'noScreenShowsNull',
+            'noSecretOneLineWhy',
+            'noSecretShownYet',
+            'noToastBehindTheModal',
+            'goodAddressHasNoRefusedLine',
+            'oldExtensionToldAboutCaFileBehindMore',
+            'oldStepTwoMapsToFilesOnTheLongPath',
+            'oldStepTwoMapsToVsCodeOnTheShortPath',
+            'onlineLineSaysConnected',
+            'onlineCheckStopsAfterSuccess',
+            'onlineWhenFirstSeenBeforeTheLastScreen',
+            'opensOnTheFirstScreen',
+            'pickerRemembersTheFolder',
+            'progressCountsTheChosenPath',
+            'progressSaysStepOfFive',
+            'refusedAddressSaidAndNotUsed',
+            'reloadResumesTheScreen',
+            'reloadShowsNoSecret',
+            # kittrial-5bb.364: the Bridge path's last screen has no prompt to paste; both
+            # paths say what the waiting count includes.
+            'bridgeResumeHasNoPromptToPaste',
+            'bridgeResumeSaysWhatWaitingCounts',
+            'longResumeKeepsThePromptAndTheCount',
+            'reviewerSaidInOneLine',
+            'roleErrorShownInsideTheDialog',
+            'roleSavedOnOrchestra',
+            'roleScreenSecond',
+            'saveCertificateIsTheOneButton',
+            'savedFilesSaidOnTheScreen',
+            'secretAbsentFromOtherScreens',
+            'secretNeverStored',
+            'secretScreenNamesTheFile',
+            'secretScreenThird',
+            'selfCheckBypassesTheProxyForThisHostOnly',
+            'selfCheckSaysTheProxySentence',
+            'shortPathOnMacRestricts',
+            'shortPathOnWindowsHasNoChmod',
+            'shortPathPlan',
+            'signOutClearsTheStoredScreen',
+            'stillOnTheSecretScreen',
+            'systemScreenHasNoCommand',
+            'testScreenChecksBeforeNext',
+            'toastDrawnInTheTopmostDialog',
+            'toastDrawnInsideTheOpenModal',
+            'toastWithoutAModalGoesToTheBody',
+            'vscodeScreenFourth',
+            'vscodeScreenHasFolderAndCommand',
+            'workerPreselected',
+        }, set(observed))
 
 
 
@@ -2266,6 +2471,21 @@ class CanonicalReadCostCase(EndpointCase):
         fresh = self.request('GET', path, token=alex).data
         self.assertIn(created, [t['id'] for t in fresh['items']])
         self.assertEqual(['bd', 'work'], self.backend.calls)
+
+    def test_a_work_read_without_dolt_coordinates_never_builds_a_read_cache(self):
+        # kittrial-5bb.339: the export cache is keyed by the tracker's dolt commit;
+        # the canonical stub has no server coordinates, so the read fails OPEN (a
+        # fresh export every time, exactly as before) and no cache directory is
+        # created under the project.
+        import shutil
+        alex, project = self.setup_project()
+        for index in range(2):
+            self.create_task(alex, project, 'task %d' % index)
+        self.backend.calls = []
+        work = self.request('GET', '/v1/me/work', token=alex)
+        self.assertEqual(200, work.status, work.data)
+        cache = self.canonical_root / 'projects' / project / '.read-cache'
+        self.assertFalse(cache.exists(), 'no read cache for a project without dolt coordinates')
 
     def test_my_work_and_prompts_fill_ids_waits_and_blocked_from_the_brief(self):
         alex, project = self.setup_project()

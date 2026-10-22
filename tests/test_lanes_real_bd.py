@@ -168,6 +168,36 @@ class RealBdLaneStateTests(unittest.TestCase):
         self.assertEqual(lane_state.parse(records[0]['text'])['checkpoint'], retry['comment_id'])
         self.assertFalse(b.brief(self.export_rows(), 'pp', task)['checkpoint']['newer_activity'])
 
+    def test_the_real_queue_marker_moves_with_each_other_party_comment_and_resets(self):
+        """kittrial-5bb.351: the marker is computed from a real bd export, provenance on."""
+        task = self.create('Marker task')
+        run = self.writer('op')
+        first = b.save_checkpoint(self.export_rows(), 'pp', task, self.payload(task), 'op', run,
+                                  provenance_writes=True)
+        self.assertFalse(first['reconciled'])
+        other = self.writer('coordinator/session')
+        other(['comments', 'add', task, 'First direction', '--json'])
+        row = next(item for item in work.queue(self.export_rows(), 'op', [])['items']
+                   if item['task'] == task)
+        marker = row['newer_activity_marker']
+        self.assertTrue(marker.startswith(task + '-c'), marker)
+        self.assertEqual((row['newer_activity_by_others'], row['newer_activity_coverage']),
+                         (1, 'snapshot'))
+        other(['comments', 'add', task, 'Second direction', '--json'])
+        row = next(item for item in work.queue(self.export_rows(), 'op', [])['items']
+                   if item['task'] == task)
+        self.assertNotEqual(row['newer_activity_marker'], marker)
+        self.assertTrue(row['newer_activity_marker'].startswith(task + '-c'))
+        self.assertEqual(row['newer_activity_by_others'], 2)
+        # A checkpoint that incorporates both moves the marker once, to the fields-only
+        # marker (kittrial-5bb.354: it stays non-null, so a later claim cannot move it).
+        b.save_checkpoint(self.export_rows(), 'pp', task, self.payload(task), 'op',
+                          self.writer('op'), provenance_writes=True)
+        row = next(item for item in work.queue(self.export_rows(), 'op', [])['items']
+                   if item['task'] == task)
+        self.assertTrue(row['newer_activity_marker'].startswith('fields:'), row['newer_activity_marker'])
+        self.assertEqual(row['newer_activity_coverage'], 'current')
+
     @unittest.skipIf(not RELEASED, 'released checkout not configured (ORCHESTRA_LANES_RELEASED_KIT)')
     def test_the_released_kit_reads_the_task_and_reports_the_documented_stale_reading(self):
         task = self.create('Released kit task')

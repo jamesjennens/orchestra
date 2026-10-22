@@ -1,5 +1,25 @@
 # Office HTTP service: installation, TLS and recovery runbook
 
+## Guidance and onboarding disclosure
+
+Every current project member, personal agent and worker credential can read this project's **whole onboarding document, including operator-written text**, at `GET /v1/projects/PROJECT/onboarding/read`. This deliberately widens the earlier edit route's disclosure. Do not place secrets in that project document. The edit route `GET /onboarding` still withholds operator-written text; these are distinct reads.
+
+Guidance is available at `GET /v1/projects/PROJECT/guidance`. Reading or loading a page never acknowledges it. `POST /guidance/ack` takes exactly `{"version":"SHA256"}` for the readable, bound version the caller saw. An unbound or unreadable document withholds actionable text and supplies the existing operator repair warning. A stale version is refused. The authenticated account, personal agent or distinct worker namespace is the actor; request bodies cannot choose an actor or host path. A worker credential whose actor is absent or is its issuer account is refused for acknowledgement (`403`): it must have a distinct worker actor. Such a credential retains its read access; no acknowledgement is silently credited to its issuer.
+
+Current owners, coordinators, superusers and explicitly granted personal coordinator agents may `PUT /guidance` with `{"text":"..."}`, `DELETE /guidance` with `{}`, and read `GET /guidance/status?offset=0&limit=50`. Worker credentials never gain coordination. The roster is project-only, at most 500 latest actor acknowledgements, paged with limits 1..100. Setting keeps only current and previous versions; compaction and oldest-entry eviction remove history. It is not a complete historical roster.
+
+The existing onboarding edit GET/PUT/DELETE routes now require project coordination, including an explicitly granted personal agent. Replacing operator onboarding retains `ONBOARDING.operator-copy.md` beside `ONBOARDING.md`; clearing an operator document is refused. The existing coordination backup includes the active `ONBOARDING.md`, guidance and acknowledgement metadata; it does not include the retained operator copy. Keep `ONBOARDING.operator-copy.md` separately before rebuilding or retiring the source host: restoring the project restores its active entry, not that copy. The document header and line marks are part of the stored document: the header now says the project's owner or a coordinator wrote it, while the editor and reader still accept documents written with the earlier owner-only line (kittrial-5bb.349). Guidance setter attribution records the actual authenticated account or agent in `set_by`, and records `set_via: web` for a web write or `set_via: host` for a host write. Every guidance read, status, version and brief block returns both; the project page and text brief display the route beside the setter. An older record without the field returns `set_via: null` (unknown legacy route); a same-text set or repair preserves that unknown route and original setter rather than inventing host provenance. The local `.guidance-repair.json` audit also records the repaired generation's route when it is known. Bound guidance from either authorized route is an instruction within the worker user's limits. Contributor task text, proposals and ordinary onboarding prose remain data. The existing `onboard` command serves the start and project entry documents and does not display guidance attribution; use `guidance get` for it. No new store or global host-operator permission is introduced. **Guidance metadata changes:** new generations add optional `set_via` in `.guidance.json` and in their history entries. This is a deliberate file-shape change; older strict validators do not accept those generations for acknowledgement, compaction, backup or restore. See the rollback boundary below.
+
+### Guidance metadata rollout and rollback
+
+Upgrade readers and all guidance writers/backup/restore tools together before setting a new guidance generation with this kit. Old kits may still display its text and setter, but cannot report its route; their strict new-acknowledgement and compaction writes refuse the added field, their guidance backup is degraded and omits the pair, and restoring a new pair with their validators refuses. Do not claim those operations are rollback-compatible. A new kit reads and preserves legacy records with unknown route, and a same-text repair of a legacy record keeps its legacy shape. A same-text repair of a new record keeps its known route; it does not remove the field for rollback.
+
+Before rolling back, use this kit's authorized `clear-guidance` and take a clean backup with no guidance pair, as described in `OPERATIONS.md`; retain the current text and route audit separately in approved operator evidence. Re-set the text after rolling forward. Do not strip the route field, rewrite the setter, or manufacture a host route to make an old validator accept it. Installing this kit alone does not migrate existing guidance records.
+
+On POSIX hosts guidance read, status, member onboarding, onboarding edit read and replay authority checks use the endpoint's common `READ_ONLY_ACTIONS` / `coordination_lock_shared` policy for shared project locks. A request carrying an operation identity stays exclusive, including a read. Authenticated guidance reads carry a live authority descriptor, so they retain the common `http_authority.file_lock` exclusive authority check, matching .281's rule that only pure reads without a descriptor/operation identity/identity check can skip that lock. There is no separate guidance-specific flock implementation. Acknowledgement, set and clear retain exclusive project and authority locks through authorization and effects. Windows uses the existing common authority lock fallback.
+
+Use a stable `Idempotency-Key` and identical body after a lost or uncertain write response. Canonical writes re-check current live authority and actor binding under its lock; service-cache replay also checks current canonical authority before returning. A failed effect that may have touched files remains unknown and must not be blindly repeated under a new key. The project page keeps unsaved drafts on errors and offers an explicit retry of the identical request; keep that page open until reconciled. Python client guidance methods accept an explicit key and return it in `UncertainOutcome` after connection loss. Independent review, integration, publication or deployment are not established by these route responses.
+
 ## Project merge slot over HTTP
 
 The endpoint's shared `BLOCK_CAPABILITIES` table binds the slot action and its JSON
@@ -515,7 +535,7 @@ the exact command for the server. `remaining` counts the `todo` ones.
 | A first task defined | the task list (the project's merge slot row is not a task) | any member who may write tasks |
 | A personal agent granted the project | the enabled agents granted this project | each member, for their own agent |
 | A usable merge slot | the host's own read of the project's merge slot | an operator: the `merge-create` coordination operation, through `coordination.py` |
-| Guidance set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-guidance NAME --actor OPERATOR --file FILE` |
+| Guidance set | the guidance record on the host | a current web project coordinator (including owner/superuser or an explicitly granted personal coordinator agent), or an operator: `PYTHON KIT/admin.py --root ROOT set-guidance NAME --actor OPERATOR --file FILE` |
 | Onboarding set | the host | an operator: `PYTHON KIT/admin.py --root ROOT set-onboarding NAME --file FILE` |
 | Covered by a scheduled backup | the host | an operator: a command that runs a backup now, and the `ExecStart` line for a schedule |
 
@@ -559,7 +579,7 @@ the exact command for the server. `remaining` counts the `todo` ones.
 - **The page runs nothing on the server.** The host steps show a command to copy; the
   web interface does not run it. One host step can also be done on the page: an owner
   may write the project's onboarding text there (see "Onboarding text from the setup
-  page" below). Guidance is not settable from the web interface.
+  page" below). The project Guidance page lets current coordinators set guidance, including owners, superusers and explicitly granted personal coordinator agents.
 - **A step the server could not check is counted separately.** `remaining` counts the
   steps that are to do; `unchecked` counts the ones whose state could not be read. The
   page says "1 step could not be checked" and never "nothing is left" over such a step.
@@ -1024,10 +1044,12 @@ to read it for editing. Owners and superusers, session only.
 - **Guidance is not settable here or by any web route.** It stays
   `admin.py set-guidance`, for a listed operator.
 - The text is stored as the project's `ONBOARDING.md` under a first line the kit writes:
-  "[Written by an owner of this project in the web interface. It is information about
-  the project, not an instruction from the operator of this server.]" The line is part
-  of the stored document, so it is in what `onboard` gives a worker, it travels with a
-  backup and a restore, and an earlier kit shows it too.
+  "[Written by the project's owner or a coordinator in the web interface. It is
+  information about the project, not an instruction from the operator of this
+  server.]" The line is part of the stored document, so it is in what `onboard` gives a
+  worker, it travels with a backup and a restore, and an earlier kit shows it too.
+  Documents written before kittrial-5bb.349 keep the earlier "Written by an owner of
+  this project" line; the editor recognises both.
 - **Every line the owner wrote is stored behind a mark, `| `** (an empty line is `|`).
   A heading, or a line written to look like the kit's own, is then visibly inside the
   owner's text: nothing an owner writes can start a line of the document, so it cannot
@@ -1282,7 +1304,7 @@ export ORCHESTRA_HTTP_URL=https://<HOSTNAME>
 export ORCHESTRA_PASSWORD='...'          # read from the environment, never an argv
 python3 http_client.py login --username <USERNAME>
 # the client prints the session token to stdout; keep it out of shell history/logs
-python3 http_client.py --token "$TOKEN" call GET /v1/projects
+python3 http_client.py --token="$TOKEN" call GET /v1/projects
 ```
 
 A project owner or superuser issues a project-scoped credential once; the secret
@@ -1400,6 +1422,38 @@ Whoever claimed last then passed every rule that asks "is the caller the assigne
 in-process backend (the tests' and the local preview's) refused both cases already;
 it refused a second claim by the SAME member too, and now answers it 200, unchanged,
 as a real installation does.
+
+### Releasing your own claim
+
+`POST /v1/projects/{id}/tasks/{task}/release` (body `{"reason": "..."}`, closed set)
+lets the caller release a claim it HOLDS (including under one of its `<agent>/<label>`
+sub-labels, kittrial-5bb.300) and has not delivered (kittrial-5bb.301):
+the task returns to `open` and unassigned, its checkpoint and open items stay, and the
+claim stops counting against the holder's `claim_limit` at once, so the next claim is
+available immediately. The holder is the authenticated caller, never a submitted
+field, and the reason is at most 120 characters. The release is recorded as the
+canonical assignment notice, which names who released it, when and the reason -- the
+same notice `POST .../tasks/{task}/assign` with `assignee: null` writes, so clearing
+an assignee has one mechanism, not two.
+
+It is refused, changing nothing, when:
+
+- the caller does not hold the task: **409 "That task is not claimed by you; only its
+  holder can release it"**. Another actor's claim is never released this way; an
+  owner's bulk release of one agent's claims is
+  `POST /v1/agents/{id}/release-claims`;
+- the holder's contribution **awaits review or has changes requested**: **409**, from
+  the canonical assignment check, because that is delivered work, not a claim (set
+  `allow_pending_review` on the assign route if a coordinator must displace it);
+- the holder holds the **merge slot** for this task: **409**, from the canonical
+  check; the slot and its holder are retained;
+- the body carries a field other than `reason`, or the reason is blank or over 120
+  characters: **422**; no `Idempotency-Key`: **422**.
+
+An agent needs only its ordinary task authority (`tasks.write`) for this route; every
+other assignee change still requires coordinate authority, so no caller gains the
+power to take another actor's task. `POST .../assign` is unchanged for coordinators
+and owners. A backend without canonical task assignment answers **501**.
 
 ### The name a worker credential writes under
 
@@ -1655,12 +1709,45 @@ narrowed, to gate it on the live-authority descriptor that only the web service 
 leaving the SSH path alone. No decision is built here beyond the service-only rule read.
 
 
+### Reading a task's history, newest first
+
+`GET /v1/projects/{id}/tasks/{task}/history` pages the task's history in exact
+cursor-bound pages (kittrial-5bb.273: a continued page resumes at the first entry the
+previous page did not return, at any page size).
+
+- **Oldest first** (the default): `limit` 1..100, and `next_cursor` continues to newer entries.
+- **Newest first:** `recent=N` (1..100; kittrial-5bb.353) is the page size of a
+  newest-first read of the same snapshot, the read the client's `history --recent`
+  gives. The first page holds the newest N logical entries, and `next_cursor` continues
+  toward OLDER ones until the oldest. It replaces `limit`: giving both is refused. An agent
+  that wants a coordinator's newest comment reads `recent=20` first, and pages back only
+  if it needs to.
+- **A long comment** arrives as several consecutive entries in either order. They share
+  `entry_id` and carry `body_offset` and `continued`. Newest first, the fragments of one
+  comment still come together and in body order, so concatenating them in page order
+  gives the whole comment.
+- **`since_checkpoint=true`** selects the entries the task's newest valid checkpoint
+  did not incorporate (the client's `history --since-checkpoint`), in either order. The
+  answer then also names the checkpoint: `since_checkpoint`, `checkpoint_author`,
+  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A checkpoint by
+  the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
+- **The cursor** is bound to the caller, the project and the query. A newest-first
+  cursor continues only a newest-first read with the same `recent`, and an oldest-first
+  one only an oldest-first read; the other is refused (409).
+- **Every answer** says `order` (`oldest-first` or `newest-first`) and `truncated`.
+  `truncated` is true, with one sentence in `truncated_note`, when entries exist that the
+  answer neither returned nor can continue to. That is the in-process backend
+  (`--backend inprocess`), which has no continuation cursor, past its first page.
+
 ### What an agent needs to write a checkpoint
 
 `GET /v1/projects/{id}/tasks/{task}/brief` carries everything a checkpoint needs, so an
 agent can write its first one from the brief alone.
 - `activity_cursor`: the cursor a checkpoint must carry. It is the same value the
   history route returns. (With `--backend inprocess` it is null and not needed.)
+- `next_action` and `review.next_actor` for every task (kittrial-5bb.291 item 3): the
+  same next-action sentence and caller-neutral role the work queue already carries, so
+  a reader of the brief alone knows whose move it is without a second read.
 - `checkpoint_template`: the record to send, for this task at this moment.
   - `send_to` and `method`: where it goes.
   - `body`: every field, with `previous` and `activity_cursor` already filled, the four
@@ -1671,9 +1758,13 @@ agent can write its first one from the brief alone.
   - `carried_open_items`: how many open items `body` holds. It is null when they could
     not all be read (the task changed during the read); `body.open_items` is then
     empty, the note says so, and the brief is read again.
-  - The brief's own `checkpoint.open_items` shows the first ten, each now with its
-    `source`; a task with more costs one further canonical read, which asks for all
-    of them (the canonical `brief --items-limit` now goes up to 100).
+  - The brief's own `checkpoint.open_items` shows the first ten, each with its
+    `source`, and carries `open_items_shown` and `open_items_total`; when the list is
+    cut, `checkpoint.open_items_note` says so in one sentence. `carry_open_items` is the
+    complete list, in order, and is null when they could not all be read. Copy
+    `carry_open_items` (or the template's `body.open_items`), not the first ten: a task
+    with more costs one further canonical read, which asks for all of them (the
+    canonical `brief --items-limit` goes up to 100).
   - `required`: the four texts to fill (`intent`, `acceptance`, `summary`,
     `next_action`); `optional`: what may be left out and when; `limits`; the shape of an
     `open_item` (with the allowed `kind` values) and of a `resolved_item`.
@@ -2002,6 +2093,31 @@ credential approved anything; this is the one place where that is lifted.
   or viewer) stays on record and shows as "Granted, no effect" until the account is raised
   again or the grant is removed.
 
+**An agent's history (kittrial-5bb.365).** It is read from the service's audit, and nothing is
+rewritten. It covers credentials issued, revoked and extended, the agent disabled,
+enabled or changed, its owner's account disabled, and projects and coordinator grants
+given and taken; each with who and when, newest first, at most 50 (`omitted` counts the
+rest). There are two views:
+
+- `GET /v1/agents/{id}/history` is the agent's own view, for its account or a superuser.
+  It names each credential by its label, read from the credential record while that record is kept (the audit itself never holds a label), and shows the scopes before and after a change.
+  Anyone else gets the same `404` an unknown id gets, and a credential cannot read it.
+- `GET /v1/projects/{id}/agents/{agent}/history` is the project's view, for its owners and
+  admins. It shows no label, no scopes and nothing about another project, and nothing from
+  before the agent was given THIS project.
+  - The time of the grant is the agent's `agents.project.granted` audit event. The service
+    writes one for each project granted since this change.
+  - A grant older than that has no recorded time, so this view then lists nothing and says
+    why. It never shows the agent's history from another project.
+  - An agent not granted the project is the same `404` as the project's agent read.
+
+`GET /v1/projects/{id}/audit` also lists the events of agents whose grant names the project
+at the time of reading, tagged `agent: {id, name}` and cut to the same project view. A
+disable is one row with `revoked_count`. An agent taken out of the project drops out of the
+list: it is a view of the current grants, not a log of the project. `notes` says when the
+service no longer keeps an agent's oldest events (see docs/OPERATIONS.md, "How long the
+audit keeps events").
+
 `GET /v1/projects/{id}/agents` and `.../agents/{agent}` carry `coordinator` for each
 agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective,
 no_effect_because}`; the last is `null` while the grant has effect, else `agent-disabled`,
@@ -2234,6 +2350,79 @@ own set-up. What the person still does once is said in the dialog: install the e
 "Orchestra Bridge: Set up" (and compare the fingerprint it shows), reload the window, click the
 first wake.
 
+**Step-by-step setup wizard (`kittrial-5bb.329`, slice 4 of `docs/ONBOARDING_DESIGN.md`; one action
+per screen since `kittrial-5bb.348`).** The setup dialog and the standalone `#/setup` route show ONE
+screen at a time: a short title, at most two short sentences, the screen's one action (a button, a
+choice, or one command with its Copy button) and `Back` / `Next`; any explanation is behind a
+collapsed "More about this". Only the current screen is in the dialog, so another screen's command
+is absent, not hidden. The first screen chooses the **operating system** (`Windows (PowerShell)`,
+`macOS`, `Linux`, auto-detected from `navigator`) and whether that computer's VS Code has
+**Orchestra Bridge 0.14 or later**; the second chooses what the agent does (worker first; reviewer
+also gets other people's deliveries). The rest of the screens are `screenPlan()` in
+`web/js/agentSetup.js`:
+
+- **Orchestra Bridge 0.14 or later** (the short path): *Save your secret* → *Restrict the file*
+  (macOS/Linux only) → *Set up in VS Code* → *Start the agent*. The extension's own "Orchestra
+  Bridge: Set up" fetches and checks the certificate, tests the connection, writes
+  `.orchestra/agent.json` (`config_path`) and `.orchestra/AGENT.md` (`guide_path`), adds
+  `.orchestra/` (`gitignore_line`) to `.gitignore` from `GET /v1/agents/me` (which includes the
+  secretless `setup` bundle), and compares the open folder with `working_directory` (offering
+  `PATCH /v1/agents/me` with `{"working_directory": "..."}` when they differ). So this path has no
+  certificate, rewrite, self-check or save-files screen.
+- **An older extension, or curl only** (the longer path): *Save the certificate* and *Move the
+  certificate* (when the service has its own) → *Save your secret* → *Add the certificate path*
+  (the rewrite command, when there is a certificate; otherwise *Restrict the file* on macOS/Linux)
+  → *Test it* (the self-check) → *Save the agent's files* → *Set up in VS Code* → *Start the
+  agent*.
+
+*Save your secret* shows the lines to paste into the credential file: `# server = ...`,
+`# server certificate sha256 = ...` (when there is a certificate) and the header line with the
+secret, behind one Copy button, and the file name. With the server line in the file, the Bridge's
+Set up proposes the server itself. Opened without a secret (the agent's card), that screen says in
+one line why (`The secret is shown only once, when it is issued; issue a new one to continue.`) with
+the **Issue a new secret** button right there, and the new secret's lines appear on the screen at
+once. The secret is shown on that screen only, never stored (the secretless `sessionStorage` state
+`orchestra.agentSetup.v1` holds the agent, the path, the screen, the system and the role, so a
+reload resumes the screen), and never in the folder files, the prompts or a command line.
+
+**Every error raised while the wizard is open is shown inside it**, on the current screen, in full
+(the sentence and the request id). Before `kittrial-5bb.348` a failed issue showed only a toast,
+which `document.body` draws UNDER a modal dialog (the browser's top layer): at the office it was a red
+box behind the wizard. Site-wide, a toast raised while a modal dialog is open is now drawn inside the
+topmost one (`toastLayer()` in `web/js/dom.js`).
+
+**Move the certificate**: browsers strip the leading dot when saving `.orchestra-agent-<slug>.crt`
+into `Downloads`; the filled-in `Move-Item` / `mv` command moves it into the user profile with the
+dot restored, and with nothing in `Downloads` prints one plain sentence (`Click Save certificate
+first, then run this again.`). **Add the certificate path** runs the rewrite command
+(`credentialFileCommand`), which expands the real user profile path on that machine
+(`[Environment]::GetFolderPath('UserProfile')` on Windows, `$HOME` on macOS/Linux) and writes the
+comment lines and `cacert = ...` with no `<your-name>` to edit. **Test it** gives the self-check
+(`checkCommands`): it looks for `.curlrc.txt`, a leftover `<your-name>`, or a certificate still in
+`Downloads/orchestra-agent-<slug>.crt`, then calls Orchestra; `CURL_ERROR_LINES` (behind "More
+about this") covers `curl` exit codes `2`, `26`, `35`, `60` and `HTTP 401`. **Save the agent's
+files** is the **Save to agent folder…** button with the agent's recorded folder path printed beside
+it (it passes the last chosen directory handle as `startIn` to `showDirectoryPicker`); the setup
+prompt and the two files to copy by hand are behind "More about this".
+
+**A command-line proxy** (`kittrial-5bb.348`): an office PC's `HTTPS_PROXY` sent curl to a corporate
+proxy that cannot reach the internal server; it hung and then answered with its own HTML page (HTTP
+503). Every curl the wizard gives carries `--noproxy HOST --max-time 20`, HOST being the server's own
+host (never `*`: only this server bypasses the proxy), and the self-check no longer uses `-f`: when
+the answer is not the kit's JSON (a web page, a 5xx without the kit's `{"error": {...}}`, no answer
+within 20 seconds, or a failed proxy tunnel) it prints ONE sentence, that a proxy probably answered
+and to check `HTTPS_PROXY` or ask IT to let the computer reach HOST directly. The agent's own calls in
+`AGENT.md` carry `--noproxy HOST --max-time 60` (a first read of a large project can take over 12 s).
+Orchestra Bridge 0.14 writes its own copy of `AGENT.md` and checks it byte for byte against the
+site's: that parity check fails against this kit until the next Bridge release carries the same
+lines.
+
+`Next` on *Test it* and *Set up in VS Code* first checks `GET /v1/agents/{id}` (`last_seen_at`),
+advancing when the agent reached the service during that screen, or showing a one-sentence remedy
+with a `Continue without checking` button. While *Start the agent* is open and
+`document.visibilityState === 'visible'`, a 3-second check polls `GET /v1/agents/{id}` and stops
+once the agent is seen, or when leaving the screen, hiding the tab, or closing the dialog.
+
 **What an agent may do is kept on the agent, and a new credential carries exactly that**
 (kittrial-5bb.208). The agent record holds its `scopes`: written when the agent is made
 (the list asked for, or the default four) and changed only by a renewal that sends a
@@ -2297,6 +2486,14 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   list to agents with inferred or unknown scopes. A new page used with an older service
   that omits scope metadata says so and asks the user to check the new credential's scopes;
   it does not promise that a plain renewal preserves scopes the page cannot know.
+- **Editing another account's agent** (kittrial-5bb.355): the project list offers only the
+  projects that agent's OWNER may be granted; every other project the viewer can see is
+  listed greyed with "OWNER is not a member of PROJECT: add them under the project's
+  Members first", linking to that project's Members & settings when the viewer may manage
+  it. The page learns this from `owner_grantable_projects` on the agent read: the owner's
+  live memberships (everything when the owner is a superuser), intersected with the
+  projects THAT reader can see, so the answer never reveals a project the reader cannot
+  see. Only the agent's owner or a superuser can edit an agent, as before.
 - An agent may hold at most 20 credentials **that still work**; revoked and expired ones
   are not counted (counted, an agent could not be renewed a twentieth time). Of those
   that no longer work **the newest 5 are kept** per agent, as the short history the card
@@ -2362,13 +2559,26 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   agent that holds 20 or more records (possible here: up to 20 that work and 5 that do
   not) cannot be renewed under the older kit until records are revoked and removed by
   hand; and the older kit gives the default four to every renewal from the page again.
+  Rolling back to a kit that predates the `'records'` scope (slice 5, kittrial-5bb.213)
+  makes that older kit treat a stored or credential `'records'` scope as an unrecognized
+  scope name and therefore read the agent's scopes as `unknown` (`scopes_source: "unknown"`,
+  `scopes: null`) until the owning account sets an explicit scope list recognized by that
+  older kit.
 
 The
 agent then calls `GET /v1/agents/me` and `GET /v1/agents/me/next` with its credential as a
 bearer token (`Authorization: Bearer <agent-secret>`); every other project route works as
 before, capped at the owner's live role and the agent's granted projects. A grant may
 only name a project the owner can open, including when a superuser edits somebody
-else's agent (`404` otherwise). Set `--public-url https://<HOSTNAME>` so the setup and
+else's agent. The refusal is a `404`, and its sentence now depends on what the caller
+can already see (kittrial-5bb.355): a caller who cannot see the project gets the plain
+`Project not found`, while one who can see it (a superuser, or a member of that project)
+gets the same `404` with "`OWNER` is not a member of `PROJECT`: add them under the
+project's Members first" - the rule is unchanged, only the sentence is clearer. Set
+`--public-url https://<HOSTNAME>` (a plain address: an http or https
+URL with a host, an optional port and a path of letters, digits, `. _ ~ - /` and `%XX` escapes; anything
+else is refused at start in one sentence, because the address is copied into commands people run;
+kittrial-5bb.360) so the setup and
 resume snippets carry the real address. Attention is computed at read time only: the
 service runs no scheduled job, poller or timer, and the owner resumes the agent
 manually.
@@ -2965,6 +3175,62 @@ line separately and unconfined.
   caller approves (blocked when the latest checkpoint lists unresolved items). Rows past
   the bound still say "read the task brief" and "wait time unknown" and are not marked
   blocked. My work rows show "Blocked" and the open request ids where known.
+- **A per-agent limit on claimed, undelivered tasks.** Each personal agent carries
+  `claim_limit` on its record: a whole number from 1 to 50, default 1, editable by the
+  agent's owner on My agents and with `PATCH /v1/agents/{id}` (`422` outside the bounds,
+  naming the field and the range). An agent may LOWER its own limit, and only lower it,
+  through `PATCH /v1/agents/me` with the one-field body `{"claim_limit": N}`: N is a whole
+  number from 1 up to the value the agent holds now (`422` outside the bounds), and a raise
+  above the current value is refused `403` with a sentence naming the owner's account or a
+  superuser and the My agents page. The agent's own route takes its identity from the
+  calling credential, never from the body, so it can only ever change the caller's own
+  record. The claim route
+  (`POST /v1/projects/{id}/tasks/{task}/claim`) refuses a NEW claim while the agent
+  already holds that many unblocked tasks that are open or in progress with review state
+  `none` or `changes-requested`, or while its total undelivered claims (including blocked
+  tasks) have reached the hard cap `claim_limit + 3`; the refusal is a `409` whose
+  sentence names the limit, the hard cap (`claim_limit + 3` including blocked tasks) and
+  the held tasks, with `claim_limit`, `hard_cap`, `held`, `blocked` and `held_readable`
+  in its detail, and it carries the
+  same bounded `candidates` fall-through an ordinary held refusal carries. Claims made
+  under a `<agent>/<label>` sub-label resolve to the owning `<agent>` record and count
+  together with `<agent>`'s own claims against its `claim_limit` and `hard_cap`. A
+  delivered
+  task (awaiting review or beyond) does not count, and the agent's own re-claim of a task
+  it already holds is not counted again. A person's own session actor is not limited.
+  A task whose latest checkpoint left an open blocker or dependency does not count
+  against `claim_limit` itself: the documented order sends a lane the checkpoint left
+  stuck on to other work, and that order has to be possible to follow. Blocked tasks DO
+  count against the hard cap `claim_limit + 3`, so an agent cannot lift its own limit
+  without bound by writing blocker checkpoints on its own claims. A held task the agent
+  releases (`POST /v1/projects/{id}/tasks/{task}/release`, kittrial-5bb.301, including a
+  claim held under one of its `<agent>/<label>` sub-labels) stops counting at once, which
+  is the other half of the refusal's "Deliver or release one". A PERSON assigning a
+  task to an agent at its limit is still allowed
+  (`POST /v1/projects/{id}/tasks/{task}/assign`): that is the owner's explicit choice,
+  not the agent taking work. An AGENT assigning a task to itself (or to one of its
+  `<agent>/<label>` sub-labels) through that same route is a claim and takes the limit
+  and hard cap, because that IS the agent taking work.
+  `GET /v1/agents/me/next` reports the limit, `hard_cap`, how many it holds (`held` and
+  `blocked`), how many are left (`available`, bounded by both `claim_limit` and the
+  `claim_limit + 3` hard cap) and `raise_by` (who may raise it: the owner's account or a
+  superuser on the My agents page), from the same one counted-held rule the gate applies,
+  so the answer cannot disagree with the claim route. `GET /v1/agents/me` is a polled
+  whoami and stays cheap (kittrial-5bb.303): it answers from the agent record only
+  (identity, `claim_limit`, `raise_by`, the calling credential's expiry) and makes no work
+  read, so `held`, `blocked` and `available` are read from `/v1/agents/me/next`; each
+  agent record carries the limit. The
+  held set is read from the same bounded `work`
+  snapshot attention already reads, across every project the agent is granted, and it
+  fails closed: a held
+  set that cannot be read refuses the claim rather than reading as "no limit". A
+  per-agent lock (`Service.claim_gate(agent_id)`, keyed by the agent id) spans the
+  held-set read and the claim write so concurrent claims by the same agent serialize
+  while claims by different agents do not wait for each other; one service process is the
+  supported setup. This is
+  the service's own gate, so it covers the web page, the client and any other client of
+  the route; a `bd update --claim` run by hand on the host, outside this service, is not
+  gated by it.
 - **Review respond step (slice 2a).** Canonically a requested change stays open until
   the contributor records a `respond` resolution for it, even after a newer revision
   arrives. The task page shows the task's assignee each open request with a "Resolved"
@@ -3124,6 +3390,32 @@ line separately and unconfined.
     coverage; its `newer.history` is the authorized task `/history` route. SSH-only
     `history_new` and `verify` commands are omitted. Read history to reconcile unknown
     coverage; reading acknowledges nothing.
+    - **A stable newer-activity marker (kittrial-5bb.351).** A held action (`blocked`
+      or `in-progress`) and every row of `GET /v1/agents/me/wait` carry
+      `newer_activity_marker` beside `newer_activity`, `newer_activity_by_others`,
+      `newer_activity_own`, `newer_activity_coverage` and `unresolved_directions`.
+      The marker is the newest other-party entry the agent's checkpoint did not
+      incorporate, written `<entry_id>:<16 hex>`, or `fields:<16 hex>` when there is
+      none; the hex covers that entry's current content and the current title,
+      description and acceptance (kittrial-5bb.354). It changes for each new
+      other-party entry, when that newest entry is **edited**, and when one of those
+      three fields is edited; never for a claim or a status change, and it never
+      encodes a timestamp. The agent's own entries do not move it. It is `null` only
+      without a valid checkpoint or with unknown coverage (a legacy checkpoint without
+      per-entry digests); a client then falls back to `newer_activity`, which keeps its
+      released rule. The wait fingerprint includes the marker, so a second coordinator
+      comment, an edit to the newest one, or a description edit wakes a waiting bridge
+      even while the boolean stays `true`. All six fields are defined once in
+      docs/BRIEFINGS.md, "Newer activity: one definition".
+    - **The task read carries the same fields and the changes (kittrial-5bb.354).**
+      `GET /v1/projects/{pid}/tasks/{tid}/brief` adds `activity` (the same six fields,
+      from the same computation as next and wait) and `changes_since_checkpoint`: the
+      entries since the checkpoint, newest first, with author, time, own or other, new,
+      edited or late, and a clipped body, plus the changed title, description or
+      acceptance with its current and previous value and "who made the change is not
+      recorded". The section and its bounds are in docs/BRIEFINGS.md, "Changes since
+      your checkpoint". The task page shows it under "Where it stands". An endpoint
+      older than this kit omits both blocks: they read `null`.
     No kind was renumbered when these two were added. A
     client relies on the order of `next_actions` and on the kind names.
   - **Why the two waiting kinds are last.** An agent, and anything that wakes it,
@@ -3202,7 +3494,9 @@ targets, unreadable state and missing authority refuse without an assignment eff
 Assignment changes the assignee. Unassigning an `in_progress` task with no
 contribution in flight also returns its native status to `open`. An undelivered
 ordinary task then appears in the available-work queue and another contributor
-can claim it. A task with delivered history retains the existing delivered-work
+can claim it. Unassigning a `blocked` task leaves it blocked: it has no holder and
+is not claimable (kittrial-5bb.291 item 4), so it stays out of the available-work
+queue until somebody reopens it. A task with delivered history retains the existing delivered-work
 claim guard; use assignment to name its next holder. With an in-flight contribution,
 unassignment retains its status and review items, and an awaiting-review or
 changes-requested contribution still requires the explicit displacement flag.
@@ -3303,3 +3597,246 @@ interrupted-cut/restore handling and the forward-only older-reader boundary.
 Install compatible readers before creating new baseline-family files; retain a
 verified backup from before the first new-family write for any older-kit rollback.
 This does not choose office settings or a deployment schedule.
+
+## Session idle and absolute limits
+
+An installation sets how long a browser session may sit unused before it signs out, and
+how long it may live at all. The web service takes two flags, and the private office JSON
+takes the two settings `office_service.py` forwards as those flags:
+
+| Limit | Flag | Private office JSON | Bounds | Default |
+| --- | --- | --- | --- | --- |
+| idle window | `--session-idle-minutes MINUTES` | `"session_idle_minutes": N` | 5 to 1440 whole minutes (5 minutes to 24 hours) | 30 |
+| absolute limit | `--session-absolute-hours HOURS` | `"session_absolute_hours": N` | 1 to 168 whole hours (1 hour to 7 days) | 12 |
+
+The absolute limit must not be shorter than the idle window. A value outside its bounds, a
+value that is not a whole number, and an absolute limit shorter than the idle window are
+refused at startup: one sentence naming the bounds and what was given, a non-zero exit
+before the state document is opened, and nothing written or clamped. An installation that
+sets neither keeps 30 minutes and 12 hours exactly as they were before this setting
+existed.
+
+To change them, edit the private office JSON named by `--config` (or, where the web service
+is run by a unit of its own, the two flags in its `ExecStart`) and restart the service. A
+session that is already signed in is not rewritten: it keeps the deadlines it was issued
+with, and the next sign-in carries the new ones. The idle deadline is refreshed by every
+authenticated request; the absolute deadline is never extended by use.
+
+`GET /v1/sessions/current` answers a browser session with the window and its own deadlines:
+`idle_seconds`, `absolute_seconds`, `idle_expires_at` (the idle window from this session's
+last authenticated request) and `absolute_expires_at` (which no use extends). A worker or
+agent credential has no browser session and the answer carries none of those fields, exactly
+as before.
+
+The page keeps a long task alive with `web/js/api.js`: `keepAlive()` is one authenticated
+session read, and `keepAliveWhileVisible({intervalMs, warnMs})` repeats it only while
+`document.visibilityState === 'visible'` (a hidden tab makes no request), stops on a
+sign-out and on an expired session's `401`, and dispatches `orchestra:session-idle-warning`
+(a `CustomEvent` on the document, with `idleSeconds`, `idleExpiresAt` and `remainingSeconds`)
+shortly before the idle deadline it last heard about. That warning is for the case where the
+touches stop reaching the service; while they do arrive, the session simply stays alive. The
+agent set-up wizard is what uses it (kittrial-5bb.329).
+
+## Agent credential lifetime
+
+The installation option `--agent-credential-days DAYS` sets future personal-agent
+credential issuance to 1 through 366 whole days, default 30. The office may choose 90;
+90 is a configuration choice, not a separate code path. Worker credentials, sessions
+and reset values retain their existing lifetimes. Changing the setting does not
+rewrite credentials already issued. Invalid values are refused before opening state.
+
+Each new agent key stores its monotone expiry and raw-clock deadline in the existing
+credential row, along with `agent_written_raw`, the raw clock of its most recent
+legitimate write (issuance, or the last extension). The current reader expires it on
+either clock and applies the 366-day write cap described below. A key longer than the
+older kit's fixed 30-day raw-age cap uses that reader's existing legacy stored-expiry
+path (no `issued_raw`); its actual raw issue time remains in `agent_issued_raw`.
+An older reader ignores the added deadline fields and honours the stored expiry;
+it does not provide the new reader's per-key raw-deadline check for those keys.
+Default30 keys keep their original raw issuance stamp as well.
+
+Expiry timestamps must have a representable RFC3339 year from 1 through 9999;
+a clock or requested expiry beyond that range is refused before credential effects.
+
+
+### Extending an agent credential
+
+`POST /v1/agents/AGENT/credentials/CREDENTIAL/extend` extends a working key for its
+own account or a superuser. A current human project owner (or a superuser) uses
+`POST /v1/projects/PROJECT/agents/AGENT/credentials/CREDENTIAL/extend` for an agent
+still granted that project. Send an empty JSON object and keep the same
+Idempotency-Key when retrying an uncertain result. Coordinators, contributors,
+viewers, personal agents and worker credentials have no extension authority.
+A completed retry rechecks current authority, the grant, the target account and
+agent, key binding, revocation and expiry; losing any of these refuses the retry.
+No expired or revoked key is revived. A disabled account or agent cannot extend.
+
+The same credential keeps its ID, hash/secret, issuer, actor, scopes and grants.
+Its expiry becomes `max(existing expiry, now + configured agent lifetime)`;
+retries do not add lifetime intervals. No secret is returned, shown, replayed or
+written to the audit. The audit records caller, target, project and old/new expiry.
+Extension and its audit are saved before the keyed receipt. A failed state save
+rolls them back; a failure after saving retains the extension and the in-progress
+reservation, so reconcile the current credential instead of inventing a fresh key.
+The existing service-local HTTP receipt window applies (24 hours); an exact retry
+within it never performs another extension. This is not an indefinite retry contract.
+
+The Agents page and the owner's project settings show expiry, the final seven-day
+warning and Extend existing credential. This action keeps the existing secret.
+Issuing a new secret is a separate action for the agent's own account or a
+superuser; it retains the existing scope confirmation/widening rules and the
+20 working / five retained dead credential bounds. Extension makes no new key.
+`GET /v1/sessions/current` adds `credential_expiry` for an agent credential, and so
+does `GET /v1/agents/me` for the calling credential itself (the same secret-free shape,
+plus its `expires_soon`). That new expiry field answers only the calling credential; the
+same `GET /v1/agents/me` answer's `agent.credentials` list already shows the agent's own
+sibling credentials, as it did before this field existed. The `401` at credential
+expiry and revocation names who can act - an owner can extend an agent credential
+before it expires, and after it expires the owner's account or a superuser issues a new
+secret - and names no other credential. A stored expiry is capped at 366 days from the
+most recent **legitimate write** - issuance, or the latest extension - **on read** in both
+the web service and the canonical endpoint, so a hand-edited store of years is not
+honoured; a record written before the write stamp existed falls back to its issuance
+stamp and still caps. The store is never rewritten by a read. The stamp lives in the same
+store as the expiry and is exactly as editable: this stops careless or stale edits, not a
+host user who can rewrite the state, and there is deliberately no HMAC tamper evidence.
+Rolling back to the released kit removes the cap entirely, because that kit does not
+know the write stamp.
+Project-owner credential rows expose only ID, expiry, working/revoked status and
+warning, never labels, hashes, scopes, directories, other grants or secrets.
+
+### A superuser creating for another account
+
+A superuser may send `owner: ACCOUNT_ID` on `POST /v1/agents`, or choose a real,
+enabled account in the Agents page. Omission means the caller's own account.
+Ownership, name/file collision, the 100-agent bound, project membership and the
+credential's user/party all use the target account. This grants no membership or
+coordinator role. Other accounts cannot target a foreign owner. The first secret
+is shown once to the creating superuser; a retry returns secret-free metadata.
+The audit identifies creator and owner, and the owner's card says Created by NAME.
+The owning account can issue a new secret and revoke that first key if the creator
+having seen it matters. Legacy agents have no invented creator attribution.
+
+## Reference and capability records over HTTP
+
+Slice 5 of [WEB_COORDINATOR_DESIGN.md](WEB_COORDINATOR_DESIGN.md) (kittrial-5bb.213).
+Members look up, find, propose and revise reference and capability records over HTTP
+and on the project's **Records** page (`#/p/NAME/records`); a coordinator accepts,
+retires and verifies them, and reads what waits to be accepted (`?waiting=true`).
+
+### Routes and capabilities
+
+| Route | Capability | Who may call |
+| --- | --- | --- |
+| `GET /v1/projects/{id}/references`, `GET .../references/find?q=...`, `GET .../references/{key}` | `projects.read` | any member of the project, a superuser, a personal agent granted the project, or a worker credential for the project |
+| `GET /v1/projects/{id}/capabilities`, `GET .../capabilities/find?q=...`, `GET .../capabilities/{key}` | `projects.read` | any member of the project, a superuser, a personal agent granted the project, or a worker credential for the project |
+| `POST /v1/projects/{id}/references`, `PATCH /v1/projects/{id}/references/{key}`, `POST .../references/{key}/revisions` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
+| `POST /v1/projects/{id}/capabilities`, `PATCH /v1/projects/{id}/capabilities/{key}`, `POST .../capabilities/{key}/revisions`, `POST .../capabilities/{key}/aliases` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
+| `POST /v1/projects/{id}/references/{key}/accept`, `POST .../references/{key}/retire` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project; never a contributor, viewer, ungranted agent or worker credential (`403`) |
+| `POST /v1/projects/{id}/capabilities/{key}/accept`, `POST .../capabilities/{key}/retire`, `POST .../capabilities/{key}/verify`, `POST .../capabilities/{key}/aliases/reject` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project; never a contributor, viewer, ungranted agent or worker credential (`403`) |
+
+- **A superuser without membership in the project is refused (`403`) on every write route.**
+  `http_authority.decide()` has no separate superuser path for `coordinate` or `records`, and
+  both the web service and `endpoint.py` require the caller's account to be a member of the
+  project on every reference and capability write, matching the requirement routes
+  (kittrial-5bb.278): a superuser who wants to propose, revise, accept, retire or verify in a
+  project adds themselves as a member first.
+- **Every write is re-checked in `endpoint.py` under `verified_web_authority`.** A direct
+  endpoint call claiming `ref` or `capability` write authority without a live verified web
+  authority block for `records` or `coordinate`, or from an account that is not a project
+  member, is refused before any lock, reservation or native write.
+
+### Two-step revise-then-accept and F3 acceptance evidence
+
+- **Revising an accepted key never overwrites the accepted record in place.** When revision `N`
+  is `accepted`, `PATCH .../references/{key}` (or `POST .../revisions` on a reference or
+  capability) compares `expected_revision` and `expected_sha256` against the newest revision,
+  writes revision `N+1` with `acceptance_state: "draft"`, and leaves revision `N` as the active
+  accepted `record` while exposing revision `N+1` as `proposed` (`waiting_acceptance: true`).
+  `GET .../references?waiting=true` and `GET .../capabilities?waiting=true` list both draft-only
+  keys and accepted keys that carry an unaccepted newer draft revision.
+- **Accepting writes the F3 evidence comment and the next revision as accepted.**
+  `POST .../accept` requires `expected_revision` and `record_sha256` of the newest draft
+  revision plus `evidence` (or an explicit `acceptance` object with `owners`, `approvers`,
+  `policy`, `decision_id` and `evidence`); `acceptance.approvers` is server-bound to the
+  authenticated coordinator (`[f"account:{user_id}"]`, refusing any forged approver list with
+  `422`), and `acceptance.owners` is verified against the project's human owner/coordinator
+  members. Accepting an already-accepted revision is refused (`422`); revise it as a draft
+  first, then accept that draft.
+- **Retiring supersedes the newest revision by an existing `successor` key** (which may not form
+  a cycle) and records the F3 `Kind: *-acceptance-v1` retirement evidence and the `superseded`
+  revision.
+- **What stays live when a role or grant is removed.** Acceptance and retirement evidence
+  comments (`Kind: reference-acceptance-v1`, `Kind: capability-acceptance-v1`) and coordinator
+  verification attestations (`Kind: capability-verification-v1` with `identity: "attested"`)
+  written by a web coordinator (`usr_<16hex>` or `agent_<16hex>`) are recognized as live by
+  `keyed_entries.evidence_is_live` and `capability_verification`. Lowering a coordinator to
+  contributor or revoking an agent's coordinator grant stops their **next** `accept`, `retire`,
+  `verify` or `aliases/reject` immediately (`403`, including idempotent replays of an earlier
+  request) and leaves the acceptances, retirements and verifications they already recorded live
+  (`acceptance_inert: false`, `verification_state: "attested"`). Keeping an attestation's
+  `attested` label after its author is demoted or has their coordinator grant removed is
+  deliberate and safe: every reader surfaces it honestly as `attested` (`trusted: false`,
+  `attested: true`, `checkout_validated: false`), and an attestation never clears a failure
+  (`drifted`).
+- **Rolling back to an older kit.** A kit that predates the `'records'` scope does not include
+  `'records'` in `ALL_SCOPES`, so on rollback any agent whose stored `scopes` or working
+  credentials include `'records'` reads as `scopes_source: "unknown"` (`scopes: null`) on that
+  older kit until the agent's owning account issues a renewal with an explicit scope list
+  recognized by the older kit.
+
+### Self-acceptance and `approval_by_another_party`
+
+- **Both proposer and acceptor (or verifier) are always recorded and returned** (`proposer` and
+  `acceptor` on `accept` and `retire`; `proposer` and `verifier` on `verify`; `proposed_by` and
+  `accepted_by` on `get` and `list`), along with `draft_authors` and `accepted_draft_authors`
+  tracking every author who contributed a draft revision since the prior acceptance.
+- **A granted personal agent never accepts or verifies a draft written by its own party**,
+  whatever the server's `approval_by_another_party` setting says (`403`). Every draft author in
+  the unaccepted revision chain (`draft_authors` for acceptance, `accepted_draft_authors` for
+  verification) is checked against the caller's party. The party of a draft's author includes
+  the owning account (`usr_...`), every personal agent of that account (`agent_...`), and every
+  actor name held by a worker credential of that account in the project.
+- **For a signed-in human coordinator or owner:**
+  - When `approval_by_another_party` is **off** (the default), a human coordinator or owner may
+    accept or verify a draft revision they (or one of their agents or worker credentials) wrote,
+    matching the requirement routes (kittrial-5bb.278).
+  - When `approval_by_another_party` is **on** (`--approval-by-another-party`), a human
+    coordinator or owner is refused (`403`) when accepting or verifying a revision where any
+    author in its unaccepted draft chain belongs to their own party (their account, one of their
+    agents, or one of their worker credential actors). Another coordinator or owner of an
+    independent party must accept or verify it.
+
+### `points_to` and `pointers_validation` on capability records
+
+The web service has no checkout of the project's repository. Capability pointer validation is
+therefore never silently skipped; every capability read (`get`, `list`, `find`) and write
+(`propose`, `revise`, `accept`, `retire`, `verify`) carries an explicit `pointers_validation`
+object:
+
+- On `propose`, `revise`, `accept` and `retire`, the endpoint validates pointer syntax
+  (`capabilities.parse_pointer` for `anchors`, `code` and `tests`) and checks that every key in
+  `requirements` resolves to an existing requirement anchor in the tracker. Because no
+  repository checkout is mounted in the web service, the response reports
+  `pointers_validation: {"checked": "syntax-and-requirements", "checkout_validated": false,
+  "verified_commit": null, "note": "..."}` naming both `capability check --repo <PATH>` and
+  `POST /v1/projects/{id}/capabilities/{key}/verify` (or `admin.py capability-verify`).
+- On `POST /v1/projects/{id}/capabilities/{key}/verify`, the caller must supply explicit
+  non-zero 40-hex `commit` (an all-zero commit SHA is refused with `422`), `revision`,
+  `record_sha256`, `passed` (boolean), and non-empty per-pointer `results` (missing any of
+  `commit`, `passed`, or `results` is refused with `422`). Because the
+  web coordinator attests to pointer checks without the server running `capability check`
+  against a repository checkout, the endpoint records `Kind: capability-verification-v1` with
+  `submitter.identity: "attested"`, `verification_state: "attested"`, `trusted: false`,
+  `attested: true`, and `pointers_validation: {"checked": "web-coordinator-attested",
+  "checkout_validated": false, "verified_commit": "<40-hex>", ...}`. Only `admin.py
+  capability-verify --repo <PATH>` (where the host validates pointers against a real repository
+  checkout) records `submitter.identity: "verified"`, `verification_state: "verified"`,
+  `trusted: true`, and `pointers_validation.checkout_validated: true`.
+- **An attestation never clears a failure (`drifted`).** In `capability_verification.derive()`,
+  only a **trusted** host pass (`submitter.identity: "verified"`, `trusted: true`) at an
+  integrated commit clears an earlier failing check on that revision. A web coordinator's
+  `attested` pass sits beside the failure in `report` (as the newest check) while leaving
+  `open_failing` and `state: "drifted"` intact until a trusted host `capability-verify --repo`
+  at an integrated commit passes.
+

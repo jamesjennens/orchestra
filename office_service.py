@@ -29,12 +29,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 import admin
 import record_json
 from version import report
+from http_auth import session_limit_seconds, validate_agent_credential_days
 
 
 def private_root(raw):
@@ -88,7 +88,8 @@ def service_config(path):
         raise ValueError('Office service configuration must have schema_version 1')
     allowed = {'schema_version', 'http_host', 'http_state', 'cert', 'key',
                'trusted_proxies', 'public_url', 'endpoint_timeout', 'connections_per_address', 'logins_per_address',
-               'approval_by_another_party', PLAINTEXT_SETTING, HSTS_SETTING}
+               'approval_by_another_party', 'agent_credential_days',
+               'session_idle_minutes', 'session_absolute_hours', PLAINTEXT_SETTING, HSTS_SETTING}
     if set(config) - allowed:
         raise ValueError('Unknown office service setting: ' + ', '.join(sorted(set(config)-allowed)))
     for setting in ('cert', 'key'):
@@ -105,18 +106,20 @@ def service_config(path):
         raise ValueError('http_host must not carry a port: give the address alone and the port in --port (got %s)' % host)
     public_url = config.get('public_url')
     if public_url is not None:
-        # urlsplit itself refuses a port that is not a number; either way the setting is named.
-        try:
-            named = urlsplit(public_url) if isinstance(public_url, str) else None
-            scheme, hostname = (named.scheme, named.hostname) if named is not None else (None, None)
-            if named is not None:
-                named.port                                  # raises when the port is not a number
-        except ValueError:
-            scheme, hostname = None, None
-        if scheme not in ('http', 'https') or not hostname:
-            raise ValueError('public_url must be an http or https URL with a host (got %r)' % (public_url,))
+        # kittrial-5bb.360: the address is copied into the set-up commands people paste into a
+        # shell, so it must be a plain http(s) address: one rule (server_address.py), one sentence
+        # naming the setting, this file and the first character it refuses.
+        from server_address import public_url_problem
+        problem = public_url_problem(public_url, 'the office configuration (%s)' % os.path.basename(str(path)))
+        if problem:
+            raise ValueError(problem)
     if not isinstance(config.get('approval_by_another_party', False), bool):
         raise ValueError('approval_by_another_party must be true or false')
+    if 'agent_credential_days' in config:
+        validate_agent_credential_days(config['agent_credential_days'])
+    # The session idle and absolute limits (kittrial-5bb.330), refused by the same helper and
+    # the same one sentence as the web service's own flags. An omitted key keeps 30 min / 12 h.
+    session_limit_seconds(config.get('session_idle_minutes'), config.get('session_absolute_hours'))
     plain = config.get(PLAINTEXT_SETTING, False)
     if not isinstance(plain, bool):
         raise ValueError(PLAINTEXT_SETTING + ' must be true or false')
@@ -601,6 +604,14 @@ def web_command(settings, root, port, release_python, release_script):
         command.extend(['--connections-per-address', settings['connections_per_address']])
     if 'logins_per_address' in settings:
         command.extend(['--logins-per-address', settings['logins_per_address']])
+    if 'agent_credential_days' in settings:
+        command.extend(['--agent-credential-days', validate_agent_credential_days(settings['agent_credential_days'])])
+    if 'session_idle_minutes' in settings or 'session_absolute_hours' in settings:
+        # Validated once as a pair, so the pair handed on is the pair that was checked: the
+        # absolute limit is never shorter than the idle window (kittrial-5bb.330).
+        idle, absolute = session_limit_seconds(settings.get('session_idle_minutes'),
+                                               settings.get('session_absolute_hours'))
+        command.extend(['--session-idle-minutes', idle // 60, '--session-absolute-hours', absolute // 3600])
     if settings.get('approval_by_another_party') is True:
         command.append('--approval-by-another-party')
     if settings.get(HSTS_SETTING) is True:

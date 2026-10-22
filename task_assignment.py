@@ -132,7 +132,12 @@ def parse_comment(comment, *, project, task):
 def holder_message(notice, actor):
     """A polling notice for either holder; no push or acknowledgement claim."""
     _validate_notice(notice)
-    if actor == notice['from'] and actor is not None:
+    from claim_limit import actor_holds
+    if actor is not None and (actor == notice['from'] or actor_holds(notice['from'], actor)):
+        if notice['assigned_by'] == actor and notice['to'] is None:
+            # The holder released its own claim (kittrial-5bb.301): say so, rather than
+            # "taken from you by" the holder itself.
+            return 'You released this task: %s' % notice['reason']
         return 'This task was taken from you by %s: %s' % (notice['assigned_by'], notice['reason'])
     if actor == notice['to'] and actor is not None:
         return 'Assigned to you by %s: %s' % (notice['assigned_by'], notice['reason'])
@@ -146,7 +151,16 @@ class AssignmentError(ValueError):
         self.status = status
 
 
-def check_change(payload, row, review, slot, target_is_eligible):
+#: Review states in which the task carries live delivered work. A claim release is
+#: refused for any of them (kittrial-5bb.301 review): a contribution awaiting review,
+#: changes requested, approved for integration, held, integrated or needing
+#: reconciliation is delivered work, not an undelivered claim. Only none, withdrawn and
+#: superseded leave the claim releasable.
+DELIVERED_REVIEW_STATES = ('awaiting-review', 'changes-requested', 'awaiting-integration',
+                           'held', 'integrated', 'reconciliation-needed', 'legacy-review-ready')
+
+
+def check_change(payload, row, review, slot, target_is_eligible, *, refuse_delivered=False):
     """Judge fresh canonical snapshots under the project/live-authority locks.
 
     The callback is a trusted current-project eligibility read, not a request field
@@ -175,6 +189,15 @@ def check_change(payload, row, review, slot, target_is_eligible):
         _actor(current, 'native assignee', nullable=True)
     except ValueError as exc:
         raise AssignmentError(503, 'The native assignee is unreadable; nothing was changed.') from exc
+    if refuse_delivered and row['status'] == 'closed':
+        # A release is for an undelivered claim, never for finished work: a holder must not
+        # clear its own name from a closed task (kittrial-5bb.305, from finding 2 of the
+        # kittrial-5bb.301 r2 review). The delivered check below deliberately skips closed
+        # rows, so without this a closed task with an approved contribution released with
+        # 200. This refuses ANY closed task, before the review and slot reads and before any
+        # write, so the answer does not depend on the state of the delivered chain.
+        raise AssignmentError(409, 'This task is closed; a finished task cannot be released '
+                              'and nothing was changed.')
     if current != payload['expected_assignee']:
         raise AssignmentError(409, 'The task assignee changed; refresh the task before assigning it.')
     if payload['assignee'] is not None:
@@ -206,10 +229,22 @@ def check_change(payload, row, review, slot, target_is_eligible):
             context.get('holder') != holder or not isinstance(context.get('task'), str)):
         raise AssignmentError(503, 'The merge-slot context is unreadable; nothing was changed.')
     changed = current != payload['assignee']
-    review_displaced = bool(changed and current and row['status'] != 'closed' and
-                            review['contribution'] and review['review_state'] in
-                            ('awaiting-review', 'changes-requested'))
+    if refuse_delivered:
+        # A claim release (kittrial-5bb.301) is allowed only while the task has NO current
+        # contribution. Any state that means live delivered work refuses it, not just
+        # awaiting review or changes requested: an approved or integrated contribution is
+        # delivered work, not a claim. The state vocabulary is the one checked above, so an
+        # unreadable chain already failed closed with 503 before this point.
+        review_displaced = bool(changed and current and row['status'] != 'closed' and
+                                review['review_state'] in DELIVERED_REVIEW_STATES)
+    else:
+        review_displaced = bool(changed and current and row['status'] != 'closed' and
+                                review['contribution'] and review['review_state'] in
+                                ('awaiting-review', 'changes-requested'))
     if review_displaced and not payload['allow_pending_review']:
+        if refuse_delivered:
+            raise AssignmentError(409, 'This task has a delivered contribution; a claim can be released '
+                                  'only before it is delivered.')
         raise AssignmentError(409, 'This holder has a contribution awaiting review or changes requested. '
                               'Set allow_pending_review explicitly to change its holder; review items are retained.')
     if changed and current and holder == current and context is None:
@@ -307,7 +342,7 @@ def standing_allowed(denied):
     raise AssignmentError(503, 'Worker target standing cannot be read; nothing was changed.')
 
 
-def apply(payload, actor, run, project, *, eligible, operators=None, at):
+def apply(payload, actor, run, project, *, eligible, operators=None, at, refuse_delivered=False):
     """One assignee-only native update and one notice in the existing guard.
 
     Caller holds project and live-authority locks. Any exception after update is
@@ -342,7 +377,7 @@ def apply(payload, actor, run, project, *, eligible, operators=None, at):
         raise
     except (ValueError, OSError, SlotError):
         raise AssignmentError(503, 'Task, review or merge-slot context cannot be read; nothing was changed.') from None
-    change = check_change(payload, row, review, slot, eligible)
+    change = check_change(payload, row, review, slot, eligible, refuse_delivered=refuse_delivered)
     result = dict(schema_version=1, operation_id=payload['operation_id'], task=payload['task'],
                   assigned_by=actor, **change)
     if not change['changed']:

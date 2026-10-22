@@ -25,6 +25,19 @@ function query(params) {
   return entries.length ? '?' + new URLSearchParams(entries).toString() : '';
 }
 
+// Keeping an open page's session alive (kittrial-5bb.330). The service refreshes a session's
+// idle deadline on every authenticated read and answers the window it is kept by, so one
+// light session read is the whole touch. A page that keeps a long task open — the agent
+// set-up wizard — touches only while it is visible: a hidden tab polls nothing. Shortly
+// before the idle deadline this loop last heard about, it warns the page, which is what the
+// wizard shows before the session would sign the owner out mid set-up.
+export const SESSION_IDLE_WARNING_EVENT = 'orchestra:session-idle-warning';
+export const KEEP_ALIVE_INTERVAL_MS = 4 * 60 * 1000;
+export const KEEP_ALIVE_WARN_MS = 2 * 60 * 1000;
+
+function later(callback, ms) { return globalThis.setTimeout(callback, ms); }
+function cancel(handle) { if (handle !== null && handle !== undefined) globalThis.clearTimeout(handle); }
+
 export function createApi(transport) {
   let csrf = null;
 
@@ -241,6 +254,126 @@ export function createApi(transport) {
       ({ name: entry.name, retry: () => cutBaseline(pid, { name: entry.name }) }));
   }
 
+  // The authenticated session read. It is also the keep-alive touch: the service refreshes
+  // the caller's idle deadline on every authenticated read and answers the window it is kept
+  // by and this session's deadlines (kittrial-5bb.330), so no second route is needed.
+  async function readSession() {
+    const result = await call('GET', '/v1/sessions/current');
+    if (result && result.csrf_token) csrf = result.csrf_token;
+    return result;
+  }
+
+  // Every loop this page started, so a sign-out stops them all: nothing touches a session
+  // that is being deleted on the way out (kittrial-5bb.330).
+  const keepAliveStops = new Set();
+
+  function keepAliveWhileVisible(options) {
+    const settings = options || {};
+    const doc = globalThis.document;
+    const intervalMs = settings.intervalMs === undefined ? KEEP_ALIVE_INTERVAL_MS : settings.intervalMs;
+    const warnMs = settings.warnMs === undefined ? KEEP_ALIVE_WARN_MS : settings.warnMs;
+    const onWarning = settings.onWarning;
+    let stopped = false;
+    let touchTimer = null;
+    let warnTimer = null;
+    let inFlight = false;
+    let idleMs = null;              // the idle window the service last answered, in ms
+    let deadline = null;            // this session's idle deadline, ms since the epoch
+
+    function visible() { return !doc || doc.visibilityState === 'visible'; }
+
+    function stop() {
+      if (stopped) return;
+      stopped = true;
+      cancel(touchTimer); cancel(warnTimer);
+      touchTimer = warnTimer = null;
+      if (doc && doc.removeEventListener) doc.removeEventListener('visibilitychange', onVisibility);
+      keepAliveStops.delete(stop);
+    }
+
+    function warn() {
+      warnTimer = null;
+      if (stopped) return;
+      const detail = {
+        idleSeconds: idleMs === null ? null : Math.round(idleMs / 1000),
+        idleExpiresAt: deadline === null ? null : new Date(deadline).toISOString(),
+        warnMs,
+        remainingSeconds: deadline === null ? null : Math.round((deadline - Date.now()) / 1000),
+      };
+      if (typeof onWarning === 'function') {
+        try { onWarning(detail); } catch { /* a page's own handler never stops the loop */ }
+      }
+      if (!doc || typeof doc.dispatchEvent !== 'function') return;
+      let event;
+      try { event = new globalThis.CustomEvent(SESSION_IDLE_WARNING_EVENT, { detail }); }
+      catch { event = { type: SESSION_IDLE_WARNING_EVENT, detail }; }
+      try { doc.dispatchEvent(event); } catch { /* a listener never stops the loop */ }
+    }
+
+    // The answer names the idle window and this session's deadline; both drive the next touch
+    // and the warning. A page told neither (an older service) falls back to the interval.
+    function remember(result) {
+      if (!result || typeof result !== 'object') return;
+      idleMs = typeof result.idle_seconds === 'number' && result.idle_seconds > 0 ? result.idle_seconds * 1000 : null;
+      const stated = typeof result.idle_expires_at === 'string' ? Date.parse(result.idle_expires_at) : NaN;
+      deadline = Number.isNaN(stated) ? (idleMs === null ? null : Date.now() + idleMs) : stated;
+    }
+
+    function scheduleWarning() {
+      cancel(warnTimer); warnTimer = null;
+      if (stopped || deadline === null) return;
+      const delay = deadline - Math.max(0, warnMs) - Date.now();
+      // No room for a warning before this deadline: it was just refreshed by the touch that
+      // armed it, so there is nothing to warn about until a touch stops refreshing it.
+      if (delay <= 0) return;
+      warnTimer = later(warn, delay);
+    }
+
+    function schedule() {
+      if (stopped) return;
+      const every = Number.isFinite(intervalMs) && intervalMs > 0 ? intervalMs : KEEP_ALIVE_INTERVAL_MS;
+      // Never wait longer than half the window the service answered, so a 5-minute
+      // installation is kept alive as reliably as a 12-hour one.
+      const wait = idleMs === null ? every : Math.min(every, Math.max(1000, Math.floor(idleMs / 2)));
+      touchTimer = later(touch, wait);
+    }
+
+    async function touch() {
+      touchTimer = null;
+      if (stopped || inFlight || !visible()) return;
+      inFlight = true;
+      try {
+        remember(await readSession());
+        scheduleWarning();
+      } catch (error) {
+        // A signed-out or expired session ends the loop. Any other failure (a lost network,
+        // a 5xx) keeps it: the next interval tries again and the warning still fires before
+        // the deadline this loop last heard about.
+        if (error instanceof ApiError && error.status === 401) { stop(); return; }
+      } finally {
+        inFlight = false;
+      }
+      schedule();
+    }
+
+    function onVisibility() {
+      if (stopped) return;
+      if (!visible()) {
+        // Hidden: nothing polls and nothing is scheduled until the page is visible again.
+        cancel(touchTimer); cancel(warnTimer);
+        touchTimer = warnTimer = null;
+        return;
+      }
+      cancel(touchTimer); touchTimer = null;
+      touch();
+    }
+
+    if (doc && doc.addEventListener) doc.addEventListener('visibilitychange', onVisibility);
+    keepAliveStops.add(stop);
+    if (visible()) touch();
+    return { stop };
+  }
+
   return {
     // session
     async login(username, password) {
@@ -251,18 +384,27 @@ export function createApi(transport) {
       return result.user;
     },
     async current() {
-      const result = await call('GET', '/v1/sessions/current');
-      if (result && result.csrf_token) csrf = result.csrf_token;
-      return result;
+      return readSession();
     },
+    // One light authenticated touch (kittrial-5bb.330): the same read, named for what the
+    // agent set-up wizard uses it for while it is open.
+    async keepAlive() {
+      return readSession();
+    },
+    keepAliveWhileVisible,
     hasCsrf: () => Boolean(csrf),
     assignmentRoster: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/assignment-roster`, { params }),
     assignTask: (pid, tid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/assign`, body),
-    async logout() { try { await call('DELETE', '/v1/sessions/current'); } finally {
-      csrf = null;
-      if (lifecycleActor) { try { sessionStorage.removeItem(lifecycleStorageKey()); } catch {} }
-      lifecycleActor = null; lifecycleKeys = new Map();
-    } },
+    async logout() {
+      // A page that is signing out stops its keep-alive loops first (kittrial-5bb.330).
+      for (const stop of [...keepAliveStops]) stop();
+      try { await call('DELETE', '/v1/sessions/current'); } finally {
+        csrf = null;
+        if (lifecycleActor) { try { sessionStorage.removeItem(lifecycleStorageKey()); } catch {} }
+        try { sessionStorage.removeItem('orchestra.agentSetup.v1'); } catch {}
+        lifecycleActor = null; lifecycleKeys = new Map();
+      }
+    },
     redeemReset: (uid, reset_value, new_password) => call('POST', `/v1/accounts/${uid}/reset/redeem`, { body: { reset_value, new_password }, key: newKey() }),
     changePassword: (uid, current_password, new_password) => mutate('POST', `/v1/accounts/${uid}/password`, { current_password, new_password }),
 
@@ -289,7 +431,14 @@ export function createApi(transport) {
     projectCreations: () => call('GET', '/v1/project-creations'),
     setProjectGrant: (uid, limit) => mutate('PUT', `/v1/accounts/${uid}/project-grant`, { limit }),
     clearProjectGrant: (uid) => mutate('DELETE', `/v1/accounts/${uid}/project-grant`),
-    // The project's onboarding text, set by an owner (guidance stays with the operator).
+    // Guidance reads never acknowledge; acknowledgements name the exact displayed version.
+    guidance: (pid) => call('GET', `/v1/projects/${pid}/guidance`),
+    guidanceStatus: (pid, offset = 0, limit = 50) => call('GET', `/v1/projects/${pid}/guidance/status`, { params: { offset, limit } }),
+    ackGuidance: (pid, version) => mutate('POST', `/v1/projects/${pid}/guidance/ack`, { version }),
+    setGuidance: (pid, text) => mutate('PUT', `/v1/projects/${pid}/guidance`, { text }),
+    clearGuidance: (pid) => mutate('DELETE', `/v1/projects/${pid}/guidance`, {}),
+    memberOnboarding: (pid) => call('GET', `/v1/projects/${pid}/onboarding/read`),
+    // Coordinate edit routes withhold operator text; the member read returns the whole document.
     onboarding: (pid) => call('GET', `/v1/projects/${pid}/onboarding`),
     setOnboarding: (pid, text) => mutate('PUT', `/v1/projects/${pid}/onboarding`, { text }),
     clearOnboarding: (pid) => mutate('DELETE', `/v1/projects/${pid}/onboarding`),
@@ -303,6 +452,8 @@ export function createApi(transport) {
       expected_task ? { expected_holder, reason, expected_task } : { expected_holder, reason }),
     createMergeSlot: (pid) => mutate('POST', `/v1/projects/${pid}/merge-slot/create`, {}),
     setRepository: (pid, repository) => mutate('PATCH', `/v1/projects/${pid}`, { repository }),
+    // The per-project claiming setting (kittrial-5bb.352): owners and coordinators set it.
+    setProjectClaiming: (pid, claiming) => mutate('PUT', `/v1/projects/${pid}/claiming`, { claiming }),
     // Superuser only: the records this server will not serve, to confirm or archive.
     unconfirmedProjects: () => call('GET', '/v1/projects/unconfirmed'),
     confirmProject: (pid) => mutate('POST', `/v1/projects/${pid}/confirm`, {}),
@@ -310,6 +461,8 @@ export function createApi(transport) {
     setMember: (pid, uid, role) => mutate('PUT', `/v1/projects/${pid}/members/${uid}`, { role }),
     // The agents that work in a project, as its owner sees them, and the coordinator grant (kittrial-5bb.209).
     projectAgents: (pid) => call('GET', `/v1/projects/${pid}/agents`),
+    // kittrial-5bb.365: the agent's history as this project's owners see it.
+    projectAgentHistory: (pid, aid) => call('GET', `/v1/projects/${pid}/agents/${aid}/history`),
     grantCoordinator: (pid, aid) => mutate('PUT', `/v1/projects/${pid}/agents/${aid}/coordinator`, {}),
     revokeCoordinator: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/coordinator`),
     // Who coordinates the project and the rules that bind them, for any member; read only (kittrial-5bb.198).
@@ -331,6 +484,9 @@ export function createApi(transport) {
     checkpoint: (pid, tid, body) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/checkpoints`, body),
     review: (pid, tid, body) => mutate('POST', `/v1/projects/${pid}/tasks/${tid}/reviews`, body),
     queue: (pid, params) => call('GET', `/v1/projects/${pid}/queue`, { params }),
+    // The lane board (kittrial-5bb.263): one server read of who holds what, who is free and
+    // the three flags. `idle_minutes` is this page's argument, `limit`/`cursor` page it.
+    lanes: (pid, params) => call('GET', `/v1/projects/${pid}/lanes`, { params }),
     myWork: () => call('GET', '/v1/me/work'),
     agents: (params) => call('GET', '/v1/agents', { params }),
     // A document of the installed kit, as the client's `docs NAME` serves it (kittrial-5bb.226).
@@ -342,11 +498,15 @@ export function createApi(transport) {
     certificate: () => call('GET', '/v1/service/certificate'),
     updateAgent: (aid, body) => mutate('PATCH', `/v1/agents/${aid}`, body),
     agent: (aid) => call('GET', `/v1/agents/${aid}`),
+    // kittrial-5bb.365: the agent's history, its owner's view.
+    agentHistory: (aid) => call('GET', `/v1/agents/${aid}/history`),
     // A NEW credential for the agent; its secret is in this one response only.
     // With no list the new credential carries what the agent has; a list sets what it has from now on
     // (kittrial-5bb.208). The page sends a list only from "What it may do" on the agent's card.
     issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, scopes ? { label: 'web: new secret', scopes } : { label: 'web: new secret' }),
     revokeAgentCredential: (aid, cid) => mutate('POST', `/v1/agents/${aid}/credentials/${cid}/revoke`, {}),
+    extendAgentCredential: (aid, cid) => mutate('POST', `/v1/agents/${aid}/credentials/${cid}/extend`, {}),
+    extendProjectAgentCredential: (pid, aid, cid) => mutate('POST', `/v1/projects/${pid}/agents/${aid}/credentials/${cid}/extend`, {}),
     // requirement proposals (identity is the session's; the submitter is never sent)
     proposals: (pid, params) => call('GET', `/v1/projects/${pid}/proposals`, { params }),
     proposal: (pid, key) => call('GET', `/v1/projects/${pid}/proposals/${key}`, { params: { history: 50 } }),
@@ -367,6 +527,9 @@ export function createApi(transport) {
     createRequirement: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements`, body),
     reviseRequirement: (pid, rid, body) => mutate('PATCH', `/v1/projects/${pid}/requirements/${rid}`, body),
     acceptRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/accept`, body),
+    // Many requirements in one action (slice 10). Per item on the server: a refused
+    // item changes nothing and does not roll back the rest, and the answer says which.
+    acceptRequirements: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements/accept-batch`, body),
     withdrawRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/withdraw`, body),
     supersedeRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/supersede`, body),
     finishRequirementTransition: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/transition/finish`, body),
@@ -376,6 +539,24 @@ export function createApi(transport) {
     setRequirementsGovernance: (pid, body) => mutate('PUT', `/v1/projects/${pid}/requirements/governance`, body),
     decisions: (pid) => call('GET', `/v1/projects/${pid}/decisions`),
     record: (pid, id) => call('GET', `/v1/projects/${pid}/records/${id}`),
+    // reference and capability records (kittrial-5bb.213)
+    references: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/references`, { params }),
+    findReferences: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/references/find`, { params }),
+    reference: (pid, key) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/references/${encodeURIComponent(key)}`),
+    proposeReference: (pid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/references`, body),
+    reviseReference: (pid, key, body) => mutate('PATCH', `/v1/projects/${encodeURIComponent(pid)}/references/${encodeURIComponent(key)}`, body),
+    acceptReference: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/references/${encodeURIComponent(key)}/accept`, body),
+    retireReference: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/references/${encodeURIComponent(key)}/retire`, body),
+    capabilities: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/capabilities`, { params }),
+    findCapabilities: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/capabilities/find`, { params }),
+    capability: (pid, key) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}`),
+    proposeCapability: (pid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities`, body),
+    reviseCapability: (pid, key, body) => mutate('PATCH', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}`, body),
+    acceptCapability: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}/accept`, body),
+    retireCapability: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}/retire`, body),
+    verifyCapability: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}/verify`, body),
+    proposeCapabilityAlias: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}/aliases`, body),
+    rejectCapabilityAlias: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}/aliases/reject`, body),
     audit: (pid, params) => call('GET', `/v1/projects/${pid}/audit`, { params }),
   };
 }

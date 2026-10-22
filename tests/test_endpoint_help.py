@@ -152,6 +152,31 @@ class EndpointRefusalTests(unittest.TestCase):
         self.assertIn('Did you mean `docs worker-guide`?', self.refusal(['workerguide']))
         self.assertNotIn('Did you mean', self.refusal(['zzzzzzzz']))
 
+    def test_each_client_side_command_is_answered_with_one_out_of_date_sentence(self):
+        """kittrial-5bb.299: a name the CURRENT client runs locally is not answered with
+        the contributor command list (which lists that same command -- a contradiction),
+        and not with "Did you mean". One plain sentence: the command is the client's
+        own, this client is older than the installation's kit, and how to update it."""
+        from version import KIT_VERSION
+        for name in endpoint.CLIENT_ACTIONS:
+            said = self.refusal([name])
+            self.assertIn('`%s` is run by the client itself' % name, said, name)
+            self.assertIn('older than the installation', said, name)
+            self.assertIn('client.py', said, name)
+            self.assertIn(KIT_VERSION, said, name)
+            self.assertNotIn('outside the contributor interface', said, name)
+            self.assertNotIn('Did you mean', said, name)
+            self.assertNotIn('The commands a contributor may run', said, name)
+            # One sentence: no list of commands at all.
+            self.assertNotIn('brief TASK - ', said, name)
+
+    def test_a_real_outsider_name_is_still_refused_with_the_list(self):
+        said = self.refusal(['zzzzzzzz'])
+        self.assertIn("'zzzzzzzz' is outside the contributor interface", said)
+        self.assertIn('The commands a contributor may run, one line each:', said)
+        self.assertIn('  brief TASK - ', said)
+        self.assertNotIn('run by the client itself', said)
+
     def test_the_endpoint_still_refuses_everything_outside_the_contributor_interface(self):
         """Only the ANSWER changed: the interface itself is the same, and its commands still pass."""
         import inspect
