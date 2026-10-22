@@ -809,6 +809,51 @@ class TaskFilesHttpTests(agents.AgentHarness):
             sock.close()
         self.assertEqual([], self.stored())
 
+    def test_r3_the_408_is_written_even_when_answering_takes_a_moment(self):
+        # The reaper waits a margin past the deadline: an answer that takes a moment (here its audit line takes 1.5 s)
+        # still reaches the client before the connection is cut.
+        self.limit.update(min_transfer_bytes_per_second=10 ** 6, transfer_grace_seconds=1)
+        original = self.service.audit
+
+        def slow(*a, **k):
+            if a[2] == 'tasks.files.upload':
+                time.sleep(1.5)
+            return original(*a, **k)
+        self.service.audit = slow
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=20)
+        try:
+            body = b'm' * 400000
+            sock.sendall(('PUT %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Length: %d\r\n\r\n'
+                          % (self.files_path(name='margin.bin', direction='to-worker'), self.tokens['coord'], len(body))).encode()
+                         + body[:1000])
+            answer = b''
+            while b'\r\n\r\n' not in answer:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                answer += piece
+            self.assertTrue(answer.startswith(b'HTTP/1.1 408'), answer[:200])
+        finally:
+            sock.close()
+            self.service.audit = original
+
+    def test_r3_a_refused_record_discards_through_the_backend_under_its_lock(self):
+        # The route removes an orphan through the backend's files_discard (which takes the lock records are written
+        # under), never by calling task_files.discard itself.
+        calls = []
+        discard = self.backend.files_discard
+        self.backend.files_discard = lambda pid, sha: (calls.append((pid, sha)), discard(pid, sha))[1]
+        first = self.raw('PUT', self.files_path(name='a.txt', direction='to-worker'), self.tokens['coord'], b'kept',
+                         headers={'Idempotency-Key': 'files-key-r3-01'})
+        self.assertEqual(201, first.status, first.data)
+        with mock.patch.object(task_files, 'discard', side_effect=AssertionError('task_files.discard called outside the lock')) as direct:
+            self.backend.files_discard = lambda pid, sha: (calls.append((pid, sha)), True)[1]
+            refused = self.raw('PUT', self.files_path(name='b.txt', direction='to-worker'), self.tokens['coord'], b'orphan',
+                               headers={'Idempotency-Key': 'files-key-r3-01'})
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertEqual([(self.pid, sha(b'orphan'))], calls)
+        self.assertEqual(0, direct.call_count)
+
     def test_r2_s1_a_download_read_too_slowly_is_cut_off_and_gives_its_slot_back(self):
         data = os.urandom(8 * task_files.MIB)
         digest = self.given(data, name='big.bin')
