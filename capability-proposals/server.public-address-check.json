@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb380-server-public-address-check-0001",
+  "key": "server.public-address-check",
+  "name": "The installation's public address is checked before the kit puts it in a command",
+  "aliases": [
+    "installation public address",
+    "public_url",
+    "public url check"
+  ],
+  "summary": "server_address.public_url_problem returns None when a value is a server address the kit may put into a command (the address people use to reach the site), and otherwise one sentence naming where the value came from and what to correct. Commands that take a public address (task-files proxy-check --url among them) refuse a value it rejects.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "server_address.py::public_url_problem"
+  ],
+  "tests": [
+    "tests/test_server_address.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "deployment",
+    "address"
+  ]
+}
