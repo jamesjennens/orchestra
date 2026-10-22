@@ -1043,20 +1043,28 @@ class TheDialogAndThePageCase(unittest.TestCase):
                      'PATCH /v1/agents/me'):
             self.assertIn(text, onboarding)
 
-    def test_windows_policy_text_is_in_the_doc_and_pointed_to_by_the_wizard(self):
-        """kittrial-5bb.375: Windows agents are told how to fix the execution policy."""
+    def test_windows_terminal_text_is_in_the_doc_and_pointed_to_by_the_wizard(self):
+        """kittrial-5bb.377: the Windows terminal fix is upgrading PSReadLine; the policy only allows the install."""
         onboarding = ' '.join((ROOT / 'docs' / 'ONBOARDING.md').read_text(encoding='utf-8').split())
         agents = (ROOT / 'web' / 'js' / 'views' / 'agents.js').read_text(encoding='utf-8')
-        self.assertIn('## Windows: PowerShell execution policy', onboarding)
-        for text in ('Get-ExecutionPolicy -List', 'Set-ExecutionPolicy -Scope CurrentUser RemoteSigned',
-                     'without administrator rights',
-                     'Windows PowerShell 5.1 and PowerShell 7 keep separate `CurrentUser` settings',
-                     'If `MachinePolicy` or `UserPolicy` sets the policy, your IT department controls it: '
-                     'do not try to override it'):
+        heading = '## Windows: VS Code terminals hang or show no output'
+        self.assertIn(heading, onboarding)
+        section = onboarding[onboarding.index(heading):onboarding.index('## Web personal-agent setup wizard')]
+        for text in ('(Get-Module PSReadLine -ListAvailable).Version', '$PSVersionTable.PSVersion',
+                     'Set-ExecutionPolicy -Scope CurrentUser RemoteSigned',
+                     'Install-Module PSReadLine -Scope CurrentUser -Force -SkipPublisherCheck',
+                     'If `Get-ExecutionPolicy -List` shows MachinePolicy or UserPolicy set, '
+                     'the command will not take effect; ask IT.',
+                     'powershellgallery.com/packages/PSReadLine', 'Unblock-File', 'rename it to `.zip`',
+                     'PSReadLine\\2.4.5', '$env:PSModulePath', 'OneDrive',
+                     '`[Content_Types].xml`, `_rels`, `package`', 'restart VS Code'):
             with self.subTest(text=text):
-                self.assertIn(text, onboarding)
+                self.assertIn(text, section)
+        self.assertNotIn('PowerShell 7', section)
+        self.assertNotIn('PowerShell execution policy', onboarding)
         self.assertIn("setupText.osKind(state.os) === 'windows'", agents)
-        self.assertIn('“Windows: PowerShell execution policy” in docs/ONBOARDING.md', agents)
+        self.assertIn('“Windows: VS Code terminals hang or show no output” in docs/ONBOARDING.md', agents)
+        self.assertNotIn('Windows: PowerShell execution policy', agents)
 
 
 class ProxyAwareSelfCheckCase(unittest.TestCase):
