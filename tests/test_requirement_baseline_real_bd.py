@@ -64,6 +64,10 @@ class NativeBaselineTests(fixture.RealBdLabelAliasTests):
         self.assertEqual(initialized.returncode, 0, initialized.stderr)
 
         class HttpHarness(fixes.Harness):
+            # Observe the native backend's bounded 150-second answer rather
+            # than the small in-memory fixture's ordinary 20-second deadline.
+            http_timeout = 180
+
             def make_backend(self):
                 return http_service.EndpointBackend(sys.executable, str(KIT / 'endpoint.py'), str(root), service=self.service)
         harness = HttpHarness(methodName='runTest'); harness.setUp()
