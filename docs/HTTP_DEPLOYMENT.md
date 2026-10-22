@@ -3783,8 +3783,14 @@ tools, the SSH framing, backups of the folder and the operator commands come lat
   nothing is attached or withdrawn (`409`).
 - **Audit:** a line that cannot be recorded is said in the service's log (`audit: the ... line
   ... could not be recorded`), with the action, outcome, task and digest.
-- **Not yet:** the folder is not in backups (slice 5): copy `projects/NAME/.task-files/` with the
-  project until then. Withdrawn bytes stay on disk until the operator purge of slice 5.
+- **Operations** (kittrial-5bb.380): the folder is backed up beside the project's backup and checked on restore;
+  `admin.py task-files verify` and `purge` (operator, dry run, audit line), and `task-files proxy-check` for a reverse
+  proxy's body limit. See [Operations](OPERATIONS.md#files-attached-to-tasks-backup-restore-verify-purge). A purged
+  file stays listed, with `purged` and the sentence "purged by an operator on DATE"; its download answers `410`.
+- **An upload refused before its body was read** (401, 403, 413, 503...) is answered, and the connection is then
+  closed lingering: the write side is shut and the rest of the body is read and dropped for at most 5 s and 64 MiB,
+  so the client reads the refusal instead of a reset. At most 8 such closes run at once; beyond that a connection is
+  closed at once (kittrial-5bb.380).
 
 ### Settings
 
