@@ -434,6 +434,19 @@ class ProxyCheckTests(unittest.TestCase):
         return 'http://127.0.0.1:%d' % server.server_address[1]
 
     @staticmethod
+    def drained(handler, status, body, content_type='application/json'):
+        # Read the whole body first, as Orchestra and a well-behaved proxy do before they close: a server that
+        # closes on unread bytes resets the connection, and the client may then never see the answer.
+        length = int(handler.headers['Content-Length'])
+        got = 0
+        while got < length:
+            piece = handler.rfile.read(min(65536, length - got))
+            if not piece:
+                break
+            got += len(piece)
+        ProxyCheckTests.reply(handler, status, body, content_type)
+
+    @staticmethod
     def reply(handler, status, body, content_type='application/json'):
         handler.send_response(status)
         handler.send_header('Content-Type', content_type)
@@ -476,7 +489,7 @@ class ProxyCheckTests(unittest.TestCase):
         self.assertIn('task_files.max_file_bytes', result['sentence'])
 
     def test_another_answer_is_not_taken_for_orchestras(self):
-        result = task_files.proxy_check(self.serve(lambda h: self.reply(h, 401, b'<html>Unauthorized</html>', 'text/html')),
+        result = task_files.proxy_check(self.serve(lambda h: self.drained(h, 401, b'<html>Unauthorized</html>', 'text/html')),
                                         64 * 1024)
         self.assertFalse(result['passed'])
         self.assertIn('not Orchestra\'s answer', result['sentence'])
@@ -484,7 +497,7 @@ class ProxyCheckTests(unittest.TestCase):
     def test_a_401_is_orchestras_only_with_its_code_and_a_request_id(self):
         for body in ({'error': {'code': 'forbidden', 'message': 'x'}, 'request_id': 'req_1'},
                      {'error': {'code': 'unauthenticated', 'message': 'Sign in'}}):
-            result = task_files.proxy_check(self.serve(lambda h, b=body: self.reply(h, 401, json.dumps(b).encode())), 64 * 1024)
+            result = task_files.proxy_check(self.serve(lambda h, b=body: self.drained(h, 401, json.dumps(b).encode())), 64 * 1024)
             self.assertFalse(result['passed'], body)
             self.assertIn('not Orchestra\'s answer', result['sentence'])
 
