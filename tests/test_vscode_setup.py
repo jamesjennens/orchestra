@@ -1035,6 +1035,21 @@ class TheDialogAndThePageCase(unittest.TestCase):
                      'PATCH /v1/agents/me'):
             self.assertIn(text, onboarding)
 
+    def test_windows_policy_text_is_in_the_doc_and_pointed_to_by_the_wizard(self):
+        """kittrial-5bb.375: Windows agents are told how to fix the execution policy."""
+        onboarding = ' '.join((ROOT / 'docs' / 'ONBOARDING.md').read_text(encoding='utf-8').split())
+        agents = (ROOT / 'web' / 'js' / 'views' / 'agents.js').read_text(encoding='utf-8')
+        self.assertIn('## Windows: PowerShell execution policy', onboarding)
+        for text in ('Get-ExecutionPolicy -List', 'Set-ExecutionPolicy -Scope CurrentUser RemoteSigned',
+                     'without administrator rights',
+                     'Windows PowerShell 5.1 and PowerShell 7 keep separate `CurrentUser` settings',
+                     'If `MachinePolicy` or `UserPolicy` sets the policy, your IT department controls it: '
+                     'do not try to override it'):
+            with self.subTest(text=text):
+                self.assertIn(text, onboarding)
+        self.assertIn("setupText.osKind(state.os) === 'windows'", agents)
+        self.assertIn('“Windows: PowerShell execution policy” in docs/ONBOARDING.md', agents)
+
 
 class ProxyAwareSelfCheckCase(unittest.TestCase):
     """kittrial-5bb.348: every curl the wizard gives bypasses a command-line proxy for the server's

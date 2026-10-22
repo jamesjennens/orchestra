@@ -133,6 +133,16 @@ another coordination database.
 
 For workers already connected, use the client `onboard` command in that prompt. The longer [worker prompt](../templates/WORKER_PROMPT.md) remains a reference, but no longer needs to be pasted into every new session.
 
+## Windows: PowerShell execution policy
+
+On Windows, the default `Restricted` PowerShell execution policy blocks the script VS Code's shell integration loads, so an agent running commands in VS Code gets no command output back. Check the policy with `Get-ExecutionPolicy -List`. If `CurrentUser` is `Undefined` or `Restricted` and neither `MachinePolicy` nor `UserPolicy` is set, fix it for your own account, without administrator rights:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Windows PowerShell 5.1 and PowerShell 7 keep separate `CurrentUser` settings: run the check and the fix in each one you use. If `MachinePolicy` or `UserPolicy` sets the policy, your IT department controls it: do not try to override it, ask them instead.
+
 ## Web personal-agent setup wizard
 
 For personal agents created on the website (`My agents` or `#/setup`, [design note](ONBOARDING_DESIGN.md) slice 4, `kittrial-5bb.329`; one action per screen since `kittrial-5bb.348`), setup runs as a wizard showing ONE action per screen: a short title, at most two short sentences, one button, choice or command with its Copy button, and `Back` / `Next`, with any explanation behind "More about this":
