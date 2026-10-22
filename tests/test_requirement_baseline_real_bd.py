@@ -159,9 +159,11 @@ class NativeBaselineTests(fixture.RealBdLabelAliasTests):
             # independent B2 owner check against the actual native project.
             for label, who in (('coordinator', principals[2]), ('granted-agent', agent.data['credential']['secret'])):
                 principal = harness.service.authenticate(who)
-                with self.assertRaisesRegex(http_service.HttpError, 'signed-in project owner'):
+                with self.assertRaises(http_service.HttpError) as refused:
                     harness.backend.owner_requirements(principal, 'pp', 'baseline',
                         {'name': 'canonical-' + label}, 'native-baseline-canonical-' + label)
+                self.assertEqual(refused.exception.status, 422)
+                self.assertIn('signed-in project owner', refused.exception.detail)
                 self.assertFalse((self.project / baselines.DIRECTORY / ('canonical-' + label)).exists())
             record('native-canonical-coordinator-and-granted-agent-refusals', passed=True)
             self.assertEqual(self.rows(), before)
