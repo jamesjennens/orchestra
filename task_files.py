@@ -1301,7 +1301,7 @@ def proxy_check(url, length, cafile=None, timeout=300):
         return result
     orchestra = False
     try:
-        answer = json.loads(body.decode('utf-8'))
+        answer = record_json.loads(body.decode('utf-8'))   # the proxy's or the site's text: guarded
         orchestra = isinstance(answer, dict) and isinstance(answer.get('error'), dict) \
             and answer['error'].get('code') == 'unauthenticated' and 'request_id' in answer
     except (ValueError, UnicodeError):

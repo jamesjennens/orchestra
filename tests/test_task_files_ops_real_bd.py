@@ -29,7 +29,7 @@ admin = rb.admin
 @without_inherited_tests
 class TaskFilesOpsRealBdTests(rb.RealBdLabelAliasTests):
 
-    def project(self, name):
+    def new_project(self, name):
         path = self.root / 'projects' / name
         path.mkdir(parents=True, exist_ok=True)
         init = subprocess.run(
@@ -67,13 +67,13 @@ class TaskFilesOpsRealBdTests(rb.RealBdLabelAliasTests):
                 mock.patch.object(admin, 'root_path', return_value=self.root), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
-                admin.main()
+                admin.run_main()
             except SystemExit as stopped:
                 code = stopped.code
         return code, out.getvalue(), err.getvalue()
 
     def test_backup_carries_the_files_and_restore_new_checks_and_places_them(self):
-        path = self.project('tfsrc')
+        path = self.new_project('tfsrc')
         open_task = self.task('tfsrc', 'open task')
         files = self.store(path)
         one = files.attach(open_task, b'input spreadsheet bytes')
@@ -94,7 +94,7 @@ class TaskFilesOpsRealBdTests(rb.RealBdLabelAliasTests):
         self.assertEqual([one], [e['sha256'] for e in task_files.live(clone, open_task)])
 
     def test_a_backup_without_the_folder_still_restores_the_project(self):
-        path = self.project('tfold')
+        path = self.new_project('tfold')
         open_task = self.task('tfold', 'task with a file')
         self.store(path).attach(open_task, b'bytes the older backup lacks')
         with contextlib.redirect_stdout(io.StringIO()):
@@ -106,7 +106,7 @@ class TaskFilesOpsRealBdTests(rb.RealBdLabelAliasTests):
         self.assertTrue((self.root / 'projects' / 'tfnew' / '.beads' / 'metadata.json').is_file())
 
     def test_a_flipped_byte_in_the_backup_restores_the_project_but_not_the_files(self):
-        path = self.project('tfbad')
+        path = self.new_project('tfbad')
         one = self.store(path).attach(self.task('tfbad', 't'), b'precious')
         with contextlib.redirect_stdout(io.StringIO()):
             admin.backup_projects(self.root, ['tfbad'])
@@ -118,7 +118,7 @@ class TaskFilesOpsRealBdTests(rb.RealBdLabelAliasTests):
         self.assertTrue((self.root / 'projects' / 'tfbadr' / '.beads' / 'metadata.json').is_file())
 
     def test_purge_reads_the_real_closed_rows_and_keeps_what_an_open_task_needs(self):
-        path = self.project('tfpur')
+        path = self.new_project('tfpur')
         closed = self.task('tfpur', 'done long ago', close=True)
         open_task = self.task('tfpur', 'still open')
         files = self.store(path)

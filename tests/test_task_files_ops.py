@@ -376,7 +376,7 @@ class AdminTaskFilesTests(unittest.TestCase):
                 mock.patch.object(admin, 'run_bd', return_value='\n'.join(json.dumps(r) for r in self.rows)), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
-                admin.main()
+                admin.run_main()
             except SystemExit as stopped:
                 code = stopped.code
         return code, out.getvalue(), err.getvalue()
