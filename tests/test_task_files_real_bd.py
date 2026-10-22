@@ -87,9 +87,10 @@ class TaskFilesRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests
             client.close()
 
     def comments(self, task):
-        row = json.loads(self.bd('show', task, '--json').stdout)
-        row = row[0] if isinstance(row, list) else row
-        return [c.get('text') or c.get('body') or '' for c in row.get('comments') or []]
+        found = json.loads(self.bd('comments', task, '--json').stdout or '[]')
+        if isinstance(found, dict):
+            found = found.get('comments') or []
+        return [c.get('text') or c.get('body') or '' for c in found or []]
 
     def claimed(self, who):
         task = self.new('task for ' + who)
@@ -142,9 +143,9 @@ class TaskFilesRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests
         refused = self.request('POST', '%s/%s/comments' % (self.tasks, mine), {'text': planted},
                                token=self.tokens['casey'])
         self.assertEqual(422, refused.status, refused.data)
-        host = rb.endpoint.execute(self.root, {'project': 'pp', 'actor': 'session-worker', 'action': 'bd',
-                                               'args': ['comments', 'add', mine, planted], 'attachments': {}})
-        self.assertNotEqual(0, host.get('returncode'), host)
+        with self.assertRaisesRegex(ValueError, 'reserved task file record'):
+            rb.endpoint.execute(self.root, {'project': 'pp', 'actor': 'session-worker', 'action': 'bd',
+                                            'args': ['comments', 'add', mine, planted], 'attachments': {}})
         # ... and one written past every guard (as a kit from before the reservation could) is inert.
         self.bd('comments', 'add', mine, planted)
         status, _, body = self.get('casey', mine, sha(secret))
