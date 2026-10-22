@@ -1735,16 +1735,20 @@ previous page did not return, at any page size).
   the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
 - **The cursor** is bound to the caller, the project (and task) and the query, and is
   signed with a per-installation HMAC key (`cursor_key`) kept in the service's state file
-  (`http.json`). `cursor_key` never leaves the server: it never appears in a cursor, an API
-  answer, an export, a log line, an audit record or the agent-facing documents. A backup of
-  the service state carries `cursor_key`, so a restore keeps in-flight cursors valid;
-  rotating `cursor_key` in the state file only invalidates existing signed cursors and
-  causes in-flight paginated reads to restart from the first page. A newest-first cursor
+  (`http-state.json`, or the `--state` path). When an upgraded installation loads a state
+  file without `cursor_key`, it generates and saves one immediately so a restart before the
+  next write keeps the same key. `cursor_key` never leaves the server: it never appears in
+  a cursor, an API answer, an export, a log line, an audit record or the agent-facing
+  documents. A backup of the service state carries `cursor_key`, so a restore keeps
+  in-flight cursors valid; rotating `cursor_key` in the state file invalidates existing
+  signed cursors: the reader gets 409 (`Cursor signature is invalid; start the read again
+  without a cursor.`) and must start the read again without a cursor. A newest-first cursor
   continues only a newest-first read with the same `recent`, and an oldest-first one only
-  an oldest-first read; another query, user or project is refused (409). A cursor whose
-  offset, payload or signature was edited is refused (409) with one sentence
-  (`Cursor signature is invalid; start the read again without a cursor.`), while an old
-  unsigned cursor simply restarts the read from the first page. The cursor stores a
+  an oldest-first read; another query, user, project or task is refused (409). A cursor
+  whose offset, continuation payload or signature was edited is refused (409) with one
+  sentence (`Cursor signature is invalid; start the read again without a cursor.`), while
+  an old unsigned cursor simply restarts the read from the first page (the newest entry for
+  `recent=N`, or the oldest for `limit=N`) and never skips ahead. The cursor stores a
   compact binding digest and packs the canonical history token without repeating route
   identifiers, staying well under the 512-character `MAX_CURSOR` limit even for the
   longest valid project and task IDs (kittrial-5bb.368).

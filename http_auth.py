@@ -833,10 +833,13 @@ class Store:
         if not isinstance(data, dict) or data.get('schema_version') != SCHEMA_VERSION:
             raise ValueError('Unsupported or corrupt service store schema')
         base = _blank_state()
+        created_cursor_key = not isinstance(data.get('cursor_key'), str) or len(data['cursor_key']) < 32
         for key, value in base.items():
             data.setdefault(key, value)
-        if not isinstance(data.get('cursor_key'), str) or len(data['cursor_key']) < 32:
+        if created_cursor_key:
             data['cursor_key'] = base['cursor_key']
+            self.state = data
+            self.save()
         return data
 
     def _migrate_records(self):
@@ -1106,6 +1109,7 @@ class Service:
             key = self.state.get('cursor_key')
             if not isinstance(key, str) or len(key) < 32:
                 key = self.state['cursor_key'] = secrets.token_hex(32)
+                self.store.save()
             return key
 
     def _now(self):

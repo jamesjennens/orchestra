@@ -297,8 +297,9 @@ class RecentHistoryCase(HistoryPagingCase):
 
     def test_cursor_is_signed_tampering_is_refused_and_unsigned_restarts_the_read(self):
         import base64
+        import sys
         from http_auth import Store, Service, request_hash
-        from http_service import CURSOR_BAD_SIGNATURE, cursor_scope
+        from http_service import CURSOR_BAD_SIGNATURE, EndpointBackend, cursor_scope
         alex, project, task = self.a_task('history-recent-0008')
         self.seed(task, MANY[:25])
         first = self.read(alex, project, task, 'recent=5')
@@ -307,13 +308,20 @@ class RecentHistoryCase(HistoryPagingCase):
         padded = cursor + '=' * (-len(cursor) % 4)
         decoded = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')))
 
-        # 1. Editing the offset in the cursor payload is refused with one sentence (409).
+        # 1. Editing the offset or the continuation in a signed cursor is refused with one sentence (409).
         edited_offset = dict(decoded, o=2)
         tampered = base64.urlsafe_b64encode(
             json.dumps(edited_offset, separators=(',', ':'), sort_keys=True).encode('utf-8')
         ).decode('ascii').rstrip('=')
         refused = self.read(alex, project, task, 'recent=5', tampered, status=409)
         self.assertEqual(CURSOR_BAD_SIGNATURE, refused['error']['message'])
+
+        edited_x = dict(decoded, x=[decoded['x'][0], decoded['x'][1] + 5, decoded['x'][2]])
+        tampered_x = base64.urlsafe_b64encode(
+            json.dumps(edited_x, separators=(',', ':'), sort_keys=True).encode('utf-8')
+        ).decode('ascii').rstrip('=')
+        refused_x = self.read(alex, project, task, 'recent=5', tampered_x, status=409)
+        self.assertEqual(CURSOR_BAD_SIGNATURE, refused_x['error']['message'])
 
         # 2. Editing the signature itself is refused with the same one sentence (409).
         bad_sig = dict(decoded, s=('A' if decoded['s'][0] != 'A' else 'B') + decoded['s'][1:])
@@ -323,40 +331,74 @@ class RecentHistoryCase(HistoryPagingCase):
         refused_sig = self.read(alex, project, task, 'recent=5', tampered_sig, status=409)
         self.assertEqual(CURSOR_BAD_SIGNATURE, refused_sig['error']['message'])
 
-        # 3. Old unsigned cursor (both legacy {'u','p','q','o'} and stripped-'s') restarts the read.
+        # 2b. User B using user A's signed cursor, or the same cursor on another task, is refused (409).
+        admin = self.admin_token()
+        blair_id = self.create_account(admin, 'blair', 'blair-password-1')
+        self.assertIn(self.request('PUT', '/v1/projects/%s/members/%s' % (project, blair_id),
+                                   {'role': 'contributor'}, token=admin).status, (200, 201))
+        blair = self.login('blair', 'blair-password-1')[0]
+        refused_user = self.read(blair, project, task, 'recent=5', cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_user['error']['message'])
+
+        other_task = self.create_task(admin, project, 'history-recent-other').data['id']
+        self.seed(other_task, MANY[:10])
+        refused_task = self.read(alex, project, other_task, 'recent=5', cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_task['error']['message'])
+
+        # 3. An unsigned crafted cursor (legacy {'u','p','q','o','x'} or compact {'b','o','x'})
+        # restarts at the newest entry and never skips ahead.
         alex_id = next(uid for uid, u in self.service.state['users'].items() if u.get('username') == 'alex')
         legacy_payload = {
             'u': alex_id,
             'p': project,
             'q': request_hash(cursor_scope({'recent': '5'}))[:16],
-            'o': 5,
+            'o': 15,
+            'x': decoded['x'],
         }
         legacy_cursor = base64.urlsafe_b64encode(
             json.dumps(legacy_payload, separators=(',', ':')).encode('utf-8')
         ).decode('ascii').rstrip('=')
         restarted = self.read(alex, project, task, 'recent=5', legacy_cursor, status=200)
-        self.assertEqual([e['entry_id'] for e in first['items']],
-                         [e['entry_id'] for e in restarted['items']])
+        self.assertEqual(['comment 024', 'comment 023', 'comment 022', 'comment 021', 'comment 020'],
+                         [e['body'] for e in restarted['items']])
 
-        stripped_payload = {k: v for k, v in decoded.items() if k != 's'}
+        stripped_payload = {'b': decoded['b'], 'o': 15, 'x': decoded['x']}
         stripped_cursor = base64.urlsafe_b64encode(
             json.dumps(stripped_payload, separators=(',', ':')).encode('utf-8')
         ).decode('ascii').rstrip('=')
         restarted_stripped = self.read(alex, project, task, 'recent=5', stripped_cursor, status=200)
-        self.assertEqual([e['entry_id'] for e in first['items']],
-                         [e['entry_id'] for e in restarted_stripped['items']])
+        self.assertEqual(['comment 024', 'comment 023', 'comment 022', 'comment 021', 'comment 020'],
+                         [e['body'] for e in restarted_stripped['items']])
 
-        # 4. A backup/reload of the store preserves cursor_key so existing cursors stay valid;
-        # rotating cursor_key refuses old signed cursors and only requires restarting the read.
+        # 4. Removing cursor_key from a saved state, starting the service, and restarting
+        # BEFORE any write persists the newly created key so a cursor signed before the
+        # restart still reads after the restart.
         self.service.store.save()
-        reloaded = Service(Store(self.service.store.path))
-        self.assertEqual(self.service.cursor_key(), reloaded.cursor_key())
-        continued = self.read(alex, project, task, 'recent=5', cursor, status=200)
+        raw_state = json.loads(self.service.store.path.read_text(encoding='utf-8'))
+        raw_state.pop('cursor_key', None)
+        self.service.store.path.write_text(json.dumps(raw_state), encoding='utf-8')
+
+        upgraded_store = Store(self.service.store.path)
+        upgraded_service = Service(upgraded_store)
+        self.restart(upgraded_service, EndpointBackend(sys.executable, str(fixes.STUB),
+                                                       str(self.canonical_root), service=upgraded_service))
+        pre_restart_page = self.read(alex, project, task, 'recent=5', status=200)
+        pre_restart_cursor = pre_restart_page['next_cursor']
+        self.assertTrue(pre_restart_cursor)
+
+        # Restart again before any write has occurred on upgraded_service.
+        restarted_store = Store(self.service.store.path)
+        restarted_service = Service(restarted_store)
+        self.assertEqual(upgraded_service.cursor_key(), restarted_service.cursor_key())
+        self.restart(restarted_service, EndpointBackend(sys.executable, str(fixes.STUB),
+                                                        str(self.canonical_root), service=restarted_service))
+        continued = self.read(alex, project, task, 'recent=5', pre_restart_cursor, status=200)
         self.assertEqual(['comment 019', 'comment 018', 'comment 017', 'comment 016', 'comment 015'],
                          [e['body'] for e in continued['items']])
 
+        # 5. Rotating cursor_key refuses old signed cursors with 409; the reader must start again without a cursor.
         self.service.state['cursor_key'] = 'f' * 64
-        rotated_refused = self.read(alex, project, task, 'recent=5', cursor, status=409)
+        rotated_refused = self.read(alex, project, task, 'recent=5', pre_restart_cursor, status=409)
         self.assertEqual(CURSOR_BAD_SIGNATURE, rotated_refused['error']['message'])
         fresh = self.read(alex, project, task, 'recent=5', status=200)
         fresh_continued = self.read(alex, project, task, 'recent=5', fresh['next_cursor'], status=200)
