@@ -263,6 +263,27 @@ class TaskFilesStoreTests(unittest.TestCase):
         (directory / ('c' * 64 + '.json')).write_text('{not json', encoding='utf-8')
         self.assertEqual([digest], [e['sha256'] for e in task_files.live(self.project, 't1')])
         self.assertIsNone(task_files.read_entry(self.project, 't2', digest), 'bound to its task')
+        # Copied into another task's journal folder, the entry still names t1: t2 does not get the file.
+        theirs = self.project / task_files.FOLDER / task_files.RECORDS / task_files.task_key('t2')
+        theirs.mkdir()
+        (theirs / (digest + '.json')).write_bytes(good.read_bytes())
+        self.assertIsNone(task_files.read_entry(self.project, 't2', digest))
+        self.assertEqual([], task_files.live(self.project, 't2'))
+
+    def test_apply_refuses_a_record_whose_stored_bytes_are_missing_or_another_size(self):
+        rows = {'t1': {'status': 'open', 'assignee': 'worker'}}
+        run, comments = self._run('t1', rows)
+        payload = {'schema_version': 1, 'operation': 'coordinator-record', 'task': 't1', 'sha256': 'd' * 64,
+                   'name': 'ghost.txt', 'bytes': 5, 'media_type': task_files.OPAQUE, 'direction': task_files.TO_WORKER,
+                   'note': None}
+        with self.assertRaises(task_files.Refusal) as caught:
+            task_files.apply(payload, 'coord', run, self.project, lambda: 'now')
+        self.assertEqual(409, caught.exception.status)
+        digest, size = task_files.receive(io.BytesIO(b'real').read, 4, self.project)
+        with self.assertRaises(task_files.Refusal):
+            task_files.apply(dict(payload, sha256=digest, bytes=size + 1), 'coord', run, self.project, lambda: 'now')
+        self.assertEqual([], comments, 'nothing was recorded')
+        self.assertIsNone(task_files.read_entry(self.project, 't1', digest))
 
     def test_record_texts_are_reserved_on_the_raw_comment_path(self):
         entry = {'name': 'a', 'sha256': 'a' * 64, 'bytes': 1, 'media_type': task_files.OPAQUE,
@@ -450,10 +471,42 @@ class TaskFilesHttpTests(agents.AgentHarness):
 
     def test_a_contributor_who_is_not_the_assignee_may_not_download_or_attach(self):
         digest = self.given()
+        before = self.stored()
+        calls = []
+        invoke = self.backend.invoke
+        self.backend.invoke = lambda route, *a, **k: (calls.append(route), invoke(route, *a, **k))[1]
         self.assertEqual(403, self.download(self.tokens['worker2'], digest)[0])
-        self.assertEqual(403, self.upload(self.tokens['worker2'], b'x', direction='from-worker').status)
-        self.assertEqual(403, self.upload(self.tokens['worker'], b'x', direction='to-worker').status,
+        self.assertEqual(403, self.upload(self.tokens['worker2'], b'not stored 1', direction='from-worker').status)
+        self.assertEqual(403, self.upload(self.tokens['worker'], b'not stored 2', direction='to-worker').status,
                          'the assignee does not attach files to the worker')
+        self.assertEqual(before, self.stored(), 'a refused upload stores no bytes: it is refused before a byte is read')
+        self.assertEqual([], [route for route in calls if route.startswith('files.')])
+
+    def test_a_withdrawal_by_somebody_else_is_refused_before_the_backend_is_asked(self):
+        mine = self.upload(self.tokens['worker'], b'mine', name='m.txt', direction='from-worker')
+        calls = []
+        invoke = self.backend.invoke
+        self.backend.invoke = lambda route, *a, **k: (calls.append(route), invoke(route, *a, **k))[1]
+        refused = self.request('POST', self.files_path(sha256=mine.data['sha256']) + '/withdraw', {'reason': 'x'},
+                               token=self.tokens['worker2'])
+        self.assertEqual(403, refused.status, refused.data)
+        self.assertEqual([], calls)
+
+    def test_the_declared_type_is_display_metadata_and_never_served(self):
+        put = self.upload(self.tokens['coord'], b'<script>alert(1)</script>', name='x.html', media_type='text/html')
+        self.assertEqual((201, 'text/html'), (put.status, put.data['media_type']), put.data)
+        status, headers, _ = self.download(self.tokens['worker'], put.data['sha256'])
+        self.assertEqual((200, 'application/octet-stream'), (status, headers['Content-Type']))
+
+    def test_an_archived_project_keeps_its_files_downloadable_and_takes_no_new_one(self):
+        digest = self.given()
+        archived = self.request('POST', '/v1/projects/%s/archive' % self.pid, {}, token=self.admin)
+        self.assertEqual(200, archived.status, archived.data)
+        refused = self.upload(self.tokens['coord'], b'after the archive', name='late.txt')
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('archived', refused.data['error']['message'])
+        self.assertEqual(1, len(self.stored()))
+        self.assertEqual(200, self.download(self.tokens['coord'], digest)[0])
 
     def test_the_former_assignee_loses_access_the_moment_the_task_is_reassigned(self):
         digest = self.given()

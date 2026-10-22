@@ -169,6 +169,24 @@ class TaskFilesRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests
             rb.endpoint.execute(self.root, {'project': 'pp', 'actor': 'session-worker', 'action': 'task-file',
                                             'args': [json.dumps(body)], 'attachments': {}}, key_projects=['pp'])
 
+    def test_the_record_is_written_under_the_projects_exclusive_lock(self):
+        # While another holder keeps the project's coordination lock SHARED (as every read
+        # does), reads go on and the record waits: it is a write, taken exclusively.
+        import fcntl
+        import threading
+        import time
+        task = self.claimed('casey')
+        done = []
+        with (self.project / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            worker = threading.Thread(target=lambda: done.append(self.put('alex', task, b'waits for the lock')))
+            worker.start()
+            time.sleep(8)
+            self.assertEqual([], done, 'the record did not wait for the lock')
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        worker.join(120)
+        self.assertEqual(201, done[0][0], done)
+
     def test_withdraw_by_the_author_writes_the_withdrawal_record(self):
         task = self.claimed('casey')
         data = b'my result'
