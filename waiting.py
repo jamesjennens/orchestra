@@ -124,6 +124,8 @@ MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor',
 #: ``pending_review_items``, ``owner`` (the assignment), ``status`` (claim/release),
 #: ``contribution_id`` and ``redelivered`` are carried directly. The coordinator form
 #: keeps :data:`MOVE_FIELDS` unchanged.
+# Ownership (including parent/sub-label authors) is resolved by the producer
+# of wait_newer_activity_marker; this projection must not reinterpret actors.
 WORKER_MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor', 'owner', 'status',
                       'contribution_id', 'pending_review_items', 'redelivered',
                       'guidance_version', 'wait_newer_activity_marker')

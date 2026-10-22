@@ -341,6 +341,8 @@ class _InlineWait:
     #: fields are dropped and the checkpoint-independent wait marker takes the marker's
     #: place. Kept identical to ``waiting.WORKER_MOVE_FIELDS``; the coordinator form keeps
     #: ``MOVE_FIELDS`` unchanged.
+    # Ownership (including parent/sub-label authors) is resolved by the producer
+    # of wait_newer_activity_marker; this projection must not reinterpret actors.
     WORKER_MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor', 'owner', 'status',
                           'contribution_id', 'pending_review_items', 'redelivered',
                           'guidance_version', 'wait_newer_activity_marker')

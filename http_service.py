@@ -1407,11 +1407,11 @@ class InProcessBackend:
         digests, but its events name their actor, so the agent's own checkpoint event
         is its own entry and never moves the marker.
         """
-        from briefing import activity_marker, fields_digest
+        from briefing import activity_marker, fields_digest, same_activity_actor
         events = [(index, event) for index, event in enumerate(self.state.get('events') or [])
                   if isinstance(event, dict) and event.get('task') == task['id']]
         others = [(index, event) for index, event in events
-                  if (event.get('actor') or 'unknown') != task.get('assignee')]
+                  if not same_activity_actor(event.get('actor'),task.get('assignee'))]
         newest = max(others, key=lambda pair: (pair[1].get('time') or '', pair[0])) if others else None
         entry = None
         if newest is not None:
@@ -1420,6 +1420,7 @@ class InProcessBackend:
         return activity_marker(entry, fields_digest(task))
 
     def _other_agent_activity(self, task, checkpoint):
+        from briefing import same_activity_actor
         events=[e for e in self.state.get('events') or [] if e.get('task')==task['id']]
         # Real writes have an ordered checkpoint event. Do not count that event
         # itself, even when an owner wrote the checkpoint for the assignee.
@@ -1427,11 +1428,11 @@ class InProcessBackend:
                  and e.get('actor')==checkpoint.get('actor')
                  and e.get('time','')>=checkpoint.get('created_at','')]
         if anchors:
-            return any(e.get('actor')!=task.get('assignee') for e in events[anchors[-1]+1:])
+            return any(not same_activity_actor(e.get('actor'),task.get('assignee')) for e in events[anchors[-1]+1:])
         # Older or directly imported in-process checkpoints have no event anchor.
         # Only attributed review records can establish external activity there.
         at=checkpoint.get('created_at')
-        return bool(at and any(r.get('created_at','')>at and r.get('actor')!=task.get('assignee')
+        return bool(at and any(r.get('created_at','')>at and not same_activity_actor(r.get('actor'),task.get('assignee'))
                                for r in self.state.get('contributions',{}).get(task['id'],[])))
 
     def _agent_activity_summary(self, task, checkpoint):
@@ -1441,7 +1442,7 @@ class InProcessBackend:
         no per-entry checkpoint digests, so imported/evicted history stays unknown.
         Reading this projection never incorporates or acknowledges an event.
         """
-        from briefing import NEWER_MAX, clip
+        from briefing import NEWER_MAX, clip, same_activity_actor
         events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
         anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
                    and e.get('actor') == checkpoint.get('actor')
@@ -1451,7 +1452,7 @@ class InProcessBackend:
                     'entries': [], 'omitted': None,
                     'note': 'Checkpoint event history is unavailable; read task history.'}
         remaining = events[anchors[-1] + 1:]
-        others = [e for e in remaining if e.get('actor') != task.get('assignee')]
+        others = [e for e in remaining if not same_activity_actor(e.get('actor'),task.get('assignee'))]
         authors = sorted({e.get('actor') for e in others if e.get('actor')})
         return {'coverage': 'unknown', 'own_count': len(remaining) - len(others),
                 'other_count': len(others),

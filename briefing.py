@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from activity import build_entries, parse_moment, utc_text
 from field_limits import check_text
+from claim_limit import actor_holds
 from lifecycle import project_facts
 from requirements import canonical_bytes, content_hash
 
@@ -557,6 +558,16 @@ def activity_marker(newest_other,digest):
     combined=content_hash({'entry':content_hash(newest_other) if newest_other is not None else None,'fields':digest})
     return (newest_other['entry_id'] if newest_other is not None else 'fields')+':'+combined[:MARKER_DIGEST]
 
+def same_activity_actor(author, owner):
+    """Parent and sub-label activity belong to the same actor (kittrial-5bb.371).
+
+    Apply the claim namespace rule in either direction: a parent can write on its
+    sub-label claim, and a sub-label can write on its parent's claim. A shared text
+    prefix without the slash boundary never establishes ownership. Missing actors
+    remain other-party activity.
+    """
+    return actor_holds(author, owner) or actor_holds(owner, author)
+
 def wait_activity_marker(data,row):
     """The stable marker a worker's wait fingerprints (kittrial-5bb.369).
 
@@ -573,7 +584,7 @@ def wait_activity_marker(data,row):
     """
     owner=row.get('assignee')
     entries=[entry for entry in data.get('entries') or []
-             if isinstance(entry,dict) and entry.get('author')!=owner]
+             if isinstance(entry,dict) and not same_activity_actor(entry.get('author'),owner)]
     newest=max(entries,key=lambda entry:(parse_moment(entry['timestamp']),entry['entry_id'])) if entries else None
     return activity_marker(newest,fields_digest(row))
 
@@ -591,7 +602,7 @@ def newer_comment_by_other(row,checkpoint_comment):
     position=next(index for index,comment in enumerate(comments)
                   if str(comment.get('id'))==str(checkpoint_comment.get('id')))
     checkpoint_id=str(checkpoint_comment.get('id'));checkpoint_author=checkpoint_comment.get('author')
-    return any(comment.get('author')!=row.get('assignee')
+    return any(not same_activity_actor(comment.get('author'),row.get('assignee'))
                and not lane_state_record(comment,checkpoint_id,checkpoint_author)
                for comment in comments[position+1:])
 # Bounded provenance window: a checkpoint records exact digests for the most
@@ -916,8 +927,8 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     collection is bounded with an explicit omitted count. Reading changes nothing.
     """
     coverage,entries,fresh,changed_late,unverified=newer_selection(data,prov,checkpoint_timestamp)
-    own=[e for e in entries if e['author']==owner]
-    others=[e for e in entries if e['author']!=owner]
+    own=[e for e in entries if same_activity_actor(e['author'],owner)]
+    others=[e for e in entries if not same_activity_actor(e['author'],owner)]
     authors=sorted({e['author'] for e in others})
     # A stable marker of the newest OTHER-party entry, so a bridge wakes on the
     # second coordinator comment too, not only when the `newer_activity` boolean
@@ -1590,9 +1601,9 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
         if shown and spent+cost>SECTION_BUDGET:break
         spent+=cost
         shown.append({'entry_id':entry['entry_id'],'kind':entry['kind'],'author':clip(entry['author'],96),
-                      'timestamp':entry['timestamp'],'own':entry['author']==owner,
+                      'timestamp':entry['timestamp'],'own':same_activity_actor(entry['author'],owner),
                       'state':entry_state(entry,fresh,stamp),'body':body})
-    own=sum(1 for e in entries if e['author']==owner)
+    own=sum(1 for e in entries if same_activity_actor(e['author'],owner))
     note=('Newest first; read these before acting on the checkpoint. Bodies are clipped; read the whole '
           'entries with '+history+'. Reading clears nothing: a new checkpoint incorporates them.')
     if coverage=='timestamp':

@@ -256,6 +256,78 @@ class TheWaitMarkerCase(unittest.TestCase):
                         row['wait_newer_activity_marker'])
 
 
+class SubLabelActivityCase(unittest.TestCase):
+    """One ownership rule across markers, counts, sections and wait implementations."""
+
+    def test_parent_and_sub_label_writes_stay_own_but_prefix_actor_wakes(self):
+        import client
+        import waiting
+        for owner, author in [('alice/session/sub0', 'alice/session'),
+                              ('alice/session', 'alice/session/sub0')]:
+            with self.subTest(owner=owner, author=author):
+                data = rows()
+                data[0]['assignee'] = owner
+                save_cp(data, 'cp1')
+                def row():
+                    return work.queue(data, owner, ['--mine'])['items'][0]
+                before = row()
+                # Parent checkpoint on a sub-label claim stays out of the wait marker.
+                save_cp(data, 'cp2')
+                self.assertEqual(before['wait_newer_activity_marker'], row()['wait_newer_activity_marker'])
+                before = row()
+                data[0]['comments'].append(comment('own', 'Own progress',
+                    '2026-09-16T01:00:00Z', author=author))
+                after = row()
+                for field in ('newer_activity_marker', 'wait_newer_activity_marker'):
+                    self.assertEqual(before[field], after[field])
+                self.assertFalse(after['newer_activity'])
+                self.assertEqual((1, 0), (after['newer_activity_own'], after['newer_activity_by_others']))
+                section = b.brief(data, PROJECT, TASK)['changes_since_checkpoint']
+                self.assertEqual((1, 0), (section['own_count'], section['other_count']))
+                self.assertTrue(section['entries'][0]['own'])
+                for module in (waiting, client._InlineWait):
+                    first = module.worker_view([before])
+                    own = module.worker_view([after])
+                    self.assertEqual(first['fingerprint'], own['fingerprint'])
+                data[0]['comments'].append(comment('other', 'Different prefix actor',
+                    '2026-09-16T02:00:00Z', author='alice/session2'))
+                other = row()
+                self.assertEqual((1, 1), (other['newer_activity_own'], other['newer_activity_by_others']))
+                self.assertTrue(other['newer_activity'])
+                for field in ('newer_activity_marker', 'wait_newer_activity_marker'):
+                    self.assertNotEqual(after[field], other[field])
+                views = [module.worker_view([other]) for module in (waiting, client._InlineWait)]
+                self.assertEqual(views[0], views[1])
+                self.assertNotEqual(first['fingerprint'], views[0]['fingerprint'])
+
+    def test_disposable_http_event_projection_uses_the_same_ownership_rule(self):
+        from http_service import InProcessBackend
+        for owner, author in [('agent/sub0', 'agent'), ('agent', 'agent/sub0')]:
+            with self.subTest(owner=owner):
+                backend = object.__new__(InProcessBackend)
+                task = dict(id=TASK, assignee=owner, title='Task')
+                checkpoint = dict(actor=author, created_at=STAMP)
+                events = [dict(task=TASK, actor=author, time=STAMP, action='checkpoint-added')]
+                backend.state = {'events': events}
+                before = backend._wait_activity_marker(task)
+                events.append(dict(task=TASK, actor=author, time='2026-09-16T01:00:00Z', action='comment-added'))
+                self.assertEqual(before, backend._wait_activity_marker(task))
+                self.assertFalse(backend._other_agent_activity(task, checkpoint))
+                summary = backend._agent_activity_summary(task, checkpoint)
+                self.assertEqual((1, 0), (summary['own_count'], summary['other_count']))
+                events.append(dict(task=TASK, actor='agent2', time='2026-09-16T02:00:00Z', action='comment-added'))
+                self.assertNotEqual(before, backend._wait_activity_marker(task))
+                self.assertTrue(backend._other_agent_activity(task, checkpoint))
+                summary = backend._agent_activity_summary(task, checkpoint)
+                self.assertEqual((1, 1), (summary['own_count'], summary['other_count']))
+
+    def test_missing_actors_and_unrelated_sublabels_are_not_own(self):
+        for author, owner in [(None, None), ('', ''), ('agent2', 'agent'),
+                              ('agent/sub1', 'agent/sub0')]:
+            with self.subTest(author=author, owner=owner):
+                self.assertFalse(b.same_activity_actor(author, owner))
+
+
 class TheSectionCase(unittest.TestCase):
     """The section's entries: new, edited and late, own and other, clipped, bounded."""
 
@@ -507,6 +579,27 @@ class TheRoutesAgreeCase(fixes.EndpointCase):
     # only in UTF-8 mode, and a stale brief's text carries an em dash (as in
     # test_agent_attention's read-only test).
     @mock.patch.dict(os.environ, {'PYTHONUTF8': '1'})
+    def test_sub_label_claim_parent_writes_and_other_comment_on_all_routes(self):
+        actor = self.agent['actor']
+        self.native(actor)(['update', self.task, '--assignee', actor + '/sub0', '--status', 'in_progress'])
+        self.checkpoint()
+        before = self.read()[0]
+        self.native(actor)(['comments', 'add', self.task, 'Own progress.'])
+        on_next, on_wait, on_page, section = self.read()
+        self.assertEqual(on_next, on_wait)
+        self.assertEqual(on_next, on_page)
+        for name in ('newer_activity_marker', 'wait_newer_activity_marker'):
+            self.assertEqual(before[name], on_next[name])
+        self.assertEqual((1, 0, False), (on_next['newer_activity_own'],
+            on_next['newer_activity_by_others'], on_next['newer_activity']))
+        self.assertTrue(section['entries'][0]['own'])
+        self.native(actor + '2')(['comments', 'add', self.task, 'Another actor.'])
+        on_next, on_wait, on_page, section = self.read()
+        self.assertEqual(on_next, on_wait)
+        self.assertEqual(on_next, on_page)
+        self.assertEqual(1, on_next['newer_activity_by_others'])
+        self.assertNotEqual(before['wait_newer_activity_marker'], on_next['wait_newer_activity_marker'])
+
     def test_every_route_carries_the_same_fields_and_the_section_names_the_comment(self):
         self.assertEqual(200, self.request('POST', self.base + '/claim', {}, token=self.secret).status)
         # Before any checkpoint the canonical brief leaves the section out; the task read
