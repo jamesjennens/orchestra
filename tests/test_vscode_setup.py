@@ -579,6 +579,14 @@ console.log(JSON.stringify({
         self.assertIn('do not search for it', text)
         self.assertIn('ask in the task for the content or a repository path', text)
 
+    def test_the_worker_is_told_where_a_question_goes(self):
+        """kittrial-5bb.372: questions go to the coordinator in the task, not to the person."""
+        text = self.run_script()['workerText']
+        self.assertIn('When you need a decision or information, ask in the task (a comment, or an open '
+                      'item of kind question in your checkpoint) so the coordinator answers it there', text)
+        self.assertIn('do not ask the person at the keyboard, who may not be watching, '
+                      'unless they started this turn with a question for you.', text)
+
     def test_the_rewrite_command_replaces_instead_of_appending(self):
         result = self.run_script()
         posix, powershell = result['posixCommand'], result['powershellCommand']

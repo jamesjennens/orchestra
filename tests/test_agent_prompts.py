@@ -265,6 +265,18 @@ class PromptCase(unittest.TestCase):
         self.assertIn('do not search for it', text)
         self.assertIn('ask in the task for the content or a repository path', text)
 
+    def test_the_worker_texts_say_where_a_question_goes(self):
+        """kittrial-5bb.372: the wake prompt, worker prompt and worker guide ask in the task."""
+        sentence = ('When you need a decision or information, ask in the task (a comment, or an open '
+                    'item of kind question in your checkpoint) so the coordinator answers it there; '
+                    'do not ask the person at the keyboard, who may not be watching, unless they '
+                    'started this turn with a question for you.')
+        wake = prompt([classify(OWNER, [row('t1', 'changes-requested', OTHER)])])['text']
+        self.assertIn('7. ' + sentence, ' '.join(wake.split()))
+        for name in ('templates/WORKER_PROMPT.md', 'docs/WORKER_GUIDE.md'):
+            with self.subTest(name=name):
+                self.assertIn(sentence, ' '.join((ROOT / name).read_text(encoding='utf-8').split()))
+
     def test_a_non_coordinator_prompt_does_not_carry_the_web_worker_paragraph(self):
         for role in ('contributor', 'owner', 'viewer'):
             with self.subTest(role=role):
