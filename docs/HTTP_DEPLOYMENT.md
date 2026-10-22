@@ -3036,8 +3036,10 @@ line separately and unconfined.
   not implemented. `POST`/`GET /v1/projects/{id}/feedback` fail closed with
   `501 not_implemented` on the canonical backend because the dedicated feedback
   stream ships with `kittrial-5bb.13`; the service never substitutes its own store
-  for canonical feedback. Attachment uploads are validated and bounded but only
-  their metadata and digest are retained, so **UI readiness is not claimed**.
+  for canonical feedback. The task-create `attachments` field is validated and
+  bounded, then refused with `501 not_implemented`: nothing of it is kept. Files are
+  attached to a task with their own route instead (see "Files attached to a task over
+  HTTP", kittrial-5bb.370), so **UI readiness is not claimed** for that field.
 - The personal-agent registry, one-time agent credential and the agent REST
   contract (`/v1/agents`, `/v1/agents/me`, `/v1/agents/me/next`, and the
   project-scoped `GET /v1/projects/{id}/agents`,
@@ -3704,6 +3706,90 @@ is shown once to the creating superuser; a retry returns secret-free metadata.
 The audit identifies creator and owner, and the owner's card says Created by NAME.
 The owning account can issue a new secret and revoke that first key if the creator
 having seen it matters. Legacy agents have no invented creator attribution.
+
+## Files attached to a task over HTTP
+
+Slice 1 of the task files design, `docs/TASK_FILES_DESIGN.md` (kittrial-5bb.370; the design is
+kittrial-5bb.350 and reaches this folder with that task's integration).
+A coordinator hands the assignee a file ("to the worker"); the assignee hands results back
+("from the worker"). This slice is the store and the four routes; the web panel, the Bridge
+tools, the SSH framing, backups of the folder and the operator commands come later.
+
+### Routes
+
+| Route | Who may call |
+| --- | --- |
+| `GET /v1/projects/{id}/tasks/{task}/files` | every reader of the project (viewers included): the records are in the task's history anyway. Withdrawn files are not listed. Each item says `may_download` for the caller, and `missing: true` when its bytes are not on disk. |
+| `PUT /v1/projects/{id}/tasks/{task}/files?name=NAME&direction=to-worker\|from-worker[&note=TEXT&media_type=TYPE]` | `to-worker`: a coordinator. `from-worker`: the task's current assignee, while the task is open. |
+| `GET /v1/projects/{id}/tasks/{task}/files/{sha256}` | a coordinator, or the current assignee of a task that is not closed |
+| `POST /v1/projects/{id}/tasks/{task}/files/{sha256}/withdraw` `{"reason": "..."}` | the file's author, or a coordinator |
+
+- **A coordinator** is a caller for whom the service's one authority check
+  (`Service.check_authority`, `http_authority.decide`) grants `coordinate` in the project: a
+  `coordinator` or `owner` member, or a personal agent holding the project's live
+  `coordinator` grant. A superuser who is not a member is refused, as on every write route.
+- **The assignee** is the caller whose acting actor is exactly the task's live assignee. The
+  acting actor is the caller's own label, or `?actor=LABEL` checked by `Service.bind_actor`
+  (a credential's own sub-label; another credential's actor is refused `403`). The task row is
+  read fresh from the tracker for every request, so a former assignee loses access the moment
+  the task is reassigned, and a closed task's last assignee may not download.
+- **Never another project**: the project is in the path, a file is bound to its task, and a
+  credential works only on the projects it was granted.
+
+### Storing and serving
+
+- **The upload is the one streamed route.** Its body is the raw bytes. `Content-Length` is
+  required (`411`); the limits and the free disk are checked before a byte is read; the body
+  is read in 64 KiB steps into a temporary file while it is hashed and counted. A body that
+  ends before its `Content-Length` is refused (`400`); every upload answer closes the
+  connection, so bytes past a short `Content-Length` are never read as a next request.
+  `X-Orchestra-SHA256`, when sent, must match (`422`). Only a complete file is renamed into
+  place. `201` answers with the record; the same file under the same name again answers `200`
+  (sent with `X-Orchestra-SHA256`, without reading the body again).
+- **Downloads** are `application/octet-stream` with `Content-Disposition: attachment`
+  (`filename*=UTF-8''...`), `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`,
+  `Content-Security-Policy: sandbox; default-src 'none'`, `Content-Length` and
+  `X-Orchestra-SHA256`. A client checks the digest before it keeps the file.
+- **Where:** `projects/NAME/.task-files/`, beside the project's other kit-owned state. Blobs are
+  named by the server, `<first two hex>/<sha256>`; the name a person gives is a label only (at
+  most 128 characters, no `/` or `\`, no control characters, not `.` or `..`). `.task-files`,
+  or any folder in it, that is a symlink or not a folder is refused (`503`) and nothing is
+  written or served through it.
+- **What makes a file attached** is its host journal entry under `.task-files/records/`,
+  written only by the web service's own endpoint action (`task-file`) under the project's
+  coordination lock, after live authority was verified. The reserved comments
+  `Kind: task-file-v1` and `Kind: task-file-withdrawn-v1` are the task's history record; the
+  raw `comments add` path refuses them, and one planted where the prefix is not reserved (an
+  older kit) grants nothing. An older kit reads them as ordinary comments.
+- **Audit:** every upload, download and withdrawal, and every refusal of one, is one line in
+  the service's audit (`tasks.files.upload`, `tasks.files.download`, `tasks.files.withdraw`)
+  with `task=... sha256=...` in the reason, readable with `GET /v1/projects/{id}/audit`.
+- **Not yet:** the folder is not in backups (slice 5): copy `projects/NAME/.task-files/` with the
+  project until then. Withdrawn bytes stay on disk until the operator purge of slice 5.
+
+### Settings
+
+One object in `deployment.private.json`, read on every request; a value that is not a whole
+number keeps its default, with a warning in the service's log:
+
+```json
+{"task_files": {"max_file_bytes": 26214400, "max_files_per_task": 20, "max_task_bytes": 104857600,
+                "max_project_bytes": 2147483648, "min_free_bytes": 1073741824,
+                "max_transfers": 4, "max_transfers_per_actor": 2}}
+```
+
+| Setting | Default | Refusal |
+| --- | --- | --- |
+| `max_file_bytes` | 25 MiB | `413`: "Uploads stop at 25 MiB a file (task_files.max_file_bytes); this one is 31 MiB." |
+| `max_files_per_task` | 20 | `409` |
+| `max_task_bytes` | 100 MiB | `413` |
+| `max_project_bytes` | 2 GiB | `413` |
+| `min_free_bytes` | 1 GiB | `507`: the upload would leave less free on the project's disk |
+| `max_transfers` | 4 | `503` with `Retry-After` |
+| `max_transfers_per_actor` | 2 (per credential, else per account) | `503` with `Retry-After` |
+
+A reverse proxy in front of the site has its own body limit (nginx `client_max_body_size`);
+raise it to `max_file_bytes`, or uploads near the limit are cut by the proxy.
 
 ## Reference and capability records over HTTP
 

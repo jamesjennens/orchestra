@@ -917,7 +917,8 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-guidance',
-                      'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release')
+                      'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
+                      'task-file')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -1218,7 +1219,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-guidance','assignee-followon','task-assign','assignment-roster','task-release'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -2310,6 +2311,51 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),followon_effect,
                                  authority_config=authority_config,require_authority=True,
                                  runner=runner,identity_check=followon_authority)
+    if action=='task-file':
+        # A file attached to a task, or its withdrawal (kittrial-5bb.370). The web service
+        # stored the bytes under .task-files and verified the caller; here, under the project's
+        # lock and live authority, task_files.apply reads the task row LIVE, applies the
+        # assignee/author rule, writes the reserved history comment and then the host journal
+        # entry that alone makes the file attached (the assignee-followon shape).
+        import task_files
+        from http_authority import server_time
+        args=request.get('args',[])
+        run_warnings=[]
+        def files_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(files_run, project=path)
+        def refused(error):
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','task_file_status':error.status}
+        try:
+            if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                raise task_files.Refusal(422,'invalid','Expected one task-file JSON payload; nothing was written.')
+            try:
+                body=record_json.loads(args[0])
+            except ValueError:
+                raise task_files.Refusal(422,'invalid','The task-file payload is not valid JSON; nothing was written.') from None
+            task_files.payload_check(body)
+            capability=required_capability(request)
+            if capability is None:
+                raise task_files.Refusal(403,'forbidden','This task-file operation has no endpoint capability binding; '
+                                         'nothing was written.')
+            def files_authority():
+                if not verified_web_authority(request,authority_config,capability,name):
+                    raise task_files.Refusal(403,'forbidden','Verified web authority required for task files in this '
+                                             'project; nothing was written.')
+            limit=task_files.limits(root,warnings=run_warnings)
+            def files_effect():
+                status,result=task_files.apply(body,actor,runner,path,server_time,limit=limit)
+                result=dict(result,status=status)
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                        'stderr':warning_text(run_warnings)}
+            with held_coordination_lock(path):
+                return guarded_write(root,request,journal_path(path),files_effect,
+                                     authority_config=authority_config,require_authority=True,
+                                     runner=runner,identity_check=files_authority)
+        except task_files.Refusal as error:
+            return refused(error)
     if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')
