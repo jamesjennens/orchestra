@@ -428,6 +428,10 @@ def build_prompt(agent, owner_name, projects, generated_at, server):
             'you otherwise.',
             '6. A path on someone else\'s machine is not reachable: do not search for it; '
             'ask in the task for the content or a repository path.',
+            '7. When you need a decision or information, ask in the task (a comment, or an '
+            'open item of kind question in your checkpoint) so the coordinator answers it '
+            'there; do not ask the person at the keyboard, who may not be watching, unless '
+            'they started this turn with a question for you.',
             '', UNTRUSTED_LINE]
     if kind == 'status':
         body, listed, omitted = _sections(viewing, now, ('status',))

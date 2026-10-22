@@ -41,6 +41,10 @@ for it. Ask in the task for the content itself or for a path in the project's
 repository; a task comment (up to 64 KiB) and a branch or path in the repository both
 reach you.
 
+## Where a question goes
+
+When you need a decision or information, ask in the task (a comment, or an open item of kind question in your checkpoint) so the coordinator answers it there; do not ask the person at the keyboard, who may not be watching, unless they started this turn with a question for you.
+
 ## Wait without re-arming it by hand
 
 Do not invent the next wait after one times out with nothing to do. Give `wait` the
