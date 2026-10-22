@@ -612,12 +612,22 @@ class ReviewFixCase(ProposalHarness):
                              token=self.token('alex')).data
         self.assertEqual([item['key'] for item in second['items'] + third['items']], newest_first[2:])
         self.assertIsNone(third['next_cursor'])
-        # A cursor the route did not issue is refused, not answered with an empty page.
+        # A cursor the route did not issue (or whose offset was edited) is refused, not answered with an empty page.
         import base64
+        from http_service import CURSOR_BAD_SIGNATURE, make_cursor
         forged = json.loads(base64.urlsafe_b64decode(first['next_cursor'] + '=' * (-len(first['next_cursor']) % 4)))
         for offset in (4, 5, 99, 100, 10 ** 9, True, '2', 1.0, None, -1):
             cursor = base64.urlsafe_b64encode(json.dumps(dict(forged, o=offset)).encode()).decode().rstrip('=')
+            with self.subTest(forged_offset=offset):
+                answer = self.request('GET', '/v1/me/contributions?limit=2&cursor=' + cursor, token=self.token('alex'))
+                self.assertEqual(409, answer.status, answer.data)
+                self.assertEqual(CURSOR_BAD_SIGNATURE, answer.data['error']['message'])
+        alex_principal = self.service.authenticate(self.token('alex'))
+        for offset in (4, 5, 99, 100, 10 ** 9, True, '2', 1.0, None, -1):
+            cursor = make_cursor(alex_principal, None, {'limit': '2'}, offset, key=self.service.cursor_key())
             with self.subTest(offset=offset):
+                if type(offset) is int and offset == 4:
+                    self.assertEqual(second['next_cursor'], cursor)
                 answer = self.request('GET', '/v1/me/contributions?limit=2&cursor=' + cursor, token=self.token('alex'))
                 self.assertEqual(answer.status, 200 if type(offset) is int and offset == 4 else 409, answer.data)
         # A cursor belongs to its query and its account.
