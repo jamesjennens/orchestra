@@ -3851,3 +3851,33 @@ object:
   `open_failing` and `state: "drifted"` intact until a trusted host `capability-verify --repo`
   at an integrated commit passes.
 
+## Serving delivered bundles over HTTP
+
+Web reviewers holding `reviews.write` or `reviews.approve` in a project can read a contribution's
+delivery metadata at `GET /v1/projects/{id}/tasks/{task_id}/delivery[?contribution=ID]` and fetch
+its verified git bundle at `GET /v1/projects/{id}/tasks/{task_id}/delivery/bundle[?contribution=ID]`
+(or via `client.py delivery TASK [--contribution ID] [--out FILE]` over HTTP).
+
+- **`delivery_roots` in `deployment.private.json`** (list of absolute directory paths, default
+  `[]`): the only directories from which `GET .../delivery/bundle` will open a recorded bundle
+  file (for example `["/srv/orchestra-drop"]`). The service strips any `HOST:` prefix from the
+  contribution's recorded `delivery.path` without comparing host names and resolves only the
+  `/absolute/...` path below it under a registered `delivery_roots` directory, opening the file
+  with `O_NOFOLLOW` and requiring a regular file. When a worker drops a bundle on another host
+  (for example `goomba:/srv/orchestra-drop/<lane>/...` read from a `koopa` service), the operator
+  copies or mounts the drop folder at the matching path under a registered `delivery_roots`
+  directory on the serving host; a bundle that is missing, outside every registered root, or a
+  symlink answers `410` (`"The delivered bundle is not available on this service."`).
+- **`delivery_serve_max_bytes` in `deployment.private.json`** (positive integer up to 2 GiB,
+  default `268435456` = 256 MiB): maximum bundle size served over HTTP; a larger bundle answers
+  `413 payload_too_large` before any byte is streamed.
+- **Serve-time verification and audit:** before sending any bytes, the service checks that the
+  file size does not exceed `delivery_serve_max_bytes`, verifies the git bundle header and full
+  file SHA-256 against the contribution's recorded `delivery.sha256`, and runs `git bundle
+  list-heads` (60 s timeout) to verify that the bundle advertises the contribution's recorded
+  40-hex `commit`. Any checksum, header, or `list-heads` mismatch or timeout answers `503`
+  (`"The delivered bundle does not match its recorded checksum."`) with zero bytes sent. Every
+  bundle download and every post-authorization refusal records a `delivery.bundle.read` entry in
+  the HTTP audit log.
+
+

@@ -1016,6 +1016,216 @@ def _wait_command(args,config,project,actor,out,config_path=None):
         sys.stdout.write(text)
     return code
 
+DELIVERY_SSH_ONLY_HTTP = (
+    "Delivered bundles are served over HTTP only; on the host transport, read the "
+    "contribution's recorded delivery.path directly."
+)
+DELIVERY_CHECKSUM_MISMATCH = 'The delivered bundle does not match its recorded checksum.'
+DELIVERY_SERVE_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _http_delivery_connection(base_url, ca_file=None, insecure=False, allow_plaintext=False, timeout=30):
+    import http.client
+    import ssl
+    from urllib.parse import urlsplit
+    parts = urlsplit(str(base_url or ''))
+    if parts.scheme not in ('http', 'https') or not parts.hostname:
+        raise ValueError('base_url must be an absolute http(s) URL')
+    loopback = parts.hostname in ('127.0.0.1', '::1', 'localhost')
+    if parts.scheme != 'https' and not (loopback or allow_plaintext):
+        raise ValueError('Refusing plaintext HTTP to a non-loopback host; use https '
+                         'or pass allow_plaintext for a disposable loopback test')
+    port = parts.port or (443 if parts.scheme == 'https' else 80)
+    prefix = parts.path.rstrip('/')
+    if parts.scheme == 'https':
+        context = ssl.create_default_context(cafile=ca_file)
+        if insecure:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(parts.hostname, port, timeout=timeout, context=context)
+    else:
+        conn = http.client.HTTPConnection(parts.hostname, port, timeout=timeout)
+    return conn, prefix
+
+
+def _http_delivery_fetch(base_url, project, task, *, token=None, contribution=None, out_path=None,
+                         ca_file=None, insecure=False, allow_plaintext=False, max_bytes=DELIVERY_SERVE_MAX_BYTES):
+    import tempfile
+    from urllib.parse import quote, urlencode
+    headers = {}
+    if token:
+        headers['Authorization'] = 'Bearer ' + str(token)
+    qs = ('?' + urlencode({'contribution': contribution})) if contribution is not None else ''
+    meta_path = '/v1/projects/%s/tasks/%s/delivery%s' % (quote(project, safe=''), quote(task, safe=''), qs)
+    if out_path is not None:
+        out = str(out_path)
+        if os.path.islink(out):
+            raise ValueError('Refusing to write delivered bundle through symlink: %s' % out)
+        if os.path.isdir(out):
+            raise ValueError('Refusing to overwrite directory with delivered bundle: %s' % out)
+        parent = os.path.dirname(os.path.abspath(out)) or '.'
+        if os.path.islink(parent) or not os.path.isdir(parent):
+            raise ValueError('Output parent directory does not exist: %s' % parent)
+    def _decode_json(raw_bytes):
+        if not raw_bytes:
+            return None
+        try:
+            return json.loads(raw_bytes)
+        except ValueError:
+            return raw_bytes.decode('utf-8', 'replace')
+
+    conn, prefix = _http_delivery_connection(base_url, ca_file=ca_file, insecure=insecure,
+                                             allow_plaintext=allow_plaintext)
+    try:
+        conn.request('GET', prefix + meta_path, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        status = resp.status
+    finally:
+        conn.close()
+    data = _decode_json(raw)
+    if status >= 400:
+        err = data.get('error', {}) if isinstance(data, dict) else {}
+        raise ValueError(server_text(err.get('message', 'Request failed')))
+    if not isinstance(data, dict):
+        raise ValueError('Invalid delivery metadata response')
+    if out_path is None:
+        return data
+    delivery_block = data.get('delivery') if isinstance(data.get('delivery'), dict) else {}
+    expected_sha = data.get('sha256') or delivery_block.get('sha256')
+    expected_bytes = data.get('bytes')
+    serve_limit = data.get('serve_limit')
+    limit = int(max_bytes)
+    if isinstance(serve_limit, int) and serve_limit > 0:
+        limit = min(limit, serve_limit)
+    bundle_path = '/v1/projects/%s/tasks/%s/delivery/bundle%s' % (
+        quote(project, safe=''), quote(task, safe=''), qs
+    )
+    conn, prefix = _http_delivery_connection(base_url, ca_file=ca_file, insecure=insecure,
+                                             allow_plaintext=allow_plaintext)
+    tmp_path = None
+    try:
+        conn.request('GET', prefix + bundle_path, headers=headers)
+        resp = conn.getresponse()
+        if resp.status >= 400:
+            err_data = _decode_json(resp.read())
+            err = err_data.get('error', {}) if isinstance(err_data, dict) else {}
+            raise ValueError(server_text(err.get('message', 'Request failed')))
+        if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+            raise ValueError(DELIVERY_CHECKSUM_MISMATCH)
+        expected_sha_lower = expected_sha.lower()
+        etag = (resp.getheader('ETag') or '').strip().strip('"').lower()
+        header_sha = (resp.getheader('X-Orchestra-Bundle-Sha256') or etag).strip().lower()
+        if not etag or etag != expected_sha_lower or header_sha != expected_sha_lower:
+            raise ValueError(DELIVERY_CHECKSUM_MISMATCH)
+        content_length_raw = resp.getheader('Content-Length')
+        expected_length = None
+        if content_length_raw is not None:
+            try:
+                expected_length = int(content_length_raw)
+            except ValueError:
+                raise ValueError(DELIVERY_CHECKSUM_MISMATCH) from None
+            if expected_length < 0 or expected_length > limit:
+                raise ValueError('The delivered bundle exceeds the %d-byte serve limit.' % limit)
+            if isinstance(expected_bytes, int) and expected_length != expected_bytes:
+                raise ValueError(DELIVERY_CHECKSUM_MISMATCH)
+        fd, tmp_path = tempfile.mkstemp(prefix='.delivery-', suffix='.bundle.tmp', dir=parent)
+        digest = hashlib.sha256()
+        total = 0
+        with os.fdopen(fd, 'wb') as tmp_file:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError('The delivered bundle exceeds the %d-byte serve limit.' % limit)
+                digest.update(chunk)
+                tmp_file.write(chunk)
+            tmp_file.flush()
+        if expected_length is not None and total != expected_length:
+            raise ValueError(DELIVERY_CHECKSUM_MISMATCH)
+        if isinstance(expected_bytes, int) and total != expected_bytes:
+            raise ValueError(DELIVERY_CHECKSUM_MISMATCH)
+        actual_sha = digest.hexdigest().lower()
+        if actual_sha != expected_sha_lower:
+            raise ValueError(DELIVERY_CHECKSUM_MISMATCH)
+        if os.path.islink(out) or os.path.isdir(out):
+            raise ValueError('Refusing to overwrite symlink or directory: %s' % out)
+        os.replace(tmp_path, out)
+        tmp_path = None
+        return {
+            'task': data.get('task') or task,
+            'project': data.get('project') or project,
+            'contribution': data.get('contribution'),
+            'revision': data.get('revision'),
+            'kind': data.get('kind') or 'bundle',
+            'commit': data.get('commit'),
+            'base_commit': data.get('base_commit'),
+            'sha256': actual_sha,
+            'bytes': total,
+            'path': data.get('path') or delivery_block.get('path'),
+            'out': out,
+            'verified': True,
+        }
+    finally:
+        conn.close()
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _delivery_command(args, config, project, actor, top_out):
+    """``client.py delivery TASK [--contribution ID] [--out FILE]`` (kittrial-5bb.373).
+
+    Over the SSH/local host transport, answers the fixed sentence and reads nothing from disk
+    (precision 4). Over HTTP, fetches metadata and, when ``--out FILE`` is given, streams the
+    bundle to a sibling temporary file, verifies its SHA-256 against the metadata and ``ETag``,
+    and atomically moves it into place only on a match.
+    """
+    is_http = isinstance(config, dict) and (
+        config.get('transport') == 'http' or bool(config.get('base_url') or config.get('url'))
+    )
+    if not is_http:
+        sys.stderr.write('ValueError: %s\n' % DELIVERY_SSH_ONLY_HTTP)
+        return 2
+    parser = _InlineWait.Parser(prog='delivery', add_help=False)
+    parser.add_argument('task')
+    parser.add_argument('--contribution', default=None)
+    parser.add_argument('--verify', action='store_true')
+    parser.add_argument('--out', default=None)
+    try:
+        options = parser.parse_args(args)
+    except ValueError as error:
+        sys.stderr.write('ValueError: %s\n' % error)
+        return 2
+    out_path = options.out if options.out is not None else top_out
+    if options.verify and not out_path:
+        sys.stderr.write('ValueError: delivery --verify requires --out FILE\n')
+        return 2
+    base_url = config.get('base_url') or config.get('url') or os.environ.get('ORCHESTRA_HTTP_URL')
+    token = config.get('token') or config.get('credential') or os.environ.get('ORCHESTRA_TOKEN')
+    try:
+        result = _http_delivery_fetch(
+            base_url,
+            project,
+            options.task,
+            token=token,
+            contribution=options.contribution,
+            out_path=out_path,
+            ca_file=config.get('ca_file'),
+            insecure=bool(config.get('insecure', False)),
+            allow_plaintext=bool(config.get('allow_plaintext', False)),
+        )
+    except (ValueError, OSError) as error:
+        sys.stderr.write('ValueError: %s\n' % error)
+        return 2
+    sys.stdout.write(json.dumps(result, ensure_ascii=False) + '\n')
+    return 0
+
+
 def _capability(args,out):
     """Client-side, read-only capability lookup over the caller's own checkout.
 
@@ -1279,6 +1489,7 @@ CONTRIBUTOR_COMMANDS = (
     ('ready', 'the tasks nobody holds that you may claim'),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
     ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
+    ('delivery TASK [--contribution ID] [--out FILE]', 'fetch and verify a delivered bundle over HTTP'),
     ('handoff ...', 'hand a task to another actor, and read what the endpoint reconciled'),
     ('guidance get|ack', 'the worker guidance in force, and the acknowledgement of a version'),
     ('onboard', 'what a new worker is told about this project'),
@@ -1323,7 +1534,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: The actions the client dispatches itself; every other name in the table above is passed to the
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
-CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','work',
+CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
                   'wait','feedback','requirement','requirements','ref','capability','proposal','guidance',
                   'coordinator')
 
@@ -1406,15 +1617,18 @@ def main():
     # wait blocks HERE, in the client, and polls the endpoint's wait read (kittrial-5bb.285);
     # the endpoint is therefore asked per poll, never for one blocking call, so an agent over
     # HTTP can use the same read.
+    config_doc = json.loads(Path(a.config).read_text())
     if args[0]=='wait':
-        return _wait_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out,
+        return _wait_command(args[1:],config_doc,a.project,a.actor,a.out,
                              config_path=a.config)
+    if args[0]=='delivery':
+        return _delivery_command(args[1:],config_doc,a.project,a.actor,a.out)
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
     elif args[0] in CLIENT_ACTIONS:action=args.pop(0)
-    result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
+    result=request(config_doc,a.project,a.actor,args,action,path)
     output = result['stdout']
     # The server's time of a write that was carried out (kittrial-5bb.97): one line on standard
     # error, so that standard output is exactly what it was. An older endpoint sends none.

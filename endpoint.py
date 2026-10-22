@@ -1207,6 +1207,9 @@ def held_coordination_lock(path,shared=False):
 
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None):
     key_project_refusal(request,key_projects)
+    if isinstance(request,dict) and request.get('action')=='delivery':
+        from review_workflow import DELIVERY_SSH_ONLY_HTTP
+        raise ValueError(DELIVERY_SSH_ONLY_HTTP)
     # Rule 2: a key bound to a principal is refused the web-only actions here, before their
     # name is looked at. The gate proper needs the project's registry and is asked below,
     # after the project is known; this structural refusal means no action at all is answered
@@ -1527,6 +1530,44 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         classified=record_json.classify(raw_rows,anchor_run,sorted(RECORD_ANCHOR_LABELS)) if raw_rows else []
         if anchor_warnings:warnings=(warnings+'\n'+'\n'.join(anchor_warnings)).strip()
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(classified)})+'\n','stderr':warnings}
+    if action=='delivery-record':
+        # Read-only (docs/REVIEW_DELIVERY_DESIGN.md, kittrial-5bb.373): the recorded
+        # contribution delivery blocks of one task for the HTTP delivery routes. Like
+        # `anchors`, it runs one `bd show --json --include-comments` without taking
+        # `.coordination.lock` or `authority_config.lock` and writes no state.
+        if authority_config is None:
+            raise ValueError('delivery-record is available only to the web service')
+        ids=request.get('args') or []
+        if (not isinstance(ids,list) or len(ids)!=1 or not isinstance(ids[0],str)
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}',ids[0])):
+            raise ValueError('delivery-record takes exactly one task id')
+        task_id=ids[0]
+        completed=native.run(native.argv(root,path,actor,['show',task_id,'--json','--include-comments']),environment(root))
+        missing=completed.returncode==1 and 'no issues found matching the provided IDs' in (completed.stdout or '')
+        if missing or (completed.returncode and 'no issue found' in (completed.stderr or '')):
+            return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':False})+'\n','stderr':completed.stderr or ''}
+        stdout,warnings=native.split(completed)
+        raw_rows=record_json.loads_array_rows(stdout or '[]')
+        matched=[r for r in raw_rows if isinstance(r,dict) and str(r.get('id') or '')==task_id]
+        if not matched:
+            return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':False})+'\n','stderr':warnings}
+        row=matched[0]
+        if row.get('malformed'):
+            return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':True,'malformed':True,'id':row.get('id') or task_id})+'\n','stderr':warnings}
+        from reserved_comments import RECORD_ANCHOR_LABELS
+        anchor_warnings=[]
+        def delivery_anchor_run(argv):
+            result,warning=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warning:anchor_warnings.append(warning)
+            return result
+        classified=record_json.classify([row],delivery_anchor_run,sorted(RECORD_ANCHOR_LABELS))
+        if anchor_warnings:warnings=(warnings+'\n'+'\n'.join(anchor_warnings)).strip()
+        row=classified[0] if classified else row
+        if is_record_anchor(row) or is_merge_slot(row) or row.get('issue_type')=='event':
+            return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':False})+'\n','stderr':warnings}
+        from review_workflow import contribution_delivery_records
+        contributions=[dict(item,project=str(name)) for item in contribution_delivery_records(row,configured_operators(root))]
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':True,'project':str(name),'task':str(row['id']),'contributions':contributions})+'\n','stderr':warnings}
     if action in ('ref','capability'):
         class RecordsRefusal(ValueError):
             def __init__(self,status,message):
@@ -2592,6 +2633,7 @@ CONTRIBUTOR_COMMANDS = (
     ('ready', 'the tasks nobody holds that you may claim'),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
     ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
+    ('delivery TASK [--contribution ID] [--out FILE]', 'fetch and verify a delivered bundle over HTTP'),
     ('handoff ...', 'hand a task to another actor, and read what the endpoint reconciled'),
     ('guidance get|ack', 'the worker guidance in force, and the acknowledgement of a version'),
     ('onboard', 'what a new worker is told about this project'),
@@ -2636,7 +2678,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: The actions the client dispatches itself; every other name in the table above is passed to the
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
-CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','work',
+CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
                   'wait','feedback','requirement','requirements','ref','capability','proposal','guidance',
                   'coordinator')
 
