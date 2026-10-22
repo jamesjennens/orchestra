@@ -786,6 +786,29 @@ class TaskFilesHttpTests(agents.AgentHarness):
         self.assertEqual([], self.stored())
         self.assertTrue(any('request_timeout' in (e.get('reason') or '') for e in self.audit_lines('tasks.files.upload')))
 
+    def test_r3_a_stalled_upload_gets_its_408_at_the_transfer_deadline_not_the_client_deadline(self):
+        # A client that sends a little and then nothing: the wait on it ends at the transfer's own deadline (here about
+        # 1.4 s), not at the 30 s client deadline, and the 408 reaches it.
+        self.limit.update(min_transfer_bytes_per_second=10 ** 6, transfer_grace_seconds=1)
+        sock = socket.create_connection(('127.0.0.1', self.port), timeout=20)
+        try:
+            body = b'q' * 400000
+            sock.sendall(('PUT %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Length: %d\r\n\r\n'
+                          % (self.files_path(name='stalled.bin', direction='to-worker'), self.tokens['coord'], len(body))).encode()
+                         + body[:1000])
+            started = time.monotonic()
+            answer = b''
+            while b'\r\n\r\n' not in answer:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                answer += piece
+            self.assertTrue(answer.startswith(b'HTTP/1.1 408'), answer[:200])
+            self.assertLess(time.monotonic() - started, 10, 'at the transfer deadline, not the 30 s client deadline')
+        finally:
+            sock.close()
+        self.assertEqual([], self.stored())
+
     def test_r2_s1_a_download_read_too_slowly_is_cut_off_and_gives_its_slot_back(self):
         data = os.urandom(8 * task_files.MIB)
         digest = self.given(data, name='big.bin')
