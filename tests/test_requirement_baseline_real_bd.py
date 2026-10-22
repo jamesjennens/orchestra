@@ -155,6 +155,15 @@ class NativeBaselineTests(fixture.RealBdLabelAliasTests):
                 self.assertEqual(denied.status, 403, denied.data)
             for who in (credential['secret'], agent.data['credential']['secret']):
                 denied = harness.request('GET', collection, token=who); self.assertEqual(denied.status, 403, denied.data)
+            # Bypass only the HTTP route to exercise the shipped endpoint's
+            # independent B2 owner check against the actual native project.
+            for label, who in (('coordinator', principals[2]), ('granted-agent', agent.data['credential']['secret'])):
+                principal = harness.service.authenticate(who)
+                with self.assertRaisesRegex(http_service.HttpError, 'signed-in project owner'):
+                    harness.backend.owner_requirements(principal, 'pp', 'baseline',
+                        {'name': 'canonical-' + label}, 'native-baseline-canonical-' + label)
+                self.assertFalse((self.project / baselines.DIRECTORY / ('canonical-' + label)).exists())
+            record('native-canonical-coordinator-and-granted-agent-refusals', passed=True)
             self.assertEqual(self.rows(), before)
             cookie_token, csrf, _ = harness.login('baseline-owner', 'baseline-owner-password')
             denied = harness.request('POST', collection, {'name': 'cookie'}, cookie='orchestra_session=' + cookie_token,
