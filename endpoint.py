@@ -2220,10 +2220,18 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 raise web_release.ReleaseError(403,'This release operation has no endpoint capability binding')
             def release_authority():
                 # Live re-check: the descriptor alone is never authority, and a release
-                # grant revoked, or an owner demoted, refuses the next request.
+                # grant revoked, or an owner demoted, refuses the next request. A deploy
+                # needs coordination AND the release authority (design section 4), the
+                # same pair the HTTP gate checked; the table names both.
                 if not verified_web_authority(request,authority_config,capability,name):
                     denied_status.append(403)
                     raise web_release.ReleaseError(403,'Verified web authority required for this release operation')
+                if operation=='deploy':
+                    from http_authority import read_state
+                    record=(read_state(authority_config.store).get('projects') or {}).get(request.get('project')) or {}
+                    if record.get('archived'):
+                        denied_status.append(409)
+                        raise web_release.ReleaseError(409,'This project is archived; release facts cannot be recorded')
                 return True
             def release_effect():
                 try:

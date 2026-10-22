@@ -4849,7 +4849,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 audit_success=True, state_saved=None, audit_metadata=None, replay_check=None):
         """Run one authorized, idempotent mutation.
 
-        ``capability`` names the authority the route needs. The idempotency key is
+        ``capability`` names the authority the route needs: one capability, or a tuple
+        of them all required (kittrial-5bb.378 review s1: a release deploy needs
+        ``coordinate`` plus the release authority). The idempotency key is
         *reserved atomically* (:meth:`Service.idempotency_reserve`) before the effect,
         so two concurrent identical requests cannot both create the effect: the
         second either replays a committed result or receives a 409. ``serialize=True``
@@ -4861,8 +4863,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         (for example the target's identity) added to the route's audit events; it must
         never carry a secret or request body.
         """
-        ctx.authorize = (lambda: self.service.check_authority(
-            ctx.principal, project_id, capability, allow_self_user=allow_self_user))
+        if isinstance(capability, str):
+            ctx.authorize = (lambda: self.service.check_authority(
+                ctx.principal, project_id, capability, allow_self_user=allow_self_user))
+        else:
+            # Every named capability is re-checked inside the same in-lock boundary, so a
+            # two-capability route cannot pass on one of them being revoked in between.
+            needed = tuple(capability)
+
+            def authorize():
+                decision = None
+                for name in needed:
+                    decision = self.service.check_authority(
+                        ctx.principal, project_id, name, allow_self_user=allow_self_user)
+                return decision
+            ctx.authorize = authorize
         idem_route = '%s %s' % (route_name, ctx.route_target)
         key = ctx.idempotency_key if idempotent else None
         digest = None
@@ -6190,10 +6205,15 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/releases')
     def release_deploy(self, ctx):
         import web_release
-        # The project's release capability, checked live: an owner or superuser, or an
-        # agent whose release grant is in effect. A coordinator alone is refused here,
-        # before the body is even read.
+        # The project's release authority AND coordination, checked live (design section
+        # 4): an owner or superuser holds both. An agent reaches it only with the project's
+        # release grant AND its coordinator grant, because a release is a decision plus a
+        # coordination step. A coordinator alone, or a release grant alone, is refused
+        # before the body is even read. An archived project records nothing new.
+        project, _role = self._project(ctx, CAP_COORDINATE)
         self._project(ctx, CAP_RELEASE)
+        if isinstance(project, dict) and project.get('archived'):
+            raise conflict('This project is archived; release facts cannot be recorded')
         try:
             _, fields = web_release.fields(dict(ctx.payload or {}, operation='deploy'))
         except web_release.ReleaseError as error:
@@ -6210,7 +6230,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                                          authorize=ctx.authorize, capability=CAP_RELEASE)
             metadata.update({key: result.get(key) for key in
                              ('operation_id', 'release_id', 'environment', 'groups_completed',
-                              'groups_total', 'skipped', 'flags')})
+                              'groups_total')})
+            # The audit is a shared capped list: keep counts and only the first few ids of
+            # the up-to-200 skipped/flags rows. The answer itself still carries every row.
+            skipped = result.get('skipped') or []
+            flags = result.get('flags') or []
+            metadata.update(skipped_count=len(skipped),
+                            skipped_first=[row.get('task') for row in skipped[:5]],
+                            flags_count=len(flags),
+                            flags_first=[row.get('task') for row in flags[:5]])
             with self.service.store.lock:
                 existing = any(event.get('action') == 'releases.deploy'
                                and event.get('project_id') == ctx.params['pid']
@@ -6227,7 +6255,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise UncertainOutcome() from None
             return result, result
         return self._mutate(ctx, 'releases.deploy', ctx.params['pid'], write,
-                            capability=CAP_RELEASE, status=201, serialize=False,
+                            capability=(CAP_COORDINATE, CAP_RELEASE), status=201, serialize=False,
                             canonical=True, audit_success=False)
 
     def _merge_slot_backend(self):

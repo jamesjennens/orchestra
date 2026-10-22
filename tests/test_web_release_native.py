@@ -222,10 +222,18 @@ class NativeReleaseWebTests(RulesHelpers, unittest.TestCase):
         grant = harness.request('PUT', '/v1/projects/pp/agents/' + agent_id + '/release', {}, token=owner)
         self.assertEqual(grant.status, 200, grant.data)
         self.assertTrue(grant.data['release']['effective'])
+        # Review s1: the release grant ALONE does not deploy; design section 4 needs
+        # coordination too, and the endpoint re-checks both capabilities live.
+        refused = self.deploy(harness, secret, self.body([task]), key='release-live-release-only')
+        self.assertEqual(refused.status, 403, refused.data)
+        coordinated = harness.request('PUT', '/v1/projects/pp/agents/' + agent_id + '/coordinator',
+                                      {}, token=owner)
+        self.assertEqual(coordinated.status, 200, coordinated.data)
         made = self.deploy(harness, secret, self.body([task]), key='release-live-agent')
         self.assertEqual(made.status, 201, made.data)
         self.assertEqual(made.data['targets'][0]['task'], task)
-        # The endpoint reads the live store: demoting the account ends the grant's effect.
+        # The endpoint reads the live store: demoting the account ends the release grant's
+        # effect (coordination remains, the release authority does not).
         self.assertEqual(harness.request('PUT', '/v1/projects/pp/members/' + owner_id,
                                          {'role': 'coordinator'}, token=token).status, 200)
         refused = self.deploy(harness, secret, self.body([task], scope=self.release_scope('demoted')),

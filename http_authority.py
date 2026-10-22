@@ -2353,25 +2353,51 @@ def http_shaped_names(names):
     return [name for name in names or [] if isinstance(name, str) and http_actor_id(name) is not None]
 
 
-def verified_web_authority(request, authority_config, capability, project):
-    """Whether the configured service grants this capability in this exact project.
+def required_capabilities(capability):
+    """The capabilities a binding names, ALL of which must hold, or an empty tuple.
 
-    A descriptor is never authority by itself. Mutations call this inside the
-    guarded effect, under the live authority lock; a PURE read - one with no
-    descriptor, no operation identity and no identity check - no longer takes that
+    Most actions need one capability and the table holds its string. A route that needs
+    two at once - a release deploy needs ``coordinate`` plus the release authority
+    (kittrial-5bb.378 review s1, design section 4) - names a tuple in the table, and every
+    one of them is re-checked here. A malformed value is no capability, never a partial
+    pass: the check fails closed.
+    """
+    if isinstance(capability, str):
+        return (capability,)
+    if isinstance(capability, (tuple, list, frozenset, set)):
+        needed = tuple(capability)
+        if needed and all(isinstance(item, str) for item in needed):
+            return needed
+    return ()
+
+
+def verified_web_authority(request, authority_config, capability, project):
+    """Whether the configured service grants every named capability in this exact project.
+
+    ``capability`` is one capability, or a tuple of them all required (see
+    :func:`required_capabilities`). A descriptor is never authority by itself. Mutations
+    call this inside the guarded effect, under the live authority lock; a PURE read - one
+    with no descriptor, no operation identity and no identity check - no longer takes that
     lock, because it never reads the authority store (kittrial-5bb.281). Any request
     that validates authority, reserves an operation identity or runs an identity
     check still holds it. This helper does not infer a capability from an actor name
     or an SSH payload.
+
+    The descriptor names the one capability the route requested (for a release deploy,
+    the release authority); every additional capability is decided from the SAME live
+    principal, so a release-granted agent without coordination is refused here too.
     """
+    needed = required_capabilities(capability)
     descriptor = request.get('authority')
-    if (authority_config is None or not isinstance(descriptor, dict)
+    if (authority_config is None or not needed or not isinstance(descriptor, dict)
             or request.get('project') != project
             or descriptor.get('project') != project
-            or descriptor.get('capability') != capability):
+            or descriptor.get('capability') not in needed):
         return False
     descriptor = {k: v for k, v in descriptor.items() if k not in ('store', 'lock')}
-    decide(read_state(authority_config.store), descriptor)
+    state = read_state(authority_config.store)
+    for name in needed:
+        decide(state, dict(descriptor, capability=name))
     return True
 
 
@@ -2541,9 +2567,10 @@ BLOCK_CAPABILITIES = {
                        'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
                        'create': CAP_PROJECT_ADMIN},
     'web-lifecycle': {'read': CAP_READ, 'scope': CAP_COORDINATE, 'fact': CAP_COORDINATE},
-    # The release routes (kittrial-5bb.378): the query is a coordinator read, the deploy
-    # is the project's release capability (owner, superuser, or a release-granted agent).
-    'web-release': {'query': CAP_COORDINATE, 'deploy': CAP_RELEASE},
+    # The release routes (kittrial-5bb.378): the query is a coordinator read; a deploy
+    # needs the release authority AND coordination (design section 4: coordinate plus the
+    # release authority), so a release-granted agent still needs its coordinator grant.
+    'web-release': {'query': CAP_COORDINATE, 'deploy': (CAP_COORDINATE, CAP_RELEASE)},
     'web-guidance': {'read': CAP_READ, 'ack': CAP_READ, 'onboarding': CAP_READ,
                      'set': CAP_COORDINATE, 'clear': CAP_COORDINATE, 'status': CAP_COORDINATE,
                      'coordinate-check': CAP_COORDINATE, 'onboarding-edit': CAP_COORDINATE},
@@ -2566,12 +2593,13 @@ BLOCK_CAPABILITIES = {
 
 
 def required_capability(request):
-    """The capability the action of ``request`` needs by ``BLOCK_CAPABILITIES``, or None.
+    """The capability (or all capabilities) the action of ``request`` needs, or None.
 
-    None means "not in the table": an action the table does not know, a read, or a request
-    so malformed that the action's own validation refuses it before it writes. The review
-    record is found and parsed exactly as ``work.execute`` does it, so the operation judged
-    here is the operation carried out.
+    A tuple return means every named capability is required; see
+    :func:`required_capabilities`. None means "not in the table": an action the table
+    does not know, a read, or a request so malformed that the action's own validation
+    refuses it before it writes. The review record is found and parsed exactly as
+    ``work.execute`` does it, so the operation judged here is the operation carried out.
     """
     action = request.get('action', 'bd')
     if not isinstance(action, str):
@@ -2646,9 +2674,13 @@ def block_mismatch_denial(request, authority_config):
     if needed is None:
         return _envelope(126, stderr='The web authority table does not allow this action or operation; '
                                      'nothing was changed\n', authority_status=403)
-    if authority.get('capability') != needed:
+    wanted = required_capabilities(needed)
+    if not wanted:
+        return _envelope(126, stderr='The web authority table names no usable capability for this action or '
+                                     'operation; nothing was changed\n', authority_status=403)
+    if authority.get('capability') not in wanted:
         return _envelope(126, stderr='The live-authority descriptor does not name the capability this request needs '
-                                     '(%s); nothing was changed\n' % needed, authority_status=403)
+                                     '(%s); nothing was changed\n' % ' + '.join(wanted), authority_status=403)
     return None
 
 

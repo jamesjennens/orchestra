@@ -173,6 +173,13 @@ class ReleaseCapabilityTests(unittest.TestCase):
         self.assertNotIn(authority.CAP_RELEASE, self.caps(self.state(role='coordinator')))
         self.assertNotIn(authority.CAP_RELEASE, self.caps(self.state(role='owner', grant=False)))
 
+    def test_the_release_grant_alone_does_not_carry_coordination(self):
+        """Review s1: a deploy needs coordinate PLUS the release authority, so the release
+        grant's capabilities are exactly `release`, never `coordinate` as well."""
+        caps = self.caps(self.state(role='owner', grant=True))
+        self.assertIn(authority.CAP_RELEASE, caps)
+        self.assertNotIn(authority.CAP_COORDINATE, caps)
+
     def test_a_worker_credential_never_holds_release(self):
         state = self.state(role='owner', grant=True)
         credential = {'user_id': 'agent-owner', 'agent_id': None, 'scopes': ['tasks', 'reviews']}
@@ -192,7 +199,9 @@ class ReleaseCapabilityTests(unittest.TestCase):
         query = {'action': 'web-release', 'args': [json.dumps({'operation': 'query'})]}
         deploy = {'action': 'web-release', 'args': [json.dumps({'operation': 'deploy'})]}
         self.assertEqual(authority.required_capability(query), authority.CAP_COORDINATE)
-        self.assertEqual(authority.required_capability(deploy), authority.CAP_RELEASE)
+        # Review s1: design section 4 says coordinate PLUS the release authority.
+        self.assertEqual(authority.required_capability(deploy),
+                         (authority.CAP_COORDINATE, authority.CAP_RELEASE))
 
 
 if __name__ == '__main__':
