@@ -5195,6 +5195,8 @@ def backup_status_record(results,scope,generated_at,http_state=None):
         entry={'name':item['name'],'status':item['status']}
         if item.get('degraded'):
             entry['degraded']=item['degraded']
+        if item.get('task_files') is not None:
+            entry['task_files']=item['task_files']   # kittrial-5bb.380: the files' backup beside the pair
         if item['status']=='complete':
             entry['completed_at']=item['completed_at']
             entry['pair']={'native':'backups/'+item['name'],

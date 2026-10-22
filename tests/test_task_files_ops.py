@@ -396,6 +396,19 @@ class AdminTaskFilesTests(unittest.TestCase):
         self.assertFalse(self.store.blob(old).exists())
         self.assertEqual('op', json.loads((self.project / task_files.FOLDER / task_files.AUDIT).read_text().splitlines()[0])['actor'])
 
+    def test_the_status_file_carries_the_task_files_and_checks_them(self):
+        files = {'status': 'complete', 'files': 1, 'bytes': 3, 'path': 'backups/p1.task-files'}
+        record = admin.backup_status_record([{'name': 'p1', 'status': 'complete', 'completed_at': '2026-10-22T00:00:00Z',
+                                              'task_files': files}], 'named', '2026-10-22T00:00:00Z')
+        self.assertEqual(files, record['projects'][0]['task_files'])
+        admin.validate_backup_status(record)
+        record['projects'][0]['task_files'] = {'status': 'half'}
+        with self.assertRaisesRegex(ValueError, 'task_files for p1 must be complete or failed'):
+            admin.validate_backup_status(record)
+        plain = admin.backup_status_record([{'name': 'p1', 'status': 'complete', 'completed_at': '2026-10-22T00:00:00Z'}],
+                                           'named', '2026-10-22T00:00:00Z')
+        self.assertNotIn('task_files', plain['projects'][0], 'a project without task files has no entry for them')
+
     def test_verify_exits_1_on_a_flipped_byte(self):
         digest = self.store.attach('t1', b'abc')
         self.assertEqual(0, self.run_admin('verify', 'p1')[0])
