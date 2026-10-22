@@ -52,6 +52,8 @@ class BrowserClientTests(AgentHarness):
         self.assertTrue(result['unchecked'])
         self.assertTrue(result['readOnly'])
         self.assertTrue(result['target'])
+        self.assertTrue(result['missingTask'])
+        self.assertTrue(result['markupText'])
 
     def test_copied_client_and_named_cli_reconcile_without_another_effect(self):
         copied=self.tmp_path/'copied_http_client.py';shutil.copyfile(KIT/'http_client.py',copied)

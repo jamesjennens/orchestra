@@ -44,7 +44,12 @@ function integrationCheck(ctx, project, task) {
     try {
       render(await ctx.api.integrationCheck(project.id, task.id, target.value.trim() || undefined));
     } catch (failure) {
-      if ([404, 501].includes(failure.status)) {
+      // A definite "this task does not exist" answer must not be reported as an
+      // older server without the route (kittrial-5bb.374 review item 3a). Both
+      // carry status 404, so the server's own sentence is the discriminator.
+      if (failure.status === 404 && /Lifecycle task does not exist/i.test(failure.message || '')) {
+        output.replaceChildren(h('p', { role: 'alert' }, failure.message));
+      } else if ([404, 501].includes(failure.status)) {
         output.replaceChildren(h('p', { class: 'muted' }, 'This server has no integration check.'));
       } else {
         output.replaceChildren(h('p', { role: 'alert' }, failure.message || describe(failure)),

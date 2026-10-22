@@ -111,11 +111,13 @@ def review_state(issue, operators=None, project=None):
     return ordered, state
 
 
-def standing_approval(issue, operators=None, owners=None, project=None, parties=None):
-    """The writer's approval-only check: a current independent approval, with party.
+def standing_approval(issue, operators=None, owners=None, project=None):
+    """The writer's approval-only check: a current independent approval.
 
-    Shared by :func:`approved_source` (which adds the source check) and the
-    read-only integration check, so both use one decision and one sentence.
+    The source and party checks are separate so :func:`approved_source` can keep
+    main's refusal order: approval, source commit, parties-callable, then party
+    (kittrial-5bb.374 review item b1). The read-only integration check calls the
+    halves because it reports each check as its own row.
     """
     import review_workflow as review
     try:
@@ -129,12 +131,6 @@ def standing_approval(issue, operators=None, owners=None, project=None, parties=
         raise LifecycleError(409, 'A current independent approval is required: ' + str(reason))
     entry = review.approving_entry(ordered, contribution['comment_id'])
     approver = entry[1].get('author') if entry else None
-    if not callable(parties):
-        raise LifecycleError(503, 'Configured web party ownership is unavailable')
-    approving_party = parties(approver)
-    if (not approving_party or approving_party & parties(contribution.get('author'))
-            or (issue.get('assignee') and approving_party & parties(issue['assignee']))):
-        raise LifecycleError(409, 'The approval must be from another party than the author and current assignee')
     return dict(id=contribution['comment_id'], commit=contribution.get('commit'),
                 author=contribution.get('author'), approver=approver, standing=True)
 
@@ -148,10 +144,26 @@ def source_matches(scope, approved):
     return commit
 
 
+def approved_party(approved, issue, parties=None):
+    """The writer's authenticated party checks, after approval and source.
+
+    Main's order matters when two checks fail at once: the source sentence and
+    its 409 win over the missing-party 503 and the same-party 409.
+    """
+    if not callable(parties):
+        raise LifecycleError(503, 'Configured web party ownership is unavailable')
+    approving_party = parties((approved or {}).get('approver'))
+    if (not approving_party or approving_party & parties((approved or {}).get('author'))
+            or (issue.get('assignee') and approving_party & parties(issue['assignee']))):
+        raise LifecycleError(409, 'The approval must be from another party than the author and current assignee')
+    return sorted(approving_party)
+
+
 def approved_source(issue, scope, operators=None, owners=None, project=None, parties=None):
-    """Raw standing approval, both party checks, and the full source commit match."""
-    approved = standing_approval(issue, operators, owners, project, parties)
+    """Approval, full source commit, parties callable, other party: main's order."""
+    approved = standing_approval(issue, operators, owners, project)
     approved['commit'] = source_matches(scope, approved)
+    approved_party(approved, issue, parties)
     return approved
 
 
@@ -366,15 +378,15 @@ def integration_check(task, actor, run, project, *, target=None, project_name=No
 
     approval = dict(check='approval', allowed=False, reason=None)
     try:
-        approved = standing_approval(issue, operators, owners, project, parties)
+        approved = standing_approval(issue, operators, owners, project)
+        party = approved_party(approved, issue, parties)
     except LifecycleError as error:
         approval['reason'] = str(error)
     except ValueError as error:
         approval['reason'] = unreadable if review is None else str(error)
     else:
         approval.update(allowed=True, contribution_id=approved['id'], commit=approved['commit'],
-                        author=approved['author'], approver=approved['approver'],
-                        party=sorted(parties(approved['approver']) or ()))
+                        author=approved['author'], approver=approved['approver'], party=party)
     checks.append(approval)
 
     source = dict(check='source_commit', allowed=False, reason=None,

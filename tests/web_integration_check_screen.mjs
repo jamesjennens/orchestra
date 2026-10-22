@@ -8,13 +8,22 @@ const { createApi } = await import(apiUrl);
 const { lifecyclePanel } = await import(viewUrl);
 let inFlight = 0;
 const calls = [];
+// One-shot server behaviours for the two panel refusal/rendering cases below.
+// forcedResponse returns a whole reply instead of fetching; transform rewrites a
+// real reply. Both are null during the ordinary read.
+let forcedResponse = null;
+let transform = null;
 const transport = async (method, path, headers, body) => {
   inFlight++;
   calls.push({ method, path });
   try {
+    const forced = forcedResponse ? forcedResponse(method, path) : null;
+    if (forced) return forced;
     const response = await fetch(base + path, { method,
       headers: { ...headers, Authorization: 'Bearer ' + token }, body });
-    return { status: response.status, data: await response.json() };
+    let data = await response.json();
+    if (transform) data = transform(path, data);
+    return { status: response.status, data };
   } finally { inFlight--; }
 };
 async function settle() {
@@ -47,4 +56,33 @@ assert(text.includes('Writes still owed'));
 assert(text.includes('the server never performs the merge') || text.includes('The server never performs the merge'));
 assert(!calls.some(call => call.method !== 'GET'), JSON.stringify(calls));
 assert(calls.some(call => call.path.endsWith('/integration-check?target=main')), JSON.stringify(calls));
-console.log(JSON.stringify({ checked: true, unchecked: true, readOnly: true, target: true }));
+
+// A missing task is a definite 404 with the server's sentence, not the generic
+// "this server has no integration check" text (kittrial-5bb.374 review item 3a).
+forcedResponse = (method, path) => path.includes('/integration-check')
+  ? { status: 404, data: { error: { code: 'not_found', message: 'Lifecycle task does not exist' } } }
+  : null;
+await button.dispatch('click');
+await settle();
+const missingTask = panel.textContent;
+assert(!missingTask.includes('This server has no integration check'), missingTask);
+assert(missingTask.includes('Lifecycle task does not exist'), missingTask);
+forcedResponse = null;
+
+// A server string carrying markup renders as text, never as DOM (review item 3b).
+const markup = '<b>server markup</b><img src=x onerror=alert(1)>';
+transform = (path, data) => {
+  if (!path.includes('/integration-check')) return data;
+  const copy = JSON.parse(JSON.stringify(data));
+  copy.checks[0].reason = markup;
+  return copy;
+};
+await button.dispatch('click');
+await settle();
+assert(!panel.querySelector('b'), 'server markup became a DOM element');
+assert(!panel.querySelector('img'), 'server markup became an image');
+assert(panel.textContent.includes(markup), panel.textContent);
+transform = null;
+
+console.log(JSON.stringify({ checked: true, unchecked: true, readOnly: true, target: true,
+  missingTask: true, markupText: true }));
