@@ -133,15 +133,29 @@ another coordination database.
 
 For workers already connected, use the client `onboard` command in that prompt. The longer [worker prompt](../templates/WORKER_PROMPT.md) remains a reference, but no longer needs to be pasted into every new session.
 
-## Windows: PowerShell execution policy
+## Windows: VS Code terminals hang or show no output
 
-On Windows, the default `Restricted` PowerShell execution policy blocks the script VS Code's shell integration loads, so an agent running commands in VS Code gets no command output back. Check the policy with `Get-ExecutionPolicy -List`. If `CurrentUser` is `Undefined` or `Restricted` and neither `MachinePolicy` nor `UserPolicy` is set, fix it for your own account, without administrator rights:
+On Windows, VS Code terminals that hang, pile up, or give an agent no command output back are usually caused by an old PSReadLine module: Windows PowerShell 5.1 ships PSReadLine 2.0.0, and upgrading it to 2.4.5 fixes the problem. Everything below runs in your own account, without administrator rights, and either you or your agent can run it.
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
+1. Check the versions:
 
-Windows PowerShell 5.1 and PowerShell 7 keep separate `CurrentUser` settings: run the check and the fix in each one you use. If `MachinePolicy` or `UserPolicy` sets the policy, your IT department controls it: do not try to override it, ask them instead.
+   ```powershell
+   (Get-Module PSReadLine -ListAvailable).Version
+   $PSVersionTable.PSVersion
+   ```
+
+2. If PSReadLine is below 2.4, allow per-user module installs and install it. Setting the execution policy for your own account is a normal per-user step, and it is what lets the install work:
+
+   ```powershell
+   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+   Install-Module PSReadLine -Scope CurrentUser -Force -SkipPublisherCheck
+   ```
+
+   If `Get-ExecutionPolicy -List` shows MachinePolicy or UserPolicy set, the command will not take effect; ask IT.
+
+3. If `Install-Module` fails (an old PowerShellGet, or no access to the PowerShell Gallery), install it by hand. Download the `.nupkg` from `https://www.powershellgallery.com/packages/PSReadLine`, run `Unblock-File` on it, rename it to `.zip` and extract it. Put the extracted files in a folder named `PSReadLine\2.4.5` inside the first path of `$env:PSModulePath` (your per-user modules folder; it may be under OneDrive if your Documents folder is redirected there). The extra package files (`[Content_Types].xml`, `_rels`, `package`) can be deleted. Then restart VS Code.
+
+4. Check again with the commands from step 1: PSReadLine should now report 2.4.5 (any 2.4 or later is fine). Open a new VS Code terminal to confirm that it responds.
 
 ## Web personal-agent setup wizard
 
