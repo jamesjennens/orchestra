@@ -145,13 +145,18 @@ class TheMarkerCase(unittest.TestCase):
         self.assertTrue(queue_row(data)['newer_activity'])
         self.assertTrue(b.brief(data, PROJECT, TASK)['activity']['newer_activity'])
 
-    def test_a_legacy_checkpoint_has_no_marker(self):
+    def test_a_legacy_checkpoint_gets_a_timestamp_marker(self):
         from test_briefing import append_checkpoint, checkpoint
         data = rows()
         append_checkpoint(data, 'cp1', checkpoint(data))
-        self.assertIsNone(queue_row(data)['newer_activity_marker'])
+        first = queue_row(data)
+        self.assertEqual('current', first['newer_activity_coverage'])
+        self.assertTrue(first['newer_activity_marker'].startswith('fields:'), first['newer_activity_marker'])
         data[0]['description'] = 'Changed'
-        self.assertIsNone(queue_row(data)['newer_activity_marker'])
+        row = queue_row(data)
+        self.assertEqual('timestamp', row['newer_activity_coverage'])
+        self.assertTrue(row['newer_activity_marker'].startswith('fields:'), row['newer_activity_marker'])
+        self.assertNotEqual(first['newer_activity_marker'], row['newer_activity_marker'])
 
 
 class TheSectionCase(unittest.TestCase):
@@ -470,7 +475,7 @@ class TheInProcessRoutesAgreeCase(test_http_agents.AgentHarness):
         page = self.request('GET', base + '/brief', token=secret).data
         self.assertEqual({name: action.get(name) for name in FIELDS}, page['activity'])
         section = page['changes_since_checkpoint']
-        self.assertEqual('unknown', section['coverage'])
+        self.assertEqual('timestamp', section['coverage'])
         self.assertEqual(1, section['total'])
         self.assertIn('keeps no tracker history', section['fields_note'])
 

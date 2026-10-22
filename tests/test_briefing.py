@@ -272,7 +272,7 @@ class NewerActivityTests(unittest.TestCase):
         self.assertEqual(flagged, [f'{TASK}-cfirst'])
         self.assertEqual(newer_small['changed_or_late_count'], 1)
 
-    def test_legacy_checkpoint_without_digests_reports_unknown_coverage(self):
+    def test_legacy_checkpoint_without_digests_reports_timestamp_coverage(self):
         data = rows()
         legacy = dict(schema_version=1, task=TASK, previous=None,
                       activity_cursor=b.activity_cursor(b.snapshot(data, PROJECT, TASK)),
@@ -289,9 +289,9 @@ class NewerActivityTests(unittest.TestCase):
         result = b.brief(data, PROJECT, TASK)
         newer = result['newer']
         self.assertIsNotNone(newer)
-        self.assertEqual(newer['coverage'], 'unknown')
-        self.assertIn('UNKNOWN', result['next_action'])
-        self.assertIn('UNKNOWN', newer['note'])
+        self.assertEqual(newer['coverage'], 'timestamp')
+        self.assertIn('TIMESTAMP', result['next_action'])
+        self.assertIn('TIMESTAMP', newer['note'])
 
     def test_no_checkpoint_and_current_checkpoint_have_no_newer_summary(self):
         self.assertIsNone(b.brief(rows(), PROJECT, TASK)['newer'])
@@ -1173,7 +1173,7 @@ class RecentHistoryTests(unittest.TestCase):
         self.assertEqual([e['entry_id'] for e in page['entries']],
                          [TASK + '-ca1', TASK + '-cfirst', TASK + '-csame'])
         self.assertNotIn(TASK + '-clate2', [e['entry_id'] for e in page['entries']])
-        self.assertEqual(page['checkpoint_coverage'], 'unknown')
+        self.assertEqual(page['checkpoint_coverage'], 'timestamp')
         self.assertEqual(page['unverified_entries'], 0)
         self.assertIn('legacy record', page['checkpoint_note'])
         self.assertIn('CANNOT be seen', page['checkpoint_note'])

@@ -474,17 +474,20 @@ class EndpointAttentionTests(fixes.EndpointCase):
                      'newer_activity_coverage','unresolved_directions'):
             self.assertIn(name,action)
         self.assertEqual(action['newer_activity_by_others'],1)
-        self.assertEqual(action['newer_activity_coverage'],'unknown')
-        # This installation has provenance writes off, so the checkpoint cannot make a
-        # precise per-entry claim: the marker is null and the boolean is the fallback.
-        self.assertIsNone(action['newer_activity_marker'])
+        self.assertEqual(action['newer_activity_coverage'],'timestamp')
+        # This installation has provenance writes off, so the checkpoint is read by the
+        # timestamp rule (kittrial-5bb.367): the marker names the newest other-party
+        # entry, and `timestamp` coverage says an older edit can be missed.
+        self.assertTrue(action['newer_activity_marker'].startswith(task + '-c'),
+                        action['newer_activity_marker'])
         wait=self.request('GET','/v1/agents/me/wait',token=self.secret)
         self.assertEqual(200,wait.status,wait.data)
         row=next(x for x in wait.data['items'] if x['task']==task)
-        self.assertIsNone(row['newer_activity_marker'])
+        self.assertTrue(row['newer_activity_marker'].startswith(task + '-c'),
+                        row['newer_activity_marker'])
         self.assertEqual(row['newer_activity_by_others'],1)
         self.assertEqual(row['newer_activity_own'],0)
-        self.assertEqual(row['newer_activity_coverage'],'unknown')
+        self.assertEqual(row['newer_activity_coverage'],'timestamp')
         # The stub counts the one other-party comment as a direction (its work path
         # defaults provenance writes on); the exact count is not what this pins.
         self.assertIsInstance(row['unresolved_directions'],int)
@@ -511,7 +514,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
             summary = web.data['newer']
             self.assertGreaterEqual(summary['own_count'], 1)
             self.assertGreaterEqual(summary['other_count'], 1)
-            self.assertEqual(summary['coverage'], 'unknown')  # digest capture remains off
+            self.assertEqual(summary['coverage'], 'timestamp')  # digest capture remains off
             self.assertLessEqual(len(summary['entries']), 5)
             self.assertIn('Reading clears nothing', summary['note'])
             self.assertEqual(action['links']['history'], summary['history'])
@@ -533,7 +536,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
                 self.assertEqual(summary[key], value)
         self.assertGreater(summary['omitted'], 0)
         self.assertEqual(len(summary['entries']), 5)
-        self.assertEqual(summary['coverage'], 'unknown')
+        self.assertEqual(summary['coverage'], 'timestamp')
         run = self.backend._run
         for value in (None, {'coverage': 'windowed', 'own_count': 0, 'other_count': None,
                             'entries': [], 'omitted': 13, 'unverified_count': 19}):
@@ -800,7 +803,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
             self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', True))
             summary = self.request('GET', action['links']['brief'], token=self.secret).data['newer']
             self.assertEqual((summary['other_count'], len(summary['entries']), summary['omitted']), (8, 5, 3))
-            self.assertEqual(summary['coverage'], 'unknown')
+            self.assertEqual(summary['coverage'], 'timestamp')
         self.assertEqual(before, json.dumps(self.backend.state, sort_keys=True))
 
     def test_every_other_open_review_state_names_who_acts_next(self):

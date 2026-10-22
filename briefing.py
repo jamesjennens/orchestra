@@ -872,10 +872,13 @@ def newer_selection(data,prov,checkpoint_timestamp):
     the marker, the boolean and the 'changes since your checkpoint' section all read
     this, so no route can count differently. With recorded provenance the selection is
     exact (new, edited and late entries); a legacy checkpoint has none, so the released
-    timestamp rule applies and coverage is 'unknown'.
+    timestamp rule applies and coverage is 'timestamp' (kittrial-5bb.367): a weaker but
+    real coverage, because a backdated arrival or an edit of an older entry can be
+    missed. 'unknown' remains for a legacy checkpoint with no timestamp at all.
     """
     coverage='unknown' if prov is None else ('snapshot' if prov['complete'] else 'windowed')
     if prov is None and checkpoint_timestamp:
+        coverage='timestamp'
         data=dict(data,entries=[e for e in data['entries']
                                if parse_moment(e['timestamp'])>=parse_moment(checkpoint_timestamp)])
     entries,fresh,changed_late,unverified=unincorporated(data,prov)
@@ -904,6 +907,10 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     # the marker is a precise claim, so a reader falls back to the boolean then.
     # kittrial-5bb.354: with ``marker_fields`` (the current fields digest) the marker is
     # the shared activity_marker, so it also moves on a title/description/acceptance edit.
+    # kittrial-5bb.367: a legacy checkpoint read by the timestamp rule ('timestamp'
+    # coverage) gets the same marker, from the newest other-party entry at/after it;
+    # the coverage label tells the client that a backdated arrival or an older edit
+    # can be missed.
     marker=None
     if coverage!='unknown' and (others or marker_fields is not None):
         newest=max(others,key=lambda e:(parse_moment(e['timestamp']),e['entry_id'])) if others else None
@@ -917,6 +924,9 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
           'Reading clears nothing: acknowledging a direction, reconciling it into a new checkpoint and completing it stay separate explicit acts.')
     if coverage=='unknown':
         note+=' Coverage is UNKNOWN: this checkpoint predates per-entry digests, so reconcile with history before trusting the counts.'
+    elif coverage=='timestamp':
+        note+=(' Coverage is TIMESTAMP: this checkpoint predates per-entry digests, so entries are selected by time; '
+               'a backdated arrival or an edit of an older entry can be missed. Reconcile with history when in doubt.')
     elif coverage=='windowed':
         note+=(' Coverage is WINDOWED: '+str(unverified)+' older entries have no per-entry evidence recorded by this checkpoint, so their current content is unverified and they are excluded from the fresh/changed counts. '
                'Run "checkpoint '+data['task']+' --verify" for the classification supported by evidence retained across the task\'s checkpoints (entries no checkpoint ever recorded stay unknown).')
@@ -1101,7 +1111,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                 dir_note='' if not dirs else '; '+str(dirs['total'])+' outstanding direction(s) not yet resolved/superseded'
                 next_action=('STALE CHECKPOINT: activity the checkpoint did not incorporate exists ('+str(newer['other_count'])
                              +' by other actors, '+str(newer['own_count'])+' own'+dir_note
-                             +('' if newer['coverage']!='unknown' else ', coverage UNKNOWN — reconcile with history before trusting counts')
+                             +('' if newer['coverage'] in ('snapshot','windowed') else
+                               (', coverage TIMESTAMP — a backdated arrival or an edit of an older entry can be missed'
+                                if newer['coverage']=='timestamp' else
+                                ', coverage UNKNOWN — reconcile with history before trusting counts'))
                              +'). Read newer activity first: '+newer['history']
                              +'. The recorded checkpoint next action was: '+p['next_action'])
     # The one newer-activity definition (kittrial-5bb.354): brief carries the SAME fields
@@ -1562,7 +1575,10 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
     own=sum(1 for e in entries if e['author']==owner)
     note=('Newest first; read these before acting on the checkpoint. Bodies are clipped; read the whole '
           'entries with '+history+'. Reading clears nothing: a new checkpoint incorporates them.')
-    if coverage=='unknown':
+    if coverage=='timestamp':
+        note+=(' Coverage is TIMESTAMP (the checkpoint predates per-entry digests): entries are selected by time, '
+               'so a backdated arrival or an edit to an older entry is not seen.')
+    elif coverage=='unknown':
         note+=' Coverage is UNKNOWN (the checkpoint predates per-entry digests): entries are selected by time, so an edit to an older entry is not seen.'
     elif coverage=='windowed':
         note+=' Coverage is WINDOWED: '+str(unverified)+' older entries cannot be re-verified and are not listed.'
@@ -1617,9 +1633,13 @@ def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved):
     """
     if newer is None:
         # Nothing newer: the marker still stands, so a later claim, which makes the cursor
-        # stale but adds no entry and no field edit, reads the same marker. A legacy
-        # checkpoint (no per-entry digests) has none.
-        own=others=0;coverage='current';marker=None if prov is None else activity_marker(None,digest)
+        # stale but adds no entry and no field edit, reads the same marker. kittrial-5bb.367:
+        # a legacy checkpoint with a timestamp gets the fields marker too (the timestamp
+        # rule can select later entries); only a checkpoint with no timestamp at all has
+        # none, because there is no selection to compare with.
+        own=others=0;coverage='current'
+        legacy_without_stamp=prov is None and not (checkpoint_comment or {}).get('created_at')
+        marker=None if legacy_without_stamp else activity_marker(None,digest)
     else:
         own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
         marker=newer['newer_activity_marker']
@@ -1737,7 +1757,9 @@ def checkpoint_gaps(data,checkpoint):
 
     ``coverage`` is `snapshot` (retained evidence re-verifies every entry the checkpoint
     incorporated), `windowed` (entries beyond the retained bounds have no per-entry
-    evidence) or `unknown` (a legacy record). `unverified_count` is how many current
+    evidence), `timestamp` (a legacy record, read by the released timestamp rule, so a
+    backdated arrival or an edit of an older entry can be missed) or `unknown` (a legacy
+    record with no timestamp at all). `unverified_count` is how many current
     entries the read could be hiding: entries the chain recorded but cannot re-verify
     that sort before the baseline. ``note`` says in plain words what this read cannot
     show, so a reader never has to infer a hidden instruction from a count
@@ -1749,7 +1771,8 @@ def checkpoint_gaps(data,checkpoint):
          +str(checkpoint['comment'].get('author'))+' at '+str(checkpoint['comment'].get('created_at')))
     prov=checkpoint['provenance']
     if prov is None:
-        return ('unknown',0,who+'. It records no per-entry provenance (a legacy record), so the released timestamp rule is '
+        coverage='timestamp' if checkpoint['comment'].get('created_at') else 'unknown'
+        return (coverage,0,who+'. It records no per-entry provenance (a legacy record), so the released timestamp rule is '
                 'used: every entry at or after the checkpoint is shown. An entry edited since the checkpoint, or an arrival '
                 'backdated to before it, CANNOT be seen in this read; read the whole history (history '+data['task']+') to be sure.')
     if prov['covered']-prov['verifiable']<=0:
@@ -1963,7 +1986,10 @@ def format_brief(result):
     if newer:
         authors=', '.join(a['text'] for a in newer['other_authors']['items']) or 'none'
         if newer['other_authors']['omitted']:authors+=f' (+{newer["other_authors"]["omitted"]} more)'
-        coverage='' if newer['coverage']=='snapshot' else (' Coverage UNKNOWN (checkpoint predates per-entry digests).' if newer['coverage']=='unknown' else f' Coverage WINDOWED ({newer["unverified_count"]} older entries unverifiable; run: {newer["verify"]}).')
+        if newer['coverage']=='snapshot':coverage=''
+        elif newer['coverage']=='timestamp':coverage=' Coverage TIMESTAMP (checkpoint predates per-entry digests; a backdated arrival or an older edit can be missed).'
+        elif newer['coverage']=='unknown':coverage=' Coverage UNKNOWN (checkpoint predates per-entry digests).'
+        else:coverage=f' Coverage WINDOWED ({newer["unverified_count"]} older entries unverifiable; run: {newer["verify"]}).'
         lines += [f'Newer activity not in checkpoint: {newer["other_count"]} by other actors ({authors}), {newer["own_count"]} own; {newer["fresh_count"]} fresh, {newer["changed_or_late_count"]} changed/late.'+coverage]
         lines += ['  '+e['entry_id']+' ['+e['kind']+(' changed' if e['changed'] else '')+'] '+e['timestamp']+' by '+e['author']['text'] for e in newer['entries']]
         if newer['omitted']:lines += [f'  ... {newer["omitted"]} more; fresh activity: '+newer['history_new']+'; full: '+newer['history']]
@@ -2077,11 +2103,12 @@ def help_notes(action):
                 'Coverage is part of the answer: snapshot means retained evidence from the checkpoint chain '
                 're-verifies every entry the checkpoint incorporated; windowed means N entries recorded by '
                 'the checkpoint have no per-entry evidence and are only returned when they order after it, '
-                'so an edit to one of them cannot be seen (unverified_entries counts them); unknown means the '
+                'so an edit to one of them cannot be seen (unverified_entries counts them); timestamp means the '
                 'baseline is a legacy record with no provenance, where the released timestamp rule applies — '
-                'every entry at or after the checkpoint is shown — and an entry edited since it, or an arrival '
-                'backdated to before it, CANNOT be seen. checkpoint_note states this in words. Read history '
-                'TASK or run checkpoint TASK --verify before trusting a windowed or unknown read alone.',
+                'every entry at or after the checkpoint is shown — so an entry edited since it, or an arrival '
+                'backdated to before it, CANNOT be seen; unknown means a legacy record with no timestamp at all. '
+                'checkpoint_note states this in words. Read history '
+                'TASK or run checkpoint TASK --verify before trusting a windowed, timestamp or unknown read alone.',
                 'Example (comments only): history TASK --kind comment --recent 20. --kind accepts comment '
                 'or event; --since stays inclusive and timezone-aware and composes with both filters.',
                 'The JSON result names the effective order, kind and checkpoint boundary and reports '

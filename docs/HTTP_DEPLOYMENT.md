@@ -1729,7 +1729,9 @@ previous page did not return, at any page size).
 - **`since_checkpoint=true`** selects the entries the task's newest valid checkpoint
   did not incorporate (the client's `history --since-checkpoint`), in either order. The
   answer then also names the checkpoint: `since_checkpoint`, `checkpoint_author`,
-  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A checkpoint by
+  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A legacy
+  record (no per-entry digests) reports `timestamp`: the released timestamp rule selects
+  the entries, so a backdated arrival or an older edit can be missed. A checkpoint by
   the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
 - **The cursor** is bound to the caller, the project and the query. A newest-first
   cursor continues only a newest-first read with the same `recent`, and an oldest-first
@@ -3401,9 +3403,12 @@ line separately and unconfined.
       other-party entry, when that newest entry is **edited**, and when one of those
       three fields is edited; never for a claim or a status change, and it never
       encodes a timestamp. The agent's own entries do not move it. It is `null` only
-      without a valid checkpoint or with unknown coverage (a legacy checkpoint without
-      per-entry digests); a client then falls back to `newer_activity`, which keeps its
-      released rule. The wait fingerprint includes the marker, so a second coordinator
+      without a valid checkpoint (or for a legacy checkpoint with no timestamp at all).
+      A legacy checkpoint with the switch off is read by the released timestamp rule and
+      gets the same marker, with `newer_activity_coverage: timestamp` saying that a
+      backdated arrival or an older edit can be missed; a client then falls back to
+      `newer_activity`, which keeps its released rule. The wait fingerprint includes the
+      marker, so a second coordinator
       comment, an edit to the newest one, or a description edit wakes a waiting bridge
       even while the boolean stays `true`. All six fields are defined once in
       docs/BRIEFINGS.md, "Newer activity: one definition".
