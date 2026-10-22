@@ -1163,7 +1163,9 @@ READ_ONLY_ACTIONS={
     # and nothing is written, so it takes the project lock SHARED like the work read itself.
     'wait':_read_only_always,
     'bd':lambda args,operation:not is_mutating_invocation(args),
-    'web-lifecycle':lambda args,operation:operation=='read',
+    # The integration check (kittrial-5bb.374) is a read with no identity: it must never
+    # take the project lock exclusively or write.
+    'web-lifecycle':lambda args,operation:operation in ('read','check'),
     'web-merge-slot':lambda args,operation:operation=='check',
     'web-guidance':_web_guidance_read_only,
     # kittrial-5bb.291 item 1: the roster read takes the project lock shared through
@@ -2152,12 +2154,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 # store under its held lock. No descriptor supplies this state.
                 return actor_parties(read_state(authority_config.store),label,name)
             def lifecycle_effect():
-                strict=operation=='read' or (payload and payload['dimension'] in ('reviewed','integrated'))
+                # The integration check needs the same operators, owners and mark family
+                # read as the writers whose decisions it reports (kittrial-5bb.374).
+                strict=operation in ('read','check') or (payload and payload['dimension'] in ('reviewed','integrated'))
                 operators=configured_operators(root) if strict else None
                 owners=owner_loader(path,'web lifecycle approval') if strict else None
                 try:
-                    enabled=web_lifecycle_mark_writes(root) if (operation=='read' or
-                              (payload['dimension']=='integrated' and payload['value']=='passed')) else False
+                    # A check never reads the mark writer switch: it does not write, and
+                    # its payload is None (kittrial-5bb.374).
+                    enabled=(web_lifecycle_mark_writes(root) if (operation=='read' or
+                              (operation=='fact' and payload['dimension']=='integrated'
+                               and payload['value']=='passed')) else False)
                 except ValueError as error:
                     raise web_lifecycle.LifecycleError(503,str(error)) from None
                 if operation=='read':
@@ -2170,6 +2177,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     result=web_lifecycle.read(body['task'],actor,runner,path,coordinate=coordinate,
                                               mark_writes=enabled,operators=operators,owners=owners,
                                               parties=lifecycle_parties)
+                elif operation=='check':
+                    result=web_lifecycle.integration_check(body['task'],actor,runner,path,
+                                                           target=body.get('target'),project_name=name,
+                                                           operators=operators,owners=owners,
+                                                           parties=lifecycle_parties)
                 else:
                     result=web_lifecycle.apply(body,actor,runner,path,name,request['operation_id'],
                                                authority=lifecycle_authority,parties=lifecycle_parties,
@@ -2177,7 +2189,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
                         'stderr':warning_text(run_warnings)}
             with held_coordination_lock(path,shared=coordination_lock_shared(request,'web-lifecycle',args,operation)):
-                if operation=='read':
+                if operation in ('read','check'):
                     if authority_config is None:
                         raise web_lifecycle.LifecycleError(403,'Configured web authority required for lifecycle reads')
                     with file_lock(authority_config.lock):

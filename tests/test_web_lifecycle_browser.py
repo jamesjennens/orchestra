@@ -37,6 +37,22 @@ class BrowserClientTests(AgentHarness):
         committed=[a for a in self.service.state['audit'] if a['action']=='lifecycle.scope' and a['outcome']=='committed']
         self.assertEqual(len(committed),1)
 
+    def test_task_page_integration_check_panel_is_read_only(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('Node unavailable; integration-check panel not exercised')
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+            (KIT / 'tests/web_integration_check_screen.mjs').as_uri(),
+            (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+            (KIT / 'web/js/api.js').as_uri(), (KIT / 'web/js/views/lifecycle.js').as_uri(),
+            self.base, self.pid, self.token, self.tid)
+        self.assertEqual(done.returncode, 0, done.stderr[-4000:])
+        result = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertTrue(result['checked'])
+        self.assertTrue(result['unchecked'])
+        self.assertTrue(result['readOnly'])
+        self.assertTrue(result['target'])
+
     def test_copied_client_and_named_cli_reconcile_without_another_effect(self):
         copied=self.tmp_path/'copied_http_client.py';shutil.copyfile(KIT/'http_client.py',copied)
         spec=importlib.util.spec_from_file_location('copied_lifecycle_client',copied)

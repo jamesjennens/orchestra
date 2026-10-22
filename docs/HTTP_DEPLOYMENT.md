@@ -64,6 +64,23 @@ still holds the role. Worker credentials and ordinary contributor/viewer access
 cannot write these records. This requirement applies with the host author and
 coordinator settings OFF as well as ON.
 
+The integration check (`GET .../tasks/{task}/integration-check`) is the read-only
+merge verdict for the same records. It requires project read
+permission (no `coordinate`), takes nothing and writes nothing. It answers
+`task`, the current `contribution` and review state, five `checks` (`approval`,
+`source_commit`, `slot`, `hold`, `reverted`), three `unchecked` rows
+(`base_membership`, `tests`, `pushed_result`, each `known: false` because the
+server has no code-host access), and `next`: the writes still owed in order
+(scope, reviewed, integrated, the integrated mark, slot release), each with its
+route and the operation identity its native event records when the write was
+already made. A refused row is HTTP 200 with the writer's own sentence, not an
+error, so every reason is visible at once; an absent task is 404. The optional
+`target` query is the branch name the merge-slot acquire accepts. The route is
+classified read-only in `endpoint.py` and `http_authority.py`, so it cannot take
+the slot, write a fact or merge. `merge_ready` covers only the five checks; it
+does not turn the three unchecked rows into a pass. The task page has a lazy
+"Integration check" panel for the refused and unchecked rows.
+
 | Route | Closed request body | Confirmed result |
 | --- | --- | --- |
 | `POST .../lifecycle/scope` | `scope`, `expected_scope_token`, `evidence`, `provenance`, optional `note` | 201 |
