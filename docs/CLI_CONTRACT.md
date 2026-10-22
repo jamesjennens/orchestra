@@ -266,9 +266,22 @@ The fingerprint covers `newer_activity_marker` as well as the `newer_activity`
 boolean. A second other-party comment after the checkpoint, an edit to the newest one,
 or an edit of the title, description or acceptance therefore wakes a waiting agent even
 while the boolean stays `true`; a claim or a status change does not (kittrial-5bb.354).
-When the marker is `null` (no checkpoint, or legacy unknown coverage) the boolean alone
-decides, exactly as before. The fields are defined once in docs/BRIEFINGS.md, "Newer
-activity: one definition".
+
+For the WORKER form the fingerprint changed in kittrial-5bb.369: it is taken over the
+row's `wait_newer_activity_marker` instead of the checkpoint-relative fields
+`checkpoint_at`, `open_items`, `blocking_items`, `newer_activity` and
+`newer_activity_marker`, so the caller's own plan checkpoint no longer returns its own
+wait with nothing new. `wait_newer_activity_marker` is the newest entry by anybody other
+than the task's assignee across the whole task history, folded with the current
+title/description/acceptance digest; it is computed even before the first checkpoint, so
+writing that checkpoint does not move it either. Everything by others still wakes: a new
+or edited comment, another actor's checkpoint, and a field edit move that marker, while
+`review_state`, `whose_move`, `next_actor`, `owner` (assignment), `status`
+(claim/release), `pending_review_items`, `contribution_id` and `redelivered` are compared
+directly. The caller's own delivery or review response takes the row out of its move, so
+the write's answer prints the post-write fingerprint to pass as `--since`. The
+COORDINATOR form and its fingerprint are unchanged. The fields are defined once in
+docs/BRIEFINGS.md, "Newer activity: one definition".
 
 **The changed block.** The client keeps a small local state file beside its config (the
 same directory as the `--config` file, derived from that path - never a hard-coded
@@ -482,10 +495,13 @@ checkpoint (or for a legacy checkpoint with no timestamp at all); a legacy check
 read by the timestamp rule gets the same marker, with `timestamp` coverage saying that
 an older edit or a backdated arrival can be missed. `newer_activity_fields` carries the
 current title/description/acceptance digest alone (16 hex), so a field edit can be told
-from the agent's own checkpoint. `brief` carries the same seven fields in its
-`activity` block, its `newer` block carries the same marker, and its
-`changes_since_checkpoint` section lists the entries and the changed fields (from
-`bd history`, read-only, cached per tracker generation) newest first.
+from the agent's own checkpoint. `wait_newer_activity_marker` carries the
+checkpoint-independent marker a worker's `wait` fingerprints (kittrial-5bb.369): the
+newest entry by anybody but the assignee, or `fields:<16 hex>`, so the agent's own
+checkpoint never moves it; it is computed even without a checkpoint. `brief` carries
+the same eight fields in its `activity` block, its `newer` block carries the same
+marker, and its `changes_since_checkpoint` section lists the entries and the changed
+fields (from `bd history`, read-only, cached per tracker generation) newest first.
 `session resume` records a resume event and returns session, resume and guidance
 metadata; it returns neither task IDs nor task rows. Read `work --mine` for tasks
 and checkpoint attention. The `worker.py resume` wrapper also runs onboarding,

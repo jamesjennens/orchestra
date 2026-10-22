@@ -29,10 +29,12 @@ import field_history
 import read_cache
 import work
 from test_briefing import PROJECT, STAMP, TASK, comment, rows, save_cp
+from test_briefing import checkpoint as checkpoint_payload
 
 COORD = 'coordinator/session'
 FIELDS = ('newer_activity', 'newer_activity_marker', 'newer_activity_fields', 'newer_activity_by_others',
-          'newer_activity_own', 'newer_activity_coverage', 'unresolved_directions')
+          'newer_activity_own', 'newer_activity_coverage', 'unresolved_directions',
+          'wait_newer_activity_marker')
 
 
 def queue_row(data):
@@ -171,6 +173,87 @@ class TheMarkerCase(unittest.TestCase):
         self.assertEqual('timestamp', row['newer_activity_coverage'])
         self.assertTrue(row['newer_activity_marker'].startswith('fields:'), row['newer_activity_marker'])
         self.assertNotEqual(first['newer_activity_marker'], row['newer_activity_marker'])
+
+
+class TheWaitMarkerCase(unittest.TestCase):
+    """kittrial-5bb.369: a wait must not return for the caller's own checkpoint.
+
+    ``wait_newer_activity_marker`` is the checkpoint-INDEPENDENT marker a worker's wait
+    fingerprints: the newest entry by anybody but the assignee across the whole task,
+    folded with the fields digest. The agent's own checkpoint, even the first one, never
+    moves it; another actor's comment, edit or checkpoint and a field edit do.
+    """
+
+    def setUp(self):
+        self.data = rows()
+        save_cp(self.data, 'cp1', next_action='Wait')
+
+    def row(self, actor='alice/session'):
+        return work.queue(self.data, actor, ['--mine'])['items'][0]
+
+    def marker(self, actor='alice/session'):
+        return self.row(actor)['wait_newer_activity_marker']
+
+    def test_the_first_checkpoint_does_not_move_it(self):
+        data = rows()                     # only the agent's own opening comment
+        before = work.queue(data, 'alice/session', ['--mine'])['items'][0]['wait_newer_activity_marker']
+        self.assertTrue(before.startswith('fields:'), before)
+        save_cp(data, 'cp1', next_action='Wait')
+        after = work.queue(data, 'alice/session', ['--mine'])['items'][0]['wait_newer_activity_marker']
+        self.assertEqual(before, after)
+
+    def test_the_callers_own_checkpoint_does_not_move_it(self):
+        self.data[0]['comments'].append(comment('dir', 'A direction', '2026-09-16T02:00:00Z', author=COORD))
+        before = self.row()
+        self.assertTrue(before['wait_newer_activity_marker'].startswith(TASK + '-cdir:'),
+                        before['wait_newer_activity_marker'])
+        save_cp(self.data, 'cp2', next_action='Doing it')
+        after = self.row()
+        # The checkpoint-relative marker resets: the old wake on the agent's own write.
+        self.assertNotEqual(before['newer_activity_marker'], after['newer_activity_marker'])
+        # The wait marker and everything else a worker fingerprints stay put.
+        self.assertEqual(before['wait_newer_activity_marker'], after['wait_newer_activity_marker'])
+        self.assertEqual(after['wait_newer_activity_marker'], self.marker())
+
+    def test_a_second_comment_an_edit_and_a_field_edit_each_move_it(self):
+        self.data[0]['comments'].append(comment('d1', 'one', '2026-09-16T02:00:00Z', author=COORD))
+        first = self.marker()
+        self.data[0]['comments'].append(comment('d2', 'two', '2026-09-16T03:00:00Z', author=COORD))
+        second = self.marker()
+        self.assertNotEqual(first, second)
+        self.assertTrue(second.startswith(TASK + '-cd2:'), second)
+        self.data[0]['comments'][-1]['text'] = 'two, corrected'
+        third = self.marker()
+        self.assertNotEqual(second, third)
+        self.data[0]['description'] = 'Intent, revised'
+        fourth = self.marker()
+        self.assertNotEqual(third, fourth)
+        # The agent's own checkpoint does not move the last one.
+        save_cp(self.data, 'cp2', next_action='Go on')
+        self.assertEqual(fourth, self.marker())
+
+    def test_another_actors_checkpoint_moves_it(self):
+        before = self.marker()
+        writes = []
+
+        def run(args):
+            writes.append(args)
+            return json.dumps(dict(id='cp-other'))
+
+        payload = checkpoint_payload(self.data)
+        b.save_checkpoint(self.data, PROJECT, TASK, payload, COORD, run, provenance_writes=True)
+        self.data[0]['comments'].append(comment('cp-other', writes[0][3], '2026-09-16T04:00:00Z', author=COORD))
+        after = self.marker()
+        self.assertNotEqual(before, after)
+        self.assertTrue(after.startswith(TASK + '-ccp-other:'), after)
+
+    def test_an_unassigned_task_counts_every_entry(self):
+        """The rule is "not the assignee", so with no assignee every entry is other-party."""
+        self.data[0]['assignee'] = None
+        self.data[0]['status'] = 'open'
+        row = work.queue(self.data, None, [])['items'][0]
+        self.assertTrue(row['wait_newer_activity_marker'].startswith(TASK + '-cfirst:'),
+                        row['wait_newer_activity_marker'])
 
 
 class TheSectionCase(unittest.TestCase):

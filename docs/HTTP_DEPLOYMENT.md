@@ -3415,8 +3415,20 @@ line separately and unconfined.
       (kittrial-5bb.367 F2b): it moves only when one of those three fields is edited,
       never for a claim, status change or the owner's own comment, and is `null` without
       a valid checkpoint. A bridge can therefore tell a field edit from the agent's own
-      checkpoint (the marker moves in both cases, this digest only in the first). All
-      seven fields are defined once in
+      checkpoint (the marker moves in both cases, this digest only in the first).
+      `wait_newer_activity_marker` is the checkpoint-independent marker a worker's
+      `wait` fingerprints (kittrial-5bb.369): the newest entry by anybody other than the
+      assignee across the whole task, folded with the same fields digest, or
+      `fields:<16 hex>` when nobody else has written. It is computed even before the
+      first checkpoint, so the agent's own plan checkpoint does not wake its own wait;
+      a new or edited other-party entry, another actor's checkpoint and a field edit
+      still do. The worker fingerprint compares it instead of `checkpoint_at`,
+      `open_items`, `blocking_items`, `newer_activity` and `newer_activity_marker`, and
+      keeps `review_state`, `whose_move`, `next_actor`, the assignment (`owner`),
+      `status` (claim/release), `pending_review_items`, `contribution_id` and
+      `redelivered`; the coordinator form and its fingerprint are unchanged. A held
+      action, a wait row and the task read's `activity` block all carry the field, from
+      the one computation. All eight fields are defined once in
       docs/BRIEFINGS.md, "Newer activity: one definition".
     - **The task read carries the same fields and the changes (kittrial-5bb.354).**
       `GET /v1/projects/{pid}/tasks/{tid}/brief` adds `activity` (the same seven fields,

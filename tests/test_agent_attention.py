@@ -633,6 +633,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
             # This page is an older endpoint's canonical row: it omits the stable
             # marker and its counts, which honestly read unknown (kittrial-5bb.351).
             'newer_activity_marker': None, 'newer_activity_fields': None,
+            # The checkpoint-independent wait marker (kittrial-5bb.369) is omitted by
+            # the same older page and honestly reads unknown.
+            'wait_newer_activity_marker': None,
             'newer_activity_by_others': None,
             'newer_activity_own': None, 'newer_activity_coverage': None,
             'unresolved_directions': None})
@@ -722,7 +725,8 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
                                        'newer_activity_fields', 'newer_activity_marker', 'newer_activity_own',
                                        'open_items', 'pending_change_requests', 'pending_review_items',
                                        'redelivered',
-                                       'review_state', 'status', 'title', 'unresolved_directions'])
+                                       'review_state', 'status', 'title', 'unresolved_directions',
+                                       'wait_newer_activity_marker'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
     def test_actor_filter_excludes_somebody_elses_work(self):

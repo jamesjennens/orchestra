@@ -557,6 +557,26 @@ def activity_marker(newest_other,digest):
     combined=content_hash({'entry':content_hash(newest_other) if newest_other is not None else None,'fields':digest})
     return (newest_other['entry_id'] if newest_other is not None else 'fields')+':'+combined[:MARKER_DIGEST]
 
+def wait_activity_marker(data,row):
+    """The stable marker a worker's wait fingerprints (kittrial-5bb.369).
+
+    ``newer_activity_marker`` is relative to the NEWEST checkpoint, so the caller's own
+    checkpoint both resets it and (through ``checkpoint_at``) moves the released wait
+    fingerprint: the agent's plan checkpoint wakes its own wait once with nothing new.
+    This marker is instead the newest entry by anybody OTHER than the task's assignee
+    across the task's whole history, folded with the current title/description/
+    acceptance digest by the same :func:`activity_marker`. The agent's own checkpoint,
+    lane-state record and comments are its own entries, so they never move it; a new or
+    edited other-party entry, another actor's checkpoint and a field edit do. It is
+    computed from the read's own full snapshot, so brief and the queue rows cannot
+    disagree.
+    """
+    owner=row.get('assignee')
+    entries=[entry for entry in data.get('entries') or []
+             if isinstance(entry,dict) and entry.get('author')!=owner]
+    newest=max(entries,key=lambda entry:(parse_moment(entry['timestamp']),entry['entry_id'])) if entries else None
+    return activity_marker(newest,fields_digest(row))
+
 def newer_comment_by_other(row,checkpoint_comment):
     """The released ``newer_activity`` boolean, in ONE place (kittrial-5bb.354).
 
@@ -1125,7 +1145,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     if p is not None:
         try:
             activity=activity_fields(issue,c,retained_provenance(state),fields_digest(issue),newer if stale else None,
-                                     dir_out['total'])
+                                     dir_out['total'],data=data)
         except StopIteration:
             activity=None
     # Which of title, description and acceptance changed: only the tracker's version
@@ -1597,19 +1617,31 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
     and so, unchanged, do brief's ``activity`` block, the agent routes and the web task
     read. ``newer_activity`` keeps its released rule (:func:`newer_comment_by_other`);
     the counts and the marker are the precise signals, and the marker also moves on an
-    edit of the title, description or acceptance (:func:`activity_marker`). On a read
-    that fails, every field is null and the caller keeps its own ``newer_activity``.
+    edit of the title, description or acceptance (:func:`activity_marker`).
+    ``wait_newer_activity_marker`` (kittrial-5bb.369) is the checkpoint-independent
+    marker the worker's wait fingerprints. On a read that fails, every field is null and
+    the caller keeps its own ``newer_activity``.
     """
     empty={'newer_activity_marker':None,'newer_activity_fields':None,
+           'wait_newer_activity_marker':None,
            'newer_activity_by_others':None,'newer_activity_own':None,
            'newer_activity_coverage':None,'unresolved_directions':None}
     try:
         if state is None:state=checkpoint_state(row)
         elif not state['provenance']:
             state=dict(state,provenance={cid:normalize_provenance(p) for cid,p in state['history']})
-        if state['current'] is None or state['invalid']:return empty
-        p,c=state['current'];project=untoken(p['activity_cursor']).get('project','work-queue')
-        data=excluding_checkpoint(snapshot(rows,project,row['id']),c['id'],c.get('author'))
+        # The wait marker does not depend on a checkpoint, and it must not move when the
+        # caller writes its FIRST one either (kittrial-5bb.369), so it is computed from the
+        # task's full snapshot for every row. The project name only seeds the snapshot's
+        # task key; the marker reads entries and task fields, never the project.
+        has_checkpoint=state['current'] is not None and not state['invalid']
+        project=untoken(state['current'][0]['activity_cursor']).get('project','work-queue') if has_checkpoint else 'work-queue'
+        full=snapshot(rows,project,row['id'])
+        wait_marker=wait_activity_marker(full,row)
+        if not has_checkpoint:
+            return dict(empty,wait_newer_activity_marker=wait_marker)
+        p,c=state['current']
+        data=excluding_checkpoint(full,c['id'],c.get('author'))
         dispositions=chain_dispositions(state['history'])
         context=direction_context(row,state);direction_data=direction_entries(data,context)
         counted,_directions_off_reason=directions_counted(provenance_writes,row.get('status'))
@@ -1619,12 +1651,15 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
             newer=newer_activity_summary(data,prov,c.get('created_at'),
                                          context[0],dispositions,direction_data,counted,_directions_off_reason,
                                          marker_fields=digest)
-        return activity_fields(row,c,prov,digest,newer,
-                               len(unresolved_directions(direction_data,dispositions,context[0],counted)))
+        fields=activity_fields(row,c,prov,digest,newer,
+                               len(unresolved_directions(direction_data,dispositions,context[0],counted)),
+                               data=full)
+        fields['wait_newer_activity_marker']=wait_marker
+        return fields
     except (ValueError,TypeError,KeyError,StopIteration):return empty
 
-def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved):
-    """The seven newer-activity fields from one read's own results (kittrial-5bb.354).
+def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved,data=None):
+    """The eight newer-activity fields from one read's own results (kittrial-5bb.354).
 
     ``newer`` is that read's :func:`newer_activity_summary` (computed with
     ``marker_fields=digest``), or None when the checkpoint's cursor is current. brief and
@@ -1633,6 +1668,8 @@ def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved):
     comment is not on the row. ``newer_activity_fields`` is the current title/description/
     acceptance digest alone (kittrial-5bb.367 F2b), so a reader can separate a field edit
     from the marker's entry-plus-fields hex; it is null in the empty (no checkpoint) row.
+    ``data`` is the task's FULL snapshot, from which ``wait_newer_activity_marker`` is
+    computed (kittrial-5bb.369); it is null when the caller has no snapshot.
     """
     if newer is None:
         # Nothing newer: the marker still stands, so a later claim, which makes the cursor
@@ -1652,6 +1689,10 @@ def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved):
             # its own, so a bridge can tell a field edit from the agent's own checkpoint
             # without unpicking the marker's combined hex.
             'newer_activity_fields':digest[:MARKER_DIGEST],
+            # kittrial-5bb.369: the checkpoint-independent marker a worker's wait
+            # fingerprints. Its own plan checkpoint does not move it; any other-party
+            # entry (a comment, an edit, another actor's checkpoint) or field edit does.
+            'wait_newer_activity_marker':wait_activity_marker(data,row) if isinstance(data,dict) else None,
             'newer_activity_by_others':others,'newer_activity_own':own,
             'newer_activity_coverage':coverage,
             'unresolved_directions':unresolved}

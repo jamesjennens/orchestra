@@ -68,6 +68,12 @@ WORKER_CORPUS = [
                            'open_requests': 4}]),
     ('web spellings', [{'task': 't2', 'whose_move': 'you', 'open_requests': 2,
                         'contribution': {'id': 'c9'}}]),
+    ('worker wait fields', [{'task': 't6', 'whose_move': 'you', 'owner': 'me/session',
+                             'status': 'in_progress', 'checkpoint_at': '2026-09-15T10:00:00Z',
+                             'open_items': 1, 'blocking_items': 0, 'newer_activity': True,
+                             'newer_activity_marker': 't6-cdir:aaaa',
+                             'wait_newer_activity_marker': 't6-cdir:bbbb',
+                             'attention': {'redelivered': False}}]),
     ('someone else', [{'task': 't4', 'whose_move': 'them', 'review_state': 'none'}]),
     ('mixed and unordered', [{'task': 'b', 'whose_move': 'you', 'open_items': 1},
                              {'task': 'a', 'whose_move': 'you', 'blocking_items': True},
@@ -177,6 +183,7 @@ class InlineAgreementTests(unittest.TestCase):
             with self.subTest(value=repr(value)[:40]):
                 self.assertEqual(client._InlineWait.digest(value), waiting.digest(value))
         self.assertEqual(client._InlineWait.MOVE_FIELDS, waiting.MOVE_FIELDS)
+        self.assertEqual(client._InlineWait.WORKER_MOVE_FIELDS, waiting.WORKER_MOVE_FIELDS)
         self.assertEqual(client._InlineWait.COORDINATOR_TRIGGERS, waiting.COORDINATOR_TRIGGERS)
         self.assertEqual(client._InlineWait.LANE_FLAGS, waiting.LANE_FLAGS)
         self.assertEqual(client._InlineWait.FINGERPRINT, waiting.FINGERPRINT)
