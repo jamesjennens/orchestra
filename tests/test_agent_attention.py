@@ -719,7 +719,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         # additive too (kittrial-5bb.253 item 1).
         self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
                                        'newer_activity_by_others', 'newer_activity_coverage',
-                                       'newer_activity_marker', 'newer_activity_own',
+                                       'newer_activity_fields', 'newer_activity_marker', 'newer_activity_own',
                                        'open_items', 'pending_change_requests', 'pending_review_items',
                                        'redelivered',
                                        'review_state', 'status', 'title', 'unresolved_directions'])
