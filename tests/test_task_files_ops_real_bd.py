@@ -89,7 +89,12 @@ class TaskFilesOpsRealBdTests(rb.RealBdLabelAliasTests):
         away = self.root.parent / (self.root.name + '-offsite')
         self.addCleanup(shutil.rmtree, away, ignore_errors=True)
         with contextlib.redirect_stdout(io.StringIO()) as copied:
-            admin.backup_copy(self.root, str(away))
+            try:
+                admin.backup_copy(self.root, str(away))
+            except SystemExit as stopped:
+                # The class shares one runtime: projects of other tests that have no complete backup are skipped
+                # and named, and the run then exits non-zero. tfsrc's pair is complete and is copied all the same.
+                self.assertNotIn('tfsrc', str(stopped).split('skipped')[-1].split(';')[0])
         self.assertIn('Copied tfsrc task files', copied.getvalue())
         self.assertTrue((away / 'tfsrc.task-files' / task_files.MANIFEST).is_file(), 'backup-copy carries the folder')
         code, out, err = self.main('restore-new', 'tfsrc', 'tfdst')
