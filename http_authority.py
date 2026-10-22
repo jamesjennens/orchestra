@@ -330,6 +330,11 @@ CAP_RECORDS = 'records'
 #: What a project's coordinator may do beyond approving (slice 1b of docs/WEB_COORDINATOR_DESIGN.md,
 #: kittrial-5bb.209). Web merge-slot acquire/release use it; lifecycle facts follow separately.
 CAP_COORDINATE = 'coordinate'
+#: Recording a release over the web (kittrial-5bb.378): an owner holds it, a
+#: coordinator does not, and an agent holds it only while the project's release
+#: grant names it and its account is still an owner. A release is a decision, not a
+#: coordination step, so ``coordinate`` alone never deploys.
+CAP_RELEASE = 'release'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
 CAP_ACCOUNTS_ADMIN = 'accounts.admin'
@@ -376,13 +381,17 @@ ROLE_CAPABILITIES = {
                               CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE}),
     'owner': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
                         CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE,
-                        CAP_PROJECT_ADMIN}),
+                        CAP_PROJECT_ADMIN, CAP_RELEASE}),
 }
 #: What the coordinator grant adds to an agent's credential in the project of the grant.
 GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE, CAP_RECORDS})
+#: What the release grant adds (kittrial-5bb.378): the one capability, and only while
+#: the agent's account still holds ``project.admin`` there. ``release`` is deliberately
+#: absent from a role's coordinator capabilities and from every credential scope.
+RELEASE_GRANT_CAPABILITIES = frozenset({CAP_RELEASE})
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
                                                CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,
-                                               CAP_AGENTS})
+                                               CAP_AGENTS, CAP_RELEASE})
 ALL_CAPABILITIES = frozenset(ROLE_CAPABILITIES['owner'] | {CAP_PROJECT_CREATE,
                                                            CAP_ACCOUNTS_ADMIN,
                                                            CAP_AGENTS})
@@ -567,14 +576,16 @@ def credential_capabilities(state, credential, issuer, project_id):
         caps |= SCOPE_CAPABILITIES.get(scope, frozenset())
     caps -= CREDENTIAL_FORBIDDEN_CAPABILITIES
     if issuer.get('superuser'):
-        return frozenset(caps | coordinator_grant_capabilities(state, credential, project_id, ROLE_CAPABILITIES['owner']))
+        return frozenset(caps | coordinator_grant_capabilities(state, credential, project_id, ROLE_CAPABILITIES['owner'])
+                         | release_grant_capabilities(state, credential, project_id, ROLE_CAPABILITIES['owner']))
     role = state.get('memberships', {}).get(project_id, {}).get(issuer['id'])
     if role is None:
         raise deny(403, 'forbidden',
                    'The credential issuer is no longer a member of this project')
     held = ROLE_CAPABILITIES.get(role, frozenset())
     return frozenset({cap for cap in caps if cap in held}
-                     | coordinator_grant_capabilities(state, credential, project_id, held))
+                     | coordinator_grant_capabilities(state, credential, project_id, held)
+                     | release_grant_capabilities(state, credential, project_id, held))
 
 
 def coordinator_grant(state, project_id, agent_id):
@@ -607,6 +618,40 @@ def coordinator_grant_capabilities(state, credential, project_id, held):
     if not agent_id or coordinator_grant(state, project_id, agent_id) is None:
         return frozenset()
     return frozenset(cap for cap in GRANT_CAPABILITIES if cap in held)
+
+
+def release_grant(state, project_id, agent_id):
+    """The release grant of one agent in one project, or None (kittrial-5bb.378).
+
+    Stored with the PROJECT beside ``coordinator_grants``:
+    ``release_grants[project][agent] = {'granted_by', 'granted_at'}``. Only an owner
+    (or a superuser) writes it, and a record of any other shape is no grant: the check
+    fails closed. It is not a credential scope and never appears on a worker credential.
+    """
+    grants = state.get('release_grants')
+    grant = (grants.get(project_id) or {}).get(agent_id) if isinstance(grants, dict) and \
+        isinstance(grants.get(project_id), dict) else None
+    if not isinstance(grant, dict) or not isinstance(grant.get('granted_by'), str):
+        return None
+    return grant
+
+
+def release_grant_capabilities(state, credential, project_id, held):
+    """What a project's release grant adds to this agent credential here, or nothing.
+
+    The release grant is narrower than the coordinator grant: it adds only
+    :data:`CAP_RELEASE`, only for an agent's credential, and only while the agent's own
+    account still holds ``project.admin`` in this project (owner, or a superuser). A
+    coordinator's account does not carry it, so demoting the owner to coordinator ends
+    the agent's release authority at the next request (the adversarial case in
+    kittrial-5bb.378). Read live by the web service and again by the endpoint.
+    """
+    agent_id = credential.get('agent_id')
+    if not agent_id or release_grant(state, project_id, agent_id) is None:
+        return frozenset()
+    if CAP_PROJECT_ADMIN not in held:
+        return frozenset()
+    return frozenset(RELEASE_GRANT_CAPABILITIES)
 
 
 #: Who may write and accept a project's own requirements on the web (kittrial-5bb.278,
@@ -2496,6 +2541,9 @@ BLOCK_CAPABILITIES = {
                        'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
                        'create': CAP_PROJECT_ADMIN},
     'web-lifecycle': {'read': CAP_READ, 'scope': CAP_COORDINATE, 'fact': CAP_COORDINATE},
+    # The release routes (kittrial-5bb.378): the query is a coordinator read, the deploy
+    # is the project's release capability (owner, superuser, or a release-granted agent).
+    'web-release': {'query': CAP_COORDINATE, 'deploy': CAP_RELEASE},
     'web-guidance': {'read': CAP_READ, 'ack': CAP_READ, 'onboarding': CAP_READ,
                      'set': CAP_COORDINATE, 'clear': CAP_COORDINATE, 'status': CAP_COORDINATE,
                      'coordinate-check': CAP_COORDINATE, 'onboarding-edit': CAP_COORDINATE},
@@ -2534,7 +2582,7 @@ def required_capability(request):
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-guidance', 'assignee-followon'):
+    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-release', 'web-guidance', 'assignee-followon'):
         if len(args) != 1:
             return None
         item = {'text': args[0]}

@@ -53,7 +53,7 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_RECORDS,
                             CAP_REVIEWS, CAP_TASKS,
-                            CAP_COORDINATE, coordinator_grant,
+                            CAP_COORDINATE, CAP_RELEASE, coordinator_grant, release_grant,
                             GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
@@ -3093,10 +3093,13 @@ class Service:
         'agents.project.revoke': 'removed from the project',
         'agents.coordinator.grant': 'coordinator grant given',
         'agents.coordinator.revoke': 'coordinator grant ended',
+        'agents.release.grant': 'release grant given',
+        'agents.release.revoke': 'release grant ended',
     }
     #: Project-bound kinds: a project's view lists them only for its own project.
     AGENT_HISTORY_PROJECT_KINDS = ('agents.project.granted', 'agents.project.revoke',
-                                   'agents.coordinator.grant', 'agents.coordinator.revoke')
+                                   'agents.coordinator.grant', 'agents.coordinator.revoke',
+                                   'agents.release.grant', 'agents.release.revoke')
     AGENT_HISTORY_DROPPED = ('Older history is no longer kept: the service keeps the last %d audit events '
                              'for all projects together.' % AUDIT_LIMIT)
     AGENT_HISTORY_GRANT_UNKNOWN = ('This agent was given this project before the time of a grant was recorded, so its '
@@ -3297,6 +3300,9 @@ class Service:
             # when, and whether the grant has effect now (its account must itself be a
             # coordinator or an owner here); null when it holds none.
             view['coordinator'] = self.coordinator_view(project_id, agent)
+            # Whether this agent may RECORD A RELEASE here (kittrial-5bb.378): the same
+            # shape as the coordinator row, so one panel can show both grants.
+            view['release'] = self.release_view(project_id, agent)
         return view
 
     def coordinator_view(self, project_id, agent):
@@ -3310,6 +3316,31 @@ class Service:
                                       'account-disabled' if owner.get('disabled') else 'account-role')
         return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
                 'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
+
+    def release_view(self, project_id, agent):
+        """Whether this agent may record a release in this project now (kittrial-5bb.378).
+
+        Mirrors :meth:`coordinator_view`, but the grant only takes effect while the
+        agent's account still holds ``project.admin`` here (owner, or a superuser). Null
+        when the agent holds no release grant.
+        """
+        grant = release_grant(self.state, project_id, agent['id'])
+        if grant is None:
+            return None
+        effective = self._may_release(project_id, agent)
+        owner = self.state['users'].get(agent.get('owner')) or {}
+        why = None if effective else ('agent-disabled' if not agent.get('enabled') else
+                                      'account-disabled' if owner.get('disabled') else 'account-role')
+        return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
+                'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
+
+    def _may_release(self, project_id, agent):
+        """Whether the agent's account holds the owner's capabilities in the project now."""
+        owner = self.state['users'].get(agent.get('owner')) or {}
+        if owner.get('disabled') or not agent.get('enabled'):
+            return False
+        role = self.state.get('memberships', {}).get(project_id, {}).get(agent.get('owner'))
+        return bool(owner.get('superuser')) or CAP_PROJECT_ADMIN in ROLE_CAPABILITIES.get(role, frozenset())
 
     def coordinators_of(self, principal, project_id):
         """Who coordinates the project, for any reader of it (kittrial-5bb.198). Changes nothing.
@@ -3395,25 +3426,33 @@ class Service:
             return self.project_agent_view(agent, project_id)
 
     def _end_coordinator_grants(self, agent, project_ids, principal, request_id, reason):
-        """Delete the agent's coordinator grant in each of ``project_ids``, and say so in the audit.
+        """Delete the agent's coordinator AND release grants in each of ``project_ids``.
 
-        The ONE place for every way an agent stops being in a project: out of the project, out
-        of its coordinators. A grant must not wait in the state for the project to be put back.
-        Caller holds ``store.lock`` and saves. Each grant that was there is audited as a revoke
-        in its project, with who did what ended it and why.
+        The ONE place for every way an agent stops being in a project: out of the project,
+        out of its coordinators, out of its release grant. A grant must not wait in the
+        state for the project to be put back. Caller holds ``store.lock`` and saves. Each
+        grant that was there is audited as a revoke in its project, with who did what
+        ended it and why. ``release_grants`` (kittrial-5bb.378) is the same family: an
+        agent that leaves takes its release authority with it.
         """
         grants = self.state.get('coordinator_grants')
-        if not isinstance(grants, dict):
-            return []
+        releases = self.state.get('release_grants')
         ended = []
         for project_id in project_ids:
-            held = grants.get(project_id)
+            held = grants.get(project_id) if isinstance(grants, dict) else None
             if isinstance(held, dict) and agent['id'] in held:
                 del held[agent['id']]
                 if not held:
                     del grants[project_id]
                 ended.append(project_id)
                 self.audit(request_id, principal, 'agents.coordinator.revoke', 'committed', project_id=project_id,
+                           reason='agent %s: %s' % (agent['id'], reason))
+            released = releases.get(project_id) if isinstance(releases, dict) else None
+            if isinstance(released, dict) and agent['id'] in released:
+                del released[agent['id']]
+                if not released:
+                    del releases[project_id]
+                self.audit(request_id, principal, 'agents.release.revoke', 'committed', project_id=project_id,
                            reason='agent %s: %s' % (agent['id'], reason))
         return ended
 
@@ -3429,6 +3468,62 @@ class Service:
             if not isinstance(held, dict) or agent_id not in held:
                 raise not_found('Agent not found' if project_id not in (agent.get('projects') or [])
                                 else 'This agent holds no coordinator grant in this project')
+            del held[agent_id]
+            if not held:
+                del grants[project_id]
+            self.store.save()
+            return self.project_agent_view(agent, project_id)
+
+    NOT_A_RELEASE_OWNER = ('This agent\'s account is not an owner of this project, so a release grant would '
+                           'have no effect. Make the account an owner first (Members), then grant the agent.')
+
+    def grant_release(self, principal, project_id, agent_id, request_id=None):
+        """Let one agent record releases in one project (kittrial-5bb.378).
+
+        The route holds the ``CAP_PROJECT_ADMIN`` boundary: an owner of the project or a
+        superuser, never a credential. The agent must be a personal agent granted this
+        project, enabled, and its account must itself be an owner of the project (or a
+        superuser): a release grant that could not take effect is not written. Stored
+        under ``release_grants[project][agent]`` beside the coordinator grant; read live
+        on every release write, so a revocation or a demotion refuses the next request.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change a release grant')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            if project_id not in (agent.get('projects') or []):
+                raise not_found('Agent not found')
+            if not agent.get('enabled'):
+                raise conflict('A disabled agent cannot be granted')
+            if not self._may_release(project_id, agent):
+                raise conflict(self.NOT_A_RELEASE_OWNER)
+            stored = self.state.get('release_grants')
+            # An ABSENT key is every installation before its first release grant. A key
+            # that is there with anything but an object is damage and fails closed.
+            if 'release_grants' in self.state and (not isinstance(stored, dict)
+                                                   or not isinstance(stored.get(project_id, {}), dict)):
+                raise HttpError(503, 'unavailable',
+                                'The record of release grants in the service state is damaged (it is not an object), '
+                                'so no grant was written. An operator must repair the state file')
+            grants = self.state.setdefault('release_grants', {}).setdefault(project_id, {})
+            if release_grant(self.state, project_id, agent_id) is None:
+                grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
+                self.store.save()
+            return self.project_agent_view(agent, project_id)
+
+    def revoke_release(self, principal, project_id, agent_id, request_id=None):
+        """Take the release grant away. From the next request the agent releases nothing here."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change a release grant')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            grants = self.state.get('release_grants')
+            held = grants.get(project_id) if isinstance(grants, dict) else None
+            if not isinstance(held, dict) or agent_id not in held:
+                raise not_found('Agent not found' if project_id not in (agent.get('projects') or [])
+                                else 'This agent holds no release grant in this project')
             del held[agent_id]
             if not held:
                 del grants[project_id]

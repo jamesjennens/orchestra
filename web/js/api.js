@@ -385,8 +385,16 @@ export function createApi(transport) {
     projectAgentHistory: (pid, aid) => call('GET', `/v1/projects/${pid}/agents/${aid}/history`),
     grantCoordinator: (pid, aid) => mutate('PUT', `/v1/projects/${pid}/agents/${aid}/coordinator`, {}),
     revokeCoordinator: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/coordinator`),
+    // The project's release grant (kittrial-5bb.378): an owner gives one agent the right
+    // to RECORD releases here; a coordinator grant does not carry it.
+    grantRelease: (pid, aid) => mutate('PUT', `/v1/projects/${pid}/agents/${aid}/release`, {}),
+    revokeRelease: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/release`),
     // Who coordinates the project and the rules that bind them, for any member; read only (kittrial-5bb.198).
     coordination: (pid) => call('GET', `/v1/projects/${pid}/coordination`),
+    // Release facts (kittrial-5bb.378). The query writes nothing; a deploy records ONE
+    // group of at most 200 already-resolved targets and is idempotent per intent.
+    releaseQuery: (pid, scope) => call('POST', `/v1/projects/${pid}/releases/query`, { body: { scope } }),
+    deployRelease: (pid, body) => mutate('POST', `/v1/projects/${pid}/releases`, body),
     removeMember: (pid, uid) => mutate('DELETE', `/v1/projects/${pid}/members/${uid}`),
     credentials: (pid) => call('GET', `/v1/projects/${pid}/worker-credentials`, { params: { limit: 100 } }),
     issueCredential: (pid, scopes, label) => mutate('POST', `/v1/projects/${pid}/worker-credentials`, { scopes, label }),

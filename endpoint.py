@@ -916,7 +916,7 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-guidance',
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release')
 
 def key_project_refusal(request,key_projects):
@@ -1165,6 +1165,9 @@ READ_ONLY_ACTIONS={
     'bd':lambda args,operation:not is_mutating_invocation(args),
     'web-lifecycle':lambda args,operation:operation=='read',
     'web-merge-slot':lambda args,operation:operation=='check',
+    # The release query writes nothing (kittrial-5bb.378); a deploy reserves an
+    # operation identity and stays exclusive.
+    'web-release':lambda args,operation:operation=='query',
     'web-guidance':_web_guidance_read_only,
     # kittrial-5bb.291 item 1: the roster read takes the project lock shared through
     # the one table, not a hand-coded LOCK_SH at its own call site. task-assign is
@@ -1218,7 +1221,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-guidance','assignee-followon','task-assign','assignment-roster','task-release'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -2191,6 +2194,93 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 return answer
         except web_lifecycle.LifecycleError as error:
             return {'returncode':2,'stdout':'','stderr':str(error)+'\n','lifecycle_status':error.status}
+    if action=='web-release':
+        # ``verified_web_authority`` is imported at module scope; importing it again here
+        # would make it a local of ``execute`` and break every earlier action's use of it.
+        from http_authority import file_lock
+        import lifecycle
+        import web_release
+        args=request.get('args',[])
+        run_warnings=[]
+        def release_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        # A release preflight compares every named target against ONE native export; the
+        # writer below reads its own fresh export, as the host command does.
+        runner=NativeRunner(release_run, project=path)
+        denied_status=[]
+        try:
+            if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                raise web_release.ReleaseError(422,'Expected one release JSON payload')
+            body=record_json.loads(args[0])
+            operation,payload=web_release.validate(body,actor,request.get('operation_id'))
+            capability=required_capability(request)
+            if capability is None:
+                raise web_release.ReleaseError(403,'This release operation has no endpoint capability binding')
+            def release_authority():
+                # Live re-check: the descriptor alone is never authority, and a release
+                # grant revoked, or an owner demoted, refuses the next request.
+                if not verified_web_authority(request,authority_config,capability,name):
+                    denied_status.append(403)
+                    raise web_release.ReleaseError(403,'Verified web authority required for this release operation')
+                return True
+            def release_effect():
+                try:
+                    return release_work()
+                except web_release.ReleaseError:
+                    raise
+                except ValueError as error:
+                    # A validation refusal before the first native write is safe to hand
+                    # back whole (the hold, a stale scope, the release-author rule). A
+                    # ValueError after a write may have left facts behind: keep the
+                    # uncertain answer instead of calling it a clean refusal.
+                    if runner.attempted_write:
+                        raise
+                    raise web_release.ReleaseError(422, str(error)) from None
+            def release_work():
+                try:operators=configured_operators(root)
+                except ConfigurationUnreadable as error:
+                    raise web_release.ReleaseError(503,'The installation operator list cannot be read, so the '
+                                                        'host revert and hold set is unavailable: '+str(error)[:160])
+                if operation=='query':
+                    result=lifecycle.release_query(payload,actor,runner,operators=operators,journal=path)
+                else:
+                    rules=configured_coordinator_rules(root,warnings=run_warnings)
+                    rows=lifecycle.read_event_rows(runner)
+                    resolved,skipped=web_release.resolve_targets(rows,payload['targets'])
+                    if skipped:
+                        payload.update(targets=resolved)
+                    if not resolved and not (payload.get('rollback') or payload.get('supersede')
+                                             or payload.get('supersede_scopes')):
+                        reasons='; '.join('%s: %s'%(row['task'],row['reason']) for row in skipped[:5])
+                        raise web_release.ReleaseError(422,
+                            'No named target is integrated at the commits it names, so nothing was written'
+                            + (': '+reasons if reasons else ''))
+                    result=lifecycle.apply_release(payload,actor,runner,operators=operators,journal=path,
+                                                   lifecycle_authors=rules['lifecycle_authors'],
+                                                   owners=(owner_loader(path,'web release lifecycle_authors')
+                                                           if rules['lifecycle_authors'] else None))
+                    result.update(groups_completed=1,groups_total=1,skipped=skipped,
+                                  resolved=[target['task'] for target in resolved],
+                                  flags=web_release.flags(result.get('targets')))
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                        'stderr':warning_text(run_warnings)}
+            if operation=='query':
+                if authority_config is None:
+                    raise web_release.ReleaseError(403,'Configured web authority required for a release query')
+                with held_coordination_lock(path,shared=True):
+                    with file_lock(authority_config.lock):
+                        release_authority()
+                        return release_effect()
+            answer=guarded_write(root,request,journal_path(path),release_effect,
+                                 authority_config=authority_config,require_authority=True,
+                                 runner=runner,identity_check=release_authority)
+            if denied_status and answer.get('returncode')==2:
+                answer['release_status']=denied_status[-1]
+            return answer
+        except web_release.ReleaseError as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','release_status':error.status}
     if action=='web-merge-slot':
         from http_authority import CAP_READ, CAP_COORDINATE, file_lock
         from web_merge_slot import SlotError, validate as slot_validate, apply as slot_apply
