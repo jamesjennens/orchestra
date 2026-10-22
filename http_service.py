@@ -28,6 +28,7 @@ import base64
 import binascii
 import errno
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -59,7 +60,7 @@ from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACC
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
                        CAP_RECORDS, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
-                       address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
+                       address_group, authority_request, busy, canonical_json, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, session_limit_seconds, unauthenticated,
                        uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
                        validate_claim_limit)
@@ -291,6 +292,10 @@ def validate_attachments(raw):
 
 
 # ------------------------------------------------------------------ cursors
+_FALLBACK_CURSOR_KEY = secrets.token_hex(32)
+CURSOR_BAD_SIGNATURE = 'Cursor signature is invalid; start the read again without a cursor.'
+
+
 def cursor_scope(query):
     """The part of the query a cursor is bound to: the page size, not the cursor itself.
 
@@ -300,32 +305,165 @@ def cursor_scope(query):
     return {key: value for key, value in query.items() if key != 'cursor'}
 
 
-def make_cursor(principal, project_id, query, offset, extra=None):
-    payload = {'u': principal.user_id, 'p': project_id,
-               'q': request_hash(cursor_scope(query))[:16], 'o': offset}
+def cursor_binding(principal, project_id, query):
+    """Compact 16-char digest binding a cursor to the caller, project and query."""
+    return request_hash({'u': principal.user_id, 'p': project_id,
+                         'q': cursor_scope(query)})[:16]
+
+
+def _cursor_mac(key, body):
+    secret = (key if isinstance(key, str) and key else _FALLBACK_CURSOR_KEY).encode('utf-8')
+    digest = hmac.new(secret, canonical_json(body).encode('utf-8'), hashlib.sha256).digest()[:16]
+    return base64.urlsafe_b64encode(digest).decode('ascii').rstrip('=')
+
+
+def make_cursor(principal, project_id, query, offset, extra=None, *, key=None):
+    payload = {'b': cursor_binding(principal, project_id, query), 'o': offset}
     if extra is not None:
         payload['x'] = extra
-    raw = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    payload['s'] = _cursor_mac(key, payload)
+    raw = json.dumps(payload, separators=(',', ':'), sort_keys=True).encode('utf-8')
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
 
-def read_cursor(principal, project_id, query, cursor):
-    """Return ``{'o': offset, 'x': route-specific continuation}`` for one request."""
+def read_cursor(principal, project_id, query, cursor, *, key=None):
+    """Return ``{'o': offset, 'x': route-specific continuation}`` for one request.
+
+    Signed cursors carry an HMAC (``s``) computed with the installation's ``cursor_key``
+    in service state (never in the cursor); a bad signature is refused with one sentence.
+    Old unsigned cursors matching the caller, project and query simply restart the read
+    (``{'o': 0, 'x': None}``).
+    """
     if cursor is None:
         return {'o': 0, 'x': None}
     if not isinstance(cursor, str) or not CURSOR.fullmatch(cursor):
         raise conflict('Invalid cursor')
     try:
         padded = cursor + '=' * (-len(cursor) % 4)
-        data = record_json.loads(base64.urlsafe_b64decode(padded.encode('ascii')))
+        raw = base64.urlsafe_b64decode(padded.encode('ascii'))
     except (ValueError, binascii.Error, UnicodeError):
         raise conflict('Invalid cursor')
-    if not isinstance(data, dict) or data.get('u') != principal.user_id or \
-            data.get('p') != project_id or \
-            data.get('q') != request_hash(cursor_scope(query))[:16] or \
-            type(data.get('o')) is not int or data['o'] < 0:      # a bool is not an offset
+    try:
+        data = record_json.loads(raw)
+    except (ValueError, UnicodeError):
+        if raw.startswith(b'{"b":') and b'"s":' in raw:
+            raise conflict(CURSOR_BAD_SIGNATURE)
+        raise conflict('Invalid cursor')
+    if not isinstance(data, dict):
+        raise conflict('Invalid cursor')
+    expected_binding = cursor_binding(principal, project_id, query)
+    if 's' not in data:
+        # An old unsigned cursor (or one with its signature omitted) never advances the
+        # offset: once its binding and offset shape check out, it simply restarts the read.
+        if type(data.get('o')) is not int or data['o'] < 0:
+            raise conflict('Invalid cursor')
+        if 'b' in data and set(data) <= {'b', 'o', 'x'}:
+            if data.get('b') != expected_binding:
+                raise conflict('Cursor is stale or belongs to a different query')
+            return {'o': 0, 'x': None}
+        if set(data) <= {'u', 'p', 'q', 'o', 'x'} and 'u' in data and 'q' in data:
+            allowed_projects = ({project_id, project_id.split('/', 1)[0]}
+                                if isinstance(project_id, str) else {project_id})
+            if (data.get('u') != principal.user_id
+                    or data.get('p') not in allowed_projects
+                    or data.get('q') != request_hash(cursor_scope(query))[:16]):
+                raise conflict('Cursor is stale or belongs to a different query')
+            return {'o': 0, 'x': None}
+        raise conflict('Invalid cursor')
+    if not set(data) <= {'b', 'o', 'x', 's'} or not isinstance(data.get('s'), str) or not data['s']:
+        raise conflict(CURSOR_BAD_SIGNATURE)
+    unsigned = {k: v for k, v in data.items() if k != 's'}
+    if not hmac.compare_digest(data['s'], _cursor_mac(key, unsigned)):
+        raise conflict(CURSOR_BAD_SIGNATURE)
+    if (data.get('b') != expected_binding
+            or type(data.get('o')) is not int or data['o'] < 0):   # a bool is not an offset
         raise conflict('Cursor is stale or belongs to a different query')
     return {'o': data['o'], 'x': data.get('x')}
+
+
+def _logical_entries(items):
+    """Group ``items`` into logical entries (fragments of one entry stay together and end at ``continued: False``)."""
+    logical = []
+    current = []
+    for item in items:
+        current.append(item)
+        if not (isinstance(item, dict) and item.get('continued')):
+            logical.append(current)
+            current = []
+    if current:
+        logical.append(current)
+    return logical
+
+
+def _logical_entry_count(items):
+    """How many completed logical entries ``items`` holds."""
+    return sum(1 for item in items if not (isinstance(item, dict) and item.get('continued')))
+
+
+def _slice_logical_entries(items, offset, limit):
+    """Flatten logical entries ``offset:offset + limit`` from ``items``."""
+    return [item for group in _logical_entries(items)[offset:offset + limit] for item in group]
+
+
+def _pack_history_cursor(cursor, project_id, task_id, recent):
+    """Compact a canonical ``briefing.history_page`` token by omitting route-known fields."""
+    if cursor is None or not isinstance(cursor, str):
+        return cursor
+    try:
+        from briefing import untoken
+        c = untoken(cursor)
+        if (not isinstance(c, dict) or c.get('v') != 1 or c.get('kind') != 'history'
+                or c.get('project') != str(project_id) or c.get('task') != str(task_id)
+                or c.get('since') is not None or c.get('entry_kind') is not None
+                or c.get('order', 'oldest') != ('newest' if recent else 'oldest')):
+            return cursor
+        snap_bytes = bytes.fromhex(c['snapshot'])
+        snap_b64 = base64.urlsafe_b64encode(snap_bytes).decode('ascii').rstrip('=')
+        packed = [snap_b64, c['index'], c['offset']]
+        scp = c.get('scp')
+        if scp is not None:
+            prefix = str(task_id) + '-'
+            if isinstance(scp, str) and scp.startswith(prefix):
+                scp = '~' + scp[len(prefix):]
+            elif isinstance(scp, str) and scp.startswith('~'):
+                scp = '~~' + scp[1:]
+            packed.append(scp)
+        return packed
+    except Exception:
+        return cursor
+
+
+def _unpack_history_cursor(packed, project_id, task_id, recent):
+    """Restore a canonical ``briefing.history_page`` token from :func:`_pack_history_cursor`."""
+    if packed is None or isinstance(packed, str):
+        return packed
+    if not isinstance(packed, list) or len(packed) not in (3, 4):
+        raise conflict('Invalid cursor')
+    snap_b64, index, start = packed[0], packed[1], packed[2]
+    if not isinstance(snap_b64, str) or type(index) is not int or type(start) is not int:
+        raise conflict('Invalid cursor')
+    try:
+        from briefing import token
+        padded = snap_b64 + '=' * (-len(snap_b64) % 4)
+        digest = base64.urlsafe_b64decode(padded.encode('ascii')).hex()
+        if len(digest) != 64:
+            raise ValueError('bad snapshot digest')
+        c = {'v': 1, 'kind': 'history', 'project': str(project_id), 'task': str(task_id),
+             'snapshot': digest, 'since': None, 'index': index, 'offset': start}
+        if recent:
+            c['order'] = 'newest'
+        if len(packed) == 4 and packed[3] is not None:
+            scp = packed[3]
+            if not isinstance(scp, str):
+                raise ValueError('bad scp')
+            if scp.startswith('~~'):
+                scp = scp[1:]
+            elif scp.startswith('~'):
+                scp = str(task_id) + '-' + scp[1:]
+            c['scp'] = scp
+        return token(c)
+    except Exception:
+        raise conflict('Invalid cursor') from None
 
 
 def result_is_stored(service, key):
@@ -1202,9 +1340,11 @@ class InProcessBackend:
             if marks:
                 checkpoint = events[marks[-1]]
                 events = events[marks[-1] + 1:]
+        logical = _logical_entries(events)
         if recent:
-            events = events[::-1]
-        result = {'items': events[offset:offset + limit], 'total': len(events),
+            logical = logical[::-1]
+        selected = [item for group in logical[offset:offset + limit] for item in group]
+        result = {'items': selected, 'total': len(logical),
                   'canonical_cursor': None, 'activity_cursor': None}
         if since_checkpoint:
             result.update({'since_checkpoint': checkpoint.get('time') if checkpoint else None,
@@ -2923,15 +3063,16 @@ class EndpointBackend:
         """
         needed = limit if canonical else offset + limit
         collected = []
-        cursor = canonical
+        completed = 0
+        cursor = _unpack_history_cursor(canonical, project_id, task_id, recent)
         total = 0
         activity = None
         selection = {}
         pages = 0
-        while len(collected) < needed and pages < 100:
+        while completed < needed and pages < 500:
             pages += 1
             argv = [str(task_id), '--recent' if recent else '--limit',
-                    str(min(20, needed - len(collected))), '--json']
+                    str(min(20, needed - completed)), '--json']
             if since_checkpoint:
                 argv.append('--since-checkpoint')
             if cursor:
@@ -2939,7 +3080,7 @@ class EndpointBackend:
             reply = self._run('history', project_id, self.actor_namespace + '/read', argv)
             if isinstance(reply, list):
                 collected.extend(reply)
-                total = len(reply)
+                total = len(_logical_entries(reply))
                 cursor = None
                 break
             entries = reply.get('entries') or []
@@ -2950,12 +3091,17 @@ class EndpointBackend:
                     'since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
                     'checkpoint_coverage', 'unverified_entries')}
             collected.extend(entries)
-            total = reply.get('total_entries', len(collected))
+            completed = _logical_entry_count(collected)
+            total = reply.get('total_entries', len(_logical_entries(collected)))
             cursor = reply.get('next_cursor')
-            if cursor is None:
+            if cursor is None or not entries:
                 break
-        return dict({'items': (collected[:limit] if canonical else collected[offset:offset + limit]),
-                     'total': total, 'canonical_cursor': cursor, 'activity_cursor': activity}, **selection)
+        items = (_slice_logical_entries(collected, 0, limit) if canonical
+                 else _slice_logical_entries(collected, offset, limit))
+        return dict({'items': items,
+                     'total': total,
+                     'canonical_cursor': _pack_history_cursor(cursor, project_id, task_id, recent),
+                     'activity_cursor': activity}, **selection)
 
     def list_feedback(self, project_id, limit, offset):
         raise not_implemented('Canonical backend has no feedback read yet: %s'
@@ -4863,7 +5009,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         offset = state['o']
         body = {'items': items[offset:offset + limit], 'total': len(items)}
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params.get('pid'), ctx.query,
-                                           offset + limit)
+                                           offset + limit, key=self.service.cursor_key())
                                if offset + limit < len(items) else None)
         body.update(extra)
         return body
@@ -6750,7 +6896,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             agents, total = self.service.agent_page(ctx.principal, state['o'], limit,
                                                   unconfirmed=unconfirmed == 'true')
             return 200, {'items': self._agent_items(ctx.principal, agents), 'total': total,
-                         'next_cursor': make_cursor(ctx.principal, None, ctx.query, state['o'] + limit)
+                         'next_cursor': make_cursor(ctx.principal, None, ctx.query, state['o'] + limit,
+                                                    key=self.service.cursor_key())
                          if state['o'] + limit < total else None,
                          'generated_at': now_iso(self.service._now())}
         items = self._agent_items(ctx.principal)
@@ -7908,7 +8055,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         refuse_unknown_fields(ctx.query,('limit','cursor'),'Assignment roster query')
         limit,state=self._page(ctx,ctx.query)
         result=self.backend.assignment_roster(ctx.principal,ctx.params['pid'],state['o'],limit)
-        result['next_cursor']=(make_cursor(ctx.principal,ctx.params['pid'],ctx.query,state['o']+limit)
+        result['next_cursor']=(make_cursor(ctx.principal,ctx.params['pid'],ctx.query,state['o']+limit,
+                                           key=self.service.cursor_key())
                                if result['more'] else None)
         return 200,result
 
@@ -8104,7 +8252,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['review_states_complete'] = complete and all(
             t.get('review_state') is not None for t in result['items'])
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
-                                             state['o'] + limit)
+                                             state['o'] + limit, key=self.service.cursor_key())
                                  if state['o'] + limit < result['total'] else None)
         if unreadable:
             result['unreadable'] = unreadable
@@ -8550,7 +8698,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid(str(error).replace('ref list: ', ''))
         result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options))
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
-                                             state['o'] + limit)
+                                             state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
         return 200, result
 
@@ -8637,7 +8785,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid(str(error).replace('capability list: ', ''))
         result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options))
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
-                                             state['o'] + limit)
+                                             state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
         return 200, result
 
@@ -9274,7 +9422,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         result = dict(self.backend.proposal_read(pid, args))
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result['items'] = [self._proposal_view(ctx, capabilities, item) for item in result.get('items') or []]
-        result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, result['next_offset'])
+        result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, result['next_offset'],
+                                             key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
         result['can_triage'] = self._triages(ctx, capabilities)
         result['can_decide'] = self._decides(ctx, capabilities)
@@ -9403,7 +9552,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         reachable = offset + limit < ME_CONTRIBUTIONS_MAX
         truncated = truncated or (more and not reachable)
         return 200, {'items': items[offset:offset + limit], 'total': total, 'truncated': truncated,
-                     'next_cursor': make_cursor(principal, None, ctx.query, offset + limit)
+                     'next_cursor': make_cursor(principal, None, ctx.query, offset + limit,
+                                                key=self.service.cursor_key())
                      if more and reachable else None,
                      'unavailable': unavailable,
                      'identity': 'account:' + principal.user_id,
@@ -9880,12 +10030,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         self._project(ctx, CAP_READ)
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        scope_id = ctx.params['pid'] + '/' + ctx.params['tid']
         recent, since_checkpoint = self._history_selection(ctx.query)
         if recent is not None:
             limit = recent
-            state = read_cursor(ctx.principal, ctx.params.get('pid'), ctx.query, ctx.query.get('cursor'))
+            state = read_cursor(ctx.principal, scope_id, ctx.query, ctx.query.get('cursor'),
+                                key=self.service.cursor_key())
         else:
-            limit, state = self._page(ctx, ctx.query)
+            limit, state = self._page(ctx, ctx.query, project_id=scope_id)
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
                                            state['o'], canonical=state['x'],
                                            recent=recent is not None, since_checkpoint=since_checkpoint)
@@ -9897,15 +10049,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         if result.get('activity_cursor'):
             body['activity_cursor'] = result['activity_cursor']
         continuation = result.get('canonical_cursor')
+        returned = state['o'] + len(_logical_entries(result['items']))
         body['next_cursor'] = (
-            make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
-                        state['o'] + len(result['items']), continuation)
+            make_cursor(ctx.principal, scope_id, ctx.query,
+                        returned, continuation, key=self.service.cursor_key())
             if continuation else None)
         body['order'] = 'newest-first' if recent is not None else 'oldest-first'
         # Entries this answer neither returned nor can continue to: a backend without a
         # continuation cursor (the in-process one) cannot page past its first page, so the
         # answer says so instead of looking complete (kittrial-5bb.353).
-        returned = state['o'] + len(result['items'])
         body['truncated'] = body['next_cursor'] is None and returned < result['total']
         if body['truncated']:
             body['truncated_note'] = (
@@ -9983,7 +10135,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._lanes_actor(ctx.principal), scope)
         body = dict(read)
         continuation = body.get('next_offset')
-        body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation)
+        body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
+                                           key=self.service.cursor_key())
                                if type(continuation) is int and continuation > state['o'] else None)
         return 200, body
 
@@ -10230,7 +10383,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['items'] = [dict(f, author_name=names.get(f.get('user_id'), f.get('actor')),
                                 at=f.get('created_at')) for f in result['items']]
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
-                                             state['o'] + limit)
+                                             state['o'] + limit, key=self.service.cursor_key())
                                  if state['o'] + limit < result['total'] else None)
         return 200, result
 
@@ -10257,7 +10410,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = {'items': [dict(e, user_name=names.get(e.get('user_id')), detail=e.get('reason'))
                           for e in page], 'total': len(events)}
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
-                                           state['o'] + limit)
+                                           state['o'] + limit, key=self.service.cursor_key())
                                if state['o'] + limit < len(events) else None)
         return 200, body
 
@@ -10290,7 +10443,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, {'certificate': certificate,
                      'sha256': certificate_fingerprint(certificate)}
 
-    def _page(self, ctx, query):
+    def _page(self, ctx, query, project_id=None):
         limit_raw = query.get('limit', str(DEFAULT_PAGE))
         try:
             limit = int(limit_raw)
@@ -10298,7 +10451,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid('limit must be an integer')
         if not 1 <= limit <= MAX_PAGE:
             raise invalid('limit must be between 1 and %d' % MAX_PAGE)
-        state = read_cursor(ctx.principal, ctx.params.get('pid'), query, query.get('cursor'))
+        scope = ctx.params.get('pid') if project_id is None else project_id
+        state = read_cursor(ctx.principal, scope, query, query.get('cursor'),
+                            key=self.service.cursor_key())
         return limit, state
 
 
