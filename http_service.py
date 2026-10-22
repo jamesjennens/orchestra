@@ -10072,7 +10072,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise not_found('Contribution not found')
         return contribution_id
 
-    def _audit_bundle_read(self, ctx, pid, record, outcome, *, reason=None, sha256=None, size_bytes=None):
+    def _audit_bundle_read(
+        self,
+        ctx,
+        pid,
+        record,
+        outcome,
+        *,
+        reason=None,
+        sha256=None,
+        size_bytes=None,
+        task=None,
+        contribution=None,
+    ):
         with self.service.store.lock:
             event = self.service.audit(
                 ctx.request_id,
@@ -10083,11 +10095,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 reason=reason,
             )
             if isinstance(record, dict):
-                event['task'] = record.get('task')
-                event['contribution'] = record.get('contribution')
+                event['task'] = record.get('task') or task
+                event['contribution'] = record.get('contribution') or contribution
                 event['commit'] = record.get('commit')
                 if sha256 is None and isinstance(record.get('delivery'), dict):
                     sha256 = record['delivery'].get('sha256')
+            else:
+                if task is not None:
+                    event['task'] = task
+                if contribution is not None:
+                    event['contribution'] = contribution
             if sha256 is not None:
                 event['sha256'] = sha256
             if size_bytes is not None:
@@ -10096,6 +10113,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _send_bundle_stream(self, handle_fd, record, verified):
         from review_workflow import BUNDLE_BLOCK_BYTES
+        headers_sent = False
         try:
             self.send_response(200)
             self.send_header('Content-Type', 'application/octet-stream')
@@ -10117,15 +10135,63 @@ class ApiHandler(BaseHTTPRequestHandler):
             if getattr(self, '_set_cookie_token', None):
                 self._send_cookie(self._set_cookie_token)
             self.end_headers()
-            if self.command != 'HEAD':
-                os.lseek(handle_fd, 0, os.SEEK_SET)
-                remaining = int(verified['bytes'])
-                while remaining > 0:
-                    chunk = os.read(handle_fd, min(BUNDLE_BLOCK_BYTES, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
+            headers_sent = True
+            if self.command == 'HEAD':
+                return 'ok', None
+            os.lseek(handle_fd, 0, os.SEEK_SET)
+            expected_bytes = int(verified['bytes'])
+            expected_sha = str(verified['sha256']).lower()
+            expected_stat = verified.get('stat_snapshot')
+            remaining = expected_bytes
+            stream_digest = hashlib.sha256()
+            held_block = None
+            while remaining > 0:
+                chunk = os.read(handle_fd, min(BUNDLE_BLOCK_BYTES, remaining))
+                if not chunk:
+                    self.close_connection = True
+                    try:
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+                    return 'interrupted', 'short_read'
+                stream_digest.update(chunk)
+                remaining -= len(chunk)
+                if held_block is not None:
+                    self.wfile.write(held_block)
+                held_block = chunk
+            extra = os.read(handle_fd, 1)
+            info_after = os.fstat(handle_fd)
+            stat_after = (
+                info_after.st_dev,
+                info_after.st_ino,
+                info_after.st_size,
+                info_after.st_mtime_ns,
+                info_after.st_ctime_ns,
+            )
+            if (
+                extra
+                or stream_digest.hexdigest().lower() != expected_sha
+                or (expected_stat is not None and stat_after != expected_stat)
+            ):
+                self.close_connection = True
+                try:
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                return 'interrupted', 'bundle_checksum_mismatch'
+            if held_block is not None:
+                self.wfile.write(held_block)
+            self.wfile.flush()
+            return 'ok', None
+        except Exception:
+            self.close_connection = True
+            if not headers_sent:
+                raise
+            try:
+                self.wfile.flush()
+            except OSError:
+                pass
+            return 'interrupted', 'stream_error'
         finally:
             try:
                 os.close(handle_fd)
@@ -10135,38 +10201,74 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/delivery')
     def tasks_delivery(self, ctx):
         """Return the contribution's recorded delivery metadata (kittrial-5bb.373)."""
-        from review_workflow import DeliveryUnavailableError, resolve_delivery_bundle_path
+        from review_workflow import (
+            DeliveryCorruptError,
+            DeliveryTooLargeError,
+            DeliveryUnavailableError,
+            resolve_delivery_bundle_path,
+            verify_served_bundle,
+        )
         self._project_delivery(ctx)
-        contribution_id = self._delivery_contribution_query(ctx.query)
         pid = ctx.params['pid']
         tid = ctx.params['tid']
-        record = self.backend.task_delivery_record(
-            pid,
-            tid,
-            contribution_id=contribution_id,
-        )
-        if record.get('task') != tid or record.get('project') not in (None, pid):
-            raise not_found('Contribution not found')
-        delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
-        kind = delivery.get('kind')
-        roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
-        max_bytes = (
-            self.backend.get_delivery_serve_max_bytes()
-            if hasattr(self.backend, 'get_delivery_serve_max_bytes')
-            else 256 * 1024 * 1024
-        )
+        contribution_id = ctx.query.get('contribution') if isinstance(ctx.query.get('contribution'), str) else None
+        record = None
+        try:
+            contribution_id = self._delivery_contribution_query(ctx.query)
+            candidate = self.backend.task_delivery_record(
+                pid,
+                tid,
+                contribution_id=contribution_id,
+            )
+            if candidate.get('task') != tid or candidate.get('project') not in (None, pid):
+                raise not_found('Contribution not found')
+            record = candidate
+            delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
+            kind = delivery.get('kind')
+            roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
+            max_bytes = (
+                self.backend.get_delivery_serve_max_bytes()
+                if hasattr(self.backend, 'get_delivery_serve_max_bytes')
+                else 256 * 1024 * 1024
+            )
+        except HttpError as error:
+            self._audit_bundle_read(
+                ctx,
+                pid,
+                record,
+                'refused',
+                reason=error.code,
+                task=tid,
+                contribution=contribution_id,
+            )
+            raise
         sha256 = delivery.get('sha256') if kind == 'bundle' else None
         path = delivery.get('path') if kind == 'bundle' else None
         bundle_bytes = None
         if kind == 'bundle':
             try:
-                _, handle_fd, bundle_bytes = resolve_delivery_bundle_path(path, roots)
-                try:
-                    os.close(handle_fd)
-                except OSError:
-                    pass
+                resolved_path, handle_fd, raw_size = resolve_delivery_bundle_path(path, roots)
             except DeliveryUnavailableError:
                 bundle_bytes = None
+            else:
+                try:
+                    verified = verify_served_bundle(
+                        resolved_path,
+                        handle_fd,
+                        raw_size,
+                        sha256,
+                        record.get('commit'),
+                        max_bytes=max_bytes,
+                        git=getattr(self.backend, 'bundle_git', None),
+                    )
+                except (DeliveryUnavailableError, DeliveryTooLargeError, DeliveryCorruptError):
+                    bundle_bytes = None
+                else:
+                    bundle_bytes = verified['bytes']
+                    try:
+                        os.close(handle_fd)
+                    except OSError:
+                        pass
         cid = record.get('contribution')
         qs = ('?' + urlencode({'contribution': cid})) if cid else ''
         base_url = '/v1/projects/%s/tasks/%s/delivery' % (quote(pid, safe=''), quote(tid, safe=''))
@@ -10207,52 +10309,65 @@ class ApiHandler(BaseHTTPRequestHandler):
             verify_served_bundle,
         )
         self._project_delivery(ctx)
-        contribution_id = self._delivery_contribution_query(ctx.query)
         pid = ctx.params['pid']
         tid = ctx.params['tid']
-        record = self.backend.task_delivery_record(pid, tid, contribution_id=contribution_id)
-        if record.get('task') != tid or record.get('project') not in (None, pid):
-            raise not_found('Contribution not found')
-        delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
-        if delivery.get('kind') != 'bundle':
-            self._audit_bundle_read(ctx, pid, record, 'refused', reason='remote_delivery')
-            raise invalid(DELIVERY_REMOTE_NO_BUNDLE)
-        roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
-        max_bytes = (
-            self.backend.get_delivery_serve_max_bytes()
-            if hasattr(self.backend, 'get_delivery_serve_max_bytes')
-            else 256 * 1024 * 1024
-        )
+        contribution_id = ctx.query.get('contribution') if isinstance(ctx.query.get('contribution'), str) else None
+        record = None
         size = None
         try:
-            resolved_path, handle_fd, size = resolve_delivery_bundle_path(delivery.get('path'), roots)
-            verified = verify_served_bundle(
-                resolved_path,
-                handle_fd,
-                size,
-                delivery.get('sha256'),
-                record.get('commit'),
-                max_bytes=max_bytes,
-                git=getattr(self.backend, 'bundle_git', None),
+            contribution_id = self._delivery_contribution_query(ctx.query)
+            candidate = self.backend.task_delivery_record(pid, tid, contribution_id=contribution_id)
+            if candidate.get('task') != tid or candidate.get('project') not in (None, pid):
+                raise not_found('Contribution not found')
+            record = candidate
+            delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
+            if delivery.get('kind') != 'bundle':
+                raise invalid(DELIVERY_REMOTE_NO_BUNDLE)
+            roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
+            max_bytes = (
+                self.backend.get_delivery_serve_max_bytes()
+                if hasattr(self.backend, 'get_delivery_serve_max_bytes')
+                else 256 * 1024 * 1024
             )
-        except DeliveryUnavailableError:
-            self._audit_bundle_read(ctx, pid, record, 'refused', reason='bundle_unavailable')
-            raise HttpError(410, 'bundle_unavailable', DELIVERY_NOT_AVAILABLE) from None
-        except DeliveryTooLargeError as error:
-            self._audit_bundle_read(ctx, pid, record, 'refused', reason='payload_too_large', size_bytes=size)
-            raise HttpError(413, 'payload_too_large', str(error)) from None
-        except DeliveryCorruptError:
-            self._audit_bundle_read(ctx, pid, record, 'refused', reason='bundle_checksum_mismatch', size_bytes=size)
-            raise HttpError(503, 'bundle_checksum_mismatch', DELIVERY_CHECKSUM_MISMATCH) from None
+            try:
+                resolved_path, handle_fd, size = resolve_delivery_bundle_path(delivery.get('path'), roots)
+                verified = verify_served_bundle(
+                    resolved_path,
+                    handle_fd,
+                    size,
+                    delivery.get('sha256'),
+                    record.get('commit'),
+                    max_bytes=max_bytes,
+                    git=getattr(self.backend, 'bundle_git', None),
+                )
+            except DeliveryUnavailableError:
+                raise HttpError(410, 'bundle_unavailable', DELIVERY_NOT_AVAILABLE) from None
+            except DeliveryTooLargeError as error:
+                raise HttpError(413, 'payload_too_large', str(error)) from None
+            except DeliveryCorruptError:
+                raise HttpError(503, 'bundle_checksum_mismatch', DELIVERY_CHECKSUM_MISMATCH) from None
+        except HttpError as error:
+            self._audit_bundle_read(
+                ctx,
+                pid,
+                record,
+                'refused',
+                reason=error.code,
+                size_bytes=size,
+                task=tid,
+                contribution=contribution_id,
+            )
+            raise
+        outcome, interrupt_reason = self._send_bundle_stream(handle_fd, record, verified)
         self._audit_bundle_read(
             ctx,
             pid,
             record,
-            'ok',
+            outcome,
+            reason=interrupt_reason,
             sha256=verified['sha256'],
             size_bytes=verified['bytes'],
         )
-        self._send_bundle_stream(handle_fd, record, verified)
         return None, None
 
     #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).

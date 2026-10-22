@@ -334,6 +334,8 @@ class HttpDeliveryTests(unittest.TestCase):
 
         self.store = self._store
         self.service = self._service
+        with self.store.lock:
+            self.service.state['audit'][:] = []
         self.backend = self._backend
         self.backend.state['contributions'][self._task_id] = [
             dict(r) for r in self._initial_task1_contributions
@@ -806,30 +808,22 @@ class HttpDeliveryTests(unittest.TestCase):
         self.assertFalse(out_file.exists())
         self.assertEqual(list(out_dir.iterdir()), [])
 
-        # Also verify via client.py CLI `delivery TASK --out FILE`
-        cfg_path = self.tmp_path / 'http-client-17.json'
-        cfg_path.write_text(json.dumps({'transport': 'http', 'base_url': url, 'token': 'tok'}), encoding='utf-8')
+        # Also verify via http_client.py CLI `delivery PROJECT TASK --out FILE`
         stderr_buf = io.StringIO()
-        with mock.patch.object(
-            sys,
-            'argv',
-            [
-                'client.py',
-                '--config',
-                str(cfg_path),
-                '--project',
-                self.alpha_id,
-                '--actor',
-                'session-1',
-                '--',
-                'delivery',
-                self.task_id,
-                '--out',
-                str(out_file),
-            ],
-        ), mock.patch('sys.stderr', stderr_buf):
-            rc = cli_client.main()
-        self.assertEqual(rc, 2)
+        with mock.patch('sys.stderr', stderr_buf):
+            rc = http_client.main(
+                [
+                    '--base-url',
+                    url,
+                    '--token=tok',
+                    'delivery',
+                    self.alpha_id,
+                    self.task_id,
+                    '--out',
+                    str(out_file),
+                ]
+            )
+        self.assertEqual(rc, 1)
         self.assertIn(rw.DELIVERY_CHECKSUM_MISMATCH, stderr_buf.getvalue())
         self.assertFalse(out_file.exists())
         self.assertEqual(list(out_dir.iterdir()), [])
@@ -891,33 +885,23 @@ class HttpDeliveryTests(unittest.TestCase):
         self.assertFalse(out_file.exists())
         self.assertEqual(list(out_dir.iterdir()), [])
 
-        # And a valid download via client.py succeeds and writes the exact bundle bytes
+        # And a valid download via http_client.py CLI succeeds with --credential and writes the exact bundle bytes
         valid_out = out_dir / 'valid.bundle'
-        cfg_path = self.tmp_path / 'http-client-valid.json'
-        cfg_path.write_text(
-            json.dumps({'transport': 'http', 'base_url': self.base_url, 'token': self.contrib_token}),
-            encoding='utf-8',
-        )
         stdout_buf = io.StringIO()
-        with mock.patch.object(
-            sys,
-            'argv',
-            [
-                'client.py',
-                '--config',
-                str(cfg_path),
-                '--project',
-                self.alpha_id,
-                '--actor',
-                'session-1',
-                '--',
-                'delivery',
-                self.task_id,
-                '--out',
-                str(valid_out),
-            ],
-        ), mock.patch('sys.stdout', stdout_buf):
-            rc = cli_client.main()
+        with mock.patch('sys.stdout', stdout_buf):
+            rc = http_client.main(
+                [
+                    '--base-url',
+                    self.base_url,
+                    'delivery',
+                    self.alpha_id,
+                    self.task_id,
+                    '--credential=' + self.contrib_token,
+                    '--out',
+                    str(valid_out),
+                    '--verify',
+                ]
+            )
         self.assertEqual(rc, 0)
         self.assertTrue(valid_out.is_file())
         self.assertEqual(valid_out.read_bytes(), self.fixture['bundle1_bytes'])
@@ -928,12 +912,8 @@ class HttpDeliveryTests(unittest.TestCase):
     # -- Coordinator precisions & deployment settings -------------------------
 
     def test_ssh_form_answers_fixed_sentence_and_reads_nothing_from_disk(self):
-        """Precision 4: endpoint.py and client.py on SSH/local transport answer the fixed sentence."""
-        cfg_path = self.tmp_path / 'ssh-client.json'
-        cfg_path.write_text(
-            json.dumps({'transport': 'ssh', 'host': 'localhost', 'endpoint': '/bin/true', 'root': '/tmp'}),
-            encoding='utf-8',
-        )
+        """Precision 4 & S3: endpoint.py and client.py answer the fixed sentence and read nothing from disk."""
+        missing_cfg = self.tmp_path / 'missing-client-config.json'
         out_file = self.tmp_path / 'never-created.bundle'
         stderr_buf = io.StringIO()
         with mock.patch.object(
@@ -942,7 +922,7 @@ class HttpDeliveryTests(unittest.TestCase):
             [
                 'client.py',
                 '--config',
-                str(cfg_path),
+                str(missing_cfg),
                 '--project',
                 self.alpha_id,
                 '--actor',
@@ -957,6 +937,7 @@ class HttpDeliveryTests(unittest.TestCase):
             rc = cli_client.main()
         self.assertEqual(rc, 2)
         self.assertEqual(stderr_buf.getvalue().strip(), 'ValueError: ' + rw.DELIVERY_SSH_ONLY_HTTP)
+        self.assertFalse(missing_cfg.exists())
         self.assertFalse(out_file.exists())
 
         if endpoint is not None:
@@ -1260,6 +1241,446 @@ class HttpDeliveryTests(unittest.TestCase):
         )
         self.assertEqual(res.status, 410, res.data)
         self.assertEqual(res.data['error']['message'], rw.DELIVERY_NOT_AVAILABLE)
+
+    def _bundle_audit_events(self):
+        audit_res = self._req('GET', '/v1/projects/%s/audit?limit=100' % self.alpha_id, token=self.owner_token)
+        self.assertEqual(audit_res.status, 200, audit_res.data)
+        return [e for e in audit_res.data['items'] if e.get('action') == 'delivery.bundle.read']
+
+    def test_post_auth_refusals_audit_one_line_each(self):
+        """b1-audit-every-refusal: forged id, foreign-project/other-task id, bad query, malformed id,
+        unknown task, record re-check, and 503 deployment_unavailable each add exactly one audit line
+        on both /delivery and /delivery/bundle.
+        """
+        from http_auth import HttpError
+
+        base_meta = '/v1/projects/%s/tasks/%s/delivery' % (self.alpha_id, self.task_id)
+        base_bundle = base_meta + '/bundle'
+        expected_count = len(self._bundle_audit_events())
+
+        def assert_one_refused_line(path, expected_status, expected_reason, expected_task=self.task_id, expected_cid=None):
+            nonlocal expected_count
+            res = self._req('GET', path, token=self.contrib_token)
+            self.assertEqual(res.status, expected_status, (path, res.data))
+            expected_count += 1
+            events = self._bundle_audit_events()
+            self.assertEqual(len(events), expected_count, (path, events))
+            newest = events[-1]
+            self.assertEqual(newest['outcome'], 'refused', (path, newest))
+            self.assertEqual(newest['reason'], expected_reason, (path, newest))
+            self.assertEqual(newest.get('task'), expected_task, (path, newest))
+            if expected_cid is not None:
+                self.assertEqual(newest.get('contribution'), expected_cid, (path, newest))
+
+        for route_base in (base_meta, base_bundle):
+            # 1. Forged contribution id -> 404 not_found
+            assert_one_refused_line(
+                route_base + '?contribution=c-forged-999999',
+                404,
+                'not_found',
+                expected_cid='c-forged-999999',
+            )
+            # 2. Other project's contribution id -> 404 not_found
+            assert_one_refused_line(
+                route_base + '?contribution=' + self.other_project_contribution_id,
+                404,
+                'not_found',
+                expected_cid=self.other_project_contribution_id,
+            )
+            # 3. Other task's contribution id -> 404 not_found
+            assert_one_refused_line(
+                route_base + '?contribution=' + self.other_task_contribution_id,
+                404,
+                'not_found',
+                expected_cid=self.other_task_contribution_id,
+            )
+            # 4. Bad query parameter -> 422 invalid_payload
+            assert_one_refused_line(
+                route_base + '?unsupported=1',
+                422,
+                'invalid_payload',
+            )
+            # 5. Malformed contribution id -> 404 not_found
+            assert_one_refused_line(
+                route_base + '?contribution=bad%20id!',
+                404,
+                'not_found',
+                expected_cid='bad id!',
+            )
+
+        # 6. Unknown task on both routes -> 404 not_found
+        for suffix in ('/delivery', '/delivery/bundle'):
+            assert_one_refused_line(
+                '/v1/projects/%s/tasks/alpha-999999%s' % (self.alpha_id, suffix),
+                404,
+                'not_found',
+                expected_task='alpha-999999',
+            )
+
+        # 7. Record re-check (record['task'] != tid or record['project'] != pid) -> 404 not_found
+        orig_record = self.backend.task_delivery_record
+        for bad_record in (
+            {'task': 'other-task', 'project': self.alpha_id, 'contribution': self.contribution_id},
+            {'task': self.task_id, 'project': self.beta_id, 'contribution': self.contribution_id},
+        ):
+            with mock.patch.object(self.backend, 'task_delivery_record', return_value=bad_record):
+                assert_one_refused_line(base_meta, 404, 'not_found')
+                assert_one_refused_line(base_bundle, 404, 'not_found')
+        self.assertEqual(self.backend.task_delivery_record, orig_record)
+
+        # 8. 503 when deployment configuration cannot be read -> 503 deployment_unavailable
+        def fail_roots():
+            raise HttpError(503, 'deployment_unavailable', 'Deployment configuration cannot be read')
+
+        with mock.patch.object(self.backend, 'get_delivery_roots', side_effect=fail_roots):
+            assert_one_refused_line(base_meta, 503, 'deployment_unavailable')
+            assert_one_refused_line(base_bundle, 503, 'deployment_unavailable')
+
+    def test_s1_file_rewritten_in_place_after_verification_aborts_stream_and_audits_interrupted(self):
+        """s1-s2-stream-integrity (S1): a file rewritten in place after verify_served_bundle holds back
+        the final block, aborts the connection on digest/fstat mismatch, and audits interrupted.
+        """
+        orig_verify = rw.verify_served_bundle
+        call_count = [0]
+
+        def verify_then_tamper(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs):
+            result = orig_verify(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs)
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                tampered = bytearray(self.fixture['bundle1_bytes'])
+                tampered[-1] ^= 0xFF
+                # Rewrite in place on the same inode so handle_fd reads the mutated bytes during streaming
+                with open(resolved_path, 'r+b') as f:
+                    f.seek(0)
+                    f.write(bytes(tampered))
+                    f.flush()
+            return result
+
+        out_dir = self.tmp_path / 's1-out'
+        out_dir.mkdir()
+        out_file = out_dir / 'tampered.bundle'
+        before_events = len(self._bundle_audit_events())
+
+        with mock.patch('review_workflow.verify_served_bundle', side_effect=verify_then_tamper):
+            hc = http_client.Client(self.base_url).use_credential(self.contrib_token)
+            with self.assertRaisesRegex(ValueError, 'does not match its recorded checksum'):
+                hc.delivery_bundle(self.alpha_id, self.task_id, str(out_file))
+
+        self.assertFalse(out_file.exists())
+        self.assertEqual(list(out_dir.iterdir()), [])
+        events = self._bundle_audit_events()
+        self.assertEqual(len(events), before_events + 1, events)
+        self.assertEqual(events[-1]['outcome'], 'interrupted', events[-1])
+        self.assertEqual(events[-1]['reason'], 'bundle_checksum_mismatch', events[-1])
+
+    def test_s2_short_read_and_read_error_close_connection_without_hanging_or_json_500(self):
+        """s1-s2-stream-integrity (S2): when os.read returns empty with bytes still owed (or raises
+        OSError after 200 headers), the server sets close_connection = True, closes without hanging
+        to the client timeout, never writes a JSON 500 after 200 headers, and audits interrupted.
+        """
+        orig_verify = rw.verify_served_bundle
+
+        # Case A: file truncated in place after verify_served_bundle so os.read returns b'' early
+        def verify_then_truncate(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs):
+            result = orig_verify(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs)
+            with open(resolved_path, 'r+b') as f:
+                f.truncate(16)
+            return result
+
+        before_events = len(self._bundle_audit_events())
+        with mock.patch('review_workflow.verify_served_bundle', side_effect=verify_then_truncate):
+            conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
+            try:
+                conn.request(
+                    'GET',
+                    '/v1/projects/%s/tasks/%s/delivery/bundle' % (self.alpha_id, self.task_id),
+                    headers={'Authorization': 'Bearer ' + self.contrib_token},
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                try:
+                    raw = resp.read()
+                except http.client.IncompleteRead as exc:
+                    raw = exc.partial
+            finally:
+                conn.close()
+
+        self.assertLess(len(raw), len(self.fixture['bundle1_bytes']))
+        self.assertNotIn(b'internal_error', raw)
+        self.assertNotIn(b'"error"', raw)
+        events = self._bundle_audit_events()
+        self.assertEqual(len(events), before_events + 1, events)
+        self.assertEqual(events[-1]['outcome'], 'interrupted', events[-1])
+        self.assertEqual(events[-1]['reason'], 'short_read', events[-1])
+
+        # Restore bundle_path for Case B: os.read raises OSError after 200 headers have gone out
+        self.bundle_path.write_bytes(self.fixture['bundle1_bytes'])
+        orig_os_read = os.read
+        target_fd_box = []
+
+        def verify_capture_fd(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs):
+            res = orig_verify(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs)
+            target_fd_box.append(handle_fd)
+            return res
+
+        def failing_stream_read(fd, n):
+            if target_fd_box and fd == target_fd_box[-1]:
+                raise OSError('simulated disk read failure during stream')
+            return orig_os_read(fd, n)
+
+        before_events = len(self._bundle_audit_events())
+        with mock.patch('review_workflow.verify_served_bundle', side_effect=failing_stream_read if False else verify_capture_fd), \
+                mock.patch('os.read', side_effect=failing_stream_read):
+            conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
+            try:
+                conn.request(
+                    'GET',
+                    '/v1/projects/%s/tasks/%s/delivery/bundle' % (self.alpha_id, self.task_id),
+                    headers={'Authorization': 'Bearer ' + self.contrib_token},
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                try:
+                    raw_err = resp.read()
+                except http.client.IncompleteRead as exc:
+                    raw_err = exc.partial
+            finally:
+                conn.close()
+
+        self.assertEqual(raw_err, b'')
+        self.assertNotIn(b'internal_error', raw_err)
+        self.assertNotIn(b'"error"', raw_err)
+        events = self._bundle_audit_events()
+        self.assertEqual(len(events), before_events + 1, events)
+        self.assertEqual(events[-1]['outcome'], 'interrupted', events[-1])
+        self.assertEqual(events[-1]['reason'], 'stream_error', events[-1])
+
+    def test_s4_approve_only_principal_and_filesystem_and_verification_mutants(self):
+        """s4-tests-and-notes: kill remaining mutants across authorization, filesystem resolution,
+        verification, metadata verified-bytes check, and client --out checks.
+        """
+        from http_auth import CAP_APPROVE, CAP_REVIEWS, HttpError
+
+        # 1. Principal with reviews.approve (CAP_APPROVE) but NOT reviews.write (CAP_REVIEWS) -> 200
+        orig_check_authority = self.service.check_authority
+
+        def approve_only_check_authority(principal, project_id, capability):
+            if capability == CAP_REVIEWS and project_id == self.alpha_id:
+                raise HttpError(403, 'forbidden', 'reviews.write denied for approve-only principal')
+            if capability == CAP_APPROVE and project_id == self.alpha_id:
+                return {'role': 'approver'}
+            return orig_check_authority(principal, project_id, capability)
+
+        with mock.patch.object(self.service, 'check_authority', side_effect=approve_only_check_authority):
+            meta_ok = self._req(
+                'GET',
+                '/v1/projects/%s/tasks/%s/delivery' % (self.alpha_id, self.task_id),
+                token=self.viewer_token,
+            )
+            self.assertEqual(meta_ok.status, 200, meta_ok.data)
+            self.assertEqual(meta_ok.data['bytes'], len(self.fixture['bundle1_bytes']))
+            bundle_ok = self._req(
+                'GET',
+                '/v1/projects/%s/tasks/%s/delivery/bundle' % (self.alpha_id, self.task_id),
+                token=self.viewer_token,
+            )
+            self.assertEqual(bundle_ok.status, 200)
+            self.assertEqual(bundle_ok.body, self.fixture['bundle1_bytes'])
+
+        # 2. Symlinked PARENT directory inside and outside the root, and symlinked ROOT itself -> 410
+        outside_dir = self.tmp_path / 'outside-parent-target'
+        outside_dir.mkdir(parents=True, exist_ok=True)
+        (outside_dir / 'b.bundle').write_bytes(self.fixture['bundle1_bytes'])
+        sym_parent_inside = self.drop_root / 'sym-inside-lane'
+        sym_parent_outside = self.drop_root / 'sym-outside-lane'
+        sym_root = self.tmp_path / 'sym-drop-root'
+        try:
+            os.symlink(str(self.lane_dir), str(sym_parent_inside))
+            os.symlink(str(outside_dir), str(sym_parent_outside))
+            os.symlink(str(self.drop_root), str(sym_root))
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest('symlink creation unavailable: %s' % exc)
+
+        prev = self.contribution_id
+        for idx, (bad_path, roots_override) in enumerate(
+            (
+                (str(sym_parent_inside / 'alpha-1-r1.bundle'), None),
+                (str(sym_parent_outside / 'b.bundle'), None),
+                (str(sym_root / 'lane' / 'alpha-1-r1.bundle'), (str(sym_root),)),
+            ),
+            start=1,
+        ):
+            c_sym = self._contribute_bundle(
+                self.alpha_id,
+                self.task_id,
+                self.contrib_token,
+                commit=self.commit,
+                base_commit=self.base_commit,
+                path=bad_path,
+                sha256=self.bundle_sha256,
+                operation_id='alpha-t1-sym-parent-%d' % idx,
+                previous=prev,
+            )
+            prev = c_sym.data['contribution']['id']
+            old_roots = self.backend.delivery_roots
+            if roots_override is not None:
+                self.backend.delivery_roots = roots_override
+            try:
+                meta_sym = self._req(
+                    'GET',
+                    '/v1/projects/%s/tasks/%s/delivery?contribution=%s' % (self.alpha_id, self.task_id, prev),
+                    token=self.contrib_token,
+                )
+                self.assertEqual(meta_sym.status, 200, (bad_path, meta_sym.data))
+                self.assertIsNone(meta_sym.data['bytes'], bad_path)
+                res_sym = self._req(
+                    'GET',
+                    '/v1/projects/%s/tasks/%s/delivery/bundle?contribution=%s' % (self.alpha_id, self.task_id, prev),
+                    token=self.contrib_token,
+                )
+                self.assertEqual(res_sym.status, 410, (bad_path, res_sym.data))
+                self.assertEqual(res_sym.data['error']['message'], rw.DELIVERY_NOT_AVAILABLE)
+            finally:
+                self.backend.delivery_roots = old_roots
+
+        # 3. Directory and FIFO as recorded bundle path -> 410 (and bytes: None on metadata)
+        dir_as_bundle = self.lane_dir / 'dir-not-file.bundle'
+        dir_as_bundle.mkdir(parents=True, exist_ok=True)
+        non_regular_paths = [dir_as_bundle]
+        if hasattr(os, 'mkfifo') and os.name != 'nt':
+            fifo_as_bundle = self.lane_dir / 'fifo-not-file.bundle'
+            os.mkfifo(str(fifo_as_bundle))
+            non_regular_paths.append(fifo_as_bundle)
+        for idx, nr_path in enumerate(non_regular_paths, start=1):
+            c_nr = self._contribute_bundle(
+                self.alpha_id,
+                self.task_id,
+                self.contrib_token,
+                commit=self.commit,
+                base_commit=self.base_commit,
+                path=str(nr_path),
+                sha256=self.bundle_sha256,
+                operation_id='alpha-t1-nonreg-%d' % idx,
+                previous=prev,
+            )
+            prev = c_nr.data['contribution']['id']
+            meta_nr = self._req(
+                'GET',
+                '/v1/projects/%s/tasks/%s/delivery?contribution=%s' % (self.alpha_id, self.task_id, prev),
+                token=self.contrib_token,
+            )
+            self.assertEqual(meta_nr.status, 200)
+            self.assertIsNone(meta_nr.data['bytes'], nr_path)
+            res_nr = self._req(
+                'GET',
+                '/v1/projects/%s/tasks/%s/delivery/bundle?contribution=%s' % (self.alpha_id, self.task_id, prev),
+                token=self.contrib_token,
+            )
+            self.assertEqual(res_nr.status, 410, (nr_path, res_nr.data))
+            self.assertEqual(res_nr.data['error']['message'], rw.DELIVERY_NOT_AVAILABLE)
+
+        # 4. Empty delivery_roots at the route -> 410 on bundle and bytes: None on metadata
+        old_roots = self.backend.delivery_roots
+        self.backend.delivery_roots = ()
+        try:
+            meta_empty = self._req(
+                'GET',
+                '/v1/projects/%s/tasks/%s/delivery?contribution=%s'
+                % (self.alpha_id, self.task_id, self.contribution_id),
+                token=self.contrib_token,
+            )
+            self.assertEqual(meta_empty.status, 200)
+            self.assertIsNone(meta_empty.data['bytes'])
+            res_empty = self._req(
+                'GET',
+                '/v1/projects/%s/tasks/%s/delivery/bundle?contribution=%s'
+                % (self.alpha_id, self.task_id, self.contribution_id),
+                token=self.contrib_token,
+            )
+            self.assertEqual(res_empty.status, 410)
+            self.assertEqual(res_empty.data['error']['message'], rw.DELIVERY_NOT_AVAILABLE)
+        finally:
+            self.backend.delivery_roots = old_roots
+
+        # 5. Inode re-check around git in verify_served_bundle -> 503 with zero bundle bytes
+        def swap_inode_during_git(args):
+            target = Path(args[-1])
+            replacement = target.with_name(target.name + '.swapped')
+            replacement.write_bytes(self.fixture['bundle1_bytes'])
+            os.replace(str(replacement), str(target))
+            return '%s refs/heads/main\n' % self.commit
+
+        self.backend.bundle_git = swap_inode_during_git
+        try:
+            res_swap = self._req(
+                'GET',
+                '/v1/projects/%s/tasks/%s/delivery/bundle?contribution=%s'
+                % (self.alpha_id, self.task_id, self.contribution_id),
+                token=self.contrib_token,
+            )
+            self.assertEqual(res_swap.status, 503, res_swap.data)
+            self.assertEqual(res_swap.data['error']['message'], rw.DELIVERY_CHECKSUM_MISMATCH)
+            self.assertNotIn(b'# v2 git bundle', res_swap.body)
+        finally:
+            self.backend.bundle_git = None
+
+        # 6. Bundle signature check (valid sha256 + matching git head, but non-bundle first line) -> 503 & bytes: None
+        not_a_bundle = self.lane_dir / 'not-a-git-bundle.bundle'
+        bad_header_bytes = b'NOT A GIT BUNDLE HEADER\n' + b'0' * 128
+        bad_header_sha = hashlib.sha256(bad_header_bytes).hexdigest()
+        not_a_bundle.write_bytes(bad_header_bytes)
+        c_sig = self._contribute_bundle(
+            self.alpha_id,
+            self.task_id,
+            self.contrib_token,
+            commit=self.commit,
+            base_commit=self.base_commit,
+            path=str(not_a_bundle),
+            sha256=bad_header_sha,
+            operation_id='alpha-t1-bad-signature',
+            previous=prev,
+        )
+        sig_cid = c_sig.data['contribution']['id']
+        self.backend.bundle_git = lambda args: '%s refs/heads/main\n' % self.commit
+        try:
+            meta_sig = self._req(
+                'GET',
+                '/v1/projects/%s/tasks/%s/delivery?contribution=%s' % (self.alpha_id, self.task_id, sig_cid),
+                token=self.contrib_token,
+            )
+            self.assertEqual(meta_sig.status, 200)
+            self.assertIsNone(meta_sig.data['bytes'])
+            res_sig = self._req(
+                'GET',
+                '/v1/projects/%s/tasks/%s/delivery/bundle?contribution=%s' % (self.alpha_id, self.task_id, sig_cid),
+                token=self.contrib_token,
+            )
+            self.assertEqual(res_sig.status, 503, res_sig.data)
+            self.assertEqual(res_sig.data['error']['message'], rw.DELIVERY_CHECKSUM_MISMATCH)
+        finally:
+            self.backend.bundle_git = None
+
+        # 7. Client refusing a symlinked --out (and directory --out)
+        out_target = self.tmp_path / 'real-target.txt'
+        out_target.write_text('do-not-overwrite\n', encoding='utf-8')
+        sym_out = self.tmp_path / 'symlink-out.bundle'
+        os.symlink(str(out_target), str(sym_out))
+        hc = http_client.Client(self.base_url).use_credential(self.contrib_token)
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            hc.delivery_bundle(
+                self.alpha_id,
+                self.task_id,
+                str(sym_out),
+                contribution=self.contribution_id,
+            )
+        self.assertEqual(out_target.read_text(encoding='utf-8'), 'do-not-overwrite\n')
+        with self.assertRaisesRegex(ValueError, 'directory'):
+            hc.delivery_bundle(
+                self.alpha_id,
+                self.task_id,
+                str(outside_dir),
+                contribution=self.contribution_id,
+            )
 
 
 sys.path.insert(0, str(ROOT / 'tests'))

@@ -1531,7 +1531,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         if anchor_warnings:warnings=(warnings+'\n'+'\n'.join(anchor_warnings)).strip()
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(classified)})+'\n','stderr':warnings}
     if action=='delivery-record':
-        # Read-only (docs/REVIEW_DELIVERY_DESIGN.md, kittrial-5bb.373): the recorded
+        # Read-only (docs/design/DELIVERY_CODE_OVER_HTTP.md, kittrial-5bb.373): the recorded
         # contribution delivery blocks of one task for the HTTP delivery routes. Like
         # `anchors`, it runs one `bd show --json --include-comments` without taking
         # `.coordination.lock` or `authority_config.lock` and writes no state.

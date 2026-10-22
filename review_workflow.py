@@ -923,7 +923,7 @@ def bundle_commit_problem(observation, commit):
     return None
 
 
-#: Delivered code over HTTP (docs/REVIEW_DELIVERY_DESIGN.md, kittrial-5bb.373).
+#: Delivered code over HTTP (docs/design/DELIVERY_CODE_OVER_HTTP.md, kittrial-5bb.373).
 DELIVERY_SERVE_MAX_BYTES = 256 * 1024 * 1024
 DELIVERY_NOT_AVAILABLE = 'The delivered bundle is not available on this service.'
 DELIVERY_REMOTE_NO_BUNDLE = 'The delivery is remote; there is no bundle to serve.'
@@ -1250,6 +1250,14 @@ def verify_served_bundle(
                 'The delivered bundle is %d bytes, exceeding the %d-byte serve limit (delivery_serve_max_bytes).'
                 % (size, max_bytes)
             )
+        stat_before = os.fstat(handle_fd)
+        stat_snapshot = (
+            stat_before.st_dev,
+            stat_before.st_ino,
+            stat_before.st_size,
+            stat_before.st_mtime_ns,
+            stat_before.st_ctime_ns,
+        )
         os.lseek(handle_fd, 0, os.SEEK_SET)
         first_chunk = os.read(handle_fd, BUNDLE_BLOCK_BYTES)
         if not first_chunk:
@@ -1280,6 +1288,14 @@ def verify_served_bundle(
         if not expected_sha256 or actual_sha != str(expected_sha256).lower():
             raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
         info = os.fstat(handle_fd)
+        if (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        ) != stat_snapshot or total != info.st_size:
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
         before_git = os.lstat(str(resolved_path))
         if (before_git.st_dev, before_git.st_ino) != (info.st_dev, info.st_ino):
             raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
@@ -1297,10 +1313,19 @@ def verify_served_bundle(
         after_git = os.lstat(str(resolved_path))
         if (after_git.st_dev, after_git.st_ino) != (info.st_dev, info.st_ino):
             raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
+        info_after = os.fstat(handle_fd)
+        if (
+            info_after.st_dev,
+            info_after.st_ino,
+            info_after.st_size,
+            info_after.st_mtime_ns,
+            info_after.st_ctime_ns,
+        ) != stat_snapshot:
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
         if bundle_commit_problem(observation, expected_commit) is not None:
             raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
         os.lseek(handle_fd, 0, os.SEEK_SET)
-        return {'bytes': total, 'sha256': actual_sha}
+        return {'bytes': total, 'sha256': actual_sha, 'stat_snapshot': stat_snapshot}
     except BaseException:
         try:
             os.close(handle_fd)

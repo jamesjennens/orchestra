@@ -690,7 +690,7 @@ def review_workflow_writes(root, strict=False, warnings=None):
     return enabled
 
 # ---------------------------------------------------------------------------
-# Delivered code over HTTP (docs/REVIEW_DELIVERY_DESIGN.md, kittrial-5bb.373):
+# Delivered code over HTTP (docs/design/DELIVERY_CODE_OVER_HTTP.md, kittrial-5bb.373):
 # `delivery_roots` and `delivery_serve_max_bytes` in `deployment.private.json`.
 #
 #   delivery_roots           - list of absolute directory paths under which the

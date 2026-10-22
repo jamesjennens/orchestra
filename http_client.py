@@ -933,6 +933,10 @@ def _build_parser():
     dlv.add_argument('--contribution', help='contribution record id (default: current contribution)')
     dlv.add_argument('--verify', action='store_true', help='verify bundle digest when fetching')
     dlv.add_argument('--out', help='write verified bundle bytes to this path')
+    dlv.add_argument('--credential',
+                     help='use this worker credential for the call; pass it as '
+                          '--credential=VALUE so a secret beginning with "-" is not read '
+                          'as an option')
     call = sub.add_parser('call', help='issue one raw JSON request')
     call.add_argument('method')
     call.add_argument('path')
@@ -954,6 +958,8 @@ def main(argv=None):
                     use_cookie=args.use_cookie)
     if args.token:
         client.token = args.token
+    if getattr(args, 'credential', None):
+        client.use_credential(args.credential)
     try:
         if args.command == 'login':
             password = os.environ.get(args.password_env)
