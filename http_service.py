@@ -5055,6 +5055,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # read(count) would keep waiting for all of them, and a trickle never lets the timeout fire.
                 read1 = getattr(self.rfile, 'read1', None)
                 chunk = read1(count) if read1 is not None else self.rfile.read(count)
+            except TimeoutError:
+                # The socket's own timeout: the transfer's time is up (it can fire a moment before the clock below
+                # says so). Never taken for a body that ended early (400).
+                raise task_files.too_slow(length, limit) from None
             except OSError:
                 chunk = b''
             finally:
