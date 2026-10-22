@@ -86,6 +86,12 @@ class TaskFilesOpsRealBdTests(rb.RealBdLabelAliasTests):
         self.assertEqual(('complete', 1, 23), (entry['task_files']['status'], entry['task_files']['files'],
                                                entry['task_files']['bytes']))
         self.assertTrue((self.root / 'backups' / 'tfsrc.task-files' / task_files.MANIFEST).is_file())
+        away = self.root.parent / (self.root.name + '-offsite')
+        self.addCleanup(shutil.rmtree, away, ignore_errors=True)
+        with contextlib.redirect_stdout(io.StringIO()) as copied:
+            admin.backup_copy(self.root, str(away))
+        self.assertIn('Copied tfsrc task files', copied.getvalue())
+        self.assertTrue((away / 'tfsrc.task-files' / task_files.MANIFEST).is_file(), 'backup-copy carries the folder')
         code, out, err = self.main('restore-new', 'tfsrc', 'tfdst')
         self.assertEqual(0, code, err or out)
         self.assertIn('Task files restored: 1 files, 23 bytes', out)

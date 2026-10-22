@@ -1144,6 +1144,9 @@ def purge(project, plan, actor, now, reason=None):
     base = folder(project)
     if base is None:
         raise Refusal(404, 'not_found', 'The project has no task files.')
+    audit = base / AUDIT
+    if os.path.islink(str(audit)):
+        raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'its audit file is a symlink'))
     at = now()
     done = []
     for item in plan['remove']:
@@ -1168,9 +1171,6 @@ def purge(project, plan, actor, now, reason=None):
             'bytes': sum(item.get('bytes') or 0 for item in done),
             'marked': [{'task': m['task'], 'sha256': m['sha256'], 'why': m['why']} for m in plan['marks']],
             'kept_referenced': plan['kept_referenced']}
-    audit = base / AUDIT
-    if os.path.islink(str(audit)):
-        raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'its audit file is a symlink'))
     with open(str(audit), 'a', encoding='utf-8') as handle:
         handle.write(json.dumps(line, ensure_ascii=False, sort_keys=True) + '\n')
         handle.flush()

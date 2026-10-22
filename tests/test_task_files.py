@@ -854,6 +854,15 @@ class TaskFilesHttpTests(agents.AgentHarness):
         self.assertEqual([(self.pid, sha(b'orphan'))], calls)
         self.assertEqual(0, direct.call_count)
 
+    def test_380_an_upload_whose_body_was_read_does_not_linger(self):
+        import http_service
+        before = http_service.LINGERING['lingered']
+        done = self.raw('PUT', self.files_path(name='l.txt', direction='to-worker'), self.tokens['coord'], b'read whole',
+                        headers={'Idempotency-Key': 'files-key-380-02'})
+        self.assertEqual(201, done.status, done.data)
+        time.sleep(0.2)
+        self.assertEqual(before, http_service.LINGERING['lingered'])
+
     def test_380_a_discard_that_fails_never_replaces_the_refusal(self):
         # kittrial-5bb.380 (review of .370 r3): the refusal is the answer; the failed discard is said in the log and
         # the stored bytes stay (an orphan for task-files purge).

@@ -126,6 +126,152 @@ class TaskFilesOpsTests(unittest.TestCase):
         self.assertEqual('refused', outcome['status'])
         self.assertIn('no complete manifest', outcome['problems'][0])
 
+    # -- kittrial-5bb.380 mutant follow-ups: the edges the first tests left open ----------------
+    def test_a_purged_mark_must_name_who_and_when(self):
+        one = self.store.attach('t1', b'abc')
+        entry = task_files.read_entry(self.store.project, 't1', one)
+        for mark, valid in (('yes', False), ({'by': 'op'}, False), ({'at': 'now'}, False),
+                            ({'by': 'op', 'at': 'now', 'reason': None}, True)):
+            self.assertEqual(valid, task_files._valid_entry(dict(entry, purged=mark), 't1', one), mark)
+
+    def test_a_purged_file_is_no_problem_for_the_backup(self):
+        gone = self.store.attach('t1', b'withdrawn bytes', withdrawn=True)
+        plan = task_files.purge_plan(self.store.project, '2026-01-01', {})
+        task_files.purge(self.store.project, plan, 'op', lambda: '2026-10-22T10:00:00Z')
+        self.assertFalse(self.store.blob(gone).exists())
+        summary = task_files.backup_folder(self.store.project, self.target)
+        self.assertEqual((0, []), (summary['files'], summary['problems']))
+
+    def test_a_short_copy_in_the_backup_is_replaced(self):
+        one = self.store.attach('t1', b'the whole file')
+        task_files.backup_folder(self.store.project, self.target)
+        (self.target / one[:2] / one).write_bytes(b'the who')                 # a copy that stopped half way
+        task_files.backup_folder(self.store.project, self.target)
+        self.assertEqual(b'the whole file', (self.target / one[:2] / one).read_bytes())
+
+    def test_a_backup_that_stops_half_way_leaves_no_manifest(self):
+        self.store.attach('t1', b'first')
+        task_files.backup_folder(self.store.project, self.target)
+        self.assertTrue((self.target / task_files.MANIFEST).exists())
+        self.store.attach('t2', b'second')
+        with mock.patch.object(task_files, '_copy_hashed', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                task_files.backup_folder(self.store.project, self.target)
+        self.assertFalse((self.target / task_files.MANIFEST).exists(), 'an unfinished backup is never taken for a whole one')
+
+    def test_a_record_the_project_no_longer_has_leaves_the_backup(self):
+        self.store.attach('t1', b'stays')
+        two = self.store.attach('t2', b'goes')
+        task_files.backup_folder(self.store.project, self.target)
+        relative = Path(task_files.RECORDS) / task_files.task_key('t2') / (two + '.json')
+        self.assertTrue((self.target / relative).exists())
+        os.unlink(str(self.store.project / task_files.FOLDER / relative))
+        task_files.backup_folder(self.store.project, self.target)
+        self.assertFalse((self.target / relative).exists())
+
+    def test_a_backup_folder_that_is_a_link_is_refused(self):
+        self.store.attach('t1', b'abc')
+        elsewhere = unique_dir('task-files-elsewhere-')
+        self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
+        try:
+            os.symlink(str(elsewhere), str(self.target), target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('no symlinks here')
+        with self.assertRaises(task_files.Refusal):
+            task_files.backup_folder(self.store.project, self.target)
+        self.assertEqual([], os.listdir(str(elsewhere)), 'nothing was copied through the link')
+
+    def rewrite_manifest(self, change):
+        path = self.target / task_files.MANIFEST
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        change(manifest)
+        path.write_text(json.dumps(manifest), encoding='utf-8')
+
+    def test_a_size_the_manifest_does_not_have_refuses_the_restore(self):
+        self.store.attach('t1', b'precious')
+        task_files.backup_folder(self.store.project, self.target)
+        self.rewrite_manifest(lambda m: m['blobs'][0].update(bytes=m['blobs'][0]['bytes'] + 1))
+        restored = Store(self)
+        outcome = task_files.restore_folder(self.target, restored.project)
+        self.assertEqual('refused', outcome['status'])
+        self.assertFalse((restored.project / task_files.FOLDER).exists())
+
+    def test_a_manifest_record_outside_records_refuses_the_restore(self):
+        self.store.attach('t1', b'abc')
+        task_files.backup_folder(self.store.project, self.target)
+        self.rewrite_manifest(lambda m: m['record_files'].append({'path': '../evil.json', 'sha256': '0' * 64}))
+        outcome = task_files.restore_folder(self.target, Store(self).project)
+        self.assertEqual('refused', outcome['status'])
+        self.assertIn('a manifest record names no valid path', outcome['problems'])
+
+    def test_verify_names_a_file_whose_record_has_another_size(self):
+        one = self.store.attach('t1', b'abc')
+        entry = task_files.read_entry(self.store.project, 't1', one)
+        task_files._write_entry(self.store.project, dict(entry, bytes=4))
+        self.assertEqual([one], [i['sha256'] for i in task_files.verify(self.store.project)['wrong_size']])
+
+    def test_verify_does_not_miss_the_bytes_of_a_withdrawn_file(self):
+        gone = self.store.attach('t1', b'withdrawn', withdrawn=True)
+        os.unlink(str(self.store.blob(gone)))
+        self.assertEqual([], task_files.verify(self.store.project)['missing'])
+
+    def temp_file(self, name, age):
+        tmp = self.store.project / task_files.FOLDER / task_files.TMP
+        tmp.mkdir(parents=True, exist_ok=True)
+        path = tmp / name
+        path.write_bytes(b'part of an upload')
+        when = time.time() - age
+        os.utime(str(path), (when, when))
+        return path
+
+    def test_only_temporary_files_older_than_a_day_are_old(self):
+        self.temp_file('fresh', 60)
+        self.temp_file('old', 2 * task_files.STALE_SECONDS)
+        self.assertEqual(['old'], task_files.verify(self.store.project)['stale_temp'])
+        plan = task_files.purge_plan(self.store.project, '2026-01-01', {})
+        self.assertEqual(['old'], [i['name'] for i in plan['remove'] if i['kind'] == 'temp'])
+
+    def test_closed_before_means_before_that_day_and_closed_now(self):
+        on_the_day = self.store.attach('t-day', b'closed on the day itself')
+        reopened = self.store.attach('t-again', b'closed once, open again')
+        rows = {'t-day': {'id': 't-day', 'status': 'closed', 'closed_at': '2026-02-01T10:00:00Z'},
+                't-again': {'id': 't-again', 'status': 'open', 'closed_at': '2026-01-05T10:00:00Z'}}
+        plan = task_files.purge_plan(self.store.project, '2026-02-01', rows)
+        self.assertEqual([], plan['marks'])
+        self.assertEqual([], plan['remove'])
+        self.assertTrue(self.store.blob(on_the_day).exists() and self.store.blob(reopened).exists())
+
+    def test_purge_never_removes_through_a_link(self):
+        gone = self.store.attach('t1', b'withdrawn', withdrawn=True)
+        plan = task_files.purge_plan(self.store.project, '2026-01-01', {})
+        outside = unique_dir('task-files-outside-') / 'keep.bin'
+        self.addCleanup(shutil.rmtree, outside.parent, ignore_errors=True)
+        outside.write_bytes(b'not the project\'s')
+        os.unlink(str(self.store.blob(gone)))
+        try:
+            os.symlink(str(outside), str(self.store.blob(gone)))
+        except (OSError, NotImplementedError):
+            self.skipTest('no symlinks here')
+        line = task_files.purge(self.store.project, plan, 'op', lambda: 'now')
+        self.assertEqual([], line['removed'])
+        self.assertTrue(os.path.islink(str(self.store.blob(gone))), 'the link was left as it is')
+        self.assertEqual(b'not the project\'s', outside.read_bytes())
+
+    def test_a_linked_audit_file_refuses_the_purge_before_anything_is_removed(self):
+        gone = self.store.attach('t1', b'withdrawn', withdrawn=True)
+        plan = task_files.purge_plan(self.store.project, '2026-01-01', {})
+        outside = unique_dir('task-files-outside-') / 'audit.jsonl'
+        self.addCleanup(shutil.rmtree, outside.parent, ignore_errors=True)
+        outside.write_text('', encoding='utf-8')
+        try:
+            os.symlink(str(outside), str(self.store.project / task_files.FOLDER / task_files.AUDIT))
+        except (OSError, NotImplementedError):
+            self.skipTest('no symlinks here')
+        with self.assertRaises(task_files.Refusal):
+            task_files.purge(self.store.project, plan, 'op', lambda: 'now')
+        self.assertEqual('', outside.read_text(encoding='utf-8'))
+        self.assertTrue(self.store.blob(gone).exists(), 'nothing was removed')
+
     def test_a_restore_without_the_folder_is_absent_and_places_nothing(self):
         restored = Store(self)
         outcome = task_files.restore_folder(self.backups / 'missing.task-files', restored.project)
@@ -335,6 +481,48 @@ class ProxyCheckTests(unittest.TestCase):
         self.assertFalse(result['passed'])
         self.assertIn('not Orchestra\'s answer', result['sentence'])
 
+    def test_a_401_is_orchestras_only_with_its_code_and_a_request_id(self):
+        for body in ({'error': {'code': 'forbidden', 'message': 'x'}, 'request_id': 'req_1'},
+                     {'error': {'code': 'unauthenticated', 'message': 'Sign in'}}):
+            result = task_files.proxy_check(self.serve(lambda h, b=body: self.reply(h, 401, json.dumps(b).encode())), 64 * 1024)
+            self.assertFalse(result['passed'], body)
+            self.assertIn('not Orchestra\'s answer', result['sentence'])
+
+    def test_the_413_and_the_cut_each_say_what_happened(self):
+        def proxy(h):
+            self.reply(h, 413, b'too large', 'text/plain')
+            length = int(h.headers['Content-Length'])
+            got = 0
+            while got < length:
+                piece = h.rfile.read(min(65536, length - got))
+                if not piece:
+                    break
+                got += len(piece)
+        said = task_files.proxy_check(self.serve(proxy), 2 * task_files.MIB)['sentence']
+        self.assertIn('HTTP 413', said)
+        self.assertIn('refused before it reached Orchestra', said)
+
+        def cut(h):
+            h.rfile.read(1000)
+            h.connection.shutdown(socket.SHUT_RDWR)
+            h.connection.close()
+        said = task_files.proxy_check(self.serve(cut), 8 * task_files.MIB)['sentence']
+        self.assertIn('The connection was cut after', said)
+
+    def test_an_answer_before_the_body_is_read_even_when_the_server_then_resets(self):
+        # A proxy that answers 413 from the Content-Length alone, reads nothing and resets the connection: the check
+        # watches for the answer while it sends, so it reads the 413 before the reset can discard it.
+        import struct
+
+        def resets(h):
+            self.reply(h, 413, b'too large', 'text/plain')
+            h.wfile.flush()
+            time.sleep(0.5)
+            h.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            h.connection.close()
+        result = task_files.proxy_check(self.serve(resets), 32 * task_files.MIB)
+        self.assertEqual(413, result['status'], result)
+
     def test_a_connection_cut_while_sending_is_said(self):
         def cut(h):
             h.rfile.read(1000)
@@ -420,6 +608,8 @@ class AdminTaskFilesTests(unittest.TestCase):
     def test_proxy_check_needs_a_url_and_takes_no_project(self):
         self.assertNotEqual(0, self.run_admin('proxy-check')[0])
         self.assertNotEqual(0, self.run_admin('proxy-check', 'p1', '--url', 'https://office.example')[0])
+        with mock.patch.object(task_files, 'proxy_check', return_value={'passed': False, 'sentence': 'cut'}):
+            self.assertEqual(1, self.run_admin('proxy-check', '--url', 'https://office.example')[0], 'a failed check exits 1')
         with mock.patch.object(task_files, 'proxy_check', return_value={'passed': True, 'sentence': 'ok'}) as check:
             code, out, _ = self.run_admin('proxy-check', '--url', 'https://office.example', '--bytes', '1000')
         self.assertEqual(0, code)
@@ -505,6 +695,65 @@ class LingeringCloseTests(unittest.TestCase):
                         data += piece
                     inner.assertTrue(data.startswith(b'HTTP/1.1 401'), data[:80])
                     inner.assertLess(time.monotonic() - started, 5, 'closed after LINGER_SECONDS, not held open')
+                finally:
+                    sock.close()
+        self.run_against_service(body)
+
+    def test_the_answer_ends_at_once_and_the_thread_is_let_go_at_the_time_bound(self):
+        # The write side is shut at once, so the client reads to the end of the refusal without waiting; the
+        # service's thread then reads the client for at most LINGER_SECONDS, though the client keeps it open.
+        import http_service
+
+        def body(inner):
+            with mock.patch.object(http_service.ApiHandler, 'LINGER_SECONDS', 2):
+                sock = socket.create_connection(('127.0.0.1', inner.port), timeout=10)
+                try:
+                    sock.sendall(b'PUT /v1/projects/p/tasks/t/files?name=a&direction=to-worker HTTP/1.1\r\nHost: x\r\n'
+                                 b'Content-Length: 1000000\r\n\r\n')
+                    started = time.monotonic()
+                    data = b''
+                    while True:
+                        piece = sock.recv(65536)
+                        if not piece:
+                            break
+                        data += piece
+                    inner.assertTrue(data.startswith(b'HTTP/1.1 401'), data[:80])
+                    inner.assertLess(time.monotonic() - started, 1.5, 'the end of the answer came at once')
+                    for _ in range(200):
+                        if http_service.LINGERING['now'] == 0:
+                            break
+                        time.sleep(0.05)
+                    inner.assertEqual(0, http_service.LINGERING['now'], 'still lingering past LINGER_SECONDS')
+                    inner.assertLess(time.monotonic() - started, 6)
+                finally:
+                    sock.close()
+        self.run_against_service(body)
+
+    def test_the_lingering_read_stops_at_the_byte_bound(self):
+        import http_service
+
+        def body(inner):
+            with mock.patch.object(http_service.ApiHandler, 'LINGER_SECONDS', 60), \
+                    mock.patch.object(http_service.ApiHandler, 'LINGER_BYTES', 256 * 1024):
+                sock = socket.create_connection(('127.0.0.1', inner.port), timeout=10)
+                try:
+                    size = 8 * task_files.MIB
+                    sock.sendall(('PUT /v1/projects/p/tasks/t/files?name=a&direction=to-worker HTTP/1.1\r\nHost: x\r\n'
+                                  'Content-Length: %d\r\n\r\n' % size).encode())
+                    started = time.monotonic()
+                    sent = 0
+                    try:
+                        while sent < size:
+                            sock.sendall(b'\0' * 65536)
+                            sent += 65536
+                    except OSError:
+                        pass                                  # the service stopped reading and closed: expected
+                    for _ in range(200):                      # the client keeps its end open, sending nothing more
+                        if http_service.LINGERING['now'] == 0:
+                            break
+                        time.sleep(0.05)
+                    inner.assertEqual(0, http_service.LINGERING['now'], 'still reading past LINGER_BYTES')
+                    inner.assertLess(time.monotonic() - started, 15)
                 finally:
                     sock.close()
         self.run_against_service(body)
