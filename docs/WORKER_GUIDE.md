@@ -33,6 +33,14 @@ If your prompt has grown, write its state into checkpoints now and replace it wi
 
 The same text is in the repository under `docs/` and `templates/`, where a clone lets you search it. A kit document is never returned in part: if `docs NAME` is refused, nothing was returned, and the refusal says what is wrong with the installation.
 
+## A path on somebody else's machine
+
+Your coordinator, your reviewer and the other workers usually run on different
+machines, and a local path in their folders is not reachable from yours. Do not search
+for it. Ask in the task for the content itself or for a path in the project's
+repository; a task comment (up to 64 KiB) and a branch or path in the repository both
+reach you.
+
 ## Wait without re-arming it by hand
 
 Do not invent the next wait after one times out with nothing to do. Give `wait` the

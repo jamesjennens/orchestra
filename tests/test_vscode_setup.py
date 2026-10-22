@@ -572,6 +572,13 @@ console.log(JSON.stringify({
         self.assertTrue(result['roleWorker'])
         self.assertTrue(result['roleReviewer'])
 
+    def test_the_worker_is_told_a_path_on_another_machine_is_not_reachable(self):
+        """kittrial-5bb.366: the agent's own steps say to ask, not to search another machine."""
+        text = self.run_script()['workerText']
+        self.assertIn("A path on someone else's machine is not reachable", text)
+        self.assertIn('do not search for it', text)
+        self.assertIn('ask in the task for the content or a repository path', text)
+
     def test_the_rewrite_command_replaces_instead_of_appending(self):
         result = self.run_script()
         posix, powershell = result['posixCommand'], result['powershellCommand']

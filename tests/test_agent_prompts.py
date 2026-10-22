@@ -245,6 +245,26 @@ class PromptCase(unittest.TestCase):
         self.assertIn('Never tell a web worker to install the kit', text)
         self.assertIn('never give it a CLI-only kit command', text)
 
+    def test_a_coordinator_prompt_says_a_worker_is_on_another_machine(self):
+        """kittrial-5bb.366: a worker elsewhere cannot read the coordinator's folders."""
+        project = {'id': 'p1', 'name': 'Alpha', 'role': 'coordinator'}
+        text = prompt([classify(OWNER, [row('t1', 'awaiting-review', OTHER)], project=project)])['text']
+        self.assertIn('Workers usually run on other machines and cannot read your folders', text)
+        self.assertIn('never name a local path', text)
+        for way in ('branch or path in the project\'s repository',
+                    'text in a task comment (up to 64 KiB)',
+                    'network share both can open',
+                    'task files when they exist'):
+            with self.subTest(way=way):
+                self.assertIn(way, text)
+
+    def test_a_worker_prompt_says_a_path_on_another_machine_is_not_reachable(self):
+        """kittrial-5bb.366: the worker is told to ask for the content, not to hunt for it."""
+        text = prompt([classify(OWNER, [row('t1', 'changes-requested', OTHER)])])['text']
+        self.assertIn('A path on someone else\'s machine is not reachable', text)
+        self.assertIn('do not search for it', text)
+        self.assertIn('ask in the task for the content or a repository path', text)
+
     def test_a_non_coordinator_prompt_does_not_carry_the_web_worker_paragraph(self):
         for role in ('contributor', 'owner', 'viewer'):
             with self.subTest(role=role):
@@ -253,6 +273,7 @@ class PromptCase(unittest.TestCase):
                                         project=project)])['text']
                 self.assertNotIn('no kit and no command line', text)
                 self.assertNotIn('#orchestraBrief', text)
+                self.assertNotIn('Workers usually run on other machines', text)
 
     def test_no_projects_gives_a_grant_note_without_an_action_list(self):
         for agent, reason in ((AGENT, 'This agent has no projects yet.'),

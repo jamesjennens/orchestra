@@ -33,6 +33,11 @@ GET /v1/projects/PROJECT/tasks/TASK/brief; comments: #orchestraHistory or
 GET /v1/projects/PROJECT/tasks/TASK/history; its own work: #orchestraNext or
 GET /v1/agents/me/next - and never tell it to install the kit.
 
+Workers usually run on other machines and cannot read your folders: never name a local
+path to one. Share the content as a branch or path in the project's repository, as text
+in a task comment (up to 64 KiB), on a network share both can open, or through the
+project's task files when they exist.
+
 Rather than making the intake pass on a timer of your own, run `wait --coordinator`
 while you have nothing else to do: it blocks and returns only when there is something
 for you - a new delivery awaiting review, approved work awaiting integration, a
