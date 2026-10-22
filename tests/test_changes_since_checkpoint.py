@@ -304,11 +304,10 @@ class SubLabelActivityCase(unittest.TestCase):
         from http_service import InProcessBackend
         for owner, author in [('agent/sub0', 'agent'), ('agent', 'agent/sub0')]:
             with self.subTest(owner=owner):
-                backend = object.__new__(InProcessBackend)
                 task = dict(id=TASK, assignee=owner, title='Task')
                 checkpoint = dict(actor=author, created_at=STAMP)
                 events = [dict(task=TASK, actor=author, time=STAMP, action='checkpoint-added')]
-                backend.state = {'events': events}
+                backend = InProcessBackend(mock.Mock(state={'canonical': {'events': events}}))
                 before = backend._wait_activity_marker(task)
                 events.append(dict(task=TASK, actor=author, time='2026-09-16T01:00:00Z', action='comment-added'))
                 self.assertEqual(before, backend._wait_activity_marker(task))
