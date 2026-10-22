@@ -204,6 +204,15 @@ me/next read, `#orchestraNext` or `GET /v1/agents/me/next`. Claim: `#orchestraCl
 `#orchestraReview` or `POST /v1/projects/PROJECT/tasks/TASK/reviews`. Release a claim:
 `#orchestraRelease` or `POST /v1/projects/PROJECT/tasks/TASK/release`.
 
+### Reaching a worker on another machine
+
+Workers usually run on other machines, and a local path in your folders is not
+reachable from theirs. Never name a local path. Share the content as a branch or path
+in the project's repository, as text in a task comment (up to 64 KiB), on a network
+share both can open, or through the project's task files when they exist. A worker that
+is given a path on somebody else's machine asks in the task for the content or for a
+repository path instead of searching for it.
+
 ### Every lane of the project: the standing guidance
 
 Every worker over SSH reads it at the start of its next run and acknowledges the

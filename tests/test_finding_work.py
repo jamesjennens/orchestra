@@ -97,6 +97,21 @@ class ServedTextTests(unittest.TestCase):
         self.assertIn('Never tell it to install the kit', text)
         self.assertIn('never give it a CLI-only kit command', text)
 
+    def test_the_text_says_a_worker_on_another_machine_cannot_read_local_paths(self):
+        """kittrial-5bb.366: a coordinator must not hand over a path on their own machine."""
+        text = ' '.join((KIT / 'docs' / 'FINDING_WORK.md').read_text(encoding='utf-8').split())
+        self.assertIn('Reaching a worker on another machine', text)
+        self.assertIn('Workers usually run on other machines', text)
+        self.assertIn('a local path in your folders is not reachable from theirs', text)
+        self.assertIn('Never name a local path', text)
+        for way in ('branch or path in the project\'s repository',
+                    'text in a task comment (up to 64 KiB)',
+                    'network share both can open',
+                    'task files when they exist'):
+            with self.subTest(way=way):
+                self.assertIn(way, text)
+        self.assertIn('asks in the task for the content or for a repository path', text)
+
     def test_the_documented_guidance_comment_and_assignment_routes_exist(self):
         """Check actual compiled routes: source fragments missed paths assembled with ID."""
         import http_service
@@ -368,7 +383,9 @@ class OrderTests(Members):
         self.assertTrue(numbered[0][1].startswith('Read GET https://office.example/v1/projects/PROJECT/guidance'), numbered[0])
         for sentence in ('set_by and set_via', 'unknown legacy route',
                          'Reading never acknowledges', '/guidance/ack',
-                         'exact version read', 'stable Idempotency-Key'):
+                         'exact version read', 'stable Idempotency-Key',
+                         'A path on someone else\'s machine is not reachable',
+                         'ask in the task for the content or a repository path'):
             self.assertIn(sentence, guide)
         self.assertTrue(numbered[1][1].startswith('Your own tasks: GET https://office.example/v1'), numbered[1])
         self.assertTrue(numbered[2][1].startswith('Only when none of your own tasks needs'), numbered[2])
