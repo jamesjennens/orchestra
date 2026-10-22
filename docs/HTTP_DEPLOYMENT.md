@@ -3410,10 +3410,16 @@ line separately and unconfined.
       `newer_activity`, which keeps its released rule. The wait fingerprint includes the
       marker, so a second coordinator
       comment, an edit to the newest one, or a description edit wakes a waiting bridge
-      even while the boolean stays `true`. All six fields are defined once in
+      even while the boolean stays `true`. Alongside it, `newer_activity_fields` carries
+      the current title/description/acceptance digest alone as 16 hex characters
+      (kittrial-5bb.367 F2b): it moves only when one of those three fields is edited,
+      never for a claim, status change or the owner's own comment, and is `null` without
+      a valid checkpoint. A bridge can therefore tell a field edit from the agent's own
+      checkpoint (the marker moves in both cases, this digest only in the first). All
+      seven fields are defined once in
       docs/BRIEFINGS.md, "Newer activity: one definition".
     - **The task read carries the same fields and the changes (kittrial-5bb.354).**
-      `GET /v1/projects/{pid}/tasks/{tid}/brief` adds `activity` (the same six fields,
+      `GET /v1/projects/{pid}/tasks/{tid}/brief` adds `activity` (the same seven fields,
       from the same computation as next and wait) and `changes_since_checkpoint`: the
       entries since the checkpoint, newest first, with author, time, own or other, new,
       edited or late, and a clipped body, plus the changed title, description or

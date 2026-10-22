@@ -470,7 +470,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
         self.assertEqual(action['kind'],'in-progress')
         self.assertTrue(action['newer_activity'])
-        for name in ('newer_activity_marker','newer_activity_by_others','newer_activity_own',
+        for name in ('newer_activity_marker','newer_activity_fields','newer_activity_by_others','newer_activity_own',
                      'newer_activity_coverage','unresolved_directions'):
             self.assertIn(name,action)
         self.assertEqual(action['newer_activity_by_others'],1)
@@ -514,7 +514,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
             summary = web.data['newer']
             self.assertGreaterEqual(summary['own_count'], 1)
             self.assertGreaterEqual(summary['other_count'], 1)
-            self.assertEqual(summary['coverage'], 'timestamp')  # digest capture remains off
+            self.assertEqual(summary['coverage'], 'timestamp')  # the checkpoint predates per-entry digests
             self.assertLessEqual(len(summary['entries']), 5)
             self.assertIn('Reading clears nothing', summary['note'])
             self.assertEqual(action['links']['history'], summary['history'])
@@ -632,7 +632,8 @@ class EndpointAttentionTests(fixes.EndpointCase):
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True,
             # This page is an older endpoint's canonical row: it omits the stable
             # marker and its counts, which honestly read unknown (kittrial-5bb.351).
-            'newer_activity_marker': None, 'newer_activity_by_others': None,
+            'newer_activity_marker': None, 'newer_activity_fields': None,
+            'newer_activity_by_others': None,
             'newer_activity_own': None, 'newer_activity_coverage': None,
             'unresolved_directions': None})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
@@ -803,7 +804,10 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
             self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', True))
             summary = self.request('GET', action['links']['brief'], token=self.secret).data['newer']
             self.assertEqual((summary['other_count'], len(summary['entries']), summary['omitted']), (8, 5, 3))
-            self.assertEqual(summary['coverage'], 'timestamp')
+            # The disposable in-process model keeps no per-entry checkpoint digests, so
+            # its own summary stays 'unknown'; the canonical timestamp rule is pinned in
+            # the endpoint cases above and in test_changes_since_checkpoint.
+            self.assertEqual(summary['coverage'], 'unknown')
         self.assertEqual(before, json.dumps(self.backend.state, sort_keys=True))
 
     def test_every_other_open_review_state_names_who_acts_next(self):

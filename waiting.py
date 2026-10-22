@@ -184,9 +184,11 @@ def normalize_item(item):
     # The stable newer-activity marker is fingerprinted (it is in MOVE_FIELDS). The
     # counts it was read with are carried for the reader but deliberately NOT
     # fingerprinted: incrementing `newer_activity_own` for the caller's own comment
-    # must not wake the caller that wrote it (kittrial-5bb.351).
+    # must not wake the caller that wrote it (kittrial-5bb.351). The current fields
+    # digest (kittrial-5bb.367) is carried the same way: the marker already moves on
+    # a field edit, so fingerprinting the digest too would be redundant.
     for name in ('newer_activity_by_others', 'newer_activity_own',
-                 'newer_activity_coverage', 'unresolved_directions'):
+                 'newer_activity_fields', 'newer_activity_coverage', 'unresolved_directions'):
         if row.get(name) is None:
             value = item.get(name)
             if value is None and isinstance(attention, dict):

@@ -398,7 +398,7 @@ class _InlineWait:
             if isinstance(contribution, dict) and contribution.get('id') is not None:
                 row['contribution_id'] = _InlineWait._scalar(contribution.get('id'))
         for name in ('newer_activity_by_others', 'newer_activity_own',
-                     'newer_activity_coverage', 'unresolved_directions'):
+                     'newer_activity_fields', 'newer_activity_coverage', 'unresolved_directions'):
             if row.get(name) is None:
                 value = item.get(name)
                 if value is None and isinstance(attention, dict):

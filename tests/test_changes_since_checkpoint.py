@@ -31,8 +31,8 @@ import work
 from test_briefing import PROJECT, STAMP, TASK, comment, rows, save_cp
 
 COORD = 'coordinator/session'
-FIELDS = ('newer_activity', 'newer_activity_marker', 'newer_activity_by_others', 'newer_activity_own',
-          'newer_activity_coverage', 'unresolved_directions')
+FIELDS = ('newer_activity', 'newer_activity_marker', 'newer_activity_fields', 'newer_activity_by_others',
+          'newer_activity_own', 'newer_activity_coverage', 'unresolved_directions')
 
 
 def queue_row(data):
@@ -120,6 +120,20 @@ class TheMarkerCase(unittest.TestCase):
         self.assertNotEqual(woke, after)
         self.assertEqual(first, after)
         self.assertEqual(after, self.marker())
+
+    def test_the_current_fields_digest_is_carried_on_its_own(self):
+        """kittrial-5bb.367 F2b: newer_activity_fields is the current fields digest."""
+        first = queue_row(self.data)
+        expected = b.fields_digest(self.data[0])[:b.MARKER_DIGEST]
+        self.assertEqual(expected, first['newer_activity_fields'])
+        self.assertEqual(b.MARKER_DIGEST, len(first['newer_activity_fields']))
+        # An own comment does not move it; a title/description/acceptance edit does.
+        self.data[0]['comments'].append(comment('own', 'My own note', '2026-09-16T01:00:00Z'))
+        self.assertEqual(first['newer_activity_fields'], queue_row(self.data)['newer_activity_fields'])
+        self.data[0]['description'] = 'Intent, revised'
+        second = queue_row(self.data)['newer_activity_fields']
+        self.assertNotEqual(first['newer_activity_fields'], second)
+        self.assertEqual(b.fields_digest(self.data[0])[:b.MARKER_DIGEST], second)
 
     def test_brief_carries_the_same_fields_as_the_queue_row(self):
         self.data[0]['comments'].append(comment('dir', 'A direction', '2026-09-16T02:00:00Z', author=COORD))
@@ -401,7 +415,7 @@ class TheRoutesAgreeCase(fixes.EndpointCase):
         # unresolved_directions is left out of the comparison: the STUB's work path counts
         # directions with provenance writes on while its brief path reads the installation
         # switch (off here); the real endpoint passes the same switch to both, and the
-        # canonical case above compares all six.
+        # canonical case above compares all seven.
         same = [name for name in FIELDS if name != 'unresolved_directions']
         return ({name: action.get(name) for name in same}, {name: row.get(name) for name in same},
                 {name: page.data['activity'].get(name) for name in same}, page.data['changes_since_checkpoint'])

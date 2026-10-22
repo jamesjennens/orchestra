@@ -1600,7 +1600,8 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
     edit of the title, description or acceptance (:func:`activity_marker`). On a read
     that fails, every field is null and the caller keeps its own ``newer_activity``.
     """
-    empty={'newer_activity_marker':None,'newer_activity_by_others':None,'newer_activity_own':None,
+    empty={'newer_activity_marker':None,'newer_activity_fields':None,
+           'newer_activity_by_others':None,'newer_activity_own':None,
            'newer_activity_coverage':None,'unresolved_directions':None}
     try:
         if state is None:state=checkpoint_state(row)
@@ -1623,13 +1624,15 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
     except (ValueError,TypeError,KeyError,StopIteration):return empty
 
 def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved):
-    """The six newer-activity fields from one read's own results (kittrial-5bb.354).
+    """The seven newer-activity fields from one read's own results (kittrial-5bb.354).
 
     ``newer`` is that read's :func:`newer_activity_summary` (computed with
     ``marker_fields=digest``), or None when the checkpoint's cursor is current. brief and
     the queue rows both call this, each with what it already computed, so the fields
     cannot differ and brief reads nothing twice. Raises StopIteration when the checkpoint
-    comment is not on the row.
+    comment is not on the row. ``newer_activity_fields`` is the current title/description/
+    acceptance digest alone (kittrial-5bb.367 F2b), so a reader can separate a field edit
+    from the marker's entry-plus-fields hex; it is null in the empty (no checkpoint) row.
     """
     if newer is None:
         # Nothing newer: the marker still stands, so a later claim, which makes the cursor
@@ -1645,6 +1648,10 @@ def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved):
         marker=newer['newer_activity_marker']
     return {'newer_activity':newer_comment_by_other(row,checkpoint_comment),
             'newer_activity_marker':marker,
+            # kittrial-5bb.367 item F2b: the CURRENT title/description/acceptance digest on
+            # its own, so a bridge can tell a field edit from the agent's own checkpoint
+            # without unpicking the marker's combined hex.
+            'newer_activity_fields':digest[:MARKER_DIGEST],
             'newer_activity_by_others':others,'newer_activity_own':own,
             'newer_activity_coverage':coverage,
             'unresolved_directions':unresolved}
@@ -1928,8 +1935,9 @@ def format_changes(section,activity):
     if section['checkpoint'] is None:return ['Changes since your checkpoint: '+section['note']]
     lines=[]
     if activity:
-        lines.append('Newer activity: newer_activity=%s marker=%s by_others=%s own=%s coverage=%s unresolved_directions=%s'%(
-            activity.get('newer_activity'),activity.get('newer_activity_marker'),activity.get('newer_activity_by_others'),
+        lines.append('Newer activity: newer_activity=%s marker=%s fields=%s by_others=%s own=%s coverage=%s unresolved_directions=%s'%(
+            activity.get('newer_activity'),activity.get('newer_activity_marker'),activity.get('newer_activity_fields'),
+            activity.get('newer_activity_by_others'),
             activity.get('newer_activity_own'),activity.get('newer_activity_coverage'),activity.get('unresolved_directions')))
     if not section['total'] and not section['fields']:
         return lines+['Changes since your checkpoint: none (coverage %s).'%section['coverage']

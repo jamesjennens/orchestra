@@ -478,8 +478,11 @@ is `<entry_id>:<16 hex>` for the newest other-party entry the current checkpoint
 not incorporate, or `fields:<16 hex>` when there is none. The hex also covers the
 current title, description and acceptance, so an edit of one of those moves it and a
 claim never does. It is never a timestamp, and it is `null` only without a valid
-checkpoint or for a legacy one (a client then falls back to the `newer_activity`
-boolean, which keeps its released rule). `brief` carries the same six fields in its
+checkpoint (or for a legacy checkpoint with no timestamp at all); a legacy checkpoint
+read by the timestamp rule gets the same marker, with `timestamp` coverage saying that
+an older edit or a backdated arrival can be missed. `newer_activity_fields` carries the
+current title/description/acceptance digest alone (16 hex), so a field edit can be told
+from the agent's own checkpoint. `brief` carries the same seven fields in its
 `activity` block, its `newer` block carries the same marker, and its
 `changes_since_checkpoint` section lists the entries and the changed fields (from
 `bd history`, read-only, cached per tracker generation) newest first.
