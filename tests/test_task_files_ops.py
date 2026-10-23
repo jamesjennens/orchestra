@@ -671,13 +671,42 @@ class LingeringCloseTests(unittest.TestCase):
         Case().run(outcome)
         self.assertEqual([], [str(e) for e in outcome.errors + outcome.failures])
 
+    @staticmethod
+    def send_like_curl(port, size):
+        # A client as curl is: it sends the whole body whatever the server answered meanwhile, then shuts its write
+        # side and reads the answer. (The proxy check stops at an early answer, so it does not exercise this.)
+        sock = socket.create_connection(('127.0.0.1', port), timeout=10)
+        try:
+            sock.sendall(('PUT /v1/projects/p/tasks/t/files?name=a&direction=to-worker HTTP/1.1\r\nHost: x\r\n'
+                          'Content-Length: %d\r\n\r\n' % size).encode())
+            try:
+                sent = 0
+                while sent < size:
+                    sock.sendall(b'\0' * 65536)
+                    sent += 65536
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass                                          # closed at once: the hard close
+            answer = b''
+            try:
+                while True:
+                    piece = sock.recv(65536)
+                    if not piece:
+                        break
+                    answer += piece
+            except OSError:
+                pass
+            return answer
+        finally:
+            sock.close()
+
     def test_a_refused_upload_lingers_and_its_answer_arrives(self):
         import http_service
 
         def body(inner):
             before = dict(http_service.LINGERING)
-            result = task_files.proxy_check('http://127.0.0.1:%d' % inner.port, 4 * task_files.MIB)
-            inner.assertTrue(result['passed'], result)
+            answer = self.send_like_curl(inner.port, 4 * task_files.MIB)
+            inner.assertTrue(answer.startswith(b'HTTP/1.1 401'), answer[:80])
             for _ in range(100):
                 if http_service.LINGERING['now'] == 0:
                     break
@@ -693,7 +722,7 @@ class LingeringCloseTests(unittest.TestCase):
         def body(inner):
             before = dict(http_service.LINGERING)
             with mock.patch.object(http_service.ApiHandler, 'LINGER_MAX', 0):
-                task_files.proxy_check('http://127.0.0.1:%d' % inner.port, 4 * task_files.MIB)
+                self.send_like_curl(inner.port, 4 * task_files.MIB)
             for _ in range(100):
                 if http_service.LINGERING['hard'] > before['hard']:
                     break
