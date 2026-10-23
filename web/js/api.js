@@ -252,6 +252,8 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     const saved = await baselineIntents();
     return saved.entries.filter(entry => entry.project === pid).map(entry =>
       ({ name: entry.name, retry: () => cutBaseline(pid, { name: entry.name }) }));
+  }
+
   // Task files (kittrial-5bb.376). The bytes travel through the binary transport, never
   // through the JSON one; the CSRF token and the idempotency key are the ones the JSON
   // calls use. The browser sets Content-Length from the body it is given.
