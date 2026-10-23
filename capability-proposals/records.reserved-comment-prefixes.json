@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb370-records-reserved-comment-prefixes-0006",
+  "key": "records.reserved-comment-prefixes",
+  "name": "Reserved Kind: comment prefixes and the raw-comment guard",
+  "aliases": [
+    "reserved comment kind record",
+    "reserved prefix",
+    "Kind: record",
+    "raw comment guard",
+    "check_comment_body",
+    "machine record comment"
+  ],
+  "summary": "reserved_comments.RESERVED lists every machine-record prefix (checkpoints, reviews, lifecycle, follow-ons, task files, ...); every version of each kind is reserved. check_comment_body and check_raw_request refuse a raw comment (HTTP comment route, endpoint bd comments add, --file transport, a BOM or CRLF lookalike) that starts with one, naming the structured operation to use instead; ordinary prose that mentions Kind: mid-text stays valid.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "reserved_comments.py::reserved_match",
+    "reserved_comments.py::check_comment_body",
+    "reserved_comments.py::check_raw_request",
+    "reserved_comments.py::is_legitimate_writer"
+  ],
+  "tests": [
+    "tests/test_task_files.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "records",
+    "comments",
+    "security"
+  ]
+}

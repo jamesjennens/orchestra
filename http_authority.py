@@ -2495,7 +2495,8 @@ BLOCK_CAPABILITIES = {
     'web-merge-slot': {'check': CAP_READ, 'acquire': CAP_COORDINATE,
                        'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
                        'create': CAP_PROJECT_ADMIN},
-    'web-lifecycle': {'read': CAP_READ, 'scope': CAP_COORDINATE, 'fact': CAP_COORDINATE},
+    'web-lifecycle': {'read': CAP_READ, 'check': CAP_READ,
+                      'scope': CAP_COORDINATE, 'fact': CAP_COORDINATE},
     'web-guidance': {'read': CAP_READ, 'ack': CAP_READ, 'onboarding': CAP_READ,
                      'set': CAP_COORDINATE, 'clear': CAP_COORDINATE, 'status': CAP_COORDINATE,
                      'coordinate-check': CAP_COORDINATE, 'onboarding-edit': CAP_COORDINATE},
@@ -2503,6 +2504,11 @@ BLOCK_CAPABILITIES = {
     # coordinator writes, and the record's own journal still has to exist for a read
     # to honour it.
     'assignee-followon': {'record': CAP_COORDINATE, 'withdraw': CAP_COORDINATE},
+    # Files attached to a task (kittrial-5bb.370). The operation names whose standing the
+    # web service relied on: a coordinator's (coordinate), or the assignee's / the author's
+    # (tasks), which the action then checks on the live row or journal under the lock.
+    'task-file': {'coordinator-record': CAP_COORDINATE, 'assignee-record': CAP_TASKS,
+                  'coordinator-withdraw': CAP_COORDINATE, 'author-withdraw': CAP_TASKS},
     'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
                None: CAP_REVIEWS},         # reviews.add, every other operation
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
@@ -2534,7 +2540,8 @@ def required_capability(request):
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-guidance', 'assignee-followon'):
+    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-guidance', 'assignee-followon',
+                  'task-file'):
         if len(args) != 1:
             return None
         item = {'text': args[0]}

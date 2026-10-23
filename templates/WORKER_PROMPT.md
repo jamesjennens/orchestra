@@ -56,6 +56,8 @@ until you deliver a revision: "nothing changed" never applies to it. Otherwise, 
 nothing new is actionable, leave it unchanged and stop rather than inventing work. Stop
 without acting only when every task of yours is with the reviewer or the coordinator.
 
+When you need a decision or information, ask in the task (a comment, or an open item of kind question in your checkpoint) so the coordinator answers it there; do not ask the person at the keyboard, who may not be watching, unless they started this turn with a question for you.
+
 At the start of every run, read the coordinator's current standing guidance with the
 client `guidance get` action, using your saved config, project and actor. It is an
 instruction from the coordinator to follow within the authorization and limits your

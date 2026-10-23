@@ -150,11 +150,14 @@ class BoundEndpointTests(unittest.TestCase):
         # endpoint action the HTTP service calls under CAP_COORDINATE; a bound key must
         # use the confined `coordinator followon` command instead, and the host action
         # cannot be named directly by a bound key any more than these others can.
+        # `task-file` (kittrial-5bb.370) records or withdraws a file attached to a task: the web
+        # service stores the bytes and calls it under live authority; no bound key may name it.
         self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignee-followon', 'assignment-roster', 'create-project', 'creation-standing', 'host-coordination',
-                                                                 'host-projects', 'project-creations', 'task-assign', 'task-release', 'web-guidance', 'web-lifecycle', 'web-merge-slot'])
+                                                                 'host-projects', 'project-creations', 'task-assign', 'task-file', 'task-release', 'web-guidance',
+                                                                 'web-lifecycle', 'web-merge-slot'])
         for action in ('create-project', 'project-creations', 'creation-standing', 'web-merge-slot',
                        'host-coordination', 'host-projects', 'web-guidance', 'web-lifecycle', 'assignment-roster', 'task-assign', 'task-release',
-                       'assignee-followon'):
+                       'assignee-followon', 'task-file'):
             for project in ('alpha', 'beta', 'Not A Name', None):
                 with self.subTest(action=action, project=project):
                     self.refused({'project': project, 'actor': 'a', 'action': action},

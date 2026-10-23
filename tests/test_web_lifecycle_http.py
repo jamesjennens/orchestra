@@ -123,6 +123,37 @@ class LifecycleHttpTests(AgentHarness):
         self.assertEqual(pending.status, 201, pending.data)
         self.assertEqual(self.state()['facts']['tested']['trigger'], 'Waiting for test evidence')
 
+    def test_integration_check_reads_with_project_read_and_writes_nothing(self):
+        user = self.create_account(self.admin, 'check-reader', 'check-reader-password-1')
+        self.assertEqual(self.request('PUT', '/v1/projects/%s/members/%s' % (self.project, user),
+                                      {'role': 'viewer'}, token=self.admin).status, 200)
+        viewer = self.login('check-reader', 'check-reader-password-1')[0]
+        path = ('/v1/projects/' + self.project + '/tasks/' + self.task
+                + '/integration-check?target=main')
+        before = copy.deepcopy(self.service.state['canonical']['tasks'][self.task])
+        result = self.request('GET', path, token=viewer)
+        self.assertEqual(result.status, 200, result.data)
+        self.assertEqual([row['check'] for row in result.data['checks']],
+                         ['approval', 'source_commit', 'slot', 'hold', 'reverted'])
+        self.assertEqual([row['check'] for row in result.data['unchecked']],
+                         ['base_membership', 'tests', 'pushed_result'])
+        self.assertTrue(all(row['known'] is False for row in result.data['unchecked']))
+        self.assertEqual([step['step'] for step in result.data['next']],
+                         ['scope', 'reviewed', 'integrated', 'integrated-mark', 'slot-release'])
+        self.assertEqual(result.data['target'], 'main')
+        self.assertEqual(result.data['task']['id'], self.task)
+        self.assertTrue(result.data['current_actor'])
+        self.assertEqual(self.service.state['canonical']['tasks'][self.task], before)
+
+    def test_integration_check_refuses_another_projects_task_and_unknown_query(self):
+        other = self.create_project(self.admin, 'Other check project')
+        foreign = self.request('GET', '/v1/projects/' + other + '/tasks/' + self.task
+                               + '/integration-check', token=self.admin)
+        self.assertEqual(foreign.status, 404, foreign.data)
+        unknown = self.request('GET', '/v1/projects/' + self.project + '/tasks/' + self.task
+                               + '/integration-check?branch=main', token=self.admin)
+        self.assertEqual(unknown.status, 422, unknown.data)
+
     def test_disposable_backend_cannot_issue_host_integrations_or_marks(self):
         self.set_scope()
         before = copy.deepcopy(self.service.state['canonical']['tasks'][self.task])

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb370-http-request-body-read-0007",
+  "key": "http.request-body-read",
+  "name": "How the web service reads a request body (whole and bounded, or streamed for one route)",
+  "aliases": [
+    "http route request body read",
+    "MAX_BODY_BYTES",
+    "request body limit",
+    "streamed upload",
+    "payload too large",
+    "_read_body"
+  ],
+  "summary": "Before a route runs, ApiHandler._read_request reads its body whole with _read_body: at most max_body (MAX_BODY_BYTES, 256 KiB; 413 beyond), under the slow-client watch, JSON only. A route registered with route(..., stream=True) (STREAMED: the task-file upload only) skips that read and streams its own body in 64 KiB steps; its answer always closes the connection.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "http_service.py::ApiHandler._read_request",
+    "http_service.py::ApiHandler._read_body",
+    "http_service.py::ApiHandler._dispatch",
+    "http_service.py::route",
+    "http_service.py::ApiHandler._files_reader"
+  ],
+  "tests": [
+    "tests/test_task_files.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "transport"
+  ]
+}

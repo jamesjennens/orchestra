@@ -917,7 +917,8 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-guidance',
-                      'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release')
+                      'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
+                      'task-file')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -1163,7 +1164,9 @@ READ_ONLY_ACTIONS={
     # and nothing is written, so it takes the project lock SHARED like the work read itself.
     'wait':_read_only_always,
     'bd':lambda args,operation:not is_mutating_invocation(args),
-    'web-lifecycle':lambda args,operation:operation=='read',
+    # The integration check (kittrial-5bb.374) is a read with no identity: it must never
+    # take the project lock exclusively or write.
+    'web-lifecycle':lambda args,operation:operation in ('read','check'),
     'web-merge-slot':lambda args,operation:operation=='check',
     'web-guidance':_web_guidance_read_only,
     # kittrial-5bb.291 item 1: the roster read takes the project lock shared through
@@ -1218,7 +1221,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-guidance','assignee-followon','task-assign','assignment-roster','task-release'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -2152,12 +2155,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 # store under its held lock. No descriptor supplies this state.
                 return actor_parties(read_state(authority_config.store),label,name)
             def lifecycle_effect():
-                strict=operation=='read' or (payload and payload['dimension'] in ('reviewed','integrated'))
+                # The integration check needs the same operators, owners and mark family
+                # read as the writers whose decisions it reports (kittrial-5bb.374).
+                strict=operation in ('read','check') or (payload and payload['dimension'] in ('reviewed','integrated'))
                 operators=configured_operators(root) if strict else None
                 owners=owner_loader(path,'web lifecycle approval') if strict else None
                 try:
-                    enabled=web_lifecycle_mark_writes(root) if (operation=='read' or
-                              (payload['dimension']=='integrated' and payload['value']=='passed')) else False
+                    # A check never reads the mark writer switch: it does not write, and
+                    # its payload is None (kittrial-5bb.374).
+                    enabled=(web_lifecycle_mark_writes(root) if (operation=='read' or
+                              (operation=='fact' and payload['dimension']=='integrated'
+                               and payload['value']=='passed')) else False)
                 except ValueError as error:
                     raise web_lifecycle.LifecycleError(503,str(error)) from None
                 if operation=='read':
@@ -2170,6 +2178,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     result=web_lifecycle.read(body['task'],actor,runner,path,coordinate=coordinate,
                                               mark_writes=enabled,operators=operators,owners=owners,
                                               parties=lifecycle_parties)
+                elif operation=='check':
+                    result=web_lifecycle.integration_check(body['task'],actor,runner,path,
+                                                           target=body.get('target'),project_name=name,
+                                                           operators=operators,owners=owners,
+                                                           parties=lifecycle_parties)
                 else:
                     result=web_lifecycle.apply(body,actor,runner,path,name,request['operation_id'],
                                                authority=lifecycle_authority,parties=lifecycle_parties,
@@ -2177,7 +2190,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
                         'stderr':warning_text(run_warnings)}
             with held_coordination_lock(path,shared=coordination_lock_shared(request,'web-lifecycle',args,operation)):
-                if operation=='read':
+                if operation in ('read','check'):
                     if authority_config is None:
                         raise web_lifecycle.LifecycleError(403,'Configured web authority required for lifecycle reads')
                     with file_lock(authority_config.lock):
@@ -2310,6 +2323,51 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return guarded_write(root,request,journal_path(path),followon_effect,
                                  authority_config=authority_config,require_authority=True,
                                  runner=runner,identity_check=followon_authority)
+    if action=='task-file':
+        # A file attached to a task, or its withdrawal (kittrial-5bb.370). The web service
+        # stored the bytes under .task-files and verified the caller; here, under the project's
+        # lock and live authority, task_files.apply reads the task row LIVE, applies the
+        # assignee/author rule, writes the reserved history comment and then the host journal
+        # entry that alone makes the file attached (the assignee-followon shape).
+        import task_files
+        from http_authority import server_time
+        args=request.get('args',[])
+        run_warnings=[]
+        def files_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(files_run, project=path)
+        def refused(error):
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','task_file_status':error.status}
+        try:
+            if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                raise task_files.Refusal(422,'invalid','Expected one task-file JSON payload; nothing was written.')
+            try:
+                body=record_json.loads(args[0])
+            except ValueError:
+                raise task_files.Refusal(422,'invalid','The task-file payload is not valid JSON; nothing was written.') from None
+            task_files.payload_check(body)
+            capability=required_capability(request)
+            if capability is None:
+                raise task_files.Refusal(403,'forbidden','This task-file operation has no endpoint capability binding; '
+                                         'nothing was written.')
+            def files_authority():
+                if not verified_web_authority(request,authority_config,capability,name):
+                    raise task_files.Refusal(403,'forbidden','Verified web authority required for task files in this '
+                                             'project; nothing was written.')
+            limit=task_files.limits(root,warnings=run_warnings)
+            def files_effect():
+                status,result=task_files.apply(body,actor,runner,path,server_time,limit=limit)
+                result=dict(result,status=status)
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                        'stderr':warning_text(run_warnings)}
+            with held_coordination_lock(path):
+                return guarded_write(root,request,journal_path(path),files_effect,
+                                     authority_config=authority_config,require_authority=True,
+                                     runner=runner,identity_check=files_authority)
+        except task_files.Refusal as error:
+            return refused(error)
     if action in ('lifecycle','coordinate','requirement'):
         args=request.get('args',[])
         if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):raise ValueError('Expected one JSON payload')

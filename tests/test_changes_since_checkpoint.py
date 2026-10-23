@@ -16,6 +16,7 @@ Pinned here:
 import json
 import os
 import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -599,6 +600,7 @@ class TheRoutesAgreeCase(fixes.EndpointCase):
         self.assertEqual(1, on_next['newer_activity_by_others'])
         self.assertNotEqual(before['wait_newer_activity_marker'], on_next['wait_newer_activity_marker'])
 
+    @mock.patch.dict(os.environ, {'PYTHONUTF8': '1'})
     def test_every_route_carries_the_same_fields_and_the_section_names_the_comment(self):
         self.assertEqual(200, self.request('POST', self.base + '/claim', {}, token=self.secret).status)
         # Before any checkpoint the canonical brief leaves the section out; the task read
@@ -632,6 +634,28 @@ class TheRoutesAgreeCase(fixes.EndpointCase):
         self.assertEqual((0, 0, False), (on_next['newer_activity_by_others'], on_next['newer_activity_own'],
                                          on_next['newer_activity']))
         self.assertEqual(0, section['total'])
+
+    def test_existing_route_flow_keeps_utf8_for_a_legacy_encoded_child_pipe(self):
+        # Reproduce Windows' legacy pipe encoding on every host. The HTTP backend
+        # decodes the stub's envelope as UTF-8; a cp1252 em dash in a stale brief
+        # otherwise raises UnicodeDecodeError and becomes HTTP 500. Inserting the
+        # sub-label test above once moved the original method's decorator onto it.
+        run = subprocess.run
+        encodings = []
+
+        def legacy_pipe(*args, **kwargs):
+            environment = dict(kwargs.get('env') or os.environ)
+            encoding = 'utf-8' if environment.get('PYTHONUTF8') == '1' else 'cp1252'
+            environment['PYTHONIOENCODING'] = encoding
+            kwargs['env'] = environment
+            encodings.append(encoding)
+            return run(*args, **kwargs)
+
+        with mock.patch.dict(os.environ, {'PYTHONUTF8': '0'}), \
+                mock.patch.object(subprocess, 'run', side_effect=legacy_pipe):
+            self.test_every_route_carries_the_same_fields_and_the_section_names_the_comment()
+        self.assertTrue(encodings)
+        self.assertEqual({'utf-8'}, set(encodings))
 
 
 import test_http_agents  # noqa: E402

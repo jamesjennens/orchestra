@@ -579,6 +579,14 @@ console.log(JSON.stringify({
         self.assertIn('do not search for it', text)
         self.assertIn('ask in the task for the content or a repository path', text)
 
+    def test_the_worker_is_told_where_a_question_goes(self):
+        """kittrial-5bb.372: questions go to the coordinator in the task, not to the person."""
+        text = self.run_script()['workerText']
+        self.assertIn('When you need a decision or information, ask in the task (a comment, or an open '
+                      'item of kind question in your checkpoint) so the coordinator answers it there', text)
+        self.assertIn('do not ask the person at the keyboard, who may not be watching, '
+                      'unless they started this turn with a question for you.', text)
+
     def test_the_rewrite_command_replaces_instead_of_appending(self):
         result = self.run_script()
         posix, powershell = result['posixCommand'], result['powershellCommand']
@@ -1034,6 +1042,29 @@ class TheDialogAndThePageCase(unittest.TestCase):
         for text in ('Web personal-agent setup wizard', 'Orchestra Bridge 0.14 or later',
                      'PATCH /v1/agents/me'):
             self.assertIn(text, onboarding)
+
+    def test_windows_terminal_text_is_in_the_doc_and_pointed_to_by_the_wizard(self):
+        """kittrial-5bb.377: the Windows terminal fix is upgrading PSReadLine; the policy only allows the install."""
+        onboarding = ' '.join((ROOT / 'docs' / 'ONBOARDING.md').read_text(encoding='utf-8').split())
+        agents = (ROOT / 'web' / 'js' / 'views' / 'agents.js').read_text(encoding='utf-8')
+        heading = '## Windows: VS Code terminals hang or show no output'
+        self.assertIn(heading, onboarding)
+        section = onboarding[onboarding.index(heading):onboarding.index('## Web personal-agent setup wizard')]
+        for text in ('(Get-Module PSReadLine -ListAvailable).Version', '$PSVersionTable.PSVersion',
+                     'Set-ExecutionPolicy -Scope CurrentUser RemoteSigned',
+                     'Install-Module PSReadLine -Scope CurrentUser -Force -SkipPublisherCheck',
+                     'If `Get-ExecutionPolicy -List` shows MachinePolicy or UserPolicy set, '
+                     'the command will not take effect; ask IT.',
+                     'powershellgallery.com/packages/PSReadLine', 'Unblock-File', 'rename it to `.zip`',
+                     'PSReadLine\\2.4.5', '$env:PSModulePath', 'OneDrive',
+                     '`[Content_Types].xml`, `_rels`, `package`', 'restart VS Code'):
+            with self.subTest(text=text):
+                self.assertIn(text, section)
+        self.assertNotIn('PowerShell 7', section)
+        self.assertNotIn('PowerShell execution policy', onboarding)
+        self.assertIn("setupText.osKind(state.os) === 'windows'", agents)
+        self.assertIn('“Windows: VS Code terminals hang or show no output” in docs/ONBOARDING.md', agents)
+        self.assertNotIn('Windows: PowerShell execution policy', agents)
 
 
 class ProxyAwareSelfCheckCase(unittest.TestCase):

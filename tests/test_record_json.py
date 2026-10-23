@@ -334,7 +334,13 @@ class NoUnguardedParseTests(unittest.TestCase):
             # kittrial-5bb.343: the eleventh guards the web hand-back payload (a text or a
             # reason this caller transports) before the SAME library call the coordinator
             # command makes.
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 11, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            # kittrial-5bb.370: the twelfth guards the web task-file payload (a file's name,
+            # note or withdrawal reason this caller transports).
+            # task_files.py (kittrial-5bb.370): a host journal entry, the task row bd prints and
+            # the two `comments add` answers; a nested or damaged one is no entry, never a
+            # traceback.
+            'task_files.py': 4,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 12, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through

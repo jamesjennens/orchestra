@@ -64,6 +64,23 @@ still holds the role. Worker credentials and ordinary contributor/viewer access
 cannot write these records. This requirement applies with the host author and
 coordinator settings OFF as well as ON.
 
+The integration check (`GET .../tasks/{task}/integration-check`) is the read-only
+merge verdict for the same records. It requires project read
+permission (no `coordinate`), takes nothing and writes nothing. It answers
+`task`, the current `contribution` and review state, five `checks` (`approval`,
+`source_commit`, `slot`, `hold`, `reverted`), three `unchecked` rows
+(`base_membership`, `tests`, `pushed_result`, each `known: false` because the
+server has no code-host access), and `next`: the writes still owed in order
+(scope, reviewed, integrated, the integrated mark, slot release), each with its
+route and the operation identity its native event records when the write was
+already made. A refused row is HTTP 200 with the writer's own sentence, not an
+error, so every reason is visible at once; an absent task is 404. The optional
+`target` query is the branch name the merge-slot acquire accepts. The route is
+classified read-only in `endpoint.py` and `http_authority.py`, so it cannot take
+the slot, write a fact or merge. `merge_ready` covers only the five checks; it
+does not turn the three unchecked rows into a pass. The task page has a lazy
+"Integration check" panel for the refused and unchecked rows.
+
 | Route | Closed request body | Confirmed result |
 | --- | --- | --- |
 | `POST .../lifecycle/scope` | `scope`, `expected_scope_token`, `evidence`, `provenance`, optional `note` | 201 |
@@ -1723,9 +1740,11 @@ previous page did not return, at any page size).
   that wants a coordinator's newest comment reads `recent=20` first, and pages back only
   if it needs to.
 - **A long comment** arrives as several consecutive entries in either order. They share
-  `entry_id` and carry `body_offset` and `continued`. Newest first, the fragments of one
-  comment still come together and in body order, so concatenating them in page order
-  gives the whole comment.
+  `entry_id` and carry `body_offset` and `continued`. Newest first or oldest first, the
+  fragments of one comment come together in body order and count as ONE logical entry
+  toward `recent=N` (or `limit=N`) on both backends, so concatenating them in page order
+  gives the whole comment and a page of `recent=N` always holds `N` logical entries
+  (or the remainder at the end; kittrial-5bb.368).
 - **`since_checkpoint=true`** selects the entries the task's newest valid checkpoint
   did not incorporate (the client's `history --since-checkpoint`), in either order. The
   answer then also names the checkpoint: `since_checkpoint`, `checkpoint_author`,
@@ -1733,9 +1752,25 @@ previous page did not return, at any page size).
   record (no per-entry digests) reports `timestamp`: the released timestamp rule selects
   the entries, so a backdated arrival or an older edit can be missed. A checkpoint by
   the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
-- **The cursor** is bound to the caller, the project and the query. A newest-first
-  cursor continues only a newest-first read with the same `recent`, and an oldest-first
-  one only an oldest-first read; the other is refused (409).
+- **The cursor** is bound to the caller, the project (and task) and the query, and is
+  signed with a per-installation HMAC key (`cursor_key`) kept in the service's state file
+  (`http-state.json`, or the `--state` path). When an upgraded installation loads a state
+  file without `cursor_key`, it generates and saves one immediately so a restart before the
+  next write keeps the same key. `cursor_key` never leaves the server: it never appears in
+  a cursor, an API answer, an export, a log line, an audit record or the agent-facing
+  documents. A backup of the service state carries `cursor_key`, so a restore keeps
+  in-flight cursors valid; rotating `cursor_key` in the state file invalidates existing
+  signed cursors: the reader gets 409 (`Cursor signature is invalid; start the read again
+  without a cursor.`) and must start the read again without a cursor. A newest-first cursor
+  continues only a newest-first read with the same `recent`, and an oldest-first one only
+  an oldest-first read; another query, user, project or task is refused (409). A cursor
+  whose offset, continuation payload or signature was edited is refused (409) with one
+  sentence (`Cursor signature is invalid; start the read again without a cursor.`), while
+  an old unsigned cursor simply restarts the read from the first page (the newest entry for
+  `recent=N`, or the oldest for `limit=N`) and never skips ahead. The cursor stores a
+  compact binding digest and packs the canonical history token without repeating route
+  identifiers, staying well under the 512-character `MAX_CURSOR` limit even for the
+  longest valid project and task IDs (kittrial-5bb.368).
 - **Every answer** says `order` (`oldest-first` or `newest-first`) and `truncated`.
   `truncated` is true, with one sentence in `truncated_note`, when entries exist that the
   answer neither returned nor can continue to. That is the in-process backend
@@ -3038,8 +3073,10 @@ line separately and unconfined.
   not implemented. `POST`/`GET /v1/projects/{id}/feedback` fail closed with
   `501 not_implemented` on the canonical backend because the dedicated feedback
   stream ships with `kittrial-5bb.13`; the service never substitutes its own store
-  for canonical feedback. Attachment uploads are validated and bounded but only
-  their metadata and digest are retained, so **UI readiness is not claimed**.
+  for canonical feedback. The task-create `attachments` field is validated and
+  bounded, then refused with `501 not_implemented`: nothing of it is kept. Files are
+  attached to a task with their own route instead (see "Files attached to a task over
+  HTTP", kittrial-5bb.370), so **UI readiness is not claimed** for that field.
 - The personal-agent registry, one-time agent credential and the agent REST
   contract (`/v1/agents`, `/v1/agents/me`, `/v1/agents/me/next`, and the
   project-scoped `GET /v1/projects/{id}/agents`,
@@ -3727,6 +3764,113 @@ is shown once to the creating superuser; a retry returns secret-free metadata.
 The audit identifies creator and owner, and the owner's card says Created by NAME.
 The owning account can issue a new secret and revoke that first key if the creator
 having seen it matters. Legacy agents have no invented creator attribution.
+
+## Files attached to a task over HTTP
+
+Slice 1 of the task files design, `docs/TASK_FILES_DESIGN.md` (kittrial-5bb.370; the design is
+kittrial-5bb.350 and reaches this folder with that task's integration).
+A coordinator hands the assignee a file ("to the worker"); the assignee hands results back
+("from the worker"). This slice is the store and the four routes; the web panel, the Bridge
+tools, the SSH framing, backups of the folder and the operator commands come later.
+
+### Routes
+
+| Route | Who may call |
+| --- | --- |
+| `GET /v1/projects/{id}/tasks/{task}/files` | every reader of the project (viewers included): the records are in the task's history anyway. Withdrawn files are not listed. Each item says `may_download` for the caller, and `missing: true` when its bytes are not on disk. |
+| `PUT /v1/projects/{id}/tasks/{task}/files?name=NAME&direction=to-worker\|from-worker[&note=TEXT&media_type=TYPE]` | `to-worker`: a coordinator. `from-worker`: the task's current assignee, while the task is open. |
+| `GET /v1/projects/{id}/tasks/{task}/files/{sha256}` | a coordinator, or the current assignee of a task that is not closed |
+| `POST /v1/projects/{id}/tasks/{task}/files/{sha256}/withdraw` `{"reason": "..."}` | the file's author, or a coordinator |
+
+- **A coordinator** is a caller for whom the service's one authority check
+  (`Service.check_authority`, `http_authority.decide`) grants `coordinate` in the project: a
+  `coordinator` or `owner` member, or a personal agent holding the project's live
+  `coordinator` grant. A superuser who is not a member is refused, as on every write route.
+- **The assignee** is the caller whose acting actor is exactly the task's live assignee. The
+  acting actor is the caller's own label, or `?actor=LABEL` checked by `Service.bind_actor`
+  (a credential's own sub-label; another credential's actor is refused `403`). The task row is
+  read fresh from the tracker for every request, so a former assignee loses access the moment
+  the task is reassigned, and a closed task's last assignee may not download.
+- **Never another project**: the project is in the path, a file is bound to its task, and a
+  credential works only on the projects it was granted.
+
+### Storing and serving
+
+- **The upload is the one streamed route.** Its body is the raw bytes. `Content-Length` is
+  required (`411`); the limits and the free disk are checked before a byte is read; the body
+  is read in 64 KiB steps into a temporary file while it is hashed and counted. A body that
+  ends before its `Content-Length` is refused (`400`); every upload answer closes the
+  connection, so bytes past a short `Content-Length` are never read as a next request.
+  `X-Orchestra-SHA256`, when sent, must match (`422`). Only a complete file is renamed into
+  place. `201` answers with the record; the same file under the same name again answers `200`
+  (sent with `X-Orchestra-SHA256`, without reading the body again).
+  - A request with `Transfer-Encoding` (chunked) is refused (`400`): the body must be sent with
+    a `Content-Length`.
+  - `Expect: 100-continue` is answered with `100 Continue` only after the caller was authorized
+    and the limits were checked; a refused upload gets its refusal instead, and the connection
+    is closed.
+  - A transfer has a time limit: `transfer_grace_seconds` plus its size divided by
+    `min_transfer_bytes_per_second` (60 s + 800 s for 25 MiB by default). An upload that is
+    slower is refused (`408`) and nothing is stored; a download that is read more slowly is cut
+    off. Either way its place among the transfers is given back.
+  - When the record of an upload is refused (another body under the same `Idempotency-Key`, the
+    caller lost the task meanwhile, the endpoint refused it), the bytes this upload stored are
+    removed again unless a record names them. Only bytes that a record names count towards
+    `max_project_bytes`.
+- **Downloads** are `application/octet-stream` with `Content-Disposition: attachment`
+  (`filename*=UTF-8''...`), `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`,
+  `Content-Security-Policy: sandbox; default-src 'none'`, `Content-Length` and
+  `X-Orchestra-SHA256`. A client checks the digest before it keeps the file.
+- **Where:** `projects/NAME/.task-files/`, beside the project's other kit-owned state. Blobs are
+  named by the server, `<first two hex>/<sha256>`; the name a person gives is a label only (at
+  most 128 characters, no `/` or `\`, not `.` or `..`, and plain text by the kit's rule for text
+  other people read: no control, bidi, zero-width, C1, tag or variation-selector characters; a
+  note and a withdrawal reason follow the same rule). `.task-files`,
+  or any folder in it, that is a symlink or not a folder is refused (`503`) and nothing is
+  written or served through it.
+- **What makes a file attached** is its host journal entry under `.task-files/records/`,
+  written only by the web service's own endpoint action (`task-file`) under the project's
+  coordination lock, after live authority was verified. The reserved comments
+  `Kind: task-file-v1` and `Kind: task-file-withdrawn-v1` are the task's history record; the
+  raw `comments add` path refuses them, and one planted where the prefix is not reserved (an
+  older kit) grants nothing. An older kit reads them as ordinary comments.
+- **Audit:** every upload, download and withdrawal, and every refusal of one, is one line in
+  the service's audit (`tasks.files.upload`, `tasks.files.download`, `tasks.files.withdraw`)
+  with `task=... sha256=...` in the reason, readable with `GET /v1/projects/{id}/audit`.
+- **An archived project** is read-only: its files are downloaded by its coordinators only, and
+  nothing is attached or withdrawn (`409`).
+- **Audit:** a line that cannot be recorded is said in the service's log (`audit: the ... line
+  ... could not be recorded`), with the action, outcome, task and digest.
+- **Not yet:** the folder is not in backups (slice 5): copy `projects/NAME/.task-files/` with the
+  project until then. Withdrawn bytes stay on disk until the operator purge of slice 5.
+
+### Settings
+
+One object in `deployment.private.json`, read on every request; a value that is not a whole
+number keeps its default, with a warning in the service's log:
+
+```json
+{"task_files": {"max_file_bytes": 26214400, "max_files_per_task": 20, "max_task_bytes": 104857600,
+                "max_project_bytes": 2147483648, "min_free_bytes": 1073741824,
+                "max_transfers": 4, "max_transfers_per_actor": 2, "max_transfers_per_project": 3,
+                "min_transfer_bytes_per_second": 32768, "transfer_grace_seconds": 60}}
+```
+
+| Setting | Default | Refusal |
+| --- | --- | --- |
+| `max_file_bytes` | 25 MiB | `413`: "Uploads stop at 25 MiB a file (task_files.max_file_bytes); this one is 31 MiB." |
+| `max_files_per_task` | 20 | `409` |
+| `max_task_bytes` | 100 MiB | `413` |
+| `max_project_bytes` | 2 GiB | `413` |
+| `min_free_bytes` | 1 GiB | `507`: the upload would leave less free on the project's disk |
+| `max_transfers` | 4 | `503` with `Retry-After` |
+| `max_transfers_per_actor` | 2 (per credential, else per account) | `503` with `Retry-After` |
+| `max_transfers_per_project` | 3 (one project's share of `max_transfers`) | `503` with `Retry-After` |
+| `min_transfer_bytes_per_second` | 32 KiB | `408` for an upload; a download is cut off |
+| `transfer_grace_seconds` | 60 | (added to the time above) |
+
+A reverse proxy in front of the site has its own body limit (nginx `client_max_body_size`);
+raise it to `max_file_bytes`, or uploads near the limit are cut by the proxy.
 
 ## Reference and capability records over HTTP
 

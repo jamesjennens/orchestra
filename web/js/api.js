@@ -340,6 +340,10 @@ export function createApi(transport) {
     projects: () => call('GET', '/v1/projects'),
     project: (pid) => call('GET', `/v1/projects/${pid}`),
     lifecycle: readLifecycle,
+    // The read-only merge check (kittrial-5bb.374). No key and no write.
+    integrationCheck: (pid, tid, target) => call('GET',
+      `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/integration-check`,
+      { params: target ? { target } : undefined }),
     pendingLifecycle,
     setLifecycleScope: (pid, tid, body) => writeLifecycle(pid, tid, 'scope', body),
     recordLifecycleFact: (pid, tid, dimension, body) => writeLifecycle(pid, tid, 'facts/' + encodeURIComponent(dimension), body),

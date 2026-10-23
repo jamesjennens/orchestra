@@ -28,6 +28,7 @@ import base64
 import binascii
 import errno
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -42,7 +43,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import actor_names
 import agent_prompts
@@ -50,6 +51,7 @@ import bd_refusals
 import claim_limit
 import project_setup
 import project_coordination
+import task_files
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
@@ -59,7 +61,7 @@ from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACC
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
                        CAP_RECORDS, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
-                       address_group, authority_request, busy, conflict, forbidden, invalid, not_found,
+                       address_group, authority_request, busy, canonical_json, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, session_limit_seconds, unauthenticated,
                        uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
                        validate_claim_limit)
@@ -285,12 +287,18 @@ def validate_attachments(raw):
     if normalized:
         # No durable attachment binding exists yet, so acknowledging the task with a
         # 201 would discard submitted evidence. Fail closed and say exactly that.
-        raise not_implemented('Durable attachment binding is not implemented yet; '
-                              'resend without attachments or wait for the artifact route')
+        # kittrial-5bb.370: a task's files have their own store and route now; the task-create
+        # field still answers 501 (design 3a: version 1 does not bind it), so no client changes.
+        raise not_implemented('Task creation does not take attachments; create the task, then '
+                              'attach each file with PUT /v1/projects/PID/tasks/TID/files')
     return normalized
 
 
 # ------------------------------------------------------------------ cursors
+_FALLBACK_CURSOR_KEY = secrets.token_hex(32)
+CURSOR_BAD_SIGNATURE = 'Cursor signature is invalid; start the read again without a cursor.'
+
+
 def cursor_scope(query):
     """The part of the query a cursor is bound to: the page size, not the cursor itself.
 
@@ -300,32 +308,161 @@ def cursor_scope(query):
     return {key: value for key, value in query.items() if key != 'cursor'}
 
 
-def make_cursor(principal, project_id, query, offset, extra=None):
-    payload = {'u': principal.user_id, 'p': project_id,
-               'q': request_hash(cursor_scope(query))[:16], 'o': offset}
+def cursor_binding(principal, project_id, query):
+    """Compact 16-char digest binding a cursor to the caller, project and query."""
+    return request_hash({'u': principal.user_id, 'p': project_id,
+                         'q': cursor_scope(query)})[:16]
+
+
+def _cursor_mac(key, body):
+    secret = (key if isinstance(key, str) and key else _FALLBACK_CURSOR_KEY).encode('utf-8')
+    digest = hmac.new(secret, canonical_json(body).encode('utf-8'), hashlib.sha256).digest()[:16]
+    return base64.urlsafe_b64encode(digest).decode('ascii').rstrip('=')
+
+
+def make_cursor(principal, project_id, query, offset, extra=None, *, key=None):
+    payload = {'b': cursor_binding(principal, project_id, query), 'o': offset}
     if extra is not None:
         payload['x'] = extra
-    raw = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    payload['s'] = _cursor_mac(key, payload)
+    raw = json.dumps(payload, separators=(',', ':'), sort_keys=True).encode('utf-8')
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
 
-def read_cursor(principal, project_id, query, cursor):
-    """Return ``{'o': offset, 'x': route-specific continuation}`` for one request."""
+def read_cursor(principal, project_id, query, cursor, *, key=None):
+    """Return ``{'o': offset, 'x': route-specific continuation}`` for one request.
+
+    Signed cursors carry an HMAC (``s``) computed with the installation's ``cursor_key``
+    in service state (never in the cursor); a bad signature is refused with one sentence.
+    Old unsigned cursors matching the caller, project and query simply restart the read
+    (``{'o': 0, 'x': None}``).
+    """
     if cursor is None:
         return {'o': 0, 'x': None}
     if not isinstance(cursor, str) or not CURSOR.fullmatch(cursor):
         raise conflict('Invalid cursor')
     try:
         padded = cursor + '=' * (-len(cursor) % 4)
-        data = record_json.loads(base64.urlsafe_b64decode(padded.encode('ascii')))
+        raw = base64.urlsafe_b64decode(padded.encode('ascii'))
     except (ValueError, binascii.Error, UnicodeError):
         raise conflict('Invalid cursor')
-    if not isinstance(data, dict) or data.get('u') != principal.user_id or \
-            data.get('p') != project_id or \
-            data.get('q') != request_hash(cursor_scope(query))[:16] or \
-            type(data.get('o')) is not int or data['o'] < 0:      # a bool is not an offset
+    try:
+        data = record_json.loads(raw)
+    except (ValueError, UnicodeError):
+        if raw.startswith(b'{"b":') and b'"s":' in raw:
+            raise conflict(CURSOR_BAD_SIGNATURE)
+        raise conflict('Invalid cursor')
+    if not isinstance(data, dict):
+        raise conflict('Invalid cursor')
+    expected_binding = cursor_binding(principal, project_id, query)
+    if 's' not in data:
+        # An old unsigned cursor (or one with its signature omitted) never advances the
+        # offset: once its binding and offset shape check out, it simply restarts the read.
+        if type(data.get('o')) is not int or data['o'] < 0:
+            raise conflict('Invalid cursor')
+        if 'b' in data and set(data) <= {'b', 'o', 'x'}:
+            if data.get('b') != expected_binding:
+                raise conflict('Cursor is stale or belongs to a different query')
+            return {'o': 0, 'x': None}
+        if set(data) <= {'u', 'p', 'q', 'o', 'x'} and 'u' in data and 'q' in data:
+            allowed_projects = ({project_id, project_id.split('/', 1)[0]}
+                                if isinstance(project_id, str) else {project_id})
+            if (data.get('u') != principal.user_id
+                    or data.get('p') not in allowed_projects
+                    or data.get('q') != request_hash(cursor_scope(query))[:16]):
+                raise conflict('Cursor is stale or belongs to a different query')
+            return {'o': 0, 'x': None}
+        raise conflict('Invalid cursor')
+    if not set(data) <= {'b', 'o', 'x', 's'} or not isinstance(data.get('s'), str) or not data['s']:
+        raise conflict(CURSOR_BAD_SIGNATURE)
+    unsigned = {k: v for k, v in data.items() if k != 's'}
+    if not hmac.compare_digest(data['s'], _cursor_mac(key, unsigned)):
+        raise conflict(CURSOR_BAD_SIGNATURE)
+    if (data.get('b') != expected_binding
+            or type(data.get('o')) is not int or data['o'] < 0):   # a bool is not an offset
         raise conflict('Cursor is stale or belongs to a different query')
     return {'o': data['o'], 'x': data.get('x')}
+
+
+def _logical_entries(items):
+    """Group ``items`` into logical entries (fragments of one entry stay together and end at ``continued: False``)."""
+    logical = []
+    current = []
+    for item in items:
+        current.append(item)
+        if not (isinstance(item, dict) and item.get('continued')):
+            logical.append(current)
+            current = []
+    if current:
+        logical.append(current)
+    return logical
+
+
+def _logical_entry_count(items):
+    """How many completed logical entries ``items`` holds."""
+    return sum(1 for item in items if not (isinstance(item, dict) and item.get('continued')))
+
+
+def _slice_logical_entries(items, offset, limit):
+    """Flatten logical entries ``offset:offset + limit`` from ``items``."""
+    return [item for group in _logical_entries(items)[offset:offset + limit] for item in group]
+
+
+def _pack_history_cursor(cursor, project_id, task_id, recent):
+    """Compact a canonical ``briefing.history_page`` token by omitting route-known fields."""
+    if cursor is None or not isinstance(cursor, str):
+        return cursor
+    try:
+        from briefing import untoken
+        c = untoken(cursor)
+        if (not isinstance(c, dict) or c.get('v') != 1 or c.get('kind') != 'history'
+                or c.get('project') != str(project_id) or c.get('task') != str(task_id)
+                or c.get('since') is not None or c.get('entry_kind') is not None
+                or c.get('order', 'oldest') != ('newest' if recent else 'oldest')):
+            return cursor
+        snap_bytes = bytes.fromhex(c['snapshot'])
+        snap_b64 = base64.urlsafe_b64encode(snap_bytes).decode('ascii').rstrip('=')
+        packed = [snap_b64, c['index'], c['offset']]
+        scp = c.get('scp')
+        if scp is not None:
+            prefix = str(task_id) + '-'
+            if isinstance(scp, str) and scp.startswith(prefix):
+                scp = '~' + scp[len(prefix):]
+            packed.append(scp)
+        return packed
+    except Exception:
+        return cursor
+
+
+def _unpack_history_cursor(packed, project_id, task_id, recent):
+    """Restore a canonical ``briefing.history_page`` token from :func:`_pack_history_cursor`."""
+    if packed is None or isinstance(packed, str):
+        return packed
+    if not isinstance(packed, list) or len(packed) not in (3, 4):
+        raise conflict('Invalid cursor')
+    snap_b64, index, start = packed[0], packed[1], packed[2]
+    if not isinstance(snap_b64, str) or type(index) is not int or type(start) is not int:
+        raise conflict('Invalid cursor')
+    try:
+        from briefing import token
+        padded = snap_b64 + '=' * (-len(snap_b64) % 4)
+        digest = base64.urlsafe_b64decode(padded.encode('ascii')).hex()
+        if len(digest) != 64:
+            raise ValueError('bad snapshot digest')
+        c = {'v': 1, 'kind': 'history', 'project': str(project_id), 'task': str(task_id),
+             'snapshot': digest, 'since': None, 'index': index, 'offset': start}
+        if recent:
+            c['order'] = 'newest'
+        if len(packed) == 4 and packed[3] is not None:
+            scp = packed[3]
+            if not isinstance(scp, str):
+                raise ValueError('bad scp')
+            if scp.startswith('~'):
+                scp = str(task_id) + '-' + scp[1:]
+            c['scp'] = scp
+        return token(c)
+    except Exception:
+        raise conflict('Invalid cursor') from None
 
 
 def result_is_stored(service, key):
@@ -475,7 +612,12 @@ class InProcessBackend:
     ROUTES = ('tasks.create', 'tasks.update', 'tasks.claim', 'tasks.comment', 'checkpoints.add',
               'reviews.add', 'feedback.add', 'projects.create', 'projects.archive',
               'members.set', 'members.remove', 'credentials.issue', 'credentials.revoke',
-              'proposals.submit', 'proposals.dispose', 'lifecycle.scope', 'lifecycle.fact')
+              'proposals.submit', 'proposals.dispose', 'lifecycle.scope', 'lifecycle.fact',
+              'files.record', 'files.withdraw')
+    #: Where this service-local backend keeps task files (kittrial-5bb.370): one folder per
+    #: project under it. None (the default) means it has no store and the routes answer 501;
+    #: a test or a local trial sets it.
+    files_root = None
     # Contributed requirement proposals are native records behind the canonical endpoint;
     # this service-local backend has no store for them (the routes answer 501).
     PROPOSALS = False
@@ -644,6 +786,85 @@ class InProcessBackend:
                                          'Current coordinate permission is required'),
                         affordances=affordances, mark_writer_enabled=False)
 
+    def integration_check(self, principal, project_id, task_id, target=None):
+        """The same four-part read on the disposable backend (kittrial-5bb.374).
+
+        This backend has no host merge slot, approval chain reader or mark family, so
+        the checks that need them are refused with that reason rather than invented.
+        It writes nothing, exactly as the host read does.
+        """
+        import lifecycle
+        import web_lifecycle
+        from requirements import content_hash
+        body = dict(operation='check', task=task_id)
+        if target is not None:
+            body['target'] = target
+        try:
+            web_lifecycle.validate(body, None, None)
+        except web_lifecycle.LifecycleError as error:
+            raise invalid(str(error)) from None
+        with self.service.store.lock:
+            self.service.check_authority(principal, project_id, CAP_READ)
+            task = self._task(project_id, task_id)
+            memory = task.get('web_lifecycle') or {}
+            scope = memory.get('scope')
+            token = content_hash(scope) if scope is not None else None
+            facts = {d: {'value': 'unknown', 'event_id': None}
+                     for d in lifecycle.DIMENSIONS}
+            facts.update((memory.get('scopes', {}).get(token) or {}).get('facts') or {})
+            contributions = self.state.get('contributions', {}).get(task_id, [])
+            record = next((r for r in reversed(contributions)
+                           if r.get('kind') == 'contribution'), None)
+            contribution = (dict(comment_id=record.get('id'), commit=record.get('commit'),
+                                 base_commit=record.get('base_commit'),
+                                 author=record.get('actor'), summary=record.get('summary'))
+                            if record else None)
+            commit = (contribution or {}).get('commit')
+            source_allowed = bool(scope is not None and commit
+                                  and scope.get('source_commit') == commit)
+            checks = [
+                dict(check='approval', allowed=False,
+                     reason='Use the host backend to record reviewed or integrated facts'),
+                dict(check='source_commit', allowed=source_allowed,
+                     reason=None if source_allowed else
+                     'The full source commit must match the current approved contribution',
+                     source_commit=(scope or {}).get('source_commit'), contribution_commit=commit),
+                dict(check='slot', allowed=False,
+                     reason='The disposable backend has no host merge slot', holder=None, target=None),
+                dict(check='hold', allowed=True, reason=None),
+                dict(check='reverted', allowed=True, reason=None,
+                     integration_commit=(scope or {}).get('integration_commit'), reverted_commits=[]),
+            ]
+            base = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
+            steps = [dict(step='scope', route='POST ' + base + '/lifecycle/scope',
+                          state='committed' if scope is not None else 'not-attempted',
+                          operation_id=None)]
+            for dimension in ('reviewed', 'integrated'):
+                passed = facts[dimension]['value'] == 'passed'
+                steps.append(dict(step=dimension,
+                                  route='POST ' + base + '/lifecycle/facts/' + dimension,
+                                  state='committed' if passed else 'not-attempted',
+                                  operation_id=None))
+            steps.append(dict(step='integrated-mark',
+                              route='POST ' + base + '/lifecycle/facts/integrated',
+                              automatic=True, state='not-attempted', operation_id=None))
+            steps.append(dict(step='slot-release',
+                              route='POST /v1/projects/%s/merge-slot/release' % project_id,
+                              state='not-held', operation_id=None,
+                              operation_id_note='The server records no identity for a slot release.'))
+            return dict(task=dict(id=task.get('id'), title=task.get('title'),
+                                  status=task.get('status'), assignee=task.get('assignee')),
+                        contribution=contribution, review_state=None,
+                        target=target, checks=checks,
+                        unchecked=[dict(row) for row in
+                                   (dict(check='base_membership', known=False,
+                                         reason='the server has no code-host access'),
+                                    dict(check='tests', known=False,
+                                         reason='the server has no code-host access'),
+                                    dict(check='pushed_result', known=False,
+                                         reason='the server has no code-host access'))],
+                        next=steps, merge_ready=all(row['allowed'] for row in checks))
+
     def _lifecycle_write(self, route, principal, project_id, payload, operation_id):
         import web_lifecycle
         from requirements import content_hash
@@ -698,10 +919,58 @@ class InProcessBackend:
             'checkpoints.add': self._checkpoint_add,
             'reviews.add': self._review_add,
             'feedback.add': self._feedback_add,
+            'files.record': self._files_write,
+            'files.withdraw': self._files_write,
         }.get(route)
         if handler is None:
             raise invalid('Backend route is not implemented for HTTP mapping')
         return handler(principal, project_id, payload)
+
+    # -- task files (kittrial-5bb.370) ---------------------------------------------------------
+    def files_project(self, project_id):
+        if self.files_root is None:
+            return None
+        path = Path(self.files_root) / project_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def files_limits(self):
+        return dict(task_files.LIMIT_DEFAULTS)
+
+    def files_discard(self, project_id, sha256):
+        # r3 (review discard-race): under the lock every record is written under (invoke holds it around apply), so a
+        # record of the same bytes that is being written is finished, and seen, before the blob may be removed.
+        project = self.files_project(project_id)
+        if project is None:
+            return False
+        with self.service.store.lock:
+            return task_files.discard(project, sha256)
+
+    def _files_write(self, principal, project_id, payload):
+        # The same task_files.apply the endpoint action runs, over this backend's own rows:
+        # ``invoke`` holds the store lock and ran the route's authority check first.
+        project = self.files_project(project_id)
+        if project is None:
+            raise not_implemented(FILES_UNAVAILABLE)
+        task = self._task(project_id, payload['task_id'])
+        actor = payload.get('actor') or principal.actor
+
+        def run(argv):
+            if argv[:1] == ['show']:
+                return json.dumps(dict(task, issue_type=task.get('issue_type') or 'task'))
+            if argv[:2] == ['comments', 'add'] and len(argv) >= 4:
+                record = dict(id='comment_' + secrets.token_hex(8), issue_id=task['id'], author=actor,
+                              text=argv[3], created_at=now_iso(self.service._now()))
+                task.setdefault('comments', []).append(record)
+                self._event(project_id, task['id'], 'comment', principal, actor)
+                return json.dumps(record)
+            raise ValueError('unexpected native command')
+        try:
+            status, result = task_files.apply(file_body(payload), actor, run, project,
+                                              lambda: now_iso(self.service._now()), limit=self.files_limits())
+        except task_files.Refusal as refusal:
+            raise files_error(refusal) from None
+        return dict(result, status=status)
 
     def _event(self, project_id, task_id, action, principal, actor=None):
         events = self.state.setdefault('events', [])
@@ -1202,9 +1471,11 @@ class InProcessBackend:
             if marks:
                 checkpoint = events[marks[-1]]
                 events = events[marks[-1] + 1:]
+        logical = _logical_entries(events)
         if recent:
-            events = events[::-1]
-        result = {'items': events[offset:offset + limit], 'total': len(events),
+            logical = logical[::-1]
+        selected = [item for group in logical[offset:offset + limit] for item in group]
+        result = {'items': selected, 'total': len(logical),
                   'canonical_cursor': None, 'activity_cursor': None}
         if since_checkpoint:
             result.update({'since_checkpoint': checkpoint.get('time') if checkpoint else None,
@@ -1786,6 +2057,8 @@ class EndpointBackend:
         # the one canonical `assignee-followon` action, which calls the same library
         # function as `coordinator followon`.
         'followons.record', 'followons.withdraw',
+        # Files attached to a task (kittrial-5bb.370): the canonical `task-file` action.
+        'files.record', 'files.withdraw',
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
         'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
@@ -1847,6 +2120,33 @@ class EndpointBackend:
         """
         return principal.actor or principal.user_id
 
+    def files_project(self, project_id):
+        # The project's own directory (kittrial-5bb.370), the place every other project-owned
+        # file of this service is read from (claiming, guidance). The name's shape and a
+        # symlinked project directory are refused by admin.project_dir.
+        import admin
+        try:
+            path = admin.project_dir(Path(self.root), project_id)
+        except ValueError:
+            raise not_found('Project not found') from None
+        if not path.is_dir():
+            raise not_found('Project not found')
+        return path
+
+    def files_limits(self, warnings=None):
+        return task_files.limits(Path(self.root), warnings=warnings)
+
+    def files_discard(self, project_id, sha256):
+        # r3 (review discard-race): the endpoint's task-file action reads the blob, writes the comment and the journal
+        # entry while it holds the project's .coordination.lock EXCLUSIVELY; this takes the same lock, so another
+        # upload's record of the same bytes is either finished (and its entry keeps the blob) or not yet begun (and it
+        # then finds the blob gone and answers "upload it again"). Never a record whose bytes vanished under it.
+        import fcntl
+        project = self.files_project(project_id)
+        with (project / '.coordination.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return task_files.discard(project, sha256)
+
     def assignment_roster(self, principal, project_id, offset=0, limit=200):
         return self._run('assignment-roster', project_id, self._actor(principal),
                          [json.dumps(dict(offset=offset,limit=limit))],
@@ -1864,6 +2164,17 @@ class EndpointBackend:
     def lifecycle_read(self, principal, project_id, task_id):
         return self._run('web-lifecycle', project_id, self._actor(principal),
                          [json.dumps(dict(operation='read', task=task_id))],
+                         authority=authority_request(principal, project_id, CAP_READ,
+                                                     now=self.service._expiry_now()),
+                         require_authority=True)
+
+    def integration_check(self, principal, project_id, task_id, target=None):
+        """The read-only merge check (kittrial-5bb.374). One read, no identity, no write."""
+        body = dict(operation='check', task=task_id)
+        if target is not None:
+            body['target'] = target
+        return self._run('web-lifecycle', project_id, self._actor(principal),
+                         [json.dumps(body)],
                          authority=authority_request(principal, project_id, CAP_READ,
                                                      now=self.service._expiry_now()),
                          require_authority=True)
@@ -2068,6 +2379,17 @@ class EndpointBackend:
             error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
                                       422: 'invalid'}.get(status, 'unavailable'),
                               (reply.get('stderr') or 'Lifecycle state cannot be read').strip())
+            error.nothing_done = True
+            raise error
+        if action == 'task-file' and isinstance(reply, dict) and reply.get('returncode') == 2 and \
+                isinstance(reply.get('task_file_status') or reply.get('records_status'), int):
+            # The action's own refusal (kittrial-5bb.370): nothing was written, and the status is
+            # the one task_files gave it.
+            status = reply.get('task_file_status') or reply.get('records_status')
+            text = (reply.get('stderr') or 'Task file operation refused').strip().split('\n')[-1]
+            if text.startswith('ValueError: '):
+                text = text[len('ValueError: '):]
+            error = HttpError(status, FILE_CODES.get(status, 'invalid'), text)
             error.nothing_done = True
             raise error
         if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
@@ -2519,6 +2841,10 @@ class EndpointBackend:
                       if key in payload}
             fields.update(operation=operation, task=payload['task_id'])
             return 'web-lifecycle', project_id, [json.dumps(fields)], {}
+        if route.startswith('files.'):
+            # A task file's record or withdrawal (kittrial-5bb.370). The bytes are stored and
+            # checked already; the action reads the row live and writes under the project lock.
+            return 'task-file', project_id, [json.dumps(file_body(payload), ensure_ascii=False)], {}
         if route.startswith('followons.'):
             # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
             # `assignee-followon` action derives every record fact under the project
@@ -2959,15 +3285,16 @@ class EndpointBackend:
         """
         needed = limit if canonical else offset + limit
         collected = []
-        cursor = canonical
+        completed = 0
+        cursor = _unpack_history_cursor(canonical, project_id, task_id, recent)
         total = 0
         activity = None
         selection = {}
         pages = 0
-        while len(collected) < needed and pages < 100:
+        while completed < needed and pages < 500:
             pages += 1
             argv = [str(task_id), '--recent' if recent else '--limit',
-                    str(min(20, needed - len(collected))), '--json']
+                    str(min(20, needed - completed)), '--json']
             if since_checkpoint:
                 argv.append('--since-checkpoint')
             if cursor:
@@ -2975,7 +3302,7 @@ class EndpointBackend:
             reply = self._run('history', project_id, self.actor_namespace + '/read', argv)
             if isinstance(reply, list):
                 collected.extend(reply)
-                total = len(reply)
+                total = len(_logical_entries(reply))
                 cursor = None
                 break
             entries = reply.get('entries') or []
@@ -2986,12 +3313,17 @@ class EndpointBackend:
                     'since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
                     'checkpoint_coverage', 'unverified_entries')}
             collected.extend(entries)
-            total = reply.get('total_entries', len(collected))
+            completed = _logical_entry_count(collected)
+            total = reply.get('total_entries', len(_logical_entries(collected)))
             cursor = reply.get('next_cursor')
-            if cursor is None:
+            if cursor is None or not entries:
                 break
-        return dict({'items': (collected[:limit] if canonical else collected[offset:offset + limit]),
-                     'total': total, 'canonical_cursor': cursor, 'activity_cursor': activity}, **selection)
+        items = (_slice_logical_entries(collected, 0, limit) if canonical
+                 else _slice_logical_entries(collected, offset, limit))
+        return dict({'items': items,
+                     'total': total,
+                     'canonical_cursor': _pack_history_cursor(cursor, project_id, task_id, recent),
+                     'activity_cursor': activity}, **selection)
 
     def list_feedback(self, project_id, limit, offset):
         raise not_implemented('Canonical backend has no feedback read yet: %s'
@@ -4141,15 +4473,98 @@ class RouteContext:
 
 
 ROUTES = []
+#: The routes that read their own body as a stream (kittrial-5bb.370): the task-file upload
+#: only. Every other route's body is read whole, bounded by ``max_body``, before it runs.
+STREAMED = set()
 
 
-def route(method, pattern, *, anonymous=False, csrf=True):
+def route(method, pattern, *, anonymous=False, csrf=True, stream=False):
     compiled = re.compile('^' + pattern + '$')
 
     def register(handler):
         ROUTES.append((method, compiled, handler.__name__, anonymous, csrf))
+        if stream:
+            STREAMED.add(handler.__name__)
         return handler
     return register
+
+
+#: Said when the service is moving as many files as it allows (kittrial-5bb.370, design 4).
+TRANSFERS_BUSY = ('The server is moving as many files as it allows at once (%s); send this again in a moment.')
+
+
+class TransferGate:
+    # At most ``max_transfers`` uploads and downloads in the service and
+    # ``max_transfers_per_actor`` for one caller at once (design 4: the service has no
+    # per-actor rate limit, so these two caps are the bound). Taken before a byte moves.
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._total = 0
+        self._by = {}
+        self._projects = {}         # r2 (review s1): one project's share of the service's transfers
+
+    def take(self, key, limit, project=None):
+        with self._lock:
+            if self._total >= limit['max_transfers']:
+                raise busy(TRANSFERS_BUSY % task_files.setting('max_transfers'), retry_after=1)
+            if self._by.get(key, 0) >= limit['max_transfers_per_actor']:
+                raise busy(TRANSFERS_BUSY % task_files.setting('max_transfers_per_actor'), retry_after=1)
+            if project is not None and self._projects.get(project, 0) >= limit['max_transfers_per_project']:
+                raise busy(TRANSFERS_BUSY % task_files.setting('max_transfers_per_project'), retry_after=1)
+            self._total += 1
+            self._by[key] = self._by.get(key, 0) + 1
+            if project is not None:
+                self._projects[project] = self._projects.get(project, 0) + 1
+
+    def give(self, key, project=None):
+        with self._lock:
+            self._total -= 1
+            for table, name in ((self._by, key), (self._projects, project)):
+                if name is None:
+                    continue
+                left = table.get(name, 1) - 1
+                if left > 0:
+                    table[name] = left
+                else:
+                    table.pop(name, None)
+
+    def held(self):
+        with self._lock:
+            return self._total, dict(self._by)
+
+    def projects(self):
+        with self._lock:
+            return dict(self._projects)
+
+
+#: One gate for handlers made without :func:`build_handler` (a test's own subclass).
+DEFAULT_TRANSFERS = TransferGate()
+FILES_UNAVAILABLE = 'Task files are not available on this server.'
+FILE_CODES = {400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict', 411: 'length_required',
+              413: 'payload_too_large', 422: 'invalid', 501: 'not_implemented', 503: 'unavailable',
+              507: 'insufficient_storage'}
+
+
+def files_error(refusal):
+    # A task_files.Refusal as the HttpError the route answers with.
+    error = HttpError(refusal.status, refusal.code, str(refusal))
+    if refusal.retry_after:
+        error.retry_after = refusal.retry_after
+    error.nothing_done = True
+    return error
+
+
+def file_body(payload):
+    # The canonical task-file request from a files.* route payload (no actor, no route data).
+    body = {'schema_version': 1, 'operation': payload['operation'], 'task': payload['task_id'],
+            'sha256': payload['sha256']}
+    if payload['operation'].endswith('-record'):
+        body.update(name=payload['name'], bytes=payload['bytes'], media_type=payload['media_type'],
+                    direction=payload['direction'], note=payload.get('note'))
+    else:
+        body['reason'] = payload['reason']
+    return body
 
 
 #: What an HTTP agent needs before a guidance item is a move it can actually make: a
@@ -4189,6 +4604,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     read_cache_lock = None
     trusted_proxies = ()
     max_body = MAX_BODY_BYTES
+    #: The task-file transfer gate (kittrial-5bb.370); one per configured service.
+    transfers = None
     #: Send ``Strict-Transport-Security`` on HTTPS answers (kittrial-5bb.168 item 6). False
     #: unless the operator's setting turns it on.
     hsts = False
@@ -4323,8 +4740,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             if match is None:
                 raise not_found('No such operation')
             name, anonymous, csrf, params = match
+            stream = name in STREAMED
+            if stream:
+                # The streamed upload's answer always ends the connection: a refusal before its
+                # body was read, or a body that was not what its Content-Length said, must never
+                # leave bytes behind that the next request on this connection would be read from.
+                self._say_close = True
             payload, auth_source = self._read_request(method, anonymous, params, csrf,
-                                                      request_id)
+                                                      request_id, stream=stream)
             # The semantic route target is the method plus the concrete path (with the
             # real account/project/task id substituted). It is the idempotency
             # namespace, so two different targets never share a receipt.
@@ -4334,7 +4757,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                self._is_secure(), route_target)
             begun = (name, ctx.idempotency_key is not None)
             status, response = getattr(self, name)(ctx)
-            self._send_json(status, response)
+            if status is not None:              # None: the route sent its own answer (a file download)
+                self._send_json(status, response)
         except HttpError as error:
             self._note_denied(error, request_id)
             self._retry_after = getattr(error, 'retry_after', None)
@@ -4489,8 +4913,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid('Idempotency-Key must be 8-128 URL-safe characters')
         return key
 
-    def _read_request(self, method, anonymous, params, csrf, request_id):
-        body = self._read_body()
+    def _read_request(self, method, anonymous, params, csrf, request_id, stream=False):
+        body = b'' if stream else self._read_body()
         payload = None
         if body:
             content_type = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
@@ -4530,6 +4954,28 @@ class ApiHandler(BaseHTTPRequestHandler):
                         raise forbidden('CSRF token missing or invalid')
         return payload, auth_source
 
+    #: r3 (review N1): how long after a too-slow upload's deadline the server still waits to write its 408.
+    ANSWER_MARGIN = 5
+
+    def parse_request(self):
+        # r3 (review N4): one request's Expect: 100-continue never outlives it; http.server notes it while it parses.
+        self._expect_100 = False
+        return super().parse_request()
+
+    def handle_expect_100(self):
+        # r2 (review s4c): never "100 Continue" before the route has authorized the request and checked its limits.
+        # http.server answers it while it parses the request line; here it is only noted, and _continue sends it
+        # where the body is about to be read: at once for a JSON body (as before), and for the streamed upload only
+        # after every check passed. A refused upload is answered with its refusal and the connection closed.
+        self._expect_100 = True
+        return True
+
+    def _continue(self):
+        if getattr(self, '_expect_100', False):
+            self._expect_100 = False
+            self.send_response_only(100)
+            self.end_headers()
+
     def _read_body(self):
         length_header = self.headers.get('Content-Length')
         if length_header is None:
@@ -4544,6 +4990,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise HttpError(413, 'payload_too_large', 'Request body exceeds the configured limit')
         if length == 0:
             return b''
+        self._continue()
         if not getattr(self, '_guarded', False):
             return self.rfile.read(length)
         self.server.watch(self.connection, self.server.client_seconds)
@@ -4598,6 +5045,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_header('Strict-Transport-Security', HSTS_HEADER)
 
     def _send_json(self, status, body):
+        self._expect_100 = False            # r2 (s4c): one request's Expect ends with its answer
         # 204/304 are bodyless by definition; sending a body would desynchronize an
         # HTTP/1.1 keep-alive connection.
         payload = b'' if status in (204, 304) else \
@@ -4778,6 +5226,370 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._forget_cached_reads(ctx.principal, project_id)
         return status, public
 
+    # -- files attached to a task (kittrial-5bb.370; docs/TASK_FILES_DESIGN.md) -------------------
+    #
+    # Who may (1a A, 1b A, read live on every request): a COORDINATOR is a caller for whom
+    # ``Service.check_authority(CAP_COORDINATE)`` passes in the project (the coordinator and owner
+    # roles, an agent's live coordinator grant, a superuser); the ASSIGNEE is the caller whose
+    # acting actor (its own label, or ``?actor=`` bound by ``Service.bind_actor``) is exactly the
+    # live row's assignee of a task that is not closed. Attach to-worker: a coordinator. Attach
+    # from-worker: the assignee. Download: either. Withdraw: the file's author or a coordinator.
+    # List: every reader of the project (the records are in the task's history anyway).
+
+    def _files_project(self, ctx):
+        place = getattr(self.backend, 'files_project', None)
+        project = place(ctx.params['pid']) if place is not None else None
+        if project is None:
+            raise not_implemented(FILES_UNAVAILABLE)
+        return project
+
+    def _files_limits(self):
+        read = getattr(self.backend, 'files_limits', None)
+        if read is None:
+            return dict(task_files.LIMIT_DEFAULTS)
+        warnings = []
+        try:
+            limit = read(warnings=warnings)
+        except TypeError:
+            limit = read()
+        for line in warnings:
+            print('task files: ' + ascii(line[:300]), file=sys.stderr, flush=True)
+        return limit
+
+    def _files_actor(self, ctx):
+        bound = self.service.bind_actor(ctx.principal, ctx.query.get('actor'))
+        return bound or ctx.principal.actor or ctx.principal.user_id
+
+    def _files_row(self, ctx):
+        # The task row read LIVE for this request (a fresh tracker read, never the read cache).
+        row = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+        if not isinstance(row, dict) or row.get('issue_type') == 'event' or is_merge_slot(row):
+            raise not_found('Task not found')
+        self._refuse_record_anchor(row)
+        return row
+
+    def _files_coordinates(self, ctx):
+        try:
+            self.service.check_authority(ctx.principal, ctx.params['pid'], CAP_COORDINATE)
+            return True
+        except HttpError:
+            return False
+
+    def _files_key(self, ctx):
+        # Whose share of the transfers this is: the credential, else the account. A credential
+        # cannot widen its share by naming another sub-label.
+        return ctx.principal.credential_id or ctx.principal.user_id or 'anonymous'
+
+    def _files_target(self, ctx, sha256=None):
+        return 'task=%s sha256=%s' % (ctx.params['tid'], sha256 or ctx.params.get('sha') or '-')
+
+    def _files_audit(self, ctx, action, outcome, reason, actor=None):
+        # r2 (review s4e): an audit line that cannot be recorded is said in the service's log, with what it was
+        # about (never a secret: the action, outcome, task and digest); the answer itself is not changed by it.
+        try:
+            with self.service.store.lock:
+                self.service.audit(ctx.request_id, ctx.principal, action, outcome,
+                                   project_id=ctx.params['pid'], reason=reason, actor=actor)
+                self.service.store.save_soon('the audit entry of a task file')
+            return True
+        except Exception as failed:
+            print('audit: the %s line (%s, %s) of request %s could not be recorded: %s'
+                  % (action, outcome, ascii(str(reason)[:200]), ctx.request_id,
+                     ascii(str(failed)[:200]) or type(failed).__name__), file=sys.stderr, flush=True)
+            return False
+
+    def _files_refused(self, ctx, action, error, sha256=None):
+        # One audit line for a refused upload, download or withdrawal, then the refusal itself.
+        if isinstance(error, task_files.Refusal):
+            error = files_error(error)
+        if isinstance(error, HttpError):
+            self._files_audit(ctx, action, 'denied' if error.status in (401, 403) else 'rejected',
+                              '%s %s' % (error.code, self._files_target(ctx, sha256)))
+            self._audited_refusal = True
+        return error
+
+    def _files_reader(self, length, limit):
+        # read(n): at most n bytes of the body. Each wait on the client is bounded by the client deadline AND by
+        # what is left of the whole transfer's time (r2, review s1: transfer_grace_seconds + length /
+        # min_transfer_bytes_per_second), so a client that trickles is cut off and its slot given back.
+        guarded = getattr(self, '_guarded', False)
+        ends = time.monotonic() + task_files.transfer_seconds(length, limit)
+
+        def read(count):
+            left = ends - time.monotonic()
+            if left <= 0:
+                raise task_files.too_slow(length, limit)
+            wait = max(0.05, min(self.server.client_seconds, left)) if guarded else left
+            if guarded:
+                # r3 (review N1): the reaper only after a margin; the socket's own timeout below ends the wait at the
+                # deadline, so the 408 can still be written before the connection is cut.
+                self.server.watch(self.connection, wait + self.ANSWER_MARGIN)
+            before = self.connection.gettimeout()
+            try:
+                # The socket's own timeout too: on Windows the reaper's shutdown does not end a wait that is under
+                # way in another thread, the timeout does.
+                self.connection.settimeout(wait)
+                # r3 (review N1): one receive at a time (read1), so the deadline is looked at between small pieces;
+                # read(count) would keep waiting for all of them, and a trickle never lets the timeout fire.
+                read1 = getattr(self.rfile, 'read1', None)
+                chunk = read1(count) if read1 is not None else self.rfile.read(count)
+            except TimeoutError:
+                # The socket's own timeout: the transfer's time is up (it can fire a moment before the clock below
+                # says so). Never taken for a body that ended early (400).
+                raise task_files.too_slow(length, limit) from None
+            except OSError:
+                chunk = b''
+            finally:
+                try:
+                    self.connection.settimeout(before)
+                except OSError:
+                    pass
+                if guarded:
+                    self.server.unwatch(self.connection)
+            if time.monotonic() >= ends:
+                raise task_files.too_slow(length, limit)
+            return chunk
+        return read
+
+    def _files_send(self, chunk, ends):
+        # One step of a download under what is left of its time (r2, review s1): a client that reads too slowly
+        # is cut off by the server's reaper; the caller gives the slot back and closes the connection.
+        inner = getattr(self.wfile, '_inner', self.wfile)
+        left = ends - time.monotonic()
+        if left <= 0:
+            raise ConnectionAbortedError('the download was slower than the server allows')
+        guarded = getattr(self, '_guarded', False)
+        wait = max(0.05, min(self.server.client_seconds, left)) if guarded else left
+        if guarded:
+            self.server.watch(self.connection, wait)
+        before = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(wait)           # as in the reader: a send that is stuck ends on Windows too
+            inner.write(chunk)
+        except (TimeoutError, OSError):
+            raise ConnectionAbortedError('the client did not take the download') from None
+        finally:
+            try:
+                self.connection.settimeout(before)
+            except OSError:
+                pass
+            if guarded:
+                self.server.unwatch(self.connection)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/files')
+    def tasks_files_list(self, ctx):
+        project = self._files_project(ctx)
+        self._project(ctx, CAP_READ)
+        actor = self._files_actor(ctx)
+        row = self._files_row(ctx)
+        may = self._files_coordinates(ctx) or task_files.is_assignee(row, actor)
+        try:
+            items = []
+            for entry in task_files.live(project, ctx.params['tid']):
+                item = task_files.view(entry, may_download=may)
+                if task_files.blob_size(project, entry['sha256']) != entry['bytes']:
+                    item['missing'] = True
+                items.append(item)
+        except task_files.Refusal as refusal:
+            raise files_error(refusal) from None
+        return 200, {'task': ctx.params['tid'], 'items': items, 'total': len(items), 'may_download': may}
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/files', stream=True)
+    def tasks_file_put(self, ctx):
+        action = 'tasks.files.upload'
+        try:
+            if self.headers.get('Transfer-Encoding') is not None:
+                # r2 (review s4b): http.server does not undo chunked framing, which would be stored as the file.
+                raise HttpError(400, 'invalid', 'An upload is sent with a Content-Length, not with Transfer-Encoding; '
+                                'nothing was stored.')
+            project = self._files_project(ctx)
+            record, _role = self._project(ctx, CAP_TASKS)
+            if isinstance(record, dict) and record.get('archived'):
+                raise conflict('The project is archived: its files can still be downloaded, and no new file is '
+                               'attached.')
+            name = task_files.clean_name(ctx.query.get('name'))
+            direction = task_files.check_direction(ctx.query.get('direction'))
+            media_type = task_files.check_media_type(ctx.query.get('media_type'))
+            note = task_files.check_text(ctx.query.get('note'), 'note', task_files.NOTE_LIMIT)
+            expected = self.headers.get('X-Orchestra-SHA256')
+            if expected is not None:
+                expected = task_files.check_sha256(expected.strip().lower())
+            said = self.headers.get('Content-Length')
+            if said is None:
+                raise HttpError(411, 'length_required', 'An upload needs a Content-Length: the server checks the '
+                                'limits before it reads a byte.')
+            try:
+                length = int(said)
+            except ValueError:
+                length = -1
+            if length < 0 or str(length) != said.strip():
+                raise invalid('Invalid Content-Length')
+            actor = self._files_actor(ctx)
+            row = self._files_row(ctx)
+            if direction == task_files.TO_WORKER:
+                if not self._files_coordinates(ctx):
+                    raise forbidden('Only the project\'s coordinators attach files to the worker.')
+                operation, capability = 'coordinator-record', CAP_COORDINATE
+            else:
+                if not task_files.is_assignee(row, actor):
+                    raise forbidden('Only the task\'s current assignee attaches files from the worker, and only '
+                                    'while the task is open.')
+                operation, capability = 'assignee-record', CAP_TASKS
+            limit = self._files_limits()
+            tid = ctx.params['tid']
+            if expected is not None:
+                # A retry of a file already attached under this name: answered from the record,
+                # without reading the body again (design 3a: an idempotent 200).
+                known = task_files.read_entry(project, tid, expected)
+                if known is not None and known.get('withdrawn') is None and known['name'] == name and \
+                        task_files.blob_size(project, expected) == known['bytes']:
+                    return 200, dict(task_files.view(known), replayed=True)
+            task_files.check_room(project, tid, length, limit)
+            gate = self.transfers or DEFAULT_TRANSFERS
+            key = self._files_key(ctx)
+            gate.take(key, limit, ctx.params['pid'])
+            try:
+                self._continue()                        # r2 (s4c): only now may the client send the body
+                sha256, size, created = task_files.receive(self._files_reader(length, limit), length, project, expected)
+            finally:
+                gate.give(key, ctx.params['pid'])
+        except (HttpError, task_files.Refusal) as error:
+            raise self._files_refused(ctx, action, error) from None
+        payload = {'operation': operation, 'task_id': tid, 'sha256': sha256, 'name': name, 'bytes': size,
+                   'media_type': media_type, 'direction': direction, 'note': note, 'actor': actor}
+        ctx.body_hash = request_hash({key: value for key, value in payload.items() if key != 'actor'})
+
+        def write():
+            result = self.backend.invoke('files.record', ctx.principal, ctx.params['pid'], payload,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=capability)
+            return result, result
+        try:
+            status, result = self._mutate(ctx, action, ctx.params['pid'], write, capability=capability,
+                                          status=201, serialize=False, canonical=True,
+                                          reason=self._files_target(ctx, sha256))
+        except HttpError as refused:
+            # r2 (review s2): a record that was refused leaves no blob behind that this upload stored and no record
+            # names. Only for a definite refusal: a 5xx that does not say nothing was done may follow a written
+            # record (a retry settles it), so its blob stays.
+            if created and (refused.status < 500 or getattr(refused, 'nothing_done', False)):
+                self.backend.files_discard(ctx.params['pid'], sha256)
+            raise
+        if isinstance(result, dict):
+            result = dict(result)
+            status = result.pop('status', status)
+        return status, result
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/files/(?P<sha>[0-9a-f]{64})')
+    def tasks_file_get(self, ctx):
+        action = 'tasks.files.download'
+        sha256 = ctx.params['sha']
+        try:
+            project = self._files_project(ctx)
+            record, _role = self._project(ctx, CAP_READ)
+            actor = self._files_actor(ctx)
+            row = self._files_row(ctx)
+            coordinates = self._files_coordinates(ctx)
+            if not (coordinates or task_files.is_assignee(row, actor)):
+                raise forbidden('Only the task\'s current assignee and the project\'s coordinators may download its '
+                                'files.')
+            if isinstance(record, dict) and record.get('archived') and not coordinates:
+                # r2 (review s4d): an archived project is read-only; its files stay downloadable by its coordinators.
+                raise forbidden('The project is archived: only its coordinators download its files.')
+            entry = task_files.read_entry(project, ctx.params['tid'], sha256)
+            if entry is None or entry.get('withdrawn') is not None:
+                raise not_found('No such file on this task.')
+            limit = self._files_limits()
+            handle = task_files.open_blob(project, sha256)
+        except (HttpError, task_files.Refusal) as error:
+            raise self._files_refused(ctx, action, error, sha256) from None
+        gate = self.transfers or DEFAULT_TRANSFERS
+        key = self._files_key(ctx)
+        try:
+            with handle:
+                size = os.fstat(handle.fileno()).st_size
+                if size != entry['bytes']:
+                    raise self._files_refused(ctx, action, task_files.Refusal(
+                        409, 'conflict', 'The stored file does not match its record (its size changed); it is not '
+                        'served. An operator must look at it.'), sha256)
+                try:
+                    gate.take(key, limit, ctx.params['pid'])
+                except HttpError as error:
+                    raise self._files_refused(ctx, action, error, sha256) from None
+                sent = 0
+                ends = time.monotonic() + task_files.transfer_seconds(size, limit)
+                try:
+                    self.send_response(200)
+                    self.send_header('Content-Type', task_files.OPAQUE)
+                    self.send_header('Content-Length', str(size))
+                    self.send_header('Content-Disposition', "attachment; filename*=UTF-8''" + quote(entry['name'], safe=''))
+                    self.send_header('X-Content-Type-Options', 'nosniff')
+                    self.send_header('Cache-Control', 'no-store')
+                    self.send_header('Content-Security-Policy', "sandbox; default-src 'none'")
+                    self.send_header('Referrer-Policy', 'no-referrer')
+                    self.send_header('X-Orchestra-SHA256', sha256)
+                    self._send_hsts()
+                    self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+                    self.end_headers()
+                    while sent < size:
+                        chunk = handle.read(min(task_files.STEP, size - sent))
+                        if not chunk:
+                            break
+                        self._files_send(chunk, ends)
+                        sent += len(chunk)
+                except ConnectionError:
+                    self.close_connection = True       # cut off, too slow, or gone: nothing more to answer
+                finally:
+                    gate.give(key, ctx.params['pid'])
+                    self._files_audit(ctx, action, 'committed' if sent == size else 'interrupted',
+                                      '%s bytes=%d' % (self._files_target(ctx, sha256), sent), actor=actor)
+                if sent != size:
+                    self.close_connection = True
+        except HttpError:
+            raise
+        return None, None
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/files/(?P<sha>[0-9a-f]{64})/withdraw')
+    def tasks_file_withdraw(self, ctx):
+        action = 'tasks.files.withdraw'
+        sha256 = ctx.params['sha']
+        try:
+            project = self._files_project(ctx)
+            record, _role = self._project(ctx, CAP_TASKS)
+            if isinstance(record, dict) and record.get('archived'):
+                raise conflict('The project is archived: its files are read-only and none is withdrawn.')
+            payload = dict(ctx.payload or {})
+            refuse_unknown_fields(payload, ('reason',), 'A file withdrawal')
+            reason = task_files.check_text(payload.get('reason'), 'reason', task_files.REASON_LIMIT, required=True)
+            actor = self._files_actor(ctx)
+            self._files_row(ctx)
+            entry = task_files.read_entry(project, ctx.params['tid'], sha256)
+            if entry is None or entry.get('withdrawn') is not None:
+                raise not_found('No such file on this task.')
+            if self._files_coordinates(ctx):
+                operation, capability = 'coordinator-withdraw', CAP_COORDINATE
+            elif entry.get('by') == actor:
+                operation, capability = 'author-withdraw', CAP_TASKS
+            else:
+                raise forbidden('A file is withdrawn by the one who attached it, or by a coordinator.')
+        except (HttpError, task_files.Refusal) as error:
+            raise self._files_refused(ctx, action, error, sha256) from None
+        body = {'operation': operation, 'task_id': ctx.params['tid'], 'sha256': sha256, 'reason': reason,
+                'actor': actor}
+
+        def write():
+            result = self.backend.invoke('files.withdraw', ctx.principal, ctx.params['pid'], body,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=capability)
+            return result, result
+        status, result = self._mutate(ctx, action, ctx.params['pid'], write, capability=capability,
+                                      status=200, serialize=False, canonical=True,
+                                      reason=self._files_target(ctx, sha256))
+        if isinstance(result, dict):
+            result = dict(result)
+            status = result.pop('status', status)
+        return status, result
+
     def require(self, ctx, capability):
         """Authorize one read/route capability against live authority."""
         return self.service.check_authority(ctx.principal, ctx.params.get('pid'), capability)
@@ -4909,7 +5721,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         offset = state['o']
         body = {'items': items[offset:offset + limit], 'total': len(items)}
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params.get('pid'), ctx.query,
-                                           offset + limit)
+                                           offset + limit, key=self.service.cursor_key())
                                if offset + limit < len(items) else None)
         body.update(extra)
         return body
@@ -5982,6 +6794,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, route_name, ctx.params['pid'], write, capability=CAP_COORDINATE,
                             status=201, serialize=False, canonical=True, audit_success=False, replay_check=replay_check)
 
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/integration-check')
+    def integration_check_get(self, ctx):
+        """The read-only merge check (kittrial-5bb.374): project read, no write."""
+        self._project(ctx, CAP_READ)
+        if not hasattr(self.backend, 'integration_check'):
+            raise not_implemented('The integration check is unavailable on this server')
+        refuse_unknown_fields(ctx.query, ('target',), 'Integration check query')
+        target = ctx.query.get('target')
+        result = self.backend.integration_check(ctx.principal, ctx.params['pid'],
+                                                ctx.params['tid'], target)
+        result['current_actor'] = self.service.bind_actor(ctx.principal, None)
+        return 200, result
+
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle/scope')
     def lifecycle_scope(self, ctx):
         return self._lifecycle_write(ctx, 'scope')
@@ -6801,7 +7626,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             agents, total = self.service.agent_page(ctx.principal, state['o'], limit,
                                                   unconfirmed=unconfirmed == 'true')
             return 200, {'items': self._agent_items(ctx.principal, agents), 'total': total,
-                         'next_cursor': make_cursor(ctx.principal, None, ctx.query, state['o'] + limit)
+                         'next_cursor': make_cursor(ctx.principal, None, ctx.query, state['o'] + limit,
+                                                    key=self.service.cursor_key())
                          if state['o'] + limit < total else None,
                          'generated_at': now_iso(self.service._now())}
         items = self._agent_items(ctx.principal)
@@ -7967,7 +8793,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         refuse_unknown_fields(ctx.query,('limit','cursor'),'Assignment roster query')
         limit,state=self._page(ctx,ctx.query)
         result=self.backend.assignment_roster(ctx.principal,ctx.params['pid'],state['o'],limit)
-        result['next_cursor']=(make_cursor(ctx.principal,ctx.params['pid'],ctx.query,state['o']+limit)
+        result['next_cursor']=(make_cursor(ctx.principal,ctx.params['pid'],ctx.query,state['o']+limit,
+                                           key=self.service.cursor_key())
                                if result['more'] else None)
         return 200,result
 
@@ -8163,7 +8990,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['review_states_complete'] = complete and all(
             t.get('review_state') is not None for t in result['items'])
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
-                                             state['o'] + limit)
+                                             state['o'] + limit, key=self.service.cursor_key())
                                  if state['o'] + limit < result['total'] else None)
         if unreadable:
             result['unreadable'] = unreadable
@@ -8609,7 +9436,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid(str(error).replace('ref list: ', ''))
         result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options))
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
-                                             state['o'] + limit)
+                                             state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
         return 200, result
 
@@ -8696,7 +9523,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid(str(error).replace('capability list: ', ''))
         result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options))
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
-                                             state['o'] + limit)
+                                             state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
         return 200, result
 
@@ -9333,7 +10160,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         result = dict(self.backend.proposal_read(pid, args))
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         result['items'] = [self._proposal_view(ctx, capabilities, item) for item in result.get('items') or []]
-        result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, result['next_offset'])
+        result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, result['next_offset'],
+                                             key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
         result['can_triage'] = self._triages(ctx, capabilities)
         result['can_decide'] = self._decides(ctx, capabilities)
@@ -9462,7 +10290,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         reachable = offset + limit < ME_CONTRIBUTIONS_MAX
         truncated = truncated or (more and not reachable)
         return 200, {'items': items[offset:offset + limit], 'total': total, 'truncated': truncated,
-                     'next_cursor': make_cursor(principal, None, ctx.query, offset + limit)
+                     'next_cursor': make_cursor(principal, None, ctx.query, offset + limit,
+                                                key=self.service.cursor_key())
                      if more and reachable else None,
                      'unavailable': unavailable,
                      'identity': 'account:' + principal.user_id,
@@ -9939,12 +10768,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         self._project(ctx, CAP_READ)
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        scope_id = ctx.params['pid'] + '/' + ctx.params['tid']
         recent, since_checkpoint = self._history_selection(ctx.query)
         if recent is not None:
             limit = recent
-            state = read_cursor(ctx.principal, ctx.params.get('pid'), ctx.query, ctx.query.get('cursor'))
+            state = read_cursor(ctx.principal, scope_id, ctx.query, ctx.query.get('cursor'),
+                                key=self.service.cursor_key())
         else:
-            limit, state = self._page(ctx, ctx.query)
+            limit, state = self._page(ctx, ctx.query, project_id=scope_id)
         result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
                                            state['o'], canonical=state['x'],
                                            recent=recent is not None, since_checkpoint=since_checkpoint)
@@ -9956,15 +10787,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         if result.get('activity_cursor'):
             body['activity_cursor'] = result['activity_cursor']
         continuation = result.get('canonical_cursor')
+        returned = state['o'] + len(_logical_entries(result['items']))
         body['next_cursor'] = (
-            make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
-                        state['o'] + len(result['items']), continuation)
+            make_cursor(ctx.principal, scope_id, ctx.query,
+                        returned, continuation, key=self.service.cursor_key())
             if continuation else None)
         body['order'] = 'newest-first' if recent is not None else 'oldest-first'
         # Entries this answer neither returned nor can continue to: a backend without a
         # continuation cursor (the in-process one) cannot page past its first page, so the
         # answer says so instead of looking complete (kittrial-5bb.353).
-        returned = state['o'] + len(result['items'])
         body['truncated'] = body['next_cursor'] is None and returned < result['total']
         if body['truncated']:
             body['truncated_note'] = (
@@ -10042,7 +10873,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._lanes_actor(ctx.principal), scope)
         body = dict(read)
         continuation = body.get('next_offset')
-        body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation)
+        body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
+                                           key=self.service.cursor_key())
                                if type(continuation) is int and continuation > state['o'] else None)
         return 200, body
 
@@ -10289,7 +11121,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['items'] = [dict(f, author_name=names.get(f.get('user_id'), f.get('actor')),
                                 at=f.get('created_at')) for f in result['items']]
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
-                                             state['o'] + limit)
+                                             state['o'] + limit, key=self.service.cursor_key())
                                  if state['o'] + limit < result['total'] else None)
         return 200, result
 
@@ -10316,7 +11148,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = {'items': [dict(e, user_name=names.get(e.get('user_id')), detail=e.get('reason'))
                           for e in page], 'total': len(events)}
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query,
-                                           state['o'] + limit)
+                                           state['o'] + limit, key=self.service.cursor_key())
                                if state['o'] + limit < len(events) else None)
         return 200, body
 
@@ -10349,7 +11181,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200, {'certificate': certificate,
                      'sha256': certificate_fingerprint(certificate)}
 
-    def _page(self, ctx, query):
+    def _page(self, ctx, query, project_id=None):
         limit_raw = query.get('limit', str(DEFAULT_PAGE))
         try:
             limit = int(limit_raw)
@@ -10357,7 +11189,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid('limit must be an integer')
         if not 1 <= limit <= MAX_PAGE:
             raise invalid('limit must be between 1 and %d' % MAX_PAGE)
-        state = read_cursor(ctx.principal, ctx.params.get('pid'), query, query.get('cursor'))
+        scope = ctx.params.get('pid') if project_id is None else project_id
+        state = read_cursor(ctx.principal, scope, query, query.get('cursor'),
+                            key=self.service.cursor_key())
         return limit, state
 
 
@@ -10370,6 +11204,7 @@ def build_handler(service, backend, *, trusted_proxies=(), max_body=MAX_BODY_BYT
         'trusted_proxies': tuple(trusted_proxies or ()),
         'max_body': max_body,
         'hsts': bool(hsts),
+        'transfers': TransferGate(),
     })
 
 

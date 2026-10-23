@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb370-http-coordinator-standing-0002",
+  "key": "http.coordinator-standing",
+  "name": "Who coordinates a project: the CAP_COORDINATE check and the coordinators list",
+  "aliases": [
+    "coordinators of a project",
+    "who is a coordinator",
+    "coordinator grant",
+    "coordinators_of",
+    "may coordinate"
+  ],
+  "summary": "A caller coordinates a project when Service.check_authority(principal, project, CAP_COORDINATE) passes: a member whose role holds coordinate (coordinator, owner) or a personal agent whose coordinator grant has effect now (GRANT_CAPABILITIES). Service.coordinators_of lists the same set for any reader (people and agents, display names only). Every route authorizes through check_authority, which runs http_authority.decide, the same decision the endpoint re-runs before an effect.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "http_auth.py::Service.check_authority",
+    "http_auth.py::Service.coordinators_of",
+    "http_authority.py::decide"
+  ],
+  "tests": [
+    "tests/test_task_files.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "authority",
+    "coordinator"
+  ]
+}

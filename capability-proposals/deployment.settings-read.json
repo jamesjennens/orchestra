@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb370-deployment-settings-read-0005",
+  "key": "deployment.settings-read",
+  "name": "Reading an installation setting from deployment.private.json",
+  "aliases": [
+    "deployment private settings read",
+    "deployment.private.json",
+    "installation setting",
+    "task_files settings",
+    "coordinator rules setting"
+  ],
+  "summary": "admin.deployment_document opens only a regular file (a FIFO or directory is refused at once) and returns the JSON object, raising ConfigurationUnreadable otherwise. Each setting reader takes its key from it and reads a value of the wrong type as its safe default with a warning naming the setting (admin.coordinator_rules, admin.review_workflow_writes, task_files.limits); a typo never lifts a limit.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "admin.py::deployment_document",
+    "admin.py::coordinator_rules",
+    "admin.py::review_workflow_writes",
+    "task_files.py::limits"
+  ],
+  "tests": [
+    "tests/test_task_files.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "deployment",
+    "configuration"
+  ]
+}
