@@ -963,8 +963,14 @@ class InProcessBackend:
         project = self.files_project(project_id)
         if project is None:
             return False
-        with self.service.store.lock:
+        # kittrial-5bb.380 (review of .370 r3): the wait for the lock is bounded; a blob not removed in time stays an
+        # orphan, which `admin.py task-files purge` removes once it is a day old.
+        if not self.service.store.lock.acquire(timeout=DISCARD_LOCK_SECONDS):
+            raise TimeoutError('the store lock was not free within %d s' % DISCARD_LOCK_SECONDS)
+        try:
             return task_files.discard(project, sha256)
+        finally:
+            self.service.store.lock.release()
 
     def _files_write(self, principal, project_id, payload):
         # The same task_files.apply the endpoint action runs, over this backend's own rows:
@@ -2243,10 +2249,24 @@ class EndpointBackend:
         # entry while it holds the project's .coordination.lock EXCLUSIVELY; this takes the same lock, so another
         # upload's record of the same bytes is either finished (and its entry keeps the blob) or not yet begun (and it
         # then finds the blob gone and answers "upload it again"). Never a record whose bytes vanished under it.
+        # kittrial-5bb.380 (review of .370 r3): the wait is bounded (DISCARD_LOCK_SECONDS); a blob not removed in time
+        # stays an orphan, which `admin.py task-files purge` removes once it is a day old.
         import fcntl
         project = self.files_project(project_id)
         with (project / '.coordination.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            ends = time.monotonic() + DISCARD_LOCK_SECONDS
+            locked = False
+            for _ in range(int(DISCARD_LOCK_SECONDS / 0.05) + 2):   # a bounded number of tries, never an open loop
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= ends:
+                        break
+                    time.sleep(0.05)
+            if not locked:
+                raise TimeoutError('the project lock was not free within %d s' % DISCARD_LOCK_SECONDS)
             return task_files.discard(project, sha256)
 
     def assignment_roster(self, principal, project_id, offset=0, limit=200):
@@ -4736,6 +4756,12 @@ class TransferGate:
 
 #: One gate for handlers made without :func:`build_handler` (a test's own subclass).
 DEFAULT_TRANSFERS = TransferGate()
+#: kittrial-5bb.380: the lingering closes of answered uploads now running in this process, and the counts
+#: of those done and of those closed at once because LINGER_MAX were running.
+LINGERING = {'now': 0, 'lingered': 0, 'hard': 0}
+#: kittrial-5bb.380 (review of .370 r3): how long a refused upload's discard waits for the project's lock.
+DISCARD_LOCK_SECONDS = 10
+LINGERING_LOCK = threading.Lock()
 FILES_UNAVAILABLE = 'Task files are not available on this server.'
 FILE_CODES = {400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict', 411: 'length_required',
               413: 'payload_too_large', 422: 'invalid', 501: 'not_implemented', 503: 'unavailable',
@@ -4942,6 +4968,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # body was read, or a body that was not what its Content-Length said, must never
                 # leave bytes behind that the next request on this connection would be read from.
                 self._say_close = True
+                self._body_unread = True              # until the route has read it (kittrial-5bb.380)
             payload, auth_source = self._read_request(method, anonymous, params, csrf,
                                                       request_id, stream=stream)
             # The semantic route target is the method plus the concrete path (with the
@@ -4984,6 +5011,60 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(500, {'error': {'code': 'internal_error',
                                             'message': 'Internal error'},
                                   'request_id': request_id})
+        finally:
+            if getattr(self, '_body_unread', False):
+                self._body_unread = False
+                self._linger()
+
+    #: kittrial-5bb.380: how long, and how much, an answered upload's unread body is still read and dropped, and
+    #: how many such closes may run at once in the service; beyond that the connection is closed at once.
+    LINGER_SECONDS = 5
+    LINGER_BYTES = 64 * 1024 * 1024
+    LINGER_MAX = 8
+
+    def _linger(self):
+        # The answer to an upload refused before its body was read (401, 403, 413, 503...) is sent, and the
+        # connection is then closed with that body still arriving. Closed at once, the unread bytes make the
+        # system answer with a reset, which can destroy the answer before the client has read it, so the client
+        # sees a cut connection instead of the refusal. As a web server's lingering close does, the write side
+        # is shut and what still arrives is read and dropped, for a short, bounded time.
+        # It runs after the route has returned: no transfer slot and no lock is held here. Bounded per connection
+        # (LINGER_SECONDS, LINGER_BYTES) and in total (LINGER_MAX at once): many refused uploads at once cannot tie
+        # up the service's threads; beyond the cap the connection is closed at once (LINGERING counts both).
+        self.close_connection = True
+        try:
+            self.wfile.flush()
+        except (OSError, ValueError):
+            return
+        with LINGERING_LOCK:
+            if LINGERING['now'] >= self.LINGER_MAX:
+                LINGERING['hard'] += 1
+                return
+            LINGERING['now'] += 1
+            LINGERING['lingered'] += 1
+        try:
+            connection = self.connection
+            try:
+                connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                return
+            ends = time.monotonic() + self.LINGER_SECONDS
+            taken = 0
+            try:
+                while taken < self.LINGER_BYTES:
+                    left = ends - time.monotonic()
+                    if left <= 0:
+                        break
+                    connection.settimeout(left)
+                    piece = connection.recv(65536)
+                    if not piece:
+                        break
+                    taken += len(piece)
+            except OSError:
+                pass
+        finally:
+            with LINGERING_LOCK:
+                LINGERING['now'] -= 1
 
     def _admit(self, method):
         """Behind a trusted proxy, one forwarded address has a share of the requests being served.
@@ -5604,7 +5685,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             items = []
             for entry in task_files.live(project, ctx.params['tid']):
                 item = task_files.view(entry, may_download=may)
-                if task_files.blob_size(project, entry['sha256']) != entry['bytes']:
+                # kittrial-5bb.380: a purged file is said as purged (view carries the sentence), not as missing.
+                if not entry.get('purged') and task_files.blob_size(project, entry['sha256']) != entry['bytes']:
                     item['missing'] = True
                 items.append(item)
         except task_files.Refusal as refusal:
@@ -5668,6 +5750,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 self._continue()                        # r2 (s4c): only now may the client send the body
                 sha256, size, created = task_files.receive(self._files_reader(length, limit), length, project, expected)
+                self._body_unread = False
             finally:
                 gate.give(key, ctx.params['pid'])
         except (HttpError, task_files.Refusal) as error:
@@ -5690,7 +5773,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             # names. Only for a definite refusal: a 5xx that does not say nothing was done may follow a written
             # record (a retry settles it), so its blob stays.
             if created and (refused.status < 500 or getattr(refused, 'nothing_done', False)):
-                self.backend.files_discard(ctx.params['pid'], sha256)
+                # kittrial-5bb.380 (review of .370 r3): the refusal is the answer. A discard that fails (the lock not
+                # free in time, a disk error) is said in the service's log and keeps the blob as an orphan, which
+                # `admin.py task-files purge` removes once it is a day old; it never replaces the refusal.
+                try:
+                    self.backend.files_discard(ctx.params['pid'], sha256)
+                except Exception as failed:
+                    print('task files: the upload %s of request %s was refused and its stored bytes were kept (task-files '
+                          'purge removes them after a day): %s' % (sha256, ctx.request_id,
+                                                                   ascii(str(failed)[:200]) or type(failed).__name__),
+                          file=sys.stderr, flush=True)
             raise
         if isinstance(result, dict):
             result = dict(result)
@@ -5716,6 +5808,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             entry = task_files.read_entry(project, ctx.params['tid'], sha256)
             if entry is None or entry.get('withdrawn') is not None:
                 raise not_found('No such file on this task.')
+            if entry.get('purged'):
+                # kittrial-5bb.380 (coordinator's Q2): the bytes were removed by an operator's purge.
+                raise HttpError(410, 'gone', task_files.purged_sentence(entry))
             limit = self._files_limits()
             handle = task_files.open_blob(project, sha256)
         except (HttpError, task_files.Refusal) as error:

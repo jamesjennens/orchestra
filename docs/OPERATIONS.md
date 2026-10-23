@@ -419,6 +419,13 @@ The database listens on loopback only. Its generated credential is stored in the
 
 The kit runs `bd`, `dolt`, the HTTP service and the endpoint with `HOME` set to `<runtime>/home` and `BD_DISABLE_METRICS=1`, so Beads keeps its configuration inside the runtime and its usage metrics stay off; the kit writes nothing to the service account's own home directory. What that variable suppresses is bd's own telemetry, not anything the kit adds: with metrics on, bd 1.2.2 leaves a detached child that writes `$HOME/.config/bd/config.yaml` (`metrics: disabled: false`, upstream's event endpoint) and queues usage events under `$HOME/.beads/eventsData/` (`*.evtq` and `eventkit.lock`) just after a command such as `bd --version` returns. `bd metrics off` and `BD_DISABLE_METRICS=1` stop that child; the release tool sets the variable for its own run checks for the same reason (kittrial-5bb.166), and starts `dolt` there with `DOLT_DISABLE_EVENT_FLUSH=1` so that `dolt version` does not re-execute itself as a detached `dolt send-metrics` child (see docs/OFFICE_SERVICE.md; dolt's `metrics.disabled` global setting alone does not stop it). A runtime created before this change keeps working without a `home` directory: the environment variable alone keeps metrics off. Rollback note: an older kit reads Beads' configuration from the account's home directory instead, so before rolling back make sure `~/.config/bd/config.yaml` there has metrics disabled (`bd metrics off` as that account), or Beads turns its metrics on for a runtime that was created by this kit. Dolt's own global configuration is pinned to the runtime by `DOLT_ROOT_PATH` and is unaffected.
 
+**A reverse proxy in front of the web site** has its own limit on a request body (nginx `client_max_body_size`, 1 MiB
+by default). Raise it to at least the per-file limit of task files (`task_files.max_file_bytes`, 25 MiB by default),
+or uploads near the limit are cut before they reach Orchestra. Check it through the address people use:
+`admin.py task-files proxy-check --url https://SITE` sends one unsigned test upload of that size. Orchestra's own
+401 means it passed; a 413, another answer or a cut connection is said with the setting to raise. Nothing is stored
+(`--bytes N` checks another size, `--cafile FILE` names the site's certificate).
+
 If initial installation fails, it stops the service and preserves files for inspection. Do not rerun by deleting the runtime: investigate the service journal first. Repeating installation of an already initialized deployment checks its pins, port and connectivity.
 
 ## Connect a contributor
@@ -2092,6 +2099,66 @@ python3 /home/beads/beads-team-kit/admin.py --root /home/beads/beads-runtime res
 ```
 
 It refuses a populated destination, restores status and comments, and retains original issue IDs. The native restore is Dolt's own restore through the SQL client (`CALL DOLT_BACKUP('restore', '--force', 'file://.../backups/SOURCE', 'DEST')` over the loopback connection, bounded by the same explicit 30-minute ceiling as `backup`), not `bd backup restore`, which has the same fixed client read timeout of about ten seconds as `bd backup sync`: a 588 MB backup failed under `bd backup restore` at exactly 10 s (`i/o timeout`, `invalid connection`) and takes about a minute through the SQL client. The client runs in its own session/process group with the password in the environment, never on a command line; a normal `SIGTERM`, Ctrl-C or the ceiling stops that whole process group before the source's backup lock is released. Because bd does not run the restore, the kit then performs the one step `bd backup restore --force` would have performed itself: it writes the restored database's `_project_id` into the destination's `.beads/metadata.json` (every other key is kept), so bd accepts the restored project instead of refusing it with `PROJECT IDENTITY MISMATCH`; a backup that records no project identity leaves the file unchanged, as bd does. The command prints `Restored backups/SOURCE into DEST through the Dolt SQL client in N s.` and, when the identity changed, the identity it adopted. A destination with no Dolt server metadata in `.beads/metadata.json` has no SQL coordinates and keeps the `bd backup restore` path, as `backup` keeps `bd backup sync`. The native restore also carries the source project's recorded backup target, so `.beads/dolt-backup.json` and the restored `dolt_backups` row would still name `backups/SOURCE`; `restore-new` re-points the destination at `backups/DEST` immediately after the restore, and `backup` refuses (before any native command) a project whose recorded target is not its own `backups/<name>`, naming the recorded URL and the expected directory, so a clone that was never re-pointed cannot overwrite the source project's backup directory. A clone restored before that re-point existed (or whose re-point failed) is repaired in place with `admin.py backup-repoint DEST`, which runs `bd backup init backups/DEST` under the kit environment and verifies both `.beads/dolt-backup.json` and the `dolt_backups` row before reporting success; do not run a bare `bd backup init` (it fails without the kit environment, `Error 1045 Access denied for user root`) and do not re-run `restore-new` onto an existing name (it is refused and would discard the clone). Re-pointing moves no data: if the clone was ever backed up while still mis-pointed, the SOURCE project's `backups/SOURCE` may hold the clone's data, so back the SOURCE project up again before relying on that backup. Inspect records and comments before any cutover. Checkpoint activity cursors name the project they were taken in, and `restore-new` gives the project a new name. From kittrial-5bb.131 a kit compares a retained checkpoint's cursor under the project it names, so a restored task whose content has not changed reads as current, as it already did on `work --mine`, and real activity after the restore is still reported as newer activity. Because current no longer prompts for it, `brief` says where such a checkpoint was taken (kittrial-5bb.136): `checkpoint.taken_in_project` names the source project, the text form adds `Checkpoint taken in project: NAME`, and the next action starts with `CHECKPOINT FROM PROJECT NAME:` asking you to confirm the history before relying on it. The name comes from text a checkpoint writer supplied, so it is shown only when it is a project name (2-24 lowercase letters and digits, beginning with a letter); anything else shows as `(unrecognised project name)` (kittrial-5bb.142). A kit before kittrial-5bb.131 makes every retained checkpoint read as newer activity after a rename (STALE CHECKPOINT in `brief`), even when native task bytes are unchanged; that is a scope change, not proof of a new comment. On such a kit, reconcile the restored history and write a fresh checkpoint under the destination name before trusting its next action. Cursors are written the same way by every kit, so mixed kits read each other's checkpoints. Do not run both copies as live coordination trackers. A complete host-loss recovery requires reinstalling the pinned kit on a replacement host, placing the saved backup and its coordination sidecar under its backups directory (with timestamps preserved, see below), using restore-new, verifying it, then updating client project/host settings. If `restore-new` refuses because no copy of the coordination sidecar can be used, first look for an intact copy of the pair, for example in your off-machine copies. Run `backup-authority SOURCE` to see what each copy says. Use `--without-coordination` only when the native tracker data alone is acceptable, then reconcile sessions, handoffs, requests and merge context by hand. No manual restore through the SQL client or edit of `.beads/metadata.json` is needed at any project size: `restore-new` does both. Re-grant operators and verifiers deliberately afterwards (the restore reports them as NOT restored), and take a fresh `backup` of the restored project before relying on it. A separate-deployment drill exercises backup transfer; actual replacement-host outage recovery remains an operator exercise.
+
+### Files attached to tasks: backup, restore, verify, purge
+
+Files attached to a task (kittrial-5bb.370; the routes are in [HTTP deployment](HTTP_DEPLOYMENT.md#files-attached-to-a-task-over-http))
+live in `projects/NAME/.task-files/`: the bytes under their sha256, and the host journal under `records/` that makes a
+file attached. They are not in the tracker and not in the coordination sidecar.
+
+- **Backup.** Every `backup` run also mirrors that folder into `backups/NAME.task-files/`:
+  - It copies every stored file a record still names and every journal entry. Orphans and unfinished uploads are not
+    copied.
+  - It copies incrementally: a file already there is kept. The backup follows the project: a file purged there, and
+    its entry, leave the backup at the next run (keep older backups elsewhere if a purge must be undoable).
+  - It hashes and copies outside the project's lock, which it takes only to read the journal and to finish, so
+    uploads and records go on meanwhile.
+  - A journal file that cannot be read as an entry is said on stderr; the backup then keeps the last good copy of it
+    (and of the file it names) and removes nothing from the backup folder until it is repaired.
+  - Each file is re-hashed while it is copied. One that no longer matches its name is NOT copied, and the run says so
+    on stderr (`task files of NAME: NOT backed up: ...`). Run `task-files verify` then.
+  - `manifest.json` (each file's sha256 and bytes, each journal entry's digest) is written last. A folder without one
+    is a backup that did not finish. The manifest proves the copy is whole and unchanged since the backup wrote it
+    (integrity); it is not signed, so it does not prove who wrote it: keep the backups where only operators can write.
+  - The run prints the size (`task files of NAME: 3 files, 12.4 MiB`), and the status file records it under
+    `task_files`. A failure here is said and leaves the tracker backup complete. Plan disk space for the backups to
+    grow by the files' size; the per-project limit (`task_files.max_project_bytes`, 2 GiB) bounds it.
+  - The coordination sidecar is untouched, so an older kit's restore of it works as before.
+- **backup-copy** carries `NAME.task-files` beside the pair.
+- **Restore.** `restore-new SOURCE DEST` checks every file of `backups/SOURCE.task-files` against its manifest BEFORE
+  any is placed, then copies the set into the new project (`Task files restored: N files, SIZE`).
+  - A backup whose files or entries do not match is not placed at all. The project itself is restored, the command
+    ends with exit status 3, and its last lines say what did not match.
+  - A backup WITHOUT the folder (made by an older kit, or a copy that lost it) restores as before, with one line
+    saying that the file records the task history holds now report the stored file as missing.
+- **Verify.** `admin.py task-files verify PROJECT` re-hashes every stored file a record needs. It names each file that
+  does not match its name, has another size than its record, or is missing, and each journal file that cannot be
+  read as an entry (not JSON, a field this kit does not know, a link); it exits 1 when there is one. It also counts
+  orphans (stored files no record names; none are named while a journal file cannot be read) and unfinished uploads
+  older than a day. It hashes outside the project's lock, holding it only to read and to confirm what it found.
+- **Purge.** `admin.py task-files purge PROJECT --closed-before YYYY-MM-DD --actor OPERATOR [--reason TEXT] [--dry-run]`.
+  - The actor must be on the operator allowlist.
+  - Run `--dry-run` first: it lists what would go and removes nothing.
+  - It removes the stored bytes of withdrawn files, of files on tasks closed before the date, of orphans older than a
+    day, and of unfinished uploads older than a day. It NEVER removes a file that a live record of a task not closed
+    before the date still needs, on that task or any other task; those are listed as kept. A deleted task (no row
+    in the tracker) is never purged: only rows closed before the date are.
+  - It refuses to purge anything while a journal file cannot be read as an entry (`task-files verify` names it):
+    that file may be the only record of bytes that would otherwise look unneeded. Repair or remove it first.
+  - It reads the tracker's rows and runs under the project's lock, and refuses a `.task-files` that is a symlink (or a
+    junction on Windows). A stored file under a linked folder is never removed, and its entry is not marked.
+  - A purged record is marked `purged: {by, at, reason}`: the task's file list and a download say "purged by an
+    operator on DATE", and the history comment is untouched.
+  - It writes to `.task-files/audit.jsonl` an intent line BEFORE anything is removed (what it will remove and mark),
+    then a result line: who ran it, the date given, every file removed and why, what was already gone, what failed
+    and what was kept. Each file is tried on its own, so one that cannot be removed is named (exit 1) and the rest go
+    on; the result line is written even when the run stops part way. An entry is marked purged only when its bytes
+    are gone. Deleting evidence is the operator's decision; nothing is purged automatically.
+- **Rollback boundary (design 6).**
+  - An older kit neither reads nor changes `.task-files` or `backups/NAME.task-files`; the task's file records show
+    in history as ordinary comments.
+  - Backups made by an older kit while rolled back leave the folder out. Before a rollback, back up with this kit
+    (or copy `projects/NAME/.task-files/` by hand), and again after the upgrade back.
 
 ### Coordination journals and interrupted recovery
 

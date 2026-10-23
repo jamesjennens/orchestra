@@ -5311,6 +5311,8 @@ def backup_status_record(results,scope,generated_at,http_state=None):
         entry={'name':item['name'],'status':item['status']}
         if item.get('degraded'):
             entry['degraded']=item['degraded']
+        if item.get('task_files') is not None:
+            entry['task_files']=item['task_files']   # kittrial-5bb.380: the files' backup beside the pair
         if item['status']=='complete':
             entry['completed_at']=item['completed_at']
             entry['pair']={'native':'backups/'+item['name'],
@@ -5370,6 +5372,9 @@ def validate_backup_status(record):
             degraded=entry.get('degraded')
             if degraded is not None and (not isinstance(degraded,str) or not degraded.strip()):
                 raise ValueError('Degraded backup status for %s needs a nonempty message'%name)
+            files=entry.get('task_files')
+            if files is not None and (not isinstance(files,dict) or files.get('status') not in ('complete','failed')):
+                raise ValueError('Backup status task_files for %s must be complete or failed'%name)
         else:
             reason=entry.get('reason')
             if not isinstance(reason,str) or not reason.strip():
@@ -5996,7 +6001,7 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
     staging=destination/('.backup-copy-staging-'+secrets.token_hex(8))
     if staging.exists():shutil.rmtree(staging)
     staging.mkdir()
-    staged=[];journals=0;copied=[];copied_meta=[]
+    staged=[];journals=0;copied=[];copied_meta=[];staged_task_files={}
     try:
         # Stage every selected project first, each under its locks, so a copy error touches
         # nothing in the destination.
@@ -6055,6 +6060,13 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
                         _atomic_copy(journal,staged_journal)
                         journals+=1
                 shutil.copytree(native,staging/name)
+                # kittrial-5bb.380: the task files' backup travels with the pair, under the same backup
+                # lock (backup_task_files writes it under that lock).
+                files=task_files_backup_path(root,name)
+                if files.is_symlink():raise ValueError('The task-files backup %s must not be a symlink'%files)
+                if files.is_dir():
+                    shutil.copytree(files,staging/(name+'.task-files'))
+                    staged_task_files[name]=staging/(name+'.task-files')
                 # The long copytree runs with the project's backup lock held, so the kit
                 # cannot rewrite the directory underneath it; a direct native writer bypasses
                 # that lock, so re-check and refuse rather than move a mixed directory into
@@ -6082,6 +6094,10 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
             if journal_staged is not None:
                 print('Copied %s journal snapshot: %s -> %s'%(
                     name,journal_snapshot_path(root,name),destination/journal_staged.name))
+            if name in staged_task_files:
+                _replace_with(staged_task_files[name],destination/(name+'.task-files'))
+                print('Copied %s task files: %s -> %s'%(name,task_files_backup_path(root,name),
+                                                        destination/(name+'.task-files')))
         # kittrial-5bb.331: the HTTP-state pair joins every copy that publishes the
         # completeness record - the off-machine copy is what survives the lost disk,
         # and the accounts and agents are exactly what it must not lose. Copied
@@ -6334,6 +6350,44 @@ def restore_http_state(root, named=None):
             'are back as they were at the backup.'%(', '.join(restored),live))
 
 
+def task_files_backup_path(root,name):
+    """Where a project's task files are backed up: ``backups/<name>.task-files`` (kittrial-5bb.380)."""
+    return root/'backups'/(name+'.task-files')
+
+def coordination_lock(path,shared=False):
+    """A factory of context managers holding ``path/.coordination.lock`` (shared or exclusive), for the
+    task-files functions that take the lock only around their short steps (kittrial-5bb.380 r2, s5)."""
+    import contextlib
+    @contextlib.contextmanager
+    def held():
+        import fcntl
+        with (Path(path)/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            yield
+    return held
+
+def backup_task_files(root,name):
+    """Mirror the project's ``.task-files`` beside its backup (design 4a A, kittrial-5bb.380).
+
+    Under the project's backup lock and then its coordination lock, the order ``backup_project`` and
+    ``backup-copy`` take them in, so no record of a file can land half way through. The coordination
+    sidecar is untouched: an older kit's restore of it is unchanged (design 6). Returns
+    task_files.backup_folder's summary."""
+    import task_files
+    path=project_dir(root,name)
+    target=task_files_backup_path(root,name)
+    if target.is_symlink():raise ValueError('The task-files backup %s must not be a symlink'%target)
+    if not os.path.lexists(str(path/task_files.FOLDER)) and not os.path.lexists(str(target)):
+        # No files and no earlier backup of them: nothing to copy or empty, so no lock is taken.
+        return {'files':0,'bytes':0,'records':0,'problems':[],'absent':True}
+    # kittrial-5bb.380 r2 (s5): the backup lock for the whole copy; the project's lock only to read the journal
+    # and to finish, never while the blobs are hashed and copied.
+    with backup_lock(root,name):
+        try:
+            return task_files.backup_folder(path,target,now=utc_stamp,lock=coordination_lock(path))
+        except task_files.Refusal as refused:
+            raise ValueError(str(refused)) from None
+
 def backup_projects(root,names,all_projects=False,named_http_state=None):
     """Back up one or more projects in one run and publish the run's status file.
 
@@ -6386,6 +6440,23 @@ def backup_projects(root,names,all_projects=False,named_http_state=None):
             if degraded_fault:entry['degraded']=degraded_fault
             results.append(entry)
             print(native)
+            # kittrial-5bb.380: the task files beside the backup, and their size in the report. A failure
+            # here leaves the tracker backup complete (it is restorable) and is said on stderr.
+            try:
+                files=backup_task_files(root,name)
+            except Exception as error:
+                entry['task_files']={'status':'failed','reason':failure_reason(error)}
+                print('backup of the task files of %s failed: %s'%(name,failure_reason(error)),file=sys.stderr)
+            else:
+                if not files.get('absent'):
+                    entry['task_files']={'status':'complete','files':files['files'],'bytes':files['bytes'],
+                                         'path':'backups/'+name+'.task-files'}
+                    print('task files of %s: %d files, %s (backups/%s.task-files)'
+                          %(name,files['files'],task_files_size_text(files['bytes']),name))
+                    for problem in files['problems']:
+                        print('task files of %s: NOT backed up: %s: %s'%(name,problem.get('path') or problem['sha256'],
+                                                                         problem['problem']),file=sys.stderr)
+                    if files['problems']:entry['task_files']['problems']=len(files['problems'])
         else:
             results.append({'name':name,'status':'failed','reason':reason})
             incomplete.append(name)
@@ -10301,6 +10372,21 @@ def main():
                         'SQLite records file, copied consistently, mode 0600); without it the http_state '
                         'path recorded in deployment.private.json is used, then the office default '
                         '<RUNTIME_ROOT>/http-state.json when that file exists (kittrial-5bb.331)')
+    a=sub.add_parser('task-files',allow_abbrev=False,
+                     help='files attached to tasks (kittrial-5bb.380): verify PROJECT re-hashes every stored file; '
+                          'purge PROJECT --closed-before DATE --actor OPERATOR [--dry-run] removes the bytes of '
+                          'withdrawn files, of files on tasks closed before DATE, of orphans and of old temporary '
+                          'files, never a file a live record needs; proxy-check --url PUBLIC_URL shows whether a '
+                          'reverse proxy cuts an upload of the size limit')
+    a.add_argument('operation',choices=['verify','purge','proxy-check'])
+    a.add_argument('project',nargs='?')
+    a.add_argument('--closed-before',dest='closed_before',default=None,metavar='YYYY-MM-DD')
+    a.add_argument('--actor',default=None,metavar='OPERATOR')
+    a.add_argument('--reason',default=None)
+    a.add_argument('--dry-run',action='store_true',dest='dry_run')
+    a.add_argument('--url',default=None,metavar='PUBLIC_URL')
+    a.add_argument('--bytes',type=int,default=None,dest='bytes')
+    a.add_argument('--cafile',default=None)
     a=sub.add_parser('backup-schedule',help='record, as an operator, that this runtime\'s backups are scheduled '
                                              'elsewhere (the project setup step then reads done; a systemd user '
                                              'unit that covers the project still wins) (operator allowlist)')
@@ -11252,6 +11338,8 @@ def main():
                 note),file=sys.stderr)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects,
                                                    getattr(args,'http_state',None))
+    elif args.command=='task-files':
+        raise SystemExit(task_files_command(root,args))
     elif args.command=='backup-schedule':
         from keyed_records import require_configured_operator
         require_configured_operator(args.actor,operators(root,strict=True),'record a backup schedule note')
@@ -11492,6 +11580,9 @@ def main():
         elif args.flag_had_nothing:
             print('--without-coordination: this backup has no coordination sidecar at all, so there was nothing '
                   'to leave out; it was restored as a legacy backup, exactly as without the flag.')
+        files_warning=getattr(args,'task_files_warning',None)
+        if files_warning:
+            warning=(warning+'\n'+files_warning) if warning else files_warning
         if warning:
             # The last thing the restore says, after everything on stdout (kittrial-5bb.144),
             # and a distinct exit status, so `restore-new ... && next-step` does not proceed.
@@ -11511,6 +11602,41 @@ def native_only_note(root,args,damaged):
               args.destination,
               'was restored from %s'%journal.relative_to(root).as_posix() if getattr(args,'journal_restored',False)
               else 'was not restored: the backup has no operation-journal snapshot'))
+
+def task_files_size_text(count):
+    import task_files
+    return task_files.size_text(count)
+
+def restore_task_files(root,source,destination):
+    """Place the source's task-files backup into the restored project, checked first (kittrial-5bb.380).
+
+    Returns None when the files were restored, or there were none to restore, and the warning that
+    makes the restore end with exit 3 when the backup's files did not match their manifest (nothing
+    of them is placed then). A backup without the folder (an older kit, or a copy that lost it)
+    restores as before, and says that the restored file records will report their files missing."""
+    import task_files
+    backup=task_files_backup_path(root,source)
+    path=project_dir(root,destination)
+    if not os.path.lexists(str(backup)):
+        outcome={'status':'absent'}        # nothing to place, so no lock is taken
+    else:
+        import fcntl
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            try:
+                outcome=task_files.restore_folder(backup,path)
+            except task_files.Refusal as refused:
+                outcome={'status':'refused','problems':[str(refused)]}
+    if outcome['status']=='absent':
+        print('This backup has no task files (backups/%s.task-files): any file records the task history '
+              'holds now say that the stored file is missing.'%source)
+        return None
+    if outcome['status']=='restored':
+        print('Task files restored: %d files, %s, checked against the backup\'s manifest.'
+              %(outcome['files'],task_files.size_text(outcome['bytes'])))
+        return None
+    return ('Task files NOT restored: the backup %s does not match its manifest, so none of its files was '
+            'placed (the project itself is restored). %s'%(backup,' '.join(outcome['problems'][:10])))
 
 def finish_restore(root,args,snapshot,step=None):
     """What ``restore-new`` does after the native restore: re-point, sidecar, journals, slot.
@@ -11576,6 +11702,8 @@ def finish_restore(root,args,snapshot,step=None):
     # restore, whose journal step above is kept.
     at(MERGE_SLOT_STEP)
     provision_merge_slot(root,args.destination)
+    at('task files')
+    args.task_files_warning=restore_task_files(root,args.project,args.destination)
     if getattr(args,'native_only',None) is not None:
         return None
     if not sidecar:
@@ -11587,6 +11715,80 @@ def finish_restore(root,args,snapshot,step=None):
         return None
     return restore_authority(root,args.project,restore_operators=args.restore_operators,
                              restore_verifiers=args.restore_verifiers,actor=args.actor,reason=args.reason)
+
+def task_files_command(root,args):
+    """``admin.py task-files verify|purge|proxy-check`` (kittrial-5bb.380); returns the exit status."""
+    import fcntl
+    import task_files
+    if args.operation=='proxy-check':
+        if args.project is not None:raise ValueError('task-files proxy-check takes no project; give --url')
+        if not args.url:raise ValueError('task-files proxy-check needs --url PUBLIC_URL (the address people use)')
+        from server_address import public_url_problem
+        problem=public_url_problem(args.url,'--url')
+        if problem:raise ValueError(problem)
+        cap=task_files.limits(root)['max_file_bytes']
+        if args.bytes is not None and not 1<=args.bytes<=cap:
+            raise ValueError('task-files proxy-check --bytes is 1 to %d (the per-file limit, task_files.max_file_bytes)'%cap)
+        size=args.bytes if args.bytes is not None else cap
+        result=task_files.proxy_check(args.url,size,cafile=args.cafile)
+        print(result['sentence'])
+        print(json.dumps(result,sort_keys=True))
+        return 0 if result['passed'] else 1
+    if not args.project:raise ValueError('task-files %s needs a project'%args.operation)
+    validate_name(args.project)
+    path=project_dir(root,args.project)
+    if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    if args.operation=='verify':
+        try:
+            # kittrial-5bb.380 r2 (s5): the shared lock only to read and to confirm, never while hashing.
+            result=task_files.verify(path,lock=coordination_lock(path,shared=True))
+        except task_files.Refusal as refused:
+            raise ValueError(str(refused)) from None
+        for key,label in (('mismatched','does not match its name'),('wrong_size','has another size than its record'),
+                          ('missing','is missing (a live record names it)')):
+            for item in result[key]:
+                print('task file %s %s'%(item['sha256'],label))
+        for item in result['unreadable']:
+            print('journal file %s cannot be read as an entry: %s'%(item['path'],item['problem']))
+        print('Checked %d stored files: %d mismatched, %d of another size, %d missing; %d journal files that cannot '
+              'be read; %d orphans and %d old temporary files (task-files purge removes those).'
+              %(result['checked'],len(result['mismatched']),len(result['wrong_size']),len(result['missing']),
+                len(result['unreadable']),len(result['orphans']),len(result['stale_temp'])))
+        print(json.dumps(result,sort_keys=True))
+        return 1 if result['mismatched'] or result['wrong_size'] or result['missing'] or result['unreadable'] else 0
+    # purge
+    if not args.closed_before:raise ValueError('task-files purge needs --closed-before YYYY-MM-DD')
+    from keyed_records import require_configured_operator
+    require_configured_operator(args.actor,operators(root,strict=True),'purge task files')
+    with (path/'.coordination.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        # kittrial-5bb.380 r2 (s2): the rows are read under the lock, so a task reopened before it is seen as open.
+        rows={row.get('id'):row for row in record_json.loads_rows(run_bd(root,args.project,['export','--all']))
+              if isinstance(row,dict)}
+        try:
+            if task_files.folder(path) is None:
+                print('Project %s has no task files; nothing to purge.'%args.project)
+                return 0
+            plan=task_files.purge_plan(path,args.closed_before,rows)
+            if args.dry_run:
+                for item in plan['remove']:
+                    print('would remove %s %s (%s): %s'%(item['kind'],item.get('sha256') or item.get('name'),
+                                                         task_files.size_text(item['bytes']),item['why']))
+                for item in plan['kept_referenced']:
+                    print('kept %s of task %s (%s): another live record needs it'%(item['sha256'],item['task'],item['why']))
+                print('Dry run: %d to remove (%s), %d kept because a live record needs them; nothing was removed.'
+                      %(len(plan['remove']),task_files.size_text(sum(i['bytes'] for i in plan['remove'])),
+                        len(plan['kept_referenced'])))
+                return 0
+            line=task_files.purge(path,plan,args.actor,utc_stamp,reason=args.reason)
+        except task_files.Refusal as refused:
+            raise ValueError(str(refused)) from None
+    print('Purged %d (%s) as %s; the line is in .task-files/audit.jsonl; %d kept because a live record needs them.'
+          %(len(line['removed']),task_files.size_text(line['bytes']),args.actor,len(line['kept_referenced'])))
+    for item in line['failed']:
+        print('NOT purged: %s %s: %s'%(item.get('kind'),item.get('sha256') or item.get('name'),item['problem']),
+              file=sys.stderr)
+    return 1 if line['failed'] else 0
 
 def kit_refusal(error):
     """Whether a ``ValueError`` is one of the kit's own refusals: exactly ``ValueError``
