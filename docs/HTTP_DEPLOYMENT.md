@@ -2531,6 +2531,16 @@ revoked one that was wider then seeded the next renewal once nothing worked).
   live memberships (everything when the owner is a superuser), intersected with the
   projects THAT reader can see, so the answer never reveals a project the reader cannot
   see. Only the agent's owner or a superuser can edit an agent, as before.
+- **A coordinator's AGENT.md** (kittrial-5bb.387): the agent read carries
+  `coordinates: [{project, effective}]`, the agent's coordinator grants in projects its
+  owner is a member of and whether each has effect now. Only the agent's owner, or a
+  superuser, signed in as a person sees it; no other member and no credential (the agent's
+  own on `/v1/agents/me` included) does. The set-up wizard writes the coordinator's
+  `.orchestra/AGENT.md` for an agent with an effective grant (guidance first, never claim a
+  worker task, then deliveries awaiting review, approved work awaiting integration,
+  checkpoints addressed to it and quiet lanes, with the coordinator routes), and its setup
+  prompt names the extension's coordinator role; every other agent gets the worker's
+  AGENT.md, unchanged. web/js/agentSetup.js exports the text for Orchestra Bridge.
 - An agent may hold at most 20 credentials **that still work**; revoked and expired ones
   are not counted (counted, an agent could not be renewed a twentieth time). Of those
   that no longer work **the newest 5 are kept** per agent, as the short history the card

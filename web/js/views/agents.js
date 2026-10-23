@@ -763,7 +763,14 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
         : null,
       more(h('p', { class: 'small muted' }, 'To see the version: in VS Code open Extensions (Ctrl+Shift+X) and find Orchestra Bridge. With 0.14 or later its own “Orchestra Bridge: Set up” checks the certificate, tests the connection and writes the agent’s files, so this wizard skips those screens.')),
     ],
-    role: () => [
+    // kittrial-5bb.387: an agent holding an effective coordinator grant is set up as a coordinator: its
+    // AGENT.md is the coordinator's and the prompt names the extension's coordinator role. Nothing is
+    // saved as its role on Orchestra (a worker/reviewer setting), so there is nothing to choose here.
+    role: () => setupText.coordinating(payload) ? [
+      h('p', { class: 'small', 'data-role-coordinator': 'true' },
+        `${payload.name} holds the coordinator grant for ${payload.coordinates.join(', ')}: it is set up as a coordinator. Its AGENT.md tells it to handle what waits on the coordinator and never to claim a worker task; in VS Code choose the coordinator role.`),
+      more(h('p', { class: 'small muted' }, 'The grant is given and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer, and AGENT.md is the worker’s.')),
+    ] : [
       h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
       h('div', { class: 'copy-row', 'data-role-choice': 'true' },
         choice('setup-role', 'worker', 'Works on tasks', state.role === 'worker', () => saveRole('worker')),

@@ -3266,7 +3266,25 @@ class Service:
         else:
             # Explicit, so a client can tell "hidden from you" from "not set".
             view['working_directory_hidden'] = True
+        # kittrial-5bb.387: the projects this agent holds a coordinator grant in, with whether the grant
+        # has effect now, so the set-up wizard writes a coordinator AGENT.md. Only for the agent's owner
+        # (or a superuser) signed in as a person: never for another member, and never for a credential,
+        # the agent's own included. Computed live; only projects the owner is a member of.
+        if principal.credential_id is None and (principal.superuser or principal.user_id == agent['owner']):
+            view['coordinates'] = self.agent_coordinates(agent)
         return view
+
+    def agent_coordinates(self, agent):
+        """``[{project, effective}]``: the agent's coordinator grants in projects its owner is a member of."""
+        owner_id = agent.get('owner')
+        found = []
+        for project_id in sorted(self.state.get('memberships', {})):
+            if owner_id not in self.state['memberships'].get(project_id, {}):
+                continue
+            if coordinator_grant(self.state, project_id, agent['id']) is None:
+                continue
+            found.append({'project': project_id, 'effective': self._may_coordinate(project_id, agent)})
+        return found
 
     def project_agent_view(self, agent, project_id=None):
         """The *project-owner* view of an agent active in their project.
