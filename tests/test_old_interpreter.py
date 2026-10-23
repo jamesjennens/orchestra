@@ -51,7 +51,8 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'guidance.py', 'handoff.py', 'host_reads.py', 'http_auth.py', 'http_authority.py',
            'keyed_entries.py', 'keyed_records.py', 'lane_state.py', 'lanes.py', 'lifecycle_voids.py', 'native.py', 'onboarding.py', 'open_items.py',
            'project_coordination.py', 'project_creation.py', 'project_setup.py', 'proposal_records.py', 'raw_lifecycle.py', 'read_cache.py', 'record_json.py', 'recovery.py',
-           'reference_records.py', 'render.py', 'requirement_governance.py', 'requirement_http.py',
+           'reference_records.py', 'render.py', 'requirement_baseline_http.py', 'requirement_baseline_records.py',
+           'requirement_baselines.py', 'requirement_brd.py', 'requirement_governance.py', 'requirement_http.py',
            'requirement_owner_records.py', 'requirement_terminal.py', 'reserved_comments.py', 'review_recommendations.py',
            'review_state.py', 'review_workflow.py',
            'task_files.py',  # kittrial-5bb.370: library-only (no __main__ block); imported by http_service/endpoint

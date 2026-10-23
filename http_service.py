@@ -9989,11 +9989,15 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _requirements_write(self, ctx, action, status=200):
         self._requirements_backend()
         editor=self._requirements_owner(ctx)
+        if action == 'baseline' and (editor.get('role') != 'owner' or editor.get('agent_id')
+                or ctx.principal.via != 'session' or ctx.principal.credential_id):
+            raise forbidden('Baseline cuts need the current signed-in project owner')
         if action=='governance' and editor.get('role')!='owner':
             # The coordinator's decision 11(i) of kittrial-5bb.278: the governance-mode
             # switch changes the rules, not requirement text, so it stays the owner's.
             raise forbidden('Switching requirements governance needs the signed-in project owner')
         fields,operation_id=self._proposal_body(ctx,{
+            'baseline':('name',),
             'create':('kind','parent','title','description','key'),
             'revise':('expected_revision','expected_sha256','title','description'),
             'accept':('expected_revision','expected_sha256'),
@@ -10004,12 +10008,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             'abandon':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http
-        try: requirement_http.checked_body(fields,action)
+        try:
+            if action == 'baseline':
+                from requirement_baseline_http import checked_body
+                checked_body(fields)
+            else:
+                requirement_http.checked_body(fields,action)
         except ValueError as error: raise invalid(str(error))
         if operation_id is not None:
             raise invalid('Use the Idempotency-Key header for requirements writes')
         pid=ctx.params['pid']
-        if action in ('withdraw','supersede','finish','abandon'):
+        if action in ('baseline','withdraw','supersede','finish','abandon'):
             # Give immediate mode advice; the canonical adapter repeats the
             # check under the project/authority locks, including exact replays.
             if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
@@ -10033,7 +10042,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                             # Terminal replay authority belongs to the canonical
                             # owner adapter. Its durable identity still deduplicates
                             # effects; a service response must not bypass that check.
-                            idempotent=action not in ('withdraw','supersede','finish','abandon'),
+                            idempotent=action not in ('baseline','withdraw','supersede','finish','abandon'),
                             audit_success=action not in ('withdraw','supersede','finish','abandon'),
                             audit_metadata=self._requirement_agent_audit(ctx))
 
@@ -10052,6 +10061,53 @@ class ApiHandler(BaseHTTPRequestHandler):
         return {'acting_agent': editor['agent_id'],
                 'coordinator_grant': {'granted_by': grant.get('granted_by'),
                                       'granted_at': grant.get('granted_at')}}
+
+    # Named snapshots are human member reads; no new agent/worker authority.
+    def _requirements_baseline_member(self, ctx):
+        self._requirements_backend(); self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        if (ctx.principal.via != 'session' or ctx.principal.credential_id or ctx.principal.agent_id
+                or self.service.state.get('memberships', {}).get(pid, {}).get(ctx.principal.user_id)
+                not in ('owner', 'coordinator', 'contributor', 'viewer')):
+            raise forbidden('Requirements baselines need a current signed-in project member')
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines')
+    def requirements_baselines(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'], ['baselines'])
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines')
+    def requirements_cut_baseline(self, ctx):
+        return self._requirements_write(ctx, 'baseline', status=201)
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines/(?P<baseline>[A-Za-z0-9_-]{1,64})')
+    def requirements_baseline(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'], ['baseline', ctx.params['baseline']])
+
+    def _requirements_document_args(self, ctx, action):
+        if set(ctx.query) - {'baseline'}:
+            raise invalid('Requirements documents take only the optional baseline query')
+        args = [action]
+        if 'baseline' in ctx.query:
+            from requirement_baseline_records import baseline_name
+            try:
+                args.append(baseline_name(ctx.query['baseline']))
+            except ValueError as error:
+                raise invalid(str(error))
+        return args
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd/export')
+    def requirements_markdown_export(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'],
+            self._requirements_document_args(ctx, 'export'))
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd/changes')
+    def requirements_baseline_changes(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'],
+            self._requirements_document_args(ctx, 'changes'))
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
@@ -10079,6 +10135,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         result['can_edit']=self._requirements_page_editor(ctx)
+        result['can_cut_baseline']=(ctx.principal.via == 'session'
+            and not ctx.principal.credential_id and not ctx.principal.agent_id
+            and self.service.state.get('memberships', {}).get(ctx.params['pid'], {}).get(ctx.principal.user_id) == 'owner'
+            and result.get('governance', {}).get('mode') == 'simple')
         return 200,result
 
     def _requirements_page_editor(self,ctx):

@@ -4261,7 +4261,8 @@ def validate_coordination_files(files):
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
         journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
+        if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -4336,6 +4337,8 @@ def validate_coordination_files(files):
             validate_quarantine_record(name,record)
     from requirement_governance import validate_files as validate_governance_files
     validate_governance_files(files)
+    from requirement_baselines import validate_backup as validate_baseline_backup
+    validate_baseline_backup(files)
     from lifecycle_voids import validate_backup as validate_void_backup
     validate_void_backup(files)
     from web_lifecycle_marks import validate_backup as validate_mark_backup
@@ -4767,6 +4770,8 @@ def backup_project(root,name):
             raise ValueError('Cannot back up an unreadable/incomplete lifecycle VOID family')
         from requirement_governance import snapshot as governance_snapshot
         files.update(governance_snapshot(path,name))
+        from requirement_baselines import backup_files as baseline_backup_files
+        files.update(baseline_backup_files(path,name))
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
         for record in sorted((path/'.coordination-requests').glob('*.json')):
             if record.is_symlink():raise ValueError('Coordination receipt must not be a symlink')
@@ -6761,18 +6766,35 @@ def restore_web_lifecycle_mark_family(root,destination,files):
         return marks.restore_files(path,files,native_rows)
 
 
+def restore_requirement_baseline_family(root,destination,files):
+    from requirement_baselines import restore_files, PREFIX, DIRECTORY, RESTORE_MARKER
+    path=project_dir(root,destination)
+    if (not any(name.startswith(PREFIX) for name in files)
+            and not os.path.lexists(path/DIRECTORY) and not os.path.lexists(path/RESTORE_MARKER)):
+        return False
+    import fcntl
+    if (path/'.coordination.lock').is_symlink():
+        raise ValueError('Coordination restore lock must not be a symlink')
+    with (path/'.coordination.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        return restore_files(path,files,destination)
+
+
 def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False,authority=True,
                          actor=None,reason=None):
     from coordination import atomic
     path=project_dir(root,destination)
     files=coordination_backup(root,source)
     if files is None:
+        restore_requirement_baseline_family(root,destination,{})
         restore_lifecycle_void_family(root,destination,{})
         restore_web_lifecycle_mark_family(root,destination,{})
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
         return False
     from requirement_governance import restored_files as restored_governance_files
     files=restored_governance_files(files,source,destination)
+    from requirement_baselines import restored_files as restored_baseline_files
+    files=restored_baseline_files(files,source,destination)
     if using_last_complete_sidecar(root,source):
         print('The canonical coordination sidecar backups/%s.coordination.json is not complete, so this restore '
               'uses the durable last-complete copy %s (the previous complete generation, restored with the '
@@ -6844,8 +6866,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     restore_lifecycle_void_family(root,destination,files)
     import web_lifecycle_marks as marks
     restore_web_lifecycle_mark_family(root,destination,files)
+    restore_requirement_baseline_family(root,destination,files)
     for name,record in files.items():
-        if name in (voids.MANIFEST,marks.MANIFEST,voids.ABANDON_FILE) or name.startswith((voids.DIRECTORY+'/',marks.DIRECTORY+'/')):
+        if name in (voids.MANIFEST,marks.MANIFEST,voids.ABANDON_FILE) or name.startswith((voids.DIRECTORY+'/',marks.DIRECTORY+'/', '.requirements-baselines/')):
             continue
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)

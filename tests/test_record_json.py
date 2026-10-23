@@ -262,7 +262,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py', 'task_assignment.py')
+    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'requirement_baseline_records.py', 'requirement_baselines.py', 'reserved_comments.py', 'task_assignment.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -357,6 +357,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # Assignment adds closed roster/request payloads at the endpoint and
             # guards both its native task reply and its reserved notice body.
             'task_assignment.py': 2,
+            # B2 frozen snapshot bytes and sidecar records are bounded untrusted
+            # text, parsed through the nesting guard with duplicate-key refusal.
+            'requirement_baseline_records.py': 1, 'requirement_baselines.py': 1,
+
             # Service-only guidance bodies are caller text, parsed through the nesting guard.
             'web_guidance.py': 2,
             'web_merge_slot.py': 4,

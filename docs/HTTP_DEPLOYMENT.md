@@ -3646,6 +3646,18 @@ original comments remain in task history. The assignment-roster read uses shared
 project and authority locks so concurrent readers do not queue behind an exclusive
 read lock; assignment effects retain their exclusive guards.
 
+### Named requirements baseline readers
+
+Baseline cuts require compatible readers on every installation that may restore
+the project. The member routes and owner cut use the canonical endpoint; their
+new sidecar files are included in the explicit backup allowlist. A cut freezes
+pending wording without accepting it. See REQUIREMENTS.md for fixed routes,
+names, limits and same-account saved retry behavior, and OPERATIONS.md for
+interrupted-cut/restore handling and the forward-only older-reader boundary.
+Install compatible readers before creating new baseline-family files; retain a
+verified backup from before the first new-family write for any older-kit rollback.
+This does not choose office settings or a deployment schedule.
+
 ## Session idle and absolute limits
 
 An installation sets how long a browser session may sit unused before it signs out, and
