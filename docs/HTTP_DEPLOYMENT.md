@@ -3704,15 +3704,20 @@ the new password is chosen on that reset page). The host bootstrap prompt
 (`http_service.py --bootstrap-user`, which `orc.sh user` calls) asks twice too, and a
 mismatch creates no account; the confirmation lives in that prompt, not in the shell
 wrapper.
-The pages state the server's rule from `GET /v1/sessions/current`: `user.password_min_length`
-(the same value is in the sign-in answer), so no hard-coded minimum remains in the browser
-code. The log-in rate limits are unchanged.
+The account page states the server's rule from `GET /v1/sessions/current`:
+`user.password_min_length` (the same value is in the sign-in answer), so no hard-coded
+minimum remains in the browser code. The reset page is signed out, so there is no session
+answer to read: it states no number and shows the server's own 422 sentence, which names
+the configured range, when the password is sent. The log-in rate limits are unchanged.
 
 The server remains the authority: `http_auth.py` refuses an empty password and one longer
-than 1024 characters, and refuses one shorter than the configured minimum with a sentence
-naming the configured range. Changing the setting does not rewrite existing verifiers, and
-an older password that is still valid keeps working; the rule applies when a password is
-next set.
+than 1024 characters, refuses one shorter than the configured minimum with a sentence
+naming the configured range, and refuses a password made only of whitespace with one
+sentence (`A password cannot be only spaces.`) on every surface that sets one: the account
+page, the reset page and the host bootstrap. Spaces inside a password are still allowed;
+this is not a character-set rule. Changing the setting does not rewrite existing verifiers,
+and an older password that is still valid keeps working; the rule applies when a password
+is next set.
 
 ## Agent credential lifetime
 

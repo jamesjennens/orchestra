@@ -11743,6 +11743,9 @@ def bootstrap_refusal_advice(error, password_min_length=1):
     """
     if getattr(error, 'status', None) == 409:
         return 'Add this person as an account inside the service instead.'
+    if 'only spaces' in getattr(error, 'message', ''):
+        # kittrial-5bb.363: a whitespace-only password is refused with its own sentence.
+        return 'Run the command again with a password that is not only spaces.'
     if 'Password' in getattr(error, 'message', ''):
         return ('Run the command again with a password of %d to %d characters.'
                 % (password_min_length, MAX_PASSWORD))

@@ -642,6 +642,20 @@ class BootstrapSentenceTests(unittest.TestCase):
         self.assertNotIn('Traceback', stderr)
 
     @unittest.skipUnless(POSIX, 'the runtime lock needs fcntl')
+    def test_a_whitespace_only_password_at_the_first_bootstrap_is_refused(self):
+        """Spaces only are refused with their own sentence (kittrial-5bb.363 item s2)."""
+        state = Path(self.tmp.name) / 'spaces.json'
+        code, stdout, stderr = self.bootstrap(password='   ', state=state)
+        self.assertEqual(code, 1, stderr)
+        self.assertIn('Refusing to bootstrap admin', stderr)
+        self.assertIn('A password cannot be only spaces.', stderr)
+        self.assertIn('Run the command again with a password that is not only spaces.', stderr)
+        self.assertNotIn('Bootstrapped', stdout)
+        self.assertNotIn('Traceback', stderr)
+        if state.exists():
+            self.assertEqual({}, json.loads(state.read_text(encoding='utf-8')).get('users', {}))
+
+    @unittest.skipUnless(POSIX, 'the runtime lock needs fcntl')
     def test_one_character_is_accepted_and_a_raised_minimum_says_its_range(self):
         state = Path(self.tmp.name) / 'one-char.json'
         code, stdout, stderr = self.bootstrap(password='x', state=state)

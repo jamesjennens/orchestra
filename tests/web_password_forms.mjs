@@ -13,11 +13,13 @@ const auth = await import(authUrl);
 
 const calls = [];
 const PASSWORD_MISMATCH = 'The two new passwords do not match.';
+const PASSWORD_WHITESPACE = 'A password cannot be only spaces.';
 
+// A null minimum is the reset page signed out: there is no session answer to read.
 function context(minimum) {
   return {
-    me: { id: 'usr_alex', username: 'alex', display_name: 'Alex', superuser: false,
-      password_min_length: minimum },
+    me: minimum === null ? null : { id: 'usr_alex', username: 'alex', display_name: 'Alex',
+      superuser: false, password_min_length: minimum },
     options: {},
     api: {
       changePassword: async (...args) => { calls.push(['change', ...args]); return { id: 'usr_alex', changed: true }; },
@@ -48,7 +50,6 @@ async function accountPage(minimum) {
   const ctx = context(minimum);
   const page = await admin.account(ctx);
   const form = formOf(page);
-  await form.dispatch('submit');
   return { page, form, ctx, before };
 }
 
@@ -64,6 +65,10 @@ const out = {};
   await form.dispatch('submit');
   out.accountMismatch = errorOf(form, 'confirm');
   out.accountMismatchCalls = calls.length - before;
+  fill(form, { current: 'old', next: '   ', confirm: '   ' });
+  await form.dispatch('submit');
+  out.accountWhitespace = errorOf(form, 'next');
+  out.accountWhitespaceCalls = calls.length - before;
   fill(form, { current: 'old', next: 'x', confirm: 'x' });
   await form.dispatch('submit');
   out.accountOneCharCalls = calls.length - before;
@@ -96,6 +101,10 @@ async function redeemPage(minimum) {
   await form.dispatch('submit');
   out.redeemEmpty = errorOf(form, 'new_password');
   out.redeemEmptyCalls = calls.length - before;
+  fill(form, { account: 'usr_alex', code: 'code', new_password: '   ', confirm_password: '   ' });
+  await form.dispatch('submit');
+  out.redeemWhitespace = errorOf(form, 'new_password');
+  out.redeemWhitespaceCalls = calls.length - before;
   fill(form, { account: 'usr_alex', code: 'code', new_password: 'abc', confirm_password: 'abd' });
   await form.dispatch('submit');
   out.redeemMismatch = errorOf(form, 'confirm_password');
@@ -111,6 +120,27 @@ async function redeemPage(minimum) {
   await form.dispatch('submit');
   out.redeemTooShort = errorOf(form, 'new_password');
   out.redeemTooShortCalls = calls.length - before;
+}
+{
+  // Signed out: the page has no session answer, so it states no number (5bb.363 item s1).
+  const { form, before } = await redeemPage(null);
+  out.redeemSignedOutHint = hintOf(form, 'new_password');
+  out.redeemSignedOutHintHasNumber = /\d/.test(out.redeemSignedOutHint || '');
+  fill(form, { account: 'usr_alex', code: 'code', new_password: '', confirm_password: '' });
+  await form.dispatch('submit');
+  out.redeemSignedOutEmpty = errorOf(form, 'new_password');
+  out.redeemSignedOutEmptyCalls = calls.length - before;
+  fill(form, { account: 'usr_alex', code: 'code', new_password: '   ', confirm_password: '   ' });
+  await form.dispatch('submit');
+  out.redeemSignedOutWhitespace = errorOf(form, 'new_password');
+  out.redeemSignedOutWhitespaceCalls = calls.length - before;
+  fill(form, { account: 'usr_alex', code: 'code', new_password: 'abc', confirm_password: 'abd' });
+  await form.dispatch('submit');
+  out.redeemSignedOutMismatch = errorOf(form, 'confirm_password');
+  out.redeemSignedOutMismatchCalls = calls.length - before;
+  fill(form, { account: 'usr_alex', code: 'code', new_password: 'x', confirm_password: 'x' });
+  await form.dispatch('submit');
+  out.redeemSignedOutOneCharCalls = calls.length - before;
 }
 
 console.log(JSON.stringify(out).replace(/[^\x00-\x7f]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')));

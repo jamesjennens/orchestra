@@ -407,6 +407,10 @@ def validate_password_min_length(value):
 
 
 def _validate_password(password, minimum=MIN_PASSWORD):
+    # A password of nothing but spaces is a mistake, not a choice: refused here for every
+    # surface that sets one (change, reset redeem, bootstrap), in one sentence (5bb.363).
+    if isinstance(password, str) and password and not password.strip():
+        raise invalid('A password cannot be only spaces.')
     if not isinstance(password, str) or not minimum <= len(password) <= MAX_PASSWORD:
         raise invalid('Password must be %d-%d characters' % (minimum, MAX_PASSWORD))
 

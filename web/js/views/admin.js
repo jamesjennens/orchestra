@@ -1,6 +1,6 @@
 import { h, time, confirmDialog, secretDialog, initials } from '../dom.js';
 import { pageHead, empty, field, setFieldError, formValues, act, errorState,
-         passwordHint, passwordTooShort, PASSWORD_MISMATCH } from '../ui.js';
+         passwordHint, passwordAdvice, passwordTooShort, PASSWORD_MISMATCH } from '../ui.js';
 
 export async function users(ctx) {
   if (!ctx.me.superuser) {
@@ -119,7 +119,7 @@ export async function account(ctx) {
   const form = h('form', { class: 'form', novalidate: true },
     status,
     field({ id: 'current', label: 'Current password', type: 'password', autocomplete: 'current-password', required: true }),
-    field({ id: 'next', label: 'New password', type: 'password', autocomplete: 'new-password', hint: passwordHint(ctx.me) + ' A short sentence is easier to remember.', required: true }),
+    field({ id: 'next', label: 'New password', type: 'password', autocomplete: 'new-password', hint: passwordHint(ctx.me) + passwordAdvice(ctx.me), required: true }),
     field({ id: 'confirm', label: 'Repeat new password', type: 'password', autocomplete: 'new-password', required: true }),
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Change password')));
   form.addEventListener('submit', async (event) => {

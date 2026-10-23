@@ -2345,11 +2345,13 @@ class PasswordPageCase(unittest.TestCase):
         self.assertEqual(0, done.returncode, done.stderr[-3000:])
         observed = json.loads(done.stdout.strip().splitlines()[-1])
         self.assertEqual({
-            'accountHintDefault': 'At least 1 character. A short sentence is easier to remember.',
+            'accountHintDefault': 'At least 1 character.',
             'accountEmpty': 'Use at least 1 character.',
             'accountEmptyCalls': 0,
             'accountMismatch': 'The two new passwords do not match.',
             'accountMismatchCalls': 0,
+            'accountWhitespace': 'A password cannot be only spaces.',
+            'accountWhitespaceCalls': 0,
             'accountOneCharCalls': 1,
             'accountHintRaised': 'At least 8 characters. A short sentence is easier to remember.',
             'accountTooShort': 'Use at least 8 characters.',
@@ -2358,12 +2360,25 @@ class PasswordPageCase(unittest.TestCase):
             'redeemHintDefault': 'At least 1 character.',
             'redeemEmpty': 'Use at least 1 character.',
             'redeemEmptyCalls': 0,
+            'redeemWhitespace': 'A password cannot be only spaces.',
+            'redeemWhitespaceCalls': 0,
             'redeemMismatch': 'The two new passwords do not match.',
             'redeemMismatchCalls': 0,
             'redeemOneCharCalls': 1,
             'redeemHintRaised': 'At least 8 characters.',
             'redeemTooShort': 'Use at least 8 characters.',
             'redeemTooShortCalls': 0,
+            # Signed out the reset page has no session answer: it states no number and the
+            # server's 422 sentence names the range when the password is sent (item s1).
+            'redeemSignedOutHint': 'The server checks the password length.',
+            'redeemSignedOutHintHasNumber': False,
+            'redeemSignedOutEmpty': 'Enter a new password.',
+            'redeemSignedOutEmptyCalls': 0,
+            'redeemSignedOutWhitespace': 'A password cannot be only spaces.',
+            'redeemSignedOutWhitespaceCalls': 0,
+            'redeemSignedOutMismatch': 'The two new passwords do not match.',
+            'redeemSignedOutMismatchCalls': 0,
+            'redeemSignedOutOneCharCalls': 1,
         }, observed)
 
 

@@ -157,24 +157,36 @@ export function formValues(form) {
 }
 
 // The server's password rule, stated by the page (kittrial-5bb.363). The session read
-// carries the installation's minimum; an older answer, or a page driven without one,
-// falls back to 1, which is the default. The maximum is a bound on work, not a rule the
-// page repeats: the server still refuses a password over 1024 characters.
+// carries the installation's minimum. The reset page is used signed out, where there is
+// no session answer to read: it states no number and lets the server's own 422 sentence
+// name the real range, rather than claiming a minimum it has not been told. The maximum
+// is a bound on work, not a rule the page repeats: the server still refuses a password
+// over 1024 characters.
 export const PASSWORD_MISMATCH = 'The two new passwords do not match.';
+export const PASSWORD_WHITESPACE = 'A password cannot be only spaces.';
 
 export function passwordMinimum(me) {
   const value = me && me.password_min_length;
-  return Number.isInteger(value) && value >= 1 ? value : 1;
+  return Number.isInteger(value) && value >= 1 ? value : null;
 }
 
 export function passwordHint(me) {
   const minimum = passwordMinimum(me);
+  if (minimum === null) return 'The server checks the password length.';
   return `At least ${minimum} character${minimum === 1 ? '' : 's'}.`;
 }
 
-export function passwordTooShort(me, value) {
+export function passwordAdvice(me) {
   const minimum = passwordMinimum(me);
-  if (String(value).length >= minimum) return '';
+  return minimum !== null && minimum >= 8 ? ' A short sentence is easier to remember.' : '';
+}
+
+export function passwordTooShort(me, value) {
+  const text = String(value);
+  if (text && !text.trim()) return PASSWORD_WHITESPACE;
+  const minimum = passwordMinimum(me);
+  if (minimum === null) return text ? '' : 'Enter a new password.';
+  if (text.length >= minimum) return '';
   return `Use at least ${minimum} character${minimum === 1 ? '' : 's'}.`;
 }
 

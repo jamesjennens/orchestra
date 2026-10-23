@@ -129,6 +129,29 @@ class AuthCase(unittest.TestCase):
         service.change_password(admin, created['id'], None, 'long-enough')
         self.assertTrue(self.service.login('alex', 'long-enough')['session_token'])
 
+    def test_a_whitespace_only_password_is_refused_on_every_surface(self):
+        # kittrial-5bb.363 item s2 (coordinator decision): a password of nothing but spaces
+        # is a mistake, not a choice. The rule is in _validate_password, so every place that
+        # sets a password gets the same one sentence, and nothing is written.
+        for value in (' ', '   ', '\t', '\n \t'):
+            with self.assertRaises(HttpError) as caught:
+                hash_password(value)
+            self.assertEqual(422, caught.exception.status)
+            self.assertEqual('A password cannot be only spaces.', caught.exception.message)
+        # This is not a character-set rule: spaces inside a password are still allowed.
+        self.assertTrue(verify_password(hash_password('a b'), 'a b'))
+        admin = self.principal_for(self.service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
+        created = self.service.create_user(admin, 'alex')
+        with self.assertRaises(HttpError) as caught:
+            self.service.change_password(admin, created['id'], None, '   ')
+        self.assertEqual('A password cannot be only spaces.', caught.exception.message)
+        self.assertIsNone(self.service.state['users'][created['id']].get('password'))
+        reset = self.service.issue_reset(admin, created['id'])
+        with self.assertRaises(HttpError) as caught:
+            self.service.redeem_reset(created['id'], reset['reset_value'], '\t ')
+        self.assertEqual('A password cannot be only spaces.', caught.exception.message)
+        self.assertIsNone(self.service.state['users'][created['id']].get('password'))
+
     def test_low_cost_verifier_requests_rehash(self):
         weak = hash_password('a-good-password', n=2 ** 8)
         self.assertTrue(needs_rehash(weak))
