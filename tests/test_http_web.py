@@ -1872,6 +1872,9 @@ console.log(JSON.stringify({
   guideNamesFile: m.agentGuide(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc')
     && m.agentGuide(p).includes('curl.exe -fsS --noproxy 127.0.0.1 --max-time 60 -K "$env:USERPROFILE\\.orchestra-agent-kestrel.curlrc" \'http://127.0.0.1:1/v1/')
     && m.agentGuide(p).includes('curl -fsS --noproxy 127.0.0.1 --max-time 60 -K ~/.orchestra-agent-kestrel.curlrc \'http://127.0.0.1:1/v1/'),
+  guideCoordinatorWait: m.agentGuide(p).includes('/v1/agents/me/wait?form=coordinator')
+    && m.agentGuide(p).includes('&since=FINGERPRINT')
+    && m.agentGuide(p).includes('no effective grant gets 403'),
   promptNamesFile: m.setupPrompt(p).includes('%USERPROFILE%\\.orchestra-agent-kestrel.curlrc'),
   placeholder: m.headerLine(), real: m.headerLine('S3'),
   tests: m.testCommands(p),
@@ -1924,6 +1927,7 @@ console.log(JSON.stringify({
         self.assertEqual({'server_url': 'http://127.0.0.1:9', 'agent_id': 'agent_1',
                           'projects': ['p1'], 'name': 'Kestrel'}, result['reopenedJson'])
         self.assertTrue(result['guideNamesFile'])
+        self.assertTrue(result['guideCoordinatorWait'])
         self.assertTrue(result['promptNamesFile'])
         self.assertEqual('header = "Authorization: Bearer <your secret>"', result['placeholder'])
         self.assertEqual('header = "Authorization: Bearer S3"', result['real'])

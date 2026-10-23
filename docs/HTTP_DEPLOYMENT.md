@@ -1,5 +1,33 @@
 # Office HTTP service: installation, TLS and recovery runbook
 
+## Coordinator wait for an agent
+
+`GET /v1/agents/me/wait?form=coordinator` exposes the existing CLI
+`wait --coordinator` projection to an agent with a current project coordinator
+grant. A worker credential, an ordinary agent without that grant, or an agent
+whose last effective grant was revoked gets `403`. Authority is checked on each
+call, including the owner's current role. Only projects where the grant is
+effective are read; membership or an agent project assignment alone grants no
+coordinator view.
+
+Each authorized project costs one canonical wait read: queue and lane triggers
+come from the same snapshot. `triggers` groups `checkpoint-to-coordinator`,
+`awaiting-review`, `awaiting-integration` and `lane-quiet`, and `items` carries
+those rows with their trigger. `idle_minutes` has the lane board's range
+1–10080 (default 15). For one project, `fingerprint` is byte-identical to the CLI
+coordinator fingerprint for the same actor, threshold and state. For multiple
+projects, rows carry `project`, and the fingerprint binds the sorted project
+identities and each canonical fingerprint, including empty projects. `projects`
+names exactly the authorized projects covered.
+
+Send `since=FINGERPRINT` from the previous reply to receive `changed: false` when
+the fact is unchanged, or `true` when it differs. Invalid fingerprints or forms
+are refused. This does not block, sleep, acknowledge any work or schedule a poll:
+the Bridge or caller decides when to read again. The coordinator projection and
+its trigger rules are shared with the CLI unchanged. The default worker form
+remains the agent's own work read. The generated `.orchestra/AGENT.md` describes
+both roles and uses the existing secret-safe curl credential file.
+
 ## Guidance and onboarding disclosure
 
 Every current project member, personal agent and worker credential can read this project's **whole onboarding document, including operator-written text**, at `GET /v1/projects/PROJECT/onboarding/read`. This deliberately widens the earlier edit route's disclosure. Do not place secrets in that project document. The edit route `GET /onboarding` still withholds operator-written text; these are distinct reads.

@@ -1750,6 +1750,26 @@ class InProcessBackend:
         return lanes_read(rows, actor, {'schema_version': 1, 'records': {}}, list(args),
                           journal=None, scope=scope)
 
+    def coordinator_wait(self, project_id, principal, idle_minutes):
+        """The disposable model's queue and board at one locked state."""
+        import waiting
+        from lanes import LANES_LIMIT_MAX
+        from work import move_decision
+        with self.service.store.lock:
+            actor = self.service.bind_actor(principal, None)
+            rows = []
+            for item in self.review_queue(project_id)['items']:
+                row = waiting.normalize_item(dict(item, task=item['id']))
+                row['whose_move'], _text, row['next_actor'] = move_decision(
+                    row['review_state'], row['task'], claim_limit.actor_holds(row['owner'], actor),
+                    pending_items=row['pending_review_items'], redelivered=bool(row['redelivered']),
+                    assignee=row['owner'], closed=row['status'] == 'closed', claimable=item['claimable'])
+                rows.append(row)
+            return waiting.coordinator_view(
+                rows,
+                self.lanes_read(project_id, ['--idle-minutes', str(idle_minutes),
+                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'))
+
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
 
@@ -3085,6 +3105,18 @@ class EndpointBackend:
         payload = self._checked(reply, reading=True)
         if not isinstance(payload, dict):
             raise uncertain('The canonical lanes read returned an unexpected shape')
+        return payload
+
+    def coordinator_wait(self, project_id, principal, idle_minutes):
+        """One canonical wait read: queue and lanes share the endpoint's export."""
+        reply = self._endpoint('wait', project_id, self.service.bind_actor(principal, None),
+                               ['--coordinator', '--idle-minutes', str(idle_minutes)],
+                               authority=authority_request(principal, project_id, CAP_COORDINATE,
+                                                           now=self.service._expiry_now()),
+                               extra={'lanes_scope': 'all'})
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict) or payload.get('form') != 'coordinator':
+            raise uncertain('The canonical coordinator wait returned an unexpected shape')
         return payload
 
     def requirements_read(self, project_id, args):
@@ -7503,6 +7535,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         from work import move_decision
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
+        form = ctx.query.get('form', 'worker')
+        if form not in ('worker', 'coordinator'):
+            raise HttpError(400, 'invalid_request', 'form must be worker or coordinator')
+        if form == 'coordinator':
+            return self._agent_coordinator_wait(ctx, agent)
         rows = []
         #: The claiming setting of every project this read covered (kittrial-5bb.352
         #: review item S1): the same fresh per-project read the endpoints and
@@ -7570,6 +7607,52 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['manual_cadence'] = ('Read this route again to see a change; it never blocks, '
                                   'never sleeps and schedules nothing. --since is the caller\'s '
                                   'own memory of the last fingerprint it acted on.')
+        return 200, view
+
+    def _agent_coordinator_wait(self, ctx, agent):
+        """Live project grants bound this read, never the service's host identity."""
+        import waiting
+        refuse_unknown_fields(ctx.query, ('form', 'since', 'idle_minutes'), 'Coordinator wait query')
+        since = ctx.query.get('since')
+        if since is not None and not waiting.is_fingerprint(since):
+            raise HttpError(400, 'invalid_request', 'since must be a wait fingerprint')
+        idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        projects = []
+        for project_id in sorted(set(agent.get('projects') or [])):
+            try:
+                self.service.check_authority(ctx.principal, project_id, CAP_COORDINATE)
+            except HttpError as error:
+                if error.status not in (403, 404):
+                    raise
+                continue
+            projects.append(project_id)
+        if not projects:
+            raise forbidden('A current project coordinator grant is required for coordinator wait')
+        if not hasattr(self.backend, 'coordinator_wait'):
+            raise not_implemented('Coordinator wait is unavailable on this server')
+        reads = [(project, self.backend.coordinator_wait(project, ctx.principal, idle_minutes))
+                 for project in projects]
+        # A one-project fingerprint is EXACTLY the CLI fact. Multiple projects have
+        # an explicit project namespace, including empty projects and grant changes.
+        if len(reads) == 1:
+            view = dict(reads[0][1])
+        else:
+            triggers = {name: [] for name in waiting.COORDINATOR_TRIGGERS}
+            for project, read in reads:
+                for name in triggers:
+                    triggers[name].extend(dict(row, project=project)
+                                          for row in read['triggers'][name])
+            view = {'schema': waiting.WAIT_SCHEMA, 'form': 'coordinator', 'triggers': triggers,
+                    'items': [dict(row, trigger=name) for name in triggers for row in triggers[name]],
+                    'fingerprint': waiting.digest([{'project': project, 'fingerprint': read['fingerprint']}
+                                                   for project, read in reads])}
+        view['projects'] = projects
+        view['agent'] = agent.get('id')
+        view['generated_at'] = now_iso(self.service._now())
+        if since is not None:
+            view['changed'] = since != view['fingerprint']
+        view['manual_cadence'] = ('Read this route again with form=coordinator and since=FINGERPRINT; '
+                                  'it never blocks, sleeps or schedules work.')
         return 200, view
 
     @route('POST', r'/v1/agents')
