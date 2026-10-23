@@ -151,6 +151,32 @@ class StoreTests(unittest.TestCase):
                               '2026-01-01T00:00:00Z')
                 self.assertEqual(before, {p.name for p in path.parent.parent.iterdir()})
 
+    def _assert_damaged_receipt_cannot_reuse_operation_under_another_name(self, extra_field):
+        self.cut(); self.cut('healthy', 'cut-healthy')
+        path = self.path / store.DIRECTORY / 'review-1' / 'receipt.json'
+        receipt = json.loads(path.read_text(encoding='utf-8'))
+        if extra_field:
+            receipt['extra'] = 'unexpected'
+            receipt['sha256'] = content_hash(receipt)  # valid hash, closed-field failure
+        else:
+            receipt['at'] = '2098-01-01T00:00:00Z'  # readable identity, stale hash
+        path.write_bytes(schema.json_bytes(receipt))
+        frozen = self.frozen_bytes()
+        pointer = (path.parent.parent / 'current.json').read_bytes()
+        calls = len(self.native.calls)
+        with self.assertRaisesRegex(ValueError, 'different cut|cannot be verified'):
+            self.cut('new', 'cut-one')
+        self.assertEqual(len(self.native.calls), calls)
+        self.assertFalse((path.parent.parent / 'new').exists())
+        self.assertEqual((path.parent.parent / 'current.json').read_bytes(), pointer)
+        self.assertEqual(self.frozen_bytes(), frozen)
+
+    def test_same_operation_other_name_refuses_a_receipt_with_hash_damage(self):
+        self._assert_damaged_receipt_cannot_reuse_operation_under_another_name(False)
+
+    def test_same_operation_other_name_refuses_a_receipt_with_extra_field(self):
+        self._assert_damaged_receipt_cannot_reuse_operation_under_another_name(True)
+
     def test_damaged_selected_receipt_and_current_pointer_still_refuse(self):
         self.cut(); self.cut('healthy', 'cut-healthy')
         receipt = self.path / store.DIRECTORY / 'review-1' / 'receipt.json'

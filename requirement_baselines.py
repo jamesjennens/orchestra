@@ -305,18 +305,19 @@ def cut(project_path, context, name, operation_id, run, at, operators=None):
         # A readable canonical name is required BEFORE considering isolation.
         # Missing/ambiguous identity or a receipt naming the selected target is
         # never evidence that the damaged record belongs to another cut.
-        if (not isinstance(entry, dict) or entry.get('name') != existing_name
-                or entry.get('name') == name):
+        if not isinstance(entry, dict) or entry.get('name') != existing_name:
             raise ValueError(REPAIR)
+        # Damage cannot authorize a second name for a readable saved operation.
+        # Check identity before any validation failure can isolate this receipt.
+        if all(entry.get(key) == value for key, value in dict(project=context.project,
+                account_id=context.account_id, operation_id=operation_id).items()):
+            raise ValueError(CONFLICT)
         try:
             schema._closed(entry, schema.RECEIPT_FIELDS, 'receipt')
             if content_hash(entry) != entry['sha256']:
                 raise ValueError(REPAIR)
         except (ValueError, TypeError, KeyError):
             continue
-        if all(entry[key] == value for key, value in dict(project=context.project,
-                account_id=context.account_id, operation_id=operation_id).items()):
-            raise ValueError(CONFLICT)
     if stage_name in stages:
         stage = _directory(base / stage_name)
         snapshot = schema.decode_snapshot(_read(stage / 'snapshot.json', schema.MAX_SNAPSHOT_BYTES))

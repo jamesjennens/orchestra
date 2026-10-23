@@ -3261,16 +3261,18 @@ coordination sidecar backup includes every complete named snapshot and validates
 all file hashes, exact references, governance history and current-pointer binding.
 
 HTTP changes reads use the existing BRD state projection and neutral author
-names. Viewers and contributors do not receive state operation handles or the
-baseline receipt's account/operation identifiers; current editors retain their
-authorized details. The member receipt is a presentation copy: its retained
+names. In `/brd`, requirement lists and `/brd/changes`, viewers and contributors
+see state `account_id` with a neutral author name, but no state `operation_id`.
+The baseline receipt read hides both `account_id` and `operation_id` from them.
+Current editors retain both identifiers in states and baseline receipts. The member receipt is a presentation copy: its retained
 hashes identify the original frozen artifacts, not the redacted JSON object.
 
 An unfinished `.pending-*` cut or missing current-pointer write **stops backup**.
 The backup failure report and its saved `backup-status` reason name the project,
 stage and exact-retry command. `backup-status` also reports live pending stages
 under `baseline_stages`, even when the last run predates the interrupted cut;
-the setup report includes the same diagnostic. These reads never repair a cut.
+the host `setup-status` report includes the same diagnostic. The web `/setup`
+page does not render these fields. These reads never repair a cut.
 Run the displayed `http_client.py call POST` command from the kit directory using
 `ORCHESTRA_HTTP_URL` set to the server and `ORCHESTRA_OWNER_TOKEN` set to a
 current session of the original owner. Set `ORIGINAL_BODY`
@@ -3282,8 +3284,10 @@ capture is damaged, preserve the stage and restore a verified complete generatio
 with the host operator. Do not delete a stage or invent a new request/key.
 No backup silently drops a staged capture. Reads list healthy named baselines
 independently. A damaged old receipt with a readable unrelated name does not block
-a new cut, but unreadable identity, the selected target and a damaged current
-pointer still refuse. Do not replace damaged files with today's requirements or
+a new cut with a different operation identity. A readable matching project,
+account and operation still refuses cross-name reuse even if its receipt is
+damaged. Unreadable identity, the selected target and a damaged current pointer
+still refuse. Do not replace damaged files with today's requirements or
 edit their hashes.
 
 Multiline terminal Reasons are blockquoted in new Markdown exports. Previously

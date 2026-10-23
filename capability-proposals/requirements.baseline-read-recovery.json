@@ -7,7 +7,7 @@
     "baseline receipt redaction",
     "pending baseline backup"
   ],
-  "summary": "Changes reads project before/after states through the existing member policy and neutral author names; non-editors read baseline receipts without account or operation handles. New cuts isolate damaged unrelated receipts only with readable matching names, and require a valid current pointer. Pending-cut backup reports, status and setup name the project, stage and original-owner exact HTTP retry. Multiline Reasons are quoted in new exports while existing frozen bytes and receipt hashes remain readable and recoverable.",
+  "summary": "Changes reads project before/after states through the existing member policy and neutral author names; non-editors read baseline receipts without account or operation handles. New cuts isolate damaged unrelated receipts only with readable matching names; readable matching project/account/operation identity still refuses cross-name replay before validation, and current-pointer validation stays strict. Pending-cut backup reports, status and host setup-status name the project, stage and original-owner exact HTTP retry. Multiline Reasons are quoted in new exports while existing frozen bytes and receipt hashes remain readable and recoverable.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#requirements-baseline-backup-and-restore-boundary"

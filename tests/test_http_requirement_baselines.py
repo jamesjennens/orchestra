@@ -158,6 +158,8 @@ class BaselineHttpTests(EndpointCase):
                 receipt = self.request('GET', self.collection + '/review-1', token=token)
                 self.assertEqual(receipt.status, 200, receipt.data)
                 if role in ('owner', 'coordinator'):
+                    self.assertIn('account_id', receipt.data['receipt'])
+                    self.assertIn('operation_id', receipt.data['receipt'])
                     self.assertEqual(receipt.data, full)
                 else:
                     self.assertNotIn('account_id', receipt.data['receipt'])
