@@ -27,6 +27,7 @@ the task row read for that request, never from a list kept with the file.
 
 This module is import-safe on every platform (no ``fcntl``): the caller holds the lock.
 """
+import contextlib
 import hashlib
 import json
 import os
@@ -228,6 +229,20 @@ UNUSABLE = ('The project\'s %s cannot be used (%s); nothing was stored or served
             'must look at it.')
 
 
+def _linked(info):
+    """Whether an lstat result is a link: a symlink, or on Windows any name-surrogate reparse point (a junction
+    is one; Python 3.11's S_ISLNK and DirEntry.is_symlink do not count it). kittrial-5bb.380 r2: a junction to a
+    folder elsewhere was walked through, and purge removed a blob through it."""
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_reparse_tag', 0) & 0x20000000)
+
+
+def _entry_linked(entry):
+    try:
+        return _linked(entry.stat(follow_symlinks=False))
+    except OSError:
+        return True
+
+
 def _directory(path, create):
     """``path`` as a real directory (made when ``create``), or :class:`Refusal` 503.
 
@@ -247,7 +262,7 @@ def _directory(path, create):
             raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'it could not be made: %s'
                                                           % (failed.strerror or type(failed).__name__)))
         info = os.lstat(str(path))
-    if stat.S_ISLNK(info.st_mode):
+    if _linked(info):
         raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, '%s is a symlink' % _shown(path)))
     if not stat.S_ISDIR(info.st_mode):
         raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, '%s is not a folder' % _shown(path)))
@@ -327,7 +342,7 @@ def referenced(project):
         return found
     with os.scandir(str(records)) as tasks:
         for task in tasks:
-            if not task.is_dir(follow_symlinks=False):
+            if not task.is_dir(follow_symlinks=False) or _entry_linked(task):
                 continue
             with os.scandir(task.path) as items:
                 for item in items:
@@ -763,6 +778,8 @@ def apply(payload, actor, run, project, now, limit=None):
 # reads or changes the folder as one unit under it.
 MANIFEST = 'manifest.json'
 AUDIT = 'audit.jsonl'
+#: A temporary file of a write in progress (_write_entry, _copy_hashed, _write_json, the backup's record copies).
+TEMP_NAME = re.compile(r'\.t[0-9a-f]{16}')
 STALE_SECONDS = 24 * 3600          # coordinator's Q1: orphans and temp files older than this are purged
 
 
@@ -774,7 +791,8 @@ def _blob_names(base):
     except FileNotFoundError:
         return found
     for top in tops:
-        if len(top.name) != 2 or not re.fullmatch(r'[0-9a-f]{2}', top.name) or not top.is_dir(follow_symlinks=False):
+        if len(top.name) != 2 or not re.fullmatch(r'[0-9a-f]{2}', top.name) or not top.is_dir(follow_symlinks=False) \
+                or _entry_linked(top):
             continue
         with os.scandir(top.path) as blobs:
             for blob in blobs:
@@ -783,8 +801,18 @@ def _blob_names(base):
     return sorted(found)
 
 
-def all_entries(project):
-    """Every valid journal entry of every task, with the path of its file (relative to .task-files)."""
+def all_entries(project, problems=None):
+    """Every valid journal entry of every task, with the path of its file (relative to .task-files).
+
+    kittrial-5bb.380 r2 (review b1): a journal file that cannot be accepted is never left out silently. When
+    ``problems`` is a list, each one is appended as ``{path, sha256, problem}`` (``sha256`` from its name, or
+    None): a file that is not JSON, not a valid entry of its task (an extra field after a rollback, say), a link
+    or not a regular file, a task folder that is a link or not a folder, and any other name in the journal. A
+    temporary file of a write in progress (``.t`` and 16 hex digits) is not one.
+    """
+    def bad(relative, sha256, problem):
+        if problems is not None:
+            problems.append({'path': relative, 'sha256': sha256, 'problem': problem})
     base = folder(project)
     if base is None:
         return []
@@ -794,21 +822,45 @@ def all_entries(project):
     found = []
     with os.scandir(str(records)) as tasks:
         for task_dir in sorted(tasks, key=lambda d: d.name):
+            relative_dir = RECORDS + '/' + task_dir.name
+            if TEMP_NAME.fullmatch(task_dir.name):
+                continue
+            if task_dir.is_symlink() or _entry_linked(task_dir):
+                bad(relative_dir, None, 'the task folder is a symlink')
+                continue
             if not task_dir.is_dir(follow_symlinks=False):
+                bad(relative_dir, None, 'not a folder')
                 continue
             with os.scandir(task_dir.path) as items:
                 for item in sorted(items, key=lambda i: i.name):
                     name = item.name
-                    if not name.endswith('.json') or not SHA256.fullmatch(name[:-5]) or not item.is_file(follow_symlinks=False):
+                    relative = relative_dir + '/' + name
+                    if TEMP_NAME.fullmatch(name):
+                        continue
+                    sha256 = name[:-5] if name.endswith('.json') and SHA256.fullmatch(name[:-5]) else None
+                    if sha256 is None:
+                        bad(relative, None, 'not a journal file name')
+                        continue
+                    if not item.is_file(follow_symlinks=False) or _entry_linked(item):
+                        bad(relative, sha256, 'a symlink or not a regular file')
                         continue
                     try:
                         entry = record_json.loads(Path(item.path).read_text(encoding='utf-8'))
                     except (OSError, ValueError, UnicodeError):
+                        bad(relative, sha256, 'not readable as JSON')
                         continue
-                    if isinstance(entry, dict) and task_key(entry.get('task', '')) == task_dir.name \
-                            and _valid_entry(entry, entry.get('task'), name[:-5]):
-                        found.append((RECORDS + '/' + task_dir.name + '/' + name, entry))
+                    if not (isinstance(entry, dict) and task_key(entry.get('task', '')) == task_dir.name
+                            and _valid_entry(entry, entry.get('task'), sha256)):
+                        bad(relative, sha256, 'not a valid entry of this task (a field this kit does not know?)')
+                        continue
+                    found.append((relative, entry))
     return found
+
+
+def _problems_sentence(problems):
+    return '%d journal file(s) of %s cannot be read as entries (%s)' % (
+        len(problems), FOLDER, '; '.join('%s: %s' % (item['path'], item['problem']) for item in problems[:5])
+        + ('; ...' if len(problems) > 5 else ''))
 
 
 def _hash_file(path):
@@ -878,12 +930,22 @@ def _plain_dir(path, create, what):
             return None
         os.mkdir(str(path), 0o700)
         info = os.lstat(str(path))
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+    if _linked(info) or not stat.S_ISDIR(info.st_mode):
         raise Refusal(503, 'unavailable', '%s is a symlink or not a folder; nothing was copied through it.' % what)
     return path
 
 
-def backup_folder(project, target, now=None):
+def _old_manifest(path):
+    try:
+        if not stat.S_ISREG(os.lstat(str(path)).st_mode):
+            return None
+        manifest = record_json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def backup_folder(project, target, now=None, lock=None):
     """Mirror the project's task files into ``target`` (``backups/<name>.task-files``); returns the summary.
 
     Copied: every blob a journal entry still names (live or withdrawn; a purged entry names nothing)
@@ -892,23 +954,36 @@ def backup_folder(project, target, now=None):
     that no longer matches its name is reported and NOT copied. The manifest is removed first and
     written LAST, so a backup that stopped half way has none and is never taken for a complete one.
     A project without the folder leaves an existing backup folder emptied (with an empty manifest).
+
+    kittrial-5bb.380 r2: ``lock`` (a context manager factory, the project's .coordination.lock) is
+    held only to read the journal and to finish, never while the blobs are hashed and copied: a blob
+    is never rewritten, only removed, and what changed meanwhile is read again under the lock (s5).
+    A journal file that cannot be read is a problem (s1): the blob its name names is still copied,
+    the last good copy of it in the backup is kept and listed, and nothing is pruned from the backup
+    while one exists.
     """
+    lock = lock or contextlib.nullcontext
     target = Path(target)
-    source = folder(project)
-    if source is None and not os.path.lexists(str(target)):
-        return {'files': 0, 'bytes': 0, 'records': 0, 'problems': [], 'absent': True}
-    _plain_dir(target, True, 'The task-files backup folder')
-    manifest = target / MANIFEST
-    if os.path.lexists(str(manifest)):
-        os.unlink(str(manifest))
-    entries_now = all_entries(project) if source is not None else []
-    needed = sorted({entry['sha256'] for _, entry in entries_now if not entry.get('purged')})
-    blobs, problems, total = [], [], 0
-    for sha256 in needed:
-        size = blob_size(project, sha256)
+    with lock():
+        source = folder(project)
+        if source is None and not os.path.lexists(str(target)):
+            return {'files': 0, 'bytes': 0, 'records': 0, 'problems': [], 'absent': True}
+        _plain_dir(target, True, 'The task-files backup folder')
+        manifest = target / MANIFEST
+        old = _old_manifest(manifest) or {}
+        if os.path.lexists(str(manifest)):
+            os.unlink(str(manifest))
+        unreadable = []
+        entries_now = all_entries(project, unreadable) if source is not None else []
+        wanted = ({entry['sha256'] for _, entry in entries_now if not entry.get('purged')}
+                  | {item['sha256'] for item in unreadable if item['sha256']})
+        sizes = {sha256: blob_size(project, sha256) for sha256 in wanted}
+    copied, problems = {}, []
+
+    def copy_blob(sha256, size):
         if size is None:
             problems.append({'sha256': sha256, 'problem': 'missing in the project'})
-            continue
+            return
         top = _plain_dir(target / sha256[:2], True, 'A task-files backup folder')
         dest = top / sha256
         try:
@@ -916,44 +991,73 @@ def backup_folder(project, target, now=None):
         except FileNotFoundError:
             info = None
         if info is not None and stat.S_ISREG(info.st_mode) and info.st_size == size:
-            blobs.append({'sha256': sha256, 'bytes': size})
-            total += size
-            continue
-        digest, count, temp = _copy_hashed(blob_path(project, sha256), dest)
+            copied[sha256] = size
+            return
+        try:
+            digest, count, temp = _copy_hashed(blob_path(project, sha256), dest)
+        except FileNotFoundError:
+            return                                          # removed meanwhile: settled under the lock below
         if digest != sha256 or count != size:
             os.unlink(str(temp))
             problems.append({'sha256': sha256, 'problem': 'the stored file does not match its name (sha256 %s)' % digest})
-            continue
+            return
         os.replace(str(temp), str(dest))
-        blobs.append({'sha256': sha256, 'bytes': count})
-        total += count
-    records = []
-    _plain_dir(target / RECORDS, True, 'The task-files backup records folder')
-    for relative, entry in entries_now:
-        parts = relative.split('/')
-        task_dir = _plain_dir(target / RECORDS / parts[1], True, 'A task-files backup records folder')
-        data = (Path(source) / relative).read_bytes()
-        dest = task_dir / parts[2]
-        temp = dest.with_name('.t' + uuid.uuid4().hex[:16])
-        with open(str(temp), 'xb') as handle:
-            handle.write(data)
-        os.replace(str(temp), str(dest))
-        records.append({'path': relative, 'sha256': hashlib.sha256(data).hexdigest()})
-    keep = {blob['sha256'] for blob in blobs}
-    for sha256, path in _blob_names(target):
-        if sha256 not in keep:
-            os.unlink(str(path))
-    keep_records = {record['path'] for record in records}
-    records_dir = target / RECORDS
-    for task_dir in list(os.scandir(str(records_dir))):
-        if not task_dir.is_dir(follow_symlinks=False):
-            continue
-        for item in list(os.scandir(task_dir.path)):
-            if RECORDS + '/' + task_dir.name + '/' + item.name not in keep_records and item.is_file(follow_symlinks=False):
-                os.unlink(item.path)
-    summary = {'schema_version': 1, 'at': now() if now else None, 'files': len(blobs), 'bytes': total,
-               'records': len(records), 'blobs': blobs, 'record_files': records, 'problems': problems}
-    _write_json(manifest, summary)
+        copied[sha256] = count
+
+    for sha256 in sorted(wanted):                         # outside the lock: the long part
+        copy_blob(sha256, sizes[sha256])
+    with lock():
+        unreadable = []
+        entries_now = all_entries(project, unreadable) if source is not None else []
+        wanted = ({entry['sha256'] for _, entry in entries_now if not entry.get('purged')}
+                  | {item['sha256'] for item in unreadable if item['sha256']})
+        named = {item['sha256'] for item in problems}
+        for sha256 in sorted(wanted - set(copied) - named):   # attached while the others were copied
+            copy_blob(sha256, blob_size(project, sha256))
+        problems = [item for item in problems if item['sha256'] in wanted]
+        blobs = [{'sha256': sha256, 'bytes': copied[sha256]} for sha256 in sorted(wanted & set(copied))]
+        total = sum(blob['bytes'] for blob in blobs)
+        records = []
+        _plain_dir(target / RECORDS, True, 'The task-files backup records folder')
+        for relative, entry in entries_now:
+            parts = relative.split('/')
+            task_dir = _plain_dir(target / RECORDS / parts[1], True, 'A task-files backup records folder')
+            data = (Path(source) / relative).read_bytes()
+            dest = task_dir / parts[2]
+            temp = dest.with_name('.t' + uuid.uuid4().hex[:16])
+            with open(str(temp), 'xb') as handle:
+                handle.write(data)
+            os.replace(str(temp), str(dest))
+            records.append({'path': relative, 'sha256': hashlib.sha256(data).hexdigest()})
+        kept_before = {item.get('path'): item.get('sha256') for item in old.get('record_files') or []
+                       if isinstance(item, dict)}
+        for item in unreadable:
+            carried = None
+            digest = kept_before.get(item['path'])
+            copy = target / item['path']
+            if digest and os.path.isfile(str(copy)) and not os.path.islink(str(copy)):
+                if hashlib.sha256(copy.read_bytes()).hexdigest() == digest:
+                    carried = {'path': item['path'], 'sha256': digest}
+                    records.append(carried)
+            problems.append({'sha256': item['sha256'] or '-', 'path': item['path'],
+                             'problem': 'its journal file cannot be read (%s); %s' % (
+                                 item['problem'], 'the last good copy is kept' if carried else 'no good copy is kept')})
+        if not unreadable:                                   # never prune what cannot be accounted for
+            keep = {blob['sha256'] for blob in blobs}
+            for sha256, path in _blob_names(target):
+                if sha256 not in keep:
+                    os.unlink(str(path))
+            keep_records = {record['path'] for record in records}
+            records_dir = target / RECORDS
+            for task_dir in list(os.scandir(str(records_dir))):
+                if not task_dir.is_dir(follow_symlinks=False):
+                    continue
+                for item in list(os.scandir(task_dir.path)):
+                    if RECORDS + '/' + task_dir.name + '/' + item.name not in keep_records and item.is_file(follow_symlinks=False):
+                        os.unlink(item.path)
+        summary = {'schema_version': 1, 'at': now() if now else None, 'files': len(blobs), 'bytes': total,
+                   'records': len(records), 'blobs': blobs, 'record_files': records, 'problems': problems}
+        _write_json(manifest, summary)
     return {'files': len(blobs), 'bytes': total, 'records': len(records), 'problems': problems, 'absent': False}
 
 
@@ -1030,44 +1134,76 @@ def restore_folder(source, project):
     return {'status': 'restored', 'files': len(blobs), 'bytes': total, 'records': len(records), 'problems': []}
 
 
-def verify(project, now_seconds=None):
+def verify(project, now_seconds=None, lock=None):
     """Re-hash every stored file a journal entry needs (design 2d); returns what does not match.
 
     ``mismatched``: the bytes no longer hash to the file's name; ``wrong_size``: the record's byte
     count differs; ``missing``: an entry that is neither withdrawn nor purged has no bytes;
+    ``unreadable``: journal files that cannot be read as entries (kittrial-5bb.380 r2, b1);
     ``orphans``: stored files no entry names; ``stale_temp``: temporary files older than a day.
+
+    kittrial-5bb.380 r2 (s5): ``lock`` is held only to read the journal and the folder, and again
+    to confirm what was found; the hashing runs outside it (a blob is never rewritten in place).
     """
     import time as _time
+    lock = lock or contextlib.nullcontext
     now_seconds = _time.time() if now_seconds is None else now_seconds
-    entries_now = all_entries(project)
-    result = {'checked': 0, 'mismatched': [], 'wrong_size': [], 'missing': [], 'orphans': [], 'stale_temp': []}
-    if folder(project) is None:
-        return result
-    named = {}
-    for relative, entry in entries_now:
-        if entry.get('purged'):
-            continue
-        named.setdefault(entry['sha256'], []).append(entry)
-    on_disk = dict(_blob_names(folder(project)))
-    for sha256, entries_of in sorted(named.items()):
+    result = {'checked': 0, 'mismatched': [], 'wrong_size': [], 'missing': [], 'unreadable': [], 'orphans': [],
+              'stale_temp': []}
+
+    def needs(entries_now, unreadable):
+        named = {}
+        for _, entry in entries_now:
+            if not entry.get('purged'):
+                named.setdefault(entry['sha256'], []).append(entry)
+        return named, {item['sha256'] for item in unreadable if item['sha256']}
+
+    with lock():
+        if folder(project) is None:
+            return result
+        unreadable = []
+        named, also = needs(all_entries(project, unreadable), unreadable)
+        on_disk = dict(_blob_names(folder(project)))
+        stale = []
+        tmp = _sub(project, TMP, False)
+        if tmp is not None:
+            for item in os.scandir(str(tmp)):
+                if item.is_file(follow_symlinks=False) and now_seconds - item.stat(follow_symlinks=False).st_mtime > STALE_SECONDS:
+                    stale.append(item.name)
+    found = {'mismatched': [], 'wrong_size': [], 'missing': []}
+    for sha256, entries_of in sorted(named.items()):          # outside the lock: the long part
+        tasks = sorted({e['task'] for e in entries_of})
         if sha256 not in on_disk:
             if any(entry.get('withdrawn') is None for entry in entries_of):
-                result['missing'].append({'sha256': sha256, 'tasks': sorted({e['task'] for e in entries_of})})
+                found['missing'].append({'sha256': sha256, 'tasks': tasks})
             continue
-        digest, count = _hash_file(on_disk[sha256])
+        try:
+            digest, count = _hash_file(on_disk[sha256])
+        except FileNotFoundError:
+            found['missing'].append({'sha256': sha256, 'tasks': tasks})
+            continue
         result['checked'] += 1
         if digest != sha256:
-            result['mismatched'].append({'sha256': sha256, 'actual': digest, 'tasks': sorted({e['task'] for e in entries_of})})
+            found['mismatched'].append({'sha256': sha256, 'actual': digest, 'tasks': tasks})
         elif any(entry['bytes'] != count for entry in entries_of):
-            result['wrong_size'].append({'sha256': sha256, 'bytes': count})
-    for sha256, path in sorted(on_disk.items()):
-        if sha256 not in named:
-            result['orphans'].append({'sha256': sha256, 'bytes': path.stat().st_size})
-    tmp = _sub(project, TMP, False)
-    if tmp is not None:
-        for item in os.scandir(str(tmp)):
-            if item.is_file(follow_symlinks=False) and now_seconds - item.stat(follow_symlinks=False).st_mtime > STALE_SECONDS:
-                result['stale_temp'].append(item.name)
+            found['wrong_size'].append({'sha256': sha256, 'bytes': count})
+    with lock():                                              # confirm against the journal as it is now
+        unreadable = []
+        named_now, also_now = needs(all_entries(project, unreadable), unreadable)
+        live = {sha256 for sha256, entries_of in named_now.items()
+                if any(entry.get('withdrawn') is None for entry in entries_of)}
+        result['mismatched'] = [item for item in found['mismatched'] if item['sha256'] in named_now]
+        result['wrong_size'] = [item for item in found['wrong_size'] if item['sha256'] in named_now]
+        result['missing'] = [item for item in found['missing']
+                             if item['sha256'] in live and blob_size(project, item['sha256']) is None]
+        result['unreadable'] = unreadable
+        on_disk = dict(_blob_names(folder(project)))
+        # r2 (review b1): while a journal file cannot be read, no blob can be called an orphan (it may be that
+        # file's bytes, and a linked task folder hides even its name).
+        result['orphans'] = [] if unreadable else [
+            {'sha256': sha256, 'bytes': path.stat().st_size} for sha256, path in sorted(on_disk.items())
+            if sha256 not in named_now and sha256 not in also_now]
+    result['stale_temp'] = stale
     return result
 
 
@@ -1093,7 +1229,13 @@ def purge_plan(project, closed_before, rows, now_seconds=None):
     plan = {'closed_before': closed_before, 'remove': [], 'kept_referenced': [], 'marks': []}
     if base is None:
         return plan
-    entries_now = all_entries(project)
+    unreadable = []
+    entries_now = all_entries(project, unreadable)
+    if unreadable:
+        # kittrial-5bb.380 r2 (review b1): such a file may be a live record of bytes no other entry names: nothing
+        # can be called an orphan, or unneeded, until an operator repairs or removes it.
+        raise Refusal(409, 'conflict', _problems_sentence(unreadable) + ': nothing is purged until an operator repairs '
+                      'or removes them (task-files verify lists them).')
     needed, candidates = set(), []
     for relative, entry in entries_now:
         if entry.get('purged'):
@@ -1117,7 +1259,8 @@ def purge_plan(project, closed_before, rows, now_seconds=None):
             removed.add(sha256)
             plan['remove'].append({'kind': 'file', 'sha256': sha256, 'bytes': on_disk[sha256].stat().st_size,
                                    'why': why, 'task': entry['task']})
-    named = {entry['sha256'] for _, entry in entries_now if not entry.get('purged')}
+    # A blob any journal file of any task is named after is never an orphan (as referenced() reads the names).
+    named = {entry['sha256'] for _, entry in entries_now if not entry.get('purged')} | referenced(project)
     for sha256, path in sorted(on_disk.items()):
         info = path.stat()
         if sha256 not in named and now_seconds - info.st_mtime > STALE_SECONDS:
@@ -1134,12 +1277,36 @@ def purge_plan(project, closed_before, rows, now_seconds=None):
     return plan
 
 
+def _append_audit(audit, line):
+    with open(str(audit), 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps(line, ensure_ascii=False, sort_keys=True) + '\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _bytes_gone(project, sha256):
+    """True when the blob of ``sha256`` is not in place (absent); False when it is, or cannot be told."""
+    try:
+        path = blob_path(project, sha256)
+    except Refusal:
+        return False                                          # a linked or odd folder: not known to be gone
+    if path is None:
+        return True
+    return not os.path.lexists(str(path))
+
+
 def purge(project, plan, actor, now, reason=None):
-    """Carry out a purge plan: remove its files, mark the entries purged, and write ONE audit line.
+    """Carry out a purge plan: remove its files, mark the entries purged, and write the audit lines.
 
     The caller holds the project's lock and checked that ``actor`` is an operator. A file is
     removed only after checking it is a regular file in place (never through a link); an entry is
     marked ``purged: {by, at, reason}`` (its history comment is untouched). Returns the audit line.
+
+    kittrial-5bb.380 r2: an intent line is written BEFORE anything is removed, each item is tried on
+    its own (a failure is recorded and the rest go on), and the result line is written in a finally,
+    so a purge that stops part way leaves a record (s3). An entry is marked only when its bytes were
+    removed or are already absent; one whose bytes are still in place (under a linked folder, say) is
+    left unmarked and named (s4).
     """
     base = folder(project)
     if base is None:
@@ -1148,33 +1315,50 @@ def purge(project, plan, actor, now, reason=None):
     if os.path.islink(str(audit)):
         raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'its audit file is a symlink'))
     at = now()
-    done = []
-    for item in plan['remove']:
-        if item['kind'] == 'temp':
-            path = _sub(project, TMP, False) / item['name']
-        else:
-            path = blob_path(project, item['sha256'])
-        try:
-            if path is not None and stat.S_ISREG(os.lstat(str(path)).st_mode):
-                os.unlink(str(path))
-                done.append(item)
-        except FileNotFoundError:
-            pass
-    for mark in plan['marks']:
-        entry = read_entry(project, mark['task'], mark['sha256'])
-        if entry is None or entry.get('purged'):
-            continue
-        entry['purged'] = {'by': actor, 'at': at, 'reason': reason or mark['why']}
-        _write_entry(project, entry)
-    line = {'schema_version': 1, 'at': at, 'actor': actor, 'operation': 'purge',
-            'closed_before': plan['closed_before'], 'removed': done,
-            'bytes': sum(item.get('bytes') or 0 for item in done),
-            'marked': [{'task': m['task'], 'sha256': m['sha256'], 'why': m['why']} for m in plan['marks']],
-            'kept_referenced': plan['kept_referenced']}
-    with open(str(audit), 'a', encoding='utf-8') as handle:
-        handle.write(json.dumps(line, ensure_ascii=False, sort_keys=True) + '\n')
-        handle.flush()
-        os.fsync(handle.fileno())
+    _append_audit(audit, {'schema_version': 1, 'at': at, 'actor': actor, 'operation': 'purge-intent',
+                          'closed_before': plan['closed_before'], 'remove': plan['remove'],
+                          'marks': [{'task': m['task'], 'sha256': m['sha256'], 'why': m['why']} for m in plan['marks']]})
+    done, absent, failed, marked = [], [], [], []
+    try:
+        for item in plan['remove']:
+            try:
+                if item['kind'] == 'temp':
+                    tmp = _sub(project, TMP, False)
+                    path = None if tmp is None else tmp / item['name']
+                else:
+                    path = blob_path(project, item['sha256'])
+                if path is None:
+                    absent.append(item)
+                    continue
+                if stat.S_ISREG(os.lstat(str(path)).st_mode):
+                    os.unlink(str(path))
+                    done.append(item)
+                else:
+                    failed.append(dict(item, problem='not a regular file in place; left as it is'))
+            except FileNotFoundError:
+                absent.append(item)
+            except (OSError, Refusal) as error:
+                failed.append(dict(item, problem=str(error)[:300]))
+        for mark in plan['marks']:
+            try:
+                if not _bytes_gone(project, mark['sha256']):
+                    failed.append({'kind': 'mark', 'task': mark['task'], 'sha256': mark['sha256'],
+                                   'problem': 'its bytes are still in place; the entry is not marked purged'})
+                    continue
+                entry = read_entry(project, mark['task'], mark['sha256'])
+                if entry is None or entry.get('purged'):
+                    continue
+                entry['purged'] = {'by': actor, 'at': at, 'reason': reason or mark['why']}
+                _write_entry(project, entry)
+                marked.append({'task': mark['task'], 'sha256': mark['sha256'], 'why': mark['why']})
+            except (OSError, Refusal) as error:
+                failed.append({'kind': 'mark', 'task': mark['task'], 'sha256': mark['sha256'], 'problem': str(error)[:300]})
+    finally:
+        line = {'schema_version': 1, 'at': at, 'actor': actor, 'operation': 'purge',
+                'closed_before': plan['closed_before'], 'removed': done, 'already_absent': absent, 'failed': failed,
+                'bytes': sum(item.get('bytes') or 0 for item in done), 'marked': marked,
+                'kept_referenced': plan['kept_referenced']}
+        _append_audit(audit, line)
     return line
 
 
@@ -1316,8 +1500,15 @@ def proxy_check(url, length, cafile=None, timeout=300):
         orchestra = False
     if status == 401 and orchestra:
         result['passed'] = True
-        result['sentence'] = ('An upload of %s through %s reached Orchestra (its own 401 for this unsigned test): nothing in '
-                              'front of the site cuts uploads of the per-file limit.' % (size, url))
+        if result['sent'] < length:
+            # kittrial-5bb.380 r2 (review note): Orchestra answers an unsigned upload early; the request of this
+            # declared size got through whatever stands in front, but not every byte was sent: say so.
+            result['sentence'] = ('An upload declared as %s through %s reached Orchestra (its own 401 for this unsigned '
+                                  'test) after %s had been sent: what stands in front of the site let a request of '
+                                  'that size through.' % (size, url, size_text(result['sent'])))
+        else:
+            result['sentence'] = ('An upload of %s through %s reached Orchestra (its own 401 for this unsigned test): '
+                                  'nothing in front of the site cuts uploads of the per-file limit.' % (size, url))
     elif status == 413:
         result['sentence'] = ('An upload of %s through %s was refused before it reached Orchestra (HTTP 413 from something '
                               'in front of the site): %s.' % (size, url, PROXY_FIX % size))

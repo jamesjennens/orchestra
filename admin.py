@@ -6238,6 +6238,18 @@ def task_files_backup_path(root,name):
     """Where a project's task files are backed up: ``backups/<name>.task-files`` (kittrial-5bb.380)."""
     return root/'backups'/(name+'.task-files')
 
+def coordination_lock(path,shared=False):
+    """A factory of context managers holding ``path/.coordination.lock`` (shared or exclusive), for the
+    task-files functions that take the lock only around their short steps (kittrial-5bb.380 r2, s5)."""
+    import contextlib
+    @contextlib.contextmanager
+    def held():
+        import fcntl
+        with (Path(path)/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            yield
+    return held
+
 def backup_task_files(root,name):
     """Mirror the project's ``.task-files`` beside its backup (design 4a A, kittrial-5bb.380).
 
@@ -6252,11 +6264,11 @@ def backup_task_files(root,name):
     if not os.path.lexists(str(path/task_files.FOLDER)) and not os.path.lexists(str(target)):
         # No files and no earlier backup of them: nothing to copy or empty, so no lock is taken.
         return {'files':0,'bytes':0,'records':0,'problems':[],'absent':True}
-    import fcntl
-    with backup_lock(root,name),(path/'.coordination.lock').open('a') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX)
+    # kittrial-5bb.380 r2 (s5): the backup lock for the whole copy; the project's lock only to read the journal
+    # and to finish, never while the blobs are hashed and copied.
+    with backup_lock(root,name):
         try:
-            return task_files.backup_folder(path,target,now=utc_stamp)
+            return task_files.backup_folder(path,target,now=utc_stamp,lock=coordination_lock(path))
         except task_files.Refusal as refused:
             raise ValueError(str(refused)) from None
 
@@ -6326,8 +6338,8 @@ def backup_projects(root,names,all_projects=False,named_http_state=None):
                     print('task files of %s: %d files, %s (backups/%s.task-files)'
                           %(name,files['files'],task_files_size_text(files['bytes']),name))
                     for problem in files['problems']:
-                        print('task files of %s: NOT backed up: %s: %s'%(name,problem['sha256'],problem['problem']),
-                              file=sys.stderr)
+                        print('task files of %s: NOT backed up: %s: %s'%(name,problem.get('path') or problem['sha256'],
+                                                                         problem['problem']),file=sys.stderr)
                     if files['problems']:entry['task_files']['problems']=len(files['problems'])
         else:
             results.append({'name':name,'status':'failed','reason':reason})
@@ -11580,7 +11592,10 @@ def task_files_command(root,args):
         from server_address import public_url_problem
         problem=public_url_problem(args.url,'--url')
         if problem:raise ValueError(problem)
-        size=args.bytes if args.bytes is not None else task_files.limits(root)['max_file_bytes']
+        cap=task_files.limits(root)['max_file_bytes']
+        if args.bytes is not None and not 1<=args.bytes<=cap:
+            raise ValueError('task-files proxy-check --bytes is 1 to %d (the per-file limit, task_files.max_file_bytes)'%cap)
+        size=args.bytes if args.bytes is not None else cap
         result=task_files.proxy_check(args.url,size,cafile=args.cafile)
         print(result['sentence'])
         print(json.dumps(result,sort_keys=True))
@@ -11590,29 +11605,32 @@ def task_files_command(root,args):
     path=project_dir(root,args.project)
     if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
     if args.operation=='verify':
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_SH)
-            try:
-                result=task_files.verify(path)
-            except task_files.Refusal as refused:
-                raise ValueError(str(refused)) from None
+        try:
+            # kittrial-5bb.380 r2 (s5): the shared lock only to read and to confirm, never while hashing.
+            result=task_files.verify(path,lock=coordination_lock(path,shared=True))
+        except task_files.Refusal as refused:
+            raise ValueError(str(refused)) from None
         for key,label in (('mismatched','does not match its name'),('wrong_size','has another size than its record'),
                           ('missing','is missing (a live record names it)')):
             for item in result[key]:
                 print('task file %s %s'%(item['sha256'],label))
-        print('Checked %d stored files: %d mismatched, %d of another size, %d missing; %d orphans and %d old '
-              'temporary files (task-files purge removes those).'%(result['checked'],len(result['mismatched']),
-              len(result['wrong_size']),len(result['missing']),len(result['orphans']),len(result['stale_temp'])))
+        for item in result['unreadable']:
+            print('journal file %s cannot be read as an entry: %s'%(item['path'],item['problem']))
+        print('Checked %d stored files: %d mismatched, %d of another size, %d missing; %d journal files that cannot '
+              'be read; %d orphans and %d old temporary files (task-files purge removes those).'
+              %(result['checked'],len(result['mismatched']),len(result['wrong_size']),len(result['missing']),
+                len(result['unreadable']),len(result['orphans']),len(result['stale_temp'])))
         print(json.dumps(result,sort_keys=True))
-        return 1 if result['mismatched'] or result['wrong_size'] or result['missing'] else 0
+        return 1 if result['mismatched'] or result['wrong_size'] or result['missing'] or result['unreadable'] else 0
     # purge
     if not args.closed_before:raise ValueError('task-files purge needs --closed-before YYYY-MM-DD')
     from keyed_records import require_configured_operator
     require_configured_operator(args.actor,operators(root,strict=True),'purge task files')
-    rows={row.get('id'):row for row in record_json.loads_rows(run_bd(root,args.project,['export','--all']))
-          if isinstance(row,dict)}
     with (path/'.coordination.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
+        # kittrial-5bb.380 r2 (s2): the rows are read under the lock, so a task reopened before it is seen as open.
+        rows={row.get('id'):row for row in record_json.loads_rows(run_bd(root,args.project,['export','--all']))
+              if isinstance(row,dict)}
         try:
             if task_files.folder(path) is None:
                 print('Project %s has no task files; nothing to purge.'%args.project)
@@ -11633,7 +11651,10 @@ def task_files_command(root,args):
             raise ValueError(str(refused)) from None
     print('Purged %d (%s) as %s; the line is in .task-files/audit.jsonl; %d kept because a live record needs them.'
           %(len(line['removed']),task_files.size_text(line['bytes']),args.actor,len(line['kept_referenced'])))
-    return 0
+    for item in line['failed']:
+        print('NOT purged: %s %s: %s'%(item.get('kind'),item.get('sha256') or item.get('name'),item['problem']),
+              file=sys.stderr)
+    return 1 if line['failed'] else 0
 
 def kit_refusal(error):
     """Whether a ``ValueError`` is one of the kit's own refusals: exactly ``ValueError``

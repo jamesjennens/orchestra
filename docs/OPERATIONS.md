@@ -2107,11 +2107,17 @@ file attached. They are not in the tracker and not in the coordination sidecar.
 - **Backup.** Every `backup` run also mirrors that folder into `backups/NAME.task-files/`:
   - It copies every stored file a record still names and every journal entry. Orphans and unfinished uploads are not
     copied.
-  - It copies incrementally: a file already there is kept.
+  - It copies incrementally: a file already there is kept. The backup follows the project: a file purged there, and
+    its entry, leave the backup at the next run (keep older backups elsewhere if a purge must be undoable).
+  - It hashes and copies outside the project's lock, which it takes only to read the journal and to finish, so
+    uploads and records go on meanwhile.
+  - A journal file that cannot be read as an entry is said on stderr; the backup then keeps the last good copy of it
+    (and of the file it names) and removes nothing from the backup folder until it is repaired.
   - Each file is re-hashed while it is copied. One that no longer matches its name is NOT copied, and the run says so
     on stderr (`task files of NAME: NOT backed up: ...`). Run `task-files verify` then.
   - `manifest.json` (each file's sha256 and bytes, each journal entry's digest) is written last. A folder without one
-    is a backup that did not finish.
+    is a backup that did not finish. The manifest proves the copy is whole and unchanged since the backup wrote it
+    (integrity); it is not signed, so it does not prove who wrote it: keep the backups where only operators can write.
   - The run prints the size (`task files of NAME: 3 files, 12.4 MiB`), and the status file records it under
     `task_files`. A failure here is said and leaves the tracker backup complete. Plan disk space for the backups to
     grow by the files' size; the per-project limit (`task_files.max_project_bytes`, 2 GiB) bounds it.
@@ -2124,19 +2130,28 @@ file attached. They are not in the tracker and not in the coordination sidecar.
   - A backup WITHOUT the folder (made by an older kit, or a copy that lost it) restores as before, with one line
     saying that the file records the task history holds now report the stored file as missing.
 - **Verify.** `admin.py task-files verify PROJECT` re-hashes every stored file a record needs. It names each file that
-  does not match its name, has another size than its record, or is missing, and exits 1 when there is one. It also
-  counts orphans (stored files no record names) and unfinished uploads older than a day.
+  does not match its name, has another size than its record, or is missing, and each journal file that cannot be
+  read as an entry (not JSON, a field this kit does not know, a link); it exits 1 when there is one. It also counts
+  orphans (stored files no record names; none are named while a journal file cannot be read) and unfinished uploads
+  older than a day. It hashes outside the project's lock, holding it only to read and to confirm what it found.
 - **Purge.** `admin.py task-files purge PROJECT --closed-before YYYY-MM-DD --actor OPERATOR [--reason TEXT] [--dry-run]`.
   - The actor must be on the operator allowlist.
   - Run `--dry-run` first: it lists what would go and removes nothing.
   - It removes the stored bytes of withdrawn files, of files on tasks closed before the date, of orphans older than a
     day, and of unfinished uploads older than a day. It NEVER removes a file that a live record of a task not closed
-    before the date still needs, on that task or any other task; those are listed as kept.
-  - It runs under the project's lock and refuses a `.task-files` that is a symlink.
+    before the date still needs, on that task or any other task; those are listed as kept. A deleted task (no row
+    in the tracker) is never purged: only rows closed before the date are.
+  - It refuses to purge anything while a journal file cannot be read as an entry (`task-files verify` names it):
+    that file may be the only record of bytes that would otherwise look unneeded. Repair or remove it first.
+  - It reads the tracker's rows and runs under the project's lock, and refuses a `.task-files` that is a symlink (or a
+    junction on Windows). A stored file under a linked folder is never removed, and its entry is not marked.
   - A purged record is marked `purged: {by, at, reason}`: the task's file list and a download say "purged by an
     operator on DATE", and the history comment is untouched.
-  - It writes ONE audit line to `.task-files/audit.jsonl`: who ran it, the date given, every file removed and why, and
-    what was kept. Deleting evidence is the operator's decision; nothing is purged automatically.
+  - It writes to `.task-files/audit.jsonl` an intent line BEFORE anything is removed (what it will remove and mark),
+    then a result line: who ran it, the date given, every file removed and why, what was already gone, what failed
+    and what was kept. Each file is tried on its own, so one that cannot be removed is named (exit 1) and the rest go
+    on; the result line is written even when the run stops part way. An entry is marked purged only when its bytes
+    are gone. Deleting evidence is the operator's decision; nothing is purged automatically.
 - **Rollback boundary (design 6).**
   - An older kit neither reads nor changes `.task-files` or `backups/NAME.task-files`; the task's file records show
     in history as ordinary comments.

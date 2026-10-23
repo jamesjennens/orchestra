@@ -272,6 +272,163 @@ class TaskFilesOpsTests(unittest.TestCase):
         self.assertEqual('', outside.read_text(encoding='utf-8'))
         self.assertTrue(self.store.blob(gone).exists(), 'nothing was removed')
 
+    # -- kittrial-5bb.380 r2 -------------------------------------------------------------------
+    def record_file(self, task, digest):
+        return self.store.project / task_files.FOLDER / task_files.RECORDS / task_files.task_key(task) / (digest + '.json')
+
+    def link_dir(self, target, at):
+        # A link to a folder: a symlink, or on Windows without the right to make one, a junction.
+        try:
+            os.symlink(str(target), str(at), target_is_directory=True)
+        except OSError:
+            if os.name != 'nt':
+                self.skipTest('no symlinks here')
+            import _winapi
+            _winapi.CreateJunction(str(target), str(at))
+
+    def test_r2_b1_an_unreadable_journal_file_stops_the_purge_and_its_blob_stays(self):
+        old_enough = time.time() - 2 * DAY
+        for how in ('not json', 'an unknown field', 'a linked task folder'):
+            with self.subTest(how=how):
+                self.store = Store(self)
+                live = self.store.attach('t-live', b'live bytes of ' + how.encode())
+                record = self.record_file('t-live', live)
+                if how == 'not json':
+                    record.write_text('{"schema_version": 1, "task": "t-live", trunc', encoding='utf-8')
+                elif how == 'an unknown field':
+                    entry = json.loads(record.read_text(encoding='utf-8'))
+                    entry['added_by_a_newer_kit'] = True
+                    record.write_text(json.dumps(entry), encoding='utf-8')
+                else:
+                    elsewhere = unique_dir('task-files-moved-')
+                    self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
+                    shutil.move(str(record.parent), str(elsewhere / 'moved'))
+                    self.link_dir(elsewhere / 'moved', record.parent)
+                os.utime(str(self.store.blob(live)), (old_enough, old_enough))
+                with self.assertRaises(task_files.Refusal) as refused:
+                    task_files.purge_plan(self.store.project, '2026-02-01', {})
+                self.assertEqual(409, refused.exception.status)
+                self.assertIn('cannot be read as entries', str(refused.exception))
+                self.assertIn('nothing is purged', str(refused.exception))
+                self.assertTrue(self.store.blob(live).exists(), how + ': the blob a live entry names is kept')
+                listed = task_files.verify(self.store.project)
+                self.assertEqual(1, len(listed['unreadable']), how)
+                self.assertEqual([], listed['orphans'], how + ': never called an orphan')
+
+    def test_r2_b1_a_blob_a_journal_file_is_named_after_is_never_an_orphan(self):
+        live = self.store.attach('t1', b'named by its record')
+        old_enough = time.time() - 2 * DAY
+        os.utime(str(self.store.blob(live)), (old_enough, old_enough))
+        with mock.patch.object(task_files, 'all_entries', return_value=[]):     # as if the entry were not read
+            plan = task_files.purge_plan(self.store.project, '2026-02-01', {})
+        self.assertEqual([], plan['remove'], 'the record file\'s name keeps it (referenced)')
+
+    def test_r2_s1_an_unreadable_entry_keeps_the_last_good_copy_in_the_backup(self):
+        live = self.store.attach('t1', b'precious input')
+        other = self.store.attach('t2', b'another file')
+        task_files.backup_folder(self.store.project, self.target)
+        self.record_file('t1', live).write_text('broken', encoding='utf-8')
+        summary = task_files.backup_folder(self.store.project, self.target)
+        self.assertEqual(1, len(summary['problems']), summary)
+        self.assertIn('the last good copy is kept', summary['problems'][0]['problem'])
+        self.assertTrue((self.target / live[:2] / live).exists(), 'the blob stays in the backup')
+        manifest = json.loads((self.target / task_files.MANIFEST).read_text(encoding='utf-8'))
+        self.assertEqual(sorted([live, other]), sorted(b['sha256'] for b in manifest['blobs']))
+        self.assertEqual(2, len(manifest['record_files']))
+        restored = Store(self)
+        self.assertEqual('restored', task_files.restore_folder(self.target, restored.project)['status'])
+        self.assertEqual(b'precious input', restored.blob(live).read_bytes())
+        self.assertEqual(live, task_files.read_entry(restored.project, 't1', live)['sha256'], 'the last good record')
+
+    def test_r2_s3_a_purge_that_fails_part_way_leaves_its_intent_and_its_result(self):
+        one = self.store.attach('t1', b'first withdrawn', withdrawn=True)
+        two = self.store.attach('t2', b'second withdrawn', withdrawn=True)
+        plan = task_files.purge_plan(self.store.project, '2026-01-01', {})
+        real_unlink = os.unlink
+
+        def unlink(path, *a, **k):
+            if str(path).endswith(one):
+                raise PermissionError(13, 'in use')
+            return real_unlink(path, *a, **k)
+        with mock.patch.object(task_files.os, 'unlink', side_effect=unlink):
+            line = task_files.purge(self.store.project, plan, 'op', lambda: 'now')
+        self.assertTrue(self.store.blob(one).exists())
+        self.assertFalse(self.store.blob(two).exists(), 'the rest went on')
+        self.assertEqual([one], [item['sha256'] for item in line['failed'] if item.get('kind') == 'file'])
+        self.assertEqual([two], [item['sha256'] for item in line['marked']], 'only the entry whose bytes went is marked')
+        self.assertIsNone(task_files.read_entry(self.store.project, 't1', one).get('purged'))
+        audit = (self.store.project / task_files.FOLDER / task_files.AUDIT).read_text(encoding='utf-8').splitlines()
+        self.assertEqual(['purge-intent', 'purge'], [json.loads(x)['operation'] for x in audit])
+        # An error that is not one of the expected ones: the result line is still written (finally).
+        three = self.store.attach('t3', b'third withdrawn', withdrawn=True)
+        plan = task_files.purge_plan(self.store.project, '2026-01-01', {})
+        with mock.patch.object(task_files, 'read_entry', side_effect=RuntimeError('a bug')):
+            with self.assertRaises(RuntimeError):
+                task_files.purge(self.store.project, plan, 'op', lambda: 'later')
+        audit = (self.store.project / task_files.FOLDER / task_files.AUDIT).read_text(encoding='utf-8').splitlines()
+        self.assertEqual(['purge-intent', 'purge', 'purge-intent', 'purge'], [json.loads(x)['operation'] for x in audit])
+        self.assertEqual(sorted([one, three]), sorted(item['sha256'] for item in json.loads(audit[-1])['removed']),
+                         'the plan of the second run holds the first file again')
+
+    def test_r2_s4_bytes_under_a_linked_folder_are_not_removed_and_their_entry_is_not_marked(self):
+        gone = self.store.attach('t1', b'withdrawn bytes', withdrawn=True)
+        top = self.store.blob(gone).parent
+        elsewhere = unique_dir('task-files-top-')
+        self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
+        shutil.move(str(top), str(elsewhere / 'top'))
+        self.link_dir(elsewhere / 'top', top)
+        plan = task_files.purge_plan(self.store.project, '2026-01-01', {})
+        self.assertEqual([], plan['remove'], 'a blob under a linked folder is never removed')
+        line = task_files.purge(self.store.project, plan, 'op', lambda: 'now')
+        self.assertEqual([], line['marked'])
+        self.assertEqual([gone], [item['sha256'] for item in line['failed'] if item['kind'] == 'mark'])
+        self.assertIsNone(task_files.read_entry(self.store.project, 't1', gone).get('purged'))
+        self.assertTrue((elsewhere / 'top' / gone).exists())
+
+    def test_r2_s5_verify_and_the_mirror_hash_outside_the_lock(self):
+        for n in range(3):
+            self.store.attach('t%d' % n, b'bytes %d' % n)
+        held = []
+
+        @contextlib.contextmanager
+        def lock():
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+        real_hash, real_copy = task_files._hash_file, task_files._copy_hashed
+        seen = []
+
+        def hash_file(path):
+            seen.append(('hash', bool(held)))
+            return real_hash(path)
+
+        def copy_hashed(source, target):
+            seen.append(('copy', bool(held)))
+            return real_copy(source, target)
+        with mock.patch.object(task_files, '_hash_file', side_effect=hash_file), \
+                mock.patch.object(task_files, '_copy_hashed', side_effect=copy_hashed):
+            result = task_files.verify(self.store.project, lock=lock)
+            summary = task_files.backup_folder(self.store.project, self.target, lock=lock)
+        self.assertEqual(3, result['checked'])
+        self.assertEqual(3, summary['files'])
+        self.assertEqual([('hash', False)] * 3 + [('copy', False)] * 3, seen, 'nothing hashed or copied under the lock')
+
+    def test_r2_s5_a_file_attached_while_the_mirror_copies_is_in_the_backup(self):
+        self.store.attach('t1', b'there first')
+        real_copy = task_files._copy_hashed
+        added = []
+
+        def copy_hashed(source, target):
+            if not added:
+                added.append(self.store.attach('t2', b'attached meanwhile'))
+            return real_copy(source, target)
+        with mock.patch.object(task_files, '_copy_hashed', side_effect=copy_hashed):
+            summary = task_files.backup_folder(self.store.project, self.target)
+        self.assertEqual(2, summary['files'])
+        self.assertTrue((self.target / added[0][:2] / added[0]).exists())
+
     def test_a_restore_without_the_folder_is_absent_and_places_nothing(self):
         restored = Store(self)
         outcome = task_files.restore_folder(self.backups / 'missing.task-files', restored.project)
@@ -326,7 +483,7 @@ class TaskFilesOpsTests(unittest.TestCase):
         self.assertEqual('op', task_files.read_entry(self.store.project, 't-old', alone)['purged']['by'])
         self.assertEqual([alone], [i['sha256'] for i in line['removed']])
 
-    def test_purge_removes_withdrawn_closed_orphans_and_old_temp_files_and_writes_one_audit_line(self):
+    def test_purge_removes_withdrawn_closed_orphans_and_old_temp_files_and_writes_its_audit_lines(self):
         withdrawn = self.store.attach('t1', b'withdrawn', withdrawn=True)
         closed = self.store.attach('t-old', b'closed task file')
         recent = self.store.attach('t-new', b'closed recently')
@@ -348,9 +505,12 @@ class TaskFilesOpsTests(unittest.TestCase):
             self.assertTrue(self.store.blob(kept).exists(), kept)
         self.assertFalse(stale.exists())
         audit = (self.store.project / task_files.FOLDER / task_files.AUDIT).read_text(encoding='utf-8').splitlines()
-        self.assertEqual(1, len(audit))
-        recorded = json.loads(audit[0])
+        # r2 (review s3): the intent first, before anything was removed, then the result.
+        self.assertEqual(2, len(audit))
+        intent, recorded = json.loads(audit[0]), json.loads(audit[1])
+        self.assertEqual(('purge-intent', 4, 2), (intent['operation'], len(intent['remove']), len(intent['marks'])))
         self.assertEqual(('op', '2026-02-01', 4), (recorded['actor'], recorded['closed_before'], len(recorded['removed'])))
+        self.assertEqual(([], []), (recorded['failed'], recorded['already_absent']))
         self.assertEqual(line, recorded)
         mark = task_files.read_entry(self.store.project, 't-old', closed)['purged']
         self.assertEqual({'by': 'op', 'at': '2026-10-22T12:00:00Z', 'reason': 'yearly clean-up'}, mark)
@@ -549,6 +709,24 @@ class ProxyCheckTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2, 'the check waited for the proxy to close')
         self.assertLess(result['sent'], 64 * task_files.MIB)
 
+    def test_r2_an_early_401_says_how_much_was_sent(self):
+        def early(h):
+            # Orchestra's own answer to an unsigned upload, before the body (then the rest is read and dropped).
+            self.reply(h, 401, json.dumps({'error': {'code': 'unauthenticated', 'message': 'Sign in'},
+                                           'request_id': 'req_1'}).encode())
+            length = int(h.headers['Content-Length'])
+            got = 0
+            while got < length:
+                piece = h.rfile.read(min(65536, length - got))
+                if not piece:
+                    break
+                got += len(piece)
+        result = task_files.proxy_check(self.serve(early), 16 * task_files.MIB)
+        self.assertTrue(result['passed'], result)
+        self.assertLess(result['sent'], 16 * task_files.MIB)
+        self.assertIn('declared as %s' % task_files.size_text(16 * task_files.MIB), result['sentence'])
+        self.assertIn('after %s had been sent' % task_files.size_text(result['sent']), result['sentence'])
+
     def test_a_connection_cut_while_sending_is_said(self):
         def cut(h):
             h.rfile.read(1000)
@@ -622,6 +800,41 @@ class AdminTaskFilesTests(unittest.TestCase):
         plain = admin.backup_status_record([{'name': 'p1', 'status': 'complete', 'completed_at': '2026-10-22T00:00:00Z'}],
                                            'named', '2026-10-22T00:00:00Z')
         self.assertNotIn('task_files', plain['projects'][0], 'a project without task files has no entry for them')
+
+    def test_r2_s2_the_rows_are_read_under_the_projects_lock(self):
+        import fcntl
+        self.store.attach('t-old', b'old')
+        seen = []
+
+        def run_bd(root, project, argv, *a, **k):
+            with (self.project / '.coordination.lock').open('a') as other:
+                try:
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    seen.append('free')
+                    fcntl.flock(other, fcntl.LOCK_UN)
+                except BlockingIOError:
+                    seen.append('held')
+            return '\n'.join(json.dumps(r) for r in self.rows)
+        with mock.patch.object(admin, 'run_bd', side_effect=run_bd):
+            code, out, err = self.run_admin('purge', 'p1', '--closed-before', '2026-02-01', '--actor', 'op', '--dry-run')
+        self.assertEqual(0, code, err)
+        self.assertEqual(['held'], seen)
+
+    def test_r2_verify_names_an_unreadable_journal_file_and_exits_1(self):
+        digest = self.store.attach('t1', b'abc')
+        (self.project / task_files.FOLDER / task_files.RECORDS / task_files.task_key('t1') / (digest + '.json')).write_text('x')
+        code, out, _ = self.run_admin('verify', 'p1')
+        self.assertEqual(1, code)
+        self.assertIn('cannot be read as an entry: not readable as JSON', out)
+        code, out, err = self.run_admin('purge', 'p1', '--closed-before', '2026-02-01', '--actor', 'op', '--dry-run')
+        self.assertNotEqual(0, code)
+
+    def test_r2_proxy_check_bytes_is_bounded(self):
+        for bad in ('0', '-5', str(task_files.LIMIT_DEFAULTS['max_file_bytes'] + 1)):
+            with mock.patch.object(task_files, 'proxy_check') as check:
+                code = self.run_admin('proxy-check', '--url', 'https://office.example', '--bytes', bad)[0]
+            self.assertNotEqual(0, code, bad)
+            check.assert_not_called()
 
     def test_verify_exits_1_on_a_flipped_byte(self):
         digest = self.store.attach('t1', b'abc')

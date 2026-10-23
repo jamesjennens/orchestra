@@ -340,8 +340,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # the two `comments add` answers; a nested or damaged one is no entry, never a
             # traceback. kittrial-5bb.380 adds four: the entries a backup, verify or purge
             # walks, a backup's manifest.json (a copy that may have been altered), and the
-            # answer a reverse proxy or the site gives the proxy check.
-            'task_files.py': 8,
+            # answer a reverse proxy or the site gives the proxy check. kittrial-5bb.380 r2: and the backup's
+            # previous manifest, read to keep the last good copy of an entry that cannot be read now.
+            'task_files.py': 9,
             'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 12, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
