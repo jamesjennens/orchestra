@@ -1,5 +1,6 @@
 import { h, time, confirmDialog, secretDialog, initials } from '../dom.js';
-import { pageHead, empty, field, setFieldError, formValues, act, errorState } from '../ui.js';
+import { pageHead, empty, field, setFieldError, formValues, act, errorState,
+         passwordHint, passwordAdvice, passwordTooShort, PASSWORD_MISMATCH } from '../ui.js';
 
 export async function users(ctx) {
   if (!ctx.me.superuser) {
@@ -118,15 +119,16 @@ export async function account(ctx) {
   const form = h('form', { class: 'form', novalidate: true },
     status,
     field({ id: 'current', label: 'Current password', type: 'password', autocomplete: 'current-password', required: true }),
-    field({ id: 'next', label: 'New password', type: 'password', autocomplete: 'new-password', hint: 'At least 12 characters. A short sentence is easier to remember.', required: true }),
+    field({ id: 'next', label: 'New password', type: 'password', autocomplete: 'new-password', hint: passwordHint(ctx.me) + passwordAdvice(ctx.me), required: true }),
     field({ id: 'confirm', label: 'Repeat new password', type: 'password', autocomplete: 'new-password', required: true }),
     h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Change password')));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const v = formValues(form);
-    if (v.next.length < 12) return setFieldError(form, 'next', 'Use at least 12 characters.');
+    const tooShort = passwordTooShort(ctx.me, v.next);
+    if (tooShort) return setFieldError(form, 'next', tooShort);
     setFieldError(form, 'next', '');
-    if (v.next !== v.confirm) return setFieldError(form, 'confirm', 'The two new passwords do not match.');
+    if (v.next !== v.confirm) return setFieldError(form, 'confirm', PASSWORD_MISMATCH);
     setFieldError(form, 'confirm', '');
     const done = await act(form.querySelector('button'), () => ctx.api.changePassword(ctx.me.id, v.current, v.next), {
       onError: (e) => { if (e.status === 401) { setFieldError(form, 'current', 'That is not your current password.'); return true; } if (e.status === 422) { setFieldError(form, 'next', e.message); return true; } return false; },

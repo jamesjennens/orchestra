@@ -60,11 +60,11 @@ from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACC
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE, CAP_RELEASE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
                        CAP_RECORDS, CAP_REVIEWS,
-                       CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
+                       CAP_TASKS, MAX_PASSWORD, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, canonical_json, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, session_limit_seconds, unauthenticated,
                        uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
-                       validate_claim_limit)
+                       validate_claim_limit, validate_password_min_length)
 from version import report as version_report
 
 KIT_VERSION = '0.1.0'
@@ -963,8 +963,14 @@ class InProcessBackend:
         project = self.files_project(project_id)
         if project is None:
             return False
-        with self.service.store.lock:
+        # kittrial-5bb.380 (review of .370 r3): the wait for the lock is bounded; a blob not removed in time stays an
+        # orphan, which `admin.py task-files purge` removes once it is a day old.
+        if not self.service.store.lock.acquire(timeout=DISCARD_LOCK_SECONDS):
+            raise TimeoutError('the store lock was not free within %d s' % DISCARD_LOCK_SECONDS)
+        try:
             return task_files.discard(project, sha256)
+        finally:
+            self.service.store.lock.release()
 
     def _files_write(self, principal, project_id, payload):
         # The same task_files.apply the endpoint action runs, over this backend's own rows:
@@ -1830,6 +1836,26 @@ class InProcessBackend:
         return lanes_read(rows, actor, {'schema_version': 1, 'records': {}}, list(args),
                           journal=None, scope=scope)
 
+    def coordinator_wait(self, project_id, principal, idle_minutes):
+        """The disposable model's queue and board at one locked state."""
+        import waiting
+        from lanes import LANES_LIMIT_MAX
+        from work import move_decision
+        with self.service.store.lock:
+            actor = self.service.bind_actor(principal, None)
+            rows = []
+            for item in self.review_queue(project_id)['items']:
+                row = waiting.normalize_item(dict(item, task=item['id']))
+                row['whose_move'], _text, row['next_actor'] = move_decision(
+                    row['review_state'], row['task'], claim_limit.actor_holds(row['owner'], actor),
+                    pending_items=row['pending_review_items'], redelivered=bool(row['redelivered']),
+                    assignee=row['owner'], closed=row['status'] == 'closed', claimable=item['claimable'])
+                rows.append(row)
+            return waiting.coordinator_view(
+                rows,
+                self.lanes_read(project_id, ['--idle-minutes', str(idle_minutes),
+                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'))
+
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
 
@@ -2223,10 +2249,24 @@ class EndpointBackend:
         # entry while it holds the project's .coordination.lock EXCLUSIVELY; this takes the same lock, so another
         # upload's record of the same bytes is either finished (and its entry keeps the blob) or not yet begun (and it
         # then finds the blob gone and answers "upload it again"). Never a record whose bytes vanished under it.
+        # kittrial-5bb.380 (review of .370 r3): the wait is bounded (DISCARD_LOCK_SECONDS); a blob not removed in time
+        # stays an orphan, which `admin.py task-files purge` removes once it is a day old.
         import fcntl
         project = self.files_project(project_id)
         with (project / '.coordination.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            ends = time.monotonic() + DISCARD_LOCK_SECONDS
+            locked = False
+            for _ in range(int(DISCARD_LOCK_SECONDS / 0.05) + 2):   # a bounded number of tries, never an open loop
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= ends:
+                        break
+                    time.sleep(0.05)
+            if not locked:
+                raise TimeoutError('the project lock was not free within %d s' % DISCARD_LOCK_SECONDS)
             return task_files.discard(project, sha256)
 
     def assignment_roster(self, principal, project_id, offset=0, limit=200):
@@ -3194,6 +3234,18 @@ class EndpointBackend:
         payload = self._checked(reply, reading=True)
         if not isinstance(payload, dict):
             raise uncertain('The canonical lanes read returned an unexpected shape')
+        return payload
+
+    def coordinator_wait(self, project_id, principal, idle_minutes):
+        """One canonical wait read: queue and lanes share the endpoint's export."""
+        reply = self._endpoint('wait', project_id, self.service.bind_actor(principal, None),
+                               ['--coordinator', '--idle-minutes', str(idle_minutes)],
+                               authority=authority_request(principal, project_id, CAP_COORDINATE,
+                                                           now=self.service._expiry_now()),
+                               extra={'lanes_scope': 'all'})
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict) or payload.get('form') != 'coordinator':
+            raise uncertain('The canonical coordinator wait returned an unexpected shape')
         return payload
 
     def requirements_read(self, project_id, args):
@@ -4704,6 +4756,12 @@ class TransferGate:
 
 #: One gate for handlers made without :func:`build_handler` (a test's own subclass).
 DEFAULT_TRANSFERS = TransferGate()
+#: kittrial-5bb.380: the lingering closes of answered uploads now running in this process, and the counts
+#: of those done and of those closed at once because LINGER_MAX were running.
+LINGERING = {'now': 0, 'lingered': 0, 'hard': 0}
+#: kittrial-5bb.380 (review of .370 r3): how long a refused upload's discard waits for the project's lock.
+DISCARD_LOCK_SECONDS = 10
+LINGERING_LOCK = threading.Lock()
 FILES_UNAVAILABLE = 'Task files are not available on this server.'
 FILE_CODES = {400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict', 411: 'length_required',
               413: 'payload_too_large', 422: 'invalid', 501: 'not_implemented', 503: 'unavailable',
@@ -4910,6 +4968,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # body was read, or a body that was not what its Content-Length said, must never
                 # leave bytes behind that the next request on this connection would be read from.
                 self._say_close = True
+                self._body_unread = True              # until the route has read it (kittrial-5bb.380)
             payload, auth_source = self._read_request(method, anonymous, params, csrf,
                                                       request_id, stream=stream)
             # The semantic route target is the method plus the concrete path (with the
@@ -4952,6 +5011,60 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(500, {'error': {'code': 'internal_error',
                                             'message': 'Internal error'},
                                   'request_id': request_id})
+        finally:
+            if getattr(self, '_body_unread', False):
+                self._body_unread = False
+                self._linger()
+
+    #: kittrial-5bb.380: how long, and how much, an answered upload's unread body is still read and dropped, and
+    #: how many such closes may run at once in the service; beyond that the connection is closed at once.
+    LINGER_SECONDS = 5
+    LINGER_BYTES = 64 * 1024 * 1024
+    LINGER_MAX = 8
+
+    def _linger(self):
+        # The answer to an upload refused before its body was read (401, 403, 413, 503...) is sent, and the
+        # connection is then closed with that body still arriving. Closed at once, the unread bytes make the
+        # system answer with a reset, which can destroy the answer before the client has read it, so the client
+        # sees a cut connection instead of the refusal. As a web server's lingering close does, the write side
+        # is shut and what still arrives is read and dropped, for a short, bounded time.
+        # It runs after the route has returned: no transfer slot and no lock is held here. Bounded per connection
+        # (LINGER_SECONDS, LINGER_BYTES) and in total (LINGER_MAX at once): many refused uploads at once cannot tie
+        # up the service's threads; beyond the cap the connection is closed at once (LINGERING counts both).
+        self.close_connection = True
+        try:
+            self.wfile.flush()
+        except (OSError, ValueError):
+            return
+        with LINGERING_LOCK:
+            if LINGERING['now'] >= self.LINGER_MAX:
+                LINGERING['hard'] += 1
+                return
+            LINGERING['now'] += 1
+            LINGERING['lingered'] += 1
+        try:
+            connection = self.connection
+            try:
+                connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                return
+            ends = time.monotonic() + self.LINGER_SECONDS
+            taken = 0
+            try:
+                while taken < self.LINGER_BYTES:
+                    left = ends - time.monotonic()
+                    if left <= 0:
+                        break
+                    connection.settimeout(left)
+                    piece = connection.recv(65536)
+                    if not piece:
+                        break
+                    taken += len(piece)
+            except OSError:
+                pass
+        finally:
+            with LINGERING_LOCK:
+                LINGERING['now'] -= 1
 
     def _admit(self, method):
         """Behind a trusted proxy, one forwarded address has a share of the requests being served.
@@ -5572,7 +5685,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             items = []
             for entry in task_files.live(project, ctx.params['tid']):
                 item = task_files.view(entry, may_download=may)
-                if task_files.blob_size(project, entry['sha256']) != entry['bytes']:
+                # kittrial-5bb.380: a purged file is said as purged (view carries the sentence), not as missing.
+                if not entry.get('purged') and task_files.blob_size(project, entry['sha256']) != entry['bytes']:
                     item['missing'] = True
                 items.append(item)
         except task_files.Refusal as refusal:
@@ -5636,6 +5750,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 self._continue()                        # r2 (s4c): only now may the client send the body
                 sha256, size, created = task_files.receive(self._files_reader(length, limit), length, project, expected)
+                self._body_unread = False
             finally:
                 gate.give(key, ctx.params['pid'])
         except (HttpError, task_files.Refusal) as error:
@@ -5658,7 +5773,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             # names. Only for a definite refusal: a 5xx that does not say nothing was done may follow a written
             # record (a retry settles it), so its blob stays.
             if created and (refused.status < 500 or getattr(refused, 'nothing_done', False)):
-                self.backend.files_discard(ctx.params['pid'], sha256)
+                # kittrial-5bb.380 (review of .370 r3): the refusal is the answer. A discard that fails (the lock not
+                # free in time, a disk error) is said in the service's log and keeps the blob as an orphan, which
+                # `admin.py task-files purge` removes once it is a day old; it never replaces the refusal.
+                try:
+                    self.backend.files_discard(ctx.params['pid'], sha256)
+                except Exception as failed:
+                    print('task files: the upload %s of request %s was refused and its stored bytes were kept (task-files '
+                          'purge removes them after a day): %s' % (sha256, ctx.request_id,
+                                                                   ascii(str(failed)[:200]) or type(failed).__name__),
+                          file=sys.stderr, flush=True)
             raise
         if isinstance(result, dict):
             result = dict(result)
@@ -5684,6 +5808,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             entry = task_files.read_entry(project, ctx.params['tid'], sha256)
             if entry is None or entry.get('withdrawn') is not None:
                 raise not_found('No such file on this task.')
+            if entry.get('purged'):
+                # kittrial-5bb.380 (coordinator's Q2): the bytes were removed by an operator's purge.
+                raise HttpError(410, 'gone', task_files.purged_sentence(entry))
             limit = self._files_limits()
             handle = task_files.open_blob(project, sha256)
         except (HttpError, task_files.Refusal) as error:
@@ -6262,7 +6389,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                  'csrf_token': result['csrf_token'],
                                  'expires_at': result['expires_at'],
                                  'idle_expires_at': result['idle_expires_at']},
-                     'user': result['user']}
+                     'user': dict(result['user'],
+                                  password_min_length=self.service.password_min_length)}
 
     @route('GET', r'/v1/sessions/current')
     def sessions_whoami(self, ctx):
@@ -6270,7 +6398,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = {'user': {'id': principal.user_id,
                          'username': self.service.username_of(principal.user_id),
                          'display_name': principal.display_name,
-                         'superuser': principal.superuser},
+                         'superuser': principal.superuser,
+                         # Additive (kittrial-5bb.363): the page states the server's real
+                         # password rule, and asks twice wherever a password is set.
+                         'password_min_length': self.service.password_min_length},
                 'via': principal.via,
                 'credential': principal.credential_id,
                 'project': principal.credential_project,
@@ -7824,6 +7955,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         from work import move_decision
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
+        form = ctx.query.get('form', 'worker')
+        if form not in ('worker', 'coordinator'):
+            raise HttpError(400, 'invalid_request', 'form must be worker or coordinator')
+        if form == 'coordinator':
+            return self._agent_coordinator_wait(ctx, agent)
         rows = []
         #: The claiming setting of every project this read covered (kittrial-5bb.352
         #: review item S1): the same fresh per-project read the endpoints and
@@ -7891,6 +8027,52 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['manual_cadence'] = ('Read this route again to see a change; it never blocks, '
                                   'never sleeps and schedules nothing. --since is the caller\'s '
                                   'own memory of the last fingerprint it acted on.')
+        return 200, view
+
+    def _agent_coordinator_wait(self, ctx, agent):
+        """Live project grants bound this read, never the service's host identity."""
+        import waiting
+        refuse_unknown_fields(ctx.query, ('form', 'since', 'idle_minutes'), 'Coordinator wait query')
+        since = ctx.query.get('since')
+        if since is not None and not waiting.is_fingerprint(since):
+            raise HttpError(400, 'invalid_request', 'since must be a wait fingerprint')
+        idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        projects = []
+        for project_id in sorted(set(agent.get('projects') or [])):
+            try:
+                self.service.check_authority(ctx.principal, project_id, CAP_COORDINATE)
+            except HttpError as error:
+                if error.status not in (403, 404):
+                    raise
+                continue
+            projects.append(project_id)
+        if not projects:
+            raise forbidden('A current project coordinator grant is required for coordinator wait')
+        if not hasattr(self.backend, 'coordinator_wait'):
+            raise not_implemented('Coordinator wait is unavailable on this server')
+        reads = [(project, self.backend.coordinator_wait(project, ctx.principal, idle_minutes))
+                 for project in projects]
+        # A one-project fingerprint is EXACTLY the CLI fact. Multiple projects have
+        # an explicit project namespace, including empty projects and grant changes.
+        if len(reads) == 1:
+            view = dict(reads[0][1])
+        else:
+            triggers = {name: [] for name in waiting.COORDINATOR_TRIGGERS}
+            for project, read in reads:
+                for name in triggers:
+                    triggers[name].extend(dict(row, project=project)
+                                          for row in read['triggers'][name])
+            view = {'schema': waiting.WAIT_SCHEMA, 'form': 'coordinator', 'triggers': triggers,
+                    'items': [dict(row, trigger=name) for name in triggers for row in triggers[name]],
+                    'fingerprint': waiting.digest([{'project': project, 'fingerprint': read['fingerprint']}
+                                                   for project, read in reads])}
+        view['projects'] = projects
+        view['agent'] = agent.get('id')
+        view['generated_at'] = now_iso(self.service._now())
+        if since is not None:
+            view['changed'] = since != view['fingerprint']
+        view['manual_cadence'] = ('Read this route again with form=coordinator and since=FINGERPRINT; '
+                                  'it never blocks, sleeps or schedules work.')
         return 200, view
 
     @route('POST', r'/v1/agents')
@@ -12463,7 +12645,7 @@ def runtime_service_lock(root):
     return fd
 
 
-def bootstrap_refusal_advice(error):
+def bootstrap_refusal_advice(error, password_min_length=1):
     """What the person at the terminal has to do about a refused ``--bootstrap-user``.
 
     Only "a superuser already exists" can be answered with "add this person as an account
@@ -12473,8 +12655,12 @@ def bootstrap_refusal_advice(error):
     """
     if getattr(error, 'status', None) == 409:
         return 'Add this person as an account inside the service instead.'
+    if 'only spaces' in getattr(error, 'message', ''):
+        # kittrial-5bb.363: a whitespace-only password is refused with its own sentence.
+        return 'Run the command again with a password that is not only spaces.'
     if 'Password' in getattr(error, 'message', ''):
-        return 'Run the command again with a password of 8 to 1024 characters.'
+        return ('Run the command again with a password of %d to %d characters.'
+                % (password_min_length, MAX_PASSWORD))
     return 'Run the command again with a name of 2 to 64 characters of letters, digits, . _ @ -.'
 
 
@@ -12555,6 +12741,10 @@ def main(argv=None):
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
+    parser.add_argument('--password-min-length', type=int, default=1, metavar='N',
+                        help='the installation password minimum: 1 to 1024 characters (default 1, '
+                             'any non-empty password). The 1024 maximum is a bound on the work one '
+                             'request may ask for, not a policy')
     parser.add_argument('--bootstrap-user', help='one-time operator bootstrap superuser')
     parser.add_argument('--list-unconfirmed-projects', action='store_true',
                         help='print the project records the endpoint backend will not serve (an upgrade '
@@ -12568,6 +12758,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         validate_agent_credential_days(args.agent_credential_days)
+        # The installation's password minimum (kittrial-5bb.363) is refused the same way:
+        # one sentence, a non-zero exit, before the state store is opened or a port is bound.
+        password_min_length = validate_password_min_length(args.password_min_length)
         # Refused here, before the state store is opened: a limit that is out of bounds, not
         # a whole number, or shorter than the idle window is one sentence and a non-zero exit,
         # never a clamped value (kittrial-5bb.330). An omitted flag keeps 30 min / 12 h.
@@ -12619,13 +12812,22 @@ def main(argv=None):
         try:
             store = Store(args.state)
             password = getpass.getpass('New superuser password: ')
-            Service.bootstrap_superuser(store, args.bootstrap_user, password)
+            confirmation = getpass.getpass('Repeat new superuser password: ')
+            if password != confirmation:
+                # The host bootstrap is one of the places a password is set (kittrial-5bb.363):
+                # ask twice and refuse a mismatch before the store is written.
+                print('Refusing to bootstrap %s: the two passwords do not match.'
+                      % args.bootstrap_user, file=sys.stderr)
+                return 1
+            Service.bootstrap_superuser(store, args.bootstrap_user, password,
+                                        password_min_length=password_min_length)
         except HttpError as error:
             # A second bootstrap, a refused user name or a password the kit refuses: one
             # sentence and the one thing to do about it, never a traceback
             # (kittrial-5bb.176 items 2 and 3).
             print('Refusing to bootstrap %s: %s. %s'
-                  % (args.bootstrap_user, error.message, bootstrap_refusal_advice(error)), file=sys.stderr)
+                  % (args.bootstrap_user, error.message,
+                     bootstrap_refusal_advice(error, password_min_length)), file=sys.stderr)
             return 1
         finally:
             import fcntl
@@ -12654,6 +12856,7 @@ def main(argv=None):
         trusted.append('localhost')
     service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party,
                       agent_credential_days=args.agent_credential_days,
+                      password_min_length=password_min_length,
                       session_idle=session_idle, session_absolute=session_absolute)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)

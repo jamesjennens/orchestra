@@ -71,7 +71,10 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF
 # memory-hard scheme available in the standard library without third-party wheels.
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
 SCRYPT_DKLEN, SCRYPT_SALT = 32, 16
-MIN_PASSWORD, MAX_PASSWORD = 8, 1024
+#: The installation's password rule (kittrial-5bb.363). The minimum is a setting,
+#: default 1: any non-empty password is accepted. The maximum is a bound on the work
+#: one request may ask for, not a policy about what a password should look like.
+MIN_PASSWORD, MAX_PASSWORD = 1, 1024
 
 # Provisional local lifecycle defaults from the reviewed design, all configurable
 # at the Service boundary.
@@ -358,8 +361,8 @@ class _PasswordWorker:
 _PASSWORD_WORKER = _PasswordWorker()
 
 
-def hash_password(password, *, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
-    _validate_password(password)
+def hash_password(password, *, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, minimum=MIN_PASSWORD):
+    _validate_password(password, minimum)
     salt = os.urandom(SCRYPT_SALT)
     derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
                                       dklen=SCRYPT_DKLEN)
@@ -391,9 +394,25 @@ def needs_rehash(verifier):
     return scheme != 'scrypt' or int(n) < SCRYPT_N or int(r) < SCRYPT_R or int(p) < SCRYPT_P
 
 
-def _validate_password(password):
-    if not isinstance(password, str) or not MIN_PASSWORD <= len(password) <= MAX_PASSWORD:
-        raise invalid('Password must be %d-%d characters' % (MIN_PASSWORD, MAX_PASSWORD))
+def validate_password_min_length(value):
+    """The installation's password minimum: a whole number from 1 to ``MAX_PASSWORD``.
+
+    One rule for the web service flag and the office configuration, so neither clamps
+    a value to the bounds (kittrial-5bb.363). The default is 1: any non-empty password.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not MIN_PASSWORD <= value <= MAX_PASSWORD:
+        raise ValueError('password_min_length must be a whole number from %d to %d'
+                         % (MIN_PASSWORD, MAX_PASSWORD))
+    return value
+
+
+def _validate_password(password, minimum=MIN_PASSWORD):
+    # A password of nothing but spaces is a mistake, not a choice: refused here for every
+    # surface that sets one (change, reset redeem, bootstrap), in one sentence (5bb.363).
+    if isinstance(password, str) and password and not password.strip():
+        raise invalid('A password cannot be only spaces.')
+    if not isinstance(password, str) or not minimum <= len(password) <= MAX_PASSWORD:
+        raise invalid('Password must be %d-%d characters' % (minimum, MAX_PASSWORD))
 
 
 # A fixed verifier used to spend the same work when an account does not exist, so a
@@ -1035,7 +1054,8 @@ class Service:
                  result_retention=RESULT_RETENTION_SECONDS,
                  login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None,
                  lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
-                 approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT):
+                 approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT,
+                 password_min_length=MIN_PASSWORD):
         self.store = store
         #: Per-agent locks spanning the claim gate's held-set read and the claim write
         #: (kittrial-5bb.276 revision; per-agent in kittrial-5bb.300). Keyed by the
@@ -1049,6 +1069,10 @@ class Service:
         self.approval_by_another_party = approval_by_another_party is True
         self.session_idle = session_idle
         self.session_absolute = session_absolute
+        #: The installation's password minimum (kittrial-5bb.363), default 1. Every
+        #: writer goes through hash_password/redeem_reset with this value, so the rule
+        #: cannot drift between the bootstrap prompt and the web forms.
+        self.password_min_length = validate_password_min_length(password_min_length)
         self.credential_ttl = credential_ttl
         # Preserve the existing test/embedding injection of credential_ttl when no new
         # option was supplied. The command line always supplies the installation days.
@@ -1275,8 +1299,10 @@ class Service:
 
     # -- bootstrap (operator, out of band; never an HTTP route) -----------------
     @classmethod
-    def bootstrap_superuser(cls, store, username, password, display_name=None):
+    def bootstrap_superuser(cls, store, username, password, display_name=None,
+                            password_min_length=MIN_PASSWORD):
         """Create the first protected superuser. Refuses once any account exists."""
+        minimum = validate_password_min_length(password_min_length)
         with store.lock:
             if store.state['users']:
                 raise conflict('A superuser already exists')
@@ -1286,7 +1312,7 @@ class Service:
                 'id': 'usr_' + secrets.token_hex(8),
                 'username': username,
                 'display_name': display_name or username,
-                'password': hash_password(password),
+                'password': hash_password(password, minimum=minimum),
                 'superuser': True,
                 'disabled': False,
                 'created_at': now_iso(store.now()),
@@ -1448,7 +1474,7 @@ class Service:
                     raise forbidden('Current password is incorrect')
             if verify_password(user.get('password'), new_password):
                 raise invalid('New password must differ from the current password')
-            user['password'] = hash_password(new_password)
+            user['password'] = hash_password(new_password, minimum=self.password_min_length)
             if user.get('reset_token'):
                 user.pop('reset_token')
             self._revoke_sessions_for(user_id)
@@ -1485,7 +1511,7 @@ class Service:
                 'expires_at': now_iso(moment + self.reset_ttl), 'single_use': True}
 
     def redeem_reset(self, user_id, reset_value, new_password):
-        _validate_password(new_password)
+        _validate_password(new_password, self.password_min_length)
         digest = token_hash(reset_value)
         with self.store.lock:
             record = self.state['reset_tokens'].get(digest)
@@ -1496,7 +1522,7 @@ class Service:
                 raise unauthenticated('Invalid or expired reset value')
             user = self._user(user_id)
             record['used'] = True
-            user['password'] = hash_password(new_password)
+            user['password'] = hash_password(new_password, minimum=self.password_min_length)
             self._revoke_sessions_for(user_id)
             self._revoke_credentials_for(user_id)
             self.store.save()

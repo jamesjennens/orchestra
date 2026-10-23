@@ -1,5 +1,33 @@
 # Office HTTP service: installation, TLS and recovery runbook
 
+## Coordinator wait for an agent
+
+`GET /v1/agents/me/wait?form=coordinator` exposes the existing CLI
+`wait --coordinator` projection to an agent with a current project coordinator
+grant. A worker credential, an ordinary agent without that grant, or an agent
+whose last effective grant was revoked gets `403`. Authority is checked on each
+call, including the owner's current role. Only projects where the grant is
+effective are read; membership or an agent project assignment alone grants no
+coordinator view.
+
+Each authorized project costs one canonical wait read: queue and lane triggers
+come from the same snapshot. `triggers` groups `checkpoint-to-coordinator`,
+`awaiting-review`, `awaiting-integration` and `lane-quiet`, and `items` carries
+those rows with their trigger. `idle_minutes` has the lane board's range
+1–10080 (default 15). For one project, `fingerprint` is byte-identical to the CLI
+coordinator fingerprint for the same actor, threshold and state. For multiple
+projects, rows carry `project`, and the fingerprint binds the sorted project
+identities and each canonical fingerprint, including empty projects. `projects`
+names exactly the authorized projects covered.
+
+Send `since=FINGERPRINT` from the previous reply to receive `changed: false` when
+the fact is unchanged, or `true` when it differs. Invalid fingerprints or forms
+are refused. This does not block, sleep, acknowledge any work or schedule a poll:
+the Bridge or caller decides when to read again. The coordinator projection and
+its trigger rules are shared with the CLI unchanged. The default worker form
+remains the agent's own work read. The generated `.orchestra/AGENT.md` describes
+both roles and uses the existing secret-safe curl credential file.
+
 ## Guidance and onboarding disclosure
 
 Every current project member, personal agent and worker credential can read this project's **whole onboarding document, including operator-written text**, at `GET /v1/projects/PROJECT/onboarding/read`. This deliberately widens the earlier edit route's disclosure. Do not place secrets in that project document. The edit route `GET /onboarding` still withholds operator-written text; these are distinct reads.
@@ -322,12 +350,14 @@ cd <RUNTIME_ROOT>/kit && git checkout <PINNED_COMMIT>
 sudo -u <SERVICE_USER> python3 http_service.py \
   --state <RUNTIME_ROOT>/http-state.json --root <RUNTIME_ROOT> \
   --bootstrap-user <ADMIN_USERNAME>
-# the operator types the password at the prompt; it is never echoed or logged
+# the operator types the password twice at the prompts; it is never echoed or logged
+# (--password-min-length N raises the default minimum of 1; see "Password rule")
 ```
 
 Bootstrap refuses to run once any account exists, so it cannot silently reset a
-live deployment. Create ordinary accounts through the API and hand each user a
-single-use reset value; only redemption changes the verifier.
+live deployment. A mismatch between the two prompts creates no account. Create ordinary
+accounts through the API and hand each user a single-use reset value; only redemption
+changes the verifier.
 
 The guard is only as good as `--root`: it locks the root you name, so naming a
 different root while a service holds the real one gets past the lock and the new
@@ -3761,6 +3791,38 @@ shortly before the idle deadline it last heard about. That warning is for the ca
 touches stop reaching the service; while they do arrive, the session simply stays alive. The
 agent set-up wizard is what uses it (kittrial-5bb.329).
 
+## Password rule
+
+The installation's password minimum is a setting, `--password-min-length N` on the web
+service and `"password_min_length": N` in the private office JSON, a whole number from 1
+to 1024, default **1**: any non-empty password is accepted. A value outside the bounds, or
+one that is not a whole number, is refused at startup with one sentence and a non-zero
+exit before the state document is opened; nothing is clamped. The **1024 maximum stays**,
+documented as a bound on the work one request may ask for, not as a policy about what a
+password should look like.
+
+Every place a password is set asks for it twice and refuses a mismatch before anything is
+sent or stored. On the web that is the account page's "Change password" and the reset
+page's "Set a new password" (the administrator's reset only issues the single-use code;
+the new password is chosen on that reset page). The host bootstrap prompt
+(`http_service.py --bootstrap-user`, which `orc.sh user` calls) asks twice too, and a
+mismatch creates no account; the confirmation lives in that prompt, not in the shell
+wrapper.
+The account page states the server's rule from `GET /v1/sessions/current`:
+`user.password_min_length` (the same value is in the sign-in answer), so no hard-coded
+minimum remains in the browser code. The reset page is signed out, so there is no session
+answer to read: it states no number and shows the server's own 422 sentence, which names
+the configured range, when the password is sent. The log-in rate limits are unchanged.
+
+The server remains the authority: `http_auth.py` refuses an empty password and one longer
+than 1024 characters, refuses one shorter than the configured minimum with a sentence
+naming the configured range, and refuses a password made only of whitespace with one
+sentence (`A password cannot be only spaces.`) on every surface that sets one: the account
+page, the reset page and the host bootstrap. Spaces inside a password are still allowed;
+this is not a character-set rule. Changing the setting does not rewrite existing verifiers,
+and an older password that is still valid keeps working; the rule applies when a password
+is next set.
+
 ## Agent credential lifetime
 
 The installation option `--agent-credential-days DAYS` sets future personal-agent
@@ -3917,8 +3979,14 @@ tools, the SSH framing, backups of the folder and the operator commands come lat
   nothing is attached or withdrawn (`409`).
 - **Audit:** a line that cannot be recorded is said in the service's log (`audit: the ... line
   ... could not be recorded`), with the action, outcome, task and digest.
-- **Not yet:** the folder is not in backups (slice 5): copy `projects/NAME/.task-files/` with the
-  project until then. Withdrawn bytes stay on disk until the operator purge of slice 5.
+- **Operations** (kittrial-5bb.380): the folder is backed up beside the project's backup and checked on restore;
+  `admin.py task-files verify` and `purge` (operator, dry run, audit line), and `task-files proxy-check` for a reverse
+  proxy's body limit. See [Operations](OPERATIONS.md#files-attached-to-tasks-backup-restore-verify-purge). A purged
+  file stays listed, with `purged` and the sentence "purged by an operator on DATE"; its download answers `410`.
+- **An upload refused before its body was read** (401, 403, 413, 503...) is answered, and the connection is then
+  closed lingering: the write side is shut and the rest of the body is read and dropped for at most 5 s and 64 MiB,
+  so the client reads the refusal instead of a reset. At most 8 such closes run at once; beyond that a connection is
+  closed at once (kittrial-5bb.380).
 
 ### Settings
 
