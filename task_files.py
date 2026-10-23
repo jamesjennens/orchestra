@@ -1275,16 +1275,24 @@ def proxy_check(url, length, cafile=None, timeout=300):
         chunk = b'\0' * STEP
         status = body = None
         while result['sent'] < length:
-            readable = select.select([sock], [], [], 0)[0] or (hasattr(sock, 'pending') and sock.pending())
+            # Wait until the socket can take more OR an answer has come, so the check never blocks inside a send
+            # while the answer arrives (a full send buffer, then a reset, would discard it).
+            left = deadline - _time.monotonic()
+            if left <= 0:
+                break
+            ready, writable, _ = select.select([sock], [sock], [], left)
+            readable = ready or (hasattr(sock, 'pending') and sock.pending())
             if readable:
                 break                                       # an answer came before the whole body: read it
+            if not writable:
+                continue
             piece = chunk[:min(STEP, length - result['sent'])]
             try:
                 sock.settimeout(max(1, deadline - _time.monotonic()))
-                sock.sendall(piece)
+                sent = sock.send(piece)
             except OSError:
                 break
-            result['sent'] += len(piece)
+            result['sent'] += sent
         try:
             status, body = _read_answer(sock, deadline)
         except OSError:
