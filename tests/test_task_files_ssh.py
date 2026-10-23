@@ -4,7 +4,6 @@ endpoint.py (the local transport runs the same endpoint as SSH does) and a real 
 The framed request is one JSON header line, then exactly ``bytes`` raw bytes; a get answers one JSON line
 and then the raw bytes. Each adversarial case here is one that a client or a network could produce.
 """
-import fcntl
 import hashlib
 import json
 import os
@@ -351,6 +350,7 @@ class TaskFilesOverSshTests(unittest.TestCase):
     def hold_slots(self, count):
         folder = self.root / '.task-file-slots'
         folder.mkdir(mode=0o700, exist_ok=True)
+        import fcntl  # POSIX only: imported here so the module still imports on Windows (its tests skip there)
         handles = []
         for number in range(count):
             handle = open(str(folder / ('slot-%d' % number)), 'a+b')
