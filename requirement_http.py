@@ -7,6 +7,7 @@ used to impersonate host authority.
 import json
 import hashlib
 import os
+import re
 import stat
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -357,7 +358,7 @@ def owner_context(project_path, project, request, authority_config, simple=True)
 def checked_body(body, action):
     allowed = {'create': {'kind', 'parent', 'title', 'description', 'key'},
                'revise': {'expected_revision', 'expected_sha256', 'title', 'description'},
-               'accept': {'expected_revision', 'expected_sha256'},
+               'accept': {'expected_revision', 'expected_sha256', 'pointer'},
                'withdraw': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason'},
                'supersede': {'expected_revision', 'expected_sha256', 'expected_state_sha256', 'reason', 'successor'},
                'release': {'original_operation_id', 'expected_receipt_sha256', 'reason'},
@@ -384,6 +385,11 @@ def checked_body(body, action):
             governance.digest(body.get('expected_sha256'))
         elif body.get('expected_sha256') is not None:
             raise ValueError('Missing requirements governance has no hash')
+    if 'pointer' in body:
+        pointer = body['pointer']
+        if (not isinstance(pointer, str)
+                or not re.fullmatch(r'orchestra:room/r-[0-9a-f]{12}#[0-9]{1,12}\Z', pointer)):
+            raise ValueError('Invalid room evidence pointer')
     for field, limit in (('title', 200), ('description', 20000)):
         if field in body and (not isinstance(body[field], str) or not body[field].strip()
                               or len(body[field]) > limit or '\0' in body[field]):
@@ -400,6 +406,27 @@ def checked_body(body, action):
             from export_requirements import exact_reference
             exact_reference(body.get('successor')); identifier(body['successor']['id'])
     return dict(body)
+
+
+def create_decision(run, title, description, identity):
+    """Create the one native decision issue both requirement and room acceptance use.
+
+    ``run`` is the endpoint's NativeRunner; the row is created with the same labels, the
+    same dry-run preflight and the same guarded write as before (kittrial-5bb.388 plan:
+    one builder for requirement acceptance and room decisions).  ``identity`` is the
+    deterministic content identity; the label names it, so a retry is visible rather than
+    silently duplicated.
+    """
+    label = 'owner-requirement-decision:' + identity
+    args = ['create', '--title', title, '--description', description, '--type', 'decision',
+            '--no-inherit-labels', '--labels', label, '--json']
+    run(args + ['--dry-run'])
+    decision = record_json.loads(run(args))
+    if not isinstance(decision, dict) or not decision.get('id'):
+        raise ValueError('Generated decision outcome is uncertain; reconcile the operation')
+    decision_id = decision['id']
+    identifier(decision_id)
+    return decision_id
 
 
 def _spec(context, body, action, operation_id, prior=None, run=None):
@@ -473,13 +500,14 @@ def _spec(context, body, action, operation_id, prior=None, run=None):
 
     def before_evidence(run, task, revision, record, actor, bound, receipt):
         identity = content_hash({'owner_requirement_decision': operation_id})
-        label = 'owner-requirement-decision:' + identity
         title = 'Accept requirement ' + task
         description = ('## Decision\nAccept the exact requirement content.\n\n## Rationale\n'
                        'The project owner or a project coordinator accepted this content in '
                        'simple mode.\n\n'
                        '## Alternatives Considered\nLeave it as a draft.\n\n'
                        'Requirement: %s revision %d sha256 %s\n' % (task, revision, record['sha256']))
+        if body.get('pointer'):
+            description += '\n' + body['pointer'] + '\n'
         saved = read_owner_receipt(receipt)
         if 'owner_decision' in saved:
             decision_id = saved['owner_decision']['decision']['decision_id']
@@ -488,14 +516,7 @@ def _spec(context, body, action, operation_id, prior=None, run=None):
                 raise ValueError('Recorded requirement decision is missing or unreadable; '
                                  'keep this operation unknown and ask the host operator to reconcile it')
         else:
-            args = ['create', '--title', title, '--description', description, '--type', 'decision',
-                    '--no-inherit-labels', '--labels', label, '--json']
-            run(args + ['--dry-run'])
-            decision = record_json.loads(run(args))
-            if not isinstance(decision, dict) or not decision.get('id'):
-                raise ValueError('Generated decision outcome is uncertain; reconcile the operation')
-            decision_id = decision['id']
-            identifier(decision_id)
+            decision_id = create_decision(run, title, description, identity)
             saved['owner_decision'] = owner_records.acceptance(
                 context.project, record, actor, operation_id, context.governance,
                 decision_id, stage['at'])
@@ -775,6 +796,88 @@ def _web_action(root, project_path, project, request, authority_config, runner, 
     return guarded_write(root, recovery, journal_path(project_path), reconcile,
                          authority_config=authority_config, require_authority=True, runner=runner,
                          account_identity=True, identity_check=identity_check)
+
+
+def room_decision(root, project_path, project, request, authority_config, runner, guarded_write):
+    """The service-only ``room-decision`` action: one native decision from a room item.
+
+    Live authority is re-checked inside the endpoint, under the authority lock, exactly as
+    ``owner-requirements`` does (the coordinator's condition 1 on the plan): the descriptor
+    must be a signed-in account's, the account must be the project's owner or coordinator
+    *now*, and only then is the item read and the decision created.  Never a credential.
+    The item's current title, text and evidence pointer are read from the room segment and
+    compared with the request, so the decision cannot be made for a different item state.
+    """
+    from http_authority import file_lock, journal_path, read_state, requirement_editor
+    from project_creation import service_descriptor
+    import rooms
+    args = request.get('args')
+    if not isinstance(args, list) or len(args) != 1 or not isinstance(args[0], str):
+        raise ValueError('Expected one room decision payload; nothing was written.')
+    try:
+        body = record_json.loads(args[0])
+    except ValueError:
+        raise ValueError('The room decision payload is not valid JSON; nothing was written.') from None
+    allowed = {'schema_version', 'operation', 'room', 'sequence', 'title', 'text',
+               'evidence', 'operation_id'}
+    if (not isinstance(body, dict) or set(body) != allowed or body.get('schema_version') != 1
+            or body.get('operation') != 'issue'):
+        raise ValueError('Unsupported room decision fields; nothing was written.')
+    try:
+        rooms.check_room_id(body['room'])
+        rooms.check_evidence(body['evidence'])
+        rooms.check_title(body['title'])
+        rooms.check_item_text(body['text'], rooms.limits(root)['max_message_chars'])
+    except rooms.Refusal as error:
+        raise ValueError(str(error)) from None
+    if type(body['sequence']) is not int or body['sequence'] < 1:
+        raise ValueError('The room item number must be a positive whole number')
+    operation_id = body['operation_id']
+    identifier(operation_id)
+    if request.get('operation_id') not in (None, operation_id):
+        raise ValueError('The room decision operation id changed; nothing was written.')
+    descriptor = service_descriptor(request, authority_config, 'room-decision')
+    if descriptor.get('project') != project:
+        raise ValueError('Room decisions need the signed-in owner or coordinator of this project')
+    if descriptor.get('via') != 'session':
+        raise ValueError('Room decisions need a signed-in person; an agent credential cannot decide an item')
+
+    def authority():
+        with file_lock(authority_config.lock):
+            state = read_state(authority_config.store)
+        editor = requirement_editor(state, project, descriptor)
+        if editor.get('role') not in ('owner', 'coordinator'):
+            raise ValueError('Only the project owner or a coordinator can decide a room decision item')
+        item = rooms.read_item(project_path, body['room'], body['sequence'])
+        if item['moderated'] or item['item_kind'] != 'decision' or \
+                item['state'] not in ('proposed', 'amended'):
+            raise ValueError('The room decision item changed; reload the room and try again')
+        if (item['title'] != body['title'] or item['text'] != body['text']
+                or item['evidence'] != body['evidence']):
+            raise ValueError('The room decision item changed; reload the room and try again')
+        return editor
+
+    authority()
+
+    def identity_check():
+        return authority()
+
+    def effect():
+        authority()
+        description = ('## Decision\n' + body['text'] + '\n\n## Rationale\n'
+                       'Accepted from a project room by the project owner or a coordinator.\n\n'
+                       '## Alternatives Considered\nLeave it as an open item.\n\n'
+                       + body['evidence'] + '\n')
+        identity = content_hash({'room_decision': operation_id})
+        decision_id = create_decision(runner, body['title'], description, identity)
+        return {'returncode': 0,
+                'stdout': json.dumps({'schema_version': 1, 'decision_id': decision_id,
+                                      'evidence': body['evidence']}) + '\n',
+                'stderr': ''}
+
+    return guarded_write(root, request, journal_path(project_path), effect,
+                         authority_config=authority_config, require_authority=True,
+                         runner=runner, identity_check=identity_check)
 
 
 def read(project_path, project, args, run, operators=None):

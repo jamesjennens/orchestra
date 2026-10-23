@@ -1,8 +1,11 @@
-"""Project rooms, slice 1: rooms for people (kittrial-5bb.385).
+"""Project rooms, slice 1 and 2: rooms for people (kittrial-5bb.385, .388).
 
 Slice 1 of ``docs/PROJECT_ROOMS_DESIGN.md`` (section 10): append-only room files beside
 the project, list/read/post/create/archive/moderate, the web page, a separate backup
-file and export. Items, the rooms scope, the scribe and the summary are later slices.
+file and export.  Slice 2 (kittrial-5bb.388) adds *items* (a candidate requirement, decision
+or open question), their proposed/accepted/rejected/amended/superseded states, the
+accept/reject/amend/answer item events, and the derived ``items`` cache in ``index.json``.
+The rooms scope, the scribe and the summary are later slices.
 
 Where the bytes live.  ``<project>/.rooms/`` beside the kit's other project-owned state,
 never in the tracker or in source control::
@@ -68,6 +71,26 @@ MESSAGE_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind', 'author'
 TOMBSTONE_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind', 'target_sequence',
                     'reason', 'author', 'created_at', 'text'}
 AUTHOR_FIELDS = {'id', 'name', 'role'}
+
+# -- items (slice 2, kittrial-5bb.388) -------------------------------------------------------------
+ITEM_KINDS = ('requirement', 'decision', 'question')
+ITEM_STATES = ('proposed', 'accepted', 'rejected', 'amended', 'superseded')
+ITEM_EVENTS = {'accept': 'accepted', 'reject': 'rejected', 'amend': 'amended',
+               'answer': 'accepted'}
+ITEM_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind', 'item_kind', 'title',
+               'author', 'created_at', 'text'}
+ITEM_FIELDS_SUPERSEDES = ITEM_FIELDS | {'supersedes'}
+#: A requirement must name the existing task it hangs under; a room item may carry it.
+ITEM_FIELDS_PARENT = ITEM_FIELDS | {'parent'}
+ITEM_FIELDS_PARENT_SUPERSEDES = ITEM_FIELDS | {'parent', 'supersedes'}
+ITEM_EVENT_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind', 'target_sequence',
+                     'event', 'state', 'author', 'created_at', 'text', 'record'}
+#: An amended item-event also carries the new title; the body is its ``text``.
+ITEM_EVENT_FIELDS_AMEND = ITEM_EVENT_FIELDS | {'title'}
+RECORD_FIELDS = {'kind', 'id', 'revision', 'sha256', 'decision_id', 'evidence'}
+RECORD_KINDS = ('requirement', 'proposal', 'decision')
+EVIDENCE = re.compile(r'orchestra:room/(r-[0-9a-f]{12})#([0-9]{1,12})\Z')
+TITLE_LIMIT = 200
 
 
 class Refusal(ValueError):
@@ -198,10 +221,80 @@ def check_reason(value, limit=500):
     return text
 
 
+def check_title(value):
+    """An item title: 1-200 characters, the kit's plain-text rule and no machine prefix."""
+    if not isinstance(value, str):
+        raise Refusal(422, 'invalid', 'An item title must be text')
+    text = value.strip()
+    if not text or len(text) > TITLE_LIMIT:
+        raise Refusal(422, 'invalid', 'An item title must be 1-%d characters' % TITLE_LIMIT)
+    _plain_text(text, 'An item title')
+    from reserved_comments import reserved_match
+    if reserved_match(text) is not None:
+        raise Refusal(422, 'reserved_text',
+                      'An item title cannot start with a reserved machine-record prefix.')
+    return text
+
+
+def check_item_text(value, limit, what='An item text'):
+    if not isinstance(value, str):
+        raise Refusal(422, 'invalid', what + ' must be text')
+    if not value.strip():
+        raise Refusal(422, 'invalid', what + ' must not be empty')
+    if len(value) > limit:
+        raise Refusal(422, 'too_long', '%s is at most %d characters; this one is %d.'
+                       % (what, limit, len(value)))
+    _plain_text(value, what)
+    from reserved_comments import reserved_match
+    if reserved_match(value) is not None:
+        raise Refusal(422, 'reserved_text',
+                      'An item text cannot start with a reserved machine-record prefix; '
+                      'write ordinary discussion, not a Kind: record.')
+    return value
+
+
+def check_item_kind(value):
+    if value not in ITEM_KINDS:
+        raise Refusal(422, 'invalid', 'item_kind must be requirement, decision or question')
+    return value
+
+
+def check_evidence(value):
+    if not isinstance(value, str) or not EVIDENCE.fullmatch(value):
+        raise Refusal(422, 'invalid', 'Invalid room evidence pointer')
+    return value
+
+
+def check_record(record):
+    """The pointer an accepted item stores: an existing record's identity, never a new shape."""
+    if record is None:
+        return None
+    if not isinstance(record, dict) or set(record) != RECORD_FIELDS:
+        raise Refusal(422, 'invalid', 'Invalid accepted record pointer')
+    if record['kind'] not in RECORD_KINDS:
+        raise Refusal(422, 'invalid', 'Invalid accepted record pointer')
+    for name in ('id', 'decision_id'):
+        value = record[name]
+        if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 200):
+            raise Refusal(422, 'invalid', 'Invalid accepted record pointer')
+    if record['revision'] is not None and (type(record['revision']) is not int or record['revision'] < 1):
+        raise Refusal(422, 'invalid', 'Invalid accepted record pointer')
+    if record['sha256'] is not None and (not isinstance(record['sha256'], str)
+                                          or not re.fullmatch(r'[0-9a-f]{64}', record['sha256'])):
+        raise Refusal(422, 'invalid', 'Invalid accepted record pointer')
+    check_evidence(record['evidence'])
+    return dict(record)
+
+
 def check_operation_id(value):
     if not isinstance(value, str) or not OPERATION_ID.fullmatch(value):
         raise Refusal(422, 'invalid', 'Invalid operation id')
     return value
+
+
+def item_operation(room_id, sequence, revision, action):
+    """The deterministic operation id of one item decision (never the client's key)."""
+    return 'room-%s-%d-%d-%s' % (room_id, sequence, revision, action)
 
 
 # -- paths and atomic writes ----------------------------------------------------------------------
@@ -277,30 +370,68 @@ def _validate_author(value):
 
 def _validate_line(line, expected=None):
     if not isinstance(line, dict):
-        raise ValueError('Invalid room message')
+        raise ValueError('Invalid room line')
     kind = line.get('kind')
-    required = TOMBSTONE_FIELDS if kind == 'tombstone' else MESSAGE_FIELDS
-    if kind not in ('message', 'tombstone') or set(line) != required:
-        raise ValueError('Invalid room message')
+    if kind == 'tombstone':
+        required = TOMBSTONE_FIELDS
+    elif kind == 'message':
+        required = MESSAGE_FIELDS
+    elif kind == 'item':
+        if 'parent' in line and 'supersedes' in line:
+            required = ITEM_FIELDS_PARENT_SUPERSEDES
+        elif 'parent' in line:
+            required = ITEM_FIELDS_PARENT
+        else:
+            required = ITEM_FIELDS_SUPERSEDES if 'supersedes' in line else ITEM_FIELDS
+    elif kind == 'item-event':
+        required = ITEM_EVENT_FIELDS_AMEND if line.get('event') == 'amend' else ITEM_EVENT_FIELDS
+    else:
+        raise ValueError('Invalid room line kind')
+    if set(line) != required:
+        raise ValueError('Invalid room line')
     if line['schema_version'] != SCHEMA_VERSION:
-        raise ValueError('Invalid room message schema')
+        raise ValueError('Invalid room line schema')
     if type(line['sequence']) is not int or line['sequence'] < 1:
-        raise ValueError('Invalid room message sequence')
+        raise ValueError('Invalid room line sequence')
     if expected is not None and line['sequence'] != expected:
-        raise ValueError('Invalid room message sequence')
+        raise ValueError('Invalid room line sequence')
     if not isinstance(line['operation_id'], str) or not OPERATION_ID.fullmatch(line['operation_id']):
-        raise ValueError('Invalid room message operation id')
-    _timestamp(line['created_at'], 'room message time')
+        raise ValueError('Invalid room line operation id')
+    _timestamp(line['created_at'], 'room line time')
     _validate_author(line['author'])
-    if not isinstance(line['text'], str) or not line['text'].strip():
-        raise ValueError('Invalid room message text')
-    if len(line['text']) > 100000:
-        raise ValueError('Invalid room message text')
     if kind == 'tombstone':
         if type(line['target_sequence']) is not int or line['target_sequence'] < 1:
             raise ValueError('Invalid room tombstone target')
         if not isinstance(line['reason'], str) or not line['reason'].strip() or len(line['reason']) > 500:
             raise ValueError('Invalid room tombstone reason')
+    if not isinstance(line['text'], str) or len(line['text']) > 100000:
+        raise ValueError('Invalid room line text')
+    if kind == 'item':
+        if line['item_kind'] not in ITEM_KINDS:
+            raise ValueError('Invalid room item kind')
+        if not isinstance(line['title'], str) or not line['title'].strip() or len(line['title']) > TITLE_LIMIT:
+            raise ValueError('Invalid room item title')
+        if not line['text'].strip():
+            raise ValueError('Invalid room item text')
+        if 'supersedes' in line and (type(line['supersedes']) is not int or line['supersedes'] < 1):
+            raise ValueError('Invalid room item supersedes')
+        if 'parent' in line:
+            if not isinstance(line['parent'], str) or not OPERATION_ID.fullmatch(line['parent']):
+                raise ValueError('Invalid room item parent')
+    elif kind == 'item-event':
+        if type(line['target_sequence']) is not int or line['target_sequence'] < 1:
+            raise ValueError('Invalid room item-event target')
+        event = line['event']
+        if event not in ITEM_EVENTS or line['state'] != ITEM_EVENTS[event]:
+            raise ValueError('Invalid room item-event event')
+        if event in ('reject', 'amend', 'answer') and not line['text'].strip():
+            raise ValueError('Invalid room item-event text')
+        if event == 'amend' and (not isinstance(line.get('title'), str) or not line['title'].strip()
+                                 or len(line['title']) > TITLE_LIMIT):
+            raise ValueError('Invalid room item-event title')
+        check_record(line['record'])
+    elif not line['text'].strip():
+        raise ValueError('Invalid room message text')
     return line
 
 
@@ -466,21 +597,24 @@ def rebuild_index(project, tolerant=False):
     """
     rooms = {}
     for room_id in _room_ids(project):
-        entry = {'last_sequence': 0, 'segments': []}
+        entry = {'last_sequence': 0, 'segments': [], 'items': []}
         try:
+            all_lines = []
             for number, path in _segments(project, room_id):
                 raw = path.read_bytes()
                 parsed, _tail = _parse_lines(raw)
                 for line in parsed:
                     _validate_line(line)
-                # A torn tail is handled (and quarantined) when the room is read; the index
-                # only records the complete lines, so a rebuild never invents a sequence.
+                all_lines.extend(parsed)
                 if parsed:
                     entry['segments'].append({'name': path.name, 'bytes': len(raw),
                                               'count': len(parsed),
                                               'first': parsed[0]['sequence'],
                                               'last': parsed[-1]['sequence']})
                     entry['last_sequence'] = parsed[-1]['sequence']
+            # A torn tail is handled (and quarantined) when the room is read; the index
+            # only records the complete lines, so a rebuild never invents a sequence.
+            entry['items'] = items_from_lines(all_lines, room_id)
         except Refusal:
             raise
         except (ValueError, KeyError, UnicodeDecodeError, OSError) as error:
@@ -524,6 +658,11 @@ def read_index(project):
         if entry is None or names != have:
             stale = True
             break
+        # The items cache is part of the index too: a cache that is absent (for example an
+        # index written by slice 1) is rebuilt rather than served as "no items".
+        if not isinstance(entry.get('items'), list):
+            stale = True
+            break
         # The index is only a cache, but a crash after an append and before its index
         # write leaves the same names with one line fewer. The file's size moves on every
         # append, so it catches that too (the segment lines remain the truth).
@@ -541,7 +680,7 @@ def write_index(project, index):
 
 
 def _index_entry(index, room_id):
-    return index['rooms'].setdefault(room_id, {'last_sequence': 0, 'segments': []})
+    return index['rooms'].setdefault(room_id, {'last_sequence': 0, 'segments': [], 'items': []})
 
 
 # -- room records ---------------------------------------------------------------------------------
@@ -650,7 +789,7 @@ def create(project, name, actor, limits_values):
     except Exception:
         shutil.rmtree(folder, ignore_errors=True)
         raise
-    index['rooms'][room_id] = {'last_sequence': 0, 'segments': []}
+    index['rooms'][room_id] = {'last_sequence': 0, 'segments': [], 'items': []}
     write_index(project, index)
     return _room_view(room)
 
@@ -701,6 +840,123 @@ def _redacted_view(line, tombstone):
             'target_sequence': line['sequence']}
 
 
+def _item_evidence(room_id, sequence):
+    return 'orchestra:room/%s#%d' % (room_id, sequence)
+
+
+def _item_line_view(line, room_id, tombstone=None):
+    """One item line in the paged log: its own current text, or its tombstone."""
+    if tombstone is not None:
+        return {'sequence': line['sequence'], 'kind': 'tombstone', 'moderated': True,
+                'item_kind': line['item_kind'], 'title': None,
+                'author': dict(tombstone['author']), 'created_at': tombstone['created_at'],
+                'text': tombstone['text'], 'reason': tombstone['reason'],
+                'target_sequence': line['sequence'],
+                'evidence': _item_evidence(room_id, line['sequence'])}
+    view = {'sequence': line['sequence'], 'kind': 'item', 'item_kind': line['item_kind'],
+            'title': line['title'], 'author': dict(line['author']),
+            'created_at': line['created_at'], 'text': line['text'],
+            'evidence': _item_evidence(room_id, line['sequence']), 'moderated': False}
+    if 'supersedes' in line:
+        view['supersedes'] = line['supersedes']
+    if 'parent' in line:
+        view['parent'] = line['parent']
+    return view
+
+
+def _item_event_view(line, redacted=None):
+    view = {'sequence': line['sequence'], 'kind': 'item-event',
+            'target_sequence': line['target_sequence'], 'event': line['event'],
+            'state': line['state'], 'author': dict(line['author']),
+            'created_at': line['created_at'], 'record': line['record']}
+    if line['event'] == 'amend':
+        view['title'] = line.get('title')
+    if redacted is not None:
+        view['text'] = redacted['text']
+        view['record'] = None
+        view['redacted'] = True
+    else:
+        view['text'] = line['text']
+    return view
+
+
+def items_from_lines(lines, room_id):
+    """Current item views, derived only from the segment lines (the truth).
+
+    The same function builds the derived ``items`` cache and a rebuild, so a cache and a
+    rebuild from the lines are identical by construction (the coordinator's condition 2 on
+    the plan).  A moderated item keeps its last state but its title and text are the
+    tombstone's, its record is dropped and its decision history is not served.
+    """
+    tombstones, _ = _tombstones(lines)
+    items = {}
+    for line in lines:
+        if line['kind'] == 'item':
+            sequence = line['sequence']
+            supersedes = line.get('supersedes')
+            if supersedes is not None and supersedes in items and \
+                    items[supersedes]['state'] in ('proposed', 'amended'):
+                items[supersedes]['state'] = 'superseded'
+                items[supersedes]['superseded_by'] = sequence
+            items[sequence] = {
+                'sequence': sequence, 'kind': 'item', 'item_kind': line['item_kind'],
+                'title': line['title'], 'state': 'proposed', 'text': line['text'],
+                'author': dict(line['author']), 'created_at': line['created_at'],
+                'supersedes': supersedes, 'parent': line.get('parent'), 'history': [],
+                'record': None,
+                'evidence': _item_evidence(room_id, sequence), 'moderated': False,
+            }
+            for name in ('accepted_by', 'rejected_by', 'amended_by', 'answered_by'):
+                items[sequence][name] = None
+            for name in ('accepted_at', 'rejected_at', 'amended_at', 'answered_at'):
+                items[sequence][name] = None
+        elif line['kind'] == 'item-event':
+            target = items.get(line['target_sequence'])
+            if target is None or target['moderated']:
+                continue
+            if target['state'] not in ('proposed', 'amended'):
+                continue
+            event = line['event']
+            target['history'].append(_item_event_view(line))
+            target['state'] = line['state']
+            if event == 'accept':
+                target['record'] = check_record(line['record'])
+                target['accepted_by'] = dict(line['author'])
+                target['accepted_at'] = line['created_at']
+            elif event == 'reject':
+                target['rejected_by'] = dict(line['author'])
+                target['rejected_at'] = line['created_at']
+            elif event == 'amend':
+                target['title'] = line['title']
+                target['text'] = line['text']
+                target['amended_by'] = dict(line['author'])
+                target['amended_at'] = line['created_at']
+            elif event == 'answer':
+                target['text'] = line['text']
+                target['answered_by'] = dict(line['author'])
+                target['answered_at'] = line['created_at']
+    for sequence, tombstone in tombstones.items():
+        target = items.get(sequence)
+        if target is None:
+            continue
+        target.update({'moderated': True, 'title': None, 'text': tombstone['text'],
+                       'author': dict(tombstone['author']),
+                       'created_at': tombstone['created_at'], 'record': None, 'history': []})
+    return [items[key] for key in sorted(items)]
+
+
+def read_item(project, room_id, sequence):
+    """One current item view, or the refusal the route answers."""
+    if type(sequence) is not int or sequence < 1:
+        raise Refusal(422, 'invalid', 'The item number must be a positive whole number')
+    read_room(project, room_id)
+    views = items_from_lines(load_lines(project, room_id), room_id)
+    for view in views:
+        if view['sequence'] == sequence:
+            return view
+    raise Refusal(404, 'not_found', 'No such item in this room.')
+
+
 def read_messages(project, room_id, since=0, limit=100):
     if type(since) is not int or since < 0:
         raise Refusal(422, 'invalid', 'since must be a whole number of at least 0')
@@ -721,18 +977,28 @@ def read_messages(project, room_id, since=0, limit=100):
             more = True
             break
         tombstone = tombstones.get(line['sequence'])
-        messages.append(_redacted_view(line, tombstone) if tombstone else _message_view(line))
+        if line['kind'] == 'message':
+            messages.append(_redacted_view(line, tombstone) if tombstone else _message_view(line))
+        elif line['kind'] == 'item':
+            messages.append(_item_line_view(line, room_id, tombstone))
+        else:
+            target_tombstone = tombstones.get(line['target_sequence'])
+            messages.append(_item_event_view(line, target_tombstone))
         last_visible = line['sequence']
     if not more:
-        # Is there a visible message after the page even when no tombstone followed it?
+        # Is there a visible line after the page even when no tombstone followed it?
         more = any(line['kind'] != 'tombstone' and line['sequence'] > last_visible for line in lines)
     moderations = [_tombstone_view(line) for line in events if line['sequence'] > since]
     index = read_index(project)
-    last_sequence = (index['rooms'].get(room_id) or {}).get('last_sequence', 0)
+    entry = index['rooms'].get(room_id) or {}
+    last_sequence = entry.get('last_sequence', 0)
     if lines:
         last_sequence = max(last_sequence, lines[-1]['sequence'])
+    # The items cache is derived from the segment lines. read_index rebuilds a missing or
+    # stale cache; a room line just appended is seen by the byte check there.
+    items = list(entry.get('items') or [])
     return {'room': _room_view(room), 'messages': messages, 'moderations': moderations,
-            'since': since, 'last_sequence': last_sequence,
+            'items': items, 'since': since, 'last_sequence': last_sequence,
             'next_since': last_sequence if not more else last_visible, 'has_more': more}
 
 
@@ -769,6 +1035,13 @@ def _append(project, room_id, line, limits_values):
     if segment['first'] is None:
         segment['first'] = line['sequence']
     entry['last_sequence'] = line['sequence']
+    if line['kind'] in ('item', 'item-event'):
+        entry['items'] = items_from_lines(load_lines(project, room_id), room_id)
+    elif line['kind'] == 'tombstone':
+        target = next((stored for stored in load_lines(project, room_id)
+                       if stored['sequence'] == line['target_sequence']), None)
+        if target is not None and target['kind'] == 'item':
+            entry['items'] = items_from_lines(load_lines(project, room_id), room_id)
     write_index(project, index)
 
 
@@ -793,6 +1066,153 @@ def post(project, room_id, text, operation_id, author, limits_values):
     return dict(_message_view(line), replayed=False)
 
 
+def _room_open(project, room_id):
+    room = read_room(project, room_id)
+    if room['state'] != 'open':
+        raise Refusal(409, 'archived', 'This room is archived; it can be read and exported, not posted to.')
+    return room
+
+
+def post_item(project, room_id, item_kind, title, text, operation_id, author, limits_values,
+              supersedes=None, parent=None):
+    """Post one item line: a proposed requirement, decision or question."""
+    operation_id = check_operation_id(operation_id)
+    item_kind = check_item_kind(item_kind)
+    title = check_title(title)
+    text = check_item_text(text, limits_values['max_message_chars'])
+    if supersedes is not None and (type(supersedes) is not int or supersedes < 1):
+        raise Refusal(422, 'invalid', 'supersedes must be the number of an earlier item')
+    if parent is not None:
+        if item_kind != 'requirement':
+            raise Refusal(422, 'invalid', 'Only a requirement item names a parent job')
+        if not isinstance(parent, str) or not OPERATION_ID.fullmatch(parent):
+            raise Refusal(422, 'invalid', 'Invalid parent job id')
+    _room_open(project, room_id)
+    lines = load_lines(project, room_id)
+    existing = _find_operation(lines, operation_id)
+    if existing is not None:
+        if (existing['kind'] == 'item' and existing['item_kind'] == item_kind
+                and existing['title'] == title and existing['text'] == text
+                and existing.get('supersedes') == supersedes and existing.get('parent') == parent
+                and existing['author']['id'] == author['id']):
+            view = next(item for item in items_from_lines(lines, room_id)
+                        if item['sequence'] == existing['sequence'])
+            return dict(view, replayed=True)
+        raise Refusal(409, 'operation_reused',
+                      'That operation id already wrote a different room line.')
+    if supersedes is not None:
+        current = next((item for item in items_from_lines(lines, room_id)
+                        if item['sequence'] == supersedes), None)
+        if current is None or current['kind'] != 'item':
+            raise Refusal(404, 'not_found', 'No such item to supersede in this room.')
+        if current['moderated']:
+            raise Refusal(409, 'moderated', 'A moderated item cannot be superseded.')
+        if current['state'] not in ('proposed', 'amended'):
+            raise Refusal(409, 'final', 'That item is already decided; a decided item cannot be superseded.')
+    line = {'schema_version': SCHEMA_VERSION,
+            'sequence': (lines[-1]['sequence'] + 1) if lines else 1,
+            'operation_id': operation_id, 'kind': 'item', 'item_kind': item_kind,
+            'title': title, 'author': dict(author), 'created_at': now_iso(), 'text': text}
+    if supersedes is not None:
+        line['supersedes'] = supersedes
+    if parent is not None:
+        line['parent'] = parent
+    _append(project, room_id, line, limits_values)
+    view = next(item for item in items_from_lines(load_lines(project, room_id), room_id)
+                if item['sequence'] == line['sequence'])
+    return dict(view, replayed=False)
+
+
+def _decide_item(project, room_id, sequence, event, operation_id, author, limits_values,
+                 text='', title=None, record=None):
+    """Append one item-event after checking the item's current state (the truth)."""
+    operation_id = check_operation_id(operation_id)
+    if type(sequence) is not int or sequence < 1:
+        raise Refusal(422, 'invalid', 'The item number must be a positive whole number')
+    if event not in ITEM_EVENTS:
+        raise Refusal(422, 'invalid', 'Unknown item decision')
+    _room_open(project, room_id)
+    lines = load_lines(project, room_id)
+    existing = _find_operation(lines, operation_id)
+    if existing is not None:
+        matches = (existing['kind'] == 'item-event' and existing['target_sequence'] == sequence
+                   and existing['event'] == event and existing['text'] == text
+                   and existing.get('title') == title and existing['record'] == record)
+        if matches:
+            view = next(item for item in items_from_lines(lines, room_id)
+                        if item['sequence'] == sequence)
+            return dict(view, replayed=True)
+        raise Refusal(409, 'operation_reused',
+                      'That operation id already wrote a different room line.')
+    current = next((item for item in items_from_lines(lines, room_id)
+                    if item['sequence'] == sequence), None)
+    if current is None or current['kind'] != 'item':
+        raise Refusal(404, 'not_found', 'No such item in this room.')
+    if event == 'accept' and current['item_kind'] == 'question':
+        raise Refusal(400, 'invalid', 'A question is answered, not accepted.')
+    if current['moderated']:
+        raise Refusal(409, 'moderated', 'A moderated item cannot be decided.')
+    if current['state'] not in ('proposed', 'amended'):
+        raise Refusal(409, 'final', 'That item is already decided.')
+    if event == 'accept':
+        if current['item_kind'] == 'question':
+            raise Refusal(400, 'invalid', 'A question is answered, not accepted.')
+        if record is None:
+            raise Refusal(422, 'invalid', 'An accepted item needs the record it became.')
+        record = check_record(record)
+        check_evidence(record['evidence'])
+        if record['evidence'] != _item_evidence(room_id, sequence):
+            raise Refusal(422, 'invalid', 'The record pointer does not name this room item.')
+    else:
+        if record is not None:
+            raise Refusal(422, 'invalid', 'Only an acceptance carries a record pointer.')
+    if event == 'answer':
+        if current['item_kind'] != 'question':
+            raise Refusal(400, 'invalid', 'Only a question is answered.')
+        text = check_item_text(text, limits_values['max_message_chars'], 'An answer')
+    elif event == 'reject':
+        text = check_reason(text)
+    elif event == 'amend':
+        title = check_title(title)
+        text = check_item_text(text, limits_values['max_message_chars'], 'An amendment')
+    else:
+        if not isinstance(text, str) or len(text) > limits_values['max_message_chars']:
+            raise Refusal(422, 'invalid', 'An acceptance note is at most %d characters'
+                          % limits_values['max_message_chars'])
+        if text:
+            _plain_text(text, 'An acceptance note')
+    line = {'schema_version': SCHEMA_VERSION, 'sequence': lines[-1]['sequence'] + 1,
+            'operation_id': operation_id, 'kind': 'item-event',
+            'target_sequence': sequence, 'event': event, 'state': ITEM_EVENTS[event],
+            'author': dict(author), 'created_at': now_iso(), 'text': text, 'record': record}
+    if event == 'amend':
+        line['title'] = title
+    _append(project, room_id, line, limits_values)
+    view = next(item for item in items_from_lines(load_lines(project, room_id), room_id)
+                if item['sequence'] == sequence)
+    return dict(view, replayed=False)
+
+
+def accept_item(project, room_id, sequence, operation_id, author, limits_values, record, text=''):
+    return _decide_item(project, room_id, sequence, 'accept', operation_id, author,
+                        limits_values, text=text, record=record)
+
+
+def reject_item(project, room_id, sequence, operation_id, author, limits_values, reason):
+    return _decide_item(project, room_id, sequence, 'reject', operation_id, author,
+                        limits_values, text=reason)
+
+
+def amend_item(project, room_id, sequence, operation_id, author, limits_values, title, text):
+    return _decide_item(project, room_id, sequence, 'amend', operation_id, author,
+                        limits_values, text=text, title=title)
+
+
+def answer_item(project, room_id, sequence, operation_id, author, limits_values, text):
+    return _decide_item(project, room_id, sequence, 'answer', operation_id, author,
+                        limits_values, text=text)
+
+
 def moderate(project, room_id, target_sequence, reason, operation_id, author, limits_values):
     operation_id = check_operation_id(operation_id)
     reason = check_reason(reason)
@@ -808,10 +1228,10 @@ def moderate(project, room_id, target_sequence, reason, operation_id, author, li
         raise Refusal(409, 'operation_reused',
                       'That operation id already wrote a different room line.')
     target = next((line for line in lines if line['sequence'] == target_sequence), None)
-    if target is None or target['kind'] != 'message':
-        raise Refusal(404, 'not_found', 'No such message in this room.')
+    if target is None or target['kind'] not in ('message', 'item'):
+        raise Refusal(404, 'not_found', 'No such message or item in this room.')
     if any(line['kind'] == 'tombstone' and line['target_sequence'] == target_sequence for line in lines):
-        raise Refusal(409, 'already_moderated', 'That message is already a tombstone.')
+        raise Refusal(409, 'already_moderated', 'That line is already a tombstone.')
     at = now_iso()
     text = 'removed by %s at %s: %s' % (author['name'], at, reason)
     line = {'schema_version': SCHEMA_VERSION, 'sequence': lines[-1]['sequence'] + 1,
@@ -841,6 +1261,7 @@ def export_markdown(project, room_id):
     room = read_room(project, room_id)
     lines = load_lines(project, room_id)
     tombstones, _ = _tombstones(lines)
+    items = {view['sequence']: view for view in items_from_lines(lines, room_id)}
     out = ['# %s' % room['name'], '',
            'State: %s' % room['state'],
            'Created by %s at %s' % (room['created_by_name'], room['created_at'])]
@@ -853,17 +1274,47 @@ def export_markdown(project, room_id):
         if line['kind'] == 'tombstone':
             continue
         tombstone = tombstones.get(line['sequence'])
-        body = tombstone if tombstone else line
-        out.append('### #%d %s (%s), %s' % (line['sequence'], body['author']['name'],
-                                            body['author']['role'], body['created_at']))
-        out.append('')
-        out.append(_fenced(body['text']))
-        out.append('')
+        if line['kind'] == 'message':
+            body = tombstone if tombstone else line
+            out.append('### #%d %s (%s), %s' % (line['sequence'], body['author']['name'],
+                                                body['author']['role'], body['created_at']))
+            out.append('')
+            out.append(_fenced(body['text']))
+            out.append('')
+        elif line['kind'] == 'item':
+            view = items.get(line['sequence']) or {}
+            author = view.get('author') or line['author']
+            out.append('### #%d Item: %s (%s) - %s (%s), %s' % (
+                line['sequence'], view.get('title') or '(removed)', line['item_kind'],
+                author['name'], author['role'], view.get('created_at') or line['created_at']))
+            out.append('')
+            out.append('State: %s  Evidence: %s' % (view.get('state'),
+                                                    view.get('evidence') or ''))
+            if view.get('record'):
+                out.append('Record: %s' % json.dumps(view['record'], ensure_ascii=False,
+                                                     sort_keys=True))
+            out.append('')
+            out.append(_fenced(view.get('text') or ''))
+            out.append('')
+        elif line['kind'] == 'item-event':
+            target = tombstones.get(line['target_sequence'])
+            text = target['text'] if target is not None else line['text']
+            record = None if target is not None else line['record']
+            out.append('### #%d Item %s on #%d - %s (%s), %s' % (
+                line['sequence'], line['event'], line['target_sequence'],
+                line['author']['name'], line['author']['role'], line['created_at']))
+            out.append('')
+            if record:
+                out.append('Record: %s' % json.dumps(record, ensure_ascii=False, sort_keys=True))
+                out.append('')
+            if text:
+                out.append(_fenced(text))
+                out.append('')
     return '\n'.join(out).rstrip() + '\n'
 
 
 def export_jsonl(project, room_id):
-    """The raw JSON lines, with every moderated original's text replaced by its tombstone.
+    """The raw JSON lines, with every moderated line's text replaced by its tombstone.
 
     The original text is not in this export in any form; it remains only in the stored
     segment and the backup, until an operator purges it (design R10).
@@ -872,13 +1323,18 @@ def export_jsonl(project, room_id):
     tombstones, _ = _tombstones(lines)
     out = []
     for line in lines:
-        tombstone = tombstones.get(line['sequence']) if line['kind'] == 'message' else None
+        tombstone = None
+        if line['kind'] in ('message', 'item'):
+            tombstone = tombstones.get(line['sequence'])
         if tombstone is not None:
             safe = {'schema_version': SCHEMA_VERSION, 'sequence': line['sequence'],
                     'operation_id': tombstone['operation_id'], 'kind': 'tombstone',
                     'target_sequence': line['sequence'], 'reason': tombstone['reason'],
                     'author': dict(tombstone['author']), 'created_at': tombstone['created_at'],
                     'text': tombstone['text']}
+        elif line['kind'] == 'item-event' and line['target_sequence'] in tombstones:
+            safe = dict(line, text=tombstones[line['target_sequence']]['text'], record=None)
+            safe.pop('title', None)
         else:
             safe = dict(line)
         out.append(json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(',', ':')))

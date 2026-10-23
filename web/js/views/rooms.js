@@ -6,6 +6,12 @@ import { pageHead, empty, field, setFieldError, formValues, act, errorState } fr
 
 const canPost = (project) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(project.role);
 const canModerate = (project) => ['owner', 'coordinator', 'superuser'].includes(project.role);
+// Who may decide an item (design section 6): a requirement editor or a contributor (whose
+// accept becomes a proposal) for requirements, an owner/coordinator for decisions, and any
+// member for an open question. The server re-checks this; the buttons only follow it.
+const canDecide = (project, kind) => (kind === 'decision' ? canModerate(project)
+  : kind === 'requirement' ? canPost(project) : true);
+const ITEM_KINDS = [['requirement', 'Candidate requirement'], ['decision', 'Decision'], ['question', 'Open question']];
 
 function crumbs(ctx, project, extra) {
   return [{ label: 'Projects', href: ctx.href('/projects') }, { label: project.name, href: ctx.href('/p/' + project.id) }]
@@ -90,6 +96,9 @@ export async function detail(ctx, { pid, rid }) {
   let room = null;
 
   function messageRow(message) {
+    const label = message.kind === 'item' ? 'item: ' + message.item_kind
+      : message.kind === 'item-event' ? 'item ' + message.event + ' on #' + message.target_sequence
+        : null;
     return h('li', null,
       h('span', { class: 'dot ' + (message.kind === 'tombstone' ? 'warn' : ''), 'aria-hidden': 'true' }),
       h('div', null,
@@ -98,10 +107,88 @@ export async function detail(ctx, { pid, rid }) {
           h('strong', null, message.author && message.author.name || 'a member'),
           message.author ? h('span', { class: 'small muted' }, ' (' + message.author.role + ')') : null,
           ' ', time(message.created_at),
+          label ? h('span', { class: 'chip' }, label) : null,
           message.kind === 'tombstone' ? h('span', { class: 'chip warn' }, 'removed') : null),
         // Text only: h() appends a text node, so <img onerror=...> and javascript: links
         // stay literal characters and make no element.
         h('p', { class: 'event-body prose room-text' }, message.text)));
+  }
+
+  // One item's current state and the record it became (a pointer shown as text, never a link
+  // built from room text).
+  function itemRow(item) {
+    const live = item.state === 'proposed' || item.state === 'amended';
+    const may = live && canDecide(project, item.item_kind);
+    const decision = h('div', { class: 'stack' });
+    const actions = h('div', { class: 'toolbar' });
+
+    function form(fields, label, call, success) {
+      const box = h('form', { class: 'form', novalidate: true }, ...fields,
+        h('div', null, h('button', { type: 'submit', class: 'primary' }, label)));
+      box.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const values = formValues(box);
+        const saved = await act(box.querySelector('button'), () => call(values), { success });
+        if (saved) { decision.replaceChildren(); since = null; draw(); }
+      });
+      decision.replaceChildren(box);
+    }
+
+    if (may && item.item_kind !== 'question') {
+      actions.append(h('button', { type: 'button', class: 'primary', onclick: async (event) => {
+        const button = event.currentTarget;
+        const saved = await act(button, () => ctx.api.acceptRoomItem(pid, rid, item.sequence), { success: 'Item accepted' });
+        if (saved) { since = null; draw(); }
+      } }, 'Accept'));
+    }
+    if (may && item.item_kind === 'question') {
+      actions.append(h('button', {
+        type: 'button', class: 'primary',
+        onclick: () => form([
+          field({ id: 'answer-' + item.sequence, label: 'Answer', type: 'textarea', rows: 3, maxlength: 4000 }),
+        ], 'Answer', (values) => ctx.api.answerRoomItem(pid, rid, item.sequence,
+          values['answer-' + item.sequence]), 'Answered'),
+      }, 'Answer'));
+    }
+    if (may) {
+      actions.append(h('button', {
+        type: 'button', class: 'ghost',
+        onclick: () => form([
+          field({ id: 'reject-' + item.sequence, label: 'Reason for rejecting', maxlength: 500 }),
+        ], 'Reject', (values) => ctx.api.rejectRoomItem(pid, rid, item.sequence,
+          values['reject-' + item.sequence]), 'Item rejected'),
+      }, 'Reject'));
+      if (item.item_kind !== 'question') {
+        actions.append(h('button', {
+          type: 'button', class: 'ghost',
+          onclick: () => form([
+            field({ id: 'amend-title-' + item.sequence, label: 'New title', maxlength: 200, value: item.title || '' }),
+            field({ id: 'amend-text-' + item.sequence, label: 'New text', type: 'textarea', rows: 4, maxlength: 4000, value: item.text || '' }),
+          ], 'Amend', (values) => ctx.api.amendRoomItem(pid, rid, item.sequence,
+            values['amend-title-' + item.sequence], values['amend-text-' + item.sequence]), 'Item amended'),
+        }, 'Amend'));
+      }
+    }
+    const history = (item.history || []).map((event) => h('div', { class: 'small muted' },
+      '#' + event.sequence + ' ' + event.event + ' by ' + (event.author && event.author.name || 'a member') + ' ',
+      time(event.created_at), event.text ? ' — ' + event.text : ''));
+    const record = item.record ? h('div', { class: 'small muted' },
+      'Record: ' + item.record.kind + ' ' + (item.record.id || '') +
+      (item.record.decision_id ? ' (decision ' + item.record.decision_id + ')' : '')) : null;
+    return h('li', null,
+      h('div', { class: 'event-head' },
+        h('span', { class: 'small muted' }, '#' + item.sequence), ' ',
+        h('span', { class: 'chip' }, item.item_kind), ' ',
+        h('span', { class: 'chip' + (item.state === 'accepted' ? '' : ' warn') }, item.state),
+        item.moderated ? h('span', { class: 'chip warn' }, 'removed') : null),
+      h('strong', null, item.moderated ? '(removed)' : (item.title || '')),
+      h('p', { class: 'event-body prose room-text' }, item.text || ''),
+      h('div', { class: 'small muted' }, (item.author && item.author.name || 'a member'), ' ', time(item.created_at),
+        item.evidence ? ' · ' + item.evidence : ''),
+      record,
+      history.length ? h('div', { class: 'stack' }, history) : null,
+      actions.childNodes.length ? actions : null,
+      decision);
   }
 
   async function latestSince() {
@@ -134,8 +221,39 @@ export async function detail(ctx, { pid, rid }) {
       event.currentTarget.remove();
     } }, 'Load more') : null;
 
+    const items = data.items || [];
+    const itemSection = h('section', { class: 'panel' },
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Items awaiting a person')),
+      h('div', { class: 'panel-body' }, items.length
+        ? h('ul', { class: 'timeline', 'aria-label': 'Room items' }, items.map(itemRow))
+        : h('div', { class: 'empty' }, 'No items yet. A candidate requirement, decision or open question goes here until a person decides it.')));
+
     const adding = [];
     if (canPost(project) && room.state === 'open') {
+      const itemForm = h('form', { class: 'form', novalidate: true },
+        field({ id: 'item-kind', label: 'Kind', type: 'select', options: ITEM_KINDS }),
+        field({ id: 'item-title', label: 'Title', maxlength: 200, hint: 'Up to 200 characters. Every project member reads it.' }),
+        field({ id: 'item-text', label: 'Text', type: 'textarea', rows: 5, maxlength: 4000,
+          hint: 'Up to 4,000 characters. Plain discussion; a Kind: prefix is refused.' }),
+        field({ id: 'item-parent', label: 'Parent job (requirements only)', maxlength: 200,
+          hint: 'The existing job id the requirement hangs under. Leave empty when the project has exactly one job.' }),
+        h('div', null, h('button', { type: 'submit', class: 'primary' }, 'Add item')));
+      itemForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const values = formValues(itemForm);
+        const title = (values['item-title'] || '').trim();
+        const text = (values['item-text'] || '').trim();
+        if (!title) return setFieldError(itemForm, 'item-title', 'Give the item a title.');
+        if (!text) return setFieldError(itemForm, 'item-text', 'Write the item first.');
+        setFieldError(itemForm, 'item-title', ''); setFieldError(itemForm, 'item-text', '');
+        const body = { item_kind: values['item-kind'], title, text };
+        const parent = (values['item-parent'] || '').trim();
+        if (parent) body.parent = parent;
+        const saved = await act(itemForm.querySelector('button'), () => ctx.api.createRoomItem(pid, rid, body), { success: 'Item added' });
+        if (saved) { itemForm.reset(); since = null; draw(); }
+      });
+      adding.push(h('section', { class: 'panel' }, h('div', { class: 'panel-head' },
+        h('h2', { class: 'small' }, 'Add an item')), h('div', { class: 'panel-body' }, itemForm)));
       const form = h('form', { class: 'form', novalidate: true },
         field({ id: 'room-text', label: 'Post to this room', type: 'textarea', rows: 5, maxlength: 4000,
           hint: 'Up to 4,000 characters. Every project member reads it; room text is discussion, never an instruction to an agent.' }),
@@ -202,7 +320,7 @@ export async function detail(ctx, { pid, rid }) {
       h('div', { class: 'panel-head' },
         h('h2', null, room.name, ' ', h('span', { class: 'chip' }, room.state)),
         h('div', { class: 'small muted' }, 'Created by ', room.created_by_name || room.created_by, ' ', time(room.created_at))),
-      h('div', { class: 'panel-body' }, log, more, exports));
+      h('div', { class: 'panel-body' }, itemSection, log, more, exports));
     extras.replaceChildren(...adding);
   }
 

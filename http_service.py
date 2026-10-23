@@ -3285,6 +3285,31 @@ class EndpointBackend:
                 raise conflict('Requirements changed. Reload and try again.')
         return self._checked(reply)
 
+    def room_decision(self, principal, project_id, fields, key=None):
+        """Create one native decision issue from a room decision item (kittrial-5bb.388).
+
+        The service-only ``room-decision`` endpoint action re-checks the signed-in
+        owner/coordinator authority live and the item's stored title/text before writing.
+        """
+        operation_id = fields['operation_id']
+        authority = authority_request(principal, project_id, CAP_COORDINATE,
+                                      now=self.service._expiry_now())
+        body = dict(fields, schema_version=1)
+        reply = self._endpoint('room-decision', project_id, principal.user_id,
+                               [json.dumps(body, ensure_ascii=False, sort_keys=True)],
+                               operation_id=operation_id, authority=authority,
+                               require_authority=True, route='rooms.item.accept')
+        if isinstance(reply, dict) and reply.get('returncode') == 2:
+            detail = (reply.get('stderr') or '').strip()
+            text = detail.split('\n')[-1] if detail else 'The room decision was refused.'
+            if text.startswith('ValueError: '):
+                text = text[len('ValueError: '):]
+            if 'changed' in text:
+                raise conflict(text)
+            raise forbidden(text) if 'Only the project owner' in text or 'signed-in' in text \
+                else invalid(text)
+        return self._checked(reply)
+
     def owner_requirement_recoveries(self, principal, project_id):
         authority=authority_request(principal,project_id,CAP_COORDINATE,now=self.service._expiry_now())
         reply=self._endpoint('owner-requirements',project_id,principal.user_id,['recoveries'],
@@ -6520,6 +6545,217 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return 200, rooms.read_messages(project, ctx.params['rid'], since, limit)
         except rooms.Refusal as refusal:
             raise self._rooms_refusal(refusal) from None
+
+    def _rooms_item_session(self, ctx):
+        """R7 before any role or grant check: a person's session decides, never a credential."""
+        if ctx.principal.via != 'session' or ctx.principal.credential_id or ctx.principal.agent_id:
+            raise forbidden('Deciding a room item needs a signed-in person; an agent credential cannot decide an item.')
+
+    def _rooms_item(self, ctx, project):
+        try:
+            with self._rooms_lock(project):
+                return rooms.read_item(project, ctx.params['rid'], int(ctx.params['seq']))
+        except rooms.Refusal as refusal:
+            raise self._rooms_refusal(refusal) from None
+
+    def _rooms_item_capability(self, ctx, pid, item):
+        """The capability the caller's own authority gives this item kind."""
+        editor = self._requirement_editor_here(ctx, pid) is not None
+        caps = self.service.capabilities_for(ctx.principal, pid)
+        if item['item_kind'] == 'requirement':
+            if editor:
+                return CAP_COORDINATE
+            if CAP_PROPOSALS in caps:
+                return CAP_PROPOSALS
+            raise forbidden('Accepting a requirement item needs the requirement editor or the '
+                            'proposal authority; your role has neither.')
+        if item['item_kind'] == 'decision':
+            if editor:
+                return CAP_COORDINATE
+            raise forbidden('Only the project owner or a coordinator can decide a decision item.')
+        return CAP_READ
+
+    def _room_item_record(self, ctx, pid, item, evidence, parent=None):
+        """Create the existing record an accepted requirement/decision item becomes."""
+        base = rooms.item_operation(ctx.params['rid'], item['sequence'], len(item['history']), 'accept')
+        if item['item_kind'] == 'requirement':
+            if self._requirement_editor_here(ctx, pid) is None:
+                # A contributor's accepted requirement is a proposal, as that person.
+                self._proposals_backend()
+                body = {'schema_version': 1, 'operation': 'submit',
+                        'submitter': 'account:' + ctx.principal.user_id,
+                        'target': {'kind': 'requirement-new'},
+                        'text': item['text'], 'rationale': item['title'],
+                        'evidence': [evidence], 'operation_id': base + '-proposal'}
+                result = self.backend.invoke(
+                    'proposals.submit', ctx.principal, pid,
+                    {'command': 'submit', 'body': body}, base + '-proposal',
+                    target=evidence, capability=CAP_PROPOSALS)
+                if not isinstance(result, dict):
+                    raise uncertain('The canonical proposal write returned an unexpected shape')
+                identity = result.get('key') or result.get('id') or result.get('native_id')
+                if not isinstance(identity, str) or not identity:
+                    raise uncertain('The canonical proposal write named no proposal; reconcile it')
+                revision = result.get('revision')
+                digest = result.get('sha256') or result.get('proposal_sha256')
+                return {'kind': 'proposal', 'id': identity,
+                        'revision': revision if type(revision) is int and revision >= 1 else None,
+                        'sha256': digest if isinstance(digest, str) else None,
+                        'decision_id': None, 'evidence': evidence}
+            if not hasattr(self.backend, 'owner_requirements'):
+                raise not_implemented('Requirements editing needs the canonical tracker backend')
+            description = item['text'] + '\n\n' + evidence
+            fields = {'kind': 'requirement', 'title': item['title'], 'description': description}
+            if parent is not None:
+                fields['parent'] = parent
+            created = self.backend.owner_requirements(
+                ctx.principal, pid, 'create', fields, base + '-requirement-create')
+            accepted = self.backend.owner_requirements(
+                ctx.principal, pid, 'accept',
+                {'expected_revision': created['revision'],
+                 'expected_sha256': created['sha256'], 'pointer': evidence},
+                base + '-requirement-accept', created['id'])
+            read = self.backend.requirements_read(pid, ['get', created['id']])
+            acceptance = (read or {}).get('acceptance') or {}
+            decision_id = (acceptance.get('decision') or {}).get('decision_id')
+            return {'kind': 'requirement', 'id': created['id'],
+                    'revision': accepted['revision'], 'sha256': accepted['sha256'],
+                    'decision_id': decision_id, 'evidence': evidence}
+        if not hasattr(self.backend, 'room_decision'):
+            raise not_implemented('Room decisions need the canonical tracker backend')
+        result = self.backend.room_decision(
+            ctx.principal, pid,
+            {'operation': 'issue', 'room': ctx.params['rid'], 'sequence': item['sequence'],
+             'title': item['title'], 'text': item['text'], 'evidence': evidence,
+             'operation_id': base},
+            base)
+        decision_id = (result or {}).get('decision_id') if isinstance(result, dict) else None
+        if not isinstance(decision_id, str) or not decision_id:
+            raise uncertain('The canonical decision write named no decision; reconcile it')
+        return {'kind': 'decision', 'id': decision_id, 'revision': None, 'sha256': None,
+                'decision_id': decision_id, 'evidence': evidence}
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items')
+    def rooms_item_post(self, ctx):
+        project = self._rooms_project(ctx)
+        _record, role = self._project(ctx, CAP_ROOMS_POST)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) - {'item_kind', 'title', 'text', 'supersedes', 'parent'}:
+            raise invalid('Send item_kind, title, text and optionally supersedes or parent')
+        actor = self._rooms_actor(ctx, role)
+        operation_id = ctx.idempotency_key or ctx.request_id
+        limits_values = self._rooms_limits()
+        def write(project):
+            return rooms.post_item(project, ctx.params['rid'], payload.get('item_kind'),
+                                   payload.get('title'), payload.get('text'), operation_id,
+                                   actor, limits_values, payload.get('supersedes'),
+                                   payload.get('parent'))
+        def stored(result):
+            return {key: result.get(key) for key in
+                    ('sequence', 'kind', 'item_kind', 'state', 'created_at')}
+        return self._rooms_write(ctx, 'rooms.item.post', CAP_ROOMS_POST, write, status=201,
+                                 reason='room %s item' % ctx.params['rid'], stored=stored)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items/(?P<seq>[0-9]{1,12})/accept')
+    def rooms_item_accept(self, ctx):
+        project = self._rooms_project(ctx)
+        self._rooms_item_session(ctx)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) - {'note', 'parent'} or not isinstance(payload.get('note', ''), str):
+            raise invalid('A room item accept takes only an optional note or parent')
+        self._project(ctx, CAP_READ)
+        item = self._rooms_item(ctx, project)
+        if item['item_kind'] == 'question':
+            raise HttpError(400, 'invalid', 'A question is answered, not accepted.')
+        capability = self._rooms_item_capability(ctx, ctx.params['pid'], item)
+        actor = self._rooms_actor(ctx, self.service.state.get('memberships', {}).get(
+            ctx.params['pid'], {}).get(ctx.principal.user_id) or 'viewer')
+        evidence = item['evidence']
+        limits_values = self._rooms_limits()
+        note = (payload.get('note') or '').strip()
+        parent = item.get('parent') or payload.get('parent')
+        # Only the requirement-editor path creates a requirement; a contributor's accept is a
+        # proposal and needs no parent job.
+        if (item['item_kind'] == 'requirement'
+                and self._requirement_editor_here(ctx, ctx.params['pid']) is not None):
+            if parent is None and hasattr(self.backend, 'requirements_read'):
+                jobs = self.backend.requirements_read(ctx.params['pid'], ['list']).get('jobs') or []
+                if len(jobs) == 1:
+                    parent = jobs[0]['id']
+            if parent is None:
+                raise invalid('A requirement item needs an existing job to hang under; name one '
+                              'with the item (or accept it while the project has exactly one job).')
+        operation_id = rooms.item_operation(ctx.params['rid'], item['sequence'],
+                                            len(item['history']), 'accept')
+        def write():
+            record = self._room_item_record(ctx, ctx.params['pid'], item, evidence, parent)
+            try:
+                with self._rooms_lock(project):
+                    result = rooms.accept_item(project, ctx.params['rid'], item['sequence'],
+                                               operation_id, actor, limits_values, record, text=note)
+            except rooms.Refusal as refusal:
+                raise self._rooms_refusal(refusal) from None
+            return result, {key: result.get(key) for key in
+                            ('sequence', 'kind', 'item_kind', 'state', 'accepted_at')}
+        return self._mutate(ctx, 'rooms.item.accept', ctx.params['pid'], write,
+                            capability=capability, serialize=False)
+
+    def _rooms_item_event(self, ctx, event):
+        project = self._rooms_project(ctx)
+        self._rooms_item_session(ctx)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        item = self._rooms_item(ctx, project)
+        capability = self._rooms_item_capability(ctx, ctx.params['pid'], item)
+        actor = self._rooms_actor(ctx, self.service.state.get('memberships', {}).get(
+            ctx.params['pid'], {}).get(ctx.principal.user_id) or 'viewer')
+        limits_values = self._rooms_limits()
+        operation_id = rooms.item_operation(ctx.params['rid'], item['sequence'],
+                                            len(item['history']), event)
+        def write():
+            try:
+                with self._rooms_lock(project):
+                    if event == 'answer':
+                        result = rooms.answer_item(project, ctx.params['rid'], item['sequence'],
+                                                   operation_id, actor, limits_values,
+                                                   payload.get('text'))
+                    elif event == 'reject':
+                        result = rooms.reject_item(project, ctx.params['rid'], item['sequence'],
+                                                   operation_id, actor, limits_values,
+                                                   payload.get('reason'))
+                    else:
+                        result = rooms.amend_item(project, ctx.params['rid'], item['sequence'],
+                                                  operation_id, actor, limits_values,
+                                                  payload.get('title'), payload.get('text'))
+            except rooms.Refusal as refusal:
+                raise self._rooms_refusal(refusal) from None
+            return result, {key: result.get(key) for key in
+                            ('sequence', 'kind', 'item_kind', 'state')}
+        return self._mutate(ctx, 'rooms.item.' + event, ctx.params['pid'], write,
+                            capability=capability, serialize=False)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items/(?P<seq>[0-9]{1,12})/reject')
+    def rooms_item_reject(self, ctx):
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'reason'}:
+            raise invalid('Send exactly: reason')
+        return self._rooms_item_event(ctx, 'reject')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items/(?P<seq>[0-9]{1,12})/amend')
+    def rooms_item_amend(self, ctx):
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'title', 'text'}:
+            raise invalid('Send exactly: title and text')
+        return self._rooms_item_event(ctx, 'amend')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items/(?P<seq>[0-9]{1,12})/answer')
+    def rooms_item_answer(self, ctx):
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'text'}:
+            raise invalid('Send exactly: text')
+        item = self._rooms_item(ctx, self._rooms_project(ctx))
+        if item['item_kind'] != 'question':
+            raise invalid('Only a question is answered.')
+        return self._rooms_item_event(ctx, 'answer')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/messages')
     def rooms_post(self, ctx):

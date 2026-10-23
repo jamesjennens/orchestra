@@ -232,11 +232,11 @@ class RoomsPageTests(unittest.TestCase):
         self.assertEqual(50, seen['contributor']['roomCalls'][0]['since'])
         self.assertEqual(0, seen['contributor']['images'])
         self.assertEqual([], seen['contributor']['js_links'])
-        # A viewer sees no post/archive/moderate form; a contributor sees a post form only;
-        # a coordinator sees the moderation forms too.
+        # A viewer sees no write form; a contributor sees the post and item forms; a
+        # coordinator sees the moderation forms too.
         self.assertEqual(0, seen['viewer']['forms'])
-        self.assertEqual(1, seen['contributor']['forms'])
-        self.assertGreaterEqual(seen['coordinator']['forms'], 2)
+        self.assertEqual(2, seen['contributor']['forms'])
+        self.assertGreaterEqual(seen['coordinator']['forms'], 3)
         self.assertIn('Planning', seen['list']['text'])
         self.assertEqual(1, seen['list']['forms'])
 

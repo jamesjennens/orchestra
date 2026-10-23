@@ -918,7 +918,7 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: which a bound key is not told.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
-                      'task-file')
+                      'task-file','room-decision')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -1227,7 +1227,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1402,6 +1402,23 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             answer=web_action(root,path,name,request,authority_config,runner,guarded_write)
+        answer['stderr']=answer.get('stderr','')+''.join(run_warnings)
+        return answer
+    if action=='room-decision':
+        # One native decision issue from an accepted room decision item (kittrial-5bb.388).
+        # Service-only; requirement_http.room_decision re-checks the signed-in account's
+        # owner/coordinator membership LIVE under the authority lock and binds the item's
+        # stored title/text/evidence before the guarded write.
+        from requirement_http import room_decision
+        run_warnings=[]
+        def decision_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(decision_run, project=path)
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            answer=room_decision(root,path,name,request,authority_config,runner,guarded_write)
         answer['stderr']=answer.get('stderr','')+''.join(run_warnings)
         return answer
     if action=='set-onboarding':

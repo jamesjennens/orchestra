@@ -4132,8 +4132,8 @@ object:
 
 ## Project rooms over HTTP (slice 1, kittrial-5bb.385)
 
-Slice 1 of `docs/PROJECT_ROOMS_DESIGN.md` (section 10): rooms for people. Items, the
-`rooms` scope, the scribe, the wake and the summary are later slices. Room text is
+Slice 1 of `docs/PROJECT_ROOMS_DESIGN.md` (section 10): rooms for people. Items are slice 2
+below; the `rooms` scope, the scribe, the wake and the summary are later slices. Room text is
 discussion, never an instruction to an agent: an agent credential cannot write in this
 slice at all, and the capability the page uses is on no credential scope.
 
@@ -4223,6 +4223,77 @@ The rooms file is written only after the complete sidecar, so a failed backup ne
 pairs a new rooms file with an older sidecar. `backup-copy` carries the same two rooms
 files (and pins their SHA-256 in the run record), so an off-machine copy does not lose
 rooms silently; `backup-status` names them when the project has them.
+## Project room items and acceptance over HTTP (slice 2, kittrial-5bb.388)
+
+Slice 2 of `docs/PROJECT_ROOMS_DESIGN.md` (sections 6 and 10): an item is a candidate
+requirement, a decision or an open question, and a person decides it. The item lines live in
+the same append-only room files as slice 1; no new file and no new record shape is added.
+
+**Lines.** An `item` line carries `item_kind` (`requirement|decision|question`), `title`
+(1..200), `text` (1..`rooms.max_message_chars`), the author, the time and an optional
+`supersedes` naming an earlier item. A requirement item also carries an optional `parent`:
+the existing job the requirement hangs under (the tracker refuses a parentless draft; when
+the project has exactly one job and the item names none, that job is used). An `item-event` line carries `target_sequence`, `event`
+(`accept|reject|amend|answer`), the resulting `state`, the author, the time, the text (the
+reason, the amended body, the answer or an optional accept note) and `record` (the pointer
+below; null otherwise). An `amend` event also carries the new `title`. Both line kinds use
+the same sequence, operation-id replay, segment rollover, torn-tail quarantine and locking
+as a message.
+
+**States.** An item starts `proposed`. `accept` makes it `accepted`; `reject` makes it
+`rejected`; `amend` makes it `amended` with the new title/text, and it may then be accepted
+or rejected; `supersedes` on a newer item makes the older one `superseded` and refuses its
+acceptance. `accepted`, `rejected` and `superseded` are final. A question is answered
+(`answer` -> `accepted`) and records who answered and when; it can also be rejected. A
+moderated item cannot be accepted, rejected, amended or answered (409), and its title and
+text are served nowhere: the read, the `index.json` items cache and both exports carry the
+tombstone instead.
+
+**Routes.** Every POST is CSRF-protected by the existing route machinery. R7 is checked
+before any role or grant check: the accept, reject, amend and answer routes take a signed-in
+person and refuse every agent credential, even one holding the coordinator grant.
+
+| Route | Body | Authority |
+|---|---|---|
+| `POST /v1/projects/{pid}/rooms/{rid}/items` | `{"item_kind","title","text","supersedes"?,"parent"?}` | the `rooms.post` capability (contributor/coordinator/owner) |
+| `POST .../items/{seq}/accept` | `{}`, `{"note": "..."}` or `{"parent": "..."}` | requirement: `requirement_editor` -> `coordinate`, otherwise `proposals.write`; decision: `coordinate` (owner/coordinator); question: 400 |
+| `POST .../items/{seq}/reject` | `{"reason": "..."}` | same as accept for that kind |
+| `POST .../items/{seq}/amend` | `{"title": "...", "text": "..."}` | same as accept for that kind |
+| `POST .../items/{seq}/answer` | `{"text": "..."}` | `read` (any member) on a question |
+
+**Accepted items become the kit's existing records, in existing fields only.** The pointer
+`orchestra:room/<room-id>#<sequence>` goes in a requirement's description, a proposal's
+`evidence` list or a decision's rationale; there is no requirement `source` field and no new
+record shape. A requirement editor's accept creates and accepts a requirement through the
+released B1 routes and appends the pointer to that acceptance's generated native decision.
+A contributor's accept submits a requirement proposal as that person. A decision item's
+accept creates a native decision through the service-only canonical `room-decision` action,
+which re-checks the signed-in account's live owner/coordinator membership (never a credential)
+inside the endpoint under the authority lock and binds the item's stored title, text and
+pointer before the guarded write. Reject, amend and answer create no record.
+
+**Idempotency.** The record write and the item-event use operation ids derived from the room,
+the item sequence and the item's current revision (never the client's key). The record
+route's journal and the segment's operation-id check then make a repeated or concurrent
+accept converge on one record and one event; the first accepting person is the one recorded.
+The client `Idempotency-Key` still guards the HTTP mutation.
+
+**The items cache.** `index.json` gains a per-room `items` list: the current views and their
+decision history. It is a cache only. `rooms.py` builds it with the same function that a
+rebuild uses from the segment lines, so deleting the index or any stale byte check rebuilds
+identical states; the lines stay the truth. A moderated item's text is dropped on moderation
+and on rebuild.
+
+**Rollback.** An older kit reads the requirements, proposals and decisions created here
+unchanged (the pointer rides in fields it already has). A `.385` reader does not know the
+`item` and `item-event` line kinds, so it names such a room damaged instead of serving it; a
+kit without rooms ignores `.rooms` entirely. Nothing in the tracker or the coordination
+sidecar changes shape.
+
+**Export.** The Markdown export adds each item with its state, evidence pointer and record,
+then its item events; the JSON-lines export carries the item and item-event lines, with a
+moderated item's text replaced by its tombstone.
+
 ## Serving delivered bundles over HTTP
 
 Web reviewers holding `reviews.write` or `reviews.approve` in a project can read a contribution's
