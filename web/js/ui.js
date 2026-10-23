@@ -156,6 +156,28 @@ export function formValues(form) {
   return Object.fromEntries(new FormData(form).entries());
 }
 
+// The server's password rule, stated by the page (kittrial-5bb.363). The session read
+// carries the installation's minimum; an older answer, or a page driven without one,
+// falls back to 1, which is the default. The maximum is a bound on work, not a rule the
+// page repeats: the server still refuses a password over 1024 characters.
+export const PASSWORD_MISMATCH = 'The two new passwords do not match.';
+
+export function passwordMinimum(me) {
+  const value = me && me.password_min_length;
+  return Number.isInteger(value) && value >= 1 ? value : 1;
+}
+
+export function passwordHint(me) {
+  const minimum = passwordMinimum(me);
+  return `At least ${minimum} character${minimum === 1 ? '' : 's'}.`;
+}
+
+export function passwordTooShort(me, value) {
+  const minimum = passwordMinimum(me);
+  if (String(value).length >= minimum) return '';
+  return `Use at least ${minimum} character${minimum === 1 ? '' : 's'}.`;
+}
+
 export function avatarName(name) {
   return name || 'Unassigned';
 }

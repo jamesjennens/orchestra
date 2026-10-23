@@ -34,7 +34,8 @@ from urllib.request import urlopen
 import admin
 import record_json
 from version import report
-from http_auth import session_limit_seconds, validate_agent_credential_days
+from http_auth import (session_limit_seconds, validate_agent_credential_days,
+                       validate_password_min_length)
 
 
 def private_root(raw):
@@ -88,7 +89,7 @@ def service_config(path):
         raise ValueError('Office service configuration must have schema_version 1')
     allowed = {'schema_version', 'http_host', 'http_state', 'cert', 'key',
                'trusted_proxies', 'public_url', 'endpoint_timeout', 'connections_per_address', 'logins_per_address',
-               'approval_by_another_party', 'agent_credential_days',
+               'approval_by_another_party', 'agent_credential_days', 'password_min_length',
                'session_idle_minutes', 'session_absolute_hours', PLAINTEXT_SETTING, HSTS_SETTING}
     if set(config) - allowed:
         raise ValueError('Unknown office service setting: ' + ', '.join(sorted(set(config)-allowed)))
@@ -117,6 +118,11 @@ def service_config(path):
         raise ValueError('approval_by_another_party must be true or false')
     if 'agent_credential_days' in config:
         validate_agent_credential_days(config['agent_credential_days'])
+    # The installation's password minimum (kittrial-5bb.363), refused by the same helper and
+    # the same sentence as the web service's own flag. An omitted key keeps 1 (any non-empty
+    # password); the 1024 maximum is a bound on work per request, not a policy.
+    if 'password_min_length' in config:
+        validate_password_min_length(config['password_min_length'])
     # The session idle and absolute limits (kittrial-5bb.330), refused by the same helper and
     # the same one sentence as the web service's own flags. An omitted key keeps 30 min / 12 h.
     session_limit_seconds(config.get('session_idle_minutes'), config.get('session_absolute_hours'))
@@ -606,6 +612,8 @@ def web_command(settings, root, port, release_python, release_script):
         command.extend(['--logins-per-address', settings['logins_per_address']])
     if 'agent_credential_days' in settings:
         command.extend(['--agent-credential-days', validate_agent_credential_days(settings['agent_credential_days'])])
+    if 'password_min_length' in settings:
+        command.extend(['--password-min-length', validate_password_min_length(settings['password_min_length'])])
     if 'session_idle_minutes' in settings or 'session_absolute_hours' in settings:
         # Validated once as a pair, so the pair handed on is the pair that was checked: the
         # absolute limit is never shorter than the idle window (kittrial-5bb.330).

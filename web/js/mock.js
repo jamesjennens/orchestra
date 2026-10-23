@@ -209,9 +209,9 @@ export function createMock(options = {}) {
     const user = Object.values(db.users).find((u) => u.username === (b.username || '').trim().toLowerCase());
     if (!user || user.disabled || b.password !== 'demo') return err(401, 'unauthenticated', 'Invalid credentials');
     db.session = user.id;
-    return ok({ session: { csrf_token: 'mock-csrf', expires_at: new Date(Date.now() + 12 * H).toISOString() }, user: { id: user.id, username: user.username, display_name: user.display_name, superuser: user.superuser } }, 201);
+    return ok({ session: { csrf_token: 'mock-csrf', expires_at: new Date(Date.now() + 12 * H).toISOString() }, user: { id: user.id, username: user.username, display_name: user.display_name, superuser: user.superuser, password_min_length: 1 } }, 201);
   }, true);
-  on('GET', '/v1/sessions/current', () => ok({ user: { id: me().id, username: me().username, display_name: me().display_name, superuser: me().superuser }, via: 'session', csrf_token: 'mock-csrf' }));
+  on('GET', '/v1/sessions/current', () => ok({ user: { id: me().id, username: me().username, display_name: me().display_name, superuser: me().superuser, password_min_length: 1 }, via: 'session', csrf_token: 'mock-csrf' }));
   on('DELETE', '/v1/sessions/current', () => { db.session = null; return { status: 204, data: null }; });
 
   on('GET', '/v1/accounts/lookup', (b, p, q) => {
@@ -262,7 +262,7 @@ export function createMock(options = {}) {
   on('POST', '/v1/accounts/(?<uid>[\\w-]+)/password', (b, p) => {
     if (p.uid !== db.session && !me().superuser) return err(403, 'forbidden', 'You can only change your own password');
     if (p.uid === db.session && b.current_password !== 'demo') return err(401, 'unauthenticated', 'Current password is incorrect');
-    if (String(b.new_password || '').length < 12) return err(422, 'invalid_payload', 'New password must be at least 12 characters');
+    if (!String(b.new_password || '').length) return err(422, 'invalid_payload', 'Password must be 1-1024 characters');
     return ok({ id: p.uid, changed: true });
   });
 

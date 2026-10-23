@@ -2323,6 +2323,50 @@ def work_row(warnings=(WARNING,)):
             'integration_warnings': list(warnings)}
 
 
+class PasswordPageCase(unittest.TestCase):
+    """The two web password forms state the server's rule and refuse a mismatch (5bb.363)."""
+
+    def test_no_hard_coded_password_minimum_is_left(self):
+        for name in ('views/admin.js', 'views/auth.js', 'mock.js'):
+            text = (WEB / 'js' / name).read_text(encoding='utf-8')
+            self.assertNotIn('At least 12', text, name)
+            self.assertNotIn('length < 12', text, name)
+
+    def test_the_real_forms_under_node(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the static check above still applies')
+        tests = Path(__file__).resolve().parent
+        done = run_node_module(self, node, 'await import(process.argv[1])',
+                               (tests / 'web_password_forms.mjs').as_uri(),
+                               (tests / 'web_dom_shim.mjs').as_uri(),
+                               (WEB / 'js' / 'views' / 'admin.js').as_uri(),
+                               (WEB / 'js' / 'views' / 'auth.js').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        observed = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual({
+            'accountHintDefault': 'At least 1 character. A short sentence is easier to remember.',
+            'accountEmpty': 'Use at least 1 character.',
+            'accountEmptyCalls': 0,
+            'accountMismatch': 'The two new passwords do not match.',
+            'accountMismatchCalls': 0,
+            'accountOneCharCalls': 1,
+            'accountHintRaised': 'At least 8 characters. A short sentence is easier to remember.',
+            'accountTooShort': 'Use at least 8 characters.',
+            'accountTooShortCalls': 0,
+            'accountAtMinimumCalls': 1,
+            'redeemHintDefault': 'At least 1 character.',
+            'redeemEmpty': 'Use at least 1 character.',
+            'redeemEmptyCalls': 0,
+            'redeemMismatch': 'The two new passwords do not match.',
+            'redeemMismatchCalls': 0,
+            'redeemOneCharCalls': 1,
+            'redeemHintRaised': 'At least 8 characters.',
+            'redeemTooShort': 'Use at least 8 characters.',
+            'redeemTooShortCalls': 0,
+        }, observed)
+
+
 class ReviewQueueWarningsTests(unittest.TestCase):
     def test_queue_row_carries_the_integration_block_and_warning(self):
         page = backend(work_page={'items': [work_row()], 'total': 1, 'next_offset': None})

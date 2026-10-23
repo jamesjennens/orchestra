@@ -60,11 +60,11 @@ from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACC
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
                        CAP_RECORDS, CAP_REVIEWS,
-                       CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
+                       CAP_TASKS, MAX_PASSWORD, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, canonical_json, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, session_limit_seconds, unauthenticated,
                        uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
-                       validate_claim_limit)
+                       validate_claim_limit, validate_password_min_length)
 from version import report as version_report
 
 KIT_VERSION = '0.1.0'
@@ -6076,7 +6076,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                  'csrf_token': result['csrf_token'],
                                  'expires_at': result['expires_at'],
                                  'idle_expires_at': result['idle_expires_at']},
-                     'user': result['user']}
+                     'user': dict(result['user'],
+                                  password_min_length=self.service.password_min_length)}
 
     @route('GET', r'/v1/sessions/current')
     def sessions_whoami(self, ctx):
@@ -6084,7 +6085,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = {'user': {'id': principal.user_id,
                          'username': self.service.username_of(principal.user_id),
                          'display_name': principal.display_name,
-                         'superuser': principal.superuser},
+                         'superuser': principal.superuser,
+                         # Additive (kittrial-5bb.363): the page states the server's real
+                         # password rule, and asks twice wherever a password is set.
+                         'password_min_length': self.service.password_min_length},
                 'via': principal.via,
                 'credential': principal.credential_id,
                 'project': principal.credential_project,
@@ -11729,7 +11733,7 @@ def runtime_service_lock(root):
     return fd
 
 
-def bootstrap_refusal_advice(error):
+def bootstrap_refusal_advice(error, password_min_length=1):
     """What the person at the terminal has to do about a refused ``--bootstrap-user``.
 
     Only "a superuser already exists" can be answered with "add this person as an account
@@ -11740,7 +11744,8 @@ def bootstrap_refusal_advice(error):
     if getattr(error, 'status', None) == 409:
         return 'Add this person as an account inside the service instead.'
     if 'Password' in getattr(error, 'message', ''):
-        return 'Run the command again with a password of 8 to 1024 characters.'
+        return ('Run the command again with a password of %d to %d characters.'
+                % (password_min_length, MAX_PASSWORD))
     return 'Run the command again with a name of 2 to 64 characters of letters, digits, . _ @ -.'
 
 
@@ -11821,6 +11826,10 @@ def main(argv=None):
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
+    parser.add_argument('--password-min-length', type=int, default=1, metavar='N',
+                        help='the installation password minimum: 1 to 1024 characters (default 1, '
+                             'any non-empty password). The 1024 maximum is a bound on the work one '
+                             'request may ask for, not a policy')
     parser.add_argument('--bootstrap-user', help='one-time operator bootstrap superuser')
     parser.add_argument('--list-unconfirmed-projects', action='store_true',
                         help='print the project records the endpoint backend will not serve (an upgrade '
@@ -11834,6 +11843,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         validate_agent_credential_days(args.agent_credential_days)
+        # The installation's password minimum (kittrial-5bb.363) is refused the same way:
+        # one sentence, a non-zero exit, before the state store is opened or a port is bound.
+        password_min_length = validate_password_min_length(args.password_min_length)
         # Refused here, before the state store is opened: a limit that is out of bounds, not
         # a whole number, or shorter than the idle window is one sentence and a non-zero exit,
         # never a clamped value (kittrial-5bb.330). An omitted flag keeps 30 min / 12 h.
@@ -11885,13 +11897,22 @@ def main(argv=None):
         try:
             store = Store(args.state)
             password = getpass.getpass('New superuser password: ')
-            Service.bootstrap_superuser(store, args.bootstrap_user, password)
+            confirmation = getpass.getpass('Repeat new superuser password: ')
+            if password != confirmation:
+                # The host bootstrap is one of the places a password is set (kittrial-5bb.363):
+                # ask twice and refuse a mismatch before the store is written.
+                print('Refusing to bootstrap %s: the two passwords do not match.'
+                      % args.bootstrap_user, file=sys.stderr)
+                return 1
+            Service.bootstrap_superuser(store, args.bootstrap_user, password,
+                                        password_min_length=password_min_length)
         except HttpError as error:
             # A second bootstrap, a refused user name or a password the kit refuses: one
             # sentence and the one thing to do about it, never a traceback
             # (kittrial-5bb.176 items 2 and 3).
             print('Refusing to bootstrap %s: %s. %s'
-                  % (args.bootstrap_user, error.message, bootstrap_refusal_advice(error)), file=sys.stderr)
+                  % (args.bootstrap_user, error.message,
+                     bootstrap_refusal_advice(error, password_min_length)), file=sys.stderr)
             return 1
         finally:
             import fcntl
@@ -11920,6 +11941,7 @@ def main(argv=None):
         trusted.append('localhost')
     service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party,
                       agent_credential_days=args.agent_credential_days,
+                      password_min_length=password_min_length,
                       session_idle=session_idle, session_absolute=session_absolute)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)

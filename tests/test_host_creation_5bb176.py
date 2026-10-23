@@ -584,13 +584,16 @@ class BootstrapSentenceTests(unittest.TestCase):
         self.root.mkdir()
         self.state = Path(self.tmp.name) / 'http-state.json'
 
-    def bootstrap(self, user='admin', password='disposable-password', state=None):
+    def bootstrap(self, user='admin', password='disposable-password', state=None, extra=(),
+                  answers=None):
         import http_service
         stdout, stderr = io.StringIO(), io.StringIO()
-        with mock.patch('getpass.getpass', return_value=password), \
+        getpass = (mock.patch('getpass.getpass', side_effect=answers) if answers is not None
+                   else mock.patch('getpass.getpass', return_value=password))
+        with getpass, \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = http_service.main(['--state', str(state or self.state), '--root', str(self.root),
-                                      '--bootstrap-user', user])
+                                      '--bootstrap-user', user, *extra])
         return code, stdout.getvalue(), stderr.getvalue()
 
     def test_a_host_without_fcntl_refuses_in_one_sentence(self):
@@ -627,19 +630,44 @@ class BootstrapSentenceTests(unittest.TestCase):
         self.assertNotIn('Traceback', stderr)
 
     @unittest.skipUnless(POSIX, 'the runtime lock needs fcntl')
-    def test_a_short_password_at_the_first_bootstrap_says_to_run_it_again(self):
-        """Reviewer mutant N2: a short or empty password is one sentence with the right advice."""
-        for number, password in enumerate(('x', 'seven--', '')):
-            with self.subTest(password=password):
-                state = Path(self.tmp.name) / ('short-state-%d.json' % number)
-                code, _stdout, stderr = self.bootstrap(password=password, state=state)
-                self.assertEqual(code, 1, stderr)
-                self.assertIn('Refusing to bootstrap admin', stderr)
-                self.assertIn('Password must be 8-1024 characters', stderr)
-                self.assertIn('Run the command again with a password of 8 to 1024 characters.', stderr)
-                # No superuser exists yet, so nobody can add this person inside the service.
-                self.assertNotIn('Add this person as an account inside the service', stderr)
-                self.assertNotIn('Traceback', stderr)
+    def test_an_empty_password_at_the_first_bootstrap_says_to_run_it_again(self):
+        """An empty password is refused with the configured range (kittrial-5bb.363)."""
+        code, _stdout, stderr = self.bootstrap(password='')
+        self.assertEqual(code, 1, stderr)
+        self.assertIn('Refusing to bootstrap admin', stderr)
+        self.assertIn('Password must be 1-1024 characters', stderr)
+        self.assertIn('Run the command again with a password of 1 to 1024 characters.', stderr)
+        # No superuser exists yet, so nobody can add this person inside the service.
+        self.assertNotIn('Add this person as an account inside the service', stderr)
+        self.assertNotIn('Traceback', stderr)
+
+    @unittest.skipUnless(POSIX, 'the runtime lock needs fcntl')
+    def test_one_character_is_accepted_and_a_raised_minimum_says_its_range(self):
+        state = Path(self.tmp.name) / 'one-char.json'
+        code, stdout, stderr = self.bootstrap(password='x', state=state)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('Bootstrapped admin', stdout)
+        self.assertNotIn('Traceback', stderr)
+        # A raised setting refuses a shorter password and names the range it was given.
+        raised = Path(self.tmp.name) / 'raised.json'
+        code, _stdout, stderr = self.bootstrap(password='short', state=raised,
+                                               extra=('--password-min-length', '8'))
+        self.assertEqual(code, 1, stderr)
+        self.assertIn('Password must be 8-1024 characters', stderr)
+        self.assertIn('Run the command again with a password of 8 to 1024 characters.', stderr)
+
+    @unittest.skipUnless(POSIX, 'the runtime lock needs fcntl')
+    def test_a_mismatch_at_the_first_bootstrap_creates_nothing(self):
+        state = Path(self.tmp.name) / 'mismatch.json'
+        code, stdout, stderr = self.bootstrap(password='first-value', state=state,
+                                               answers=['first-value', 'another-value'])
+        self.assertEqual(code, 1, stderr)
+        self.assertIn('Refusing to bootstrap admin', stderr)
+        self.assertIn('the two passwords do not match', stderr)
+        self.assertNotIn('Bootstrapped', stdout)
+        self.assertNotIn('Traceback', stderr)
+        if state.exists():
+            self.assertEqual({}, json.loads(state.read_text(encoding='utf-8')).get('users', {}))
 
     @unittest.skipUnless(POSIX, 'the runtime lock needs fcntl')
     def test_a_refused_user_name_at_the_first_bootstrap_says_to_run_it_again(self):
