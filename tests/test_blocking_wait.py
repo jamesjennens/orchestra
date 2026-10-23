@@ -312,6 +312,22 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(code, waiting.EXIT_WORK)
         self.assertEqual(view['fingerprint'], woke['fingerprint'])
 
+    def test_own_status_change_wakes_once_in_both_wait_implementations(self):
+        import client
+        for module in (waiting, client._InlineWait):
+            with self.subTest(module=module):
+                base = {'task': 't1', 'whose_move': 'you', 'owner': 'agent/sub0',
+                        'status': 'open', 'wait_newer_activity_marker': 'fields:aaaa'}
+                before = module.worker_view([base])
+                after = module.worker_view([dict(base, status='blocked')])
+                clock = FakeClock()
+                code, view = module.run_wait(scripted([after]), since=before['fingerprint'],
+                    interval=60, timeout=60, clock=clock.clock, sleep=clock.sleep)
+                self.assertEqual(module.EXIT_WORK, code)
+                code, _ = module.run_wait(scripted([after]), since=view['fingerprint'],
+                    interval=60, timeout=60, clock=clock.clock, sleep=clock.sleep)
+                self.assertEqual(module.EXIT_TIMEOUT, code)
+
     def test_everything_by_others_still_wakes_a_worker(self):
         base = {'task': 't1', 'whose_move': 'you', 'review_state': 'in_progress',
                 'owner': 'alice/session', 'status': 'in_progress',

@@ -283,10 +283,14 @@ def _event_payload(events, event_id):
     return (event or {}).get('payload')
 
 
-def _scope_operation_id(events, scope):
-    """The operation identity of the newest trusted scope event for ``scope``."""
+def _scope_evidence(events, scope):
+    """The newest trusted scope event for ``scope``: ``(event_id, operation_id)``.
+
+    Both are ``None`` when there is no scope or no readable scope event; a legacy
+    scope without a comparable native order supplies neither.
+    """
     if scope is None:
-        return None
+        return None, None
     newest = None
     for row in events.values():
         event = lifecycle.native_event(row)
@@ -296,8 +300,13 @@ def _scope_operation_id(events, scope):
             continue
         order = event.get('order')
         if order is not None and (newest is None or order > newest[0]):
-            newest = (order, payload['operation_id'])
-    return newest[1] if newest else None
+            newest = (order, row.get('id'), payload['operation_id'])
+    return (newest[1], newest[2]) if newest else (None, None)
+
+
+def _scope_operation_id(events, scope):
+    """The operation identity of the newest trusted scope event for ``scope``."""
+    return _scope_evidence(events, scope)[1]
 
 
 def _routes(project_name, task):
@@ -311,26 +320,32 @@ def _routes(project_name, task):
 def _next_steps(issue, state, events, journal, held, project_name):
     """The writes still owed, in order, with the identity to reuse when recorded.
 
-    A committed write names the operation identity its native event carries. A
-    write not yet attempted has none (the caller mints the key). The integration
-    mark is issued by the integrated fact's own request. The server keeps no
-    identity for a slot release, so that row says so instead of inventing one.
+    A committed write names the operation identity its native event carries and its
+    canonical fact: the native event id for the scope and the facts, the host mark
+    sha256 for the integrated mark. A write not yet attempted has neither (the caller
+    mints the key). The integration mark is issued by the integrated fact's own
+    request. The server keeps no identity or fact for a slot release, so that row
+    says so instead of inventing one.
     """
     task = issue['id']
     scope = state['scope']
     facts = state['facts']
     routes = _routes(project_name, task)
+    scope_event, scope_operation = _scope_evidence(events, scope)
     steps = [dict(step='scope', route=routes['scope'],
                   state='committed' if scope is not None else 'not-attempted',
-                  operation_id=_scope_operation_id(events, scope))]
+                  operation_id=scope_operation if scope is not None else None,
+                  fact=scope_event if scope is not None else None)]
     for dimension in ('reviewed', 'integrated'):
         passed = facts[dimension]['value'] == 'passed'
+        payload = (_event_payload(events, facts[dimension]['event_id']) or {}) if passed else {}
         steps.append(dict(step=dimension, route=routes[dimension],
                           state='committed' if passed else 'not-attempted',
-                          operation_id=((_event_payload(events, facts[dimension]['event_id']) or {})
-                                        .get('operation_id')) if passed else None))
+                          operation_id=payload.get('operation_id') if passed else None,
+                          fact=facts[dimension]['event_id'] if passed else None))
     mark = dict(step='integrated-mark', route=routes['integrated'], automatic=True,
-                operation_id=steps[2]['operation_id'] if facts['integrated']['value'] == 'passed' else None)
+                operation_id=steps[2]['operation_id'] if facts['integrated']['value'] == 'passed' else None,
+                fact=None)
     if facts['integrated']['value'] != 'passed':
         mark.update(state='not-attempted', reason=None)
     elif journal['invalid']:
@@ -339,15 +354,17 @@ def _next_steps(issue, state, events, journal, held, project_name):
           and project_name is not None
           and marks.matches(journal['entries'][facts['integrated']['event_id']],
                             project_name, events.get(facts['integrated']['event_id']))):
-        mark.update(state='committed', reason=None)
+        entry = journal['entries'][facts['integrated']['event_id']]
+        mark.update(state='committed', fact=entry['sha256'], reason=None)
     else:
         mark.update(state='unknown',
                     reason='The native integration exists but its host mark is not confirmed; an operator repairs the mark family')
     steps.append(mark)
     release = dict(step='slot-release', route=routes['release'],
                    state='not-attempted' if held else 'not-held',
-                   operation_id=None,
-                   operation_id_note='The release takes the caller\'s own Idempotency-Key; the server records no identity for it.')
+                   operation_id=None, fact=None,
+                   operation_id_note='The release takes the caller\'s own Idempotency-Key; the server records no identity for it.',
+                   fact_note='A slot release has no native fact; the server records only the operation audit.')
     steps.append(release)
     return steps
 

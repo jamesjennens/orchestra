@@ -19,6 +19,12 @@ export const NO_EFFECT = {
   'account-disabled': ' — its account is disabled',
   'account-role': ' — its account is no longer a coordinator or owner here',
 };
+// The release grant is narrower (kittrial-5bb.378): only an owner's account carries it.
+export const RELEASE_NO_EFFECT = {
+  'agent-disabled': ' — the agent is disabled',
+  'account-disabled': ' — its account is disabled',
+  'account-role': ' — its account is no longer an owner here',
+};
 export const ROLE_NAMES = [['viewer', 'Viewer'], ['contributor', 'Contributor'], ['coordinator', 'Coordinator'], ['owner', 'Owner']];
 
 async function load(ctx, pid) {
@@ -508,16 +514,18 @@ export async function settings(ctx, { pid }) {
     const rows = (data.items || []).slice().sort((a, b) => a.name.localeCompare(b.name));
     agentsHost.replaceChildren(h('section', { class: 'panel', 'data-panel': 'project-agents' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Agents in this project ', h('span', { class: 'nav-count' }, rows.length)),
-        h('span', { class: 'small muted hide-narrow' }, 'A coordinating agent may approve other accounts’ work here; never its own account’s')),
+        h('span', { class: 'small muted hide-narrow' }, 'A coordinating agent may approve other accounts’ work here; never its own account’s. A release grant only lets it record release facts')),
       rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
-        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, 'Agent credentials'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Agent'), h('th', { scope: 'col' }, 'Account'), h('th', { scope: 'col' }, 'Coordinator'), h('th', { scope: 'col' }, 'Release'), h('th', { scope: 'col' }, 'Agent credentials'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
         h('tbody', null, rows.map((a) => {
           const grant = a.coordinator;
+          const release = a.release;
           const change = async (e, call, done) => {
             try { await act(e.currentTarget, call, { success: done }); } catch { /* the refusal is shown */ }
             drawAgents(); coordination.draw();
           };
-          return h('tr', { 'data-agent': a.id, 'data-coordinator': grant ? String(grant.effective) : 'none' },
+          return h('tr', { 'data-agent': a.id, 'data-coordinator': grant ? String(grant.effective) : 'none',
+            'data-release': release ? String(release.effective) : 'none' },
             h('td', null, a.name, a.enabled ? null : h('div', { class: 'sub' }, 'Disabled'),
               historyPanel(() => ctx.api.projectAgentHistory(pid, a.id))),
             h('td', null, a.owner_display_name || a.owner),
@@ -525,15 +533,25 @@ export async function settings(ctx, { pid }) {
               [h('span', { class: 'chip ' + (grant.effective ? 'ok' : 'plain') }, grant.effective ? 'Coordinates' : 'Granted, no effect'),
                 h('div', { class: 'sub' }, 'by ', grant.granted_by_display_name || grant.granted_by, ' ', time(grant.granted_at),
                   grant.effective ? null : (NO_EFFECT[grant.no_effect_because] || NO_EFFECT['account-role']))]),
+            h('td', null, !release ? h('span', { class: 'muted' }, 'No') :
+              [h('span', { class: 'chip ' + (release.effective ? 'ok' : 'plain') }, release.effective ? 'May release' : 'Granted, no effect'),
+                h('div', { class: 'sub' }, 'by ', release.granted_by_display_name || release.granted_by, ' ', time(release.granted_at),
+                  release.effective ? null : (RELEASE_NO_EFFECT[release.no_effect_because] || RELEASE_NO_EFFECT['account-role']))]),
             h('td', null, (a.credentials || []).map((c) => h('div', { class: 'stack', 'data-credential': c.id },
               h('code', { class: 'small' }, c.id), expiryLine(c),
               !project.archived && a.enabled && c.working ? extensionButton(a, c,
                 () => ctx.api.extendProjectAgentCredential(pid, a.id, c.id), drawAgents) : null))),
-            h('td', null, project.archived ? null : grant ?
-              h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the coordinator grant from ' + a.name,
-                onclick: (e) => change(e, () => ctx.api.revokeCoordinator(pid, a.id), `${a.name} no longer coordinates`) }, 'Remove grant') :
-              h('button', { type: 'button', 'aria-label': 'Let ' + a.name + ' coordinate this project',
-                onclick: (e) => change(e, () => ctx.api.grantCoordinator(pid, a.id), `${a.name} coordinates this project`) }, 'Make coordinator')));
+            h('td', null, project.archived ? null : h('div', { class: 'stack' },
+              grant ?
+                h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the coordinator grant from ' + a.name,
+                  onclick: (e) => change(e, () => ctx.api.revokeCoordinator(pid, a.id), `${a.name} no longer coordinates`) }, 'Remove grant') :
+                h('button', { type: 'button', 'aria-label': 'Let ' + a.name + ' coordinate this project',
+                  onclick: (e) => change(e, () => ctx.api.grantCoordinator(pid, a.id), `${a.name} coordinates this project`) }, 'Make coordinator'),
+              release ?
+                h('button', { type: 'button', class: 'danger', 'aria-label': 'Remove the release grant from ' + a.name,
+                  onclick: (e) => change(e, () => ctx.api.revokeRelease(pid, a.id), `${a.name} may no longer record releases`) }, 'Remove release grant') :
+                h('button', { type: 'button', 'aria-label': 'Let ' + a.name + ' record releases in this project',
+                  onclick: (e) => change(e, () => ctx.api.grantRelease(pid, a.id), `${a.name} may record releases`) }, 'Allow releases'))));
         })))) : h('div', { class: 'panel-body' }, empty('No agents here yet', 'A member grants their own agent this project on the Agents page.'))));
   }
 

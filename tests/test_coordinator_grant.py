@@ -63,7 +63,9 @@ class RoleTests(Grants):
         self.assertTrue(rank['contributor'] < rank['coordinator'] < rank['owner'])
         caps = http_authority.ROLE_CAPABILITIES
         self.assertEqual(caps['coordinator'] - caps['contributor'], {'reviews.approve', 'coordinate'})
-        self.assertEqual(caps['owner'] - caps['coordinator'], {'project.admin'})
+        # kittrial-5bb.378: recording a release is the owner's alone, so `release` joins
+        # the one capability an owner has and a coordinator does not.
+        self.assertEqual(caps['owner'] - caps['coordinator'], {'project.admin', 'release'})
         self.assertEqual(caps['contributor'] - caps['coordinator'], frozenset())
 
     def test_a_person_who_is_a_coordinator_approves_and_does_not_administer(self):
@@ -884,12 +886,13 @@ class PageTests(Grants):
         self.assertEqual(seen['claimingCan'], {'serverYes': True, 'serverNo': False})
         self.assertIn('Agents in this project 2', seen['head'])
         self.assertEqual(sorted((row['coordinator'], row['buttons']) for row in seen['before']),
-                         [('none', ['Extend existing credential', 'Make coordinator']), ('none', ['Extend existing credential', 'Make coordinator'])])
+                         [('none', ['Extend existing credential', 'Make coordinator', 'Allow releases']),
+                          ('none', ['Extend existing credential', 'Make coordinator', 'Allow releases'])])
         self.assertEqual((seen['granted']['agent'], seen['granted']['coordinator'], seen['granted']['buttons']),
-                         (self.agent_id, 'true', ['Extend existing credential', 'Remove grant']))
+                         (self.agent_id, 'true', ['Extend existing credential', 'Remove grant', 'Allow releases']))
         self.assertIn('Coordinates', seen['granted']['text'])
         self.assertEqual((seen['refused']['agent'], seen['refused']['coordinator']), (worker_id, 'none'))
-        self.assertEqual((seen['removed']['coordinator'], seen['removed']['buttons']), ('none', ['Extend existing credential', 'Make coordinator']))
+        self.assertEqual((seen['removed']['coordinator'], seen['removed']['buttons']), ('none', ['Extend existing credential', 'Make coordinator', 'Allow releases']))
         self.assertIs(seen['coordinatorSeesPanel'], False)
         # kittrial-5bb.198: who coordinates, read only, for the owner and for a coordinator who is not one.
         before, granted, other = seen['coordinationBefore'], seen['coordinationGranted'], seen['coordinationOfCoordinator']

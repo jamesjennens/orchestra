@@ -43,7 +43,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import actor_names
 import agent_prompts
@@ -57,7 +57,7 @@ from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_r
                                is_record_anchor)
 from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_APPROVE,
-                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
+                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE, CAP_RELEASE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
                        CAP_RECORDS, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
@@ -628,11 +628,22 @@ class InProcessBackend:
     #: service's namespace only; no row rule is applied or recorded (kittrial-5bb.188 item 4).
     ACTOR_ROWS = False
 
-    def __init__(self, service, actor_namespace=None):
+    def __init__(self, service, actor_namespace=None, *, delivery_roots=(), delivery_serve_max_bytes=None):
         import actor_names
+        from review_workflow import DELIVERY_SERVE_MAX_BYTES
         self.service = service
         self.actor_namespace = actor_namespace or actor_names.SERVICE_NAMESPACE
         self.faults = {}
+        self.delivery_roots = tuple(delivery_roots or ())
+        self.delivery_serve_max_bytes = (
+            DELIVERY_SERVE_MAX_BYTES if delivery_serve_max_bytes is None else int(delivery_serve_max_bytes)
+        )
+
+    def get_delivery_roots(self):
+        return tuple(self.delivery_roots or ())
+
+    def get_delivery_serve_max_bytes(self):
+        return int(self.delivery_serve_max_bytes)
 
     def fail_next(self, route, times=1):
         """Test hook: commit, then raise :class:`UncertainOutcome` for the next call(s)."""
@@ -836,22 +847,30 @@ class InProcessBackend:
                      integration_commit=(scope or {}).get('integration_commit'), reverted_commits=[]),
             ]
             base = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
+            scope_event = memory.get('scope_event_id') if scope is not None else None
             steps = [dict(step='scope', route='POST ' + base + '/lifecycle/scope',
                           state='committed' if scope is not None else 'not-attempted',
-                          operation_id=None)]
+                          operation_id=(scope_event[4:] if isinstance(scope_event, str)
+                                        and scope_event.startswith('lif_') else None),
+                          fact=scope_event)]
             for dimension in ('reviewed', 'integrated'):
                 passed = facts[dimension]['value'] == 'passed'
+                fact = facts[dimension].get('event_id') if passed else None
                 steps.append(dict(step=dimension,
                                   route='POST ' + base + '/lifecycle/facts/' + dimension,
                                   state='committed' if passed else 'not-attempted',
-                                  operation_id=None))
+                                  operation_id=(fact[4:] if isinstance(fact, str)
+                                                and fact.startswith('lif_') else None),
+                                  fact=fact))
             steps.append(dict(step='integrated-mark',
                               route='POST ' + base + '/lifecycle/facts/integrated',
-                              automatic=True, state='not-attempted', operation_id=None))
+                              automatic=True, state='not-attempted', operation_id=None,
+                              fact=None))
             steps.append(dict(step='slot-release',
                               route='POST /v1/projects/%s/merge-slot/release' % project_id,
-                              state='not-held', operation_id=None,
-                              operation_id_note='The server records no identity for a slot release.'))
+                              state='not-held', operation_id=None, fact=None,
+                              operation_id_note='The server records no identity for a slot release.',
+                              fact_note='A slot release has no native fact; the server records only the operation audit.'))
             return dict(task=dict(id=task.get('id'), title=task.get('title'),
                                   status=task.get('status'), assignee=task.get('assignee')),
                         contribution=contribution, review_state=None,
@@ -898,6 +917,7 @@ class InProcessBackend:
         event_id = 'lif_' + operation_id
         if operation == 'scope':
             memory['scope'] = native['scope']
+            memory['scope_event_id'] = event_id
         else:
             fact = dict(value=native['value'], event_id=event_id, evidence=native['evidence'],
                         provenance=native['provenance'])
@@ -1143,8 +1163,19 @@ class InProcessBackend:
                 raise invalid('bundle_sha256 must be a 64-character lowercase hex digest')
             if not isinstance(summary, str) or not summary.strip() or len(summary) > 1200:
                 raise invalid('Contribution summary must be 1-1200 characters')
+            repository = payload.get('repository')
+            repository = repository.strip() if isinstance(repository, str) else ''
+            if isinstance(delivery, dict) and delivery.get('kind') == 'remote':
+                delivery_block = {'kind': 'remote', 'remote': delivery['remote'].strip(), 'branch': branch.strip()}
+            elif isinstance(delivery, dict) and delivery.get('kind') == 'bundle':
+                delivery_block = {'kind': 'bundle', 'path': str(delivery.get('path') or ''), 'sha256': digest}
+            elif branch is not None:
+                delivery_block = {'kind': 'remote', 'remote': '', 'branch': branch}
+            else:
+                delivery_block = {'kind': 'bundle', 'path': '', 'sha256': digest}
             record = {'id': 'con_' + secrets.token_hex(6), 'task_id': task['id'],
                       'kind': 'contribution', 'commit': commit, 'base_commit': base_commit,
+                      'repository': repository, 'delivery': delivery_block,
                       'bundle_sha256': digest, 'branch': branch, 'summary': summary.strip(),
                       'actor': payload.get('actor') or principal.actor,
                       'created_at': now_iso(self.service._now())}
@@ -1456,6 +1487,54 @@ class InProcessBackend:
     def get_task(self, project_id, task_id):
         return dict(self._task(project_id, task_id))
 
+    def task_delivery_record(self, project_id, task_id, contribution_id=None):
+        task = self._task(project_id, task_id)
+        if isinstance(task, dict) and task.get('malformed'):
+            raise unreadable_row(task.get('id') or task_id)
+        if is_record_anchor(task) or is_merge_slot(task):
+            raise not_found('Task not found')
+        records = self.state.get('contributions', {}).get(task['id'], [])
+        contributions = []
+        revision = 0
+        for rec in records:
+            if not isinstance(rec, dict) or rec.get('kind') != 'contribution':
+                continue
+            revision += 1
+            delivery = rec.get('delivery')
+            if not isinstance(delivery, dict):
+                if rec.get('branch') is not None:
+                    delivery = {
+                        'kind': 'remote',
+                        'remote': rec.get('remote') or '',
+                        'branch': rec['branch'],
+                    }
+                else:
+                    delivery = {
+                        'kind': 'bundle',
+                        'path': rec.get('bundle_path') or '',
+                        'sha256': rec.get('bundle_sha256') or '',
+                    }
+            contributions.append({
+                'project': project_id,
+                'task': task['id'],
+                'contribution': rec['id'],
+                'revision': revision,
+                'commit': rec['commit'],
+                'base_commit': rec['base_commit'],
+                'repository': rec.get('repository') or '',
+                'author': rec.get('actor') or '',
+                'at': rec.get('created_at') or '',
+                'delivery': dict(delivery),
+            })
+        if not contributions:
+            raise not_found('Contribution not found')
+        if contribution_id is None:
+            return contributions[-1]
+        for item in contributions:
+            if item['contribution'] == contribution_id:
+                return item
+        raise not_found('Contribution not found')
+
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
                      recent=False, since_checkpoint=False):
         """The task's events, oldest first or (``recent``) newest first. This backend has no
@@ -1678,11 +1757,11 @@ class InProcessBackend:
         digests, but its events name their actor, so the agent's own checkpoint event
         is its own entry and never moves the marker.
         """
-        from briefing import activity_marker, fields_digest
+        from briefing import activity_marker, fields_digest, same_activity_actor
         events = [(index, event) for index, event in enumerate(self.state.get('events') or [])
                   if isinstance(event, dict) and event.get('task') == task['id']]
         others = [(index, event) for index, event in events
-                  if (event.get('actor') or 'unknown') != task.get('assignee')]
+                  if not same_activity_actor(event.get('actor'),task.get('assignee'))]
         newest = max(others, key=lambda pair: (pair[1].get('time') or '', pair[0])) if others else None
         entry = None
         if newest is not None:
@@ -1691,6 +1770,7 @@ class InProcessBackend:
         return activity_marker(entry, fields_digest(task))
 
     def _other_agent_activity(self, task, checkpoint):
+        from briefing import same_activity_actor
         events=[e for e in self.state.get('events') or [] if e.get('task')==task['id']]
         # Real writes have an ordered checkpoint event. Do not count that event
         # itself, even when an owner wrote the checkpoint for the assignee.
@@ -1698,11 +1778,11 @@ class InProcessBackend:
                  and e.get('actor')==checkpoint.get('actor')
                  and e.get('time','')>=checkpoint.get('created_at','')]
         if anchors:
-            return any(e.get('actor')!=task.get('assignee') for e in events[anchors[-1]+1:])
+            return any(not same_activity_actor(e.get('actor'),task.get('assignee')) for e in events[anchors[-1]+1:])
         # Older or directly imported in-process checkpoints have no event anchor.
         # Only attributed review records can establish external activity there.
         at=checkpoint.get('created_at')
-        return bool(at and any(r.get('created_at','')>at and r.get('actor')!=task.get('assignee')
+        return bool(at and any(r.get('created_at','')>at and not same_activity_actor(r.get('actor'),task.get('assignee'))
                                for r in self.state.get('contributions',{}).get(task['id'],[])))
 
     def _agent_activity_summary(self, task, checkpoint):
@@ -1712,7 +1792,7 @@ class InProcessBackend:
         no per-entry checkpoint digests, so imported/evicted history stays unknown.
         Reading this projection never incorporates or acknowledges an event.
         """
-        from briefing import NEWER_MAX, clip
+        from briefing import NEWER_MAX, clip, same_activity_actor
         events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
         anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
                    and e.get('actor') == checkpoint.get('actor')
@@ -1722,7 +1802,7 @@ class InProcessBackend:
                     'entries': [], 'omitted': None,
                     'note': 'Checkpoint event history is unavailable; read task history.'}
         remaining = events[anchors[-1] + 1:]
-        others = [e for e in remaining if e.get('actor') != task.get('assignee')]
+        others = [e for e in remaining if not same_activity_actor(e.get('actor'),task.get('assignee'))]
         authors = sorted({e.get('actor') for e in others if e.get('actor')})
         return {'coverage': 'unknown', 'own_count': len(remaining) - len(others),
                 'other_count': len(others),
@@ -2052,6 +2132,9 @@ class EndpointBackend:
     ROUTES = InProcessBackend.ROUTES + (
         'tasks.assign', 'tasks.release', 'merge-slot.acquire',
         'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create',
+        # The release routes (kittrial-5bb.378): one canonical release-query or one
+        # release-deploy group per request. The endpoint holds the host tracker.
+        'release.query', 'release.deploy',
         # The coordinator's recorded hand-back (kittrial-5bb.343). Both operations run
         # the one canonical `assignee-followon` action, which calls the same library
         # function as `coordinator followon`.
@@ -2389,6 +2472,18 @@ class EndpointBackend:
             if text.startswith('ValueError: '):
                 text = text[len('ValueError: '):]
             error = HttpError(status, FILE_CODES.get(status, 'invalid'), text)
+            error.nothing_done = True
+            raise error
+        if action == 'web-release' and isinstance(reply, dict) and (
+                reply.get('release_status') or reply.get('records_status')):
+            # The release routes (kittrial-5bb.378): a live-authority refusal, a hold, a
+            # stale target or a release-writer refusal keeps its own status instead of
+            # collapsing into 422. Both keys are read: an identity check reports the
+            # shared ledger key, the route's own errors report release_status.
+            status = reply.get('release_status') or reply.get('records_status')
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid', 503: 'unavailable'}.get(status, 'unavailable'),
+                              (reply.get('stderr') or 'Release facts cannot be recorded').strip())
             error.nothing_done = True
             raise error
         if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
@@ -2844,6 +2939,20 @@ class EndpointBackend:
             # A task file's record or withdrawal (kittrial-5bb.370). The bytes are stored and
             # checked already; the action reads the row live and writes under the project lock.
             return 'task-file', project_id, [json.dumps(file_body(payload), ensure_ascii=False)], {}
+        if route.startswith('release.'):
+            # The release routes (kittrial-5bb.378): one body carrying the unchanged
+            # host field set; the endpoint supplies the actor and the operation id from
+            # the request envelope, exactly as the lifecycle routes do.
+            import web_release
+            operation = route.split('.', 1)[1]
+            body = {'operation': operation}
+            if operation == 'query':
+                body['scope'] = payload['scope']
+            else:
+                for key in web_release.DEPLOY_FIELDS | web_release.DEPLOY_OPTIONAL:
+                    if key in payload:
+                        body[key] = payload[key]
+            return 'web-release', project_id, [json.dumps(body, ensure_ascii=False)], {}
         if route.startswith('followons.'):
             # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
             # `assignee-followon` action derives every record fact under the project
@@ -3254,6 +3363,62 @@ class EndpointBackend:
         if isinstance(row, dict) and row.get('project_id') not in (None, project_id):
             raise not_found('Task not found')
         return self._with_record_comments(project_id, [row])[0]
+
+    def _read_deployment_setting(self, fn):
+        from admin import ConfigurationUnreadable
+        try:
+            return fn(Path(self.root))
+        except ConfigurationUnreadable as exc:
+            print(
+                'configuration: the service could not read the deployment configuration: %s'
+                % ascii(str(exc)[:600]),
+                file=sys.stderr,
+                flush=True,
+            )
+            refused = HttpError(503, 'server_configuration', self.CONFIGURATION_UNREADABLE)
+            refused.nothing_done = True
+            raise refused from None
+
+    def get_delivery_roots(self):
+        from admin import delivery_roots
+        return self._read_deployment_setting(delivery_roots)
+
+    def get_delivery_serve_max_bytes(self):
+        from admin import delivery_serve_max_bytes
+        return self._read_deployment_setting(delivery_serve_max_bytes)
+
+    def task_delivery_record(self, project_id, task_id, contribution_id=None):
+        reply = self._endpoint(
+            'delivery-record',
+            project_id,
+            self.actor_namespace + '/read',
+            [str(task_id)],
+        )
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
+        if code == 2 and 'Unknown action' in stderr:
+            raise not_implemented(
+                'The canonical endpoint is older than this HTTP service and has no delivery '
+                'record read; install the same kit for both'
+            )
+        payload = self._checked(reply, 'delivery-record', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical delivery record read returned an unexpected shape')
+        if not payload.get('found'):
+            raise not_found('Task not found')
+        if payload.get('malformed'):
+            raise unreadable_row(payload.get('id') or task_id)
+        if payload.get('project') not in (None, project_id) or payload.get('task') not in (None, task_id):
+            raise not_found('Task not found')
+        contributions = [c for c in (payload.get('contributions') or []) if isinstance(c, dict)]
+        if not contributions:
+            raise not_found('Contribution not found')
+        if contribution_id is None:
+            return contributions[-1]
+        for item in contributions:
+            if item.get('contribution') == contribution_id:
+                return item
+        raise not_found('Contribution not found')
 
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
                      recent=False, since_checkpoint=False):
@@ -5126,7 +5291,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 audit_success=True, state_saved=None, audit_metadata=None, replay_check=None):
         """Run one authorized, idempotent mutation.
 
-        ``capability`` names the authority the route needs. The idempotency key is
+        ``capability`` names the authority the route needs: one capability, or a tuple
+        of them all required (kittrial-5bb.378 review s1: a release deploy needs
+        ``coordinate`` plus the release authority). The idempotency key is
         *reserved atomically* (:meth:`Service.idempotency_reserve`) before the effect,
         so two concurrent identical requests cannot both create the effect: the
         second either replays a committed result or receives a 409. ``serialize=True``
@@ -5138,8 +5305,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         (for example the target's identity) added to the route's audit events; it must
         never carry a secret or request body.
         """
-        ctx.authorize = (lambda: self.service.check_authority(
-            ctx.principal, project_id, capability, allow_self_user=allow_self_user))
+        if isinstance(capability, str):
+            ctx.authorize = (lambda: self.service.check_authority(
+                ctx.principal, project_id, capability, allow_self_user=allow_self_user))
+        else:
+            # Every named capability is re-checked inside the same in-lock boundary, so a
+            # two-capability route cannot pass on one of them being revoked in between.
+            needed = tuple(capability)
+
+            def authorize():
+                decision = None
+                for name in needed:
+                    decision = self.service.check_authority(
+                        ctx.principal, project_id, name, allow_self_user=allow_self_user)
+                return decision
+            ctx.authorize = authorize
         idem_route = '%s %s' % (route_name, ctx.route_target)
         key = ctx.idempotency_key if idempotent else None
         digest = None
@@ -5170,8 +5350,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 public, stored = fn()
         except UncertainOutcome:
             self.service.idempotency_unknown(digest)
-            self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
-                               project_id=project_id, reason=reason or 'uncertain')
+            event = self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
+                                       project_id=project_id, reason=reason or 'uncertain')
+            # The lifecycle write records the step's task, dimension and deterministic
+            # operation identity on an uncertain answer too, so the integration-check
+            # ledger can say which step to resume with the same identity
+            # (kittrial-5bb.383). Other routes carry no such metadata.
+            if audit_metadata:
+                event.update(audit_metadata)
             self.service.store.save()
             raise uncertain(self.UNCERTAIN if ctx.idempotency_key is not None else self.UNCERTAIN_NO_KEY)
         except HttpError as error:
@@ -6790,8 +6976,58 @@ class ApiHandler(BaseHTTPRequestHandler):
                     and hasattr(self.backend, 'lifecycle_replay_guard')):
                 self.backend.lifecycle_replay_guard(ctx.principal, ctx.params['pid'],
                     ctx.params['tid'], ctx.params['dimension'])
+        # The deterministic operation identity the backend will use, recorded on an
+        # uncertain (124 at the endpoint / 503 here) answer so the ledger can name the
+        # step and the identity to retry (kittrial-5bb.383).
+        ledger_audit = None
+        if ctx.idempotency_key is not None and hasattr(self.backend, '_result_key'):
+            ledger_audit = dict(task=ctx.params['tid'],
+                                dimension=('lifecycle-scope' if operation == 'scope'
+                                           else ctx.params['dimension']),
+                                operation_id=self.backend._result_key(
+                                    ctx.principal, ctx.params['pid'], route_name,
+                                    ctx.idempotency_key, ctx.route_target))
         return self._mutate(ctx, route_name, ctx.params['pid'], write, capability=CAP_COORDINATE,
-                            status=201, serialize=False, canonical=True, audit_success=False, replay_check=replay_check)
+                            status=201, serialize=False, canonical=True, audit_success=False,
+                            replay_check=replay_check, audit_metadata=ledger_audit)
+
+    #: Lifecycle audit actions whose last HTTP response the step ledger reports.
+    LEDGER_ACTIONS = ('lifecycle.scope', 'lifecycle.fact')
+
+    def _ledger_uncertain(self, project_id, task_id, steps):
+        """Mark a not-yet-committed step whose last HTTP answer was uncertain.
+
+        The canonical native rows stay authoritative: a step with a native fact keeps
+        its `committed` state and fact id (and reports the last response beside it).
+        A step with no native write but a lifecycle audit `unknown` outcome reads
+        `unknown`, carrying the deterministic operation identity the backend used, so
+        a coordinator retries that identity instead of minting a new one
+        (kittrial-5bb.383). Audit rows without the task/dimension metadata added for
+        this ledger are skipped: they cannot be attributed to a step.
+        """
+        latest = {}
+        for event in self.service.state['audit']:
+            if (event.get('project_id') != project_id
+                    or event.get('action') not in self.LEDGER_ACTIONS
+                    or event.get('task') != task_id
+                    or not isinstance(event.get('operation_id'), str)):
+                continue
+            if event.get('action') == 'lifecycle.scope':
+                step = 'scope'
+            else:
+                step = event.get('dimension')
+                if step not in ('reviewed', 'integrated'):
+                    continue
+            latest[step] = event
+        for row in steps:
+            event = latest.get(row.get('step'))
+            if event is None:
+                continue
+            row['response_state'] = event.get('outcome')
+            if row.get('state') != 'committed' and event.get('outcome') == 'unknown':
+                row['state'] = 'unknown'
+                row['operation_id'] = event['operation_id']
+        return steps
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/integration-check')
     def integration_check_get(self, ctx):
@@ -6803,6 +7039,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         target = ctx.query.get('target')
         result = self.backend.integration_check(ctx.principal, ctx.params['pid'],
                                                 ctx.params['tid'], target)
+        result['next'] = self._ledger_uncertain(ctx.params['pid'], ctx.params['tid'],
+                                                result.get('next') or [])
         result['current_actor'] = self.service.bind_actor(ctx.principal, None)
         return 200, result
 
@@ -6813,6 +7051,89 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle/facts/(?P<dimension>[a-z-]+)')
     def lifecycle_fact(self, ctx):
         return self._lifecycle_write(ctx, 'fact')
+
+    # -- release query and one release group (kittrial-5bb.378) --------------------
+    #
+    # Slice 2 of docs/design/WEB_COORDINATOR_INTEGRATION.md, section 4. The server never
+    # chooses release membership (it has no checkout): the caller resolves targets with
+    # git and sends ONE group, at most 200 targets; the endpoint re-verifies every named
+    # target against its own export and skips a target that is not integrated there. The
+    # query is the read-only pre-flight: the host-issued reverted set and the recorded
+    # live releases for one environment, writing nothing.
+    def _release_backend(self, route):
+        if not hasattr(self.backend, 'ROUTES') or route not in self.backend.ROUTES:
+            raise not_implemented('Release facts are unavailable on this server')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/releases/query')
+    def release_query(self, ctx):
+        import web_release
+        # A coordinator read: the query writes nothing and discloses only the reverted
+        # set and the environment's live releases this project already knows.
+        self._project(ctx, CAP_COORDINATE)
+        try:
+            _, fields = web_release.fields(dict(ctx.payload or {}, operation='query'))
+        except web_release.ReleaseError as error:
+            raise invalid(str(error)) from None
+        self._release_backend('release.query')
+        result = self.backend.invoke('release.query', ctx.principal, ctx.params['pid'], fields,
+                                     None, target=ctx.route_target, capability=CAP_COORDINATE)
+        return 200, result
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/releases')
+    def release_deploy(self, ctx):
+        import web_release
+        # The project's release authority AND coordination, checked live (design section
+        # 4): an owner or superuser holds both. An agent reaches it only with the project's
+        # release grant AND its coordinator grant, because a release is a decision plus a
+        # coordination step. A coordinator alone, or a release grant alone, is refused
+        # before the body is even read. An archived project records nothing new.
+        project, _role = self._project(ctx, CAP_COORDINATE)
+        self._project(ctx, CAP_RELEASE)
+        if isinstance(project, dict) and project.get('archived'):
+            raise conflict('This project is archived; release facts cannot be recorded')
+        try:
+            _, fields = web_release.fields(dict(ctx.payload or {}, operation='deploy'))
+        except web_release.ReleaseError as error:
+            raise invalid(str(error)) from None
+        self._release_backend('release.deploy')
+        metadata = {}
+
+        def write():
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request '
+                              'after an uncertain outcome')
+            result = self.backend.invoke('release.deploy', ctx.principal, ctx.params['pid'], fields,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_RELEASE)
+            metadata.update({key: result.get(key) for key in
+                             ('operation_id', 'release_id', 'environment', 'groups_completed',
+                              'groups_total')})
+            # The audit is a shared capped list: keep counts and only the first few ids of
+            # the up-to-200 skipped/flags rows. The answer itself still carries every row.
+            skipped = result.get('skipped') or []
+            flags = result.get('flags') or []
+            metadata.update(skipped_count=len(skipped),
+                            skipped_first=[row.get('task') for row in skipped[:5]],
+                            flags_count=len(flags),
+                            flags_first=[row.get('task') for row in flags[:5]])
+            with self.service.store.lock:
+                existing = any(event.get('action') == 'releases.deploy'
+                               and event.get('project_id') == ctx.params['pid']
+                               and event.get('operation_id') == result.get('operation_id')
+                               and event.get('outcome') == 'committed'
+                               for event in self.service.state['audit'])
+                if not existing:
+                    event = self.service.audit(ctx.request_id, ctx.principal, 'releases.deploy', 'committed',
+                                               project_id=ctx.params['pid'])
+                    event.update(metadata)
+                try:
+                    self.service.store.save()
+                except (OSError, TimeoutError):
+                    raise UncertainOutcome() from None
+            return result, result
+        return self._mutate(ctx, 'releases.deploy', ctx.params['pid'], write,
+                            capability=(CAP_COORDINATE, CAP_RELEASE), status=201, serialize=False,
+                            canonical=True, audit_success=False)
 
     def _merge_slot_backend(self):
         if not hasattr(self.backend, 'merge_slot_read'):
@@ -7990,6 +8311,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                      request_id=ctx.request_id)
             return result, result
         return self._mutate(ctx, 'agents.coordinator.revoke', ctx.params['pid'], revoke,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
+    # The project's release grant (kittrial-5bb.378): an owner gives and revokes one
+    # agent's authority to RECORD releases here. It is stored beside the coordinator grant
+    # and read live on every release write; the coordinator grant does not imply it.
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/release')
+    def project_agent_release_grant(self, ctx):
+        refuse_unknown_fields(dict(ctx.payload or {}), (), 'A release grant')
+
+        def grant():
+            result = self.service.grant_release(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.release.grant', ctx.params['pid'], grant,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/release')
+    def project_agent_release_revoke(self, ctx):
+        def revoke():
+            result = self.service.revoke_release(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                 request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.release.revoke', ctx.params['pid'], revoke,
                             capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
 
     @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')')
@@ -9713,11 +10057,15 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _requirements_write(self, ctx, action, status=200):
         self._requirements_backend()
         editor=self._requirements_owner(ctx)
+        if action == 'baseline' and (editor.get('role') != 'owner' or editor.get('agent_id')
+                or ctx.principal.via != 'session' or ctx.principal.credential_id):
+            raise forbidden('Baseline cuts need the current signed-in project owner')
         if action=='governance' and editor.get('role')!='owner':
             # The coordinator's decision 11(i) of kittrial-5bb.278: the governance-mode
             # switch changes the rules, not requirement text, so it stays the owner's.
             raise forbidden('Switching requirements governance needs the signed-in project owner')
         fields,operation_id=self._proposal_body(ctx,{
+            'baseline':('name',),
             'create':('kind','parent','title','description','key'),
             'revise':('expected_revision','expected_sha256','title','description'),
             'accept':('expected_revision','expected_sha256'),
@@ -9728,12 +10076,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             'abandon':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http
-        try: requirement_http.checked_body(fields,action)
+        try:
+            if action == 'baseline':
+                from requirement_baseline_http import checked_body
+                checked_body(fields)
+            else:
+                requirement_http.checked_body(fields,action)
         except ValueError as error: raise invalid(str(error))
         if operation_id is not None:
             raise invalid('Use the Idempotency-Key header for requirements writes')
         pid=ctx.params['pid']
-        if action in ('withdraw','supersede','finish','abandon'):
+        if action in ('baseline','withdraw','supersede','finish','abandon'):
             # Give immediate mode advice; the canonical adapter repeats the
             # check under the project/authority locks, including exact replays.
             if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
@@ -9757,7 +10110,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                             # Terminal replay authority belongs to the canonical
                             # owner adapter. Its durable identity still deduplicates
                             # effects; a service response must not bypass that check.
-                            idempotent=action not in ('withdraw','supersede','finish','abandon'),
+                            idempotent=action not in ('baseline','withdraw','supersede','finish','abandon'),
                             audit_success=action not in ('withdraw','supersede','finish','abandon'),
                             audit_metadata=self._requirement_agent_audit(ctx))
 
@@ -9776,6 +10129,53 @@ class ApiHandler(BaseHTTPRequestHandler):
         return {'acting_agent': editor['agent_id'],
                 'coordinator_grant': {'granted_by': grant.get('granted_by'),
                                       'granted_at': grant.get('granted_at')}}
+
+    # Named snapshots are human member reads; no new agent/worker authority.
+    def _requirements_baseline_member(self, ctx):
+        self._requirements_backend(); self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        if (ctx.principal.via != 'session' or ctx.principal.credential_id or ctx.principal.agent_id
+                or self.service.state.get('memberships', {}).get(pid, {}).get(ctx.principal.user_id)
+                not in ('owner', 'coordinator', 'contributor', 'viewer')):
+            raise forbidden('Requirements baselines need a current signed-in project member')
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines')
+    def requirements_baselines(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'], ['baselines'])
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines')
+    def requirements_cut_baseline(self, ctx):
+        return self._requirements_write(ctx, 'baseline', status=201)
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines/(?P<baseline>[A-Za-z0-9_-]{1,64})')
+    def requirements_baseline(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'], ['baseline', ctx.params['baseline']])
+
+    def _requirements_document_args(self, ctx, action):
+        if set(ctx.query) - {'baseline'}:
+            raise invalid('Requirements documents take only the optional baseline query')
+        args = [action]
+        if 'baseline' in ctx.query:
+            from requirement_baseline_records import baseline_name
+            try:
+                args.append(baseline_name(ctx.query['baseline']))
+            except ValueError as error:
+                raise invalid(str(error))
+        return args
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd/export')
+    def requirements_markdown_export(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'],
+            self._requirements_document_args(ctx, 'export'))
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd/changes')
+    def requirements_baseline_changes(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'],
+            self._requirements_document_args(ctx, 'changes'))
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
@@ -9803,6 +10203,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         result['can_edit']=self._requirements_page_editor(ctx)
+        result['can_cut_baseline']=(ctx.principal.via == 'session'
+            and not ctx.principal.credential_id and not ctx.principal.agent_id
+            and self.service.state.get('memberships', {}).get(ctx.params['pid'], {}).get(ctx.principal.user_id) == 'owner'
+            and result.get('governance', {}).get('mode') == 'simple')
         return 200,result
 
     def _requirements_page_editor(self,ctx):
@@ -10741,6 +11145,336 @@ class ApiHandler(BaseHTTPRequestHandler):
     ALREADY_RECOMMENDED = ('%s has already recommended this contribution, and that recommendation stands until the '
                            'contribution is revised or decided. To ask for changes instead, request changes: the '
                            'recommendation then stops counting. A recommendation cannot be withdrawn.')
+
+    def _project_delivery(self, ctx):
+        """Authorize a delivery read: ``CAP_REVIEWS``, or ``CAP_APPROVE`` on the same project.
+
+        The ``CAP_APPROVE`` fallback runs ONLY after a ``403`` from the ``CAP_REVIEWS``
+        check for the SAME route project (kittrial-5bb.373 precision 2); any other
+        refusal (``404`` unknown project, ``401``) is returned as is, and a principal
+        with neither capability gets the original ``403``.
+        """
+        try:
+            self._project(ctx, CAP_REVIEWS)
+            return
+        except HttpError as first_error:
+            if first_error.status != 403:
+                raise
+            try:
+                self._project(ctx, CAP_APPROVE)
+                return
+            except HttpError:
+                raise first_error from None
+
+    @staticmethod
+    def _delivery_contribution_query(query):
+        unknown = sorted(set(query) - {'contribution'})
+        if unknown:
+            raise invalid('Unsupported query parameter(s): %s' % ', '.join(unknown))
+        if 'contribution' not in query:
+            return None
+        contribution_id = query.get('contribution')
+        if not isinstance(contribution_id, str) or not SAFE_ID.fullmatch(contribution_id):
+            raise not_found('Contribution not found')
+        return contribution_id
+
+    def _audit_bundle_read(
+        self,
+        ctx,
+        pid,
+        record,
+        outcome,
+        *,
+        reason=None,
+        sha256=None,
+        size_bytes=None,
+        task=None,
+        contribution=None,
+    ):
+        with self.service.store.lock:
+            event = self.service.audit(
+                ctx.request_id,
+                ctx.principal,
+                'delivery.bundle.read',
+                outcome,
+                project_id=pid,
+                reason=reason,
+            )
+            if isinstance(record, dict):
+                event['task'] = record.get('task') or task
+                event['contribution'] = record.get('contribution') or contribution
+                event['commit'] = record.get('commit')
+                if sha256 is None and isinstance(record.get('delivery'), dict):
+                    sha256 = record['delivery'].get('sha256')
+            else:
+                if task is not None:
+                    event['task'] = task
+                if contribution is not None:
+                    event['contribution'] = contribution
+            if sha256 is not None:
+                event['sha256'] = sha256
+            if size_bytes is not None:
+                event['bytes'] = size_bytes
+            self.service.store.save_soon('the audit entry of a bundle read')
+
+    def _send_bundle_stream(self, handle_fd, record, verified):
+        from review_workflow import BUNDLE_BLOCK_BYTES
+        headers_sent = False
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(verified['bytes']))
+            self.send_header('ETag', str(verified['sha256']))
+            self.send_header('X-Contribution', str(record['contribution']))
+            self.send_header('X-Orchestra-Contribution', str(record['contribution']))
+            self.send_header('X-Orchestra-Commit', str(record['commit']))
+            self.send_header('X-Orchestra-Base-Commit', str(record['base_commit']))
+            self.send_header('X-Orchestra-Bundle-Sha256', str(verified['sha256']))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self._send_hsts()
+            self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+            if getattr(self, '_say_close', False):
+                self.send_header('Connection', 'close')
+                self._say_close = False
+            if getattr(self, '_set_cookie_token', None):
+                self._send_cookie(self._set_cookie_token)
+            self.end_headers()
+            headers_sent = True
+            if self.command == 'HEAD':
+                return 'ok', None
+            os.lseek(handle_fd, 0, os.SEEK_SET)
+            expected_bytes = int(verified['bytes'])
+            expected_sha = str(verified['sha256']).lower()
+            expected_stat = verified.get('stat_snapshot')
+            remaining = expected_bytes
+            stream_digest = hashlib.sha256()
+            held_block = None
+            while remaining > 0:
+                chunk = os.read(handle_fd, min(BUNDLE_BLOCK_BYTES, remaining))
+                if not chunk:
+                    self.close_connection = True
+                    try:
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+                    return 'interrupted', 'short_read'
+                stream_digest.update(chunk)
+                remaining -= len(chunk)
+                if held_block is not None:
+                    self.wfile.write(held_block)
+                held_block = chunk
+            extra = os.read(handle_fd, 1)
+            info_after = os.fstat(handle_fd)
+            stat_after = (
+                info_after.st_dev,
+                info_after.st_ino,
+                info_after.st_size,
+                info_after.st_mtime_ns,
+                info_after.st_ctime_ns,
+            )
+            if (
+                extra
+                or stream_digest.hexdigest().lower() != expected_sha
+                or (expected_stat is not None and stat_after != expected_stat)
+            ):
+                self.close_connection = True
+                try:
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                return 'interrupted', 'bundle_checksum_mismatch'
+            if held_block is not None:
+                self.wfile.write(held_block)
+            self.wfile.flush()
+            return 'ok', None
+        except Exception:
+            self.close_connection = True
+            if not headers_sent:
+                raise
+            try:
+                self.wfile.flush()
+            except OSError:
+                pass
+            return 'interrupted', 'stream_error'
+        finally:
+            try:
+                os.close(handle_fd)
+            except OSError:
+                pass
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/delivery')
+    def tasks_delivery(self, ctx):
+        """Return the contribution's recorded delivery metadata (kittrial-5bb.373)."""
+        from review_workflow import (
+            DeliveryCorruptError,
+            DeliveryTooLargeError,
+            DeliveryUnavailableError,
+            resolve_delivery_bundle_path,
+            verify_served_bundle,
+        )
+        self._project_delivery(ctx)
+        pid = ctx.params['pid']
+        tid = ctx.params['tid']
+        contribution_id = ctx.query.get('contribution') if isinstance(ctx.query.get('contribution'), str) else None
+        record = None
+        try:
+            contribution_id = self._delivery_contribution_query(ctx.query)
+            candidate = self.backend.task_delivery_record(
+                pid,
+                tid,
+                contribution_id=contribution_id,
+            )
+            if candidate.get('task') != tid or candidate.get('project') not in (None, pid):
+                raise not_found('Contribution not found')
+            record = candidate
+            delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
+            kind = delivery.get('kind')
+            roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
+            max_bytes = (
+                self.backend.get_delivery_serve_max_bytes()
+                if hasattr(self.backend, 'get_delivery_serve_max_bytes')
+                else 256 * 1024 * 1024
+            )
+        except HttpError as error:
+            self._audit_bundle_read(
+                ctx,
+                pid,
+                record,
+                'refused',
+                reason=error.code,
+                task=tid,
+                contribution=contribution_id,
+            )
+            raise
+        sha256 = delivery.get('sha256') if kind == 'bundle' else None
+        path = delivery.get('path') if kind == 'bundle' else None
+        bundle_bytes = None
+        if kind == 'bundle':
+            try:
+                resolved_path, handle_fd, raw_size = resolve_delivery_bundle_path(path, roots)
+            except DeliveryUnavailableError:
+                bundle_bytes = None
+            else:
+                try:
+                    verified = verify_served_bundle(
+                        resolved_path,
+                        handle_fd,
+                        raw_size,
+                        sha256,
+                        record.get('commit'),
+                        max_bytes=max_bytes,
+                        git=getattr(self.backend, 'bundle_git', None),
+                    )
+                except (DeliveryUnavailableError, DeliveryTooLargeError, DeliveryCorruptError):
+                    bundle_bytes = None
+                else:
+                    bundle_bytes = verified['bytes']
+                    try:
+                        os.close(handle_fd)
+                    except OSError:
+                        pass
+        cid = record.get('contribution')
+        qs = ('?' + urlencode({'contribution': cid})) if cid else ''
+        base_url = '/v1/projects/%s/tasks/%s/delivery' % (quote(pid, safe=''), quote(tid, safe=''))
+        links = {
+            'self': base_url + qs,
+            'bundle': (base_url + '/bundle' + qs) if kind == 'bundle' else None,
+        }
+        return 200, {
+            'task': tid,
+            'project': pid,
+            'contribution': cid,
+            'revision': record.get('revision'),
+            'kind': kind,
+            'commit': record.get('commit'),
+            'base_commit': record.get('base_commit'),
+            'sha256': sha256,
+            'bytes': bundle_bytes,
+            'path': path,
+            'serve_limit': max_bytes,
+            'repository': record.get('repository'),
+            'author': record.get('author'),
+            'at': record.get('at'),
+            'delivery': delivery,
+            'links': links,
+        }
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/delivery/bundle')
+    def tasks_delivery_bundle(self, ctx):
+        """Verify and stream the contribution's delivered git bundle (kittrial-5bb.373)."""
+        from review_workflow import (
+            DELIVERY_CHECKSUM_MISMATCH,
+            DELIVERY_NOT_AVAILABLE,
+            DELIVERY_REMOTE_NO_BUNDLE,
+            DeliveryCorruptError,
+            DeliveryTooLargeError,
+            DeliveryUnavailableError,
+            resolve_delivery_bundle_path,
+            verify_served_bundle,
+        )
+        self._project_delivery(ctx)
+        pid = ctx.params['pid']
+        tid = ctx.params['tid']
+        contribution_id = ctx.query.get('contribution') if isinstance(ctx.query.get('contribution'), str) else None
+        record = None
+        size = None
+        try:
+            contribution_id = self._delivery_contribution_query(ctx.query)
+            candidate = self.backend.task_delivery_record(pid, tid, contribution_id=contribution_id)
+            if candidate.get('task') != tid or candidate.get('project') not in (None, pid):
+                raise not_found('Contribution not found')
+            record = candidate
+            delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
+            if delivery.get('kind') != 'bundle':
+                raise invalid(DELIVERY_REMOTE_NO_BUNDLE)
+            roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
+            max_bytes = (
+                self.backend.get_delivery_serve_max_bytes()
+                if hasattr(self.backend, 'get_delivery_serve_max_bytes')
+                else 256 * 1024 * 1024
+            )
+            try:
+                resolved_path, handle_fd, size = resolve_delivery_bundle_path(delivery.get('path'), roots)
+                verified = verify_served_bundle(
+                    resolved_path,
+                    handle_fd,
+                    size,
+                    delivery.get('sha256'),
+                    record.get('commit'),
+                    max_bytes=max_bytes,
+                    git=getattr(self.backend, 'bundle_git', None),
+                )
+            except DeliveryUnavailableError:
+                raise HttpError(410, 'bundle_unavailable', DELIVERY_NOT_AVAILABLE) from None
+            except DeliveryTooLargeError as error:
+                raise HttpError(413, 'payload_too_large', str(error)) from None
+            except DeliveryCorruptError:
+                raise HttpError(503, 'bundle_checksum_mismatch', DELIVERY_CHECKSUM_MISMATCH) from None
+        except HttpError as error:
+            self._audit_bundle_read(
+                ctx,
+                pid,
+                record,
+                'refused',
+                reason=error.code,
+                size_bytes=size,
+                task=tid,
+                contribution=contribution_id,
+            )
+            raise
+        outcome, interrupt_reason = self._send_bundle_stream(handle_fd, record, verified)
+        self._audit_bundle_read(
+            ctx,
+            pid,
+            record,
+            outcome,
+            reason=interrupt_reason,
+            sha256=verified['sha256'],
+            size_bytes=verified['bytes'],
+        )
+        return None, None
 
     #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')

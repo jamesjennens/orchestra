@@ -853,8 +853,10 @@ class ProjectOwnerAgentTests(AgentHarness):
     """
 
     #: The only fields a project owner may receive about an agent in their project.
+    #: ``release`` is the project's release grant row (kittrial-5bb.378), the same shape
+    #: as ``coordinator``; it carries no path, credential secret or wider registry.
     SAFE_FIELDS = {'id', 'name', 'owner', 'owner_display_name', 'actor', 'enabled',
-                   'last_seen_at', 'coordinator', 'credentials'}
+                   'last_seen_at', 'coordinator', 'release', 'credentials'}
 
     def setUp(self):
         super().setUp()

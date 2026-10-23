@@ -72,10 +72,14 @@ required deployment order is documented in ``docs/REVIEWS.md``.
 """
 import json
 import hashlib
+import ntpath
 import os
+import posixpath
 import record_json
 import re
 import stat
+import subprocess
+import tempfile
 from pathlib import Path
 import recovery
 from coordination import is_merge_slot, merge_slot_sentence
@@ -917,6 +921,442 @@ def bundle_commit_problem(observation, commit):
     if str(commit or '').lower() not in heads:
         return 'the observed commit %s is not one of the heads this bundle advertises' % commit
     return None
+
+
+#: Delivered code over HTTP (docs/design/DELIVERY_CODE_OVER_HTTP.md, kittrial-5bb.373).
+DELIVERY_SERVE_MAX_BYTES = 256 * 1024 * 1024
+DELIVERY_NOT_AVAILABLE = 'The delivered bundle is not available on this service.'
+DELIVERY_REMOTE_NO_BUNDLE = 'The delivery is remote; there is no bundle to serve.'
+DELIVERY_CHECKSUM_MISMATCH = 'The delivered bundle does not match its recorded checksum.'
+DELIVERY_SSH_ONLY_HTTP = (
+    "Delivered bundles are served over HTTP only; on the host transport, read the "
+    "contribution's recorded delivery.path directly."
+)
+DELIVERY_HOST_PATH = re.compile(
+    r'^(?:(?![A-Za-z]:)[A-Za-z0-9][A-Za-z0-9._-]{1,63}:)?(/(?!/)[^\x00-\x1f\x7f\\]{1,400})\Z'
+)
+DELIVERY_WINDOWS_DRIVE_PATH = re.compile(
+    r'^[A-Za-z]:[/\\](?![/\\])[^\x00-\x1f\x7f]{1,400}\Z'
+)
+
+
+class DeliveryUnavailableError(ValueError):
+    """410 Gone: bundle is outside configured delivery_roots, missing, a symlink, or non-regular."""
+
+
+class DeliveryTooLargeError(ValueError):
+    """413 Payload Too Large: bundle size exceeds delivery_serve_max_bytes."""
+
+
+class DeliveryCorruptError(ValueError):
+    """503 Service Unavailable: bundle fails signature, SHA-256, or advertised head commit check."""
+
+
+def strip_delivery_host_prefix(recorded_path):
+    """Strip an optional ``HOST:`` prefix and return the absolute path, or ``None``.
+
+    Host names are deliberately not compared (kittrial-5bb.373 precision 1). A
+    ``HOST:`` prefix is stripped only when it is not a single-letter drive and the
+    remainder is a POSIX absolute path (``/srv/...``). A Windows drive-letter
+    absolute path (``D:\\...`` or ``D:/...``) is returned intact so its drive letter
+    is never mistaken for a host prefix; drive-relative paths (``C:relative``) and
+    relative or UNC paths are refused (``None``).
+    """
+    if not isinstance(recorded_path, str):
+        return None
+    match = DELIVERY_HOST_PATH.fullmatch(recorded_path)
+    if match:
+        return match.group(1)
+    if DELIVERY_WINDOWS_DRIVE_PATH.fullmatch(recorded_path):
+        return recorded_path
+    return None
+
+
+def _is_within_directory(child, parent):
+    """Whether ``child`` resolves strictly inside ``parent`` using ``resolve()`` and ``os.path.normcase``."""
+    try:
+        child_resolved = Path(child).resolve()
+        parent_resolved = Path(parent).resolve()
+    except OSError:
+        return False
+    parent_norm = os.path.normcase(str(parent_resolved))
+    if os.path.normcase(str(child_resolved)) == parent_norm:
+        return False
+    return any(
+        os.path.normcase(str(ancestor)) == parent_norm
+        for ancestor in child_resolved.parents
+    )
+
+
+def _parse_delivery_abs_path(path_str, *, allow_trailing_sep=False):
+    """Parse a non-root POSIX or Windows drive-letter absolute path into ``(kind, drive, segments)``."""
+    if not isinstance(path_str, str) or '\x00' in path_str:
+        return None
+    if path_str.startswith('/') and not path_str.startswith('//') and '\\' not in path_str:
+        trimmed = path_str.rstrip('/') if (allow_trailing_sep and len(path_str) > 1) else path_str
+        if trimmed == '/' or trimmed.endswith('/') or '//' in trimmed:
+            return None
+        segments = tuple(seg for seg in trimmed.split('/') if seg)
+        if not segments or any(seg in ('.', '..') for seg in segments):
+            return None
+        return ('posix', '', segments)
+    if len(path_str) >= 4 and path_str[0].isalpha() and path_str[1] == ':' and path_str[2] in ('/', '\\'):
+        if path_str[3] in ('/', '\\'):
+            return None
+        drive = path_str[:2]
+        rest = path_str[3:]
+        if allow_trailing_sep:
+            rest = rest.rstrip('/\\')
+        if not rest or rest[-1] in ('/', '\\'):
+            return None
+        raw_segs = re.split(r'[/\\]', rest)
+        if not raw_segs or any(seg == '' or seg in ('.', '..') for seg in raw_segs):
+            return None
+        return ('windows', drive, tuple(raw_segs))
+    return None
+
+
+def _step_child_component(parent_dir, part, *, case_insensitive=False):
+    """Advance one path component under ``parent_dir``, matching case-insensitively for Windows drive paths on POSIX."""
+    direct = parent_dir / part
+    if not case_insensitive:
+        return direct
+    try:
+        os.lstat(str(direct))
+        return direct
+    except OSError:
+        pass
+    folded = ntpath.normcase(part)
+    try:
+        with os.scandir(str(parent_dir)) as it:
+            for entry in it:
+                if ntpath.normcase(entry.name) == folded:
+                    return parent_dir / entry.name
+    except OSError:
+        pass
+    return direct
+
+
+def _resolve_root_on_filesystem(base_anchor, segments, *, case_insensitive=False):
+    """Resolve ``segments`` starting at ``base_anchor`` without following symlinks."""
+    cur = Path(base_anchor)
+    for seg in segments:
+        cur = _step_child_component(cur, seg, case_insensitive=case_insensitive)
+        try:
+            st = os.lstat(str(cur))
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            return None
+    if not cur.is_dir():
+        return None
+    return cur
+
+
+def _candidate_root_and_rel_parts(root_parsed, target_parsed):
+    """Yield ``(root_path, walk_root, rel_parts, case_insensitive)`` candidates for ``target_parsed`` under ``root_parsed``."""
+    root_kind, root_drive, root_segments = root_parsed
+    target_kind, target_drive, target_segments = target_parsed
+
+    if root_kind == 'windows' and target_kind == 'windows':
+        if ntpath.normcase(root_drive) != ntpath.normcase(target_drive):
+            return
+        norm_seg = ntpath.normcase
+        case_insensitive = os.name != 'nt'
+        anchors = [root_drive + '\\'] if os.name == 'nt' else ['/']
+    elif root_kind == 'posix' and target_kind == 'posix':
+        norm_seg = os.path.normcase
+        case_insensitive = False
+        if os.name == 'nt':
+            drives = []
+            for sample in (os.getcwd(), tempfile.gettempdir()):
+                drv = os.path.splitdrive(sample)[0]
+                if drv and drv not in drives:
+                    drives.append(drv)
+            anchors = [drv + '\\' for drv in drives] + ['/']
+        else:
+            anchors = ['/']
+    elif os.name == 'nt' and root_kind == 'windows' and target_kind == 'posix':
+        norm_seg = ntpath.normcase
+        case_insensitive = False
+        anchors = [root_drive + '\\']
+    elif os.name == 'nt' and root_kind == 'posix' and target_kind == 'windows':
+        norm_seg = ntpath.normcase
+        case_insensitive = False
+        anchors = [target_drive + '\\']
+    else:
+        return
+
+    for anchor in anchors:
+        if case_insensitive:
+            root_path = _resolve_root_on_filesystem(anchor, root_segments, case_insensitive=True)
+            if root_path is None:
+                continue
+        else:
+            root_path = Path(anchor).joinpath(*root_segments)
+            if root_path.is_symlink() or not root_path.is_dir():
+                continue
+
+        if (
+            len(target_segments) > len(root_segments)
+            and [norm_seg(s) for s in target_segments[: len(root_segments)]]
+            == [norm_seg(s) for s in root_segments]
+        ):
+            yield root_path, root_path, target_segments[len(root_segments) :], case_insensitive
+            continue
+
+        if os.name == 'nt':
+            try:
+                resolved_root = root_path.resolve()
+            except OSError:
+                continue
+            res_parsed = _parse_delivery_abs_path(str(resolved_root), allow_trailing_sep=True)
+            if res_parsed is not None:
+                _, _, res_segs = res_parsed
+                if (
+                    len(target_segments) > len(res_segs)
+                    and [norm_seg(s) for s in target_segments[: len(res_segs)]]
+                    == [norm_seg(s) for s in res_segs]
+                ):
+                    yield root_path, resolved_root, target_segments[len(res_segs) :], False
+                    continue
+            if len(target_segments) > len(root_segments):
+                prefix_dir = Path(anchor).joinpath(*target_segments[: len(root_segments)])
+                try:
+                    if (
+                        not prefix_dir.is_symlink()
+                        and prefix_dir.is_dir()
+                        and os.path.normcase(str(prefix_dir.resolve()))
+                        == os.path.normcase(str(resolved_root))
+                    ):
+                        yield root_path, prefix_dir, target_segments[len(root_segments) :], False
+                except OSError:
+                    continue
+
+
+def resolve_delivery_bundle_path(recorded_path, roots):
+    """Resolve ``recorded_path`` under ``roots`` without following symlinks.
+
+    Returns ``(resolved_path, handle_fd, size)`` with an open ``O_RDONLY | O_NONBLOCK |
+    O_NOFOLLOW`` regular-file descriptor, or raises :class:`DeliveryUnavailableError`
+    with the single ``DELIVERY_NOT_AVAILABLE`` sentence so the route does not leak
+    whether an arbitrary path exists outside ``delivery_roots``.
+    """
+    if not roots:
+        raise DeliveryUnavailableError(DELIVERY_NOT_AVAILABLE)
+    raw_path = strip_delivery_host_prefix(recorded_path)
+    if raw_path is None:
+        raise DeliveryUnavailableError(DELIVERY_NOT_AVAILABLE)
+    target_parsed = _parse_delivery_abs_path(raw_path, allow_trailing_sep=False)
+    if target_parsed is None:
+        raise DeliveryUnavailableError(DELIVERY_NOT_AVAILABLE)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, 'O_NONBLOCK', 0)
+        | getattr(os, 'O_NOFOLLOW', 0)
+        | getattr(os, 'O_BINARY', 0)
+        | getattr(os, 'O_CLOEXEC', 0)
+    )
+    for root_entry in roots:
+        root_parsed = _parse_delivery_abs_path(root_entry, allow_trailing_sep=True)
+        if root_parsed is None:
+            continue
+        for root_path, walk_root, rel_parts, case_insensitive in _candidate_root_and_rel_parts(
+            root_parsed, target_parsed
+        ):
+            if not rel_parts or any(part in ('.', '..') for part in rel_parts):
+                continue
+            cur = walk_root
+            bad_component = False
+            for part in rel_parts:
+                cur = _step_child_component(cur, part, case_insensitive=case_insensitive)
+                try:
+                    st = os.lstat(str(cur))
+                except OSError:
+                    bad_component = True
+                    break
+                if stat.S_ISLNK(st.st_mode):
+                    bad_component = True
+                    break
+            if bad_component:
+                continue
+            try:
+                handle_fd = os.open(str(cur), flags)
+            except OSError:
+                continue
+            try:
+                info = os.fstat(handle_fd)
+                if not stat.S_ISREG(info.st_mode):
+                    os.close(handle_fd)
+                    continue
+                resolved_root = root_path.resolve()
+                resolved_target = cur.resolve()
+                if not _is_within_directory(resolved_target, resolved_root):
+                    os.close(handle_fd)
+                    continue
+                after = os.lstat(str(resolved_target))
+                if (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+                    os.close(handle_fd)
+                    continue
+                return str(resolved_target), handle_fd, info.st_size
+            except OSError:
+                try:
+                    os.close(handle_fd)
+                except OSError:
+                    pass
+                continue
+    raise DeliveryUnavailableError(DELIVERY_NOT_AVAILABLE)
+
+
+def _run_bundle_git(args):
+    try:
+        proc = subprocess.run(
+            ['git'] + [str(a) for a in args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=BUNDLE_GIT_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(str(exc)) from exc
+    if proc.returncode != 0:
+        raise ValueError((proc.stderr or proc.stdout or 'git bundle list-heads failed').strip())
+    return proc.stdout
+
+
+def verify_served_bundle(
+    resolved_path,
+    handle_fd,
+    size,
+    expected_sha256,
+    expected_commit,
+    max_bytes=DELIVERY_SERVE_MAX_BYTES,
+    git=None,
+):
+    """Verify a resolved bundle fd before serving a single byte (kittrial-5bb.373).
+
+    Checks:
+      1. ``size <= max_bytes`` BEFORE reading or hashing (raises :class:`DeliveryTooLargeError`).
+      2. First line matches ``BUNDLE_SIGNATURE`` (``# v2 git bundle`` / ``# v3 git bundle``).
+      3. Streamed SHA-256 matches ``expected_sha256``.
+      4. ``git bundle list-heads`` advertises ``expected_commit`` on the same inode.
+
+    Leaves ``handle_fd`` rewound to offset 0 on success; closes ``handle_fd`` on any error.
+    """
+    try:
+        if size > max_bytes:
+            raise DeliveryTooLargeError(
+                'The delivered bundle is %d bytes, exceeding the %d-byte serve limit (delivery_serve_max_bytes).'
+                % (size, max_bytes)
+            )
+        stat_before = os.fstat(handle_fd)
+        stat_snapshot = (
+            stat_before.st_dev,
+            stat_before.st_ino,
+            stat_before.st_size,
+            stat_before.st_mtime_ns,
+            stat_before.st_ctime_ns,
+        )
+        os.lseek(handle_fd, 0, os.SEEK_SET)
+        first_chunk = os.read(handle_fd, BUNDLE_BLOCK_BYTES)
+        if not first_chunk:
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
+        newline_idx = first_chunk.find(b'\n')
+        first_line = first_chunk[: newline_idx + 1] if newline_idx >= 0 else first_chunk[:200]
+        if not BUNDLE_SIGNATURE.match(first_line):
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
+        digest = hashlib.sha256(first_chunk)
+        total = len(first_chunk)
+        while True:
+            if total > max_bytes:
+                raise DeliveryTooLargeError(
+                    'The delivered bundle exceeds the %d-byte serve limit (delivery_serve_max_bytes).'
+                    % (max_bytes,)
+                )
+            block = os.read(handle_fd, BUNDLE_BLOCK_BYTES)
+            if not block:
+                break
+            total += len(block)
+            digest.update(block)
+        if total > max_bytes:
+            raise DeliveryTooLargeError(
+                'The delivered bundle is %d bytes, exceeding the %d-byte serve limit (delivery_serve_max_bytes).'
+                % (total, max_bytes)
+            )
+        actual_sha = digest.hexdigest().lower()
+        if not expected_sha256 or actual_sha != str(expected_sha256).lower():
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
+        info = os.fstat(handle_fd)
+        if (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        ) != stat_snapshot or total != info.st_size:
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
+        before_git = os.lstat(str(resolved_path))
+        if (before_git.st_dev, before_git.st_ino) != (info.st_dev, info.st_ino):
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
+        runner = _run_bundle_git if git is None else git
+        observation = {'path': str(resolved_path), 'bytes': total, 'sha256': actual_sha, 'heads': [], 'heads_error': None}
+        try:
+            raw = runner(['bundle', 'list-heads', str(resolved_path)])
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            observation['heads_error'] = str(exc)[:200]
+        else:
+            for line in str(raw or '').splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', parts[0]):
+                    observation['heads'].append({'commit': parts[0].lower(), 'ref': parts[1]})
+        after_git = os.lstat(str(resolved_path))
+        if (after_git.st_dev, after_git.st_ino) != (info.st_dev, info.st_ino):
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
+        info_after = os.fstat(handle_fd)
+        if (
+            info_after.st_dev,
+            info_after.st_ino,
+            info_after.st_size,
+            info_after.st_mtime_ns,
+            info_after.st_ctime_ns,
+        ) != stat_snapshot:
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
+        if bundle_commit_problem(observation, expected_commit) is not None:
+            raise DeliveryCorruptError(DELIVERY_CHECKSUM_MISMATCH)
+        os.lseek(handle_fd, 0, os.SEEK_SET)
+        return {'bytes': total, 'sha256': actual_sha, 'stat_snapshot': stat_snapshot}
+    except BaseException:
+        try:
+            os.close(handle_fd)
+        except OSError:
+            pass
+        raise
+
+
+def contribution_delivery_records(issue, operators=None):
+    """Ordered contribution delivery records for ``issue`` after applied operator voids."""
+    applied, _, _ = applied_review_voids(issue, operators)
+    ordered = records(issue, set(applied))
+    contributions = []
+    revision = 0
+    for payload, comment in ordered:
+        if payload.get('operation') != 'contribute':
+            continue
+        revision += 1
+        contributions.append({
+            'task': str(issue['id']),
+            'contribution': str(comment['id']),
+            'revision': revision,
+            'commit': payload['commit'],
+            'base_commit': payload['base_commit'],
+            'repository': payload['repository'],
+            'author': str(comment.get('author') or ''),
+            'at': str(comment.get('created_at') or ''),
+            'delivery': dict(payload['delivery']),
+        })
+    return contributions
+
 
 
 def integration_hold_sentence(state):

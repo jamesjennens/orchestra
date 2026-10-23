@@ -341,6 +341,8 @@ class _InlineWait:
     #: fields are dropped and the checkpoint-independent wait marker takes the marker's
     #: place. Kept identical to ``waiting.WORKER_MOVE_FIELDS``; the coordinator form keeps
     #: ``MOVE_FIELDS`` unchanged.
+    # Ownership (including parent/sub-label authors) is resolved by the producer
+    # of wait_newer_activity_marker; this projection must not reinterpret actors.
     WORKER_MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor', 'owner', 'status',
                           'contribution_id', 'pending_review_items', 'redelivered',
                           'guidance_version', 'wait_newer_activity_marker')
@@ -1016,6 +1018,23 @@ def _wait_command(args,config,project,actor,out,config_path=None):
         sys.stdout.write(text)
     return code
 
+DELIVERY_SSH_ONLY_HTTP = (
+    "Delivered bundles are served over HTTP only; on the host transport, read the "
+    "contribution's recorded delivery.path directly."
+)
+
+
+def _delivery_command():
+    """``client.py delivery`` (kittrial-5bb.373).
+
+    ``client.py`` is the SSH/local host-transport client; it answers the fixed sentence and
+    reads nothing from disk (precision 4, s3-client-config). HTTP bundle metadata and verified
+    downloads are served through ``http_client.py delivery``.
+    """
+    sys.stderr.write('ValueError: %s\n' % DELIVERY_SSH_ONLY_HTTP)
+    return 2
+
+
 def _capability(args,out):
     """Client-side, read-only capability lookup over the caller's own checkout.
 
@@ -1279,6 +1298,7 @@ CONTRIBUTOR_COMMANDS = (
     ('ready', 'the tasks nobody holds that you may claim'),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
     ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
+    ('delivery TASK [--contribution ID] [--out FILE]', 'fetch and verify a delivered bundle over HTTP'),
     ('handoff ...', 'hand a task to another actor, and read what the endpoint reconciled'),
     ('guidance get|ack', 'the worker guidance in force, and the acknowledgement of a version'),
     ('onboard', 'what a new worker is told about this project'),
@@ -1323,7 +1343,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: The actions the client dispatches itself; every other name in the table above is passed to the
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
-CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','work',
+CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
                   'wait','feedback','requirement','requirements','ref','capability','proposal','guidance',
                   'coordinator')
 
@@ -1403,18 +1423,21 @@ def main():
     if args[0] not in contributor_command_names():
         print(server_text(contributor_help_text(args[0])), file=sys.stderr)
         return 1
+    if args[0]=='delivery':
+        return _delivery_command()
     # wait blocks HERE, in the client, and polls the endpoint's wait read (kittrial-5bb.285);
     # the endpoint is therefore asked per poll, never for one blocking call, so an agent over
     # HTTP can use the same read.
+    config_doc = json.loads(Path(a.config).read_text())
     if args[0]=='wait':
-        return _wait_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out,
+        return _wait_command(args[1:],config_doc,a.project,a.actor,a.out,
                              config_path=a.config)
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
     elif args[0] in CLIENT_ACTIONS:action=args.pop(0)
-    result=request(json.loads(Path(a.config).read_text()),a.project,a.actor,args,action,path)
+    result=request(config_doc,a.project,a.actor,args,action,path)
     output = result['stdout']
     # The server's time of a write that was carried out (kittrial-5bb.97): one line on standard
     # error, so that standard output is exactly what it was. An older endpoint sends none.

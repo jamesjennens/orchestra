@@ -1906,6 +1906,15 @@ console.log(JSON.stringify({
     && m.agentGuide(p).includes('ask in the task for the content or a repository path'),
   // kittrial-5bb.372: the generated AGENT.md says where a question goes.
   guideStatesWhereQuestionsGo: m.agentGuide(p).includes('ask in the task (a comment, or an open item of kind question in your checkpoint) so the coordinator answers it there; do not ask the person at the keyboard, who may not be watching, unless they started this turn with a question for you.'),
+  // kittrial-5bb.383: the coordinator part of the generated AGENT.md carries the
+  // web-only merge/push recipe with the agent's own repository credential.
+  guideStatesMergeRecipe: /## If you coordinate a project: merging and pushing/.test(m.agentGuide(p))
+    && m.agentGuide(p).includes('YOUR OWN repository-scoped credential')
+    && m.agentGuide(p).includes("Never use the server's credential")
+    && m.agentGuide(p).includes('the integration as your word')
+    && m.agentGuide(p).includes('ONE stable Idempotency-Key per step')
+    && m.agentGuide(p).includes('Resume from the first ledger row that is not committed'),
+  guideMergeRecipeWhoPushes: m.agentGuide(p).includes('the repository-scoped credential and the decision that you may push with it'),
   paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
           m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
   ignore: [m.gitignoreAppend('node_modules'), m.gitignoreAppend('a\r\n'), m.gitignoreAppend('/.orchestra\n'),
@@ -1979,6 +1988,8 @@ console.log(JSON.stringify({
         self.assertTrue(result['guideWithCertIsKOnly'])
         self.assertTrue(result['guideStatesPathRule'])
         self.assertTrue(result['guideStatesWhereQuestionsGo'])
+        self.assertTrue(result['guideStatesMergeRecipe'])
+        self.assertTrue(result['guideMergeRecipeWhoPushes'])
         self.assertIn('cacert', result['guideWithCert'])
         self.assertIn('ssl-no-revoke', result['guideWithCert'])
         # The rewrite WRITES the curl options with the real expanded path.
