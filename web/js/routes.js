@@ -17,6 +17,8 @@ export const ROUTE_PATTERNS = [
   ['reviews', '/p/{pid}/reviews'],
   ['releases', '/p/{pid}/releases'],
   ['feedback', '/p/{pid}/feedback'],
+  ['rooms', '/p/{pid}/rooms'],
+  ['room', '/p/{pid}/rooms/{rid}'],
   ['settings', '/p/{pid}/settings'],
   ['setup', '/p/{pid}/setup'],
   ['how', '/p/{pid}/how'],

@@ -324,6 +324,10 @@ CAP_APPROVE = 'reviews.approve'
 #: member or an agent can propose. Triage and decisions need CAP_APPROVE, which no
 #: credential ever holds.
 CAP_PROPOSALS = 'proposals.write'
+#: Post a message in a project room (kittrial-5bb.385, rooms slice 1). Contributor,
+#: coordinator and owner roles hold it; it is deliberately NOT in SCOPE_CAPABILITIES, so
+#: no agent credential can hold it: agents cannot post in this slice.
+CAP_ROOMS_POST = 'rooms.post'
 #: Propose or revise reference and capability records (.201 slice 5, kittrial-5bb.213).
 #: Contributors, coordinators and owners hold it, and the `tasks` credential scope grants it.
 CAP_RECORDS = 'records'
@@ -374,14 +378,15 @@ CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 ROLE_CAPABILITIES = {
     'viewer': frozenset({CAP_READ}),
     'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
-                              CAP_FEEDBACK, CAP_PROPOSALS}),
+                              CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST}),
     # Between contributor and owner: approves and coordinates; does not administer the
     # project (members, worker credentials, archive and the audit stay the owner's).
     'coordinator': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
-                              CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE}),
+                              CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_APPROVE,
+                              CAP_COORDINATE}),
     'owner': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
-                        CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE,
-                        CAP_PROJECT_ADMIN, CAP_RELEASE}),
+                        CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_APPROVE,
+                        CAP_COORDINATE, CAP_PROJECT_ADMIN, CAP_RELEASE}),
 }
 #: What the coordinator grant adds to an agent's credential in the project of the grant.
 GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE, CAP_RECORDS})
