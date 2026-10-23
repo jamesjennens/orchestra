@@ -318,6 +318,26 @@ class Client:
         return self.request('GET', '/v1/projects/%s/tasks/%s/lifecycle'
                             % (quote(project, safe=''), quote(task, safe='')))
 
+    def integration_check(self, project, task, target=None):
+        """The read-only merge check and its step ledger (kittrial-5bb.383)."""
+        path = '/v1/projects/%s/tasks/%s/integration-check' % (
+            quote(project, safe=''), quote(task, safe=''))
+        if target is not None:
+            path += '?' + urlencode({'target': target})
+        return self.request('GET', path)
+
+    def ledger(self, project, task, target=None):
+        """The writes still owed, from the same read-only integration check.
+
+        Returns the task, target, `merge_ready` and the `next` rows only: a
+        coordinator reads the check before merging and this ledger to resume from the
+        first row that is not `committed`.
+        """
+        state = self.integration_check(project, task, target)
+        return {'task': state.get('task'), 'target': state.get('target'),
+                'merge_ready': state.get('merge_ready'),
+                'next': state.get('next') or []}
+
     def _write_lifecycle(self, project, task, operation, body, key=None, dimension=None):
         identity = key or new_idempotency_key()
         suffix = 'scope' if operation == 'scope' else 'facts/' + quote(dimension, safe='')
@@ -768,6 +788,14 @@ def _build_parser():
     life.add_argument('--dimension', choices=('implemented','tested','reviewed','integrated','deployed','live-verified'))
     life.add_argument('--file', help='UTF-8 JSON HTTP request body for scope or fact')
     life.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
+    check = sub.add_parser('integration-check',
+                           help='read the merge check: checks, unchecked rows and the step ledger')
+    check.add_argument('project');check.add_argument('task')
+    check.add_argument('--target', help='target branch to compare with the held merge slot')
+    ledger = sub.add_parser('ledger',
+                            help='read only the step ledger: the writes still owed, in order')
+    ledger.add_argument('project');ledger.add_argument('task')
+    ledger.add_argument('--target', help='target branch to compare with the held merge slot')
     ref = sub.add_parser('ref', help='read or mutate project reference records')
     ref.add_argument('project')
     ref.add_argument('operation', choices=('list', 'find', 'get', 'propose', 'revise', 'accept', 'retire'))
@@ -874,6 +902,12 @@ def main(argv=None):
                 result = client._write_lifecycle(args.project, args.task, args.operation, body,
                                                  args.idempotency_key, args.dimension)
             print(json.dumps(result, indent=2));return 0
+        if args.command == 'integration-check':
+            print(json.dumps(client.integration_check(args.project, args.task, args.target), indent=2))
+            return 0
+        if args.command == 'ledger':
+            print(json.dumps(client.ledger(args.project, args.task, args.target), indent=2))
+            return 0
         if args.command == 'ref':
             op = args.operation
             if op == 'list':

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from test_http_agents import AgentHarness
-from http_service import ApiHandler
+from http_service import ApiHandler, UncertainOutcome
 
 
 class LifecycleHttpTests(AgentHarness):
@@ -96,6 +96,35 @@ class LifecycleHttpTests(AgentHarness):
         self.assertEqual(len(committed), 1)
         self.assertEqual(committed[0]['operation_id'], retry.data['operation_id'])
         self.assertEqual(committed[0]['event_id'], retry.data['event_id'])
+        # The uncertain answer carries the step and its deterministic identity, so the
+        # integration-check ledger can name the step to retry (kittrial-5bb.383).
+        uncertain = [a for a in self.service.state['audit']
+                     if a['action'] == 'lifecycle.scope' and a['outcome'] == 'unknown']
+        self.assertEqual(len(uncertain), 1)
+        self.assertEqual(uncertain[0]['task'], self.task)
+        self.assertEqual(uncertain[0]['dimension'], 'lifecycle-scope')
+        self.assertEqual(uncertain[0]['operation_id'], retry.data['operation_id'])
+
+    def test_an_uncertain_fact_reads_unknown_with_the_identity_to_retry(self):
+        """A 503 whose effect was never observed is a ledger row to resume, not a new key."""
+        self.set_scope()
+        check = ('/v1/projects/' + self.project + '/tasks/' + self.task
+                 + '/integration-check?target=main')
+        with patch.object(self.backend, '_lifecycle_write',
+                          side_effect=UncertainOutcome('synthetic reserved outcome')):
+            lost = self.post('/facts/reviewed', self.fact_body(), 'uncertain-fact')
+        self.assertEqual(lost.status, 503, lost.data)
+        unknown = [a for a in self.service.state['audit']
+                   if a['action'] == 'lifecycle.fact' and a['outcome'] == 'unknown']
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0]['dimension'], 'reviewed')
+        result = self.request('GET', check, token=self.admin)
+        self.assertEqual(result.status, 200, result.data)
+        steps = {step['step']: step for step in result.data['next']}
+        self.assertEqual(steps['reviewed']['state'], 'unknown')
+        self.assertEqual(steps['reviewed']['operation_id'], unknown[0]['operation_id'])
+        self.assertIsNone(steps['reviewed']['fact'])
+        self.assertEqual(steps['reviewed']['response_state'], 'unknown')
 
     def test_full_route_target_separates_same_key_and_changed_body_is_refused(self):
         self.set_scope()
@@ -144,6 +173,49 @@ class LifecycleHttpTests(AgentHarness):
         self.assertEqual(result.data['task']['id'], self.task)
         self.assertTrue(result.data['current_actor'])
         self.assertEqual(self.service.state['canonical']['tasks'][self.task], before)
+
+    def test_integration_check_ledger_marks_an_uncertain_step_with_its_identity(self):
+        scope = self.set_scope()
+        check = ('/v1/projects/' + self.project + '/tasks/' + self.task
+                 + '/integration-check?target=main')
+        with self.service.store.lock:
+            # What an uncertain lifecycle answer records: the step, the task and the
+            # deterministic operation identity the backend used (kittrial-5bb.383).
+            # A row from before this ledger has no task metadata and is ignored.
+            self.service.state['audit'].append(dict(
+                time='2026-10-23T00:00:00+00:00', request_id='synthetic-uncertain',
+                project_id=self.project, action='lifecycle.fact', outcome='unknown',
+                task=self.task, dimension='reviewed', operation_id='operation-reviewed',
+                reason='uncertain'))
+            self.service.state['audit'].append(dict(
+                time='2026-10-23T00:00:01+00:00', request_id='synthetic-legacy',
+                project_id=self.project, action='lifecycle.fact', outcome='unknown',
+                dimension='integrated', operation_id='legacy-no-task'))
+        result = self.request('GET', check, token=self.admin)
+        self.assertEqual(result.status, 200, result.data)
+        steps = {step['step']: step for step in result.data['next']}
+        self.assertEqual(steps['scope']['state'], 'committed')
+        self.assertEqual(steps['scope']['fact'], scope.data['event_id'])
+        self.assertEqual(steps['reviewed']['state'], 'unknown')
+        self.assertEqual(steps['reviewed']['operation_id'], 'operation-reviewed')
+        self.assertEqual(steps['reviewed']['response_state'], 'unknown')
+        self.assertEqual(steps['integrated']['state'], 'not-attempted')
+        self.assertIsNone(steps['integrated']['operation_id'])
+        # A committed native fact stays committed and keeps its fact id, while the
+        # last response is still reported beside it.
+        with self.service.store.lock:
+            self.service.state['audit'].append(dict(
+                time='2026-10-23T00:00:02+00:00', request_id='synthetic-scope-uncertain',
+                project_id=self.project, action='lifecycle.scope', outcome='unknown',
+                task=self.task, dimension='lifecycle-scope', operation_id='operation-scope',
+                reason='uncertain'))
+        again = self.request('GET', check, token=self.admin)
+        self.assertEqual(again.status, 200, again.data)
+        steps = {step['step']: step for step in again.data['next']}
+        self.assertEqual(steps['scope']['state'], 'committed')
+        self.assertEqual(steps['scope']['fact'], scope.data['event_id'])
+        self.assertEqual(steps['scope']['response_state'], 'unknown')
+        self.assertEqual(steps['scope']['operation_id'], scope.data['operation_id'])
 
     def test_integration_check_refuses_another_projects_task_and_unknown_query(self):
         other = self.create_project(self.admin, 'Other check project')

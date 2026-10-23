@@ -107,16 +107,20 @@ class IntegrationCheckTests(unittest.TestCase):
         steps = {step['step']: step for step in result['next']}
         self.assertEqual(steps['scope']['state'], 'committed')
         self.assertEqual(steps['scope']['operation_id'], scope_write['operation_id'])
+        self.assertEqual(steps['scope']['fact'], scope_write['event_id'])
         for name in ('reviewed', 'integrated', 'integrated-mark', 'slot-release'):
             self.assertEqual(steps[name]['state'], 'not-attempted', steps[name])
             self.assertIsNone(steps[name]['operation_id'])
+            self.assertIsNone(steps[name]['fact'])
         self.assertTrue(steps['integrated-mark']['automatic'])
         self.assertIn('Idempotency-Key', steps['slot-release']['operation_id_note'])
+        self.assertIn('no native fact', steps['slot-release']['fact_note'])
 
     def test_after_merge_the_committed_rows_name_their_reused_operation_identity(self):
-        self.scoped()
-        self.apply(self.fact_body('reviewed', 'passed'), 'reviewed-1')
-        self.apply(self.fact_body('integrated', 'passed'), 'integrated-1', mark_writes=True)
+        scope_write = self.scoped()
+        reviewed = self.apply(self.fact_body('reviewed', 'passed'), 'reviewed-1')
+        integrated = self.apply(self.fact_body('integrated', 'passed'), 'integrated-1', mark_writes=True)
+        mark = marks.read_journal(self.project)['entries'][integrated['event_id']]
         before = copy.deepcopy(self.rows)
         writes = self.writes
         result = self.check()
@@ -125,13 +129,37 @@ class IntegrationCheckTests(unittest.TestCase):
         self.assertTrue(all(row['allowed'] for row in result['checks']), result['checks'])
         steps = {step['step']: step for step in result['next']}
         self.assertEqual(steps['scope']['state'], 'committed')
+        self.assertEqual(steps['scope']['operation_id'], scope_write['operation_id'])
+        self.assertEqual(steps['scope']['fact'], scope_write['event_id'])
         self.assertEqual(steps['reviewed']['state'], 'committed')
         self.assertEqual(steps['reviewed']['operation_id'], 'reviewed-1')
+        self.assertEqual(steps['reviewed']['fact'], reviewed['event_id'])
         self.assertEqual(steps['integrated']['state'], 'committed')
         self.assertEqual(steps['integrated']['operation_id'], 'integrated-1')
+        self.assertEqual(steps['integrated']['fact'], integrated['event_id'])
         self.assertEqual(steps['integrated-mark']['state'], 'committed')
         self.assertEqual(steps['integrated-mark']['operation_id'], 'integrated-1')
+        self.assertEqual(steps['integrated-mark']['fact'], mark['sha256'])
         self.assertEqual(steps['slot-release']['state'], 'not-attempted')
+
+    def test_native_integration_without_its_mark_reads_unknown_with_its_identity(self):
+        self.scoped()
+        integrated = self.apply(self.fact_body('integrated', 'passed'), 'integrated-1',
+                                mark_writes=True)
+        entry = marks.read_journal(self.project)['entries'][integrated['event_id']]
+        (self.project / marks.DIRECTORY / (entry['sha256'] + '.json')).unlink()
+        before = copy.deepcopy(self.rows)
+        writes = self.writes
+        steps = {step['step']: step for step in self.check()['next']}
+        self.assertEqual(self.rows, before)
+        self.assertEqual(self.writes, writes)
+        self.assertEqual(steps['integrated']['state'], 'committed')
+        self.assertEqual(steps['integrated']['operation_id'], 'integrated-1')
+        self.assertEqual(steps['integrated']['fact'], integrated['event_id'])
+        self.assertEqual(steps['integrated-mark']['state'], 'unknown')
+        self.assertEqual(steps['integrated-mark']['operation_id'], 'integrated-1')
+        self.assertIsNone(steps['integrated-mark']['fact'])
+        self.assertIn('host mark is not confirmed', steps['integrated-mark']['reason'])
 
     def test_refusals_are_answers_with_the_writers_sentence(self):
         self.scoped()
