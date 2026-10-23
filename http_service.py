@@ -847,22 +847,30 @@ class InProcessBackend:
                      integration_commit=(scope or {}).get('integration_commit'), reverted_commits=[]),
             ]
             base = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
+            scope_event = memory.get('scope_event_id') if scope is not None else None
             steps = [dict(step='scope', route='POST ' + base + '/lifecycle/scope',
                           state='committed' if scope is not None else 'not-attempted',
-                          operation_id=None)]
+                          operation_id=(scope_event[4:] if isinstance(scope_event, str)
+                                        and scope_event.startswith('lif_') else None),
+                          fact=scope_event)]
             for dimension in ('reviewed', 'integrated'):
                 passed = facts[dimension]['value'] == 'passed'
+                fact = facts[dimension].get('event_id') if passed else None
                 steps.append(dict(step=dimension,
                                   route='POST ' + base + '/lifecycle/facts/' + dimension,
                                   state='committed' if passed else 'not-attempted',
-                                  operation_id=None))
+                                  operation_id=(fact[4:] if isinstance(fact, str)
+                                                and fact.startswith('lif_') else None),
+                                  fact=fact))
             steps.append(dict(step='integrated-mark',
                               route='POST ' + base + '/lifecycle/facts/integrated',
-                              automatic=True, state='not-attempted', operation_id=None))
+                              automatic=True, state='not-attempted', operation_id=None,
+                              fact=None))
             steps.append(dict(step='slot-release',
                               route='POST /v1/projects/%s/merge-slot/release' % project_id,
-                              state='not-held', operation_id=None,
-                              operation_id_note='The server records no identity for a slot release.'))
+                              state='not-held', operation_id=None, fact=None,
+                              operation_id_note='The server records no identity for a slot release.',
+                              fact_note='A slot release has no native fact; the server records only the operation audit.'))
             return dict(task=dict(id=task.get('id'), title=task.get('title'),
                                   status=task.get('status'), assignee=task.get('assignee')),
                         contribution=contribution, review_state=None,
@@ -909,6 +917,7 @@ class InProcessBackend:
         event_id = 'lif_' + operation_id
         if operation == 'scope':
             memory['scope'] = native['scope']
+            memory['scope_event_id'] = event_id
         else:
             fact = dict(value=native['value'], event_id=event_id, evidence=native['evidence'],
                         provenance=native['provenance'])
@@ -5340,8 +5349,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 public, stored = fn()
         except UncertainOutcome:
             self.service.idempotency_unknown(digest)
-            self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
-                               project_id=project_id, reason=reason or 'uncertain')
+            event = self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
+                                       project_id=project_id, reason=reason or 'uncertain')
+            # The lifecycle write records the step's task, dimension and deterministic
+            # operation identity on an uncertain answer too, so the integration-check
+            # ledger can say which step to resume with the same identity
+            # (kittrial-5bb.383). Other routes carry no such metadata.
+            if audit_metadata:
+                event.update(audit_metadata)
             self.service.store.save()
             raise uncertain(self.UNCERTAIN if ctx.idempotency_key is not None else self.UNCERTAIN_NO_KEY)
         except HttpError as error:
@@ -6960,8 +6975,58 @@ class ApiHandler(BaseHTTPRequestHandler):
                     and hasattr(self.backend, 'lifecycle_replay_guard')):
                 self.backend.lifecycle_replay_guard(ctx.principal, ctx.params['pid'],
                     ctx.params['tid'], ctx.params['dimension'])
+        # The deterministic operation identity the backend will use, recorded on an
+        # uncertain (124 at the endpoint / 503 here) answer so the ledger can name the
+        # step and the identity to retry (kittrial-5bb.383).
+        ledger_audit = None
+        if ctx.idempotency_key is not None and hasattr(self.backend, '_result_key'):
+            ledger_audit = dict(task=ctx.params['tid'],
+                                dimension=('lifecycle-scope' if operation == 'scope'
+                                           else ctx.params['dimension']),
+                                operation_id=self.backend._result_key(
+                                    ctx.principal, ctx.params['pid'], route_name,
+                                    ctx.idempotency_key, ctx.route_target))
         return self._mutate(ctx, route_name, ctx.params['pid'], write, capability=CAP_COORDINATE,
-                            status=201, serialize=False, canonical=True, audit_success=False, replay_check=replay_check)
+                            status=201, serialize=False, canonical=True, audit_success=False,
+                            replay_check=replay_check, audit_metadata=ledger_audit)
+
+    #: Lifecycle audit actions whose last HTTP response the step ledger reports.
+    LEDGER_ACTIONS = ('lifecycle.scope', 'lifecycle.fact')
+
+    def _ledger_uncertain(self, project_id, task_id, steps):
+        """Mark a not-yet-committed step whose last HTTP answer was uncertain.
+
+        The canonical native rows stay authoritative: a step with a native fact keeps
+        its `committed` state and fact id (and reports the last response beside it).
+        A step with no native write but a lifecycle audit `unknown` outcome reads
+        `unknown`, carrying the deterministic operation identity the backend used, so
+        a coordinator retries that identity instead of minting a new one
+        (kittrial-5bb.383). Audit rows without the task/dimension metadata added for
+        this ledger are skipped: they cannot be attributed to a step.
+        """
+        latest = {}
+        for event in self.service.state['audit']:
+            if (event.get('project_id') != project_id
+                    or event.get('action') not in self.LEDGER_ACTIONS
+                    or event.get('task') != task_id
+                    or not isinstance(event.get('operation_id'), str)):
+                continue
+            if event.get('action') == 'lifecycle.scope':
+                step = 'scope'
+            else:
+                step = event.get('dimension')
+                if step not in ('reviewed', 'integrated'):
+                    continue
+            latest[step] = event
+        for row in steps:
+            event = latest.get(row.get('step'))
+            if event is None:
+                continue
+            row['response_state'] = event.get('outcome')
+            if row.get('state') != 'committed' and event.get('outcome') == 'unknown':
+                row['state'] = 'unknown'
+                row['operation_id'] = event['operation_id']
+        return steps
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/integration-check')
     def integration_check_get(self, ctx):
@@ -6973,6 +7038,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         target = ctx.query.get('target')
         result = self.backend.integration_check(ctx.principal, ctx.params['pid'],
                                                 ctx.params['tid'], target)
+        result['next'] = self._ledger_uncertain(ctx.params['pid'], ctx.params['tid'],
+                                                result.get('next') or [])
         result['current_actor'] = self.service.bind_actor(ctx.principal, None)
         return 200, result
 

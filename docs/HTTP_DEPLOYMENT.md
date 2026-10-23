@@ -70,16 +70,27 @@ permission (no `coordinate`), takes nothing and writes nothing. It answers
 `task`, the current `contribution` and review state, five `checks` (`approval`,
 `source_commit`, `slot`, `hold`, `reverted`), three `unchecked` rows
 (`base_membership`, `tests`, `pushed_result`, each `known: false` because the
-server has no code-host access), and `next`: the writes still owed in order
-(scope, reviewed, integrated, the integrated mark, slot release), each with its
-route and the operation identity its native event records when the write was
-already made. A refused row is HTTP 200 with the writer's own sentence, not an
-error, so every reason is visible at once; an absent task is 404. The optional
-`target` query is the branch name the merge-slot acquire accepts. The route is
-classified read-only in `endpoint.py` and `http_authority.py`, so it cannot take
-the slot, write a fact or merge. `merge_ready` covers only the five checks; it
-does not turn the three unchecked rows into a pass. The task page has a lazy
-"Integration check" panel for the refused and unchecked rows.
+server has no code-host access), and `next`: the step ledger, the writes still owed
+in order (scope, reviewed, integrated, the integrated mark, slot release). Each
+ledger row carries its `route`, its `operation_id` (the identity its native event
+records when the write was made), its `state` and its canonical `fact`. `state` is
+`committed`, `not-attempted`, `unknown` (a native integration exists but its host
+mark is not confirmed, or the step's last HTTP answer was uncertain) or `not-held`
+for a slot that is not held. `fact` is the native event id for the scope and the
+facts, the host mark sha256 for the integrated mark, and absent for a slot release
+(which has no native fact; its `fact_note` says so). A not-yet-committed step whose
+last lifecycle answer was uncertain reads `unknown` with the deterministic
+operation identity the server used, so a coordinator retries that identity instead
+of minting a new one; a committed row keeps its fact id and reports the last
+response beside it as `response_state`. Audit activity from before this ledger
+carries no step metadata and is ignored rather than guessed. A refused row is HTTP
+200 with the writer's own sentence, not an error, so every reason is visible at
+once; an absent task is 404. The optional `target` query is the branch name the
+merge-slot acquire accepts. The route is classified read-only in `endpoint.py` and
+`http_authority.py`, so it cannot take the slot, write a fact or merge.
+`merge_ready` covers only the five checks; it does not turn the three unchecked
+rows into a pass. The task page has a lazy "Integration check" panel for the
+refused and unchecked rows.
 
 | Route | Closed request body | Confirmed result |
 | --- | --- | --- |
@@ -131,7 +142,50 @@ Copied `http_client.py` methods are `lifecycle`, `set_lifecycle_scope` and
 `record_lifecycle_fact`. The standard-library CLI is
 `http_client.py lifecycle PROJECT TASK read|scope|fact`; writes take `--file` with
 the HTTP JSON body, `--idempotency-key`, and `--dimension` for a fact. Reuse that
-file and key when reconciling an ambiguous request.
+file and key when reconciling an ambiguous request. The same client has
+`integration_check(project, task, target=None)` and `ledger(project, task,
+target=None)` for the read-only merge check and its step ledger; the CLI is
+`http_client.py integration-check PROJECT TASK [--target BRANCH]` for the whole
+answer and `http_client.py ledger PROJECT TASK [--target BRANCH]` for the `task`,
+`target`, `merge_ready` and `next` rows alone.
+
+### The web-only merge and push recipe (an agent with its own repository credential)
+
+This is the sequence for a coordinator agent that reaches Orchestra only over HTTP
+and has its own repository-scoped credential. The server never merges, tests or
+pushes; it records the coordinator's word, and `unchecked` says so.
+
+1. **Read before touching the repository.** `GET .../tasks/{task}/integration-check`
+   (or `http_client.py integration-check`/`ledger`). Stop on any refused `checks`
+   row, and treat every `unchecked` row as unknown, never as a pass.
+2. **Take the slot** with `POST .../merge-slot/acquire` for the task and target
+   branch, with one stable `Idempotency-Key`.
+3. **Fetch, check out and merge** in a clone the agent can push from. The approved
+   commit is merged as a merge commit; the target branch is never force-pushed and
+   the approved commit is never rewritten. The agent's repository credential is its
+   own, scoped to that repository. It is never the server's credential, the
+   Orchestra secret, or another person's credential.
+4. **Run the project's tests** in that checkout and record the result as `tested`
+   evidence if the project wants it on the tracker; it is not `integrated`.
+5. **Push the target branch** with the agent's own credential. The server cannot see
+   the push: the integration records it as the agent's word.
+6. **Record the facts** with one stable `Idempotency-Key` per step: the scope with
+   `source_commit` = the approved commit and `integration_commit` = the pushed merge
+   commit, then `reviewed=passed`, then `integrated=passed` (which also publishes
+   the host mark when the writer is enabled), then release the slot.
+7. **Resume from the ledger after a failure.** Read the check again. Retry only the
+   first row whose `state` is not `committed`, with the *same* `operation_id`/key
+   and the identical body. `unknown` means the outcome was not observed: keep the
+   identity, inspect canonical state, and reconcile. A `409` means state changed:
+   read again before a changed request. Never mint a second identity to "fix" a
+   native integration whose mark is missing; an operator repairs the mark family.
+
+The push and its credential are the agent's own act and record. What stays a
+person's step: approving the repository-scoped credential and deciding the agent
+may push with it; the contribution approval unless a granted agent already holds
+it; deciding whether the tests and merge base are enough when an `unchecked` row
+says the server cannot know; a forced release of a slot; and every void, revert and
+reconciliation.
 
 ### Passed integration marks and operator recovery
 
