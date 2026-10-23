@@ -2,6 +2,7 @@
 import http.client
 import json
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -34,6 +35,17 @@ class ItemsBackend(http_service.InProcessBackend):
         self.proposals = {}
         self.proposal_by_key = {}
         self.calls = []
+        #: Set by the concurrency test: both accept paths meet here, so a route that did
+        #: not serialize the decision would let both create a record.
+        self.accept_barrier = None
+
+    def rendezvous(self):
+        barrier = self.accept_barrier
+        if barrier is not None:
+            try:
+                barrier.wait(timeout=2)
+            except threading.BrokenBarrierError:
+                pass
 
     def requirements_read(self, project_id, args):
         if args[:1] == ['get']:
@@ -51,6 +63,7 @@ class ItemsBackend(http_service.InProcessBackend):
     def owner_requirements(self, principal, project_id, action, fields, key, task=None):
         self.calls.append(('owner_requirements', action, key, task))
         if action == 'create':
+            self.rendezvous()
             known = self.requirement_by_key.get(key)
             if known is not None:
                 return dict(self.requirements[known])
@@ -73,6 +86,7 @@ class ItemsBackend(http_service.InProcessBackend):
 
     def room_decision(self, principal, project_id, fields, key=None):
         self.calls.append(('room_decision', fields['operation_id'], fields['evidence']))
+        self.rendezvous()
         known = self.decision_by_key.get(fields['operation_id'])
         if known is not None:
             return {'decision_id': known, 'evidence': fields['evidence']}
@@ -86,6 +100,7 @@ class ItemsBackend(http_service.InProcessBackend):
         if route == 'proposals.submit':
             if authorize is not None:
                 authorize()
+            self.rendezvous()
             body = payload.get('body') if isinstance(payload, dict) else None
             if not isinstance(body, dict):
                 raise ValueError('proposal body missing')
@@ -202,6 +217,15 @@ class RoomsItemsHttpTests(agents.AgentHarness):
         self.assertIn('orchestra:room/%s#1' % self.room['id'], record['evidence'])
         self.assertEqual({}, self.backend.requirements)
 
+    def test_a_requirement_parent_must_be_an_existing_job(self):
+        # Review n1: a contributor-chosen parent is not trusted; an editor's accept checks
+        # that the named parent is one of the project's jobs before the record write.
+        self.post_item(self.tokens['worker'], parent='not-a-job')
+        refused = self.accept(self.tokens['owner'])
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual({}, self.backend.requirements)
+        self.assertEqual([], self.backend.decisions)
+
     def test_decision_owner_or_coordinator_only(self):
         self.post_item(self.tokens['worker'], kind='decision', title='Use CSV',
                        text='We will emit CSV first.')
@@ -225,10 +249,124 @@ class RoomsItemsHttpTests(agents.AgentHarness):
                   if line['kind'] == 'item-event']
         self.assertEqual(1, len(events))
         self.assertEqual(1, len(self.backend.decisions), 'one native decision, not two')
-        # A DIFFERENT client key after the item is decided is a new decision attempt: refused.
+        # A DIFFERENT client key after the item is decided is a new decision attempt: refused,
+        # and (review b1) it counts no second record or event.
         third = self.accept(self.tokens['owner'], key='accept-key-b')
         self.assertEqual(409, third.status, third.data)
         self.assertEqual(1, len(events))
+        self.assertEqual(1, len(self.backend.requirements))
+        self.assertEqual(1, len(self.backend.decisions))
+        self.assertEqual({}, self.backend.proposals)
+
+    def test_concurrent_accepts_create_only_one_record(self):
+        # Review b2: a contributor accept (a proposal) and an owner accept (a requirement)
+        # running together used to create two records. The item-decision lock makes the
+        # second one see the decided item and write nothing.
+        self.post_item(self.tokens['worker'])
+        self.backend.accept_barrier = threading.Barrier(2)
+        answers = []
+        def run(token, key):
+            answers.append((key, self.accept(token, key=key)))
+        threads = [threading.Thread(target=run, args=(self.tokens['worker'], 'concurrent-worker')),
+                   threading.Thread(target=run, args=(self.tokens['owner'], 'concurrent-owner'))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(2, len(answers), 'both concurrent requests answered')
+        self.assertEqual([200, 409], sorted(answer.status for _key, answer in answers))
+        events = [line for line in rooms.load_lines(Path(self.rooms_root) / self.pid, self.room['id'])
+                  if line['kind'] == 'item-event']
+        self.assertEqual(1, len(events), 'one decision line')
+        winner = next(answer for _key, answer in answers if answer.status == 200).data
+        if winner['record']['kind'] == 'proposal':
+            self.assertEqual(1, len(self.backend.proposals))
+            self.assertEqual({}, self.backend.requirements)
+            self.assertEqual([], self.backend.decisions)
+        else:
+            self.assertEqual(1, len(self.backend.requirements))
+            self.assertEqual(1, len(self.backend.decisions))
+            self.assertEqual({}, self.backend.proposals)
+
+    def test_a_viewer_cannot_amend_or_reject_another_members_question(self):
+        # Review b3: CAP_READ for a question is not a right to amend or reject it.
+        self.post_item(self.tokens['worker'], kind='question', title='Delimiter?',
+                       text='Comma or semicolon?')
+        for route, body in (('/amend', {'title': 'Viewer title', 'text': 'Viewer text'}),
+                            ('/reject', {'reason': 'viewer says no'})):
+            refused = self.request('POST', self.path('/items/1' + route), body,
+                                    token=self.tokens['viewer'], key='viewer-' + route[1:])
+            self.assertEqual(403, refused.status, (route, refused.data))
+        self.assertEqual(('Delimiter?', 'Comma or semicolon?'),
+                         (self.items()[0]['title'], self.items()[0]['text']))
+        # The author may amend and reject their own question.
+        amended = self.request('POST', self.path('/items/1/amend'),
+                               {'title': 'Semicolon?', 'text': 'Semicolon first.'},
+                               token=self.tokens['worker'], key='author-amend')
+        self.assertEqual(200, amended.status, amended.data)
+        rejected = self.request('POST', self.path('/items/1/reject'), {'reason': 'resolved'},
+                                token=self.tokens['worker'], key='author-reject')
+        self.assertEqual(200, rejected.status, rejected.data)
+        # A coordinator or owner may amend and reject anyone's question.
+        second = self.post_item(self.tokens['worker'], kind='question', title='Other?',
+                                text='Other text.', key='item-key-2')
+        self.assertEqual(201, second.status, second.data)
+        owner = self.request('POST', self.path('/items/%d/amend' % second.data['sequence']),
+                             {'title': 'Owner title', 'text': 'Owner text'},
+                             token=self.tokens['owner'], key='owner-amend')
+        self.assertEqual(200, owner.status, owner.data)
+
+    def test_a_moderated_items_amended_title_is_not_served(self):
+        # Review b4: an amendment's title is user text too and must be redacted.
+        self.post_item(self.tokens['worker'], text='Original body.')
+        amended = self.request('POST', self.path('/items/1/amend'),
+                               {'title': 'SECRET amended title', 'text': 'SECRET amended body'},
+                               token=self.tokens['owner'], key='amend-secret')
+        self.assertEqual(200, amended.status, amended.data)
+        moderated = self.request('POST', self.path('/messages/1/moderate'),
+                                 {'reason': 'private'}, token=self.tokens['coord'], key='mod-secret')
+        self.assertEqual(201, moderated.status, moderated.data)
+        read = self.read(self.tokens['viewer'])
+        blob = json.dumps(read.data)
+        self.assertNotIn('SECRET amended title', blob)
+        self.assertNotIn('SECRET amended body', blob)
+        self.assertTrue(read.data['items'][0]['moderated'])
+        events = [message for message in read.data['messages'] if message['kind'] == 'item-event']
+        self.assertTrue(any(event.get('redacted') and event.get('title') is None
+                            for event in events), events)
+
+    def test_an_archived_project_refuses_every_item_decision(self):
+        # Review s1: the item routes must apply slice 1's archived-project refusal.
+        self.post_item(self.tokens['worker'])
+        self.post_item(self.tokens['worker'], kind='question', title='Q?', text='Q text.',
+                       key='item-key-2')
+        self.service.state['projects'][self.pid]['archived'] = True
+        self.store.save()
+        for route, sequence, body in (('/accept', 1, {}), ('/reject', 1, {'reason': 'no'}),
+                                      ('/amend', 1, {'title': 't', 'text': 'x'}),
+                                      ('/answer', 2, {'text': 'an answer'})):
+            refused = self.request('POST', self.path('/items/%d%s' % (sequence, route)), body,
+                                    token=self.tokens['owner'], key='archived-' + route[1:])
+            self.assertEqual(409, refused.status, (route, refused.data))
+        self.assertEqual({}, self.backend.requirements)
+        self.assertEqual({}, self.backend.proposals)
+        self.assertEqual([], self.backend.decisions)
+        self.assertEqual(200, self.read(self.tokens['viewer']).status)
+
+    def test_an_outsider_gets_no_item_existence_oracle(self):
+        # Review n2: membership is checked before the item is read.
+        self.post_item(self.tokens['worker'])
+        for sequence in (1, 99):
+            refused = self.request('POST', self.path('/items/%d/amend' % sequence),
+                                    {'title': 'x', 'text': 'y'}, token=self.tokens['outsider'],
+                                    key='outsider-%d' % sequence)
+            self.assertIn(refused.status, (403, 404), refused.data)
+            self.assertNotIn('No such item', json.dumps(refused.data))
+        missing = self.request('POST', self.path('/items/99/amend'),
+                               {'title': 'x', 'text': 'y'}, token=self.tokens['owner'],
+                               key='member-missing')
+        self.assertEqual(404, missing.status, missing.data)
+        self.assertIn('No such item', missing.data['error']['message'])
 
     def test_r7_an_agent_credential_is_refused_before_any_grant(self):
         self.post_item(self.tokens['worker'])

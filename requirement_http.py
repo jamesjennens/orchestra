@@ -848,6 +848,12 @@ def room_decision(root, project_path, project, request, authority_config, runner
         editor = requirement_editor(state, project, descriptor)
         if editor.get('role') not in ('owner', 'coordinator'):
             raise ValueError('Only the project owner or a coordinator can decide a room decision item')
+        # Review b1 of kittrial-5bb.388: the archived-room refusal is enforced here as well
+        # as in the HTTP route, so no caller of this service-only action can create a
+        # decision from an item in a room that is already archived.
+        room = rooms.read_room(project_path, body['room'])
+        if room['state'] != 'open':
+            raise ValueError('This room is archived; its items can be read, not decided.')
         item = rooms.read_item(project_path, body['room'], body['sequence'])
         if item['moderated'] or item['item_kind'] != 'decision' or \
                 item['state'] not in ('proposed', 'amended'):

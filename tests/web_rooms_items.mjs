@@ -11,17 +11,20 @@ function ctxFor(role) {
     href: (path) => '#' + path,
     go() {},
     accepted,
+    me: { id: 'usr_2', username: 'alice' },
     api: {
       project: async () => ({ id: 'alpha', name: 'Alpha', role, archived: false }),
       rooms: async () => ({ items: [{ id: 'r-0123456789ab', name: 'Planning', state: 'open',
         created_by: 'usr_1', created_by_name: 'Carol', created_at: '2026-10-23T04:00:00Z',
         last_sequence: 3 }], total: 1 }),
       room: async () => data,
+      // Review n1: a requirement accept names its parent job; one job is offered directly.
+      requirements: async () => ({ items: [], jobs: [{ id: 'job_0001', title: 'The project job' }] }),
       createRoom: async () => { throw new Error('not used'); },
       postRoomMessage: async () => { throw new Error('not used'); },
       createRoomItem: async () => { throw new Error('not used'); },
-      acceptRoomItem: async (pid, rid, sequence) => {
-        accepted.push(sequence);
+      acceptRoomItem: async (pid, rid, sequence, note, parent) => {
+        accepted.push([sequence, parent]);
         return { sequence, state: 'accepted' };
       },
       rejectRoomItem: async () => { throw new Error('not used'); },

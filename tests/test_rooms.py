@@ -409,6 +409,14 @@ class RoomsItemsTest(unittest.TestCase):
                          rooms.item_operation(self.room['id'], 3, 1, 'accept'))
         self.assertNotEqual(rooms.item_operation(self.room['id'], 3, 1, 'accept'),
                             rooms.item_operation(self.room['id'], 3, 2, 'accept'))
+        # Review b1/b2: the decision identity does not move with the event count, so a
+        # retried record write reconciles and a decided item is refused before writing.
+        self.assertEqual(rooms.item_decision_operation(self.room['id'], 3, 'accept'),
+                         rooms.item_decision_operation(self.room['id'], 3, 'accept'))
+        self.assertNotEqual(rooms.item_decision_operation(self.room['id'], 3, 'accept'),
+                            rooms.item_decision_operation(self.room['id'], 4, 'accept'))
+        self.assertNotEqual(rooms.item_decision_operation(self.room['id'], 3, 'accept'),
+                            rooms.item_decision_operation(self.room['id'], 3, 'reject'))
 
     def test_export_includes_the_item_and_its_pointer(self):
         self.item()

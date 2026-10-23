@@ -297,6 +297,16 @@ def item_operation(room_id, sequence, revision, action):
     return 'room-%s-%d-%d-%s' % (room_id, sequence, revision, action)
 
 
+def item_decision_operation(room_id, sequence, action):
+    """The stable operation id of one item decision (review b1/b2 of kittrial-5bb.388).
+
+    It names the item and the action, never the current event count: a retried native write
+    reconciles on the same identity instead of creating a second record, and the route can
+    refuse an already-decided item before it calls the native write at all.
+    """
+    return 'room-%s-%d-%s' % (room_id, sequence, action)
+
+
 # -- paths and atomic writes ----------------------------------------------------------------------
 def rooms_root(project):
     path = Path(project) / FOLDER
@@ -872,8 +882,12 @@ def _item_event_view(line, redacted=None):
     if line['event'] == 'amend':
         view['title'] = line.get('title')
     if redacted is not None:
+        # Review b4 of kittrial-5bb.388: every field a person wrote on a moderated item's
+        # event is replaced, including an amendment's title (only text was replaced before).
         view['text'] = redacted['text']
         view['record'] = None
+        if 'title' in view:
+            view['title'] = None
         view['redacted'] = True
     else:
         view['text'] = line['text']
@@ -1007,6 +1021,41 @@ def _find_operation(lines, operation_id):
         if line['operation_id'] == operation_id:
             return line
     return None
+
+
+def find_operation(project, room_id, operation_id):
+    """The existing room line written under one operation id, or None (review b1/b2)."""
+    check_operation_id(operation_id)
+    read_room(project, room_id)
+    return _find_operation(load_lines(project, room_id), operation_id)
+
+
+def decidable_item(project, room_id, sequence, event):
+    """The item an accept/reject/amend/answer may act on, before any native record write.
+
+    Reviews b1 and b2 of kittrial-5bb.388: the route checks the item's state, moderation,
+    room and event kind BEFORE it creates the record an acceptance becomes, under the
+    project's item-decision lock, so a refused or concurrent decision writes nothing.
+    """
+    if type(sequence) is not int or sequence < 1:
+        raise Refusal(422, 'invalid', 'The item number must be a positive whole number')
+    if event not in ITEM_EVENTS:
+        raise Refusal(422, 'invalid', 'Unknown item decision')
+    _room_open(project, room_id)
+    lines = load_lines(project, room_id)
+    current = next((item for item in items_from_lines(lines, room_id)
+                    if item['sequence'] == sequence), None)
+    if current is None or current['kind'] != 'item':
+        raise Refusal(404, 'not_found', 'No such item in this room.')
+    if current['moderated']:
+        raise Refusal(409, 'moderated', 'A moderated item cannot be decided.')
+    if current['state'] not in ('proposed', 'amended'):
+        raise Refusal(409, 'final', 'That item is already decided.')
+    if event == 'accept' and current['item_kind'] == 'question':
+        raise Refusal(400, 'invalid', 'A question is answered, not accepted.')
+    if event == 'answer' and current['item_kind'] != 'question':
+        raise Refusal(400, 'invalid', 'Only a question is answered.')
+    return current
 
 
 def _append(project, room_id, line, limits_values):

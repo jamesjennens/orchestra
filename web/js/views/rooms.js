@@ -94,6 +94,22 @@ export async function detail(ctx, { pid, rid }) {
   // sequence, then reads the page ending there (review s5).
   let since = null;
   let room = null;
+  let jobs = null;
+
+  // The jobs a candidate requirement may hang under (review n1 of kittrial-5bb.388). The
+  // server requires an existing job; the page offers the project's jobs and never lets an
+  // accept without one go through when the choice matters.
+  async function jobList() {
+    if (jobs !== null) return jobs;
+    try {
+      const listed = (typeof ctx.api.requirements === 'function')
+        ? await ctx.api.requirements(pid) : {};
+      jobs = (listed.jobs || []).map((job) => [job.id, job.title || job.id]);
+    } catch (error) {
+      jobs = [];
+    }
+    return jobs;
+  }
 
   function messageRow(message) {
     const label = message.kind === 'item' ? 'item: ' + message.item_kind
@@ -119,6 +135,10 @@ export async function detail(ctx, { pid, rid }) {
   function itemRow(item) {
     const live = item.state === 'proposed' || item.state === 'amended';
     const may = live && canDecide(project, item.item_kind);
+    // Review b3: amend and reject need the author or a project owner/coordinator; the
+    // server refuses a viewer amending or rejecting someone else's question.
+    const mayEdit = live && (canModerate(project)
+      || Boolean(ctx.me && item.author && item.author.id === ctx.me.id));
     const decision = h('div', { class: 'stack' });
     const actions = h('div', { class: 'toolbar' });
 
@@ -134,12 +154,35 @@ export async function detail(ctx, { pid, rid }) {
       decision.replaceChildren(box);
     }
 
+    async function acceptItem() {
+      let parent = item.parent || null;
+      // Only an owner/coordinator's accept creates a requirement that needs a job; a
+      // contributor's accept is a proposal and needs none (review n1).
+      if (item.item_kind === 'requirement' && canModerate(project)) {
+        const known = await jobList();
+        if (!parent && known.length === 1) parent = known[0][0];
+        if (!parent) {
+          if (!known.length) {
+            decision.replaceChildren(h('div', { class: 'small warn' },
+              'This project has no job yet; create one before accepting a requirement.'));
+            return;
+          }
+          form([field({ id: 'accept-parent-' + item.sequence, label: 'Parent job',
+            type: 'select', options: known })], 'Accept',
+          (values) => ctx.api.acceptRoomItem(pid, rid, item.sequence, null,
+            values['accept-parent-' + item.sequence]), 'Item accepted');
+          return;
+        }
+      }
+      const saved = await act(actions.querySelector('button.primary'),
+        () => ctx.api.acceptRoomItem(pid, rid, item.sequence, null, parent),
+        { success: 'Item accepted' });
+      if (saved) { since = null; draw(); }
+    }
+
     if (may && item.item_kind !== 'question') {
-      actions.append(h('button', { type: 'button', class: 'primary', onclick: async (event) => {
-        const button = event.currentTarget;
-        const saved = await act(button, () => ctx.api.acceptRoomItem(pid, rid, item.sequence), { success: 'Item accepted' });
-        if (saved) { since = null; draw(); }
-      } }, 'Accept'));
+      actions.append(h('button', { type: 'button', class: 'primary',
+        onclick: acceptItem }, 'Accept'));
     }
     if (may && item.item_kind === 'question') {
       actions.append(h('button', {
@@ -150,7 +193,7 @@ export async function detail(ctx, { pid, rid }) {
           values['answer-' + item.sequence]), 'Answered'),
       }, 'Answer'));
     }
-    if (may) {
+    if (mayEdit) {
       actions.append(h('button', {
         type: 'button', class: 'ghost',
         onclick: () => form([
@@ -184,7 +227,8 @@ export async function detail(ctx, { pid, rid }) {
       h('strong', null, item.moderated ? '(removed)' : (item.title || '')),
       h('p', { class: 'event-body prose room-text' }, item.text || ''),
       h('div', { class: 'small muted' }, (item.author && item.author.name || 'a member'), ' ', time(item.created_at),
-        item.evidence ? ' · ' + item.evidence : ''),
+        item.evidence ? ' · ' + item.evidence : '',
+        item.parent ? ' · job ' + item.parent : ''),
       record,
       history.length ? h('div', { class: 'stack' }, history) : null,
       actions.childNodes.length ? actions : null,

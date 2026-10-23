@@ -4232,8 +4232,10 @@ the same append-only room files as slice 1; no new file and no new record shape 
 **Lines.** An `item` line carries `item_kind` (`requirement|decision|question`), `title`
 (1..200), `text` (1..`rooms.max_message_chars`), the author, the time and an optional
 `supersedes` naming an earlier item. A requirement item also carries an optional `parent`:
-the existing job the requirement hangs under (the tracker refuses a parentless draft; when
-the project has exactly one job and the item names none, that job is used). An `item-event` line carries `target_sequence`, `event`
+the existing job the requirement hangs under, checked against the project's current jobs
+(the tracker refuses a parentless draft; when the project has exactly one job and the item
+names none, that job is used; with two or more jobs an editor's accept must name one). An
+`item-event` line carries `target_sequence`, `event`
 (`accept|reject|amend|answer`), the resulting `state`, the author, the time, the text (the
 reason, the amended body, the answer or an optional accept note) and `record` (the pointer
 below; null otherwise). An `amend` event also carries the new `title`. Both line kinds use
@@ -4245,9 +4247,19 @@ as a message.
 or rejected; `supersedes` on a newer item makes the older one `superseded` and refuses its
 acceptance. `accepted`, `rejected` and `superseded` are final. A question is answered
 (`answer` -> `accepted`) and records who answered and when; it can also be rejected. A
-moderated item cannot be accepted, rejected, amended or answered (409), and its title and
-text are served nowhere: the read, the `index.json` items cache and both exports carry the
-tombstone instead.
+moderated item cannot be accepted, rejected, amended or answered (409), and every field its
+author wrote is served nowhere — the original title and text, an amendment's title and text,
+an answer, an accept note and a reject reason all become the tombstone in the read, the
+`index.json` items cache and both exports. Moderation names a message or an item line; it
+does not name an individual answer, accept note or reject reason inside an item's history
+(moderating the item replaces all of them).
+
+**Rights.** The accept capability above is the right to accept. Rejecting or amending an
+item needs its author or a project owner/coordinator: a viewer never posts an item in slice
+1, so a viewer holding only `read` on a question must not be able to rewrite or reject
+someone else's question. Answering an open question stays an ordinary member action (`read`).
+The page shows Reject/Amend only to the author or an owner/coordinator; the server re-checks
+the rule against a current read before the write.
 
 **Routes.** Every POST is CSRF-protected by the existing route machinery. R7 is checked
 before any role or grant check: the accept, reject, amend and answer routes take a signed-in
@@ -4257,8 +4269,8 @@ person and refuse every agent credential, even one holding the coordinator grant
 |---|---|---|
 | `POST /v1/projects/{pid}/rooms/{rid}/items` | `{"item_kind","title","text","supersedes"?,"parent"?}` | the `rooms.post` capability (contributor/coordinator/owner) |
 | `POST .../items/{seq}/accept` | `{}`, `{"note": "..."}` or `{"parent": "..."}` | requirement: `requirement_editor` -> `coordinate`, otherwise `proposals.write`; decision: `coordinate` (owner/coordinator); question: 400 |
-| `POST .../items/{seq}/reject` | `{"reason": "..."}` | same as accept for that kind |
-| `POST .../items/{seq}/amend` | `{"title": "...", "text": "..."}` | same as accept for that kind |
+| `POST .../items/{seq}/reject` | `{"reason": "..."}` | the item's author, or a project owner/coordinator |
+| `POST .../items/{seq}/amend` | `{"title": "...", "text": "..."}` | the item's author, or a project owner/coordinator |
 | `POST .../items/{seq}/answer` | `{"text": "..."}` | `read` (any member) on a question |
 
 **Accepted items become the kit's existing records, in existing fields only.** The pointer
@@ -4270,19 +4282,25 @@ A contributor's accept submits a requirement proposal as that person. A decision
 accept creates a native decision through the service-only canonical `room-decision` action,
 which re-checks the signed-in account's live owner/coordinator membership (never a credential)
 inside the endpoint under the authority lock and binds the item's stored title, text and
-pointer before the guarded write. Reject, amend and answer create no record.
+pointer before the guarded write; it also refuses an item in an archived room there.
+Reject, amend and answer create no record.
 
-**Idempotency.** The record write and the item-event use operation ids derived from the room,
-the item sequence and the item's current revision (never the client's key). The record
-route's journal and the segment's operation-id check then make a repeated or concurrent
-accept converge on one record and one event; the first accepting person is the one recorded.
-The client `Idempotency-Key` still guards the HTTP mutation.
+**One record per item, written after the checks.** The HTTP route takes the project's
+item-decision lock, re-reads the item, and checks its state, moderation, room and (for an
+accept) the parent job before any native record is written; the room is locked only for the
+append, so the endpoint's own `.coordination.lock` is never nested inside it. The record
+write and the item-event use an operation identity naming the room, the item sequence and
+the action — never the current event count or the client's key — so a retry reconciles on
+the same record. A second accept with a *fresh* client key after the item is decided is
+refused (409) and writes no second record, proposal or decision; a contributor accept and an
+owner accept racing each other produce exactly one record, decided by whichever took the
+item-decision lock first. The client `Idempotency-Key` still guards the HTTP mutation.
 
 **The items cache.** `index.json` gains a per-room `items` list: the current views and their
 decision history. It is a cache only. `rooms.py` builds it with the same function that a
 rebuild uses from the segment lines, so deleting the index or any stale byte check rebuilds
-identical states; the lines stay the truth. A moderated item's text is dropped on moderation
-and on rebuild.
+identical states; the lines stay the truth. A moderated item's title, text and every
+user-written event field are dropped on moderation and on rebuild.
 
 **Rollback.** An older kit reads the requirements, proposals and decisions created here
 unchanged (the pointer rides in fields it already has). A `.385` reader does not know the
@@ -4292,7 +4310,7 @@ sidecar changes shape.
 
 **Export.** The Markdown export adds each item with its state, evidence pointer and record,
 then its item events; the JSON-lines export carries the item and item-event lines, with a
-moderated item's text replaced by its tombstone.
+moderated item's title, text and every user-written event field replaced by its tombstone.
 
 ## Serving delivered bundles over HTTP
 

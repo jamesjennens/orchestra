@@ -6454,6 +6454,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         # admin.py and the task-file routes (kittrial-5bb.352's CI lesson).
         return project_room_lock(project)
 
+    def _rooms_item_lock(self, project):
+        """The project's item-decision lock (review b1/b2 of kittrial-5bb.388).
+
+        A separate lock, held across the native record write and the room append. It must
+        NOT be the room's ``.coordination.lock``: the canonical endpoint takes that lock
+        itself for ``room-decision``, so holding it here across the call would deadlock.
+        Every item decision and moderation takes this lock before the room lock, so one
+        item gets at most one record and a moderator cannot slip between the state check
+        and the append.
+        """
+        from http_authority import file_lock
+        return file_lock(Path(project) / '.item-decisions.lock')
+
     def _rooms_actor(self, ctx, role):
         user = self.service.state['users'].get(ctx.principal.user_id) or {}
         name = user.get('display_name') or user.get('username') or ctx.principal.user_id
@@ -6577,7 +6590,9 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _room_item_record(self, ctx, pid, item, evidence, parent=None):
         """Create the existing record an accepted requirement/decision item becomes."""
-        base = rooms.item_operation(ctx.params['rid'], item['sequence'], len(item['history']), 'accept')
+        # Review b1: the identity names the item and action, never the event count, so the
+        # record write is idempotent and a retry never creates a second record.
+        base = rooms.item_decision_operation(ctx.params['rid'], item['sequence'], 'accept')
         if item['item_kind'] == 'requirement':
             if self._requirement_editor_here(ctx, pid) is None:
                 # A contributor's accepted requirement is a proposal, as that person.
@@ -6638,23 +6653,35 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items')
     def rooms_item_post(self, ctx):
         project = self._rooms_project(ctx)
-        _record, role = self._project(ctx, CAP_ROOMS_POST)
+        if ctx.principal.via == 'credential':
+            raise forbidden('Rooms are for people in this slice: an agent credential cannot write to a room.')
+        record, role = self._project(ctx, CAP_ROOMS_POST)
+        if isinstance(record, dict) and record.get('archived'):
+            raise conflict('The project is archived: its rooms can be read and exported, and no room is written.')
         payload = ctx.payload if isinstance(ctx.payload, dict) else {}
         if set(payload) - {'item_kind', 'title', 'text', 'supersedes', 'parent'}:
             raise invalid('Send item_kind, title, text and optionally supersedes or parent')
         actor = self._rooms_actor(ctx, role)
         operation_id = ctx.idempotency_key or ctx.request_id
         limits_values = self._rooms_limits()
-        def write(project):
-            return rooms.post_item(project, ctx.params['rid'], payload.get('item_kind'),
-                                   payload.get('title'), payload.get('text'), operation_id,
-                                   actor, limits_values, payload.get('supersedes'),
-                                   payload.get('parent'))
-        def stored(result):
-            return {key: result.get(key) for key in
-                    ('sequence', 'kind', 'item_kind', 'state', 'created_at')}
-        return self._rooms_write(ctx, 'rooms.item.post', CAP_ROOMS_POST, write, status=201,
-                                 reason='room %s item' % ctx.params['rid'], stored=stored)
+        def write():
+            try:
+                # The item-decision lock serializes a post (which may supersede an item)
+                # with accept/reject/amend/answer, so no decision can race a supersede.
+                with self._rooms_item_lock(project):
+                    with self._rooms_lock(project):
+                        result = rooms.post_item(project, ctx.params['rid'],
+                                                 payload.get('item_kind'), payload.get('title'),
+                                                 payload.get('text'), operation_id, actor,
+                                                 limits_values, payload.get('supersedes'),
+                                                 payload.get('parent'))
+            except rooms.Refusal as refusal:
+                raise self._rooms_refusal(refusal) from None
+            return result, {key: result.get(key) for key in
+                            ('sequence', 'kind', 'item_kind', 'state', 'created_at')}
+        return self._mutate(ctx, 'rooms.item.post', ctx.params['pid'], write,
+                            capability=CAP_ROOMS_POST, serialize=False, status=201,
+                            reason='room %s item' % ctx.params['rid'])
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items/(?P<seq>[0-9]{1,12})/accept')
     def rooms_item_accept(self, ctx):
@@ -6663,36 +6690,63 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = ctx.payload if isinstance(ctx.payload, dict) else {}
         if set(payload) - {'note', 'parent'} or not isinstance(payload.get('note', ''), str):
             raise invalid('A room item accept takes only an optional note or parent')
-        self._project(ctx, CAP_READ)
+        record, role = self._project(ctx, CAP_READ)
+        if isinstance(record, dict) and record.get('archived'):
+            raise conflict('The project is archived: its rooms can be read and exported, and no room is written.')
         item = self._rooms_item(ctx, project)
         if item['item_kind'] == 'question':
             raise HttpError(400, 'invalid', 'A question is answered, not accepted.')
         capability = self._rooms_item_capability(ctx, ctx.params['pid'], item)
-        actor = self._rooms_actor(ctx, self.service.state.get('memberships', {}).get(
-            ctx.params['pid'], {}).get(ctx.principal.user_id) or 'viewer')
-        evidence = item['evidence']
+        actor = self._rooms_actor(ctx, role)
         limits_values = self._rooms_limits()
         note = (payload.get('note') or '').strip()
         parent = item.get('parent') or payload.get('parent')
-        # Only the requirement-editor path creates a requirement; a contributor's accept is a
-        # proposal and needs no parent job.
-        if (item['item_kind'] == 'requirement'
-                and self._requirement_editor_here(ctx, ctx.params['pid']) is not None):
-            if parent is None and hasattr(self.backend, 'requirements_read'):
-                jobs = self.backend.requirements_read(ctx.params['pid'], ['list']).get('jobs') or []
-                if len(jobs) == 1:
-                    parent = jobs[0]['id']
-            if parent is None:
-                raise invalid('A requirement item needs an existing job to hang under; name one '
-                              'with the item (or accept it while the project has exactly one job).')
-        operation_id = rooms.item_operation(ctx.params['rid'], item['sequence'],
-                                            len(item['history']), 'accept')
+        editor = self._requirement_editor_here(ctx, ctx.params['pid']) is not None
+        # Review b1: the item is decided from a CURRENT read under the item lock, its state
+        # and room are checked BEFORE the native record is written, and the record write
+        # itself carries a stable item identity so a retry reconciles.
+        operation_id = rooms.item_decision_operation(ctx.params['rid'], item['sequence'], 'accept')
         def write():
-            record = self._room_item_record(ctx, ctx.params['pid'], item, evidence, parent)
             try:
-                with self._rooms_lock(project):
-                    result = rooms.accept_item(project, ctx.params['rid'], item['sequence'],
-                                               operation_id, actor, limits_values, record, text=note)
+                with self._rooms_item_lock(project):
+                    with self._rooms_lock(project):
+                        current = rooms.read_item(project, ctx.params['rid'],
+                                                  int(ctx.params['seq']))
+                        existing = rooms.find_operation(project, ctx.params['rid'], operation_id)
+                    if existing is not None:
+                        # An exact retry of the SAME client key is replayed by _mutate before
+                        # this point. Any other request that reaches here names an item whose
+                        # decision line already exists: it is refused before the native write,
+                        # never a second record (review b1).
+                        raise rooms.Refusal(409, 'final', 'That item is already decided.')
+                    # The project may have been archived since the route's first read.
+                    live, _role = self._project(ctx, CAP_READ)
+                    if isinstance(live, dict) and live.get('archived'):
+                        raise conflict('The project is archived: its rooms can be read and exported, '
+                                       'and no room is written.')
+                    current = rooms.decidable_item(project, ctx.params['rid'],
+                                                   current['sequence'], 'accept')
+                    chosen = current.get('parent') or parent
+                    if current['item_kind'] == 'requirement' and editor:
+                        jobs = []
+                        if hasattr(self.backend, 'requirements_read'):
+                            listing = self.backend.requirements_read(ctx.params['pid'], ['list']) or {}
+                            jobs = listing.get('jobs') or []
+                        if chosen is None and len(jobs) == 1:
+                            chosen = jobs[0].get('id')
+                        if chosen is None:
+                            raise invalid('A requirement item needs an existing job to hang under; '
+                                          'name one with the item (or accept it while the project '
+                                          'has exactly one job).')
+                        if jobs and chosen not in [job.get('id') for job in jobs]:
+                            raise invalid('That parent is not a job of this project; a requirement '
+                                          'hangs under an existing job.')
+                    record = self._room_item_record(ctx, ctx.params['pid'], current,
+                                                    current['evidence'], chosen)
+                    with self._rooms_lock(project):
+                        result = rooms.accept_item(project, ctx.params['rid'], current['sequence'],
+                                                   operation_id, actor, limits_values, record,
+                                                   text=note)
             except rooms.Refusal as refusal:
                 raise self._rooms_refusal(refusal) from None
             return result, {key: result.get(key) for key in
@@ -6700,38 +6754,59 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'rooms.item.accept', ctx.params['pid'], write,
                             capability=capability, serialize=False)
 
+    def _rooms_item_rights(self, ctx, item, role, event):
+        """Who may amend or reject an item (review b3 of kittrial-5bb.388).
+
+        A viewer holds CAP_READ for a question and could amend or reject anyone's question
+        before this check. Only the item's author or a project owner/coordinator may amend
+        or reject it; answering an open question stays an ordinary member action, as
+        docs/HTTP_DEPLOYMENT.md says.
+        """
+        if event == 'answer':
+            return
+        if role in ('owner', 'coordinator', 'superuser'):
+            return
+        if item.get('author', {}).get('id') != ctx.principal.user_id:
+            raise forbidden('Only the item author or a project owner or coordinator can amend '
+                            'or reject it.')
+
     def _rooms_item_event(self, ctx, event):
         project = self._rooms_project(ctx)
         self._rooms_item_session(ctx)
+        record, role = self._project(ctx, CAP_READ)
+        if isinstance(record, dict) and record.get('archived'):
+            raise conflict('The project is archived: its rooms can be read and exported, and no room is written.')
         payload = ctx.payload if isinstance(ctx.payload, dict) else {}
         item = self._rooms_item(ctx, project)
-        capability = self._rooms_item_capability(ctx, ctx.params['pid'], item)
-        actor = self._rooms_actor(ctx, self.service.state.get('memberships', {}).get(
-            ctx.params['pid'], {}).get(ctx.principal.user_id) or 'viewer')
+        self._rooms_item_rights(ctx, item, role, event)
+        actor = self._rooms_actor(ctx, role)
         limits_values = self._rooms_limits()
-        operation_id = rooms.item_operation(ctx.params['rid'], item['sequence'],
-                                            len(item['history']), event)
+        operation_id = rooms.item_decision_operation(ctx.params['rid'], item['sequence'], event)
         def write():
             try:
-                with self._rooms_lock(project):
-                    if event == 'answer':
-                        result = rooms.answer_item(project, ctx.params['rid'], item['sequence'],
-                                                   operation_id, actor, limits_values,
-                                                   payload.get('text'))
-                    elif event == 'reject':
-                        result = rooms.reject_item(project, ctx.params['rid'], item['sequence'],
-                                                   operation_id, actor, limits_values,
-                                                   payload.get('reason'))
-                    else:
-                        result = rooms.amend_item(project, ctx.params['rid'], item['sequence'],
-                                                  operation_id, actor, limits_values,
-                                                  payload.get('title'), payload.get('text'))
+                with self._rooms_item_lock(project):
+                    current = self._rooms_item(ctx, project)
+                    self._rooms_item_rights(ctx, current, role, event)
+                    with self._rooms_lock(project):
+                        if event == 'answer':
+                            result = rooms.answer_item(project, ctx.params['rid'],
+                                                       current['sequence'], operation_id, actor,
+                                                       limits_values, payload.get('text'))
+                        elif event == 'reject':
+                            result = rooms.reject_item(project, ctx.params['rid'],
+                                                       current['sequence'], operation_id, actor,
+                                                       limits_values, payload.get('reason'))
+                        else:
+                            result = rooms.amend_item(project, ctx.params['rid'],
+                                                      current['sequence'], operation_id, actor,
+                                                      limits_values, payload.get('title'),
+                                                      payload.get('text'))
             except rooms.Refusal as refusal:
                 raise self._rooms_refusal(refusal) from None
             return result, {key: result.get(key) for key in
                             ('sequence', 'kind', 'item_kind', 'state')}
         return self._mutate(ctx, 'rooms.item.' + event, ctx.params['pid'], write,
-                            capability=capability, serialize=False)
+                            capability=CAP_READ, serialize=False)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items/(?P<seq>[0-9]{1,12})/reject')
     def rooms_item_reject(self, ctx):
@@ -6752,9 +6827,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         payload = ctx.payload if isinstance(ctx.payload, dict) else {}
         if set(payload) != {'text'}:
             raise invalid('Send exactly: text')
-        item = self._rooms_item(ctx, self._rooms_project(ctx))
-        if item['item_kind'] != 'question':
-            raise invalid('Only a question is answered.')
+        # Review n2: membership is checked inside _rooms_item_event before the item is read,
+        # so an outsider gets "Project not found", never an item existence oracle.
         return self._rooms_item_event(ctx, 'answer')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/messages')
@@ -6795,19 +6869,33 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/messages/(?P<seq>[0-9]{1,12})/moderate')
     def rooms_moderate(self, ctx):
-        self._rooms_project(ctx)
-        _record, role = self._project(ctx, CAP_COORDINATE)
+        project = self._rooms_project(ctx)
+        if ctx.principal.via == 'credential':
+            raise forbidden('Rooms are for people in this slice: an agent credential cannot write to a room.')
+        record, role = self._project(ctx, CAP_COORDINATE)
+        if isinstance(record, dict) and record.get('archived'):
+            raise conflict('The project is archived: its rooms can be read and exported, and no room is written.')
         payload = ctx.payload if isinstance(ctx.payload, dict) else {}
         if set(payload) != {'reason'}:
             raise invalid('Send exactly: reason')
         actor = self._rooms_actor(ctx, role)
         operation_id = ctx.idempotency_key or ctx.request_id
         sequence = int(ctx.params['seq'])
-        def write(project):
-            return rooms.moderate(project, ctx.params['rid'], sequence, payload['reason'],
-                                  operation_id, actor, self._rooms_limits())
-        return self._rooms_write(ctx, 'rooms.moderate', CAP_COORDINATE, write, status=201,
-                                 reason='room %s message %d' % (ctx.params['rid'], sequence))
+        # Review b2 of kittrial-5bb.388: moderation takes the item-decision lock before the
+        # room lock, so it cannot slip between an acceptance's state check and its append.
+        def write():
+            try:
+                with self._rooms_item_lock(project):
+                    with self._rooms_lock(project):
+                        result = rooms.moderate(project, ctx.params['rid'], sequence,
+                                                payload['reason'], operation_id, actor,
+                                                self._rooms_limits())
+            except rooms.Refusal as refusal:
+                raise self._rooms_refusal(refusal) from None
+            return result, result
+        return self._mutate(ctx, 'rooms.moderate', ctx.params['pid'], write,
+                            capability=CAP_COORDINATE, serialize=False, status=201,
+                            reason='room %s message %d' % (ctx.params['rid'], sequence))
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/export')
     def rooms_export(self, ctx):

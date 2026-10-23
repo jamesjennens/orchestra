@@ -188,6 +188,117 @@ class RoomsItemsRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTest
         self.assertNotIn('source', requirement)
         self.assertIn(self.pointer(rid), requirement.get('description') or '')
 
+    # -- review r1 of kittrial-5bb.388 -------------------------------------------------------------
+    def proposals(self):
+        answer = self.request('GET', '/v1/projects/pp/proposals', token=self.tokens['alex'])
+        self.assertEqual(200, answer.status, answer.data)
+        return answer.data.get('items') or []
+
+    def decision_endpoint(self, rid, sequence, title, text, evidence, operation_id):
+        """Call the service-only room-decision action directly with a forged payload."""
+        principal = self.service.authenticate(self.tokens['alex'])
+        authority = held.http_service.authority_request(
+            principal, 'pp', held.http_service.CAP_COORDINATE,
+            now=self.service._expiry_now())
+        body = {'schema_version': 1, 'operation': 'issue', 'room': rid,
+                'sequence': sequence, 'title': title, 'text': text,
+                'evidence': evidence, 'operation_id': operation_id}
+        return self.backend._endpoint(
+            'room-decision', 'pp', principal.user_id,
+            [json.dumps(body, sort_keys=True)], operation_id=operation_id,
+            authority=authority, require_authority=True, route='rooms.item.accept')
+
+    def test_refused_accepts_create_no_native_record(self):
+        # Review b1: every refused accept is checked before any record write, on real bd.
+        rid = self.room('B1 decided')
+        self.assertEqual(201, self.item(rid, parent=self.job).status)
+        first = self.decide(rid, 'alex', key='b1-first')
+        self.assertEqual(200, first.status, first.data)
+        rows, proposals = len(self.export_rows()), len(self.proposals())
+        twice = self.decide(rid, 'alex', key='b1-second')
+        self.assertEqual(409, twice.status, twice.data)
+        self.assertEqual(rows, len(self.export_rows()), 'a refused second accept wrote a row')
+        self.assertEqual(proposals, len(self.proposals()))
+
+        # A moderated item: the tombstone text must not become a proposal's title.
+        rid = self.room('Moderated')
+        self.assertEqual(201, self.item(rid, text='SECRET moderation text',
+                                        parent=self.job, key='item-key-0010').status)
+        made = self.request('POST', '/v1/projects/pp/rooms/%s/messages/1/moderate' % rid,
+                            {'reason': 'private'}, token=self.tokens['alex'], key='moderate-0010')
+        self.assertEqual(201, made.status, made.data)
+        rows, proposals = len(self.export_rows()), len(self.proposals())
+        moderated = self.decide(rid, 'alex', key='b1-moderated')
+        self.assertEqual(409, moderated.status, moderated.data)
+        self.assertEqual((rows, proposals),
+                         (len(self.export_rows()), len(self.proposals())))
+        self.assertFalse(any('SECRET moderation text' in (row.get('description') or '')
+                             for row in self.export_rows()))
+
+        # An archived room: neither the decision nor a second record is created.
+        rid = self.room('Archived room')
+        self.assertEqual(201, self.item(rid, parent=self.job, key='item-key-0011').status)
+        archived = self.request('POST', '/v1/projects/pp/rooms/%s/archive' % rid, {},
+                                token=self.tokens['alex'], key='archive-0011')
+        self.assertIn(archived.status, (200, 201), archived.data)
+        rows, proposals = len(self.export_rows()), len(self.proposals())
+        closed = self.decide(rid, 'alex', key='b1-archived')
+        self.assertEqual(409, closed.status, closed.data)
+        self.assertEqual((rows, proposals),
+                         (len(self.export_rows()), len(self.proposals())))
+
+        # A rejected item: an accept after the decision writes nothing.
+        rid = self.room('Rejected')
+        self.assertEqual(201, self.item(rid, parent=self.job, key='item-key-0012').status)
+        rejected = self.decide(rid, 'alex', operation='reject', body={'reason': 'not this'},
+                               key='b1-reject')
+        self.assertEqual(200, rejected.status, rejected.data)
+        rows, proposals = len(self.export_rows()), len(self.proposals())
+        after = self.decide(rid, 'alex', key='b1-after-reject')
+        self.assertEqual(409, after.status, after.data)
+        self.assertEqual((rows, proposals),
+                         (len(self.export_rows()), len(self.proposals())))
+
+    def test_the_room_decision_action_binds_content_state_and_room(self):
+        # Review s2: the endpoint's title/text/evidence and state binds, on real bd.
+        rid = self.room('Binding')
+        self.assertEqual(201, self.item(rid, who='casey', kind='decision', title='Use CSV',
+                                        text='Emit CSV first.', key='item-key-0020').status)
+        evidence = self.pointer(rid)
+        for label, title, text, pointer in (
+                ('title', 'Forged title', 'Emit CSV first.', evidence),
+                ('text', 'Use CSV', 'Forged text.', evidence),
+                ('evidence', 'Use CSV', 'Emit CSV first.',
+                 self.pointer(self.room('Elsewhere binding')))):
+            before = len(self.export_rows())
+            forged = self.decision_endpoint(rid, 1, title, text, pointer,
+                                            'room-binding-' + label)
+            self.assertEqual(2, forged.get('returncode'), (label, forged))
+            self.assertEqual(before, len(self.export_rows()), label)
+        # The state bind: the exact current content, but the item is already rejected.
+        rejected = self.decide(rid, 'alex', operation='reject', body={'reason': 'not now'},
+                               key='binding-reject')
+        self.assertEqual(200, rejected.status, rejected.data)
+        item = self.request('GET', '/v1/projects/pp/rooms/%s' % rid,
+                            token=self.tokens['vic']).data['items'][0]
+        before = len(self.export_rows())
+        stale = self.decision_endpoint(rid, 1, item['title'], item['text'], item['evidence'],
+                                       'room-binding-state')
+        self.assertEqual(2, stale.get('returncode'), stale)
+        self.assertEqual(before, len(self.export_rows()))
+        # The room bind: a matching item in an archived room is refused by the endpoint too.
+        rid = self.room('Binding archive')
+        self.assertEqual(201, self.item(rid, who='casey', kind='decision', title='Archived',
+                                        text='Archived body.', key='item-key-0021').status)
+        archived = self.request('POST', '/v1/projects/pp/rooms/%s/archive' % rid, {},
+                                token=self.tokens['alex'], key='archive-0021')
+        self.assertIn(archived.status, (200, 201), archived.data)
+        before = len(self.export_rows())
+        closed = self.decision_endpoint(rid, 1, 'Archived', 'Archived body.',
+                                        self.pointer(rid), 'room-binding-archived')
+        self.assertEqual(2, closed.get('returncode'), closed)
+        self.assertEqual(before, len(self.export_rows()))
+
 
 if __name__ == '__main__':
     unittest.main()
