@@ -2301,6 +2301,11 @@ console.log(JSON.stringify({
             'vscodeScreenFourth',
             'vscodeScreenHasFolderAndCommand',
             'workerPreselected',
+            # kittrial-5bb.387: an agent with an effective coordinator grant.
+            'coordinatorHasNoRoleChoice',
+            'coordinatorRoleNotSaved',
+            'coordinatorRoleScreen',
+            'noEffectGrantIsAWorker',
         }, set(observed))
 
 

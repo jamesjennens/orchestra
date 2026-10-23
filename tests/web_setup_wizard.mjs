@@ -82,7 +82,8 @@ const api = createApi(async (method, path, _headers, text) => {
   if (method === 'GET' && path === '/v1/agents/agent_1') {
     agentReads += 1;
     return { status: 200, data: { id: 'agent_1', name: 'Kestrel', owner: 'u1', role: 'worker', scopes: server.scopes, scopes_source: 'stored',
-      working_directory: 'C:\\Users\\olive\\kestrel', projects: ['p1'], last_seen_at: server.lastSeen, credentials: [] } };
+      working_directory: 'C:\\Users\\olive\\kestrel', projects: ['p1'], last_seen_at: server.lastSeen, credentials: [],
+      ...(server.coordinates ? { coordinates: server.coordinates } : {}) } };
   }
   if (method === 'POST' && path === '/v1/agents/agent_1/credentials') {
     if (server.failIssue) return { status: 0, data: { error: { code: 'network', message: 'The server could not be reached.' } } };
@@ -388,5 +389,25 @@ for (const x of openDialogs()) await x.close();
 toast('A message with no dialog open');
 out.toastWithoutAModalGoesToTheBody = body.childNodes && [...body.children].some((c) => c.className === 'toasts'
   && c.all((e) => e.textContent === 'A message with no dialog open').length === 1);
+
+// ---- kittrial-5bb.387: an agent holding an effective coordinator grant is set up as a coordinator -----
+store.clear();
+server.coordinates = [{ project: 'p1', effective: true }];
+const rolesBefore = server.roles.length;
+d = await openWizard();
+await d.wizard.next();
+out.coordinatorRoleScreen = screenOf(d) === 'role' && attr(d, 'data-role-coordinator', 'true').length === 1
+  && /Kestrel holds the coordinator grant for p1: it is set up as a coordinator\./.test(shownText(d));
+out.coordinatorHasNoRoleChoice = !windowsChoice(d, 'setup-role', 'worker') && !windowsChoice(d, 'setup-role', 'reviewer');
+await d.wizard.next();
+out.coordinatorRoleNotSaved = server.roles.length === rolesBefore;
+// A grant without effect: the worker's screen, as before.
+store.clear();
+server.coordinates = [{ project: 'p1', effective: false }];
+d = await openWizard();
+await d.wizard.next();
+out.noEffectGrantIsAWorker = attr(d, 'data-role-coordinator', 'true').length === 0 && windowsChoice(d, 'setup-role', 'worker').checked === true;
+server.coordinates = undefined;
+for (const open of openDialogs()) await open.close();   // a dialog left open keeps its online check going
 
 console.log(JSON.stringify(out));
