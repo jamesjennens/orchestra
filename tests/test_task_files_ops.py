@@ -173,10 +173,7 @@ class TaskFilesOpsTests(unittest.TestCase):
         self.store.attach('t1', b'abc')
         elsewhere = unique_dir('task-files-elsewhere-')
         self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
-        try:
-            os.symlink(str(elsewhere), str(self.target), target_is_directory=True)
-        except (OSError, NotImplementedError):
-            self.skipTest('no symlinks here')
+        self.link_dir(elsewhere, self.target)                # a symlink, or a junction on Windows
         with self.assertRaises(task_files.Refusal):
             task_files.backup_folder(self.store.project, self.target)
         self.assertEqual([], os.listdir(str(elsewhere)), 'nothing was copied through the link')
@@ -339,6 +336,22 @@ class TaskFilesOpsTests(unittest.TestCase):
         self.assertEqual('restored', task_files.restore_folder(self.target, restored.project)['status'])
         self.assertEqual(b'precious input', restored.blob(live).read_bytes())
         self.assertEqual(live, task_files.read_entry(restored.project, 't1', live)['sha256'], 'the last good record')
+
+    def test_r2_s1_a_task_folder_that_became_a_link_prunes_nothing_from_the_backup(self):
+        # A linked records/<task> hides even the names of its files: the backup cannot tell which of its copies are
+        # still needed, so it removes none of them (the previous good copies of that task stay).
+        live = self.store.attach('t1', b'precious input')
+        task_files.backup_folder(self.store.project, self.target)
+        record = self.record_file('t1', live)
+        elsewhere = unique_dir('task-files-moved-')
+        self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
+        shutil.move(str(record.parent), str(elsewhere / 'moved'))
+        self.link_dir(elsewhere / 'moved', record.parent)
+        summary = task_files.backup_folder(self.store.project, self.target)
+        self.assertEqual(['the task folder is a symlink'], [p['problem'].split('(')[1].split(')')[0] for p in summary['problems']])
+        self.assertTrue((self.target / live[:2] / live).exists(), 'the previous copy of the blob stays')
+        self.assertTrue((self.target / task_files.RECORDS / task_files.task_key('t1') / (live + '.json')).exists(),
+                        'the previous copy of the record stays')
 
     def test_r2_s3_a_purge_that_fails_part_way_leaves_its_intent_and_its_result(self):
         one = self.store.attach('t1', b'first withdrawn', withdrawn=True)
