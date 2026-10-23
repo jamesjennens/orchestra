@@ -1863,6 +1863,15 @@ before a lock is taken and nothing is written. The command takes the project's
 `coordinator followon` and web routes call, so its validation, fact derivation and
 journal are identical.
 
+## `files`: a task's files over SSH
+
+`client.py ... -- files list TASK`, `files get TASK SHA256 --out DIR [--force]` and `files put TASK PATH --direction to-worker|from-worker [--note TEXT] [--media-type TYPE]`. The rules are the web service's (docs/TASK_FILES_DESIGN.md 1b, 3b): a listed operator attaches `to-worker`, the task's current assignee attaches `from-worker`, either downloads, and anybody who may read the task lists.
+
+- The wire is one JSON header line (at most 64 KiB), then exactly `bytes` raw bytes for a put; a get answers one JSON line carrying `frame_bytes`, then that many raw bytes. A header over its limit, a short or digest-mismatched body and a file over a limit store nothing.
+- `list` and `put` print the endpoint's JSON on stdout (`put` adds `status`: 201 new, 200 an identical retry with `replayed`). A refusal prints the endpoint's sentence on stderr and exits 1.
+- `get` writes `DIR/<name>`, where the name is the cleaned base name; `DIR` must exist and must not be a symlink. The bytes go to a private temporary file first and are kept only when their size and sha256 match both the endpoint's answer and the `SHA256` asked for. An existing target is refused unless `--force`, which replaces a regular file only; a symlink target is always refused. Nothing is left behind on a refusal.
+- At most `task_files.max_transfers` transfers run at once on an installation; one more is refused with a busy sentence and nothing is read.
+
 ## `docs` and `onboard`: the installed documents
 
 `docs` lists the catalogued documents and serves one whole; `docs --status` reports every

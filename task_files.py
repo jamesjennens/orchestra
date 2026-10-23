@@ -772,6 +772,104 @@ def apply(payload, actor, run, project, now, limit=None):
     return 200, dict(view(current), withdrawn=True)
 
 
+# -- the framed SSH request (kittrial-5bb.384, design 3b option B) -----------------------------------
+# One JSON header line, then exactly ``bytes`` raw bytes (file-put), or an answer line and then the
+# raw bytes (file-get). The endpoint and the client both read these; the rules live here once.
+_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
+FRAMED_ACTIONS = ('file-list', 'file-get', 'file-put')
+#: The longest header line either side reads or sends; a longer one is refused before a byte of body.
+HEADER_LIMIT = 64 * 1024
+_FRAME_REQUIRED = {
+    'file-list': {'action', 'project', 'actor', 'task'},
+    'file-get': {'action', 'project', 'actor', 'task', 'sha256'},
+    'file-put': {'action', 'project', 'actor', 'task', 'name', 'direction', 'bytes', 'sha256'},
+}
+_FRAME_OPTIONAL = {'file-list': set(), 'file-get': set(), 'file-put': {'media_type', 'note'}}
+
+
+
+def frame_check(header):
+    """The header of a framed request, checked: exactly the fields of its action, each well formed."""
+    if not isinstance(header, dict) or header.get('action') not in FRAMED_ACTIONS:
+        raise Refusal(422, 'invalid', 'Expected one framed task-file header; nothing was read or stored.')
+    action = header['action']
+    fields = set(header)
+    if not _FRAME_REQUIRED[action] <= fields or fields - _FRAME_REQUIRED[action] - _FRAME_OPTIONAL[action]:
+        raise Refusal(422, 'invalid', 'The %s header has the wrong fields; nothing was read or stored.' % action)
+    for key in ('project', 'actor', 'task'):
+        if not isinstance(header[key], str) or not header[key]:
+            raise Refusal(422, 'invalid', 'The %s header names no %s; nothing was read or stored.' % (action, key))
+    for key in ('project', 'task'):
+        # The task goes into the tracker's argv: a leading '-' would be read as an option.
+        if not _ID.fullmatch(header[key]):
+            raise Refusal(422, 'invalid', 'The %s header\'s %s is not an identifier; nothing was read or stored.' % (action, key))
+    if action != 'file-list':
+        check_sha256(header['sha256'])
+    if action == 'file-put':
+        clean_name(header['name'])
+        check_direction(header['direction'])
+        if type(header['bytes']) is not int or header['bytes'] < 0:
+            raise Refusal(422, 'invalid', 'The file-put header has no byte count; nothing was read or stored.')
+        check_media_type(header.get('media_type'))
+        check_text(header.get('note'), 'note', NOTE_LIMIT)
+    return header
+
+
+def task_row(run, task):
+    """The task's row read live (``show``), refused when it is not a task: what authority is decided on."""
+    return _row(run, task)
+
+
+def listing(project, task, may):
+    """The task's live files as the list answers them (HTTP and SSH alike): ``missing`` when the bytes are not there."""
+    items = []
+    for entry in live(project, task):
+        item = view(entry, may_download=may)
+        # a purged file is said as purged (view carries the sentence), not as missing
+        if not entry.get('purged') and blob_size(project, entry['sha256']) != entry['bytes']:
+            item['missing'] = True
+        items.append(item)
+    return items
+
+
+def download_target(project, task, sha256):
+    """``(entry, open handle)`` of a live file of ``task``, or :class:`Refusal`; the caller closes the handle."""
+    entry = read_entry(project, task, sha256)
+    if entry is None or entry.get('withdrawn') is not None:
+        raise Refusal(404, 'not_found', 'No such file on this task.')
+    if entry.get('purged'):
+        raise Refusal(410, 'gone', purged_sentence(entry))
+    handle = open_blob(project, sha256)
+    if os.fstat(handle.fileno()).st_size != entry['bytes']:
+        handle.close()
+        raise Refusal(409, 'conflict', 'The stored file does not match its record (its size changed); it is not '
+                      'served. An operator must look at it.')
+    return entry, handle
+
+
+def sweep_uploads(project, age=86400):
+    """Remove upload temporaries older than ``age`` seconds: a killed process leaves one behind."""
+    import time
+    folder = _sub(project, TMP, False)
+    if folder is None:
+        return
+    cutoff = time.time() - age
+    try:
+        names = os.listdir(str(folder))
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith('upload-'):
+            continue
+        try:
+            path = folder / name
+            info = os.lstat(str(path))
+            if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                os.unlink(str(path))
+        except OSError:
+            pass
+
+
 # -- operations (kittrial-5bb.380, slice 5) -------------------------------------------------------
 # Backups of the folder (design 4a A), the operator's verify and purge (design 2d, 2e). The caller
 # holds the project's .coordination.lock (and, for a backup, its backup lock): every function here

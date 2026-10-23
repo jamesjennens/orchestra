@@ -162,6 +162,8 @@ The SSH transport carries one JSON request of at most 2 MB (`client.py` `MAX_WIR
 - The new client commands are `files list TASK`, `files get TASK SHA256 --out DIR` and `files put TASK PATH --direction ...`. They follow the existing `client.py ... --` shape and verify the digest before keeping a file.
 - The authorization is the endpoint's, exactly as for every other endpoint action: the actor, the project and the live rule of 1b.
 
+**Built (kittrial-5bb.384).** Option B, as `client.py files list|get|put` and the endpoint actions `file-list`, `file-get` and `file-put` (the header is at most 64 KiB, one line; the actions are refused in an ordinary JSON request and under `--authority-store`). The endpoint answers the rules of 1b with the web route's own sentences: a listed operator of the installation (the host coordinate rule) attaches files to the worker, the task's live assignee attaches files from it, and either downloads; withdrawal stays HTTP-only. SSH has no per-actor or per-project transfer count, so the endpoint keeps a small cross-process bound instead: `max_transfers` slot files under `<root>/.task-file-slots`, each taken with a non-blocking `flock` for the whole transfer. A call that finds none free answers one busy sentence (503) and reads nothing; a process that ends or dies frees its slot.
+
 ### 3c. Orchestra Bridge tools (web agents)
 
 Some agents reach Orchestra only through the Bridge or curl, often behind an office proxy. The Bridge already goes through the same HTTPS site and the proxy settings the person has, so no new network path is needed. Three tools, with the shape the Bridge's other tools have:

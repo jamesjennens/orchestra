@@ -5725,13 +5725,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         row = self._files_row(ctx)
         may = self._files_coordinates(ctx) or task_files.is_assignee(row, actor)
         try:
-            items = []
-            for entry in task_files.live(project, ctx.params['tid']):
-                item = task_files.view(entry, may_download=may)
-                # kittrial-5bb.380: a purged file is said as purged (view carries the sentence), not as missing.
-                if not entry.get('purged') and task_files.blob_size(project, entry['sha256']) != entry['bytes']:
-                    item['missing'] = True
-                items.append(item)
+            items = task_files.listing(project, ctx.params['tid'], may)
         except task_files.Refusal as refusal:
             raise files_error(refusal) from None
         return 200, {'task': ctx.params['tid'], 'items': items, 'total': len(items), 'may_download': may}
@@ -5848,25 +5842,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if isinstance(record, dict) and record.get('archived') and not coordinates:
                 # r2 (review s4d): an archived project is read-only; its files stay downloadable by its coordinators.
                 raise forbidden('The project is archived: only its coordinators download its files.')
-            entry = task_files.read_entry(project, ctx.params['tid'], sha256)
-            if entry is None or entry.get('withdrawn') is not None:
-                raise not_found('No such file on this task.')
-            if entry.get('purged'):
-                # kittrial-5bb.380 (coordinator's Q2): the bytes were removed by an operator's purge.
-                raise HttpError(410, 'gone', task_files.purged_sentence(entry))
             limit = self._files_limits()
-            handle = task_files.open_blob(project, sha256)
+            entry, handle = task_files.download_target(project, ctx.params['tid'], sha256)
         except (HttpError, task_files.Refusal) as error:
             raise self._files_refused(ctx, action, error, sha256) from None
         gate = self.transfers or DEFAULT_TRANSFERS
         key = self._files_key(ctx)
         try:
             with handle:
-                size = os.fstat(handle.fileno()).st_size
-                if size != entry['bytes']:
-                    raise self._files_refused(ctx, action, task_files.Refusal(
-                        409, 'conflict', 'The stored file does not match its record (its size changed); it is not '
-                        'served. An operator must look at it.'), sha256)
+                size = entry['bytes']
                 try:
                     gate.take(key, limit, ctx.params['pid'])
                 except HttpError as error:
