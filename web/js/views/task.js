@@ -2,6 +2,7 @@ import { h, time, confirmDialog, shortSha, toast } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, lifecycleStrip, describe, errorState } from '../ui.js';
 import { canWrite, canApprove, isOwner } from './project.js';
 import { lifecyclePanel } from './lifecycle.js';
+import { taskFilesPanel } from './taskFiles.js';
 
 const ACTIONS = {
   'task-created': ['Created the task', ''], 'task-claimed': ['Claimed the task', 'accent'], 'task-updated': ['Edited the task', ''],
@@ -238,6 +239,7 @@ export async function detail(ctx, { pid, tid }) {
     brief.depends_on && brief.depends_on.length ? h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Depends on')),
       h('ul', { class: 'panel-body open-items' }, brief.depends_on.map((d) => h('li', null, h('a', { href: ctx.href(`/p/${pid}/t/${d.id}`) }, d.title), ' ', statusChip(d.status))))) : null,
+    taskFilesPanel(ctx, { pid, tid, task: t, project }),
     h('p', { class: 'small muted' }, 'Viewing a task never marks it read, done or acknowledged.'));
 
   return h('div', { class: 'stack' },
