@@ -470,21 +470,24 @@ class EndpointAttentionTests(fixes.EndpointCase):
         action=next(x for x in self.next()['next_actions'] if x['task']==task)
         self.assertEqual(action['kind'],'in-progress')
         self.assertTrue(action['newer_activity'])
-        for name in ('newer_activity_marker','newer_activity_by_others','newer_activity_own',
+        for name in ('newer_activity_marker','newer_activity_fields','newer_activity_by_others','newer_activity_own',
                      'newer_activity_coverage','unresolved_directions'):
             self.assertIn(name,action)
         self.assertEqual(action['newer_activity_by_others'],1)
-        self.assertEqual(action['newer_activity_coverage'],'unknown')
-        # This installation has provenance writes off, so the checkpoint cannot make a
-        # precise per-entry claim: the marker is null and the boolean is the fallback.
-        self.assertIsNone(action['newer_activity_marker'])
+        self.assertEqual(action['newer_activity_coverage'],'timestamp')
+        # This installation has provenance writes off, so the checkpoint is read by the
+        # timestamp rule (kittrial-5bb.367): the marker names the newest other-party
+        # entry, and `timestamp` coverage says an older edit can be missed.
+        self.assertTrue(action['newer_activity_marker'].startswith(task + '-c'),
+                        action['newer_activity_marker'])
         wait=self.request('GET','/v1/agents/me/wait',token=self.secret)
         self.assertEqual(200,wait.status,wait.data)
         row=next(x for x in wait.data['items'] if x['task']==task)
-        self.assertIsNone(row['newer_activity_marker'])
+        self.assertTrue(row['newer_activity_marker'].startswith(task + '-c'),
+                        row['newer_activity_marker'])
         self.assertEqual(row['newer_activity_by_others'],1)
         self.assertEqual(row['newer_activity_own'],0)
-        self.assertEqual(row['newer_activity_coverage'],'unknown')
+        self.assertEqual(row['newer_activity_coverage'],'timestamp')
         # The stub counts the one other-party comment as a direction (its work path
         # defaults provenance writes on); the exact count is not what this pins.
         self.assertIsInstance(row['unresolved_directions'],int)
@@ -511,7 +514,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
             summary = web.data['newer']
             self.assertGreaterEqual(summary['own_count'], 1)
             self.assertGreaterEqual(summary['other_count'], 1)
-            self.assertEqual(summary['coverage'], 'unknown')  # digest capture remains off
+            self.assertEqual(summary['coverage'], 'timestamp')  # the checkpoint predates per-entry digests
             self.assertLessEqual(len(summary['entries']), 5)
             self.assertIn('Reading clears nothing', summary['note'])
             self.assertEqual(action['links']['history'], summary['history'])
@@ -533,7 +536,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
                 self.assertEqual(summary[key], value)
         self.assertGreater(summary['omitted'], 0)
         self.assertEqual(len(summary['entries']), 5)
-        self.assertEqual(summary['coverage'], 'unknown')
+        self.assertEqual(summary['coverage'], 'timestamp')
         run = self.backend._run
         for value in (None, {'coverage': 'windowed', 'own_count': 0, 'other_count': None,
                             'entries': [], 'omitted': 13, 'unverified_count': 19}):
@@ -629,7 +632,11 @@ class EndpointAttentionTests(fixes.EndpointCase):
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True,
             # This page is an older endpoint's canonical row: it omits the stable
             # marker and its counts, which honestly read unknown (kittrial-5bb.351).
-            'newer_activity_marker': None, 'newer_activity_by_others': None,
+            'newer_activity_marker': None, 'newer_activity_fields': None,
+            # The checkpoint-independent wait marker (kittrial-5bb.369) is omitted by
+            # the same older page and honestly reads unknown.
+            'wait_newer_activity_marker': None,
+            'newer_activity_by_others': None,
             'newer_activity_own': None, 'newer_activity_coverage': None,
             'unresolved_directions': None})
         self.assertEqual(asked, [['--owner', 'me', '--limit', '100', '--offset', '0', '--json'],
@@ -715,10 +722,11 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         # additive too (kittrial-5bb.253 item 1).
         self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
                                        'newer_activity_by_others', 'newer_activity_coverage',
-                                       'newer_activity_marker', 'newer_activity_own',
+                                       'newer_activity_fields', 'newer_activity_marker', 'newer_activity_own',
                                        'open_items', 'pending_change_requests', 'pending_review_items',
                                        'redelivered',
-                                       'review_state', 'status', 'title', 'unresolved_directions'])
+                                       'review_state', 'status', 'title', 'unresolved_directions',
+                                       'wait_newer_activity_marker'])
         self.assertEqual(self.backend.agent_tasks(self.project)['tasks'], [row])   # unfiltered: every held task
 
     def test_actor_filter_excludes_somebody_elses_work(self):
@@ -800,6 +808,9 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
             self.assertEqual((action['kind'], action['newer_activity']), ('in-progress', True))
             summary = self.request('GET', action['links']['brief'], token=self.secret).data['newer']
             self.assertEqual((summary['other_count'], len(summary['entries']), summary['omitted']), (8, 5, 3))
+            # The disposable in-process model keeps no per-entry checkpoint digests, so
+            # its own summary stays 'unknown'; the canonical timestamp rule is pinned in
+            # the endpoint cases above and in test_changes_since_checkpoint.
             self.assertEqual(summary['coverage'], 'unknown')
         self.assertEqual(before, json.dumps(self.backend.state, sort_keys=True))
 

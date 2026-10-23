@@ -136,6 +136,47 @@ class NativeLifecycleTests(RulesHelpers, unittest.TestCase):
         self.assertEqual(disabled.status, 200, disabled.data)
         refused(last.data['credential']['secret'], '/facts/tested', fact, 'last-agent', status=401)
 
+    def test_native_integration_check_is_read_only_and_reports_every_row(self):
+        self.deployment(operators=['ops'])
+        harness, owner = self.web()
+        task = self.task('Native integration check', assignee='other-author')
+        made = self.contribute(task, 'other-author')
+        self.assertEqual(made['returncode'], 0, made)
+        contribution = json.loads(made['stdout'])['comment_id']
+        approved = self.approve(task, 'ops', contribution)
+        self.assertEqual(approved['returncode'], 0, approved)
+        scope = dict(source_commit=COMMIT, integration_commit='e' * 40,
+                     release_id='synthetic-check-release', environment='native-synthetic')
+        seeded = self.lifecycle('other-author', 'lifecycle-scope', task, scope=scope)
+        self.assertEqual(seeded['returncode'], 0, seeded)
+        acquired = harness.request('POST', '/v1/projects/pp/merge-slot/acquire',
+                                   dict(task_id=task, target='main'), token=owner,
+                                   key='native-check-slot')
+        self.assertEqual(acquired.status, 200, acquired.data)
+        path = '/v1/projects/pp/tasks/' + task + '/integration-check?target=main'
+        before = self.capture('check-before')
+        read = harness.request('GET', path, token=owner)
+        self.assertEqual(read.status, 200, read.data)
+        self.assertEqual([row['check'] for row in read.data['checks']],
+                         ['approval', 'source_commit', 'slot', 'hold', 'reverted'])
+        self.assertTrue(all(row['allowed'] for row in read.data['checks']), read.data['checks'])
+        self.assertEqual([row['check'] for row in read.data['unchecked']],
+                         ['base_membership', 'tests', 'pushed_result'])
+        self.assertTrue(all(row['known'] is False for row in read.data['unchecked']))
+        steps = {step['step']: step for step in read.data['next']}
+        self.assertEqual(steps['scope']['state'], 'committed')
+        self.assertTrue(steps['scope']['operation_id'])
+        self.assertEqual(steps['reviewed']['state'], 'not-attempted')
+        self.assertEqual(steps['slot-release']['state'], 'not-attempted')
+        self.assertEqual(read.data['contribution']['commit'], COMMIT)
+        self.assertEqual(self.capture('check-after'), before)
+        bad = harness.request('GET', '/v1/projects/pp/tasks/' + task
+                              + '/integration-check?target=' + 'x' * 161, token=owner)
+        self.assertEqual(bad.status, 422, bad.data)
+        unknown = harness.request('GET', '/v1/projects/pp/tasks/no-such-task/integration-check',
+                                  token=owner)
+        self.assertEqual(unknown.status, 404, unknown.data)
+
     def test_native_scope_six_facts_refusals_retry_and_bound_backup(self):
         self.deployment(operators=['ops'])
         harness, owner = self.web()

@@ -758,6 +758,9 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
       h('div', { class: 'copy-row', 'data-bridge-choice': 'true' },
         choice('setup-bridge', 'yes', 'Orchestra Bridge 0.14 or later', state.bridge, () => { state.bridge = true; persist(); showProgress(); }),
         choice('setup-bridge', 'no', 'An older extension, or none', !state.bridge, () => { state.bridge = false; persist(); showProgress(); })),
+      setupText.osKind(state.os) === 'windows'
+        ? h('p', { class: 'small muted', 'data-windows-policy': 'true' }, 'On Windows, if VS Code terminals hang or the agent gets no command output, see “Windows: VS Code terminals hang or show no output” in docs/ONBOARDING.md.')
+        : null,
       more(h('p', { class: 'small muted' }, 'To see the version: in VS Code open Extensions (Ctrl+Shift+X) and find Orchestra Bridge. With 0.14 or later its own “Orchestra Bridge: Set up” checks the certificate, tests the connection and writes the agent’s files, so this wizard skips those screens.')),
     ],
     role: () => [

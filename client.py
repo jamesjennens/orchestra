@@ -337,6 +337,13 @@ class _InlineWait:
                    'contribution_id', 'pending_review_items', 'open_items', 'blocking_items',
                    'checkpoint_at', 'newer_activity', 'newer_activity_marker',
                    'redelivered', 'guidance_version')
+    #: The worker fingerprint's fields (kittrial-5bb.369): the caller's own checkpoint
+    #: fields are dropped and the checkpoint-independent wait marker takes the marker's
+    #: place. Kept identical to ``waiting.WORKER_MOVE_FIELDS``; the coordinator form keeps
+    #: ``MOVE_FIELDS`` unchanged.
+    WORKER_MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor', 'owner', 'status',
+                          'contribution_id', 'pending_review_items', 'redelivered',
+                          'guidance_version', 'wait_newer_activity_marker')
     COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
                             'checkpoint-to-coordinator', 'lane-quiet')
     LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')
@@ -379,10 +386,15 @@ class _InlineWait:
         if not isinstance(item, dict):
             return {}
         row = {name: _InlineWait._scalar(item.get(name)) for name in _InlineWait.MOVE_FIELDS}
+        row['wait_newer_activity_marker'] = _InlineWait._scalar(item.get('wait_newer_activity_marker'))
+        row['owner'] = _InlineWait._scalar(item.get('owner') if item.get('owner') is not None
+                                           else item.get('assignee'))
+        row['status'] = _InlineWait._scalar(item.get('status'))
         attention = item.get('attention')
         if isinstance(attention, dict):
             for name in ('open_items', 'blocking_items', 'checkpoint_at', 'newer_activity',
-                         'newer_activity_marker', 'redelivered', 'pending_review_items'):
+                         'newer_activity_marker', 'wait_newer_activity_marker',
+                         'redelivered', 'pending_review_items'):
                 if row.get(name) is None and name in attention:
                     row[name] = _InlineWait._scalar(attention.get(name))
         if not isinstance(row.get('pending_review_items'), int):
@@ -398,7 +410,7 @@ class _InlineWait:
             if isinstance(contribution, dict) and contribution.get('id') is not None:
                 row['contribution_id'] = _InlineWait._scalar(contribution.get('id'))
         for name in ('newer_activity_by_others', 'newer_activity_own',
-                     'newer_activity_coverage', 'unresolved_directions'):
+                     'newer_activity_fields', 'newer_activity_coverage', 'unresolved_directions'):
             if row.get(name) is None:
                 value = item.get(name)
                 if value is None and isinstance(attention, dict):
@@ -409,6 +421,10 @@ class _InlineWait:
     @staticmethod
     def _fingerprinted(row):
         return {name: row.get(name) for name in _InlineWait.MOVE_FIELDS}
+
+    @staticmethod
+    def _worker_fingerprinted(row):
+        return {name: row.get(name) for name in _InlineWait.WORKER_MOVE_FIELDS}
 
     @staticmethod
     def _canonical(value):
@@ -678,7 +694,7 @@ class _InlineWait:
         rows = _InlineWait.movement(items)
         return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'worker', 'items': rows,
                 'fingerprint': _InlineWait.digest(_InlineWait._sorted_rows(
-                    [_InlineWait._fingerprinted(row) for row in rows]))}
+                    [_InlineWait._worker_fingerprinted(row) for row in rows]))}
 
     @staticmethod
     def _lane_row(lane, entry=None):

@@ -275,6 +275,237 @@ class RecentHistoryCase(HistoryPagingCase):
                 afters = [b for b in bodies if b.startswith('after ')]
                 self.assertEqual(['after 0', 'after 1', 'after 2', 'after 3'][::(-1 if order == 'newest-first' else 1)], afters)
 
+    def test_recent_counts_logical_entries_when_long_comments_fragment(self):
+        alex, project, task = self.a_task('history-recent-0007')
+        texts = ['short %02d' % i for i in range(15)]
+        texts[14] = 'long-14-' + ('a' * 9000)
+        texts[11] = 'long-11-' + ('b' * 9000)
+        self.seed(task, texts)
+        first = self.read(alex, project, task, 'recent=10')
+        first_logical = reassemble(first['items'])
+        # 10 logical entries, even though two of them split into 3 fragments each (14 items total).
+        self.assertEqual(10, len(first_logical))
+        self.assertGreater(len(first['items']), 10)
+        self.assertFalse(first['items'][-1]['continued'])
+        self.assertEqual([texts[i] for i in range(14, 4, -1)], [body for _, body in first_logical])
+        self.assertTrue(first['next_cursor'])
+        second = self.read(alex, project, task, 'recent=10', first['next_cursor'])
+        second_logical = reassemble(second['items'])
+        self.assertEqual(5, len(second_logical))
+        self.assertEqual([texts[i] for i in range(4, -1, -1)], [body for _, body in second_logical])
+        self.assertIsNone(second['next_cursor'])
+
+    def test_cursor_is_signed_tampering_is_refused_and_unsigned_restarts_the_read(self):
+        import base64
+        import sys
+        from http_auth import Store, Service, request_hash
+        from http_service import CURSOR_BAD_SIGNATURE, EndpointBackend, cursor_scope
+        alex, project, task = self.a_task('history-recent-0008')
+        self.seed(task, MANY[:25])
+        first = self.read(alex, project, task, 'recent=5')
+        cursor = first['next_cursor']
+        self.assertTrue(cursor)
+        padded = cursor + '=' * (-len(cursor) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded.encode('ascii')))
+
+        # 1. Editing the offset or the continuation in a signed cursor is refused with one sentence (409).
+        edited_offset = dict(decoded, o=2)
+        tampered = base64.urlsafe_b64encode(
+            json.dumps(edited_offset, separators=(',', ':'), sort_keys=True).encode('utf-8')
+        ).decode('ascii').rstrip('=')
+        refused = self.read(alex, project, task, 'recent=5', tampered, status=409)
+        self.assertEqual(CURSOR_BAD_SIGNATURE, refused['error']['message'])
+
+        edited_x = dict(decoded, x=[decoded['x'][0], decoded['x'][1] + 5, decoded['x'][2]])
+        tampered_x = base64.urlsafe_b64encode(
+            json.dumps(edited_x, separators=(',', ':'), sort_keys=True).encode('utf-8')
+        ).decode('ascii').rstrip('=')
+        refused_x = self.read(alex, project, task, 'recent=5', tampered_x, status=409)
+        self.assertEqual(CURSOR_BAD_SIGNATURE, refused_x['error']['message'])
+
+        # 2. Editing the signature itself is refused with the same one sentence (409).
+        bad_sig = dict(decoded, s=('A' if decoded['s'][0] != 'A' else 'B') + decoded['s'][1:])
+        tampered_sig = base64.urlsafe_b64encode(
+            json.dumps(bad_sig, separators=(',', ':'), sort_keys=True).encode('utf-8')
+        ).decode('ascii').rstrip('=')
+        refused_sig = self.read(alex, project, task, 'recent=5', tampered_sig, status=409)
+        self.assertEqual(CURSOR_BAD_SIGNATURE, refused_sig['error']['message'])
+
+        # 2b. User B using user A's signed cursor, or the same cursor on another task, is refused (409).
+        admin = self.admin_token()
+        blair_id = self.create_account(admin, 'blair', 'blair-password-1')
+        self.assertIn(self.request('PUT', '/v1/projects/%s/members/%s' % (project, blair_id),
+                                   {'role': 'contributor'}, token=admin).status, (200, 201))
+        blair = self.login('blair', 'blair-password-1')[0]
+        refused_user = self.read(blair, project, task, 'recent=5', cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_user['error']['message'])
+
+        other_task = self.create_task(admin, project, 'history-recent-other').data['id']
+        self.seed(other_task, MANY[:10])
+        refused_task = self.read(alex, project, other_task, 'recent=5', cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_task['error']['message'])
+
+        # 3. An unsigned crafted cursor (legacy {'u','p','q','o','x'} or compact {'b','o','x'})
+        # restarts at the newest entry and never skips ahead.
+        alex_id = next(uid for uid, u in self.service.state['users'].items() if u.get('username') == 'alex')
+        legacy_payload = {
+            'u': alex_id,
+            'p': project,
+            'q': request_hash(cursor_scope({'recent': '5'}))[:16],
+            'o': 15,
+            'x': decoded['x'],
+        }
+        legacy_cursor = base64.urlsafe_b64encode(
+            json.dumps(legacy_payload, separators=(',', ':')).encode('utf-8')
+        ).decode('ascii').rstrip('=')
+        restarted = self.read(alex, project, task, 'recent=5', legacy_cursor, status=200)
+        self.assertEqual(['comment 024', 'comment 023', 'comment 022', 'comment 021', 'comment 020'],
+                         [e['body'] for e in restarted['items']])
+
+        stripped_payload = {'b': decoded['b'], 'o': 15, 'x': decoded['x']}
+        stripped_cursor = base64.urlsafe_b64encode(
+            json.dumps(stripped_payload, separators=(',', ':')).encode('utf-8')
+        ).decode('ascii').rstrip('=')
+        restarted_stripped = self.read(alex, project, task, 'recent=5', stripped_cursor, status=200)
+        self.assertEqual(['comment 024', 'comment 023', 'comment 022', 'comment 021', 'comment 020'],
+                         [e['body'] for e in restarted_stripped['items']])
+
+        # An unsigned cursor cannot skip the binding: another user's or another task's unsigned cursor is refused (409).
+        refused_unsigned_user = self.read(blair, project, task, 'recent=5', stripped_cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_unsigned_user['error']['message'])
+        refused_unsigned_task = self.read(alex, project, other_task, 'recent=5', stripped_cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_unsigned_task['error']['message'])
+        refused_legacy_user = self.read(blair, project, task, 'recent=5', legacy_cursor, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_legacy_user['error']['message'])
+        legacy_other_task = base64.urlsafe_b64encode(
+            json.dumps(dict(legacy_payload, p=project + '/' + other_task), separators=(',', ':')).encode('utf-8')
+        ).decode('ascii').rstrip('=')
+        refused_legacy_task = self.read(alex, project, task, 'recent=5', legacy_other_task, status=409)
+        self.assertEqual('Cursor is stale or belongs to a different query', refused_legacy_task['error']['message'])
+
+        # 4. Removing cursor_key from a saved state, starting the service, and restarting
+        # BEFORE any write persists the newly created key so a cursor signed before the
+        # restart still reads after the restart.
+        self.service.store.save()
+        raw_state = json.loads(self.service.store.path.read_text(encoding='utf-8'))
+        raw_state.pop('cursor_key', None)
+        self.service.store.path.write_text(json.dumps(raw_state), encoding='utf-8')
+
+        upgraded_store = Store(self.service.store.path)
+        upgraded_service = Service(upgraded_store)
+        self.restart(upgraded_service, EndpointBackend(sys.executable, str(fixes.STUB),
+                                                       str(self.canonical_root), service=upgraded_service))
+        pre_restart_page = self.read(alex, project, task, 'recent=5', status=200)
+        pre_restart_cursor = pre_restart_page['next_cursor']
+        self.assertTrue(pre_restart_cursor)
+
+        # Restart again before any write has occurred on upgraded_service.
+        restarted_store = Store(self.service.store.path)
+        restarted_service = Service(restarted_store)
+        self.assertEqual(upgraded_service.cursor_key(), restarted_service.cursor_key())
+        self.restart(restarted_service, EndpointBackend(sys.executable, str(fixes.STUB),
+                                                        str(self.canonical_root), service=restarted_service))
+        continued = self.read(alex, project, task, 'recent=5', pre_restart_cursor, status=200)
+        self.assertEqual(['comment 019', 'comment 018', 'comment 017', 'comment 016', 'comment 015'],
+                         [e['body'] for e in continued['items']])
+
+        # 5. Rotating cursor_key refuses old signed cursors with 409; the reader must start again without a cursor.
+        self.service.state['cursor_key'] = 'f' * 64
+        rotated_refused = self.read(alex, project, task, 'recent=5', pre_restart_cursor, status=409)
+        self.assertEqual(CURSOR_BAD_SIGNATURE, rotated_refused['error']['message'])
+        fresh = self.read(alex, project, task, 'recent=5', status=200)
+        fresh_continued = self.read(alex, project, task, 'recent=5', fresh['next_cursor'], status=200)
+        self.assertEqual([e['entry_id'] for e in continued['items']],
+                         [e['entry_id'] for e in fresh_continued['items']])
+
+    def test_cursor_stays_compact_for_longest_valid_project_and_task_ids(self):
+        from http_service import MAX_CURSOR, make_cursor, read_cursor
+        alex, project, _ = self.a_task('history-recent-0008')
+        long_task = 't' + ('a' * 127)
+        self.assertEqual(128, len(long_task))
+        state_path = self.canonical_root / 'canonical.json'
+        state = json.loads(state_path.read_text(encoding='utf-8'))
+        template = dict(state['rows'][0], id=long_task, title='longest valid task id',
+                        comments=[{'id': '%s-c%04d' % (long_task, i), 'author': 'alex',
+                                   'created_at': '2025-06-01T00:00:%02dZ' % (i + 1),
+                                   'text': 'before %d' % i} for i in range(6)])
+        state['rows'].append(template)
+        state_path.write_text(json.dumps(state), encoding='utf-8')
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (project, long_task), {}, token=alex).status)
+        act_cursor = self.read(alex, project, long_task, 'limit=5')['activity_cursor']
+        cp = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/checkpoints' % (project, long_task),
+            {'schema_version': 1, 'previous': None, 'activity_cursor': act_cursor, 'source_commit': fixes.COMMIT,
+             'branch': 'contrib/test', 'intent': 'baseline', 'acceptance': 'baseline',
+             'summary': 'baseline', 'next_action': 'continue', 'open_items': [], 'resolved': []},
+            token=alex)
+        self.assertEqual(201, cp.status, cp.data)
+        # Give the checkpoint comment a real bd-shaped '<task>-c<uuid>' id so the
+        # task-prefix packing and unpacking of 'scp' is exercised across pages.
+        prefixed_cp_id = '%s-c01a1608e-f8f1-75f5-a4c6-eacb09ed6ee3' % long_task
+        state = json.loads(state_path.read_text(encoding='utf-8'))
+        row = next(r for r in state['rows'] if r['id'] == long_task)
+        row['comments'][-1]['id'] = prefixed_cp_id
+        state_path.write_text(json.dumps(state), encoding='utf-8')
+        self.seed(long_task, ['after %d' % i for i in range(10)], start=100, stamp='2099-01-01T%02d:%02d:%02dZ')
+
+        for query in ('recent=3', 'limit=3', 'since_checkpoint=true&recent=3'):
+            with self.subTest(query=query):
+                first = self.read(alex, project, long_task, query)
+                if 'since_checkpoint' in query:
+                    self.assertEqual(prefixed_cp_id, first['since_checkpoint'])
+                cursor = first['next_cursor']
+                self.assertTrue(cursor)
+                self.assertLess(len(cursor), MAX_CURSOR // 2,
+                                'cursor length %d is not well under MAX_CURSOR=%d' % (len(cursor), MAX_CURSOR))
+                second = self.read(alex, project, long_task, query, cursor)
+                self.assertTrue(second['items'])
+                if 'since_checkpoint' in query:
+                    self.assertEqual(prefixed_cp_id, second['since_checkpoint'])
+
+        # Direct check with both a 128-char project ID and a 128-char task ID.
+        long_project = 'p' + ('b' * 127)
+        principal = self.service.authenticate(alex)
+        direct = make_cursor(principal, long_project + '/' + long_task, {'recent': '20'}, 20,
+                             first['next_cursor'], key=self.service.cursor_key())
+        self.assertLess(len(direct), MAX_CURSOR)
+        unpacked = read_cursor(principal, long_project + '/' + long_task, {'recent': '20'}, direct,
+                               key=self.service.cursor_key())
+        self.assertEqual(20, unpacked['o'])
+
+    def test_cursor_key_never_appears_in_route_answers_or_audit(self):
+        import base64
+        alex, project, task = self.a_task('history-recent-0009')
+        self.seed(task, MANY[:10])
+        secret = self.service.cursor_key()
+        self.assertGreaterEqual(len(secret), 64)
+        admin = self.admin_token()
+        for path, tok in (
+            ('/healthz', None),
+            ('/v1/sessions/current', alex),
+            ('/v1/me/work', alex),
+            ('/v1/projects', alex),
+            ('/v1/projects/%s' % project, alex),
+            ('/v1/projects/%s/tasks?limit=1' % project, alex),
+            ('/v1/projects/%s/tasks/%s' % (project, task), alex),
+            ('/v1/projects/%s/tasks/%s/brief' % (project, task), alex),
+            ('/v1/projects/%s/tasks/%s/history?recent=3' % (project, task), alex),
+            ('/v1/projects/%s/queue' % project, alex),
+            ('/v1/projects/%s/audit' % project, admin),
+            ('/v1/agents', alex),
+            ('/v1/docs', alex),
+        ):
+            response = self.request('GET', path, token=tok)
+            self.assertEqual(200, response.status, (path, response.data))
+            serialized = json.dumps(response.data)
+            self.assertNotIn(secret, serialized, path)
+            next_cursor = response.data.get('next_cursor') if isinstance(response.data, dict) else None
+            if next_cursor:
+                padded = next_cursor + '=' * (-len(next_cursor) % 4)
+                raw = base64.urlsafe_b64decode(padded.encode('ascii')).decode('utf-8')
+                self.assertNotIn(secret, raw, path)
+        self.assertNotIn(secret, json.dumps(self.service.state['audit']))
+
 
 import test_http_service as service_harness  # noqa: E402  (the in-process backend harness)
 
@@ -339,6 +570,30 @@ class InProcessRecentCase(service_harness.ServerHarness):
         page = self.get(alex, project, task, 'since_checkpoint=true&recent=10')
         self.assertEqual(['note-after'], [e['action'] for e in page['items']])
         self.assertEqual('2026-02-02T00:00:00Z', page['checkpoint_timestamp'])
+
+    def test_recent_counts_logical_entries_and_keeps_fragments_in_body_order(self):
+        alex, project, task = self.task_with_events(0)
+        events = [e for e in self.backend.state['events'] if not (e.get('project') == project and e.get('task') == task)]
+        for n in range(12):
+            if n == 10:
+                for frag_idx, text in enumerate(('part-0-', 'part-1-', 'part-2')):
+                    events.append({'time': '2026-02-01T00:00:10Z', 'project': project, 'task': task,
+                                   'action': 'note-010', 'entry_id': 'e-10', 'body': text,
+                                   'body_offset': frag_idx * 7, 'continued': frag_idx < 2,
+                                   'user_id': None, 'actor': 'alex'})
+            else:
+                events.append({'time': '2026-02-01T00:00:%02dZ' % n, 'project': project, 'task': task,
+                               'action': 'note-%03d' % n, 'entry_id': 'e-%d' % n, 'body': 'body-%d' % n,
+                               'body_offset': 0, 'continued': False, 'user_id': None, 'actor': 'alex'})
+        self.backend.state['events'] = events
+        page = self.get(alex, project, task, 'recent=10')
+        logical = reassemble(page['items'])
+        self.assertEqual(10, len(logical))
+        self.assertEqual(12, len(page['items']))
+        self.assertEqual(12, page['total'])
+        self.assertEqual('part-0-part-1-part-2', dict(logical)['e-10'])
+        self.assertTrue(page['truncated'])
+        self.assertIn('2 of 12 entries are not in this answer', page['truncated_note'])
 
 
 if __name__ == '__main__':

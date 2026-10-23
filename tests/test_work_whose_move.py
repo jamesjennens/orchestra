@@ -430,9 +430,11 @@ class ServedRuleTests(unittest.TestCase):
         import http_service
         fields = http_service.EndpointBackend._attention_fields(
             {'newer_activity': True, 'newer_activity_marker': 'task-bi:0123456789abcdef',
+             'newer_activity_fields': 'fedcba9876543210',
              'newer_activity_by_others': 2, 'newer_activity_own': 1,
              'newer_activity_coverage': 'snapshot', 'unresolved_directions': 3})
         self.assertEqual(fields['newer_activity_marker'], 'task-bi:0123456789abcdef')
+        self.assertEqual(fields['newer_activity_fields'], 'fedcba9876543210')
         self.assertEqual(fields['newer_activity_by_others'], 2)
         self.assertEqual(fields['newer_activity_own'], 1)
         self.assertEqual(fields['newer_activity_coverage'], 'snapshot')
@@ -445,6 +447,7 @@ class ServedRuleTests(unittest.TestCase):
              'attention': fields}]}
         task = http_service.own_queue_tasks(queue, 'me/session')['tasks'][0]
         self.assertEqual(task['newer_activity_marker'], 'task-bi:0123456789abcdef')
+        self.assertEqual(task['newer_activity_fields'], 'fedcba9876543210')
         self.assertEqual(task['newer_activity_by_others'], 2)
         self.assertEqual(task['newer_activity_coverage'], 'snapshot')
         self.assertEqual(task['unresolved_directions'], 3)

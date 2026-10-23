@@ -52,6 +52,15 @@ WEB_WORKER_TOOLS = (
     'GET /v1/projects/PROJECT/tasks/TASK/history); me/next for its own work (#orchestraNext '
     'or GET /v1/agents/me/next). Never tell a web worker to install the kit, and never give '
     'it a CLI-only kit command.')
+#: The coordinator-only paragraph (kittrial-5bb.366): a worker usually runs on another
+#: machine, so it cannot read the coordinator's folders and a local path means nothing to
+#: it. Content travels through the project's repository, a task comment, a network share
+#: both can open, or the project's task files when they exist.
+WORKER_ON_ANOTHER_MACHINE = (
+    'Workers usually run on other machines and cannot read your folders: never name a '
+    'local path. Share the content as a branch or path in the project\'s repository, as '
+    'text in a task comment (up to 64 KiB), on a network share both can open, or through '
+    'the project\'s task files when they exist.')
 #: Every quote-like character (ASCII, typographic, guillemets, low-9, primes,
 #: fullwidth, CJK corner brackets) becomes a plain apostrophe, so a title can never
 #: close or imitate the label's own double quotes.
@@ -392,7 +401,7 @@ def build_prompt(agent, owner_name, projects, generated_at, server):
     else:
         # Only a project where this person coordinates gets the paragraph (kittrial-5bb.357);
         # a contributor or owner is not told how to direct a web worker.
-        coordinator_tools = ['', WEB_WORKER_TOOLS] if any(
+        coordinator_tools = ['', WEB_WORKER_TOOLS, WORKER_ON_ANOTHER_MACHINE] if any(
             p.get('role') == 'coordinator' for p in acting) else []
         head = intro + coordinator_tools + [
             '',
@@ -417,6 +426,12 @@ def build_prompt(agent, owner_name, projects, generated_at, server):
             'deliver, tell your owner it must be handed over to you first instead of working '
             'around it. Approvals and integration stay your owner\'s decision unless they tell '
             'you otherwise.',
+            '6. A path on someone else\'s machine is not reachable: do not search for it; '
+            'ask in the task for the content or a repository path.',
+            '7. When you need a decision or information, ask in the task (a comment, or an '
+            'open item of kind question in your checkpoint) so the coordinator answers it '
+            'there; do not ask the person at the keyboard, who may not be watching, unless '
+            'they started this turn with a question for you.',
             '', UNTRUSTED_LINE]
     if kind == 'status':
         body, listed, omitted = _sections(viewing, now, ('status',))

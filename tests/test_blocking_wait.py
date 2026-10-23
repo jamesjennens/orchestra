@@ -263,12 +263,12 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(one['fingerprint'], two['fingerprint'])
 
     def test_a_marker_change_alone_returns_again(self):
-        """kittrial-5bb.351: the second other-party comment wakes even while the boolean stays true."""
+        """kittrial-5bb.369: a second other-party comment wakes through the wait marker."""
         clock = FakeClock()
         before = worker({'task': 't1', 'whose_move': 'you', 'review_state': 'in-progress',
-                         'newer_activity': True, 'newer_activity_marker': 't1-ca:aaaa'})
+                         'wait_newer_activity_marker': 't1-ca:aaaa'})
         after = worker({'task': 't1', 'whose_move': 'you', 'review_state': 'in-progress',
-                        'newer_activity': True, 'newer_activity_marker': 't1-cb:bbbb'})
+                        'wait_newer_activity_marker': 't1-cb:bbbb'})
         self.assertNotEqual(before['fingerprint'], after['fingerprint'])
         read = scripted([before, after])
         code, view = waiting.run_wait(read, since=before['fingerprint'], interval=60, timeout=600,
@@ -279,8 +279,76 @@ class FingerprintTests(unittest.TestCase):
         # transports must fingerprint the same task the same way.
         nested = worker({'task': 't1', 'whose_move': 'you', 'review_state': 'in-progress',
                          'attention': {'newer_activity': True,
-                                       'newer_activity_marker': 't1-cb:bbbb'}})
+                                       'wait_newer_activity_marker': 't1-cb:bbbb'}})
         self.assertEqual(nested['fingerprint'], after['fingerprint'])
+
+    def test_the_callers_own_checkpoint_does_not_change_a_worker_fingerprint(self):
+        """kittrial-5bb.369: the plan checkpoint must not wake the wait that wrote it."""
+        before = worker({'task': 't1', 'whose_move': 'you', 'review_state': 'in_progress',
+                         'owner': 'alice/session', 'status': 'in_progress',
+                         'checkpoint_at': '2026-09-15T10:00:00Z', 'open_items': 0,
+                         'blocking_items': 0, 'newer_activity': False,
+                         'newer_activity_marker': 'fields:aaaa',
+                         'wait_newer_activity_marker': 'fields:bbbb'})
+        after = worker({'task': 't1', 'whose_move': 'you', 'review_state': 'in_progress',
+                        'owner': 'alice/session', 'status': 'in_progress',
+                        'checkpoint_at': '2026-09-15T11:00:00Z', 'open_items': 2,
+                        'blocking_items': 1, 'newer_activity': True,
+                        'newer_activity_marker': 't1-cdir:cccc',
+                        'wait_newer_activity_marker': 'fields:bbbb'})
+        self.assertEqual(before['fingerprint'], after['fingerprint'])
+        clock = FakeClock()
+        read = scripted([after, after])
+        code, _view = waiting.run_wait(read, since=before['fingerprint'], interval=60,
+                                       timeout=120, clock=clock.clock, sleep=clock.sleep)
+        self.assertEqual(code, waiting.EXIT_TIMEOUT)      # nothing new: the wait blocks
+        # A coordinator comment moves the stable marker and the same wait returns.
+        woke = worker({'task': 't1', 'whose_move': 'you', 'review_state': 'in_progress',
+                       'wait_newer_activity_marker': 't1-cdir:dddd'})
+        self.assertNotEqual(before['fingerprint'], woke['fingerprint'])
+        read = scripted([woke])
+        code, view = waiting.run_wait(read, since=before['fingerprint'], interval=60,
+                                      timeout=120, clock=clock.clock, sleep=clock.sleep)
+        self.assertEqual(code, waiting.EXIT_WORK)
+        self.assertEqual(view['fingerprint'], woke['fingerprint'])
+
+    def test_everything_by_others_still_wakes_a_worker(self):
+        base = {'task': 't1', 'whose_move': 'you', 'review_state': 'in_progress',
+                'owner': 'alice/session', 'status': 'in_progress',
+                'wait_newer_activity_marker': 'fields:bbbb', 'pending_review_items': 0}
+        first = worker(base)['fingerprint']
+        cases = {
+            'review state': {'review_state': 'changes-requested'},
+            'pending review items': {'pending_review_items': 3},
+            'assignment': {'owner': 'someone/else'},
+            'claim/release': {'status': 'open'},
+            'contribution': {'contribution_id': 'c1'},
+            'redelivered': {'redelivered': True},
+            'guidance': {'guidance_version': 'v2'},
+            'stable marker': {'wait_newer_activity_marker': 't1-cdir:dddd'},
+        }
+        for name, change in cases.items():
+            with self.subTest(field=name):
+                self.assertNotEqual(first, worker(dict(base, **change))['fingerprint'])
+        # Whose move changes: the row leaves the worker's list.
+        self.assertNotEqual(first, worker(dict(base, whose_move='them'))['fingerprint'])
+
+    def test_the_wait_marker_is_lifted_from_the_attention_block(self):
+        flat = worker({'task': 't1', 'whose_move': 'you',
+                       'wait_newer_activity_marker': 't1-cdir:dddd'})
+        nested = worker({'task': 't1', 'whose_move': 'you',
+                         'attention': {'wait_newer_activity_marker': 't1-cdir:dddd'}})
+        self.assertEqual(flat['fingerprint'], nested['fingerprint'])
+
+    def test_the_coordinator_fingerprint_ignores_the_wait_marker(self):
+        lanes = empty_lanes()
+        one = waiting.coordinator_view([{'task': 't1', 'review_state': 'awaiting-review',
+                                         'contribution_id': 'c1',
+                                         'wait_newer_activity_marker': 'a'}], lanes)
+        two = waiting.coordinator_view([{'task': 't1', 'review_state': 'awaiting-review',
+                                         'contribution_id': 'c1',
+                                         'wait_newer_activity_marker': 'b'}], lanes)
+        self.assertEqual(one['fingerprint'], two['fingerprint'])
 
     def test_a_fingerprint_is_versioned(self):
         self.assertTrue(waiting.is_fingerprint(waiting.fingerprint([])))

@@ -1901,6 +1901,11 @@ console.log(JSON.stringify({
   guideWithCert: m.agentGuide(p, { hasCertificate: true }),
   guideWithCertIsKOnly: m.agentGuide(p, { hasCertificate: true }).includes('curl -fsS --noproxy 127.0.0.1 --max-time 60 -K')
     && !/curl[^\\n]*--cacert/.test(m.agentGuide(p, { hasCertificate: true })),
+  // kittrial-5bb.366: the generated AGENT.md tells the agent to ask for content it cannot reach.
+  guideStatesPathRule: m.agentGuide(p).includes("A path on someone else's machine is not reachable")
+    && m.agentGuide(p).includes('ask in the task for the content or a repository path'),
+  // kittrial-5bb.372: the generated AGENT.md says where a question goes.
+  guideStatesWhereQuestionsGo: m.agentGuide(p).includes('ask in the task (a comment, or an open item of kind question in your checkpoint) so the coordinator answers it there; do not ask the person at the keyboard, who may not be watching, unless they started this turn with a question for you.'),
   paths: [m.destinationPath(p.workingDirectory, m.CONFIG_PATH), m.destinationPath('/home/j/x/', m.GUIDE_PATH),
           m.destinationPath('D:', m.CONFIG_PATH), m.destinationPath('', m.CONFIG_PATH)],
   ignore: [m.gitignoreAppend('node_modules'), m.gitignoreAppend('a\r\n'), m.gitignoreAppend('/.orchestra\n'),
@@ -1972,6 +1977,8 @@ console.log(JSON.stringify({
         self.assertIn('<your-name>', result['bodyPlaceholder'])
         self.assertFalse(result['testHasCacert'])
         self.assertTrue(result['guideWithCertIsKOnly'])
+        self.assertTrue(result['guideStatesPathRule'])
+        self.assertTrue(result['guideStatesWhereQuestionsGo'])
         self.assertIn('cacert', result['guideWithCert'])
         self.assertIn('ssl-no-revoke', result['guideWithCert'])
         # The rewrite WRITES the curl options with the real expanded path.

@@ -557,6 +557,26 @@ def activity_marker(newest_other,digest):
     combined=content_hash({'entry':content_hash(newest_other) if newest_other is not None else None,'fields':digest})
     return (newest_other['entry_id'] if newest_other is not None else 'fields')+':'+combined[:MARKER_DIGEST]
 
+def wait_activity_marker(data,row):
+    """The stable marker a worker's wait fingerprints (kittrial-5bb.369).
+
+    ``newer_activity_marker`` is relative to the NEWEST checkpoint, so the caller's own
+    checkpoint both resets it and (through ``checkpoint_at``) moves the released wait
+    fingerprint: the agent's plan checkpoint wakes its own wait once with nothing new.
+    This marker is instead the newest entry by anybody OTHER than the task's assignee
+    across the task's whole history, folded with the current title/description/
+    acceptance digest by the same :func:`activity_marker`. The agent's own checkpoint,
+    lane-state record and comments are its own entries, so they never move it; a new or
+    edited other-party entry, another actor's checkpoint and a field edit do. It is
+    computed from the read's own full snapshot, so brief and the queue rows cannot
+    disagree.
+    """
+    owner=row.get('assignee')
+    entries=[entry for entry in data.get('entries') or []
+             if isinstance(entry,dict) and entry.get('author')!=owner]
+    newest=max(entries,key=lambda entry:(parse_moment(entry['timestamp']),entry['entry_id'])) if entries else None
+    return activity_marker(newest,fields_digest(row))
+
 def newer_comment_by_other(row,checkpoint_comment):
     """The released ``newer_activity`` boolean, in ONE place (kittrial-5bb.354).
 
@@ -872,10 +892,13 @@ def newer_selection(data,prov,checkpoint_timestamp):
     the marker, the boolean and the 'changes since your checkpoint' section all read
     this, so no route can count differently. With recorded provenance the selection is
     exact (new, edited and late entries); a legacy checkpoint has none, so the released
-    timestamp rule applies and coverage is 'unknown'.
+    timestamp rule applies and coverage is 'timestamp' (kittrial-5bb.367): a weaker but
+    real coverage, because a backdated arrival or an edit of an older entry can be
+    missed. 'unknown' remains for a legacy checkpoint with no timestamp at all.
     """
     coverage='unknown' if prov is None else ('snapshot' if prov['complete'] else 'windowed')
     if prov is None and checkpoint_timestamp:
+        coverage='timestamp'
         data=dict(data,entries=[e for e in data['entries']
                                if parse_moment(e['timestamp'])>=parse_moment(checkpoint_timestamp)])
     entries,fresh,changed_late,unverified=unincorporated(data,prov)
@@ -904,6 +927,10 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     # the marker is a precise claim, so a reader falls back to the boolean then.
     # kittrial-5bb.354: with ``marker_fields`` (the current fields digest) the marker is
     # the shared activity_marker, so it also moves on a title/description/acceptance edit.
+    # kittrial-5bb.367: a legacy checkpoint read by the timestamp rule ('timestamp'
+    # coverage) gets the same marker, from the newest other-party entry at/after it;
+    # the coverage label tells the client that a backdated arrival or an older edit
+    # can be missed.
     marker=None
     if coverage!='unknown' and (others or marker_fields is not None):
         newest=max(others,key=lambda e:(parse_moment(e['timestamp']),e['entry_id'])) if others else None
@@ -917,6 +944,9 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
           'Reading clears nothing: acknowledging a direction, reconciling it into a new checkpoint and completing it stay separate explicit acts.')
     if coverage=='unknown':
         note+=' Coverage is UNKNOWN: this checkpoint predates per-entry digests, so reconcile with history before trusting the counts.'
+    elif coverage=='timestamp':
+        note+=(' Coverage is TIMESTAMP: this checkpoint predates per-entry digests, so entries are selected by time; '
+               'a backdated arrival or an edit of an older entry can be missed. Reconcile with history when in doubt.')
     elif coverage=='windowed':
         note+=(' Coverage is WINDOWED: '+str(unverified)+' older entries have no per-entry evidence recorded by this checkpoint, so their current content is unverified and they are excluded from the fresh/changed counts. '
                'Run "checkpoint '+data['task']+' --verify" for the classification supported by evidence retained across the task\'s checkpoints (entries no checkpoint ever recorded stay unknown).')
@@ -1101,7 +1131,10 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                 dir_note='' if not dirs else '; '+str(dirs['total'])+' outstanding direction(s) not yet resolved/superseded'
                 next_action=('STALE CHECKPOINT: activity the checkpoint did not incorporate exists ('+str(newer['other_count'])
                              +' by other actors, '+str(newer['own_count'])+' own'+dir_note
-                             +('' if newer['coverage']!='unknown' else ', coverage UNKNOWN — reconcile with history before trusting counts')
+                             +('' if newer['coverage'] in ('snapshot','windowed') else
+                               (', coverage TIMESTAMP — a backdated arrival or an edit of an older entry can be missed'
+                                if newer['coverage']=='timestamp' else
+                                ', coverage UNKNOWN — reconcile with history before trusting counts'))
                              +'). Read newer activity first: '+newer['history']
                              +'. The recorded checkpoint next action was: '+p['next_action'])
     # The one newer-activity definition (kittrial-5bb.354): brief carries the SAME fields
@@ -1112,7 +1145,7 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     if p is not None:
         try:
             activity=activity_fields(issue,c,retained_provenance(state),fields_digest(issue),newer if stale else None,
-                                     dir_out['total'])
+                                     dir_out['total'],data=data)
         except StopIteration:
             activity=None
     # Which of title, description and acceptance changed: only the tracker's version
@@ -1562,7 +1595,10 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
     own=sum(1 for e in entries if e['author']==owner)
     note=('Newest first; read these before acting on the checkpoint. Bodies are clipped; read the whole '
           'entries with '+history+'. Reading clears nothing: a new checkpoint incorporates them.')
-    if coverage=='unknown':
+    if coverage=='timestamp':
+        note+=(' Coverage is TIMESTAMP (the checkpoint predates per-entry digests): entries are selected by time, '
+               'so a backdated arrival or an edit to an older entry is not seen.')
+    elif coverage=='unknown':
         note+=' Coverage is UNKNOWN (the checkpoint predates per-entry digests): entries are selected by time, so an edit to an older entry is not seen.'
     elif coverage=='windowed':
         note+=' Coverage is WINDOWED: '+str(unverified)+' older entries cannot be re-verified and are not listed.'
@@ -1581,18 +1617,31 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
     and so, unchanged, do brief's ``activity`` block, the agent routes and the web task
     read. ``newer_activity`` keeps its released rule (:func:`newer_comment_by_other`);
     the counts and the marker are the precise signals, and the marker also moves on an
-    edit of the title, description or acceptance (:func:`activity_marker`). On a read
-    that fails, every field is null and the caller keeps its own ``newer_activity``.
+    edit of the title, description or acceptance (:func:`activity_marker`).
+    ``wait_newer_activity_marker`` (kittrial-5bb.369) is the checkpoint-independent
+    marker the worker's wait fingerprints. On a read that fails, every field is null and
+    the caller keeps its own ``newer_activity``.
     """
-    empty={'newer_activity_marker':None,'newer_activity_by_others':None,'newer_activity_own':None,
+    empty={'newer_activity_marker':None,'newer_activity_fields':None,
+           'wait_newer_activity_marker':None,
+           'newer_activity_by_others':None,'newer_activity_own':None,
            'newer_activity_coverage':None,'unresolved_directions':None}
     try:
         if state is None:state=checkpoint_state(row)
         elif not state['provenance']:
             state=dict(state,provenance={cid:normalize_provenance(p) for cid,p in state['history']})
-        if state['current'] is None or state['invalid']:return empty
-        p,c=state['current'];project=untoken(p['activity_cursor']).get('project','work-queue')
-        data=excluding_checkpoint(snapshot(rows,project,row['id']),c['id'],c.get('author'))
+        # The wait marker does not depend on a checkpoint, and it must not move when the
+        # caller writes its FIRST one either (kittrial-5bb.369), so it is computed from the
+        # task's full snapshot for every row. The project name only seeds the snapshot's
+        # task key; the marker reads entries and task fields, never the project.
+        has_checkpoint=state['current'] is not None and not state['invalid']
+        project=untoken(state['current'][0]['activity_cursor']).get('project','work-queue') if has_checkpoint else 'work-queue'
+        full=snapshot(rows,project,row['id'])
+        wait_marker=wait_activity_marker(full,row)
+        if not has_checkpoint:
+            return dict(empty,wait_newer_activity_marker=wait_marker)
+        p,c=state['current']
+        data=excluding_checkpoint(full,c['id'],c.get('author'))
         dispositions=chain_dispositions(state['history'])
         context=direction_context(row,state);direction_data=direction_entries(data,context)
         counted,_directions_off_reason=directions_counted(provenance_writes,row.get('status'))
@@ -1602,29 +1651,48 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
             newer=newer_activity_summary(data,prov,c.get('created_at'),
                                          context[0],dispositions,direction_data,counted,_directions_off_reason,
                                          marker_fields=digest)
-        return activity_fields(row,c,prov,digest,newer,
-                               len(unresolved_directions(direction_data,dispositions,context[0],counted)))
+        fields=activity_fields(row,c,prov,digest,newer,
+                               len(unresolved_directions(direction_data,dispositions,context[0],counted)),
+                               data=full)
+        fields['wait_newer_activity_marker']=wait_marker
+        return fields
     except (ValueError,TypeError,KeyError,StopIteration):return empty
 
-def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved):
-    """The six newer-activity fields from one read's own results (kittrial-5bb.354).
+def activity_fields(row,checkpoint_comment,prov,digest,newer,unresolved,data=None):
+    """The eight newer-activity fields from one read's own results (kittrial-5bb.354).
 
     ``newer`` is that read's :func:`newer_activity_summary` (computed with
     ``marker_fields=digest``), or None when the checkpoint's cursor is current. brief and
     the queue rows both call this, each with what it already computed, so the fields
     cannot differ and brief reads nothing twice. Raises StopIteration when the checkpoint
-    comment is not on the row.
+    comment is not on the row. ``newer_activity_fields`` is the current title/description/
+    acceptance digest alone (kittrial-5bb.367 F2b), so a reader can separate a field edit
+    from the marker's entry-plus-fields hex; it is null in the empty (no checkpoint) row.
+    ``data`` is the task's FULL snapshot, from which ``wait_newer_activity_marker`` is
+    computed (kittrial-5bb.369); it is null when the caller has no snapshot.
     """
     if newer is None:
         # Nothing newer: the marker still stands, so a later claim, which makes the cursor
-        # stale but adds no entry and no field edit, reads the same marker. A legacy
-        # checkpoint (no per-entry digests) has none.
-        own=others=0;coverage='current';marker=None if prov is None else activity_marker(None,digest)
+        # stale but adds no entry and no field edit, reads the same marker. kittrial-5bb.367:
+        # a legacy checkpoint with a timestamp gets the fields marker too (the timestamp
+        # rule can select later entries); only a checkpoint with no timestamp at all has
+        # none, because there is no selection to compare with.
+        own=others=0;coverage='current'
+        legacy_without_stamp=prov is None and not (checkpoint_comment or {}).get('created_at')
+        marker=None if legacy_without_stamp else activity_marker(None,digest)
     else:
         own=newer['own_count'];others=newer['other_count'];coverage=newer['coverage']
         marker=newer['newer_activity_marker']
     return {'newer_activity':newer_comment_by_other(row,checkpoint_comment),
             'newer_activity_marker':marker,
+            # kittrial-5bb.367 item F2b: the CURRENT title/description/acceptance digest on
+            # its own, so a bridge can tell a field edit from the agent's own checkpoint
+            # without unpicking the marker's combined hex.
+            'newer_activity_fields':digest[:MARKER_DIGEST],
+            # kittrial-5bb.369: the checkpoint-independent marker a worker's wait
+            # fingerprints. Its own plan checkpoint does not move it; any other-party
+            # entry (a comment, an edit, another actor's checkpoint) or field edit does.
+            'wait_newer_activity_marker':wait_activity_marker(data,row) if isinstance(data,dict) else None,
             'newer_activity_by_others':others,'newer_activity_own':own,
             'newer_activity_coverage':coverage,
             'unresolved_directions':unresolved}
@@ -1737,7 +1805,9 @@ def checkpoint_gaps(data,checkpoint):
 
     ``coverage`` is `snapshot` (retained evidence re-verifies every entry the checkpoint
     incorporated), `windowed` (entries beyond the retained bounds have no per-entry
-    evidence) or `unknown` (a legacy record). `unverified_count` is how many current
+    evidence), `timestamp` (a legacy record, read by the released timestamp rule, so a
+    backdated arrival or an edit of an older entry can be missed) or `unknown` (a legacy
+    record with no timestamp at all). `unverified_count` is how many current
     entries the read could be hiding: entries the chain recorded but cannot re-verify
     that sort before the baseline. ``note`` says in plain words what this read cannot
     show, so a reader never has to infer a hidden instruction from a count
@@ -1749,7 +1819,8 @@ def checkpoint_gaps(data,checkpoint):
          +str(checkpoint['comment'].get('author'))+' at '+str(checkpoint['comment'].get('created_at')))
     prov=checkpoint['provenance']
     if prov is None:
-        return ('unknown',0,who+'. It records no per-entry provenance (a legacy record), so the released timestamp rule is '
+        coverage='timestamp' if checkpoint['comment'].get('created_at') else 'unknown'
+        return (coverage,0,who+'. It records no per-entry provenance (a legacy record), so the released timestamp rule is '
                 'used: every entry at or after the checkpoint is shown. An entry edited since the checkpoint, or an arrival '
                 'backdated to before it, CANNOT be seen in this read; read the whole history (history '+data['task']+') to be sure.')
     if prov['covered']-prov['verifiable']<=0:
@@ -1905,8 +1976,9 @@ def format_changes(section,activity):
     if section['checkpoint'] is None:return ['Changes since your checkpoint: '+section['note']]
     lines=[]
     if activity:
-        lines.append('Newer activity: newer_activity=%s marker=%s by_others=%s own=%s coverage=%s unresolved_directions=%s'%(
-            activity.get('newer_activity'),activity.get('newer_activity_marker'),activity.get('newer_activity_by_others'),
+        lines.append('Newer activity: newer_activity=%s marker=%s fields=%s by_others=%s own=%s coverage=%s unresolved_directions=%s'%(
+            activity.get('newer_activity'),activity.get('newer_activity_marker'),activity.get('newer_activity_fields'),
+            activity.get('newer_activity_by_others'),
             activity.get('newer_activity_own'),activity.get('newer_activity_coverage'),activity.get('unresolved_directions')))
     if not section['total'] and not section['fields']:
         return lines+['Changes since your checkpoint: none (coverage %s).'%section['coverage']
@@ -1963,7 +2035,10 @@ def format_brief(result):
     if newer:
         authors=', '.join(a['text'] for a in newer['other_authors']['items']) or 'none'
         if newer['other_authors']['omitted']:authors+=f' (+{newer["other_authors"]["omitted"]} more)'
-        coverage='' if newer['coverage']=='snapshot' else (' Coverage UNKNOWN (checkpoint predates per-entry digests).' if newer['coverage']=='unknown' else f' Coverage WINDOWED ({newer["unverified_count"]} older entries unverifiable; run: {newer["verify"]}).')
+        if newer['coverage']=='snapshot':coverage=''
+        elif newer['coverage']=='timestamp':coverage=' Coverage TIMESTAMP (checkpoint predates per-entry digests; a backdated arrival or an older edit can be missed).'
+        elif newer['coverage']=='unknown':coverage=' Coverage UNKNOWN (checkpoint predates per-entry digests).'
+        else:coverage=f' Coverage WINDOWED ({newer["unverified_count"]} older entries unverifiable; run: {newer["verify"]}).'
         lines += [f'Newer activity not in checkpoint: {newer["other_count"]} by other actors ({authors}), {newer["own_count"]} own; {newer["fresh_count"]} fresh, {newer["changed_or_late_count"]} changed/late.'+coverage]
         lines += ['  '+e['entry_id']+' ['+e['kind']+(' changed' if e['changed'] else '')+'] '+e['timestamp']+' by '+e['author']['text'] for e in newer['entries']]
         if newer['omitted']:lines += [f'  ... {newer["omitted"]} more; fresh activity: '+newer['history_new']+'; full: '+newer['history']]
@@ -2077,11 +2152,12 @@ def help_notes(action):
                 'Coverage is part of the answer: snapshot means retained evidence from the checkpoint chain '
                 're-verifies every entry the checkpoint incorporated; windowed means N entries recorded by '
                 'the checkpoint have no per-entry evidence and are only returned when they order after it, '
-                'so an edit to one of them cannot be seen (unverified_entries counts them); unknown means the '
+                'so an edit to one of them cannot be seen (unverified_entries counts them); timestamp means the '
                 'baseline is a legacy record with no provenance, where the released timestamp rule applies — '
-                'every entry at or after the checkpoint is shown — and an entry edited since it, or an arrival '
-                'backdated to before it, CANNOT be seen. checkpoint_note states this in words. Read history '
-                'TASK or run checkpoint TASK --verify before trusting a windowed or unknown read alone.',
+                'every entry at or after the checkpoint is shown — so an entry edited since it, or an arrival '
+                'backdated to before it, CANNOT be seen; unknown means a legacy record with no timestamp at all. '
+                'checkpoint_note states this in words. Read history '
+                'TASK or run checkpoint TASK --verify before trusting a windowed, timestamp or unknown read alone.',
                 'Example (comments only): history TASK --kind comment --recent 20. --kind accepts comment '
                 'or event; --since stays inclusive and timezone-aware and composes with both filters.',
                 'The JSON result names the effective order, kind and checkpoint boundary and reports '
