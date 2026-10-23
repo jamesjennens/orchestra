@@ -89,6 +89,11 @@ ITEM_EVENT_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind', 'targ
 #: kittrial-5bb.388 lets an editor name the parent job on an amendment too.
 ITEM_EVENT_FIELDS_AMEND = ITEM_EVENT_FIELDS | {'title'}
 ITEM_EVENT_FIELDS_AMEND_PARENT = ITEM_EVENT_FIELDS_AMEND | {'parent'}
+#: An accept-intent line names the native record identity an acceptance is about to write
+#: (review b1/r4). It is internal bookkeeping: reads, the items cache and the Markdown export
+#: skip it, while the raw JSONL export keeps it like every other stored line.
+ITEM_INTENT_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind',
+                      'target_sequence', 'action', 'identity', 'author', 'created_at'}
 RECORD_FIELDS = {'kind', 'id', 'revision', 'sha256', 'decision_id', 'evidence'}
 RECORD_KINDS = ('requirement', 'proposal', 'decision')
 EVIDENCE = re.compile(r'orchestra:room/(r-[0-9a-f]{12})#([0-9]{1,12})\Z')
@@ -308,9 +313,10 @@ def item_decision_operation(room_id, sequence, action, content=None):
 
     Review b1/r3 and s1/r3: ``content`` is the digest of what the decision records (or the
     new text an amendment writes).  An amendment and an acceptance therefore get a fresh
-    identity when the item's text changed, so a second amendment applies and an accept after
-    a failed append still records the current text; an unchanged retry keeps its identity and
-    reconciles on the same native record.
+    identity when the item's text changed, so a second amendment applies; an unchanged retry
+    keeps its identity and reconciles on the same native record. Review b1/r4 adds the accept
+    intent: an acceptance names its identity in the room log before the record write, and a
+    retry after a failed append reuses that identity instead of creating a second record.
     """
     if content is None:
         return 'room-%s-%d-%s' % (room_id, sequence, action)
@@ -321,6 +327,73 @@ def item_content_digest(*values):
     """A short, stable digest of the item fields a decision records (review b1/s1, r3)."""
     joined = '\x1f'.join(value if isinstance(value, str) else '' for value in values)
     return hashlib.sha256(joined.encode('utf-8')).hexdigest()[:16]
+
+
+def item_intent_operation(identity):
+    """The room-line operation id of the intent for one native record identity (review b1/r4)."""
+    return 'intent-' + identity
+
+
+def pending_accept_intent(lines, sequence):
+    """The accept intent on an item that has no matching accepted event yet, or None.
+
+    Review b1/r4: the route appends this line before the native write. While it is pending,
+    an amendment, a supersede, a moderation or any decision other than a retry of that exact
+    identity is refused (409 ``accepting``), so the item cannot change under the native
+    record the failed attempt already wrote.
+    """
+    accepted = {line['operation_id'] for line in lines
+                if line['kind'] == 'item-event' and line['event'] == 'accept'
+                and line['target_sequence'] == sequence}
+    for line in reversed(lines):
+        if line['kind'] != 'item-intent' or line['target_sequence'] != sequence:
+            continue
+        if line['identity'] in accepted:
+            continue
+        return line
+    return None
+
+
+def intend_accept(project, room_id, sequence, identity, author, limits_values):
+    """Write the accept intent before the native record (review b1/r4).
+
+    The line names the identity of the native record about to be written. A retry of that
+    same identity reuses the line and proceeds; any other decision on the item is refused
+    until the matching accepted event exists.
+    """
+    identity = check_operation_id(identity)
+    if type(sequence) is not int or sequence < 1:
+        raise Refusal(422, 'invalid', 'The item number must be a positive whole number')
+    _room_open(project, room_id)
+    lines = load_lines(project, room_id)
+    operation_id = item_intent_operation(identity)
+    existing = _find_operation(lines, operation_id)
+    if existing is not None:
+        if (existing['kind'] == 'item-intent' and existing['target_sequence'] == sequence
+                and existing['identity'] == identity):
+            return dict(existing, replayed=True)
+        raise Refusal(409, 'operation_reused',
+                      'That operation id already wrote a different room line.')
+    pending = pending_accept_intent(lines, sequence)
+    if pending is not None:
+        if pending['identity'] == identity:
+            return dict(pending, replayed=True)
+        raise Refusal(409, 'accepting',
+                      'That item is being accepted; retry that acceptance.')
+    current = next((item for item in items_from_lines(lines, room_id)
+                    if item['sequence'] == sequence), None)
+    if current is None or current['kind'] != 'item':
+        raise Refusal(404, 'not_found', 'No such item in this room.')
+    if current['moderated']:
+        raise Refusal(409, 'moderated', 'A moderated item cannot be decided.')
+    if current['state'] not in ('proposed', 'amended'):
+        raise Refusal(409, 'final', 'That item is already decided.')
+    line = {'schema_version': SCHEMA_VERSION, 'sequence': lines[-1]['sequence'] + 1,
+            'operation_id': operation_id, 'kind': 'item-intent',
+            'target_sequence': sequence, 'action': 'accept', 'identity': identity,
+            'author': dict(author), 'created_at': now_iso()}
+    _append(project, room_id, line, limits_values)
+    return dict(line, replayed=False)
 
 
 # -- paths and atomic writes ----------------------------------------------------------------------
@@ -415,6 +488,8 @@ def _validate_line(line, expected=None):
                         else ITEM_EVENT_FIELDS_AMEND)
         else:
             required = ITEM_EVENT_FIELDS
+    elif kind == 'item-intent':
+        required = ITEM_INTENT_FIELDS
     else:
         raise ValueError('Invalid room line kind')
     if set(line) != required:
@@ -434,8 +509,16 @@ def _validate_line(line, expected=None):
             raise ValueError('Invalid room tombstone target')
         if not isinstance(line['reason'], str) or not line['reason'].strip() or len(line['reason']) > 500:
             raise ValueError('Invalid room tombstone reason')
-    if not isinstance(line['text'], str) or len(line['text']) > 100000:
-        raise ValueError('Invalid room line text')
+    if kind in ('tombstone', 'message', 'item', 'item-event'):
+        if not isinstance(line['text'], str) or len(line['text']) > 100000:
+            raise ValueError('Invalid room line text')
+    if kind == 'item-intent':
+        if type(line['target_sequence']) is not int or line['target_sequence'] < 1:
+            raise ValueError('Invalid room item-intent target')
+        if line['action'] != 'accept':
+            raise ValueError('Invalid room item-intent action')
+        if not isinstance(line['identity'], str) or not OPERATION_ID.fullmatch(line['identity']):
+            raise ValueError('Invalid room item-intent identity')
     if kind == 'item':
         if line['item_kind'] not in ITEM_KINDS:
             raise ValueError('Invalid room item kind')
@@ -463,7 +546,7 @@ def _validate_line(line, expected=None):
                                  or not OPERATION_ID.fullmatch(line['parent'])):
             raise ValueError('Invalid room item-event parent')
         check_record(line['record'])
-    elif not line['text'].strip():
+    elif kind in ('tombstone', 'message') and not line['text'].strip():
         raise ValueError('Invalid room message text')
     return line
 
@@ -1013,7 +1096,9 @@ def read_messages(project, room_id, since=0, limit=100):
     last_visible = since
     more = False
     for line in lines:
-        if line['kind'] == 'tombstone':
+        # An accept intent is internal bookkeeping (review b1/r4): the page sees the item
+        # and its eventual decision, not the pending line.
+        if line['kind'] in ('tombstone', 'item-intent'):
             continue
         if line['sequence'] <= since:
             continue
@@ -1031,7 +1116,8 @@ def read_messages(project, room_id, since=0, limit=100):
         last_visible = line['sequence']
     if not more:
         # Is there a visible line after the page even when no tombstone followed it?
-        more = any(line['kind'] != 'tombstone' and line['sequence'] > last_visible for line in lines)
+        more = any(line['kind'] not in ('tombstone', 'item-intent')
+                   and line['sequence'] > last_visible for line in lines)
     moderations = [_tombstone_view(line) for line in events if line['sequence'] > since]
     index = read_index(project)
     entry = index['rooms'].get(room_id) or {}
@@ -1184,6 +1270,9 @@ def post_item(project, room_id, item_kind, title, text, operation_id, author, li
                         if item['sequence'] == supersedes), None)
         if current is None or current['kind'] != 'item':
             raise Refusal(404, 'not_found', 'No such item to supersede in this room.')
+        if pending_accept_intent(lines, supersedes) is not None:
+            raise Refusal(409, 'accepting',
+                          'That item is being accepted; a new item cannot supersede it.')
         if current['moderated']:
             raise Refusal(409, 'moderated', 'A moderated item cannot be superseded.')
         if current['state'] not in ('proposed', 'amended'):
@@ -1224,6 +1313,10 @@ def _decide_item(project, room_id, sequence, event, operation_id, author, limits
             return dict(view, replayed=True)
         raise Refusal(409, 'operation_reused',
                       'That operation id already wrote a different room line.')
+    pending = pending_accept_intent(lines, sequence)
+    if pending is not None and not (event == 'accept' and operation_id == pending['identity']):
+        raise Refusal(409, 'accepting',
+                      'That item is being accepted; retry that acceptance.')
     current = next((item for item in items_from_lines(lines, room_id)
                     if item['sequence'] == sequence), None)
     if current is None or current['kind'] != 'item':
@@ -1260,6 +1353,11 @@ def _decide_item(project, room_id, sequence, event, operation_id, author, limits
                 raise Refusal(422, 'invalid', 'Only a requirement item names a parent job')
             if not isinstance(parent, str) or not OPERATION_ID.fullmatch(parent):
                 raise Refusal(422, 'invalid', 'Invalid parent job id')
+        # Review s1/r4: an exact retry of an amendment that already applied (a fresh client
+        # key, same title/text/parent) is a replay, not a second event.
+        if current['title'] == title and current['text'] == text and \
+                (parent is None or parent == current.get('parent')):
+            return dict(current, replayed=True)
     else:
         if parent is not None:
             raise Refusal(422, 'invalid', 'Only an amendment or an acceptance names a parent job')
@@ -1320,6 +1418,10 @@ def moderate(project, room_id, target_sequence, reason, operation_id, author, li
     target = next((line for line in lines if line['sequence'] == target_sequence), None)
     if target is None or target['kind'] not in ('message', 'item'):
         raise Refusal(404, 'not_found', 'No such message or item in this room.')
+    if target['kind'] == 'item' and pending_accept_intent(lines, target_sequence) is not None:
+        raise Refusal(409, 'accepting',
+                      'That item is being accepted; it cannot be moderated until the acceptance '
+                      'is recorded.')
     if any(line['kind'] == 'tombstone' and line['target_sequence'] == target_sequence for line in lines):
         raise Refusal(409, 'already_moderated', 'That line is already a tombstone.')
     at = now_iso()
@@ -1424,7 +1526,10 @@ def export_jsonl(project, room_id):
                     'text': tombstone['text']}
         elif line['kind'] == 'item-event' and line['target_sequence'] in tombstones:
             safe = dict(line, text=tombstones[line['target_sequence']]['text'], record=None)
+            # Review n2/r4: an amendment's parent is user-chosen data too; the JSONL export
+            # clears it with the title when the item was moderated.
             safe.pop('title', None)
+            safe.pop('parent', None)
         else:
             safe = dict(line)
         out.append(json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(',', ':')))

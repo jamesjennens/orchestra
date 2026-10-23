@@ -6613,9 +6613,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         """Create the existing record an accepted requirement/decision item becomes."""
         # Review b1: the identity names the item and action, never the event count, so the
         # record write is idempotent and a retry never creates a second record. Review s1/r3:
-        # it also follows the content the acceptance records, so an accept after an amendment
-        # (or after an append that failed) writes the current text instead of reusing an
-        # identity a native record already holds.
+        # it also follows the content the acceptance records. Review b1/r4: an accept intent
+        # in the room log holds that identity, and an amendment is refused until the matching
+        # accepted event exists, so a retry after a failed append always names this record.
         if base is None:
             base = rooms.item_decision_operation(ctx.params['rid'], item['sequence'], 'accept')
         if item['item_kind'] == 'requirement':
@@ -6774,6 +6774,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                         if chosen not in ids:
                             raise invalid('That parent is not a job of this project; a requirement '
                                           'hangs under an existing job.')
+                    # Review b1/r4: name this acceptance's native identity in the room log
+                    # BEFORE the record write. While the intent has no matching accepted
+                    # event, an amend, supersede, moderation or a different decision is
+                    # refused (409 accepting), so only a retry of this identity may proceed
+                    # and reconcile on the record the failed attempt already wrote.
+                    with self._rooms_lock(project):
+                        rooms.intend_accept(project, ctx.params['rid'], current['sequence'],
+                                            operation_id, actor, limits_values)
                     record = self._room_item_record(ctx, ctx.params['pid'], current,
                                                     current['evidence'], chosen,
                                                     base=operation_id)
@@ -6828,9 +6836,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                         # Review b1/r3: an amendment's identity follows the new content, so
                         # a second amendment with other text is a new line, while an exact
                         # retry (also after a failed append) replays the same identity.
+                        # Review s1/r4: it also names the previous line, so amending back to
+                        # an earlier text (A, B, then A) is a real change and applies while
+                        # the same request against the same current line still replays.
+                        previous = (current['history'][-1]['sequence'] if current['history']
+                                    else current['sequence'])
                         operation_id = rooms.item_decision_operation(
                             ctx.params['rid'], current['sequence'], event,
-                            content=rooms.item_content_digest(title, text, parent))
+                            content=rooms.item_content_digest(title, text, parent,
+                                                              'after-%d' % previous))
                         if parent is not None:
                             # Review n2/r3: an editor names the parent on an amendment; it
                             # must be an existing job, never an arbitrary string.

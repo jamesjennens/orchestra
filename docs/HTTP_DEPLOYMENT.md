@@ -4238,9 +4238,14 @@ names none, that job is used; with two or more jobs an editor's accept must name
 `item-event` line carries `target_sequence`, `event`
 (`accept|reject|amend|answer`), the resulting `state`, the author, the time, the text (the
 reason, the amended body, the answer or an optional accept note) and `record` (the pointer
-below; null otherwise). An `amend` event also carries the new `title`. Both line kinds use
-the same sequence, operation-id replay, segment rollover, torn-tail quarantine and locking
-as a message.
+below; null otherwise). An `amend` event also carries the new `title`. An `item-intent` line
+carries `target_sequence`, `action` (`accept`), `identity` (the native record identity the
+acceptance is about to write), the author and the time; it is internal bookkeeping that the
+read, the items cache and the Markdown export skip, while the raw JSON-lines export keeps it
+like every stored line. All line kinds use the same sequence, operation-id replay, segment
+rollover, torn-tail quarantine and locking as a message. An amendment's identity names the
+new title, text and parent and the item line it follows, so A, B, then A applies again while
+an unchanged request replays; an acceptance's identity names its title and text.
 
 **States.** An item starts `proposed`. `accept` makes it `accepted`; `reject` makes it
 `rejected`; `amend` makes it `amended` with the new title/text, and it may then be accepted
@@ -4295,13 +4300,17 @@ came first and nothing is written. The record write and the item-event use an op
 identity naming the room, the item sequence and the action — never the current event count
 or the client's key — so a retry reconciles on the same record. An acceptance's identity also
 follows the title and text it records, and an amendment's follows the new title, text and
-parent, so a second amendment applies (the page offers Amend on an amended item) and an
-accept retried after a failed append records the current text instead of colliding with the
-native record the earlier attempt made. A second accept with a *fresh* client key after the
-item is decided is refused (409) and writes no second record, proposal or decision; a
-contributor accept and an owner accept racing each other produce exactly one record,
-decided by whichever took the item-decision lock first. The client `Idempotency-Key` still
-guards the HTTP mutation.
+parent and the line it follows, so a second amendment applies (the page offers Amend on an
+amended item), amending back to an earlier text applies again, and an unchanged request
+replays. Before the native write the route appends an `item-intent` line naming that
+identity. While the intent has no matching accepted event (the record was written but the
+room append failed), an amendment, a supersede, a moderation or any other decision is
+refused (409 `accepting`); only a retry of that exact identity proceeds and reconciles on the
+record the failed attempt wrote, so one item still becomes one native record. A second accept
+with a *fresh* client key after the item is decided is refused (409) and writes no second
+record, proposal or decision; a contributor accept and an owner accept racing each other
+produce exactly one record, decided by whichever took the item-decision lock first. The
+client `Idempotency-Key` still guards the HTTP mutation.
 
 **The items cache.** `index.json` gains a per-room `items` list: the current views and their
 decision history. It is a cache only. `rooms.py` builds it with the same function that a
@@ -4310,14 +4319,15 @@ identical states; the lines stay the truth. A moderated item's title, text, pare
 every user-written event field are dropped on moderation and on rebuild.
 
 **Rollback.** An older kit reads the requirements, proposals and decisions created here
-unchanged (the pointer rides in fields it already has). A `.385` reader does not know the
-`item` and `item-event` line kinds, so it names such a room damaged instead of serving it; a
-kit without rooms ignores `.rooms` entirely. Nothing in the tracker or the coordination
-sidecar changes shape.
+unchanged (the pointer rides in fields it already has). A `.385` reader, and a `.388` reader
+older than this revision, does not know the `item`, `item-event` and `item-intent` line
+kinds, so it names such a room damaged instead of serving it; a kit without rooms ignores
+`.rooms` entirely. Nothing in the tracker or the coordination sidecar changes shape.
 
 **Export.** The Markdown export adds each item with its state, evidence pointer and record,
-then its item events; the JSON-lines export carries the item and item-event lines, with a
-moderated item's title, text and every user-written event field replaced by its tombstone.
+then its item events; the JSON-lines export carries the item, item-event and item-intent
+lines, with a moderated item's title, text, parent and every user-written event field
+replaced by its tombstone.
 
 ## Serving delivered bundles over HTTP
 

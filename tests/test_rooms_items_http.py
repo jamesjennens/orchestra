@@ -504,34 +504,109 @@ class RoomsItemsHttpTests(agents.AgentHarness):
         self.assertEqual(1, len(events), 'the acceptance was recorded before the room was archived')
         self.assertEqual('accepted', self.items()[0]['state'])
 
-    def test_accept_after_a_failed_append_records_the_amended_text(self):
-        # Review s1/r3: a failed room append after the native write used to leave an identity
-        # the next accept could never reuse. The accept identity follows the content it
-        # records, so an amendment is followed by an accept of the amended text.
-        self.post_item(self.tokens['worker'])
+    def test_accept_after_a_failed_append_keeps_one_record_and_refuses_amend(self):
+        # Review b1/r4: the route writes an accept intent naming the native identity BEFORE
+        # the record write. When the room append fails AFTER the native write, the intent is
+        # still pending: an amendment is refused (409 accepting), a retry of the same
+        # identity reconciles on that record, and the item counts one record and one event.
+        self.post_item(self.tokens['worker'], kind='decision', title='Use CSV',
+                       text='We will emit CSV first.')
         real_append = rooms._append
         state = {'failed': False}
-        def flaky(*args, **kwargs):
-            if not state['failed']:
+        def flaky(project, room_id, line, limits_values):
+            if line['kind'] == 'item-event' and not state['failed']:
                 state['failed'] = True
-                raise OSError(5, 'injected append failure')
-            return real_append(*args, **kwargs)
+                raise OSError(5, 'injected append failure after the native write')
+            return real_append(project, room_id, line, limits_values)
         with mock.patch.object(rooms, '_append', flaky):
             failed = self.accept(self.tokens['owner'], key='accept-fail')
         self.assertEqual(500, failed.status, failed.data)
-        self.assertEqual(1, len(self.backend.requirements), 'the native record was written')
+        self.assertEqual(1, len(self.backend.decisions), 'the native record was written')
         self.assertEqual('proposed', self.items()[0]['state'])
+        intent = [line for line in rooms.load_lines(Path(self.rooms_root) / self.pid,
+                                                    self.room['id'])
+                  if line['kind'] == 'item-intent']
+        self.assertEqual(1, len(intent), 'the intent names the pending record')
         amended = self.request('POST', self.path('/items/1/amend'),
                                {'title': 'Amended export', 'text': 'Amended body with a header row.'},
                                token=self.tokens['owner'], key='amend-after-fail')
-        self.assertEqual(200, amended.status, amended.data)
+        self.assertEqual(409, amended.status, amended.data)
+        self.assertEqual('accepting', amended.data['error']['code'])
+        self.assertEqual('Use CSV', self.items()[0]['title'])
         accepted = self.accept(self.tokens['owner'], key='accept-after-fail')
         self.assertEqual(200, accepted.status, accepted.data)
         self.assertEqual('accepted', accepted.data['state'])
-        record = accepted.data['record']
-        self.assertEqual(2, len(self.backend.requirements))
-        self.assertIn('Amended body with a header row.',
-                      self.backend.requirements[record['id']]['description'])
+        self.assertEqual({}, self.backend.requirements, 'a decision item makes no requirement')
+        self.assertEqual(1, len(self.backend.decisions), 'the retry reconciled on one decision')
+        events = [line for line in rooms.load_lines(Path(self.rooms_root) / self.pid,
+                                                    self.room['id'])
+                  if line['kind'] == 'item-event']
+        self.assertEqual(1, len(events), 'one accepted event, not two')
+        self.assertEqual('accepted', self.items()[0]['state'])
+
+    def test_a_failed_intent_append_writes_no_native_record(self):
+        # Review b1/r4: the intent append happens before the native write, so a failure
+        # there leaves nothing in the tracker and the item can still be amended and decided.
+        self.post_item(self.tokens['worker'])
+        real_append = rooms._append
+        state = {'failed': False}
+        def flaky(project, room_id, line, limits_values):
+            if line['kind'] == 'item-intent' and not state['failed']:
+                state['failed'] = True
+                raise OSError(5, 'injected intent append failure')
+            return real_append(project, room_id, line, limits_values)
+        with mock.patch.object(rooms, '_append', flaky):
+            failed = self.accept(self.tokens['owner'], key='accept-intent-fail')
+        self.assertEqual(500, failed.status, failed.data)
+        self.assertEqual({}, self.backend.requirements)
+        self.assertEqual([], self.backend.decisions)
+        amended = self.request('POST', self.path('/items/1/amend'),
+                               {'title': 'Amended export', 'text': 'Amended body.'},
+                               token=self.tokens['owner'], key='amend-after-intent-fail')
+        self.assertEqual(200, amended.status, amended.data)
+        accepted = self.accept(self.tokens['owner'], key='accept-after-intent-fail')
+        self.assertEqual(200, accepted.status, accepted.data)
+        self.assertEqual(1, len(self.backend.requirements))
+
+    def test_amend_back_to_an_earlier_text_applies_and_an_exact_retry_replays(self):
+        # Review s1/r4: the amendment identity names the previous line, so A, B, then A is
+        # a real change (it used to answer 200 replayed and leave the item at B), while the
+        # exact same request against the same current line still replays.
+        self.post_item(self.tokens['worker'])
+        first = self.request('POST', self.path('/items/1/amend'),
+                             {'title': 'A title', 'text': 'A body.'},
+                             token=self.tokens['owner'], key='amend-a1-key')
+        self.assertEqual(200, first.status, first.data)
+        second = self.request('POST', self.path('/items/1/amend'),
+                              {'title': 'B title', 'text': 'B body.'},
+                              token=self.tokens['owner'], key='amend-b-key')
+        self.assertEqual(200, second.status, second.data)
+        back = self.request('POST', self.path('/items/1/amend'),
+                            {'title': 'A title', 'text': 'A body.'},
+                            token=self.tokens['owner'], key='amend-a2-key')
+        self.assertEqual(200, back.status, back.data)
+        self.assertEqual(('A title', 'A body.'), (back.data['title'], back.data['text']))
+        self.assertEqual('A body.', self.items()[0]['text'])
+        events = [line for line in rooms.load_lines(Path(self.rooms_root) / self.pid,
+                                                    self.room['id'])
+                  if line['kind'] == 'item-event']
+        self.assertEqual(3, len(events), 'A, B and back to A are three applied amendments')
+        # A retry of the very same request key replays the stored answer.
+        retry = self.request('POST', self.path('/items/1/amend'),
+                             {'title': 'A title', 'text': 'A body.'},
+                             token=self.tokens['owner'], key='amend-a2-key')
+        self.assertEqual(200, retry.status, retry.data)
+        self.assertEqual(3, len([line for line in rooms.load_lines(
+            Path(self.rooms_root) / self.pid, self.room['id'])
+            if line['kind'] == 'item-event']), 'a replay writes no fourth amendment')
+        # The same content through a fresh client key is a replay too, not a fourth event.
+        fresh = self.request('POST', self.path('/items/1/amend'),
+                             {'title': 'A title', 'text': 'A body.'},
+                             token=self.tokens['owner'], key='amend-a-fresh-key')
+        self.assertEqual(200, fresh.status, fresh.data)
+        self.assertEqual(3, len([line for line in rooms.load_lines(
+            Path(self.rooms_root) / self.pid, self.room['id'])
+            if line['kind'] == 'item-event']), 'an unchanged amendment is a replay')
 
     def test_a_moderated_items_parent_is_not_served(self):
         # Review n1/r3: the parent job is user-chosen item data too; moderation clears it in
@@ -568,6 +643,56 @@ class RoomsItemsHttpTests(agents.AgentHarness):
         self.assertEqual(200, accepted.status, accepted.data)
         record = accepted.data['record']
         self.assertEqual('job_0002', self.backend.requirements[record['id']]['parent'])
+
+    def test_an_editor_can_choose_the_parent_on_accept(self):
+        # Review test gap: the accept route's explicit parent choice, not only the amend.
+        self.post_item(self.tokens['worker'], parent='job_0001')
+        self.backend.requirements_read = lambda pid, args: {
+            'items': [], 'decisions': [],
+            'jobs': [{'id': 'job_0001', 'title': 'One'}, {'id': 'job_0002', 'title': 'Two'}]}
+        accepted = self.accept(self.tokens['owner'], key='accept-parent-at-accept',
+                               body={'parent': 'job_0002'})
+        self.assertEqual(200, accepted.status, accepted.data)
+        record = accepted.data['record']
+        self.assertEqual('job_0002', self.backend.requirements[record['id']]['parent'])
+
+    def test_an_editor_accept_with_no_jobs_is_refused(self):
+        # Review test gap: a requirement needs an existing job; an empty job list is not a
+        # reason to make one up.
+        self.post_item(self.tokens['worker'])
+        self.backend.requirements_read = lambda pid, args: {
+            'items': [], 'decisions': [], 'jobs': []}
+        refused = self.accept(self.tokens['owner'], key='accept-no-jobs')
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual('invalid_payload', refused.data['error']['code'])
+        self.assertEqual({}, self.backend.requirements)
+
+    def test_a_moderated_items_amended_parent_is_not_served(self):
+        # Review test gap/n2/r4: an amendment's parent is user-chosen item data too; after
+        # moderation the room read, the index cache and both exports drop it.
+        self.post_item(self.tokens['worker'], parent='job_0001')
+        self.backend.requirements_read = lambda pid, args: {
+            'items': [], 'decisions': [],
+            'jobs': [{'id': 'job_0001', 'title': 'One'}, {'id': 'job_0002', 'title': 'Two'}]}
+        amended = self.request('POST', self.path('/items/1/amend'),
+                               {'title': 'Export', 'text': 'Body.', 'parent': 'job_0002'},
+                               token=self.tokens['owner'], key='amend-then-mod-parent')
+        self.assertEqual(200, amended.status, amended.data)
+        moderated = self.request('POST', self.path('/messages/1/moderate'),
+                                 {'reason': 'private'}, token=self.tokens['coord'],
+                                 key='mod-amend-parent')
+        self.assertEqual(201, moderated.status, moderated.data)
+        read = self.read(self.tokens['viewer'])
+        self.assertNotIn('job_0002', json.dumps(read.data))
+        self.assertIsNone(read.data['items'][0]['parent'])
+        index = (Path(self.rooms_root) / self.pid / rooms.FOLDER / rooms.INDEX).read_text(
+            encoding='utf-8')
+        self.assertNotIn('job_0002', index)
+        for wanted in ('jsonl', 'markdown'):
+            exported = self.request('GET', self.path('/export?format=' + wanted),
+                                    token=self.tokens['viewer'])
+            self.assertEqual(200, exported.status, exported.data)
+            self.assertNotIn('job_0002', exported.data['text'])
 
     def test_a_symlinked_room_or_item_lock_is_refused(self):
         # Review n3/r3: a lock is never opened through a symlink (as admin.py checks the
