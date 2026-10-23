@@ -536,6 +536,19 @@ class ProxyCheckTests(unittest.TestCase):
         result = task_files.proxy_check(self.serve(resets), 32 * task_files.MIB)
         self.assertEqual(413, result['status'], result)
 
+    def test_an_early_answer_stops_the_sending_at_once(self):
+        # A proxy that answers 413 and then holds the connection open for 3 s, reading nothing: the check reads the
+        # answer while it sends and stops, instead of blocking in a send until the proxy closes.
+        def holds(h):
+            self.reply(h, 413, b'too large', 'text/plain')
+            h.wfile.flush()
+            time.sleep(3)
+        started = time.monotonic()
+        result = task_files.proxy_check(self.serve(holds), 64 * task_files.MIB)
+        self.assertEqual(413, result['status'], result)
+        self.assertLess(time.monotonic() - started, 2, 'the check waited for the proxy to close')
+        self.assertLess(result['sent'], 64 * task_files.MIB)
+
     def test_a_connection_cut_while_sending_is_said(self):
         def cut(h):
             h.rfile.read(1000)
