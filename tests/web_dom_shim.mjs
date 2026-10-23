@@ -126,6 +126,14 @@ class Element extends Node {
     return this.tagName === 'TEXTAREA' ? this.textContent : '';
   }
   set value(v) { if (this.tagName === 'SELECT') this.chosen = String(v); else this.stored = String(v); }
+  // A form reset clears what the user typed. The default VALUE attribute is not tracked
+  // here, so this returns controls to empty, which is what every test form starts as.
+  reset() {
+    for (const control of this.all((e) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.tagName))) {
+      if (control.tagName === 'SELECT') control.chosen = undefined;
+      else control.stored = '';
+    }
+  }
 }
 class FormData {
   constructor(form) {

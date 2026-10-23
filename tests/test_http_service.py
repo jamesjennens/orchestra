@@ -259,6 +259,15 @@ class HttpContractCase(ServerHarness):
         self.assertEqual(401, self.request('GET', '/v1/projects/%s/tasks' % alpha,
                                            token=secret).status)
 
+    def test_a_session_answers_the_password_rule(self):
+        # kittrial-5bb.363: the pages read the installation's minimum from the same answer
+        # they already fetch, on sign-in and on the authenticated session read.
+        token, _, user = self.login(ADMIN, ADMIN_PASSWORD)
+        self.assertEqual(1, user['password_min_length'])
+        who = self.request('GET', '/v1/sessions/current', token=token)
+        self.assertEqual(200, who.status)
+        self.assertEqual(1, who.data['user']['password_min_length'])
+
     def test_expired_session_and_logout(self):
         self.create_account(self.admin_token(), 'alex', 'alex-password-1')
         token, _, _ = self.login('alex', 'alex-password-1')

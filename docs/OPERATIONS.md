@@ -1696,6 +1696,8 @@ history.
 
 **Every upgrade and rollback: restart the web service in the same step as the files (kittrial-5bb.156).** Where the web interface runs (`http_service.py --backend endpoint`), the service is a long-running process and the endpoint is started anew for each request. Replacing the kit's files therefore changes the endpoint at once and the service only when it is restarted, and a service of the other kit left running applies its own rules to the new endpoint's answers (seen: it registered a half-made project whose creation record is damaged, which the new service refuses). Replace the files and restart the service together; see docs/HTTP_DEPLOYMENT.md.
 
+**Web passwords (kittrial-5bb.363).** Any non-empty password is accepted by default. The installation can raise the minimum with `--password-min-length N` (or `"password_min_length": N` in the private office JSON), from 1 to 1024; 1024 remains the maximum as a bound on work per request, not a policy. Every web password form and the one-time host bootstrap prompt ask for the password twice, and a mismatch sends or stores nothing. A password made only of whitespace is refused with one sentence on the server, so no surface can set one. The signed-in account page reads the real minimum from the server's session answer; the signed-out reset page states no number and shows the server's 422 sentence, so no installation-specific number is hard-coded in the browser. See [the password rule](HTTP_DEPLOYMENT.md#password-rule).
+
 **Upgrading to this kit, and rolling back from it (kittrial-5bb.105).** The plain-text
 rule is checked when guidance is read as well as when it is set, so a change of rule
 has an effect in both directions.
