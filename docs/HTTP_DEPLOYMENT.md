@@ -4086,4 +4086,6 @@ falls back to the last-complete copy, verifies every path, sha256 and byte count
 writing a byte, and refuses a damaged file before the destination is created;
 `--without-rooms` restores the tracker and coordination data without rooms and says so.
 The rooms file is written only after the complete sidecar, so a failed backup never
-pairs a new rooms file with an older sidecar.
+pairs a new rooms file with an older sidecar. `backup-copy` carries the same two rooms
+files (and pins their SHA-256 in the run record), so an off-machine copy does not lose
+rooms silently; `backup-status` names them when the project has them.

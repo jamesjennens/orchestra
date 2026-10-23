@@ -1697,6 +1697,27 @@ class BackupCopyCase(RuntimeCase):
                              (self.destination / admin.BACKUP_STATUS_NAME).read_bytes()).hexdigest())
         self.assertEqual(run['full_record']['generated_at'], '2026-09-27T16:00:00Z')
 
+    def test_a_full_copy_carries_the_separate_rooms_files(self):
+        # Review s1: an off-machine copy must carry backups/<name>.rooms.json and its
+        # durable last-complete copy, and the run record must pin the exact bytes.
+        self.record()
+        rooms_bytes = b'{"schema_version":1,"status":"complete","files":{}}'
+        rooms_last_bytes = b'{"schema_version":1,"status":"complete","files":{"old":1}}'
+        (self.root / 'backups' / 'alpha.rooms.json').write_bytes(rooms_bytes)
+        (self.root / 'backups' / 'alpha.rooms.last-complete.json').write_bytes(rooms_last_bytes)
+        stdout, stderr, code = self.run_admin('backup-copy', str(self.destination))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(rooms_bytes, (self.destination / 'alpha.rooms.json').read_bytes())
+        self.assertEqual(rooms_last_bytes,
+                         (self.destination / 'alpha.rooms.last-complete.json').read_bytes())
+        run = json.loads((self.destination / admin.BACKUP_COPY_RUN_NAME).read_text(encoding='utf-8'))
+        generation = next(item['generation'] for item in run['copied'] if item['name'] == 'alpha')
+        self.assertEqual(hashlib.sha256(rooms_bytes).hexdigest(), generation['rooms_sha256'])
+        self.assertEqual(hashlib.sha256(rooms_last_bytes).hexdigest(),
+                         generation['rooms_last_complete_sha256'])
+        # A project with no rooms file copies just as before.
+        self.assertFalse((self.destination / 'beta.rooms.json').exists())
+
     def test_a_failed_copy_leaves_the_destination_completeness_record_alone(self):
         # The failure path used to unlink the destination's record with errors swallowed; a
         # failure must publish nothing new and remove nothing either (kittrial-5bb.160 review 2).

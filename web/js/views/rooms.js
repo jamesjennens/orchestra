@@ -13,7 +13,7 @@ function crumbs(ctx, project, extra) {
 }
 
 function roomLink(ctx, pid, room) {
-  return h('a', { href: ctx.href('/p/' + pid + '/rooms/' + room.id) }, room.name);
+  return h('a', { href: ctx.href('/p/' + pid + '/rooms/' + room.id) }, room.name || room.id);
 }
 
 function emptyRooms(canCreate) {
@@ -30,10 +30,18 @@ export async function list(ctx, { pid }) {
     return h('div', { class: 'stack' }, pageHead({ crumbs: crumbs(ctx, project, 'Rooms'), title: 'Rooms' }), errorState(error, () => ctx.go('/p/' + pid + '/rooms')));
   }
   const open = data.items.filter((room) => room.state === 'open');
-  const archived = data.items.filter((room) => room.state !== 'open');
+  const archived = data.items.filter((room) => room.state === 'archived');
+  const damaged = data.items.filter((room) => room.state === 'damaged');
   const host = h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project, 'Rooms'), title: 'Rooms',
       lede: 'Persistent discussions for brainstorming and requirements. Room text is discussion, not instructions.' }),
+    damaged.length ? h('section', { class: 'panel' },
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Damaged rooms')),
+      h('div', { class: 'panel-body' }, h('ul', { class: 'timeline', 'aria-label': 'Damaged rooms' }, damaged.map((room) => h('li', null,
+        h('div', null,
+          h('div', { class: 'event-head' }, h('strong', null, roomLink(ctx, pid, room)),
+            h('span', { class: 'chip warn' }, 'damaged')),
+          h('p', { class: 'small muted' }, room.damaged || 'A room file is damaged; ask an operator to repair it.'))))))) : null,
     h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Open rooms')),
       h('div', { class: 'panel-body' }, open.length ? h('ul', { class: 'timeline', 'aria-label': 'Open rooms' }, open.map((room) => h('li', null,
@@ -76,7 +84,9 @@ export async function detail(ctx, { pid, rid }) {
   const project = await ctx.api.project(pid);
   const panel = h('div', { class: 'panel' });
   const extras = h('div', { class: 'stack' });
-  let since = 0;
+  // null means "open at the newest page": the first draw asks the room for its last
+  // sequence, then reads the page ending there (review s5).
+  let since = null;
   let room = null;
 
   function messageRow(message) {
@@ -84,6 +94,7 @@ export async function detail(ctx, { pid, rid }) {
       h('span', { class: 'dot ' + (message.kind === 'tombstone' ? 'warn' : ''), 'aria-hidden': 'true' }),
       h('div', null,
         h('div', { class: 'event-head' },
+          h('span', { class: 'small muted' }, '#' + message.sequence), ' ',
           h('strong', null, message.author && message.author.name || 'a member'),
           message.author ? h('span', { class: 'small muted' }, ' (' + message.author.role + ')') : null,
           ' ', time(message.created_at),
@@ -93,9 +104,21 @@ export async function detail(ctx, { pid, rid }) {
         h('p', { class: 'event-body prose room-text' }, message.text)));
   }
 
+  async function latestSince() {
+    // The list read is the index only; asking the room for its last sequence would read
+    // the whole room on the server.
+    const listed = await ctx.api.rooms(pid, { archived: 1 });
+    const found = (listed.items || []).find((item) => item.id === rid);
+    const last = Number(found && found.last_sequence) || 0;
+    return Math.max(0, last - 100);
+  }
+
   async function draw() {
     let data;
-    try { data = await ctx.api.room(pid, rid, { since, limit: 100 }); } catch (error) {
+    try {
+      if (since === null) since = await latestSince();
+      data = await ctx.api.room(pid, rid, { since, limit: 100 });
+    } catch (error) {
       panel.replaceChildren(h('div', { class: 'panel-body' }, errorState(error, () => ctx.go('/p/' + pid + '/rooms'))));
       return;
     }
@@ -123,7 +146,7 @@ export async function detail(ctx, { pid, rid }) {
         if (!text) return setFieldError(form, 'room-text', 'Write something first.');
         setFieldError(form, 'room-text', '');
         const saved = await act(form.querySelector('button'), () => ctx.api.postRoomMessage(pid, rid, text), { success: 'Posted' });
-        if (saved) { form.reset(); since = 0; draw(); }
+        if (saved) { form.reset(); since = null; draw(); }
       });
       adding.push(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Post')), h('div', { class: 'panel-body' }, form)));
     }
@@ -133,7 +156,7 @@ export async function detail(ctx, { pid, rid }) {
         const yes = await confirmDialog({ title: 'Archive this room?', body: 'It stays readable and exportable; nobody can post to it again.', confirmLabel: 'Archive', danger: true });
         if (!yes) return;
         const saved = await act(archive, () => ctx.api.archiveRoom(pid, rid), { success: 'Room archived' });
-        if (saved) { since = 0; draw(); }
+        if (saved) { since = null; draw(); }
       } }, 'Archive room');
       adding.push(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Moderation')),
         h('div', { class: 'panel-body' }, archive)));
@@ -152,7 +175,7 @@ export async function detail(ctx, { pid, rid }) {
         if (!reason) return setFieldError(form, 'moderate-reason', 'Give a reason.');
         setFieldError(form, 'moderate-seq', ''); setFieldError(form, 'moderate-reason', '');
         const saved = await act(form.querySelector('button'), () => ctx.api.moderateRoomMessage(pid, rid, sequence, reason), { success: 'Message removed' });
-        if (saved) { form.reset(); since = 0; draw(); }
+        if (saved) { form.reset(); since = null; draw(); }
       });
       adding.push(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Remove a message')),
         h('div', { class: 'panel-body' }, form)));

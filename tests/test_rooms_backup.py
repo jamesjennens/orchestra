@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -86,6 +87,58 @@ class RoomsBackupTests(unittest.TestCase):
         # And the separate file name is the one design section 2 names.
         self.assertTrue((self.root / 'backups' / 'alpha.rooms.json').is_file())
         self.assertTrue(admin.last_complete_rooms_path(self.root, 'alpha').name.endswith('.rooms.last-complete.json'))
+
+    def test_backup_status_names_each_rooms_file_with_its_digest(self):
+        # Review s1: the status record reports the separate rooms file (and its durable
+        # copy), so an operator can see that the restorable generation carries rooms.
+        import hashlib
+        self.write_record()
+        self.write_record(path=admin.last_complete_rooms_path(self.root, 'alpha'))
+        entry = admin.rooms_status_entry(self.root, 'alpha')
+        self.assertEqual('backups/alpha.rooms.json', entry['file'])
+        self.assertEqual(hashlib.sha256(
+            (self.root / 'backups' / 'alpha.rooms.json').read_bytes()).hexdigest(),
+            entry['sha256'])
+        self.assertEqual('backups/alpha.rooms.last-complete.json',
+                         entry['last_complete']['file'])
+        record = admin.backup_status_record(
+            [{'name': 'alpha', 'status': 'complete', 'completed_at': '2026-10-23T07:30:00Z',
+              'rooms': entry}], 'named', '2026-10-23T07:30:00Z')
+        admin.validate_backup_status(record)
+        self.assertEqual(entry, record['projects'][0]['rooms'])
+        # A failed entry must not claim a rooms completion.
+        bad = dict(record)
+        bad['projects'] = [{'name': 'alpha', 'status': 'failed', 'reason': 'no pair',
+                            'rooms': entry}]
+        bad['status'] = 'incomplete'
+        with self.assertRaises(ValueError):
+            admin.validate_backup_status(bad)
+
+    def test_a_backup_run_records_the_rooms_files_in_its_status(self):
+        # The real backup path adds the rooms entry after writing the rooms files.
+        (self.project / '.beads').mkdir()
+        (self.project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+
+        def fake_backup(root, name):
+            (root / 'backups' / name).mkdir(parents=True, exist_ok=True)
+            (root / 'backups' / (name + '.coordination.json')).write_text(json.dumps(
+                {'schema_version': 1, 'status': 'complete', 'files': {}, 'operators': []}),
+                encoding='utf-8')
+            record = rooms.backup_record(root / 'projects' / name)
+            (root / 'backups' / (name + '.rooms.json')).write_text(
+                json.dumps(record), encoding='utf-8')
+            (root / 'backups' / (name + '.rooms.last-complete.json')).write_text(
+                json.dumps(record), encoding='utf-8')
+            return 'native output'
+
+        with patch.object(admin, 'backup_project', side_effect=fake_backup):
+            admin.backup_projects(self.root, ['alpha'])
+        status = admin.read_backup_status(self.root)
+        entry = status['projects'][0]
+        self.assertEqual('complete', entry['status'])
+        self.assertEqual('backups/alpha.rooms.json', entry['rooms']['file'])
+        self.assertEqual('backups/alpha.rooms.last-complete.json',
+                         entry['rooms']['last_complete']['file'])
 
 
 if __name__ == '__main__':

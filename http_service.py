@@ -4500,17 +4500,13 @@ def route(method, pattern, *, anonymous=False, csrf=True, stream=False):
 def project_room_lock(project):
     """Hold a project's ``.coordination.lock`` exclusively for one rooms operation.
 
-    ``fcntl`` is imported inside, never at import time: this module must import on
-    Windows (the kit's tests import it there), and the lock is taken only on the Linux
-    service path, exactly as admin.py and the task-file routes do it.
+    The cross-platform lock is ``http_authority.file_lock``: it uses ``fcntl`` on Linux
+    and ``msvcrt`` on Windows, so importing http_service and serving rooms both work on
+    Windows (review b2). ``fcntl`` is never imported here at import time.
     """
-    import fcntl
-    with (Path(project) / '.coordination.lock').open('a') as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    from http_authority import file_lock
+    with file_lock(Path(project) / '.coordination.lock'):
+        yield
 
 
 #: Said when the service is moving as many files as it allows (kittrial-5bb.370, design 4).
@@ -6127,7 +6123,19 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _rooms_refusal(self, error):
         return HttpError(error.status, error.code, str(error))
 
-    def _rooms_write(self, ctx, action, capability, fn, *, status=200, reason=None):
+    def _rooms_read_allowed(self, ctx):
+        """Refuse a room read from an agent credential (review s3, design R1).
+
+        Room text must not reach task-capable credentials. This slice already refuses a
+        credential write; the read routes (list, read and export) need the same refusal,
+        or a worker credential granted CAP_READ can read every room.
+        """
+        if ctx.principal.via == 'credential':
+            raise forbidden('Rooms are for people in this slice: an agent credential cannot read a room.')
+        return self._project(ctx, CAP_READ)
+
+    def _rooms_write(self, ctx, action, capability, fn, *, status=200, reason=None,
+                     stored=None):
         # Rooms are for people in this slice: the new rooms.post capability is on no
         # credential scope, and a coordinator grant must not become a room-write grant.
         if ctx.principal.via == 'credential':
@@ -6142,14 +6150,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                     result = fn(project)
             except rooms.Refusal as refusal:
                 raise self._rooms_refusal(refusal) from None
-            return result, result
+            # Review b1: a post's stored answer must not keep the message text for 24 h.
+            # The route can replace what is kept for a retry with a metadata-only view;
+            # the caller still receives the full result now.
+            return result, (stored(result) if stored is not None else result)
         return self._mutate(ctx, action, ctx.params['pid'], write, capability=capability,
                             serialize=False, status=status, reason=reason)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms')
     def rooms_list(self, ctx):
         project = self._rooms_project(ctx)
-        record, role = self._project(ctx, CAP_READ)
+        record, role = self._rooms_read_allowed(ctx)
         pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
         if set(pairs) - {'archived'} or any(len(values) != 1 for values in pairs.values()):
             raise invalid('Use only one archived flag')
@@ -6181,7 +6192,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')')
     def rooms_read(self, ctx):
         project = self._rooms_project(ctx)
-        self._project(ctx, CAP_READ)
+        self._rooms_read_allowed(ctx)
         pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
         if set(pairs) - {'since', 'limit'} or any(len(values) != 1 for values in pairs.values()):
             raise invalid('Use only one since and limit')
@@ -6209,8 +6220,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         def write(project):
             return rooms.post(project, ctx.params['rid'], payload['text'], operation_id,
                               actor, limits_values)
+        # Review b1: keep only the message identity for a retry, never its text. After the
+        # message is moderated a replay must not answer with the original text from the
+        # server's 24-hour idempotency record (or carry it in the state file and backups).
+        def stored(result):
+            return {key: result.get(key) for key in ('sequence', 'kind', 'created_at')}
         return self._rooms_write(ctx, 'rooms.post', CAP_ROOMS_POST, write, status=201,
-                                 reason='room %s' % ctx.params['rid'])
+                                 reason='room %s' % ctx.params['rid'], stored=stored)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/archive')
     def rooms_archive(self, ctx):
@@ -6246,7 +6262,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/export')
     def rooms_export(self, ctx):
         project = self._rooms_project(ctx)
-        self._project(ctx, CAP_READ)
+        self._rooms_read_allowed(ctx)
         pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
         if set(pairs) - {'format'} or any(len(values) != 1 for values in pairs.values()):
             raise invalid('Use only one format')

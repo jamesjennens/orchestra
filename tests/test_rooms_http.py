@@ -52,6 +52,14 @@ class RoomsHttpTests(agents.AgentHarness):
     def audit(self, action):
         return [event for event in self.service.state['audit'] if event.get('action') == action]
 
+    def store_bytes(self):
+        """Every byte the service's durable store holds (state JSON and its SQLite sidecar)."""
+        blob = b''
+        for path in sorted(self.tmp_path.glob(self.store.path.name + '*')):
+            if path.is_file():
+                blob += path.read_bytes()
+        return blob
+
     def test_roles_create_post_read_and_refuse(self):
         listed = self.request('GET', self.rooms_path(), token=self.tokens['viewer'])
         self.assertEqual(200, listed.status, listed.data)
@@ -138,6 +146,52 @@ class RoomsHttpTests(agents.AgentHarness):
                                {'text': 'different'}, token=self.tokens['worker'], key='same-key')
         self.assertEqual(409, changed.status, changed.data)
 
+    def test_a_moderated_posts_text_is_not_kept_for_a_retry(self):
+        # Review b1: the stored answer of a post must not keep its text for 24 h, or a
+        # replay after moderation answers 201 with the original.
+        secret = 'b1 secret original text'
+        first = self.post(self.tokens['worker'], secret, key='b1-key-0001')
+        self.assertEqual(201, first.status, first.data)
+        moderated = self.request('POST', self.rooms_path(self.room['id'], '/messages/1/moderate'),
+                                 {'reason': 'off topic'}, token=self.tokens['coord'], key='b1-mod-0001')
+        self.assertEqual(201, moderated.status, moderated.data)
+        replay = self.post(self.tokens['worker'], secret, key='b1-key-0001')
+        self.assertEqual(201, replay.status, replay.data)
+        self.assertEqual(first.data['sequence'], replay.data['sequence'])
+        self.assertNotIn(secret, json.dumps(replay.data))
+        self.assertNotIn(secret.encode('utf-8'), self.store_bytes())
+        read = self.request('GET', self.rooms_path(self.room['id']), token=self.tokens['viewer'])
+        self.assertNotIn(secret, json.dumps(read.data))
+
+    def test_a_non_member_cannot_list_read_or_export_rooms(self):
+        # Review s7: the project-membership check on all three read routes.
+        for path in (self.rooms_path(),
+                     self.rooms_path(self.room['id']),
+                     self.rooms_path(self.room['id'], '/export?format=markdown')):
+            refused = self.request('GET', path, token=self.tokens['outsider'])
+            self.assertIn(refused.status, (403, 404), (path, refused.data))
+
+    def test_an_agent_credential_cannot_read_rooms(self):
+        # Review s3: CAP_READ alone must not let an agent credential read room text (R1).
+        _agent_id, secret, _data = self.agent_secret(self.tokens['coord'], projects=[self.pid])
+        for path in (self.rooms_path(),
+                     self.rooms_path(self.room['id']),
+                     self.rooms_path(self.room['id'], '/export?format=markdown')):
+            refused = self.request('GET', path, token=secret)
+            self.assertEqual(403, refused.status, (path, refused.data))
+        self.assertEqual(403, self.post(secret, 'credential post', key='cred-post').status)
+
+    def test_an_archived_project_refuses_room_writes_but_still_reads(self):
+        # Review s7: the archived-project refusal in _rooms_write.
+        self.service.state['projects'][self.pid]['archived'] = True
+        self.store.save()
+        made = self.request('POST', self.rooms_path(), {'name': 'No'}, token=self.tokens['coord'])
+        self.assertEqual(409, made.status, made.data)
+        sent = self.post(self.tokens['worker'], 'no', key='archived-project')
+        self.assertEqual(409, sent.status, sent.data)
+        read = self.request('GET', self.rooms_path(self.room['id']), token=self.tokens['viewer'])
+        self.assertEqual(200, read.status, read.data)
+
     def test_open_room_bound_is_a_setting(self):
         self.limit = dict(self.limit, max_open_rooms=2)
         self.create_room(self.tokens['coord'], 'Second')
@@ -171,6 +225,11 @@ class RoomsPageTests(unittest.TestCase):
         # Markup and a javascript: link stay literal text and make no element.
         self.assertIn('<img src=x onerror=alert(1)>', seen['contributor']['text'])
         self.assertIn('javascript:alert(1)', seen['contributor']['text'])
+        # Review s5: each message shows its sequence, and the page opens at the newest
+        # 100-message window (last_sequence 150 -> start at 50), not at message 1.
+        self.assertIn('#150', seen['contributor']['text'])
+        self.assertEqual(1, len(seen['contributor']['roomCalls']))
+        self.assertEqual(50, seen['contributor']['roomCalls'][0]['since'])
         self.assertEqual(0, seen['contributor']['images'])
         self.assertEqual([], seen['contributor']['js_links'])
         # A viewer sees no post/archive/moderate form; a contributor sees a post form only;

@@ -146,14 +146,28 @@ def check_room_id(value):
     return value
 
 
+def _plain_text(value, name):
+    """Apply the kit's shared plain-text rule, as a room refusal (review s6).
+
+    ``isprintable`` was both too strict (CR, NBSP and a Persian ZWNJ between letters were
+    refused) and too lax (U+E0100-E01EF passed). ``review_workflow.plain_text`` is the rule
+    every other human-authored record already uses, so rooms use it too rather than keep a
+    second, drifting one.
+    """
+    from review_workflow import plain_text
+    try:
+        plain_text(value, name)
+    except ValueError as error:
+        raise Refusal(422, 'invalid', str(error)) from None
+
+
 def check_name(value):
     if not isinstance(value, str):
         raise Refusal(422, 'invalid', 'A room name must be text')
     text = value.strip()
     if not text or len(text) > 200:
         raise Refusal(422, 'invalid', 'A room name must be 1-200 characters')
-    if any((not ch.isprintable()) for ch in text):
-        raise Refusal(422, 'invalid', 'A room name must not contain control characters')
+    _plain_text(text, 'A room name')
     return text
 
 
@@ -165,8 +179,7 @@ def check_text(value, limit):
     if len(value) > limit:
         raise Refusal(422, 'too_long', 'A room post is at most %d characters; this one is %d.'
                       % (limit, len(value)))
-    if any(ch == '\x00' or (not ch.isprintable() and ch not in '\n\t') for ch in value):
-        raise Refusal(422, 'invalid', 'A room post must not contain control characters')
+    _plain_text(value, 'A room post')
     from reserved_comments import reserved_match
     if reserved_match(value) is not None:
         raise Refusal(422, 'reserved_text',
@@ -181,8 +194,7 @@ def check_reason(value, limit=500):
     text = value.strip()
     if not text or len(text) > limit:
         raise Refusal(422, 'invalid', 'A moderation reason must be 1-%d characters' % limit)
-    if any((not ch.isprintable()) and ch not in '\n\t' for ch in text):
-        raise Refusal(422, 'invalid', 'A moderation reason must not contain control characters')
+    _plain_text(text, 'A moderation reason')
     return text
 
 
@@ -398,6 +410,8 @@ def load_lines(project, room_id, start=1):
     if start > 1:
         index = read_index(project)
         entry = index['rooms'].get(room_id) or {}
+        if entry.get('damaged'):
+            raise Refusal(500, 'damaged', entry['damaged'])
         segments = entry.get('segments') or []
         chosen = next((item for item in segments if (item.get('last') or 0) >= start), None)
         if chosen is None:
@@ -442,24 +456,39 @@ def _room_ids(project):
     return sorted(ids)
 
 
-def rebuild_index(project):
-    """The index rebuilt from the segment files, which are the truth."""
+def rebuild_index(project, tolerant=False):
+    """The index rebuilt from the segment files, which are the truth.
+
+    A damaged room must not take the whole project down (review s2): ``tolerant=True``
+    (what the read path uses) records the room as damaged instead of raising, so a list
+    can name it as damaged. The default still raises a ``Refusal``, never a bare
+    ``ValueError``/``KeyError``, for a caller that asked for a strict rebuild.
+    """
     rooms = {}
     for room_id in _room_ids(project):
-        segments = []
-        last_sequence = 0
-        for number, path in _segments(project, room_id):
-            raw = path.read_bytes()
-            parsed, _tail = _parse_lines(raw)
-            # A torn tail is handled (and quarantined) when the room is read; the index
-            # only records the complete lines, so a rebuild never invents a sequence.
-            if parsed:
-                segments.append({'name': path.name, 'bytes': len(raw),
-                                 'count': len(parsed),
-                                 'first': parsed[0]['sequence'],
-                                 'last': parsed[-1]['sequence']})
-                last_sequence = parsed[-1]['sequence']
-        rooms[room_id] = {'last_sequence': last_sequence, 'segments': segments}
+        entry = {'last_sequence': 0, 'segments': []}
+        try:
+            for number, path in _segments(project, room_id):
+                raw = path.read_bytes()
+                parsed, _tail = _parse_lines(raw)
+                for line in parsed:
+                    _validate_line(line)
+                # A torn tail is handled (and quarantined) when the room is read; the index
+                # only records the complete lines, so a rebuild never invents a sequence.
+                if parsed:
+                    entry['segments'].append({'name': path.name, 'bytes': len(raw),
+                                              'count': len(parsed),
+                                              'first': parsed[0]['sequence'],
+                                              'last': parsed[-1]['sequence']})
+                    entry['last_sequence'] = parsed[-1]['sequence']
+        except Refusal:
+            raise
+        except (ValueError, KeyError, UnicodeDecodeError, OSError) as error:
+            message = 'Room %s is damaged: %s' % (room_id, error)
+            if not tolerant:
+                raise Refusal(500, 'damaged', message) from None
+            entry['damaged'] = message
+        rooms[room_id] = entry
     return {'schema_version': SCHEMA_VERSION, 'rooms': rooms}
 
 
@@ -477,12 +506,19 @@ def read_index(project):
         except (OSError, ValueError, UnicodeDecodeError):
             rebuilt = None
     if rebuilt is None:
-        rebuilt = rebuild_index(project)
+        rebuilt = rebuild_index(project, tolerant=True)
     # The index is a cache: compare its segment list with the files, and rebuild when stale.
-    stale = False
+    # A cached damage mark is re-checked too, so a repaired room becomes healthy again.
+    stale = any(entry.get('damaged') for entry in rebuilt['rooms'].values())
     for room_id in _room_ids(project):
+        if stale:
+            break
         entry = rebuilt['rooms'].get(room_id)
-        pairs = _segments(project, room_id)
+        try:
+            pairs = _segments(project, room_id)
+        except Refusal:
+            stale = True
+            break
         names = [path.name for _, path in pairs]
         have = [item.get('name') for item in (entry or {}).get('segments', [])]
         if entry is None or names != have:
@@ -496,7 +532,7 @@ def read_index(project):
             stale = True
             break
     if stale:
-        rebuilt = rebuild_index(project)
+        rebuilt = rebuild_index(project, tolerant=True)
     return rebuilt
 
 
@@ -542,11 +578,30 @@ def list_rooms(project, include_archived=False):
     index = read_index(project)
     items = []
     for room_id in sorted(index['rooms']):
-        room = read_room(project, room_id)
-        if room['state'] != 'open' and not include_archived:
+        entry = index['rooms'][room_id]
+        try:
+            room = read_room(project, room_id)
+        except Refusal as error:
+            # One damaged room is named as damaged here, not turned into a 500 for every
+            # other room in the project (review s2).
+            items.append({'id': room_id, 'name': None, 'state': 'damaged',
+                          'created_by': None, 'created_by_name': None, 'created_at': None,
+                          'archived_by': None, 'archived_by_name': None, 'archived_at': None,
+                          'archive_reason': None, 'last_sequence': entry.get('last_sequence', 0),
+                          'damaged': str(error)})
             continue
-        items.append(dict(_room_view(room), last_sequence=index['rooms'][room_id].get('last_sequence', 0)))
-    items.sort(key=lambda item: (item['created_at'], item['id']))
+        if room['state'] != 'open' and not include_archived and not entry.get('damaged'):
+            continue
+        view = dict(_room_view(room),
+                    last_sequence=entry.get('last_sequence', 0))
+        if entry.get('damaged'):
+            # The room's record is readable, but its message files are not: name it
+            # damaged so the page cannot present it as a healthy open room.
+            view['state'] = 'damaged'
+            view['record_state'] = room['state']
+            view['damaged'] = entry['damaged']
+        items.append(view)
+    items.sort(key=lambda item: (item['created_at'] or '', item['id']))
     return items
 
 
@@ -557,7 +612,12 @@ def create(project, name, actor, limits_values):
     index = read_index(project)
     opened = 0
     for room_id in index['rooms']:
-        room = read_room(project, room_id)
+        try:
+            room = read_room(project, room_id)
+        except Refusal:
+            # A damaged room cannot be counted or compared by name; leave it for repair
+            # rather than refusing every new room in the project (review s2).
+            continue
         if room['state'] == 'open':
             opened += 1
             if room['name'].casefold() == name.casefold():
@@ -763,6 +823,20 @@ def moderate(project, room_id, target_sequence, reason, operation_id, author, li
 
 
 # -- export ---------------------------------------------------------------------------------------
+def _fenced(text):
+    """A fenced code block around one message body (review s4).
+
+    A body is literal text: without a fence a message starting ``### #2 Carol (owner)``
+    forges a message heading in the Markdown export. The fence is longer than any run of
+    backticks in the body, so a body cannot close it early.
+    """
+    longest = 0
+    for match in re.finditer('`+', text):
+        longest = max(longest, len(match.group(0)))
+    fence = '`' * max(3, longest + 1)
+    return fence + '\n' + text + '\n' + fence
+
+
 def export_markdown(project, room_id):
     room = read_room(project, room_id)
     lines = load_lines(project, room_id)
@@ -783,7 +857,7 @@ def export_markdown(project, room_id):
         out.append('### #%d %s (%s), %s' % (line['sequence'], body['author']['name'],
                                             body['author']['role'], body['created_at']))
         out.append('')
-        out.append(body['text'])
+        out.append(_fenced(body['text']))
         out.append('')
     return '\n'.join(out).rstrip() + '\n'
 

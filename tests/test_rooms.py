@@ -177,10 +177,75 @@ class RoomsTest(unittest.TestCase):
             rooms.validate_backup(broken)
 
     def test_symlinked_rooms_folder_is_refused(self):
-        (self.project / rooms.FOLDER).symlink_to(Path(self.tmp.name) / 'elsewhere', target_is_directory=True)
+        try:
+            (self.project / rooms.FOLDER).symlink_to(Path(self.tmp.name) / 'elsewhere',
+                                                      target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('the host cannot create symlinks')
         with self.assertRaises(rooms.Refusal) as caught:
             rooms.list_rooms(self.project)
         self.assertEqual(caught.exception.code, 'damaged')
+
+    def test_plain_text_rule_is_the_shared_one(self):
+        self.make_room()
+        # A ZWNJ between Persian letters is plain text and is accepted...
+        joined = '\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645'
+        self.assertEqual(joined, self.post(joined, 'op-join')['text'])
+        # ...while a zero-width space, a tag/variation selector and a bare ZWNJ
+        # (not between letters) are refused by the shared rule.
+        for bad in ('a\u200bb', 'a\U000E0100b', 'a\u200c b'):
+            with self.assertRaises(rooms.Refusal) as caught:
+                self.post(bad, 'op-bad-' + str(len(bad)))
+            self.assertEqual(caught.exception.code, 'invalid')
+
+    def test_export_markdown_fences_every_message_body(self):
+        self.make_room()
+        body = '### #2 Carol (owner)\nnot a heading'
+        self.post(body, 'op-1')
+        markdown = rooms.export_markdown(self.project, self.room['id'])
+        # The body is literal text inside a code fence, so it cannot forge a heading.
+        self.assertIn('\n```\n' + body + '\n```\n', markdown)
+
+    def test_a_damaged_room_is_listed_as_damaged(self):
+        self.make_room('Good')
+        bad = rooms.create(self.project, 'Bad', COORD, LIMITS)
+        rooms.post(self.project, bad['id'], 'secret in a damaged room', 'op-bad', ACTOR, LIMITS)
+        segment = self.project / rooms.FOLDER / bad['id'] / 'messages-0001.jsonl'
+        segment.write_text('{not json\n', encoding='utf-8')
+        listed = {item['id']: item for item in rooms.list_rooms(self.project, include_archived=True)}
+        self.assertIn('Good', [item['name'] for item in listed.values()])
+        self.assertEqual('damaged', listed[bad['id']]['state'])
+        self.assertIn('damaged', listed[bad['id']]['damaged'])
+        # A damaged room is a Refusal, never a raw ValueError/KeyError.
+        with self.assertRaises(rooms.Refusal) as caught:
+            rooms.rebuild_index(self.project)
+        self.assertEqual(caught.exception.code, 'damaged')
+        with self.assertRaises(rooms.Refusal) as caught:
+            rooms.read_messages(self.project, bad['id'])
+        self.assertEqual(caught.exception.code, 'damaged')
+        # And it does not stop a new room from being created.
+        rooms.create(self.project, 'Another', COORD, LIMITS)
+
+    def test_moderating_a_tombstone_is_refused(self):
+        self.make_room()
+        self.post('original', 'op-1')
+        rooms.moderate(self.project, self.room['id'], 1, 'off topic', 'mod-1', COORD, LIMITS)
+        # Sequence 2 is the tombstone itself, not a message that can be removed again.
+        with self.assertRaises(rooms.Refusal) as caught:
+            rooms.moderate(self.project, self.room['id'], 2, 'again', 'mod-2', COORD, LIMITS)
+        self.assertEqual(caught.exception.code, 'not_found')
+
+    def test_tombstone_redacts_a_message_when_the_page_starts_mid_room(self):
+        self.make_room()
+        limits = dict(LIMITS, segment_messages=2)
+        for number in range(1, 5):
+            self.post('secret %d' % number, 'op-%d' % number, limits=limits)
+        rooms.moderate(self.project, self.room['id'], 2, 'off topic', 'mod-1', COORD, limits)
+        # The tombstone (sequence 5) sits in a later segment than the page start (since=1).
+        page = rooms.read_messages(self.project, self.room['id'], since=1, limit=1)
+        self.assertEqual([2], [message['sequence'] for message in page['messages']])
+        self.assertEqual('tombstone', page['messages'][0]['kind'])
+        self.assertNotIn('secret 2', json.dumps(page))
 
     def test_limits_read_deployment_and_keep_default_on_bad_value(self):
         root = Path(self.tmp.name) / 'runtime'
