@@ -1376,12 +1376,26 @@ FILES_HEADER_LIMIT = 64 * 1024
 FILES_STEP = 64 * 1024
 SHA256_TEXT = re.compile(r'[0-9a-f]{64}')
 
-def _clean_file_name(name):
+WINDOWS_RESERVED = re.compile(r'(?i)(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?')
+
+def _is_link(path):
+    """A symbolic link, or on Windows a junction or any other reparse point."""
+    if os.path.islink(path):
+        return True
+    try:
+        return bool(getattr(os.lstat(path), 'st_file_attributes', 0) & 0x400)
+    except OSError:
+        return False
+
+def _clean_file_name(name, for_disk=False):
     """The basename of ``name`` with nothing a path or a terminal obeys left in it; a refusal when none is left."""
     base = re.split(r'[\\/]', name)[-1].strip()
     base = TERMINAL_CONTROL.sub('', base)
     if not base or base in ('.', '..') or len(base) > 255 or ':' in base[:2]:
         raise ValueError('The file has no usable name; nothing was sent.')
+    if for_disk and (WINDOWS_RESERVED.fullmatch(base) or base[-1] in '. '):
+        raise ValueError('The file name %r cannot be written safely here (a reserved name, or it ends in a dot or space); '
+                         'nothing was kept.' % base)
     return base
 
 def _frame_exchange(config, header, body=None, sink=None):
@@ -1437,6 +1451,11 @@ def _frame_exchange(config, header, body=None, sink=None):
             raise RuntimeError('Invalid endpoint response; inspect state before retrying.')
         if sink is not None and answer['returncode'] == 0 and type(answer.get('frame_bytes')) is int:
             want = answer['frame_bytes']
+            # The answer says how many bytes follow: the time to receive them is theirs, not the flat TIMEOUT.
+            timer.cancel()
+            timer = threading.Timer(TIMEOUT + want / 16384.0, proc.kill)
+            timer.daemon = True
+            timer.start()
             while received < want:
                 chunk = proc.stdout.read(min(FILES_STEP, want - received))
                 if not chunk:
@@ -1504,7 +1523,7 @@ def _files_get(a, config, header):
     if not SHA256_TEXT.fullmatch(a.sha256):
         raise ValueError('The file is named by its 64 hexadecimal sha256; nothing was asked for.')
     folder = a.out
-    if os.path.islink(folder) or not os.path.isdir(folder):
+    if _is_link(folder) or not os.path.isdir(folder):
         raise ValueError('--out must be an existing folder and not a link; nothing was asked for.')
     header['sha256'] = a.sha256
     temporary = os.path.join(folder, '.orchestra-get-%d-%s.part' % (os.getpid(), a.sha256[:12]))
@@ -1522,13 +1541,13 @@ def _files_get(a, config, header):
             item = json.loads(answer['stdout'])
         except ValueError:
             raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
-        name = _clean_file_name(str(item.get('name', '')))
+        name = _clean_file_name(str(item.get('name', '')), for_disk=True)
         if (type(answer.get('frame_bytes')) is not int or received != answer['frame_bytes']
                 or item.get('bytes') != received or digest.hexdigest() != a.sha256
                 or item.get('sha256') != a.sha256):
             raise RuntimeError('The file did not arrive whole and as named (size or sha256 differs); nothing was kept.')
         final = os.path.join(folder, name)
-        if os.path.islink(final):
+        if _is_link(final):
             raise ValueError('%s is a link; it is never replaced. Nothing was kept.' % final)
         if a.force and os.path.lexists(final):
             import stat as stat_module

@@ -132,14 +132,69 @@ class TaskFilesOverSshTests(unittest.TestCase):
         self.assertEqual(0, self.cli('ops', 'list', self.task).returncode)
         self.assertEqual([], json.loads(self.cli('ops', 'list', self.task).stdout)['items'])
 
-    def test_a_body_longer_than_announced_stores_only_what_was_announced(self):
+    def test_a_body_longer_than_announced_is_refused_and_stores_nothing(self):
         announced = b'abcde'
         answer, _ = self.raw(dict(action='file-put', task=self.task, name='a.bin', direction='to-worker', bytes=5,
                                   sha256=sha(announced)), announced + b'MORE' * 5000)
-        self.assertEqual(0, answer['returncode'], answer)
-        entry = self.stored(data=announced)
-        self.assertEqual(5, entry['bytes'])
-        self.assertEqual(5, task_files.blob_size(self.project, sha(announced)))
+        self.assertEqual((2, 400), (answer['returncode'], answer['task_file_status']), answer)
+        self.assertIsNone(self.stored(data=announced))
+        self.assertIsNone(task_files.blob_size(self.project, sha(announced)))
+
+    def test_a_task_that_is_not_an_identifier_is_refused_before_anything_runs(self):
+        for task in ('--directory=/tmp', '--help', '-x', 'a b', '../x', ''):
+            answer, _ = self.raw(dict(action='file-list', task=task))
+            self.assertEqual((2, 422), (answer['returncode'], answer['task_file_status']), task)
+
+    def test_a_reader_that_stops_mid_get_frees_its_slot_by_the_deadline(self):
+        path = self.root / 'deployment.private.json'
+        original = path.read_text(encoding='utf-8')
+        document = json.loads(original)
+        document['task_files'] = {'transfer_grace_seconds': 2, 'min_transfer_bytes_per_second': 1048576}
+        path.write_text(json.dumps(document), encoding='utf-8')
+        try:
+            data = os.urandom(6 * MIB)
+            self.assertEqual(0, self.put_file('ops', data, name='big.bin').returncode)
+            wire = json.dumps(dict(action='file-get', project='pp', actor='ops', task=self.task,
+                                   sha256=sha(data))).encode() + b'\n'
+            proc = subprocess.Popen([sys.executable, str(KIT / 'endpoint.py'), '--root', str(self.root)],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            try:
+                proc.stdin.write(wire)
+                proc.stdin.close()
+                proc.stdout.readline()
+                proc.stdout.read(4096)
+                try:
+                    proc.wait(30)
+                except subprocess.TimeoutExpired:
+                    self.fail('a stalled reader kept the endpoint (and its slot) past the deadline')
+            finally:
+                proc.kill()
+                proc.wait()
+                proc.stdout.close()
+            held = self.hold_slots(task_files.LIMIT_DEFAULTS['max_transfers'])
+            for handle in held:
+                handle.close()
+        finally:
+            path.write_text(original, encoding='utf-8')
+
+    def test_old_upload_temporaries_are_swept_and_fresh_ones_kept(self):
+        folder = self.project / '.task-files' / 'tmp'
+        folder.mkdir(parents=True, exist_ok=True)
+        old, fresh = folder / 'upload-old', folder / 'upload-fresh'
+        old.write_bytes(b'x')
+        fresh.write_bytes(b'x')
+        os.utime(str(old), (1, 1))
+        task_files.sweep_uploads(self.project)
+        self.assertEqual((False, True), (old.exists(), fresh.exists()))
+
+    def test_a_reserved_windows_name_is_not_written_by_get(self):
+        data = b'reserved'
+        self.assertEqual(0, self.put_file('ops', data, name='NUL.txt').returncode)
+        dest = self.out / 'dest'
+        dest.mkdir()
+        done = self.cli(self.casey, 'get', self.task, sha(data), '--out', str(dest))
+        self.assertNotEqual(0, done.returncode)
+        self.assertEqual([], list(dest.iterdir()))
 
     def test_a_header_over_its_size_limit_is_refused_before_a_body_is_read(self):
         wire = b'{"action": "file-put", "note": "' + b'x' * (task_files.HEADER_LIMIT + 10)

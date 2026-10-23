@@ -719,6 +719,7 @@ def apply(payload, actor, run, project, now, limit=None):
 # -- the framed SSH request (kittrial-5bb.384, design 3b option B) -----------------------------------
 # One JSON header line, then exactly ``bytes`` raw bytes (file-put), or an answer line and then the
 # raw bytes (file-get). The endpoint and the client both read these; the rules live here once.
+_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
 FRAMED_ACTIONS = ('file-list', 'file-get', 'file-put')
 #: The longest header line either side reads or sends; a longer one is refused before a byte of body.
 HEADER_LIMIT = 64 * 1024
@@ -742,6 +743,10 @@ def frame_check(header):
     for key in ('project', 'actor', 'task'):
         if not isinstance(header[key], str) or not header[key]:
             raise Refusal(422, 'invalid', 'The %s header names no %s; nothing was read or stored.' % (action, key))
+    for key in ('project', 'task'):
+        # The task goes into the tracker's argv: a leading '-' would be read as an option.
+        if not _ID.fullmatch(header[key]):
+            raise Refusal(422, 'invalid', 'The %s header\'s %s is not an identifier; nothing was read or stored.' % (action, key))
     if action != 'file-list':
         check_sha256(header['sha256'])
     if action == 'file-put':
@@ -781,3 +786,26 @@ def download_target(project, task, sha256):
         raise Refusal(409, 'conflict', 'The stored file does not match its record (its size changed); it is not '
                       'served. An operator must look at it.')
     return entry, handle
+
+
+def sweep_uploads(project, age=86400):
+    """Remove upload temporaries older than ``age`` seconds: a killed process leaves one behind."""
+    import time
+    folder = _sub(project, TMP, False)
+    if folder is None:
+        return
+    cutoff = time.time() - age
+    try:
+        names = os.listdir(str(folder))
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith('upload-'):
+            continue
+        try:
+            path = folder / name
+            info = os.lstat(str(path))
+            if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                os.unlink(str(path))
+        except OSError:
+            pass

@@ -2789,6 +2789,12 @@ class Frame:
     """The bytes after a framed header: what was read past the line, then the pipe itself."""
     def __init__(self,fd,leftover=b''):
         self.fd=fd;self.leftover=bytearray(leftover);self.ends=None
+    def finished(self,seconds=5.0):
+        """Whether nothing follows the announced bytes: the client closed its end (EOF) and sent no more."""
+        import select
+        if self.leftover:return False
+        if not select.select([self.fd],[],[],seconds)[0]:return False
+        return os.read(self.fd,1)==b''
     def reader(self,length,limit):
         """``read(n)`` for task_files.receive: ends the transfer when it is slower than the limit allows."""
         import select,time,task_files
@@ -2809,6 +2815,8 @@ class Transfer:
     def copy(self,out):
         import select,time,task_files
         ends=time.monotonic()+task_files.transfer_seconds(self.size,self.limit);sent=0
+        # Non-blocking, so that a reader that stops cannot hold one write (and its slot) past the deadline.
+        os.set_blocking(out,False)
         while sent<self.size:
             chunk=self.handle.read(min(task_files.STEP,self.size-sent))
             if not chunk:break
@@ -2816,7 +2824,10 @@ class Transfer:
             while view:
                 wait=ends-time.monotonic()
                 if wait<=0 or not select.select([],[out],[],wait)[1]:return False
-                view=view[os.write(out,view):]
+                try:
+                    view=view[os.write(out,view):]
+                except BlockingIOError:
+                    continue
             sent+=len(chunk)
         return sent==self.size
     def close(self):
@@ -2901,7 +2912,12 @@ def framed_files(root,path,actor,header,frame):
         task_files.check_room(path,task,length,limit)
         slot=take_transfer_slot(root,limit)
         try:
+            task_files.sweep_uploads(path)
             stored,size,created=task_files.receive(frame.reader(length,limit),length,path,sha256)
+            if not frame.finished():
+                if created:
+                    with held_coordination_lock(path):task_files.discard(path,stored)
+                raise task_files.Refusal(400,'invalid','The upload sent more bytes than its header announced; nothing was stored.')
         finally:
             slot.close()
         body={'schema_version':1,'operation':operation,'task':task,'sha256':stored,'name':name,'bytes':size,
@@ -2929,7 +2945,12 @@ def read_request(fd):
     """
     import codecs,task_files
     head=b''
+    import select,time
+    ends=time.monotonic()+60
     while b'\n' not in head and len(head)<=task_files.HEADER_LIMIT:
+        if FRAME_SNIFF.match(head) and not select.select([fd],[],[],max(0,ends-time.monotonic()))[0]:
+            # A framed header that does not finish (no newline, stdin left open) must not hold the process.
+            return None,None,task_files.Refusal(408,'request_timeout','The request header did not arrive in 60 seconds; nothing was read or stored.')
         chunk=os.read(fd,task_files.HEADER_LIMIT+1-len(head))
         if not chunk:break
         head+=chunk
