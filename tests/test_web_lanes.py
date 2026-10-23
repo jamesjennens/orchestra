@@ -163,8 +163,19 @@ class LanesRouteCase(ServerHarness):
                 self.assertIn('idle_minutes', refused.data['error']['message'])
                 self.assertIn('1', refused.data['error']['message'])
                 self.assertIn('10080', refused.data['error']['message'])
-        # A read that names no threshold at all is the read's own default, never a refusal.
-        self.assertEqual(200, self.lanes(self.olive, '?idle_minutes=').status)
+        # A read that names no threshold at all is the read's own default, never a
+        # refusal; a blank one is malformed, not the default (kittrial-5bb.389).
+        self.assertEqual(200, self.lanes(self.olive).status)
+
+    def test_a_blank_repeated_or_non_digit_threshold_is_refused_400(self):
+        for value in ('', '1_5', '+15', '%2015'):
+            with self.subTest(idle_minutes=value):
+                refused = self.lanes(self.olive, '?idle_minutes=' + value)
+                self.assertEqual(400, refused.status, refused.data)
+                self.assertIn('idle_minutes', refused.data['error']['message'])
+        repeated = self.lanes(self.olive, '?idle_minutes=15&idle_minutes=30')
+        self.assertEqual(400, repeated.status, repeated.data)
+        self.assertIn('idle_minutes', repeated.data['error']['message'])
 
     def test_an_owner_sees_every_lane_and_a_contributor_sees_only_their_own(self):
         # The route asks the HOST who an operator is (design section 4), and never the

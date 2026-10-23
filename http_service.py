@@ -1941,6 +1941,27 @@ def unsupported_fields_text(keys):
     return ', '.join(shown)
 
 
+def refuse_ambiguous_query(raw_query, names):
+    """Refuse a blank or repeated query value instead of quietly taking the first.
+
+    ``_dispatch`` builds ``ctx.query`` with ``keep_blank_values=False`` and keeps only
+    ``v[0]``, so a handler cannot tell ``?form=`` from no form at all, or the first
+    ``?idle_minutes=15`` from two of them. The routes that read these names re-parse the
+    raw query with ``keep_blank_values=True`` and refuse a malformed value here, before
+    reading it (kittrial-5bb.389; the same reading as ``project_guidance_status``).
+    A parameter that is absent is left alone: the route's own default still applies.
+    """
+    pairs = parse_qs(raw_query, keep_blank_values=True)
+    for name in names:
+        values = pairs.get(name)
+        if values is None:
+            continue
+        if len(values) != 1:
+            raise HttpError(400, 'invalid_request', 'Use %s only once' % name)
+        if values[0] == '':
+            raise HttpError(400, 'invalid_request', '%s must not be blank' % name)
+
+
 def refuse_unknown_fields(payload, allowed, where, takes=None):
     """Refuse a body field the route does not take, in the task-change shape (kittrial-5bb.183).
 
@@ -8170,6 +8191,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         from work import move_decision
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
+        refuse_ambiguous_query(urlsplit(self.path).query, ('form', 'since', 'idle_minutes'))
+        # Both forms share this query, so a malformed threshold is refused even on the
+        # worker form, where the value is otherwise unused (kittrial-5bb.389).
+        self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
         form = ctx.query.get('form', 'worker')
         if form not in ('worker', 'coordinator'):
             raise HttpError(400, 'invalid_request', 'form must be worker or coordinator')
@@ -11994,6 +12019,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         so the cursor the answer carries is minted from that, never from a second cut here.
         """
         self._project(ctx, CAP_READ)
+        refuse_ambiguous_query(urlsplit(self.path).query, ('idle_minutes',))
         limit, state = self._page(ctx, ctx.query)
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
         scope = self._lanes_scope(ctx.principal, ctx.params['pid'])
@@ -12015,14 +12041,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         the ONE read's own range, so the page cannot ask for a value the read would refuse.
         """
         from lanes import DEFAULT_IDLE_MINUTES, IDLE_MINUTES_MIN, IDLE_MINUTES_MAX
-        if raw is None or raw == '':
+        if raw is None:
             return DEFAULT_IDLE_MINUTES
-        try:
-            minutes = int(raw)
-        except (TypeError, ValueError):
+        # Plain ASCII digits only (kittrial-5bb.389): ``int()`` would also take ``1_5``,
+        # ``+15`` and surrounding whitespace and quietly repair the caller's value.
+        if not re.fullmatch(r'[0-9]+', raw):
             raise HttpError(400, 'invalid_request',
                             'idle_minutes must be a whole number of minutes, %d to %d'
                             % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
+        minutes = int(raw)
         if not IDLE_MINUTES_MIN <= minutes <= IDLE_MINUTES_MAX:
             raise HttpError(400, 'invalid_request',
                             'idle_minutes must be %d to %d (one minute to seven days)'
