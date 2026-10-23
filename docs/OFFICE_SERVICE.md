@@ -800,6 +800,19 @@ adding the key: an older `office_service.py` refuses an unknown setting. 90 is t
 office choice, not a special value in the implementation. Existing credentials are
 not rewritten when configuration changes.
 
+## Password minimum configuration
+
+The same private office JSON accepts `"password_min_length": 8` (a whole number from 1
+through 1024); omission keeps 1, which accepts any non-empty password. It is passed as
+`--password-min-length`. 1024 stays the maximum as a bound on the work one request may ask
+for, not a policy about what a password should look like. The browser account page states
+the configured minimum; the signed-out reset page states no number and shows the server's
+own sentence. A password made only of whitespace is refused on the server with one
+sentence, on this path too. Upgrade the kit before adding the key: an older
+`office_service.py` refuses an unknown setting. Changing the setting rewrites no existing
+verifier; it applies the next time a password is set. See docs/HTTP_DEPLOYMENT.md
+("Password rule").
+
 ## Session idle and absolute limit configuration
 
 The same private office JSON accepts the browser session's two limits, and

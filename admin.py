@@ -15,6 +15,7 @@ import csv
 import hashlib
 import io
 import json
+import ntpath
 import os
 import posixpath
 import re
@@ -74,6 +75,12 @@ RESTORE_TIMEOUT=BACKUP_SYNC_TIMEOUT
 #: failed or interrupted run must never destroy the previous restorable pair, so the
 #: last complete sidecar is kept here and ``coordination_backup`` can fall back to it.
 LAST_COMPLETE_SUFFIX='.coordination.last-complete.json'
+#: The rooms backup is its OWN file beside the coordination sidecar (rooms design section 2,
+#: option B): an older kit ignores it, so its fixed restore list never sees an unknown path and
+#: its restore still works, without rooms. The schema is the rooms module's; this kit validates
+#: every digest before it writes one byte.
+ROOMS_SUFFIX='.rooms.json'
+ROOMS_LAST_COMPLETE_SUFFIX='.rooms.last-complete.json'
 
 #: Additive key in a COMPLETE coordination sidecar that records a manifest of the native
 #: backup directory at the moment that generation completed. ``restore-new`` recomputes it
@@ -687,6 +694,116 @@ def review_workflow_writes(root, strict=False, warnings=None):
             else:
                 print('WARNING: ' + message,file=sys.stderr)
     return enabled
+
+# ---------------------------------------------------------------------------
+# Delivered code over HTTP (docs/design/DELIVERY_CODE_OVER_HTTP.md, kittrial-5bb.373):
+# `delivery_roots` and `delivery_serve_max_bytes` in `deployment.private.json`.
+#
+#   delivery_roots           - list of absolute directory paths under which the
+#                              HTTP service may open a recorded bundle path
+#                              (default `()`, so a service that does not configure
+#                              it refuses every bundle read with 410).
+#   delivery_serve_max_bytes - maximum byte size of a served bundle (default
+#                              268435456 = 256 MiB, hard cap 2 GiB).
+#
+# As with `review_workflow_writes`, a malformed value logs a warning (or appends
+# to `warnings` when supplied) and falls back to the safe default rather than
+# breaking unrelated endpoint or HTTP reads.
+# ---------------------------------------------------------------------------
+DELIVERY_SERVE_MAX_BYTES = 256 * 1024 * 1024
+DELIVERY_SERVE_MAX_BYTES_CAP = 2 * 1024 ** 3
+
+
+def _warn_deployment_setting(warnings, message):
+    if warnings is not None:
+        warnings.append('WARNING: ' + message)
+    else:
+        print('WARNING: ' + message, file=sys.stderr)
+
+
+def _normalize_delivery_root_entry(item):
+    """Normalize a non-root POSIX or Windows drive-letter absolute path for ``delivery_roots``."""
+    if not isinstance(item, str) or '\x00' in item:
+        return None, 'not_absolute'
+    if item.startswith('/') and not item.startswith('//') and '\\' not in item:
+        if item == '/':
+            return None, 'root'
+        normalized = posixpath.normpath(item)
+        if not normalized.startswith('/') or normalized.startswith('//') or normalized == '/':
+            return None, 'root'
+        return normalized, None
+    if len(item) >= 3 and item[0].isalpha() and item[1] == ':' and item[2] in ('/', '\\'):
+        if len(item) >= 4 and item[3] in ('/', '\\'):
+            return None, 'not_absolute'
+        if len(item.rstrip('/\\')) <= 2:
+            return None, 'root'
+        normalized = ntpath.normpath(item)
+        if not (len(normalized) > 3 and normalized[0].isalpha() and normalized[1:3] == ':\\'):
+            return None, 'root'
+        return normalized, None
+    return None, 'not_absolute'
+
+
+def delivery_roots(root, doc=None, warnings=None):
+    """Configured bundle drop-root directories from `deployment.private.json` (`()` by default)."""
+    if doc is None:
+        marker = Path(root) / 'deployment.private.json'
+        if not marker.is_file():
+            return ()
+        doc = deployment_document(marker)
+    if not isinstance(doc, dict):
+        return ()
+    value = doc.get('delivery_roots')
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        _warn_deployment_setting(
+            warnings,
+            'deployment delivery_roots is %r, not a list of absolute paths; reading it as empty' % (value,),
+        )
+        return ()
+    roots = []
+    for item in value:
+        normalized, problem = _normalize_delivery_root_entry(item)
+        if problem == 'not_absolute':
+            _warn_deployment_setting(
+                warnings,
+                'deployment delivery_roots entry %r is not a non-root absolute path; reading delivery_roots as empty'
+                % (item,),
+            )
+            return ()
+        if problem == 'root':
+            _warn_deployment_setting(
+                warnings,
+                'deployment delivery_roots entry %r resolves to root; reading delivery_roots as empty' % (item,),
+            )
+            return ()
+        if normalized not in roots:
+            roots.append(normalized)
+    return tuple(roots)
+
+
+def delivery_serve_max_bytes(root, doc=None, warnings=None):
+    """Configured byte cap for served bundles from `deployment.private.json` (256 MiB default)."""
+    if doc is None:
+        marker = Path(root) / 'deployment.private.json'
+        if not marker.is_file():
+            return DELIVERY_SERVE_MAX_BYTES
+        doc = deployment_document(marker)
+    if not isinstance(doc, dict):
+        return DELIVERY_SERVE_MAX_BYTES
+    value = doc.get('delivery_serve_max_bytes')
+    if value is None:
+        return DELIVERY_SERVE_MAX_BYTES
+    if type(value) is int and 0 < value <= DELIVERY_SERVE_MAX_BYTES_CAP:
+        return value
+    _warn_deployment_setting(
+        warnings,
+        'deployment delivery_serve_max_bytes is %r, not a positive integer <= %d; reading it as %d'
+        % (value, DELIVERY_SERVE_MAX_BYTES_CAP, DELIVERY_SERVE_MAX_BYTES),
+    )
+    return DELIVERY_SERVE_MAX_BYTES
+
 
 # ---------------------------------------------------------------------------
 # Slices 6 and 7 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.197) and
@@ -4150,7 +4267,8 @@ def validate_coordination_files(files):
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
         journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
+        if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -4225,6 +4343,8 @@ def validate_coordination_files(files):
             validate_quarantine_record(name,record)
     from requirement_governance import validate_files as validate_governance_files
     validate_governance_files(files)
+    from requirement_baselines import validate_backup as validate_baseline_backup
+    validate_baseline_backup(files)
     from lifecycle_voids import validate_backup as validate_void_backup
     validate_void_backup(files)
     from web_lifecycle_marks import validate_backup as validate_mark_backup
@@ -4656,6 +4776,8 @@ def backup_project(root,name):
             raise ValueError('Cannot back up an unreadable/incomplete lifecycle VOID family')
         from requirement_governance import snapshot as governance_snapshot
         files.update(governance_snapshot(path,name))
+        from requirement_baselines import backup_files as baseline_backup_files
+        files.update(baseline_backup_files(path,name))
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
         for record in sorted((path/'.coordination-requests').glob('*.json')):
             if record.is_symlink():raise ValueError('Coordination receipt must not be a symlink')
@@ -4808,6 +4930,13 @@ def backup_project(root,name):
                 manifest,problem=native_backup_manifest(root/'backups'/name)
                 if manifest is not None:record[NATIVE_MANIFEST_KEY]=manifest
                 atomic(bundle,record)
+                # The separate rooms file belongs to this generation too, and it is written
+                # only after the complete sidecar: a failure here leaves the previous sidecar
+                # (the guard below) with the previous or no rooms file, never a half pair.
+                import rooms
+                rooms_record=rooms.backup_record(path)
+                if rooms_record is not None:
+                    atomic(root/'backups'/(name+ROOMS_SUFFIX),rooms_record)
                 # The new generation is now native + complete sidecar + promoted journal;
                 # from here the guard must not put the previous sidecar back. SIGTERM is
                 # held across the promotion and the flag together: a stop landing between
@@ -4822,6 +4951,8 @@ def backup_project(root,name):
                 # A failure here leaves the new complete generation in place (the guard no
                 # longer rolls it back), and the next run's guard refreshes this copy.
                 _atomic_copy(bundle,last_complete)
+                if rooms_record is not None:
+                    _atomic_copy(root/'backups'/(name+ROOMS_SUFFIX),last_complete_rooms_path(root,name))
             finally:
                 # On ANY path that is not a normally-finished client - SIGTERM/SIGINT, the
                 # explicit ceiling, an exception - stop the whole process group here, while
@@ -5195,10 +5326,14 @@ def backup_status_record(results,scope,generated_at,http_state=None):
         entry={'name':item['name'],'status':item['status']}
         if item.get('degraded'):
             entry['degraded']=item['degraded']
+        if item.get('task_files') is not None:
+            entry['task_files']=item['task_files']   # kittrial-5bb.380: the files' backup beside the pair
         if item['status']=='complete':
             entry['completed_at']=item['completed_at']
             entry['pair']={'native':'backups/'+item['name'],
                            'coordination':'backups/'+item['name']+'.coordination.json'}
+            if item.get('rooms') is not None:
+                entry['rooms']=item['rooms']
         else:
             entry['reason']=item['reason']
         projects.append(entry)
@@ -5254,6 +5389,27 @@ def validate_backup_status(record):
             degraded=entry.get('degraded')
             if degraded is not None and (not isinstance(degraded,str) or not degraded.strip()):
                 raise ValueError('Degraded backup status for %s needs a nonempty message'%name)
+            files=entry.get('task_files')
+            if files is not None and (not isinstance(files,dict) or files.get('status') not in ('complete','failed')):
+                raise ValueError('Backup status task_files for %s must be complete or failed'%name)
+            rooms=entry.get('rooms')
+            if rooms is not None:
+                if not isinstance(rooms,dict) or set(rooms)!={'file','sha256','last_complete'} \
+                        and set(rooms)!={'file','sha256'}:
+                    raise ValueError('Rooms backup status for %s must name file, sha256 and optionally last_complete'%name)
+                if rooms['file']!='backups/'+name+ROOMS_SUFFIX:
+                    raise ValueError('Rooms backup status for %s must name backups/%s%s'%(name,name,ROOMS_SUFFIX))
+                if not re.fullmatch(r'[0-9a-f]{64}',rooms.get('sha256') or ''):
+                    raise ValueError('Rooms backup status for %s needs the rooms file sha256'%name)
+                last=rooms.get('last_complete')
+                if last is not None:
+                    if not isinstance(last,dict) or set(last)!={'file','sha256'}:
+                        raise ValueError('Rooms last_complete status for %s must name file and sha256'%name)
+                    if last['file']!='backups/'+name+ROOMS_LAST_COMPLETE_SUFFIX:
+                        raise ValueError('Rooms last_complete status for %s must name backups/%s%s'%(
+                            name,name,ROOMS_LAST_COMPLETE_SUFFIX))
+                    if not re.fullmatch(r'[0-9a-f]{64}',last.get('sha256') or ''):
+                        raise ValueError('Rooms last_complete status for %s needs its sha256'%name)
         else:
             reason=entry.get('reason')
             if not isinstance(reason,str) or not reason.strip():
@@ -5262,6 +5418,8 @@ def validate_backup_status(record):
                 raise ValueError('Incomplete backup status for %s must not carry a completion'%name)
             if 'degraded' in entry:
                 raise ValueError('Incomplete backup status for %s must not carry a degraded message'%name)
+            if 'rooms' in entry:
+                raise ValueError('Incomplete backup status for %s must not carry a rooms backup'%name)
     expected='complete' if complete==len(projects) else 'incomplete'
     http_state=record.get('http_state')
     if http_state is not None:
@@ -5599,19 +5757,22 @@ def backup_copy_skips(root,record):
             add(name,'the last run recorded %s, not complete'%entry['status'])
     return sorted(reasons.items())
 
-def backup_copy_generation(entry,sidecar_bytes):
+def backup_copy_generation(entry,sidecar_bytes,rooms_bytes=None,rooms_last_bytes=None):
     """The generation of the pair a copy run wrote, named from what the destination holds.
 
-    Native directory, complete sidecar and operation-journal snapshot are one generation, and
-    the complete sidecar is the small file that identifies it, so the SHA-256 of the sidecar
-    bytes copied is the generation's own name at the destination. The UTC time the last run
-    recorded for the project travels alongside, and the native directory's recorded manifest
-    digest when the sidecar carries one (a sidecar written by an older kit records none), so a
-    reader at the destination can tell which copy came from which run (kittrial-5bb.160 review
-    2). Never raises: the caller has the bytes it just copied.
+    Native directory, complete sidecar, operation-journal snapshot and—when the project
+    has rooms—the separate ``.rooms.json`` and its last-complete copy are one generation
+    (review s1). The complete sidecar is the small file that identifies it, so the SHA-256
+    of the sidecar bytes copied is the generation's own name at the destination; the rooms
+    file digests travel alongside so a destination reader can tell the rooms came from the
+    same run. Never raises: the caller has the bytes it just copied.
     """
     generation={'completed_at':entry.get('completed_at'),
                 'coordination_sha256':hashlib.sha256(sidecar_bytes).hexdigest()}
+    if rooms_bytes is not None:
+        generation['rooms_sha256']=hashlib.sha256(rooms_bytes).hexdigest()
+    if rooms_last_bytes is not None:
+        generation['rooms_last_complete_sha256']=hashlib.sha256(rooms_last_bytes).hexdigest()
     # Through the record guard, not a bare json.loads: a sidecar an older kit or an
     # operator wrote is still text this kit did not just create, and a deeply nested one
     # must read as "no manifest to name", never as a RecursionError out of a copy run.
@@ -5880,7 +6041,7 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
     staging=destination/('.backup-copy-staging-'+secrets.token_hex(8))
     if staging.exists():shutil.rmtree(staging)
     staging.mkdir()
-    staged=[];journals=0;copied=[];copied_meta=[]
+    staged=[];journals=0;copied=[];copied_meta=[];staged_task_files={}
     try:
         # Stage every selected project first, each under its locks, so a copy error touches
         # nothing in the destination.
@@ -5891,9 +6052,15 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
             if name in retired:continue
             native=backups/name
             sidecar=backups/(name+'.coordination.json')
+            rooms_file=backups/(name+ROOMS_SUFFIX)
+            rooms_last=backups/(name+ROOMS_LAST_COMPLETE_SUFFIX)
             journal=journal_snapshot_path(root,name)
-            if native.is_symlink() or sidecar.is_symlink() or journal.is_symlink():
+            if native.is_symlink() or sidecar.is_symlink() or rooms_file.is_symlink() \
+                    or rooms_last.is_symlink() or journal.is_symlink():
                 raise ValueError('Backup pair paths must not be symlinks')
+            for rooms_path in (rooms_file,rooms_last):
+                if rooms_path.exists() and not rooms_path.is_file():
+                    raise ValueError('The rooms backup %s must be a regular file or absent'%rooms_path.name)
             project=root/'projects'/name
             # This project's backup lock is held for its whole staging; it is the same lock
             # ``backup_project`` takes, so no concurrent backup can rewrite the native
@@ -5934,11 +6101,32 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
                               'complete sidecar, because %s; this copy cannot claim the directory is the '
                               'one that sidecar belongs to.'%(name,detail))
                     _atomic_copy(sidecar,staging/(name+'.coordination.json'))
+                    # The separate rooms files belong to the same generation (review s1).
+                    # They are staged under the same locks, so an off-machine restore no
+                    # longer silently loses every room.
+                    #
+                    # They are not used by backup_pair_state (an older kit ignores them),
+                    # but they are copied by name because a restore prefers the canonical
+                    # file and falls back to the durable last-complete one.
+                    staged_rooms=staged_rooms_last=None
+                    if rooms_file.is_file():
+                        staged_rooms=staging/(name+ROOMS_SUFFIX)
+                        _atomic_copy(rooms_file,staged_rooms)
+                    if rooms_last.is_file():
+                        staged_rooms_last=staging/(name+ROOMS_LAST_COMPLETE_SUFFIX)
+                        _atomic_copy(rooms_last,staged_rooms_last)
                     if journal.is_file():
                         staged_journal=staging/journal.name
                         _atomic_copy(journal,staged_journal)
                         journals+=1
                 shutil.copytree(native,staging/name)
+                # kittrial-5bb.380: the task files' backup travels with the pair, under the same backup
+                # lock (backup_task_files writes it under that lock).
+                files=task_files_backup_path(root,name)
+                if files.is_symlink():raise ValueError('The task-files backup %s must not be a symlink'%files)
+                if files.is_dir():
+                    shutil.copytree(files,staging/(name+'.task-files'))
+                    staged_task_files[name]=staging/(name+'.task-files')
                 # The long copytree runs with the project's backup lock held, so the kit
                 # cannot rewrite the directory underneath it; a direct native writer bypasses
                 # that lock, so re-check and refuse rather than move a mixed directory into
@@ -5950,14 +6138,26 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
                                      'completeness record already there was left unchanged.'%(
                                          name,detail,destination))
             staged.append((name,staging/name,staging/(name+'.coordination.json'),staged_journal,
-                           backup_copy_generation(entry,(staging/(name+'.coordination.json')).read_bytes())))
+                           backup_copy_generation(entry,(staging/(name+'.coordination.json')).read_bytes(),
+                                                  staged_rooms.read_bytes() if staged_rooms is not None else None,
+                                                  staged_rooms_last.read_bytes() if staged_rooms_last is not None else None),
+                           staged_rooms,staged_rooms_last))
         # Every project staged: move each pair into place, replacing (not merging) the
         # destination, then publish the completeness record last.
-        for name,native_staged,sidecar_staged,journal_staged,generation in staged:
+        for name,native_staged,sidecar_staged,journal_staged,generation,rooms_staged,rooms_last_staged in staged:
             _replace_with(native_staged,destination/name)
             _replace_with(sidecar_staged,destination/(name+'.coordination.json'))
             if journal_staged is not None:
                 _replace_with(journal_staged,destination/journal_staged.name)
+            if rooms_staged is not None:
+                _replace_with(rooms_staged,destination/(name+ROOMS_SUFFIX))
+                print('Copied %s rooms: %s -> %s'%(name,backups/(name+ROOMS_SUFFIX),
+                                                   destination/(name+ROOMS_SUFFIX)))
+            if rooms_last_staged is not None:
+                _replace_with(rooms_last_staged,destination/(name+ROOMS_LAST_COMPLETE_SUFFIX))
+                print('Copied %s rooms last-complete: %s -> %s'%(
+                    name,backups/(name+ROOMS_LAST_COMPLETE_SUFFIX),
+                    destination/(name+ROOMS_LAST_COMPLETE_SUFFIX)))
             copied.append(name)
             copied_meta.append({'name':name,'generation':generation})
             print('Copied %s: %s -> %s'%(name,backups/name,destination/name))
@@ -5966,6 +6166,10 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
             if journal_staged is not None:
                 print('Copied %s journal snapshot: %s -> %s'%(
                     name,journal_snapshot_path(root,name),destination/journal_staged.name))
+            if name in staged_task_files:
+                _replace_with(staged_task_files[name],destination/(name+'.task-files'))
+                print('Copied %s task files: %s -> %s'%(name,task_files_backup_path(root,name),
+                                                        destination/(name+'.task-files')))
         # kittrial-5bb.331: the HTTP-state pair joins every copy that publishes the
         # completeness record - the off-machine copy is what survives the lost disk,
         # and the accounts and agents are exactly what it must not lose. Copied
@@ -6218,6 +6422,44 @@ def restore_http_state(root, named=None):
             'are back as they were at the backup.'%(', '.join(restored),live))
 
 
+def task_files_backup_path(root,name):
+    """Where a project's task files are backed up: ``backups/<name>.task-files`` (kittrial-5bb.380)."""
+    return root/'backups'/(name+'.task-files')
+
+def coordination_lock(path,shared=False):
+    """A factory of context managers holding ``path/.coordination.lock`` (shared or exclusive), for the
+    task-files functions that take the lock only around their short steps (kittrial-5bb.380 r2, s5)."""
+    import contextlib
+    @contextlib.contextmanager
+    def held():
+        import fcntl
+        with (Path(path)/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            yield
+    return held
+
+def backup_task_files(root,name):
+    """Mirror the project's ``.task-files`` beside its backup (design 4a A, kittrial-5bb.380).
+
+    Under the project's backup lock and then its coordination lock, the order ``backup_project`` and
+    ``backup-copy`` take them in, so no record of a file can land half way through. The coordination
+    sidecar is untouched: an older kit's restore of it is unchanged (design 6). Returns
+    task_files.backup_folder's summary."""
+    import task_files
+    path=project_dir(root,name)
+    target=task_files_backup_path(root,name)
+    if target.is_symlink():raise ValueError('The task-files backup %s must not be a symlink'%target)
+    if not os.path.lexists(str(path/task_files.FOLDER)) and not os.path.lexists(str(target)):
+        # No files and no earlier backup of them: nothing to copy or empty, so no lock is taken.
+        return {'files':0,'bytes':0,'records':0,'problems':[],'absent':True}
+    # kittrial-5bb.380 r2 (s5): the backup lock for the whole copy; the project's lock only to read the journal
+    # and to finish, never while the blobs are hashed and copied.
+    with backup_lock(root,name):
+        try:
+            return task_files.backup_folder(path,target,now=utc_stamp,lock=coordination_lock(path))
+        except task_files.Refusal as refused:
+            raise ValueError(str(refused)) from None
+
 def backup_projects(root,names,all_projects=False,named_http_state=None):
     """Back up one or more projects in one run and publish the run's status file.
 
@@ -6268,8 +6510,27 @@ def backup_projects(root,names,all_projects=False,named_http_state=None):
             entry={'name':name,'status':'complete','completed_at':utc_stamp()}
             _,degraded_fault=guidance_backup_pair(path)
             if degraded_fault:entry['degraded']=degraded_fault
+            rooms_entry=rooms_status_entry(root,name)
+            if rooms_entry is not None:entry['rooms']=rooms_entry
             results.append(entry)
             print(native)
+            # kittrial-5bb.380: the task files beside the backup, and their size in the report. A failure
+            # here leaves the tracker backup complete (it is restorable) and is said on stderr.
+            try:
+                files=backup_task_files(root,name)
+            except Exception as error:
+                entry['task_files']={'status':'failed','reason':failure_reason(error)}
+                print('backup of the task files of %s failed: %s'%(name,failure_reason(error)),file=sys.stderr)
+            else:
+                if not files.get('absent'):
+                    entry['task_files']={'status':'complete','files':files['files'],'bytes':files['bytes'],
+                                         'path':'backups/'+name+'.task-files'}
+                    print('task files of %s: %d files, %s (backups/%s.task-files)'
+                          %(name,files['files'],task_files_size_text(files['bytes']),name))
+                    for problem in files['problems']:
+                        print('task files of %s: NOT backed up: %s: %s'%(name,problem.get('path') or problem['sha256'],
+                                                                         problem['problem']),file=sys.stderr)
+                    if files['problems']:entry['task_files']['problems']=len(files['problems'])
         else:
             results.append({'name':name,'status':'failed','reason':reason})
             incomplete.append(name)
@@ -6404,6 +6665,94 @@ def resolved_coordination_sidecar(root,source):
     last-complete copy is the fallback (see ``coordination_sidecar_source``).
     """
     return coordination_sidecar_source(root,source)[1]
+
+def last_complete_rooms_path(root,name):
+    validate_name(name)
+    return root/'backups'/(name+ROOMS_LAST_COMPLETE_SUFFIX)
+
+def rooms_status_entry(root,name):
+    """The rooms file pair a complete backup generation carries, for ``backup-status``.
+
+    Review s1: the separate rooms file is part of the restorable generation, so the run
+    record names it and its durable last-complete copy with their SHA-256. Absent rooms
+    (a project that never had any) contribute nothing; the key stays optional so an
+    older record still validates.
+    """
+    canonical=root/'backups'/(name+ROOMS_SUFFIX)
+    if canonical.is_symlink() or not canonical.is_file():
+        return None
+    entry={'file':canonical.relative_to(root).as_posix(),
+           'sha256':hashlib.sha256(canonical.read_bytes()).hexdigest()}
+    last=last_complete_rooms_path(root,name)
+    if last.is_file() and not last.is_symlink():
+        entry['last_complete']={'file':last.relative_to(root).as_posix(),
+                                'sha256':hashlib.sha256(last.read_bytes()).hexdigest()}
+    return entry
+
+def complete_rooms_backup(path):
+    """The complete, digest-verified rooms record at ``path``, or ``(None, problem)``."""
+    path=Path(path)
+    if path.is_symlink():return None,'it is a symlink'
+    if not path.is_file():return None,None
+    try:
+        import rooms
+        data=record_json.loads(path.read_text(encoding='utf-8'))
+        rooms.validate_backup(data)
+        return data,None
+    except (OSError,ValueError,UnicodeDecodeError) as error:
+        return None,str(error) or 'it cannot be read'
+
+def rooms_backup_outcome(root,source):
+    """What the separate rooms file allows: ('answer',path,data,None), ('absent',...), ('refuse',...,problem).
+
+    The canonical ``backups/<name>.rooms.json`` is preferred; the durable last-complete copy
+    is the fallback, exactly as the coordination sidecar prefers its two copies. A copy that
+    exists but cannot be verified refuses rather than silently restoring half the rooms.
+    """
+    validate_name(source)
+    canonical=root/'backups'/(source+ROOMS_SUFFIX)
+    fallback=last_complete_rooms_path(root,source)
+    problems=[]
+    for path in (canonical,fallback):
+        data,problem=complete_rooms_backup(path)
+        if data is not None:return 'answer',path,data,None
+        if problem is not None:problems.append((path,problem))
+    if problems:
+        return 'refuse',None,None,'; '.join('%s: %s'%(path.relative_to(root).as_posix(),problem)
+                                            for path,problem in problems)
+    return 'absent',None,None,None
+
+def unusable_rooms_message(root,source,problem):
+    return ('The rooms backup of %s cannot be used (%s). Nothing was changed: repair or remove '
+            'backups/%s and backups/%s, or restore the tracker alone with '
+            '`restore-new %s DEST --without-rooms`.'
+            %(source,problem,source+ROOMS_SUFFIX,source+ROOMS_LAST_COMPLETE_SUFFIX,source))
+
+def restore_rooms(root,source,destination,without_rooms=False):
+    """Restore the separate rooms file into a fresh destination; return a report line."""
+    outcome,path,data,problem=rooms_backup_outcome(root,source)
+    if without_rooms:
+        if outcome=='absent':
+            return None
+        if outcome=='answer':
+            return ('NOT restored (--without-rooms): the rooms backup %s and its last-complete copy; '
+                    'the tracker and coordination data restored without rooms.'
+                    %path.relative_to(root).as_posix())
+        return ('NOT restored (--without-rooms): the rooms backup of %s (%s); the tracker and '
+                'coordination data restored without rooms.'%(source,problem))
+    if outcome=='absent':
+        return ('This backup has no separate rooms file: no rooms were restored (an older kit or a '
+                'project that never had rooms).')
+    if outcome=='refuse':
+        raise ValueError(unusable_rooms_message(root,source,problem))
+    import rooms
+    destination_path=project_dir(root,destination)
+    try:
+        count=rooms.restore_files(destination_path,data)
+    except ValueError as error:
+        raise ValueError('Cannot restore the rooms backup %s: %s'
+                         %(path.relative_to(root).as_posix(),error)) from None
+    return ('Restored %d rooms files from %s.'%(count,path.relative_to(root).as_posix()))
 
 def coordination_backup(root,source):
     # None only for a truly legacy backup (no sidecar copy at all). A copy that exists but
@@ -6650,18 +6999,35 @@ def restore_web_lifecycle_mark_family(root,destination,files):
         return marks.restore_files(path,files,native_rows)
 
 
+def restore_requirement_baseline_family(root,destination,files):
+    from requirement_baselines import restore_files, PREFIX, DIRECTORY, RESTORE_MARKER
+    path=project_dir(root,destination)
+    if (not any(name.startswith(PREFIX) for name in files)
+            and not os.path.lexists(path/DIRECTORY) and not os.path.lexists(path/RESTORE_MARKER)):
+        return False
+    import fcntl
+    if (path/'.coordination.lock').is_symlink():
+        raise ValueError('Coordination restore lock must not be a symlink')
+    with (path/'.coordination.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        return restore_files(path,files,destination)
+
+
 def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False,authority=True,
                          actor=None,reason=None):
     from coordination import atomic
     path=project_dir(root,destination)
     files=coordination_backup(root,source)
     if files is None:
+        restore_requirement_baseline_family(root,destination,{})
         restore_lifecycle_void_family(root,destination,{})
         restore_web_lifecycle_mark_family(root,destination,{})
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
         return False
     from requirement_governance import restored_files as restored_governance_files
     files=restored_governance_files(files,source,destination)
+    from requirement_baselines import restored_files as restored_baseline_files
+    files=restored_baseline_files(files,source,destination)
     if using_last_complete_sidecar(root,source):
         print('The canonical coordination sidecar backups/%s.coordination.json is not complete, so this restore '
               'uses the durable last-complete copy %s (the previous complete generation, restored with the '
@@ -6733,8 +7099,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     restore_lifecycle_void_family(root,destination,files)
     import web_lifecycle_marks as marks
     restore_web_lifecycle_mark_family(root,destination,files)
+    restore_requirement_baseline_family(root,destination,files)
     for name,record in files.items():
-        if name in (voids.MANIFEST,marks.MANIFEST,voids.ABANDON_FILE) or name.startswith((voids.DIRECTORY+'/',marks.DIRECTORY+'/')):
+        if name in (voids.MANIFEST,marks.MANIFEST,voids.ABANDON_FILE) or name.startswith((voids.DIRECTORY+'/',marks.DIRECTORY+'/', '.requirements-baselines/')):
             continue
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
@@ -10167,6 +10534,21 @@ def main():
                         'SQLite records file, copied consistently, mode 0600); without it the http_state '
                         'path recorded in deployment.private.json is used, then the office default '
                         '<RUNTIME_ROOT>/http-state.json when that file exists (kittrial-5bb.331)')
+    a=sub.add_parser('task-files',allow_abbrev=False,
+                     help='files attached to tasks (kittrial-5bb.380): verify PROJECT re-hashes every stored file; '
+                          'purge PROJECT --closed-before DATE --actor OPERATOR [--dry-run] removes the bytes of '
+                          'withdrawn files, of files on tasks closed before DATE, of orphans and of old temporary '
+                          'files, never a file a live record needs; proxy-check --url PUBLIC_URL shows whether a '
+                          'reverse proxy cuts an upload of the size limit')
+    a.add_argument('operation',choices=['verify','purge','proxy-check'])
+    a.add_argument('project',nargs='?')
+    a.add_argument('--closed-before',dest='closed_before',default=None,metavar='YYYY-MM-DD')
+    a.add_argument('--actor',default=None,metavar='OPERATOR')
+    a.add_argument('--reason',default=None)
+    a.add_argument('--dry-run',action='store_true',dest='dry_run')
+    a.add_argument('--url',default=None,metavar='PUBLIC_URL')
+    a.add_argument('--bytes',type=int,default=None,dest='bytes')
+    a.add_argument('--cafile',default=None)
     a=sub.add_parser('backup-schedule',help='record, as an operator, that this runtime\'s backups are scheduled '
                                              'elsewhere (the project setup step then reads done; a systemd user '
                                              'unit that covers the project still wins) (operator allowlist)')
@@ -10236,6 +10618,10 @@ def main():
                    help='restore only the native tracker data of a backup whose coordination sidecar exists but '
                         'cannot be used (restore-new refuses such a backup without this flag); its sessions, '
                         'handoffs, requests, merge context and recorded operators and verifiers are not restored')
+    a.add_argument('--without-rooms',action='store_true',dest='without_rooms',
+                   help='do not restore this backup set\'s separate rooms file (backups/PROJECT.rooms.json); '
+                        'the tracker, coordination sidecar and journals restore as usual, without rooms. '
+                        'A damaged rooms file otherwise refuses the restore before anything is created')
     a.add_argument('--restore-http-state',action='store_true',dest='restore_http_state',
                    help='ALSO restore the runtime HTTP state pair this backup set carries (accounts, agents, '
                         'memberships; mode 0600). The ONLY way it comes back: without the flag a restore never '
@@ -11118,6 +11504,8 @@ def main():
                 note),file=sys.stderr)
     elif args.command=='backup':backup_projects(root,args.projects,args.all_projects,
                                                    getattr(args,'http_state',None))
+    elif args.command=='task-files':
+        raise SystemExit(task_files_command(root,args))
     elif args.command=='backup-schedule':
         from keyed_records import require_configured_operator
         require_configured_operator(args.actor,operators(root,strict=True),'record a backup schedule note')
@@ -11272,6 +11660,13 @@ def main():
             else:
                 coordination_backup(root,args.project)
             args.flag_had_nothing=args.without_coordination and outcome=='legacy'
+            # The rooms file is validated BEFORE the destination exists too: a damaged one must
+            # not leave a half-restored project behind (the same rule as the sidecar).
+            rooms_outcome,rooms_path,rooms_data,rooms_problem=rooms_backup_outcome(root,args.project)
+            if rooms_outcome=='refuse' and not args.without_rooms:
+                raise ValueError(unusable_rooms_message(root,args.project,rooms_problem))
+            if args.without_rooms and rooms_outcome=='answer':
+                args.rooms_skipped=rooms_path
             # Validate the journal snapshot BEFORE creating anything: a corrupt snapshot
             # must fail the restore with no destination project, Dolt restore or
             # coordination files left behind.
@@ -11358,6 +11753,9 @@ def main():
         elif args.flag_had_nothing:
             print('--without-coordination: this backup has no coordination sidecar at all, so there was nothing '
                   'to leave out; it was restored as a legacy backup, exactly as without the flag.')
+        files_warning=getattr(args,'task_files_warning',None)
+        if files_warning:
+            warning=(warning+'\n'+files_warning) if warning else files_warning
         if warning:
             # The last thing the restore says, after everything on stdout (kittrial-5bb.144),
             # and a distinct exit status, so `restore-new ... && next-step` does not proceed.
@@ -11377,6 +11775,41 @@ def native_only_note(root,args,damaged):
               args.destination,
               'was restored from %s'%journal.relative_to(root).as_posix() if getattr(args,'journal_restored',False)
               else 'was not restored: the backup has no operation-journal snapshot'))
+
+def task_files_size_text(count):
+    import task_files
+    return task_files.size_text(count)
+
+def restore_task_files(root,source,destination):
+    """Place the source's task-files backup into the restored project, checked first (kittrial-5bb.380).
+
+    Returns None when the files were restored, or there were none to restore, and the warning that
+    makes the restore end with exit 3 when the backup's files did not match their manifest (nothing
+    of them is placed then). A backup without the folder (an older kit, or a copy that lost it)
+    restores as before, and says that the restored file records will report their files missing."""
+    import task_files
+    backup=task_files_backup_path(root,source)
+    path=project_dir(root,destination)
+    if not os.path.lexists(str(backup)):
+        outcome={'status':'absent'}        # nothing to place, so no lock is taken
+    else:
+        import fcntl
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            try:
+                outcome=task_files.restore_folder(backup,path)
+            except task_files.Refusal as refused:
+                outcome={'status':'refused','problems':[str(refused)]}
+    if outcome['status']=='absent':
+        print('This backup has no task files (backups/%s.task-files): any file records the task history '
+              'holds now say that the stored file is missing.'%source)
+        return None
+    if outcome['status']=='restored':
+        print('Task files restored: %d files, %s, checked against the backup\'s manifest.'
+              %(outcome['files'],task_files.size_text(outcome['bytes'])))
+        return None
+    return ('Task files NOT restored: the backup %s does not match its manifest, so none of its files was '
+            'placed (the project itself is restored). %s'%(backup,' '.join(outcome['problems'][:10])))
 
 def finish_restore(root,args,snapshot,step=None):
     """What ``restore-new`` does after the native restore: re-point, sidecar, journals, slot.
@@ -11411,6 +11844,11 @@ def finish_restore(root,args,snapshot,step=None):
         sidecar=False
     else:
         sidecar=restore_coordination(root,args.project,args.destination,authority=False)
+    # Rooms are their own backup file, not coordination: restore them on both the sidecar and
+    # --without-coordination paths. A damaged file refused before the destination existed.
+    rooms_line=restore_rooms(root,args.project,args.destination,
+                             without_rooms=getattr(args,'without_rooms',False))
+    if rooms_line:print(rooms_line)
     # What the deployment-authority step at the END of this function needed: it does not run when
     # the merge-slot step below fails, so the notice must say what was not compared and not
     # re-granted, and it can only say that knowing this (kittrial-5bb.240 F1).
@@ -11442,6 +11880,8 @@ def finish_restore(root,args,snapshot,step=None):
     # restore, whose journal step above is kept.
     at(MERGE_SLOT_STEP)
     provision_merge_slot(root,args.destination)
+    at('task files')
+    args.task_files_warning=restore_task_files(root,args.project,args.destination)
     if getattr(args,'native_only',None) is not None:
         return None
     if not sidecar:
@@ -11453,6 +11893,80 @@ def finish_restore(root,args,snapshot,step=None):
         return None
     return restore_authority(root,args.project,restore_operators=args.restore_operators,
                              restore_verifiers=args.restore_verifiers,actor=args.actor,reason=args.reason)
+
+def task_files_command(root,args):
+    """``admin.py task-files verify|purge|proxy-check`` (kittrial-5bb.380); returns the exit status."""
+    import fcntl
+    import task_files
+    if args.operation=='proxy-check':
+        if args.project is not None:raise ValueError('task-files proxy-check takes no project; give --url')
+        if not args.url:raise ValueError('task-files proxy-check needs --url PUBLIC_URL (the address people use)')
+        from server_address import public_url_problem
+        problem=public_url_problem(args.url,'--url')
+        if problem:raise ValueError(problem)
+        cap=task_files.limits(root)['max_file_bytes']
+        if args.bytes is not None and not 1<=args.bytes<=cap:
+            raise ValueError('task-files proxy-check --bytes is 1 to %d (the per-file limit, task_files.max_file_bytes)'%cap)
+        size=args.bytes if args.bytes is not None else cap
+        result=task_files.proxy_check(args.url,size,cafile=args.cafile)
+        print(result['sentence'])
+        print(json.dumps(result,sort_keys=True))
+        return 0 if result['passed'] else 1
+    if not args.project:raise ValueError('task-files %s needs a project'%args.operation)
+    validate_name(args.project)
+    path=project_dir(root,args.project)
+    if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+    if args.operation=='verify':
+        try:
+            # kittrial-5bb.380 r2 (s5): the shared lock only to read and to confirm, never while hashing.
+            result=task_files.verify(path,lock=coordination_lock(path,shared=True))
+        except task_files.Refusal as refused:
+            raise ValueError(str(refused)) from None
+        for key,label in (('mismatched','does not match its name'),('wrong_size','has another size than its record'),
+                          ('missing','is missing (a live record names it)')):
+            for item in result[key]:
+                print('task file %s %s'%(item['sha256'],label))
+        for item in result['unreadable']:
+            print('journal file %s cannot be read as an entry: %s'%(item['path'],item['problem']))
+        print('Checked %d stored files: %d mismatched, %d of another size, %d missing; %d journal files that cannot '
+              'be read; %d orphans and %d old temporary files (task-files purge removes those).'
+              %(result['checked'],len(result['mismatched']),len(result['wrong_size']),len(result['missing']),
+                len(result['unreadable']),len(result['orphans']),len(result['stale_temp'])))
+        print(json.dumps(result,sort_keys=True))
+        return 1 if result['mismatched'] or result['wrong_size'] or result['missing'] or result['unreadable'] else 0
+    # purge
+    if not args.closed_before:raise ValueError('task-files purge needs --closed-before YYYY-MM-DD')
+    from keyed_records import require_configured_operator
+    require_configured_operator(args.actor,operators(root,strict=True),'purge task files')
+    with (path/'.coordination.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        # kittrial-5bb.380 r2 (s2): the rows are read under the lock, so a task reopened before it is seen as open.
+        rows={row.get('id'):row for row in record_json.loads_rows(run_bd(root,args.project,['export','--all']))
+              if isinstance(row,dict)}
+        try:
+            if task_files.folder(path) is None:
+                print('Project %s has no task files; nothing to purge.'%args.project)
+                return 0
+            plan=task_files.purge_plan(path,args.closed_before,rows)
+            if args.dry_run:
+                for item in plan['remove']:
+                    print('would remove %s %s (%s): %s'%(item['kind'],item.get('sha256') or item.get('name'),
+                                                         task_files.size_text(item['bytes']),item['why']))
+                for item in plan['kept_referenced']:
+                    print('kept %s of task %s (%s): another live record needs it'%(item['sha256'],item['task'],item['why']))
+                print('Dry run: %d to remove (%s), %d kept because a live record needs them; nothing was removed.'
+                      %(len(plan['remove']),task_files.size_text(sum(i['bytes'] for i in plan['remove'])),
+                        len(plan['kept_referenced'])))
+                return 0
+            line=task_files.purge(path,plan,args.actor,utc_stamp,reason=args.reason)
+        except task_files.Refusal as refused:
+            raise ValueError(str(refused)) from None
+    print('Purged %d (%s) as %s; the line is in .task-files/audit.jsonl; %d kept because a live record needs them.'
+          %(len(line['removed']),task_files.size_text(line['bytes']),args.actor,len(line['kept_referenced'])))
+    for item in line['failed']:
+        print('NOT purged: %s %s: %s'%(item.get('kind'),item.get('sha256') or item.get('name'),item['problem']),
+              file=sys.stderr)
+    return 1 if line['failed'] else 0
 
 def kit_refusal(error):
     """Whether a ``ValueError`` is one of the kit's own refusals: exactly ``ValueError``

@@ -1,5 +1,33 @@
 # Office HTTP service: installation, TLS and recovery runbook
 
+## Coordinator wait for an agent
+
+`GET /v1/agents/me/wait?form=coordinator` exposes the existing CLI
+`wait --coordinator` projection to an agent with a current project coordinator
+grant. A worker credential, an ordinary agent without that grant, or an agent
+whose last effective grant was revoked gets `403`. Authority is checked on each
+call, including the owner's current role. Only projects where the grant is
+effective are read; membership or an agent project assignment alone grants no
+coordinator view.
+
+Each authorized project costs one canonical wait read: queue and lane triggers
+come from the same snapshot. `triggers` groups `checkpoint-to-coordinator`,
+`awaiting-review`, `awaiting-integration` and `lane-quiet`, and `items` carries
+those rows with their trigger. `idle_minutes` has the lane board's range
+1–10080 (default 15). For one project, `fingerprint` is byte-identical to the CLI
+coordinator fingerprint for the same actor, threshold and state. For multiple
+projects, rows carry `project`, and the fingerprint binds the sorted project
+identities and each canonical fingerprint, including empty projects. `projects`
+names exactly the authorized projects covered.
+
+Send `since=FINGERPRINT` from the previous reply to receive `changed: false` when
+the fact is unchanged, or `true` when it differs. Invalid fingerprints or forms
+are refused. This does not block, sleep, acknowledge any work or schedule a poll:
+the Bridge or caller decides when to read again. The coordinator projection and
+its trigger rules are shared with the CLI unchanged. The default worker form
+remains the agent's own work read. The generated `.orchestra/AGENT.md` describes
+both roles and uses the existing secret-safe curl credential file.
+
 ## Guidance and onboarding disclosure
 
 Every current project member, personal agent and worker credential can read this project's **whole onboarding document, including operator-written text**, at `GET /v1/projects/PROJECT/onboarding/read`. This deliberately widens the earlier edit route's disclosure. Do not place secrets in that project document. The edit route `GET /onboarding` still withholds operator-written text; these are distinct reads.
@@ -70,16 +98,27 @@ permission (no `coordinate`), takes nothing and writes nothing. It answers
 `task`, the current `contribution` and review state, five `checks` (`approval`,
 `source_commit`, `slot`, `hold`, `reverted`), three `unchecked` rows
 (`base_membership`, `tests`, `pushed_result`, each `known: false` because the
-server has no code-host access), and `next`: the writes still owed in order
-(scope, reviewed, integrated, the integrated mark, slot release), each with its
-route and the operation identity its native event records when the write was
-already made. A refused row is HTTP 200 with the writer's own sentence, not an
-error, so every reason is visible at once; an absent task is 404. The optional
-`target` query is the branch name the merge-slot acquire accepts. The route is
-classified read-only in `endpoint.py` and `http_authority.py`, so it cannot take
-the slot, write a fact or merge. `merge_ready` covers only the five checks; it
-does not turn the three unchecked rows into a pass. The task page has a lazy
-"Integration check" panel for the refused and unchecked rows.
+server has no code-host access), and `next`: the step ledger, the writes still owed
+in order (scope, reviewed, integrated, the integrated mark, slot release). Each
+ledger row carries its `route`, its `operation_id` (the identity its native event
+records when the write was made), its `state` and its canonical `fact`. `state` is
+`committed`, `not-attempted`, `unknown` (a native integration exists but its host
+mark is not confirmed, or the step's last HTTP answer was uncertain) or `not-held`
+for a slot that is not held. `fact` is the native event id for the scope and the
+facts, the host mark sha256 for the integrated mark, and absent for a slot release
+(which has no native fact; its `fact_note` says so). A not-yet-committed step whose
+last lifecycle answer was uncertain reads `unknown` with the deterministic
+operation identity the server used, so a coordinator retries that identity instead
+of minting a new one; a committed row keeps its fact id and reports the last
+response beside it as `response_state`. Audit activity from before this ledger
+carries no step metadata and is ignored rather than guessed. A refused row is HTTP
+200 with the writer's own sentence, not an error, so every reason is visible at
+once; an absent task is 404. The optional `target` query is the branch name the
+merge-slot acquire accepts. The route is classified read-only in `endpoint.py` and
+`http_authority.py`, so it cannot take the slot, write a fact or merge.
+`merge_ready` covers only the five checks; it does not turn the three unchecked
+rows into a pass. The task page has a lazy "Integration check" panel for the
+refused and unchecked rows.
 
 | Route | Closed request body | Confirmed result |
 | --- | --- | --- |
@@ -131,7 +170,50 @@ Copied `http_client.py` methods are `lifecycle`, `set_lifecycle_scope` and
 `record_lifecycle_fact`. The standard-library CLI is
 `http_client.py lifecycle PROJECT TASK read|scope|fact`; writes take `--file` with
 the HTTP JSON body, `--idempotency-key`, and `--dimension` for a fact. Reuse that
-file and key when reconciling an ambiguous request.
+file and key when reconciling an ambiguous request. The same client has
+`integration_check(project, task, target=None)` and `ledger(project, task,
+target=None)` for the read-only merge check and its step ledger; the CLI is
+`http_client.py integration-check PROJECT TASK [--target BRANCH]` for the whole
+answer and `http_client.py ledger PROJECT TASK [--target BRANCH]` for the `task`,
+`target`, `merge_ready` and `next` rows alone.
+
+### The web-only merge and push recipe (an agent with its own repository credential)
+
+This is the sequence for a coordinator agent that reaches Orchestra only over HTTP
+and has its own repository-scoped credential. The server never merges, tests or
+pushes; it records the coordinator's word, and `unchecked` says so.
+
+1. **Read before touching the repository.** `GET .../tasks/{task}/integration-check`
+   (or `http_client.py integration-check`/`ledger`). Stop on any refused `checks`
+   row, and treat every `unchecked` row as unknown, never as a pass.
+2. **Take the slot** with `POST .../merge-slot/acquire` for the task and target
+   branch, with one stable `Idempotency-Key`.
+3. **Fetch, check out and merge** in a clone the agent can push from. The approved
+   commit is merged as a merge commit; the target branch is never force-pushed and
+   the approved commit is never rewritten. The agent's repository credential is its
+   own, scoped to that repository. It is never the server's credential, the
+   Orchestra secret, or another person's credential.
+4. **Run the project's tests** in that checkout and record the result as `tested`
+   evidence if the project wants it on the tracker; it is not `integrated`.
+5. **Push the target branch** with the agent's own credential. The server cannot see
+   the push: the integration records it as the agent's word.
+6. **Record the facts** with one stable `Idempotency-Key` per step: the scope with
+   `source_commit` = the approved commit and `integration_commit` = the pushed merge
+   commit, then `reviewed=passed`, then `integrated=passed` (which also publishes
+   the host mark when the writer is enabled), then release the slot.
+7. **Resume from the ledger after a failure.** Read the check again. Retry only the
+   first row whose `state` is not `committed`, with the *same* `operation_id`/key
+   and the identical body. `unknown` means the outcome was not observed: keep the
+   identity, inspect canonical state, and reconcile. A `409` means state changed:
+   read again before a changed request. Never mint a second identity to "fix" a
+   native integration whose mark is missing; an operator repairs the mark family.
+
+The push and its credential are the agent's own act and record. What stays a
+person's step: approving the repository-scoped credential and deciding the agent
+may push with it; the contribution approval unless a granted agent already holds
+it; deciding whether the tests and merge base are enough when an `unchecked` row
+says the server cannot know; a forced release of a slot; and every void, revert and
+reconciliation.
 
 ### Passed integration marks and operator recovery
 
@@ -268,12 +350,14 @@ cd <RUNTIME_ROOT>/kit && git checkout <PINNED_COMMIT>
 sudo -u <SERVICE_USER> python3 http_service.py \
   --state <RUNTIME_ROOT>/http-state.json --root <RUNTIME_ROOT> \
   --bootstrap-user <ADMIN_USERNAME>
-# the operator types the password at the prompt; it is never echoed or logged
+# the operator types the password twice at the prompts; it is never echoed or logged
+# (--password-min-length N raises the default minimum of 1; see "Password rule")
 ```
 
 Bootstrap refuses to run once any account exists, so it cannot silently reset a
-live deployment. Create ordinary accounts through the API and hand each user a
-single-use reset value; only redemption changes the verifier.
+live deployment. A mismatch between the two prompts creates no account. Create ordinary
+accounts through the API and hand each user a single-use reset value; only redemption
+changes the verifier.
 
 The guard is only as good as `--root`: it locks the root you name, so naming a
 different root while a service holds the real one gets past the lock and the new
@@ -3646,6 +3730,18 @@ original comments remain in task history. The assignment-roster read uses shared
 project and authority locks so concurrent readers do not queue behind an exclusive
 read lock; assignment effects retain their exclusive guards.
 
+### Named requirements baseline readers
+
+Baseline cuts require compatible readers on every installation that may restore
+the project. The member routes and owner cut use the canonical endpoint; their
+new sidecar files are included in the explicit backup allowlist. A cut freezes
+pending wording without accepting it. See REQUIREMENTS.md for fixed routes,
+names, limits and same-account saved retry behavior, and OPERATIONS.md for
+interrupted-cut/restore handling and the forward-only older-reader boundary.
+Install compatible readers before creating new baseline-family files; retain a
+verified backup from before the first new-family write for any older-kit rollback.
+This does not choose office settings or a deployment schedule.
+
 ## Session idle and absolute limits
 
 An installation sets how long a browser session may sit unused before it signs out, and
@@ -3684,6 +3780,38 @@ sign-out and on an expired session's `401`, and dispatches `orchestra:session-id
 shortly before the idle deadline it last heard about. That warning is for the case where the
 touches stop reaching the service; while they do arrive, the session simply stays alive. The
 agent set-up wizard is what uses it (kittrial-5bb.329).
+
+## Password rule
+
+The installation's password minimum is a setting, `--password-min-length N` on the web
+service and `"password_min_length": N` in the private office JSON, a whole number from 1
+to 1024, default **1**: any non-empty password is accepted. A value outside the bounds, or
+one that is not a whole number, is refused at startup with one sentence and a non-zero
+exit before the state document is opened; nothing is clamped. The **1024 maximum stays**,
+documented as a bound on the work one request may ask for, not as a policy about what a
+password should look like.
+
+Every place a password is set asks for it twice and refuses a mismatch before anything is
+sent or stored. On the web that is the account page's "Change password" and the reset
+page's "Set a new password" (the administrator's reset only issues the single-use code;
+the new password is chosen on that reset page). The host bootstrap prompt
+(`http_service.py --bootstrap-user`, which `orc.sh user` calls) asks twice too, and a
+mismatch creates no account; the confirmation lives in that prompt, not in the shell
+wrapper.
+The account page states the server's rule from `GET /v1/sessions/current`:
+`user.password_min_length` (the same value is in the sign-in answer), so no hard-coded
+minimum remains in the browser code. The reset page is signed out, so there is no session
+answer to read: it states no number and shows the server's own 422 sentence, which names
+the configured range, when the password is sent. The log-in rate limits are unchanged.
+
+The server remains the authority: `http_auth.py` refuses an empty password and one longer
+than 1024 characters, refuses one shorter than the configured minimum with a sentence
+naming the configured range, and refuses a password made only of whitespace with one
+sentence (`A password cannot be only spaces.`) on every surface that sets one: the account
+page, the reset page and the host bootstrap. Spaces inside a password are still allowed;
+this is not a character-set rule. Changing the setting does not rewrite existing verifiers,
+and an older password that is still valid keeps working; the rule applies when a password
+is next set.
 
 ## Agent credential lifetime
 
@@ -3841,8 +3969,14 @@ tools, the SSH framing, backups of the folder and the operator commands come lat
   nothing is attached or withdrawn (`409`).
 - **Audit:** a line that cannot be recorded is said in the service's log (`audit: the ... line
   ... could not be recorded`), with the action, outcome, task and digest.
-- **Not yet:** the folder is not in backups (slice 5): copy `projects/NAME/.task-files/` with the
-  project until then. Withdrawn bytes stay on disk until the operator purge of slice 5.
+- **Operations** (kittrial-5bb.380): the folder is backed up beside the project's backup and checked on restore;
+  `admin.py task-files verify` and `purge` (operator, dry run, audit line), and `task-files proxy-check` for a reverse
+  proxy's body limit. See [Operations](OPERATIONS.md#files-attached-to-tasks-backup-restore-verify-purge). A purged
+  file stays listed, with `purged` and the sentence "purged by an operator on DATE"; its download answers `410`.
+- **An upload refused before its body was read** (401, 403, 413, 503...) is answered, and the connection is then
+  closed lingering: the write side is shut and the rest of the body is read and dropped for at most 5 s and 64 MiB,
+  so the client reads the refusal instead of a reset. At most 8 such closes run at once; beyond that a connection is
+  closed at once (kittrial-5bb.380).
 
 ### Settings
 
@@ -3995,3 +4129,130 @@ object:
   `open_failing` and `state: "drifted"` intact until a trusted host `capability-verify --repo`
   at an integrated commit passes.
 
+
+## Project rooms over HTTP (slice 1, kittrial-5bb.385)
+
+Slice 1 of `docs/PROJECT_ROOMS_DESIGN.md` (section 10): rooms for people. Items, the
+`rooms` scope, the scribe, the wake and the summary are later slices. Room text is
+discussion, never an instruction to an agent: an agent credential cannot write in this
+slice at all, and the capability the page uses is on no credential scope.
+
+**Where the bytes live.** Beside the project, never in the tracker and never in source
+control:
+
+```
+projects/NAME/.rooms/index.json
+projects/NAME/.rooms/<room-id>/room.json
+projects/NAME/.rooms/<room-id>/messages-0001.jsonl
+projects/NAME/.rooms/<room-id>/messages-0002.jsonl
+projects/NAME/.rooms/<room-id>/messages-0001.jsonl.<sha16>.incomplete
+```
+
+`room.json` and `index.json` are written by atomic rename. Every message line carries a
+consecutive `sequence` and an `operation_id`; each append is flushed and fsynced. A
+segment rolls over at 5,000 messages or 4 MiB, and the next segment continues the
+sequence. A torn last line is split off, stored as `.incomplete` exactly as
+`.feedback.jsonl` does, and the valid prefix is kept; any other invalid line or a
+sequence gap refuses the read as damaged data rather than dropping text.
+
+**Bounds** are settings in `deployment.private.json` under `rooms`, read like
+`task_files`: a bad value keeps the default with a warning and never lifts the bound.
+
+| Setting | Default |
+|---|---|
+| `rooms.max_message_chars` | 4,000 |
+| `rooms.segment_messages` | 5,000 |
+| `rooms.segment_bytes` | 4 MiB |
+| `rooms.max_open_rooms` | 50 |
+
+Archived rooms do not count against the open-room bound. Nothing is deleted
+automatically.
+
+**Routes** (every read is `CAP_READ`, so every project member, viewers included, reads;
+no private rooms):
+
+| Route | Body / query | Authority |
+|---|---|---|
+| `GET /v1/projects/{pid}/rooms` | `?archived=1` includes archived rooms | `read` |
+| `POST /v1/projects/{pid}/rooms` | `{"name": "..."}` | `coordinate` (coordinator/owner) |
+| `GET /v1/projects/{pid}/rooms/{rid}` | `?since=N&limit=1..500` | `read` |
+| `POST /v1/projects/{pid}/rooms/{rid}/messages` | `{"text": "..."}` | the new `rooms.post` (contributor/coordinator/owner) |
+| `POST /v1/projects/{pid}/rooms/{rid}/archive` | `{}` or `{"reason": "..."}` | `coordinate` |
+| `POST /v1/projects/{pid}/rooms/{rid}/messages/{seq}/moderate` | `{"reason": "..."}` | `coordinate` |
+| `GET /v1/projects/{pid}/rooms/{rid}/export?format=markdown\|jsonl` | | `read` |
+
+A failed authority check, a room of another project, a viewer posting, a contributor
+creating/archiving/moderating, and any credential write are refused. `rooms.post` is
+deliberately not in `SCOPE_CAPABILITIES`, so no agent credential holds it; the route
+also refuses any credential by name in this slice.
+
+**Text rules (R8).** A post is at most `rooms.max_message_chars` characters, non-empty,
+and may not start with a reserved machine-record prefix (`Kind: ...`, BOM/CRLF lookalikes
+included). The room page renders every message through `dom.js` (`textContent`, never
+`innerHTML`), so `<img onerror=...>` and `javascript:` links are literal text and make no
+element.
+
+**Retries.** The `Idempotency-Key` of a post is the line's `operation_id`. A retry with
+the same key answers the original sequence and never writes a second line, also after
+`index.json` is rebuilt: the segment lines are the truth and the index is only a cache.
+
+**Moderation (R10).** A moderated message becomes a tombstone line whose text is
+`removed by NAME at TIME: REASON`, and the act is in the service audit
+(`rooms.moderate`). Every read and both exports hide the original text, including the
+raw JSON-lines export, which emits the redacted tombstone in the original message's
+place. The original remains only in the stored segment and in the separate rooms backup
+until an operator purges it; the room page shows a `removed` chip. `moderations` in a
+read answer lists tombstone events after `since`, so a client that already holds an
+earlier message can replace it.
+
+**Export.** `format=markdown` answers one Markdown document (room header, state, then
+`#sequence` author and text); `format=jsonl` answers the raw JSON lines with every
+moderated original already redacted. The answer is `{"room": ..., "format": ...,
+"text": ...}`; the page offers both as a download. The service is JSON over HTTP and
+does not add a second content-type transport for this slice.
+
+**Backup and restore.** `admin.py backup PROJECT` writes `backups/<name>.rooms.json`
+atomically in the same backup run as the coordination sidecar, and keeps a durable
+`backups/<name>.rooms.last-complete.json`. The coordination sidecar is untouched and
+`validate_coordination_files` has no rooms path: an older kit ignores the rooms file,
+so its restore still works (without rooms). A restore-new prefers the canonical file,
+falls back to the last-complete copy, verifies every path, sha256 and byte count before
+writing a byte, and refuses a damaged file before the destination is created;
+`--without-rooms` restores the tracker and coordination data without rooms and says so.
+The rooms file is written only after the complete sidecar, so a failed backup never
+pairs a new rooms file with an older sidecar. `backup-copy` carries the same two rooms
+files (and pins their SHA-256 in the run record), so an off-machine copy does not lose
+rooms silently; `backup-status` names them when the project has them.
+## Serving delivered bundles over HTTP
+
+Web reviewers holding `reviews.write` or `reviews.approve` in a project can read a contribution's
+delivery metadata at `GET /v1/projects/{id}/tasks/{task_id}/delivery[?contribution=ID]` and fetch
+its verified git bundle at `GET /v1/projects/{id}/tasks/{task_id}/delivery/bundle[?contribution=ID]`
+(or via `http_client.py delivery PROJECT TASK [--contribution ID] [--out FILE] [--verify]`; on the
+SSH/host `client.py`, `client.py delivery` refuses with the fixed host-transport sentence and reads
+nothing from disk).
+
+- **`delivery_roots` in `deployment.private.json`** (list of absolute directory paths, default
+  `[]`): the only directories from which `GET .../delivery/bundle` (and the verified `bytes` field
+  of `GET .../delivery`) will open a recorded bundle file (for example `["/srv/orchestra-drop"]`).
+  The service strips any `HOST:` prefix from the contribution's recorded `delivery.path` without
+  comparing host names and resolves only the absolute path below it under a registered
+  `delivery_roots` directory, opening the file with `O_NOFOLLOW` and requiring a regular file. A
+  symlinked `delivery_roots` root directory refuses everything under it (`410`), and any symlinked
+  parent directory or symlinked bundle file below a root is likewise refused (`410`). When a worker
+  drops a bundle on another host (for example `goomba:/srv/orchestra-drop/<lane>/...` read from a
+  `koopa` service), the operator copies or mounts the drop folder at the matching real directory
+  path under a registered `delivery_roots` directory on the serving host; a bundle that is missing,
+  outside every registered root, a directory or FIFO, or under/at a symlink answers `410`
+  (`"The delivered bundle is not available on this service."`).
+- **`delivery_serve_max_bytes` in `deployment.private.json`** (positive integer up to 2 GiB,
+  default `268435456` = 256 MiB): maximum bundle size served over HTTP; a larger bundle answers
+  `413 payload_too_large` before any byte is streamed.
+- **Serve-time verification and audit:** before sending any bytes, the service checks that the
+  file size does not exceed `delivery_serve_max_bytes`, verifies the git bundle header and full
+  file SHA-256 against the contribution's recorded `delivery.sha256`, and runs `git bundle
+  list-heads` (60 s timeout) to verify that the bundle advertises the contribution's recorded
+  40-hex `commit`. Any checksum, header, or `list-heads` mismatch or timeout answers `503`
+  (`"The delivered bundle does not match its recorded checksum."`) with zero bytes sent. Every
+  bundle download and every post-authorization refusal records a `delivery.bundle.read` entry in
+  the HTTP audit log.

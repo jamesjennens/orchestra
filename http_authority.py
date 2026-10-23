@@ -324,12 +324,21 @@ CAP_APPROVE = 'reviews.approve'
 #: member or an agent can propose. Triage and decisions need CAP_APPROVE, which no
 #: credential ever holds.
 CAP_PROPOSALS = 'proposals.write'
+#: Post a message in a project room (kittrial-5bb.385, rooms slice 1). Contributor,
+#: coordinator and owner roles hold it; it is deliberately NOT in SCOPE_CAPABILITIES, so
+#: no agent credential can hold it: agents cannot post in this slice.
+CAP_ROOMS_POST = 'rooms.post'
 #: Propose or revise reference and capability records (.201 slice 5, kittrial-5bb.213).
 #: Contributors, coordinators and owners hold it, and the `tasks` credential scope grants it.
 CAP_RECORDS = 'records'
 #: What a project's coordinator may do beyond approving (slice 1b of docs/WEB_COORDINATOR_DESIGN.md,
 #: kittrial-5bb.209). Web merge-slot acquire/release use it; lifecycle facts follow separately.
 CAP_COORDINATE = 'coordinate'
+#: Recording a release over the web (kittrial-5bb.378): an owner holds it, a
+#: coordinator does not, and an agent holds it only while the project's release
+#: grant names it and its account is still an owner. A release is a decision, not a
+#: coordination step, so ``coordinate`` alone never deploys.
+CAP_RELEASE = 'release'
 CAP_PROJECT_ADMIN = 'project.admin'
 CAP_PROJECT_CREATE = 'project.create'
 CAP_ACCOUNTS_ADMIN = 'accounts.admin'
@@ -369,20 +378,25 @@ CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 ROLE_CAPABILITIES = {
     'viewer': frozenset({CAP_READ}),
     'contributor': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
-                              CAP_FEEDBACK, CAP_PROPOSALS}),
+                              CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST}),
     # Between contributor and owner: approves and coordinates; does not administer the
     # project (members, worker credentials, archive and the audit stay the owner's).
     'coordinator': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
-                              CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE}),
+                              CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_APPROVE,
+                              CAP_COORDINATE}),
     'owner': frozenset({CAP_READ, CAP_TASKS, CAP_RECORDS, CAP_CHECKPOINTS, CAP_REVIEWS,
-                        CAP_FEEDBACK, CAP_PROPOSALS, CAP_APPROVE, CAP_COORDINATE,
-                        CAP_PROJECT_ADMIN}),
+                        CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_APPROVE,
+                        CAP_COORDINATE, CAP_PROJECT_ADMIN, CAP_RELEASE}),
 }
 #: What the coordinator grant adds to an agent's credential in the project of the grant.
 GRANT_CAPABILITIES = frozenset({CAP_APPROVE, CAP_COORDINATE, CAP_RECORDS})
+#: What the release grant adds (kittrial-5bb.378): the one capability, and only while
+#: the agent's account still holds ``project.admin`` there. ``release`` is deliberately
+#: absent from a role's coordinator capabilities and from every credential scope.
+RELEASE_GRANT_CAPABILITIES = frozenset({CAP_RELEASE})
 CREDENTIAL_FORBIDDEN_CAPABILITIES = frozenset({CAP_APPROVE, CAP_PROJECT_ADMIN,
                                                CAP_PROJECT_CREATE, CAP_ACCOUNTS_ADMIN,
-                                               CAP_AGENTS})
+                                               CAP_AGENTS, CAP_RELEASE})
 ALL_CAPABILITIES = frozenset(ROLE_CAPABILITIES['owner'] | {CAP_PROJECT_CREATE,
                                                            CAP_ACCOUNTS_ADMIN,
                                                            CAP_AGENTS})
@@ -567,14 +581,16 @@ def credential_capabilities(state, credential, issuer, project_id):
         caps |= SCOPE_CAPABILITIES.get(scope, frozenset())
     caps -= CREDENTIAL_FORBIDDEN_CAPABILITIES
     if issuer.get('superuser'):
-        return frozenset(caps | coordinator_grant_capabilities(state, credential, project_id, ROLE_CAPABILITIES['owner']))
+        return frozenset(caps | coordinator_grant_capabilities(state, credential, project_id, ROLE_CAPABILITIES['owner'])
+                         | release_grant_capabilities(state, credential, project_id, ROLE_CAPABILITIES['owner']))
     role = state.get('memberships', {}).get(project_id, {}).get(issuer['id'])
     if role is None:
         raise deny(403, 'forbidden',
                    'The credential issuer is no longer a member of this project')
     held = ROLE_CAPABILITIES.get(role, frozenset())
     return frozenset({cap for cap in caps if cap in held}
-                     | coordinator_grant_capabilities(state, credential, project_id, held))
+                     | coordinator_grant_capabilities(state, credential, project_id, held)
+                     | release_grant_capabilities(state, credential, project_id, held))
 
 
 def coordinator_grant(state, project_id, agent_id):
@@ -607,6 +623,40 @@ def coordinator_grant_capabilities(state, credential, project_id, held):
     if not agent_id or coordinator_grant(state, project_id, agent_id) is None:
         return frozenset()
     return frozenset(cap for cap in GRANT_CAPABILITIES if cap in held)
+
+
+def release_grant(state, project_id, agent_id):
+    """The release grant of one agent in one project, or None (kittrial-5bb.378).
+
+    Stored with the PROJECT beside ``coordinator_grants``:
+    ``release_grants[project][agent] = {'granted_by', 'granted_at'}``. Only an owner
+    (or a superuser) writes it, and a record of any other shape is no grant: the check
+    fails closed. It is not a credential scope and never appears on a worker credential.
+    """
+    grants = state.get('release_grants')
+    grant = (grants.get(project_id) or {}).get(agent_id) if isinstance(grants, dict) and \
+        isinstance(grants.get(project_id), dict) else None
+    if not isinstance(grant, dict) or not isinstance(grant.get('granted_by'), str):
+        return None
+    return grant
+
+
+def release_grant_capabilities(state, credential, project_id, held):
+    """What a project's release grant adds to this agent credential here, or nothing.
+
+    The release grant is narrower than the coordinator grant: it adds only
+    :data:`CAP_RELEASE`, only for an agent's credential, and only while the agent's own
+    account still holds ``project.admin`` in this project (owner, or a superuser). A
+    coordinator's account does not carry it, so demoting the owner to coordinator ends
+    the agent's release authority at the next request (the adversarial case in
+    kittrial-5bb.378). Read live by the web service and again by the endpoint.
+    """
+    agent_id = credential.get('agent_id')
+    if not agent_id or release_grant(state, project_id, agent_id) is None:
+        return frozenset()
+    if CAP_PROJECT_ADMIN not in held:
+        return frozenset()
+    return frozenset(RELEASE_GRANT_CAPABILITIES)
 
 
 #: Who may write and accept a project's own requirements on the web (kittrial-5bb.278,
@@ -2308,25 +2358,51 @@ def http_shaped_names(names):
     return [name for name in names or [] if isinstance(name, str) and http_actor_id(name) is not None]
 
 
-def verified_web_authority(request, authority_config, capability, project):
-    """Whether the configured service grants this capability in this exact project.
+def required_capabilities(capability):
+    """The capabilities a binding names, ALL of which must hold, or an empty tuple.
 
-    A descriptor is never authority by itself. Mutations call this inside the
-    guarded effect, under the live authority lock; a PURE read - one with no
-    descriptor, no operation identity and no identity check - no longer takes that
+    Most actions need one capability and the table holds its string. A route that needs
+    two at once - a release deploy needs ``coordinate`` plus the release authority
+    (kittrial-5bb.378 review s1, design section 4) - names a tuple in the table, and every
+    one of them is re-checked here. A malformed value is no capability, never a partial
+    pass: the check fails closed.
+    """
+    if isinstance(capability, str):
+        return (capability,)
+    if isinstance(capability, (tuple, list, frozenset, set)):
+        needed = tuple(capability)
+        if needed and all(isinstance(item, str) for item in needed):
+            return needed
+    return ()
+
+
+def verified_web_authority(request, authority_config, capability, project):
+    """Whether the configured service grants every named capability in this exact project.
+
+    ``capability`` is one capability, or a tuple of them all required (see
+    :func:`required_capabilities`). A descriptor is never authority by itself. Mutations
+    call this inside the guarded effect, under the live authority lock; a PURE read - one
+    with no descriptor, no operation identity and no identity check - no longer takes that
     lock, because it never reads the authority store (kittrial-5bb.281). Any request
     that validates authority, reserves an operation identity or runs an identity
     check still holds it. This helper does not infer a capability from an actor name
     or an SSH payload.
+
+    The descriptor names the one capability the route requested (for a release deploy,
+    the release authority); every additional capability is decided from the SAME live
+    principal, so a release-granted agent without coordination is refused here too.
     """
+    needed = required_capabilities(capability)
     descriptor = request.get('authority')
-    if (authority_config is None or not isinstance(descriptor, dict)
+    if (authority_config is None or not needed or not isinstance(descriptor, dict)
             or request.get('project') != project
             or descriptor.get('project') != project
-            or descriptor.get('capability') != capability):
+            or descriptor.get('capability') not in needed):
         return False
     descriptor = {k: v for k, v in descriptor.items() if k not in ('store', 'lock')}
-    decide(read_state(authority_config.store), descriptor)
+    state = read_state(authority_config.store)
+    for name in needed:
+        decide(state, dict(descriptor, capability=name))
     return True
 
 
@@ -2483,6 +2559,9 @@ def descriptor_actor_denial(request, authority_config, reserved):
 #: are not judged there at all: they carry their own exact check
 #: (``project_creation.SERVICE_ACTIONS``).
 BLOCK_CAPABILITIES = {
+    # The HTTP coordinator read uses exactly this canonical wait form. Other
+    # wait forms have no web authority entry and cannot inherit its wider view.
+    'wait': {'--coordinator': CAP_COORDINATE},
     'bd': {'create': CAP_TASKS,            # tasks.create
            'update': CAP_TASKS,            # tasks.update, tasks.claim
            'comments': CAP_TASKS},         # tasks.comment; raw reserved guards still apply
@@ -2497,6 +2576,10 @@ BLOCK_CAPABILITIES = {
                        'create': CAP_PROJECT_ADMIN},
     'web-lifecycle': {'read': CAP_READ, 'check': CAP_READ,
                       'scope': CAP_COORDINATE, 'fact': CAP_COORDINATE},
+    # The release routes (kittrial-5bb.378): the query is a coordinator read; a deploy
+    # needs the release authority AND coordination (design section 4: coordinate plus the
+    # release authority), so a release-granted agent still needs its coordinator grant.
+    'web-release': {'query': CAP_COORDINATE, 'deploy': (CAP_COORDINATE, CAP_RELEASE)},
     'web-guidance': {'read': CAP_READ, 'ack': CAP_READ, 'onboarding': CAP_READ,
                      'set': CAP_COORDINATE, 'clear': CAP_COORDINATE, 'status': CAP_COORDINATE,
                      'coordinate-check': CAP_COORDINATE, 'onboarding-edit': CAP_COORDINATE},
@@ -2524,12 +2607,13 @@ BLOCK_CAPABILITIES = {
 
 
 def required_capability(request):
-    """The capability the action of ``request`` needs by ``BLOCK_CAPABILITIES``, or None.
+    """The capability (or all capabilities) the action of ``request`` needs, or None.
 
-    None means "not in the table": an action the table does not know, a read, or a request
-    so malformed that the action's own validation refuses it before it writes. The review
-    record is found and parsed exactly as ``work.execute`` does it, so the operation judged
-    here is the operation carried out.
+    A tuple return means every named capability is required; see
+    :func:`required_capabilities`. None means "not in the table": an action the table
+    does not know, a read, or a request so malformed that the action's own validation
+    refuses it before it writes. The review record is found and parsed exactly as
+    ``work.execute`` does it, so the operation judged here is the operation carried out.
     """
     action = request.get('action', 'bd')
     if not isinstance(action, str):
@@ -2540,7 +2624,7 @@ def required_capability(request):
     args = request.get('args')
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
-    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-guidance', 'assignee-followon',
+    if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-release', 'web-guidance', 'assignee-followon',
                   'task-file'):
         if len(args) != 1:
             return None
@@ -2605,9 +2689,13 @@ def block_mismatch_denial(request, authority_config):
     if needed is None:
         return _envelope(126, stderr='The web authority table does not allow this action or operation; '
                                      'nothing was changed\n', authority_status=403)
-    if authority.get('capability') != needed:
+    wanted = required_capabilities(needed)
+    if not wanted:
+        return _envelope(126, stderr='The web authority table names no usable capability for this action or '
+                                     'operation; nothing was changed\n', authority_status=403)
+    if authority.get('capability') not in wanted:
         return _envelope(126, stderr='The live-authority descriptor does not name the capability this request needs '
-                                     '(%s); nothing was changed\n' % needed, authority_status=403)
+                                     '(%s); nothing was changed\n' % ' + '.join(wanted), authority_status=403)
     return None
 
 

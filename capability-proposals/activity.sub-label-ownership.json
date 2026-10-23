@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "operation_id": "kittrial-5bb.371-own-activity",
+  "key": "activity.sub-label-ownership",
+  "name": "Parent and sub-label activity ownership",
+  "aliases": [
+    "own other sub-label activity wait markers"
+  ],
+  "summary": "Parent and sub-label actor writes count as own activity in checkpoint summaries, changes sections and wait markers. Slash boundaries distinguish unrelated prefix actors. Worker wait clients fingerprint the shared producer marker; own status changes still wake once.",
+  "requirements": [],
+  "anchors": [
+    "docs/CLI_CONTRACT.md#wait-block-until-it-is-your-move-then-print-the-next-wait"
+  ],
+  "code": [
+    "briefing.py::same_activity_actor",
+    "briefing.py::wait_activity_marker",
+    "briefing.py::newer_activity_summary",
+    "briefing.py::changes_since_checkpoint",
+    "http_service.py::InProcessBackend._wait_activity_marker"
+  ],
+  "tests": [
+    "tests/test_changes_since_checkpoint.py::SubLabelActivityCase",
+    "tests/test_changes_since_checkpoint.py::TheRoutesAgreeCase.test_sub_label_claim_parent_writes_and_other_comment_on_all_routes",
+    "tests/test_blocking_wait.py::FingerprintTests.test_own_status_change_wakes_once_in_both_wait_implementations"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "activity",
+    "wait",
+    "agents"
+  ]
+}

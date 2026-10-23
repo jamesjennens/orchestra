@@ -175,7 +175,9 @@ released or still held. The server still cannot check the pushed result.
 
 ### What stays a person's step
 
-- the code-host credential and the push itself;
+- the decision to give a coordinator agent a repository-scoped credential and let
+  it push; the credential is the agent's own, never the server's (taken up in
+  slice 3, below);
 - the approval, unless a granted agent holds the project grant
   (`http_authority.py:381-382`);
 - the decision when `unchecked` says `known: false`: whether the tests are
@@ -188,6 +190,15 @@ released or still held. The server still cannot check the pushed result.
 release. If a later decision lets an agent push, give it a repository-scoped
 credential of its own, never the server's, and still record the integration as
 the agent's word (see question 3).
+
+**Taken up in slice 3 (kittrial-5bb.383, 2026-10-23):** the coordinator
+authorized the second sentence above. A coordinator agent may now push with its
+own repository-scoped credential; the server never receives that credential and
+still records the integration as the agent's word. The approval (unless a
+granted agent holds it), the decision when an `unchecked` row says `known:
+false`, a forced release, and every void, revert and reconciliation stay a
+person's step. The recipe is in
+[HTTP_DEPLOYMENT.md](../HTTP_DEPLOYMENT.md#the-web-only-merge-and-push-recipe-an-agent-with-its-own-repository-credential).
 
 ## 4. Release-level lifecycle writes (`.95` and `.107`)
 

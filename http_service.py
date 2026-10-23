@@ -41,9 +41,10 @@ import ssl
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import actor_names
 import agent_prompts
@@ -52,19 +53,21 @@ import claim_limit
 import project_setup
 import project_coordination
 import task_files
+import rooms
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_APPROVE,
-                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
+                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_COORDINATE,
+                       CAP_RELEASE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
                        CAP_RECORDS, CAP_REVIEWS,
-                       CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
+                       CAP_TASKS, MAX_PASSWORD, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, canonical_json, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, session_limit_seconds, unauthenticated,
                        uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
-                       validate_claim_limit)
+                       validate_claim_limit, validate_password_min_length)
 from version import report as version_report
 
 KIT_VERSION = '0.1.0'
@@ -628,11 +631,22 @@ class InProcessBackend:
     #: service's namespace only; no row rule is applied or recorded (kittrial-5bb.188 item 4).
     ACTOR_ROWS = False
 
-    def __init__(self, service, actor_namespace=None):
+    def __init__(self, service, actor_namespace=None, *, delivery_roots=(), delivery_serve_max_bytes=None):
         import actor_names
+        from review_workflow import DELIVERY_SERVE_MAX_BYTES
         self.service = service
         self.actor_namespace = actor_namespace or actor_names.SERVICE_NAMESPACE
         self.faults = {}
+        self.delivery_roots = tuple(delivery_roots or ())
+        self.delivery_serve_max_bytes = (
+            DELIVERY_SERVE_MAX_BYTES if delivery_serve_max_bytes is None else int(delivery_serve_max_bytes)
+        )
+
+    def get_delivery_roots(self):
+        return tuple(self.delivery_roots or ())
+
+    def get_delivery_serve_max_bytes(self):
+        return int(self.delivery_serve_max_bytes)
 
     def fail_next(self, route, times=1):
         """Test hook: commit, then raise :class:`UncertainOutcome` for the next call(s)."""
@@ -836,22 +850,30 @@ class InProcessBackend:
                      integration_commit=(scope or {}).get('integration_commit'), reverted_commits=[]),
             ]
             base = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
+            scope_event = memory.get('scope_event_id') if scope is not None else None
             steps = [dict(step='scope', route='POST ' + base + '/lifecycle/scope',
                           state='committed' if scope is not None else 'not-attempted',
-                          operation_id=None)]
+                          operation_id=(scope_event[4:] if isinstance(scope_event, str)
+                                        and scope_event.startswith('lif_') else None),
+                          fact=scope_event)]
             for dimension in ('reviewed', 'integrated'):
                 passed = facts[dimension]['value'] == 'passed'
+                fact = facts[dimension].get('event_id') if passed else None
                 steps.append(dict(step=dimension,
                                   route='POST ' + base + '/lifecycle/facts/' + dimension,
                                   state='committed' if passed else 'not-attempted',
-                                  operation_id=None))
+                                  operation_id=(fact[4:] if isinstance(fact, str)
+                                                and fact.startswith('lif_') else None),
+                                  fact=fact))
             steps.append(dict(step='integrated-mark',
                               route='POST ' + base + '/lifecycle/facts/integrated',
-                              automatic=True, state='not-attempted', operation_id=None))
+                              automatic=True, state='not-attempted', operation_id=None,
+                              fact=None))
             steps.append(dict(step='slot-release',
                               route='POST /v1/projects/%s/merge-slot/release' % project_id,
-                              state='not-held', operation_id=None,
-                              operation_id_note='The server records no identity for a slot release.'))
+                              state='not-held', operation_id=None, fact=None,
+                              operation_id_note='The server records no identity for a slot release.',
+                              fact_note='A slot release has no native fact; the server records only the operation audit.'))
             return dict(task=dict(id=task.get('id'), title=task.get('title'),
                                   status=task.get('status'), assignee=task.get('assignee')),
                         contribution=contribution, review_state=None,
@@ -898,6 +920,7 @@ class InProcessBackend:
         event_id = 'lif_' + operation_id
         if operation == 'scope':
             memory['scope'] = native['scope']
+            memory['scope_event_id'] = event_id
         else:
             fact = dict(value=native['value'], event_id=event_id, evidence=native['evidence'],
                         provenance=native['provenance'])
@@ -937,14 +960,23 @@ class InProcessBackend:
     def files_limits(self):
         return dict(task_files.LIMIT_DEFAULTS)
 
+    def rooms_limits(self, warnings=None):
+        return dict(rooms.LIMIT_DEFAULTS)
+
     def files_discard(self, project_id, sha256):
         # r3 (review discard-race): under the lock every record is written under (invoke holds it around apply), so a
         # record of the same bytes that is being written is finished, and seen, before the blob may be removed.
         project = self.files_project(project_id)
         if project is None:
             return False
-        with self.service.store.lock:
+        # kittrial-5bb.380 (review of .370 r3): the wait for the lock is bounded; a blob not removed in time stays an
+        # orphan, which `admin.py task-files purge` removes once it is a day old.
+        if not self.service.store.lock.acquire(timeout=DISCARD_LOCK_SECONDS):
+            raise TimeoutError('the store lock was not free within %d s' % DISCARD_LOCK_SECONDS)
+        try:
             return task_files.discard(project, sha256)
+        finally:
+            self.service.store.lock.release()
 
     def _files_write(self, principal, project_id, payload):
         # The same task_files.apply the endpoint action runs, over this backend's own rows:
@@ -1143,8 +1175,19 @@ class InProcessBackend:
                 raise invalid('bundle_sha256 must be a 64-character lowercase hex digest')
             if not isinstance(summary, str) or not summary.strip() or len(summary) > 1200:
                 raise invalid('Contribution summary must be 1-1200 characters')
+            repository = payload.get('repository')
+            repository = repository.strip() if isinstance(repository, str) else ''
+            if isinstance(delivery, dict) and delivery.get('kind') == 'remote':
+                delivery_block = {'kind': 'remote', 'remote': delivery['remote'].strip(), 'branch': branch.strip()}
+            elif isinstance(delivery, dict) and delivery.get('kind') == 'bundle':
+                delivery_block = {'kind': 'bundle', 'path': str(delivery.get('path') or ''), 'sha256': digest}
+            elif branch is not None:
+                delivery_block = {'kind': 'remote', 'remote': '', 'branch': branch}
+            else:
+                delivery_block = {'kind': 'bundle', 'path': '', 'sha256': digest}
             record = {'id': 'con_' + secrets.token_hex(6), 'task_id': task['id'],
                       'kind': 'contribution', 'commit': commit, 'base_commit': base_commit,
+                      'repository': repository, 'delivery': delivery_block,
                       'bundle_sha256': digest, 'branch': branch, 'summary': summary.strip(),
                       'actor': payload.get('actor') or principal.actor,
                       'created_at': now_iso(self.service._now())}
@@ -1456,6 +1499,54 @@ class InProcessBackend:
     def get_task(self, project_id, task_id):
         return dict(self._task(project_id, task_id))
 
+    def task_delivery_record(self, project_id, task_id, contribution_id=None):
+        task = self._task(project_id, task_id)
+        if isinstance(task, dict) and task.get('malformed'):
+            raise unreadable_row(task.get('id') or task_id)
+        if is_record_anchor(task) or is_merge_slot(task):
+            raise not_found('Task not found')
+        records = self.state.get('contributions', {}).get(task['id'], [])
+        contributions = []
+        revision = 0
+        for rec in records:
+            if not isinstance(rec, dict) or rec.get('kind') != 'contribution':
+                continue
+            revision += 1
+            delivery = rec.get('delivery')
+            if not isinstance(delivery, dict):
+                if rec.get('branch') is not None:
+                    delivery = {
+                        'kind': 'remote',
+                        'remote': rec.get('remote') or '',
+                        'branch': rec['branch'],
+                    }
+                else:
+                    delivery = {
+                        'kind': 'bundle',
+                        'path': rec.get('bundle_path') or '',
+                        'sha256': rec.get('bundle_sha256') or '',
+                    }
+            contributions.append({
+                'project': project_id,
+                'task': task['id'],
+                'contribution': rec['id'],
+                'revision': revision,
+                'commit': rec['commit'],
+                'base_commit': rec['base_commit'],
+                'repository': rec.get('repository') or '',
+                'author': rec.get('actor') or '',
+                'at': rec.get('created_at') or '',
+                'delivery': dict(delivery),
+            })
+        if not contributions:
+            raise not_found('Contribution not found')
+        if contribution_id is None:
+            return contributions[-1]
+        for item in contributions:
+            if item['contribution'] == contribution_id:
+                return item
+        raise not_found('Contribution not found')
+
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
                      recent=False, since_checkpoint=False):
         """The task's events, oldest first or (``recent``) newest first. This backend has no
@@ -1678,11 +1769,11 @@ class InProcessBackend:
         digests, but its events name their actor, so the agent's own checkpoint event
         is its own entry and never moves the marker.
         """
-        from briefing import activity_marker, fields_digest
+        from briefing import activity_marker, fields_digest, same_activity_actor
         events = [(index, event) for index, event in enumerate(self.state.get('events') or [])
                   if isinstance(event, dict) and event.get('task') == task['id']]
         others = [(index, event) for index, event in events
-                  if (event.get('actor') or 'unknown') != task.get('assignee')]
+                  if not same_activity_actor(event.get('actor'),task.get('assignee'))]
         newest = max(others, key=lambda pair: (pair[1].get('time') or '', pair[0])) if others else None
         entry = None
         if newest is not None:
@@ -1691,6 +1782,7 @@ class InProcessBackend:
         return activity_marker(entry, fields_digest(task))
 
     def _other_agent_activity(self, task, checkpoint):
+        from briefing import same_activity_actor
         events=[e for e in self.state.get('events') or [] if e.get('task')==task['id']]
         # Real writes have an ordered checkpoint event. Do not count that event
         # itself, even when an owner wrote the checkpoint for the assignee.
@@ -1698,11 +1790,11 @@ class InProcessBackend:
                  and e.get('actor')==checkpoint.get('actor')
                  and e.get('time','')>=checkpoint.get('created_at','')]
         if anchors:
-            return any(e.get('actor')!=task.get('assignee') for e in events[anchors[-1]+1:])
+            return any(not same_activity_actor(e.get('actor'),task.get('assignee')) for e in events[anchors[-1]+1:])
         # Older or directly imported in-process checkpoints have no event anchor.
         # Only attributed review records can establish external activity there.
         at=checkpoint.get('created_at')
-        return bool(at and any(r.get('created_at','')>at and r.get('actor')!=task.get('assignee')
+        return bool(at and any(r.get('created_at','')>at and not same_activity_actor(r.get('actor'),task.get('assignee'))
                                for r in self.state.get('contributions',{}).get(task['id'],[])))
 
     def _agent_activity_summary(self, task, checkpoint):
@@ -1712,7 +1804,7 @@ class InProcessBackend:
         no per-entry checkpoint digests, so imported/evicted history stays unknown.
         Reading this projection never incorporates or acknowledges an event.
         """
-        from briefing import NEWER_MAX, clip
+        from briefing import NEWER_MAX, clip, same_activity_actor
         events = [e for e in self.state.get('events') or [] if e.get('task') == task['id']]
         anchors = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
                    and e.get('actor') == checkpoint.get('actor')
@@ -1722,7 +1814,7 @@ class InProcessBackend:
                     'entries': [], 'omitted': None,
                     'note': 'Checkpoint event history is unavailable; read task history.'}
         remaining = events[anchors[-1] + 1:]
-        others = [e for e in remaining if e.get('actor') != task.get('assignee')]
+        others = [e for e in remaining if not same_activity_actor(e.get('actor'),task.get('assignee'))]
         authors = sorted({e.get('actor') for e in others if e.get('actor')})
         return {'coverage': 'unknown', 'own_count': len(remaining) - len(others),
                 'other_count': len(others),
@@ -1749,6 +1841,26 @@ class InProcessBackend:
                 for task in self._project_rows(project_id)]
         return lanes_read(rows, actor, {'schema_version': 1, 'records': {}}, list(args),
                           journal=None, scope=scope)
+
+    def coordinator_wait(self, project_id, principal, idle_minutes):
+        """The disposable model's queue and board at one locked state."""
+        import waiting
+        from lanes import LANES_LIMIT_MAX
+        from work import move_decision
+        with self.service.store.lock:
+            actor = self.service.bind_actor(principal, None)
+            rows = []
+            for item in self.review_queue(project_id)['items']:
+                row = waiting.normalize_item(dict(item, task=item['id']))
+                row['whose_move'], _text, row['next_actor'] = move_decision(
+                    row['review_state'], row['task'], claim_limit.actor_holds(row['owner'], actor),
+                    pending_items=row['pending_review_items'], redelivered=bool(row['redelivered']),
+                    assignee=row['owner'], closed=row['status'] == 'closed', claimable=item['claimable'])
+                rows.append(row)
+            return waiting.coordinator_view(
+                rows,
+                self.lanes_read(project_id, ['--idle-minutes', str(idle_minutes),
+                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'))
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -2052,6 +2164,9 @@ class EndpointBackend:
     ROUTES = InProcessBackend.ROUTES + (
         'tasks.assign', 'tasks.release', 'merge-slot.acquire',
         'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create',
+        # The release routes (kittrial-5bb.378): one canonical release-query or one
+        # release-deploy group per request. The endpoint holds the host tracker.
+        'release.query', 'release.deploy',
         # The coordinator's recorded hand-back (kittrial-5bb.343). Both operations run
         # the one canonical `assignee-followon` action, which calls the same library
         # function as `coordinator followon`.
@@ -2135,15 +2250,32 @@ class EndpointBackend:
     def files_limits(self, warnings=None):
         return task_files.limits(Path(self.root), warnings=warnings)
 
+    def rooms_limits(self, warnings=None):
+        return rooms.limits(Path(self.root), warnings=warnings)
+
     def files_discard(self, project_id, sha256):
         # r3 (review discard-race): the endpoint's task-file action reads the blob, writes the comment and the journal
         # entry while it holds the project's .coordination.lock EXCLUSIVELY; this takes the same lock, so another
         # upload's record of the same bytes is either finished (and its entry keeps the blob) or not yet begun (and it
         # then finds the blob gone and answers "upload it again"). Never a record whose bytes vanished under it.
+        # kittrial-5bb.380 (review of .370 r3): the wait is bounded (DISCARD_LOCK_SECONDS); a blob not removed in time
+        # stays an orphan, which `admin.py task-files purge` removes once it is a day old.
         import fcntl
         project = self.files_project(project_id)
         with (project / '.coordination.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            ends = time.monotonic() + DISCARD_LOCK_SECONDS
+            locked = False
+            for _ in range(int(DISCARD_LOCK_SECONDS / 0.05) + 2):   # a bounded number of tries, never an open loop
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= ends:
+                        break
+                    time.sleep(0.05)
+            if not locked:
+                raise TimeoutError('the project lock was not free within %d s' % DISCARD_LOCK_SECONDS)
             return task_files.discard(project, sha256)
 
     def assignment_roster(self, principal, project_id, offset=0, limit=200):
@@ -2389,6 +2521,18 @@ class EndpointBackend:
             if text.startswith('ValueError: '):
                 text = text[len('ValueError: '):]
             error = HttpError(status, FILE_CODES.get(status, 'invalid'), text)
+            error.nothing_done = True
+            raise error
+        if action == 'web-release' and isinstance(reply, dict) and (
+                reply.get('release_status') or reply.get('records_status')):
+            # The release routes (kittrial-5bb.378): a live-authority refusal, a hold, a
+            # stale target or a release-writer refusal keeps its own status instead of
+            # collapsing into 422. Both keys are read: an identity check reports the
+            # shared ledger key, the route's own errors report release_status.
+            status = reply.get('release_status') or reply.get('records_status')
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid', 503: 'unavailable'}.get(status, 'unavailable'),
+                              (reply.get('stderr') or 'Release facts cannot be recorded').strip())
             error.nothing_done = True
             raise error
         if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
@@ -2844,6 +2988,20 @@ class EndpointBackend:
             # A task file's record or withdrawal (kittrial-5bb.370). The bytes are stored and
             # checked already; the action reads the row live and writes under the project lock.
             return 'task-file', project_id, [json.dumps(file_body(payload), ensure_ascii=False)], {}
+        if route.startswith('release.'):
+            # The release routes (kittrial-5bb.378): one body carrying the unchanged
+            # host field set; the endpoint supplies the actor and the operation id from
+            # the request envelope, exactly as the lifecycle routes do.
+            import web_release
+            operation = route.split('.', 1)[1]
+            body = {'operation': operation}
+            if operation == 'query':
+                body['scope'] = payload['scope']
+            else:
+                for key in web_release.DEPLOY_FIELDS | web_release.DEPLOY_OPTIONAL:
+                    if key in payload:
+                        body[key] = payload[key]
+            return 'web-release', project_id, [json.dumps(body, ensure_ascii=False)], {}
         if route.startswith('followons.'):
             # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
             # `assignee-followon` action derives every record fact under the project
@@ -3087,6 +3245,18 @@ class EndpointBackend:
             raise uncertain('The canonical lanes read returned an unexpected shape')
         return payload
 
+    def coordinator_wait(self, project_id, principal, idle_minutes):
+        """One canonical wait read: queue and lanes share the endpoint's export."""
+        reply = self._endpoint('wait', project_id, self.service.bind_actor(principal, None),
+                               ['--coordinator', '--idle-minutes', str(idle_minutes)],
+                               authority=authority_request(principal, project_id, CAP_COORDINATE,
+                                                           now=self.service._expiry_now()),
+                               extra={'lanes_scope': 'all'})
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict) or payload.get('form') != 'coordinator':
+            raise uncertain('The canonical coordinator wait returned an unexpected shape')
+        return payload
+
     def requirements_read(self, project_id, args):
         reply=self._endpoint('requirements',project_id,self.actor_namespace+'/read',args)
         if isinstance(reply,dict) and reply.get('returncode')==2 and 'Requirement was not found' in (reply.get('stderr') or ''):
@@ -3254,6 +3424,62 @@ class EndpointBackend:
         if isinstance(row, dict) and row.get('project_id') not in (None, project_id):
             raise not_found('Task not found')
         return self._with_record_comments(project_id, [row])[0]
+
+    def _read_deployment_setting(self, fn):
+        from admin import ConfigurationUnreadable
+        try:
+            return fn(Path(self.root))
+        except ConfigurationUnreadable as exc:
+            print(
+                'configuration: the service could not read the deployment configuration: %s'
+                % ascii(str(exc)[:600]),
+                file=sys.stderr,
+                flush=True,
+            )
+            refused = HttpError(503, 'server_configuration', self.CONFIGURATION_UNREADABLE)
+            refused.nothing_done = True
+            raise refused from None
+
+    def get_delivery_roots(self):
+        from admin import delivery_roots
+        return self._read_deployment_setting(delivery_roots)
+
+    def get_delivery_serve_max_bytes(self):
+        from admin import delivery_serve_max_bytes
+        return self._read_deployment_setting(delivery_serve_max_bytes)
+
+    def task_delivery_record(self, project_id, task_id, contribution_id=None):
+        reply = self._endpoint(
+            'delivery-record',
+            project_id,
+            self.actor_namespace + '/read',
+            [str(task_id)],
+        )
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
+        if code == 2 and 'Unknown action' in stderr:
+            raise not_implemented(
+                'The canonical endpoint is older than this HTTP service and has no delivery '
+                'record read; install the same kit for both'
+            )
+        payload = self._checked(reply, 'delivery-record', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical delivery record read returned an unexpected shape')
+        if not payload.get('found'):
+            raise not_found('Task not found')
+        if payload.get('malformed'):
+            raise unreadable_row(payload.get('id') or task_id)
+        if payload.get('project') not in (None, project_id) or payload.get('task') not in (None, task_id):
+            raise not_found('Task not found')
+        contributions = [c for c in (payload.get('contributions') or []) if isinstance(c, dict)]
+        if not contributions:
+            raise not_found('Contribution not found')
+        if contribution_id is None:
+            return contributions[-1]
+        for item in contributions:
+            if item.get('contribution') == contribution_id:
+                return item
+        raise not_found('Contribution not found')
 
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
                      recent=False, since_checkpoint=False):
@@ -4488,6 +4714,19 @@ def route(method, pattern, *, anonymous=False, csrf=True, stream=False):
     return register
 
 
+@contextmanager
+def project_room_lock(project):
+    """Hold a project's ``.coordination.lock`` exclusively for one rooms operation.
+
+    The cross-platform lock is ``http_authority.file_lock``: it uses ``fcntl`` on Linux
+    and ``msvcrt`` on Windows, so importing http_service and serving rooms both work on
+    Windows (review b2). ``fcntl`` is never imported here at import time.
+    """
+    from http_authority import file_lock
+    with file_lock(Path(project) / '.coordination.lock'):
+        yield
+
+
 #: Said when the service is moving as many files as it allows (kittrial-5bb.370, design 4).
 TRANSFERS_BUSY = ('The server is moving as many files as it allows at once (%s); send this again in a moment.')
 
@@ -4539,6 +4778,12 @@ class TransferGate:
 
 #: One gate for handlers made without :func:`build_handler` (a test's own subclass).
 DEFAULT_TRANSFERS = TransferGate()
+#: kittrial-5bb.380: the lingering closes of answered uploads now running in this process, and the counts
+#: of those done and of those closed at once because LINGER_MAX were running.
+LINGERING = {'now': 0, 'lingered': 0, 'hard': 0}
+#: kittrial-5bb.380 (review of .370 r3): how long a refused upload's discard waits for the project's lock.
+DISCARD_LOCK_SECONDS = 10
+LINGERING_LOCK = threading.Lock()
 FILES_UNAVAILABLE = 'Task files are not available on this server.'
 FILE_CODES = {400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict', 411: 'length_required',
               413: 'payload_too_large', 422: 'invalid', 501: 'not_implemented', 503: 'unavailable',
@@ -4745,6 +4990,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # body was read, or a body that was not what its Content-Length said, must never
                 # leave bytes behind that the next request on this connection would be read from.
                 self._say_close = True
+                self._body_unread = True              # until the route has read it (kittrial-5bb.380)
             payload, auth_source = self._read_request(method, anonymous, params, csrf,
                                                       request_id, stream=stream)
             # The semantic route target is the method plus the concrete path (with the
@@ -4787,6 +5033,60 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(500, {'error': {'code': 'internal_error',
                                             'message': 'Internal error'},
                                   'request_id': request_id})
+        finally:
+            if getattr(self, '_body_unread', False):
+                self._body_unread = False
+                self._linger()
+
+    #: kittrial-5bb.380: how long, and how much, an answered upload's unread body is still read and dropped, and
+    #: how many such closes may run at once in the service; beyond that the connection is closed at once.
+    LINGER_SECONDS = 5
+    LINGER_BYTES = 64 * 1024 * 1024
+    LINGER_MAX = 8
+
+    def _linger(self):
+        # The answer to an upload refused before its body was read (401, 403, 413, 503...) is sent, and the
+        # connection is then closed with that body still arriving. Closed at once, the unread bytes make the
+        # system answer with a reset, which can destroy the answer before the client has read it, so the client
+        # sees a cut connection instead of the refusal. As a web server's lingering close does, the write side
+        # is shut and what still arrives is read and dropped, for a short, bounded time.
+        # It runs after the route has returned: no transfer slot and no lock is held here. Bounded per connection
+        # (LINGER_SECONDS, LINGER_BYTES) and in total (LINGER_MAX at once): many refused uploads at once cannot tie
+        # up the service's threads; beyond the cap the connection is closed at once (LINGERING counts both).
+        self.close_connection = True
+        try:
+            self.wfile.flush()
+        except (OSError, ValueError):
+            return
+        with LINGERING_LOCK:
+            if LINGERING['now'] >= self.LINGER_MAX:
+                LINGERING['hard'] += 1
+                return
+            LINGERING['now'] += 1
+            LINGERING['lingered'] += 1
+        try:
+            connection = self.connection
+            try:
+                connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                return
+            ends = time.monotonic() + self.LINGER_SECONDS
+            taken = 0
+            try:
+                while taken < self.LINGER_BYTES:
+                    left = ends - time.monotonic()
+                    if left <= 0:
+                        break
+                    connection.settimeout(left)
+                    piece = connection.recv(65536)
+                    if not piece:
+                        break
+                    taken += len(piece)
+            except OSError:
+                pass
+        finally:
+            with LINGERING_LOCK:
+                LINGERING['now'] -= 1
 
     def _admit(self, method):
         """Behind a trusted proxy, one forwarded address has a share of the requests being served.
@@ -5126,7 +5426,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 audit_success=True, state_saved=None, audit_metadata=None, replay_check=None):
         """Run one authorized, idempotent mutation.
 
-        ``capability`` names the authority the route needs. The idempotency key is
+        ``capability`` names the authority the route needs: one capability, or a tuple
+        of them all required (kittrial-5bb.378 review s1: a release deploy needs
+        ``coordinate`` plus the release authority). The idempotency key is
         *reserved atomically* (:meth:`Service.idempotency_reserve`) before the effect,
         so two concurrent identical requests cannot both create the effect: the
         second either replays a committed result or receives a 409. ``serialize=True``
@@ -5138,8 +5440,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         (for example the target's identity) added to the route's audit events; it must
         never carry a secret or request body.
         """
-        ctx.authorize = (lambda: self.service.check_authority(
-            ctx.principal, project_id, capability, allow_self_user=allow_self_user))
+        if isinstance(capability, str):
+            ctx.authorize = (lambda: self.service.check_authority(
+                ctx.principal, project_id, capability, allow_self_user=allow_self_user))
+        else:
+            # Every named capability is re-checked inside the same in-lock boundary, so a
+            # two-capability route cannot pass on one of them being revoked in between.
+            needed = tuple(capability)
+
+            def authorize():
+                decision = None
+                for name in needed:
+                    decision = self.service.check_authority(
+                        ctx.principal, project_id, name, allow_self_user=allow_self_user)
+                return decision
+            ctx.authorize = authorize
         idem_route = '%s %s' % (route_name, ctx.route_target)
         key = ctx.idempotency_key if idempotent else None
         digest = None
@@ -5170,8 +5485,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 public, stored = fn()
         except UncertainOutcome:
             self.service.idempotency_unknown(digest)
-            self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
-                               project_id=project_id, reason=reason or 'uncertain')
+            event = self.service.audit(ctx.request_id, ctx.principal, route_name, 'unknown',
+                                       project_id=project_id, reason=reason or 'uncertain')
+            # The lifecycle write records the step's task, dimension and deterministic
+            # operation identity on an uncertain answer too, so the integration-check
+            # ledger can say which step to resume with the same identity
+            # (kittrial-5bb.383). Other routes carry no such metadata.
+            if audit_metadata:
+                event.update(audit_metadata)
             self.service.store.save()
             raise uncertain(self.UNCERTAIN if ctx.idempotency_key is not None else self.UNCERTAIN_NO_KEY)
         except HttpError as error:
@@ -5445,6 +5766,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 self._continue()                        # r2 (s4c): only now may the client send the body
                 sha256, size, created = task_files.receive(self._files_reader(length, limit), length, project, expected)
+                self._body_unread = False
             finally:
                 gate.give(key, ctx.params['pid'])
         except (HttpError, task_files.Refusal) as error:
@@ -5467,7 +5789,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             # names. Only for a definite refusal: a 5xx that does not say nothing was done may follow a written
             # record (a retry settles it), so its blob stays.
             if created and (refused.status < 500 or getattr(refused, 'nothing_done', False)):
-                self.backend.files_discard(ctx.params['pid'], sha256)
+                # kittrial-5bb.380 (review of .370 r3): the refusal is the answer. A discard that fails (the lock not
+                # free in time, a disk error) is said in the service's log and keeps the blob as an orphan, which
+                # `admin.py task-files purge` removes once it is a day old; it never replaces the refusal.
+                try:
+                    self.backend.files_discard(ctx.params['pid'], sha256)
+                except Exception as failed:
+                    print('task files: the upload %s of request %s was refused and its stored bytes were kept (task-files '
+                          'purge removes them after a day): %s' % (sha256, ctx.request_id,
+                                                                   ascii(str(failed)[:200]) or type(failed).__name__),
+                          file=sys.stderr, flush=True)
             raise
         if isinstance(result, dict):
             result = dict(result)
@@ -6052,6 +6383,199 @@ class ApiHandler(BaseHTTPRequestHandler):
         return bool(read.get('complete'))
 
     # -- session and account routes -------------------------------------------
+    # -- project rooms (kittrial-5bb.385, docs/PROJECT_ROOMS_DESIGN.md section 10) ---------------
+    #: Said when the backend has no host project folder to keep rooms beside.
+    ROOMS_UNAVAILABLE = 'Rooms are not available on this server.'
+
+    def _rooms_project(self, ctx):
+        place = getattr(self.backend, 'files_project', None)
+        project = place(ctx.params['pid']) if place is not None else None
+        if project is None:
+            raise not_implemented(self.ROOMS_UNAVAILABLE)
+        return project
+
+    def _rooms_limits(self):
+        read = getattr(self.backend, 'rooms_limits', None)
+        if read is None:
+            return dict(rooms.LIMIT_DEFAULTS)
+        warnings = []
+        try:
+            values = read(warnings=warnings)
+        except TypeError:
+            values = read()
+        for line in warnings:
+            print('rooms: ' + ascii(line[:300]), file=sys.stderr, flush=True)
+        return values
+
+    def _rooms_lock(self, project):
+        # Imported here, not at module top: http_service must import on Windows (the kit's
+        # tests import it there), and the project lock is a Linux runtime path, as in
+        # admin.py and the task-file routes (kittrial-5bb.352's CI lesson).
+        return project_room_lock(project)
+
+    def _rooms_actor(self, ctx, role):
+        user = self.service.state['users'].get(ctx.principal.user_id) or {}
+        name = user.get('display_name') or user.get('username') or ctx.principal.user_id
+        return {'id': ctx.principal.user_id, 'name': str(name)[:200], 'role': role}
+
+    def _rooms_refusal(self, error):
+        return HttpError(error.status, error.code, str(error))
+
+    def _rooms_read_allowed(self, ctx):
+        """Refuse a room read from an agent credential (review s3, design R1).
+
+        Room text must not reach task-capable credentials. This slice already refuses a
+        credential write; the read routes (list, read and export) need the same refusal,
+        or a worker credential granted CAP_READ can read every room.
+        """
+        if ctx.principal.via == 'credential':
+            raise forbidden('Rooms are for people in this slice: an agent credential cannot read a room.')
+        return self._project(ctx, CAP_READ)
+
+    def _rooms_write(self, ctx, action, capability, fn, *, status=200, reason=None,
+                     stored=None):
+        # Rooms are for people in this slice: the new rooms.post capability is on no
+        # credential scope, and a coordinator grant must not become a room-write grant.
+        if ctx.principal.via == 'credential':
+            raise forbidden('Rooms are for people in this slice: an agent credential cannot write to a room.')
+        record, _role = self._project(ctx, CAP_READ)
+        if isinstance(record, dict) and record.get('archived'):
+            raise conflict('The project is archived: its rooms can be read and exported, and no room is written.')
+        def write():
+            project = self._rooms_project(ctx)
+            try:
+                with self._rooms_lock(project):
+                    result = fn(project)
+            except rooms.Refusal as refusal:
+                raise self._rooms_refusal(refusal) from None
+            # Review b1: a post's stored answer must not keep the message text for 24 h.
+            # The route can replace what is kept for a retry with a metadata-only view;
+            # the caller still receives the full result now.
+            return result, (stored(result) if stored is not None else result)
+        return self._mutate(ctx, action, ctx.params['pid'], write, capability=capability,
+                            serialize=False, status=status, reason=reason)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms')
+    def rooms_list(self, ctx):
+        project = self._rooms_project(ctx)
+        record, role = self._rooms_read_allowed(ctx)
+        pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(pairs) - {'archived'} or any(len(values) != 1 for values in pairs.values()):
+            raise invalid('Use only one archived flag')
+        archived = pairs.get('archived', ['0'])[0] in ('1', 'true', 'yes')
+        try:
+            with self._rooms_lock(project):
+                items = rooms.list_rooms(project, include_archived=archived)
+        except rooms.Refusal as refusal:
+            raise self._rooms_refusal(refusal) from None
+        capabilities = self.service.capabilities_for(ctx.principal, ctx.params['pid'])
+        return 200, {'items': items, 'total': len(items),
+                     'can_post': CAP_ROOMS_POST in capabilities,
+                     'can_coordinate': CAP_COORDINATE in capabilities}
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms')
+    def rooms_create(self, ctx):
+        self._rooms_project(ctx)
+        _record, role = self._project(ctx, CAP_COORDINATE)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'name'}:
+            raise invalid('Send exactly: name')
+        limits_values = self._rooms_limits()
+        actor = self._rooms_actor(ctx, role)
+        def write(project):
+            return rooms.create(project, payload['name'], actor, limits_values)
+        return self._rooms_write(ctx, 'rooms.create', CAP_COORDINATE, write, status=201,
+                                 reason='room create')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')')
+    def rooms_read(self, ctx):
+        project = self._rooms_project(ctx)
+        self._rooms_read_allowed(ctx)
+        pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(pairs) - {'since', 'limit'} or any(len(values) != 1 for values in pairs.values()):
+            raise invalid('Use only one since and limit')
+        try:
+            since = int(pairs.get('since', ['0'])[0])
+            limit = int(pairs.get('limit', ['100'])[0])
+        except (ValueError, TypeError):
+            raise invalid('Use an integer since and limit') from None
+        try:
+            with self._rooms_lock(project):
+                return 200, rooms.read_messages(project, ctx.params['rid'], since, limit)
+        except rooms.Refusal as refusal:
+            raise self._rooms_refusal(refusal) from None
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/messages')
+    def rooms_post(self, ctx):
+        self._rooms_project(ctx)
+        _record, role = self._project(ctx, CAP_ROOMS_POST)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'text'}:
+            raise invalid('Send exactly: text')
+        limits_values = self._rooms_limits()
+        actor = self._rooms_actor(ctx, role)
+        operation_id = ctx.idempotency_key or ctx.request_id
+        def write(project):
+            return rooms.post(project, ctx.params['rid'], payload['text'], operation_id,
+                              actor, limits_values)
+        # Review b1: keep only the message identity for a retry, never its text. After the
+        # message is moderated a replay must not answer with the original text from the
+        # server's 24-hour idempotency record (or carry it in the state file and backups).
+        def stored(result):
+            return {key: result.get(key) for key in ('sequence', 'kind', 'created_at')}
+        return self._rooms_write(ctx, 'rooms.post', CAP_ROOMS_POST, write, status=201,
+                                 reason='room %s' % ctx.params['rid'], stored=stored)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/archive')
+    def rooms_archive(self, ctx):
+        self._rooms_project(ctx)
+        _record, role = self._project(ctx, CAP_COORDINATE)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) - {'reason'}:
+            raise invalid('A room archive takes only an optional reason')
+        actor = self._rooms_actor(ctx, role)
+        operation_id = ctx.idempotency_key or ctx.request_id
+        def write(project):
+            return rooms.archive(project, ctx.params['rid'], actor, operation_id,
+                                 payload.get('reason'))
+        return self._rooms_write(ctx, 'rooms.archive', CAP_COORDINATE, write,
+                                 reason='room %s' % ctx.params['rid'])
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/messages/(?P<seq>[0-9]{1,12})/moderate')
+    def rooms_moderate(self, ctx):
+        self._rooms_project(ctx)
+        _record, role = self._project(ctx, CAP_COORDINATE)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'reason'}:
+            raise invalid('Send exactly: reason')
+        actor = self._rooms_actor(ctx, role)
+        operation_id = ctx.idempotency_key or ctx.request_id
+        sequence = int(ctx.params['seq'])
+        def write(project):
+            return rooms.moderate(project, ctx.params['rid'], sequence, payload['reason'],
+                                  operation_id, actor, self._rooms_limits())
+        return self._rooms_write(ctx, 'rooms.moderate', CAP_COORDINATE, write, status=201,
+                                 reason='room %s message %d' % (ctx.params['rid'], sequence))
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/export')
+    def rooms_export(self, ctx):
+        project = self._rooms_project(ctx)
+        self._rooms_read_allowed(ctx)
+        pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(pairs) - {'format'} or any(len(values) != 1 for values in pairs.values()):
+            raise invalid('Use only one format')
+        wanted = pairs.get('format', ['markdown'])[0]
+        if wanted not in ('markdown', 'jsonl'):
+            raise invalid('format must be markdown or jsonl')
+        try:
+            with self._rooms_lock(project):
+                text = (rooms.export_markdown(project, ctx.params['rid']) if wanted == 'markdown'
+                        else rooms.export_jsonl(project, ctx.params['rid']))
+                room = rooms.read_room(project, ctx.params['rid'])
+        except rooms.Refusal as refusal:
+            raise self._rooms_refusal(refusal) from None
+        return 200, {'room': rooms._room_view(room), 'format': wanted, 'text': text}
+
     @route('POST', r'/v1/sessions', anonymous=True, csrf=False)
     def sessions_create(self, ctx):
         payload = ctx.payload or {}
@@ -6064,7 +6588,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                  'csrf_token': result['csrf_token'],
                                  'expires_at': result['expires_at'],
                                  'idle_expires_at': result['idle_expires_at']},
-                     'user': result['user']}
+                     'user': dict(result['user'],
+                                  password_min_length=self.service.password_min_length)}
 
     @route('GET', r'/v1/sessions/current')
     def sessions_whoami(self, ctx):
@@ -6072,7 +6597,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = {'user': {'id': principal.user_id,
                          'username': self.service.username_of(principal.user_id),
                          'display_name': principal.display_name,
-                         'superuser': principal.superuser},
+                         'superuser': principal.superuser,
+                         # Additive (kittrial-5bb.363): the page states the server's real
+                         # password rule, and asks twice wherever a password is set.
+                         'password_min_length': self.service.password_min_length},
                 'via': principal.via,
                 'credential': principal.credential_id,
                 'project': principal.credential_project,
@@ -6778,8 +7306,58 @@ class ApiHandler(BaseHTTPRequestHandler):
                     and hasattr(self.backend, 'lifecycle_replay_guard')):
                 self.backend.lifecycle_replay_guard(ctx.principal, ctx.params['pid'],
                     ctx.params['tid'], ctx.params['dimension'])
+        # The deterministic operation identity the backend will use, recorded on an
+        # uncertain (124 at the endpoint / 503 here) answer so the ledger can name the
+        # step and the identity to retry (kittrial-5bb.383).
+        ledger_audit = None
+        if ctx.idempotency_key is not None and hasattr(self.backend, '_result_key'):
+            ledger_audit = dict(task=ctx.params['tid'],
+                                dimension=('lifecycle-scope' if operation == 'scope'
+                                           else ctx.params['dimension']),
+                                operation_id=self.backend._result_key(
+                                    ctx.principal, ctx.params['pid'], route_name,
+                                    ctx.idempotency_key, ctx.route_target))
         return self._mutate(ctx, route_name, ctx.params['pid'], write, capability=CAP_COORDINATE,
-                            status=201, serialize=False, canonical=True, audit_success=False, replay_check=replay_check)
+                            status=201, serialize=False, canonical=True, audit_success=False,
+                            replay_check=replay_check, audit_metadata=ledger_audit)
+
+    #: Lifecycle audit actions whose last HTTP response the step ledger reports.
+    LEDGER_ACTIONS = ('lifecycle.scope', 'lifecycle.fact')
+
+    def _ledger_uncertain(self, project_id, task_id, steps):
+        """Mark a not-yet-committed step whose last HTTP answer was uncertain.
+
+        The canonical native rows stay authoritative: a step with a native fact keeps
+        its `committed` state and fact id (and reports the last response beside it).
+        A step with no native write but a lifecycle audit `unknown` outcome reads
+        `unknown`, carrying the deterministic operation identity the backend used, so
+        a coordinator retries that identity instead of minting a new one
+        (kittrial-5bb.383). Audit rows without the task/dimension metadata added for
+        this ledger are skipped: they cannot be attributed to a step.
+        """
+        latest = {}
+        for event in self.service.state['audit']:
+            if (event.get('project_id') != project_id
+                    or event.get('action') not in self.LEDGER_ACTIONS
+                    or event.get('task') != task_id
+                    or not isinstance(event.get('operation_id'), str)):
+                continue
+            if event.get('action') == 'lifecycle.scope':
+                step = 'scope'
+            else:
+                step = event.get('dimension')
+                if step not in ('reviewed', 'integrated'):
+                    continue
+            latest[step] = event
+        for row in steps:
+            event = latest.get(row.get('step'))
+            if event is None:
+                continue
+            row['response_state'] = event.get('outcome')
+            if row.get('state') != 'committed' and event.get('outcome') == 'unknown':
+                row['state'] = 'unknown'
+                row['operation_id'] = event['operation_id']
+        return steps
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/integration-check')
     def integration_check_get(self, ctx):
@@ -6791,6 +7369,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         target = ctx.query.get('target')
         result = self.backend.integration_check(ctx.principal, ctx.params['pid'],
                                                 ctx.params['tid'], target)
+        result['next'] = self._ledger_uncertain(ctx.params['pid'], ctx.params['tid'],
+                                                result.get('next') or [])
         result['current_actor'] = self.service.bind_actor(ctx.principal, None)
         return 200, result
 
@@ -6801,6 +7381,89 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle/facts/(?P<dimension>[a-z-]+)')
     def lifecycle_fact(self, ctx):
         return self._lifecycle_write(ctx, 'fact')
+
+    # -- release query and one release group (kittrial-5bb.378) --------------------
+    #
+    # Slice 2 of docs/design/WEB_COORDINATOR_INTEGRATION.md, section 4. The server never
+    # chooses release membership (it has no checkout): the caller resolves targets with
+    # git and sends ONE group, at most 200 targets; the endpoint re-verifies every named
+    # target against its own export and skips a target that is not integrated there. The
+    # query is the read-only pre-flight: the host-issued reverted set and the recorded
+    # live releases for one environment, writing nothing.
+    def _release_backend(self, route):
+        if not hasattr(self.backend, 'ROUTES') or route not in self.backend.ROUTES:
+            raise not_implemented('Release facts are unavailable on this server')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/releases/query')
+    def release_query(self, ctx):
+        import web_release
+        # A coordinator read: the query writes nothing and discloses only the reverted
+        # set and the environment's live releases this project already knows.
+        self._project(ctx, CAP_COORDINATE)
+        try:
+            _, fields = web_release.fields(dict(ctx.payload or {}, operation='query'))
+        except web_release.ReleaseError as error:
+            raise invalid(str(error)) from None
+        self._release_backend('release.query')
+        result = self.backend.invoke('release.query', ctx.principal, ctx.params['pid'], fields,
+                                     None, target=ctx.route_target, capability=CAP_COORDINATE)
+        return 200, result
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/releases')
+    def release_deploy(self, ctx):
+        import web_release
+        # The project's release authority AND coordination, checked live (design section
+        # 4): an owner or superuser holds both. An agent reaches it only with the project's
+        # release grant AND its coordinator grant, because a release is a decision plus a
+        # coordination step. A coordinator alone, or a release grant alone, is refused
+        # before the body is even read. An archived project records nothing new.
+        project, _role = self._project(ctx, CAP_COORDINATE)
+        self._project(ctx, CAP_RELEASE)
+        if isinstance(project, dict) and project.get('archived'):
+            raise conflict('This project is archived; release facts cannot be recorded')
+        try:
+            _, fields = web_release.fields(dict(ctx.payload or {}, operation='deploy'))
+        except web_release.ReleaseError as error:
+            raise invalid(str(error)) from None
+        self._release_backend('release.deploy')
+        metadata = {}
+
+        def write():
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request '
+                              'after an uncertain outcome')
+            result = self.backend.invoke('release.deploy', ctx.principal, ctx.params['pid'], fields,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_RELEASE)
+            metadata.update({key: result.get(key) for key in
+                             ('operation_id', 'release_id', 'environment', 'groups_completed',
+                              'groups_total')})
+            # The audit is a shared capped list: keep counts and only the first few ids of
+            # the up-to-200 skipped/flags rows. The answer itself still carries every row.
+            skipped = result.get('skipped') or []
+            flags = result.get('flags') or []
+            metadata.update(skipped_count=len(skipped),
+                            skipped_first=[row.get('task') for row in skipped[:5]],
+                            flags_count=len(flags),
+                            flags_first=[row.get('task') for row in flags[:5]])
+            with self.service.store.lock:
+                existing = any(event.get('action') == 'releases.deploy'
+                               and event.get('project_id') == ctx.params['pid']
+                               and event.get('operation_id') == result.get('operation_id')
+                               and event.get('outcome') == 'committed'
+                               for event in self.service.state['audit'])
+                if not existing:
+                    event = self.service.audit(ctx.request_id, ctx.principal, 'releases.deploy', 'committed',
+                                               project_id=ctx.params['pid'])
+                    event.update(metadata)
+                try:
+                    self.service.store.save()
+                except (OSError, TimeoutError):
+                    raise UncertainOutcome() from None
+            return result, result
+        return self._mutate(ctx, 'releases.deploy', ctx.params['pid'], write,
+                            capability=(CAP_COORDINATE, CAP_RELEASE), status=201, serialize=False,
+                            canonical=True, audit_success=False)
 
     def _merge_slot_backend(self):
         if not hasattr(self.backend, 'merge_slot_read'):
@@ -7491,6 +8154,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         from work import move_decision
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
+        form = ctx.query.get('form', 'worker')
+        if form not in ('worker', 'coordinator'):
+            raise HttpError(400, 'invalid_request', 'form must be worker or coordinator')
+        if form == 'coordinator':
+            return self._agent_coordinator_wait(ctx, agent)
         rows = []
         #: The claiming setting of every project this read covered (kittrial-5bb.352
         #: review item S1): the same fresh per-project read the endpoints and
@@ -7558,6 +8226,52 @@ class ApiHandler(BaseHTTPRequestHandler):
         view['manual_cadence'] = ('Read this route again to see a change; it never blocks, '
                                   'never sleeps and schedules nothing. --since is the caller\'s '
                                   'own memory of the last fingerprint it acted on.')
+        return 200, view
+
+    def _agent_coordinator_wait(self, ctx, agent):
+        """Live project grants bound this read, never the service's host identity."""
+        import waiting
+        refuse_unknown_fields(ctx.query, ('form', 'since', 'idle_minutes'), 'Coordinator wait query')
+        since = ctx.query.get('since')
+        if since is not None and not waiting.is_fingerprint(since):
+            raise HttpError(400, 'invalid_request', 'since must be a wait fingerprint')
+        idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        projects = []
+        for project_id in sorted(set(agent.get('projects') or [])):
+            try:
+                self.service.check_authority(ctx.principal, project_id, CAP_COORDINATE)
+            except HttpError as error:
+                if error.status not in (403, 404):
+                    raise
+                continue
+            projects.append(project_id)
+        if not projects:
+            raise forbidden('A current project coordinator grant is required for coordinator wait')
+        if not hasattr(self.backend, 'coordinator_wait'):
+            raise not_implemented('Coordinator wait is unavailable on this server')
+        reads = [(project, self.backend.coordinator_wait(project, ctx.principal, idle_minutes))
+                 for project in projects]
+        # A one-project fingerprint is EXACTLY the CLI fact. Multiple projects have
+        # an explicit project namespace, including empty projects and grant changes.
+        if len(reads) == 1:
+            view = dict(reads[0][1])
+        else:
+            triggers = {name: [] for name in waiting.COORDINATOR_TRIGGERS}
+            for project, read in reads:
+                for name in triggers:
+                    triggers[name].extend(dict(row, project=project)
+                                          for row in read['triggers'][name])
+            view = {'schema': waiting.WAIT_SCHEMA, 'form': 'coordinator', 'triggers': triggers,
+                    'items': [dict(row, trigger=name) for name in triggers for row in triggers[name]],
+                    'fingerprint': waiting.digest([{'project': project, 'fingerprint': read['fingerprint']}
+                                                   for project, read in reads])}
+        view['projects'] = projects
+        view['agent'] = agent.get('id')
+        view['generated_at'] = now_iso(self.service._now())
+        if since is not None:
+            view['changed'] = since != view['fingerprint']
+        view['manual_cadence'] = ('Read this route again with form=coordinator and since=FINGERPRINT; '
+                                  'it never blocks, sleeps or schedules work.')
         return 200, view
 
     @route('POST', r'/v1/agents')
@@ -7978,6 +8692,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                      request_id=ctx.request_id)
             return result, result
         return self._mutate(ctx, 'agents.coordinator.revoke', ctx.params['pid'], revoke,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
+    # The project's release grant (kittrial-5bb.378): an owner gives and revokes one
+    # agent's authority to RECORD releases here. It is stored beside the coordinator grant
+    # and read live on every release write; the coordinator grant does not imply it.
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/release')
+    def project_agent_release_grant(self, ctx):
+        refuse_unknown_fields(dict(ctx.payload or {}), (), 'A release grant')
+
+        def grant():
+            result = self.service.grant_release(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.release.grant', ctx.params['pid'], grant,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/release')
+    def project_agent_release_revoke(self, ctx):
+        def revoke():
+            result = self.service.revoke_release(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                 request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.release.revoke', ctx.params['pid'], revoke,
                             capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
 
     @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')')
@@ -9701,11 +10438,15 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _requirements_write(self, ctx, action, status=200):
         self._requirements_backend()
         editor=self._requirements_owner(ctx)
+        if action == 'baseline' and (editor.get('role') != 'owner' or editor.get('agent_id')
+                or ctx.principal.via != 'session' or ctx.principal.credential_id):
+            raise forbidden('Baseline cuts need the current signed-in project owner')
         if action=='governance' and editor.get('role')!='owner':
             # The coordinator's decision 11(i) of kittrial-5bb.278: the governance-mode
             # switch changes the rules, not requirement text, so it stays the owner's.
             raise forbidden('Switching requirements governance needs the signed-in project owner')
         fields,operation_id=self._proposal_body(ctx,{
+            'baseline':('name',),
             'create':('kind','parent','title','description','key'),
             'revise':('expected_revision','expected_sha256','title','description'),
             'accept':('expected_revision','expected_sha256'),
@@ -9716,12 +10457,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             'abandon':('original_operation_id','expected_receipt_sha256','reason'),
             'governance':('mode','expected_revision','expected_sha256')}[action],'Requirements')
         import requirement_http
-        try: requirement_http.checked_body(fields,action)
+        try:
+            if action == 'baseline':
+                from requirement_baseline_http import checked_body
+                checked_body(fields)
+            else:
+                requirement_http.checked_body(fields,action)
         except ValueError as error: raise invalid(str(error))
         if operation_id is not None:
             raise invalid('Use the Idempotency-Key header for requirements writes')
         pid=ctx.params['pid']
-        if action in ('withdraw','supersede','finish','abandon'):
+        if action in ('baseline','withdraw','supersede','finish','abandon'):
             # Give immediate mode advice; the canonical adapter repeats the
             # check under the project/authority locks, including exact replays.
             if self.backend.requirements_read(pid,['governance'])['mode']!='simple':
@@ -9745,7 +10491,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                             # Terminal replay authority belongs to the canonical
                             # owner adapter. Its durable identity still deduplicates
                             # effects; a service response must not bypass that check.
-                            idempotent=action not in ('withdraw','supersede','finish','abandon'),
+                            idempotent=action not in ('baseline','withdraw','supersede','finish','abandon'),
                             audit_success=action not in ('withdraw','supersede','finish','abandon'),
                             audit_metadata=self._requirement_agent_audit(ctx))
 
@@ -9764,6 +10510,53 @@ class ApiHandler(BaseHTTPRequestHandler):
         return {'acting_agent': editor['agent_id'],
                 'coordinator_grant': {'granted_by': grant.get('granted_by'),
                                       'granted_at': grant.get('granted_at')}}
+
+    # Named snapshots are human member reads; no new agent/worker authority.
+    def _requirements_baseline_member(self, ctx):
+        self._requirements_backend(); self._project(ctx, CAP_READ)
+        pid = ctx.params['pid']
+        if (ctx.principal.via != 'session' or ctx.principal.credential_id or ctx.principal.agent_id
+                or self.service.state.get('memberships', {}).get(pid, {}).get(ctx.principal.user_id)
+                not in ('owner', 'coordinator', 'contributor', 'viewer')):
+            raise forbidden('Requirements baselines need a current signed-in project member')
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines')
+    def requirements_baselines(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'], ['baselines'])
+
+    @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines')
+    def requirements_cut_baseline(self, ctx):
+        return self._requirements_write(ctx, 'baseline', status=201)
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines/(?P<baseline>[A-Za-z0-9_-]{1,64})')
+    def requirements_baseline(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'], ['baseline', ctx.params['baseline']])
+
+    def _requirements_document_args(self, ctx, action):
+        if set(ctx.query) - {'baseline'}:
+            raise invalid('Requirements documents take only the optional baseline query')
+        args = [action]
+        if 'baseline' in ctx.query:
+            from requirement_baseline_records import baseline_name
+            try:
+                args.append(baseline_name(ctx.query['baseline']))
+            except ValueError as error:
+                raise invalid(str(error))
+        return args
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd/export')
+    def requirements_markdown_export(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'],
+            self._requirements_document_args(ctx, 'export'))
+
+    @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd/changes')
+    def requirements_baseline_changes(self, ctx):
+        self._requirements_baseline_member(ctx)
+        return 200, self.backend.requirements_read(ctx.params['pid'],
+            self._requirements_document_args(ctx, 'changes'))
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
@@ -9791,6 +10584,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         result=self._requirements_state_only(ctx,result)
         self._requirements_names(result)
         result['can_edit']=self._requirements_page_editor(ctx)
+        result['can_cut_baseline']=(ctx.principal.via == 'session'
+            and not ctx.principal.credential_id and not ctx.principal.agent_id
+            and self.service.state.get('memberships', {}).get(ctx.params['pid'], {}).get(ctx.principal.user_id) == 'owner'
+            and result.get('governance', {}).get('mode') == 'simple')
         return 200,result
 
     def _requirements_page_editor(self,ctx):
@@ -10729,6 +11526,336 @@ class ApiHandler(BaseHTTPRequestHandler):
     ALREADY_RECOMMENDED = ('%s has already recommended this contribution, and that recommendation stands until the '
                            'contribution is revised or decided. To ask for changes instead, request changes: the '
                            'recommendation then stops counting. A recommendation cannot be withdrawn.')
+
+    def _project_delivery(self, ctx):
+        """Authorize a delivery read: ``CAP_REVIEWS``, or ``CAP_APPROVE`` on the same project.
+
+        The ``CAP_APPROVE`` fallback runs ONLY after a ``403`` from the ``CAP_REVIEWS``
+        check for the SAME route project (kittrial-5bb.373 precision 2); any other
+        refusal (``404`` unknown project, ``401``) is returned as is, and a principal
+        with neither capability gets the original ``403``.
+        """
+        try:
+            self._project(ctx, CAP_REVIEWS)
+            return
+        except HttpError as first_error:
+            if first_error.status != 403:
+                raise
+            try:
+                self._project(ctx, CAP_APPROVE)
+                return
+            except HttpError:
+                raise first_error from None
+
+    @staticmethod
+    def _delivery_contribution_query(query):
+        unknown = sorted(set(query) - {'contribution'})
+        if unknown:
+            raise invalid('Unsupported query parameter(s): %s' % ', '.join(unknown))
+        if 'contribution' not in query:
+            return None
+        contribution_id = query.get('contribution')
+        if not isinstance(contribution_id, str) or not SAFE_ID.fullmatch(contribution_id):
+            raise not_found('Contribution not found')
+        return contribution_id
+
+    def _audit_bundle_read(
+        self,
+        ctx,
+        pid,
+        record,
+        outcome,
+        *,
+        reason=None,
+        sha256=None,
+        size_bytes=None,
+        task=None,
+        contribution=None,
+    ):
+        with self.service.store.lock:
+            event = self.service.audit(
+                ctx.request_id,
+                ctx.principal,
+                'delivery.bundle.read',
+                outcome,
+                project_id=pid,
+                reason=reason,
+            )
+            if isinstance(record, dict):
+                event['task'] = record.get('task') or task
+                event['contribution'] = record.get('contribution') or contribution
+                event['commit'] = record.get('commit')
+                if sha256 is None and isinstance(record.get('delivery'), dict):
+                    sha256 = record['delivery'].get('sha256')
+            else:
+                if task is not None:
+                    event['task'] = task
+                if contribution is not None:
+                    event['contribution'] = contribution
+            if sha256 is not None:
+                event['sha256'] = sha256
+            if size_bytes is not None:
+                event['bytes'] = size_bytes
+            self.service.store.save_soon('the audit entry of a bundle read')
+
+    def _send_bundle_stream(self, handle_fd, record, verified):
+        from review_workflow import BUNDLE_BLOCK_BYTES
+        headers_sent = False
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(verified['bytes']))
+            self.send_header('ETag', str(verified['sha256']))
+            self.send_header('X-Contribution', str(record['contribution']))
+            self.send_header('X-Orchestra-Contribution', str(record['contribution']))
+            self.send_header('X-Orchestra-Commit', str(record['commit']))
+            self.send_header('X-Orchestra-Base-Commit', str(record['base_commit']))
+            self.send_header('X-Orchestra-Bundle-Sha256', str(verified['sha256']))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self._send_hsts()
+            self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+            if getattr(self, '_say_close', False):
+                self.send_header('Connection', 'close')
+                self._say_close = False
+            if getattr(self, '_set_cookie_token', None):
+                self._send_cookie(self._set_cookie_token)
+            self.end_headers()
+            headers_sent = True
+            if self.command == 'HEAD':
+                return 'ok', None
+            os.lseek(handle_fd, 0, os.SEEK_SET)
+            expected_bytes = int(verified['bytes'])
+            expected_sha = str(verified['sha256']).lower()
+            expected_stat = verified.get('stat_snapshot')
+            remaining = expected_bytes
+            stream_digest = hashlib.sha256()
+            held_block = None
+            while remaining > 0:
+                chunk = os.read(handle_fd, min(BUNDLE_BLOCK_BYTES, remaining))
+                if not chunk:
+                    self.close_connection = True
+                    try:
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+                    return 'interrupted', 'short_read'
+                stream_digest.update(chunk)
+                remaining -= len(chunk)
+                if held_block is not None:
+                    self.wfile.write(held_block)
+                held_block = chunk
+            extra = os.read(handle_fd, 1)
+            info_after = os.fstat(handle_fd)
+            stat_after = (
+                info_after.st_dev,
+                info_after.st_ino,
+                info_after.st_size,
+                info_after.st_mtime_ns,
+                info_after.st_ctime_ns,
+            )
+            if (
+                extra
+                or stream_digest.hexdigest().lower() != expected_sha
+                or (expected_stat is not None and stat_after != expected_stat)
+            ):
+                self.close_connection = True
+                try:
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                return 'interrupted', 'bundle_checksum_mismatch'
+            if held_block is not None:
+                self.wfile.write(held_block)
+            self.wfile.flush()
+            return 'ok', None
+        except Exception:
+            self.close_connection = True
+            if not headers_sent:
+                raise
+            try:
+                self.wfile.flush()
+            except OSError:
+                pass
+            return 'interrupted', 'stream_error'
+        finally:
+            try:
+                os.close(handle_fd)
+            except OSError:
+                pass
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/delivery')
+    def tasks_delivery(self, ctx):
+        """Return the contribution's recorded delivery metadata (kittrial-5bb.373)."""
+        from review_workflow import (
+            DeliveryCorruptError,
+            DeliveryTooLargeError,
+            DeliveryUnavailableError,
+            resolve_delivery_bundle_path,
+            verify_served_bundle,
+        )
+        self._project_delivery(ctx)
+        pid = ctx.params['pid']
+        tid = ctx.params['tid']
+        contribution_id = ctx.query.get('contribution') if isinstance(ctx.query.get('contribution'), str) else None
+        record = None
+        try:
+            contribution_id = self._delivery_contribution_query(ctx.query)
+            candidate = self.backend.task_delivery_record(
+                pid,
+                tid,
+                contribution_id=contribution_id,
+            )
+            if candidate.get('task') != tid or candidate.get('project') not in (None, pid):
+                raise not_found('Contribution not found')
+            record = candidate
+            delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
+            kind = delivery.get('kind')
+            roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
+            max_bytes = (
+                self.backend.get_delivery_serve_max_bytes()
+                if hasattr(self.backend, 'get_delivery_serve_max_bytes')
+                else 256 * 1024 * 1024
+            )
+        except HttpError as error:
+            self._audit_bundle_read(
+                ctx,
+                pid,
+                record,
+                'refused',
+                reason=error.code,
+                task=tid,
+                contribution=contribution_id,
+            )
+            raise
+        sha256 = delivery.get('sha256') if kind == 'bundle' else None
+        path = delivery.get('path') if kind == 'bundle' else None
+        bundle_bytes = None
+        if kind == 'bundle':
+            try:
+                resolved_path, handle_fd, raw_size = resolve_delivery_bundle_path(path, roots)
+            except DeliveryUnavailableError:
+                bundle_bytes = None
+            else:
+                try:
+                    verified = verify_served_bundle(
+                        resolved_path,
+                        handle_fd,
+                        raw_size,
+                        sha256,
+                        record.get('commit'),
+                        max_bytes=max_bytes,
+                        git=getattr(self.backend, 'bundle_git', None),
+                    )
+                except (DeliveryUnavailableError, DeliveryTooLargeError, DeliveryCorruptError):
+                    bundle_bytes = None
+                else:
+                    bundle_bytes = verified['bytes']
+                    try:
+                        os.close(handle_fd)
+                    except OSError:
+                        pass
+        cid = record.get('contribution')
+        qs = ('?' + urlencode({'contribution': cid})) if cid else ''
+        base_url = '/v1/projects/%s/tasks/%s/delivery' % (quote(pid, safe=''), quote(tid, safe=''))
+        links = {
+            'self': base_url + qs,
+            'bundle': (base_url + '/bundle' + qs) if kind == 'bundle' else None,
+        }
+        return 200, {
+            'task': tid,
+            'project': pid,
+            'contribution': cid,
+            'revision': record.get('revision'),
+            'kind': kind,
+            'commit': record.get('commit'),
+            'base_commit': record.get('base_commit'),
+            'sha256': sha256,
+            'bytes': bundle_bytes,
+            'path': path,
+            'serve_limit': max_bytes,
+            'repository': record.get('repository'),
+            'author': record.get('author'),
+            'at': record.get('at'),
+            'delivery': delivery,
+            'links': links,
+        }
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/delivery/bundle')
+    def tasks_delivery_bundle(self, ctx):
+        """Verify and stream the contribution's delivered git bundle (kittrial-5bb.373)."""
+        from review_workflow import (
+            DELIVERY_CHECKSUM_MISMATCH,
+            DELIVERY_NOT_AVAILABLE,
+            DELIVERY_REMOTE_NO_BUNDLE,
+            DeliveryCorruptError,
+            DeliveryTooLargeError,
+            DeliveryUnavailableError,
+            resolve_delivery_bundle_path,
+            verify_served_bundle,
+        )
+        self._project_delivery(ctx)
+        pid = ctx.params['pid']
+        tid = ctx.params['tid']
+        contribution_id = ctx.query.get('contribution') if isinstance(ctx.query.get('contribution'), str) else None
+        record = None
+        size = None
+        try:
+            contribution_id = self._delivery_contribution_query(ctx.query)
+            candidate = self.backend.task_delivery_record(pid, tid, contribution_id=contribution_id)
+            if candidate.get('task') != tid or candidate.get('project') not in (None, pid):
+                raise not_found('Contribution not found')
+            record = candidate
+            delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
+            if delivery.get('kind') != 'bundle':
+                raise invalid(DELIVERY_REMOTE_NO_BUNDLE)
+            roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
+            max_bytes = (
+                self.backend.get_delivery_serve_max_bytes()
+                if hasattr(self.backend, 'get_delivery_serve_max_bytes')
+                else 256 * 1024 * 1024
+            )
+            try:
+                resolved_path, handle_fd, size = resolve_delivery_bundle_path(delivery.get('path'), roots)
+                verified = verify_served_bundle(
+                    resolved_path,
+                    handle_fd,
+                    size,
+                    delivery.get('sha256'),
+                    record.get('commit'),
+                    max_bytes=max_bytes,
+                    git=getattr(self.backend, 'bundle_git', None),
+                )
+            except DeliveryUnavailableError:
+                raise HttpError(410, 'bundle_unavailable', DELIVERY_NOT_AVAILABLE) from None
+            except DeliveryTooLargeError as error:
+                raise HttpError(413, 'payload_too_large', str(error)) from None
+            except DeliveryCorruptError:
+                raise HttpError(503, 'bundle_checksum_mismatch', DELIVERY_CHECKSUM_MISMATCH) from None
+        except HttpError as error:
+            self._audit_bundle_read(
+                ctx,
+                pid,
+                record,
+                'refused',
+                reason=error.code,
+                size_bytes=size,
+                task=tid,
+                contribution=contribution_id,
+            )
+            raise
+        outcome, interrupt_reason = self._send_bundle_stream(handle_fd, record, verified)
+        self._audit_bundle_read(
+            ctx,
+            pid,
+            record,
+            outcome,
+            reason=interrupt_reason,
+            sha256=verified['sha256'],
+            size_bytes=verified['bytes'],
+        )
+        return None, None
 
     #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')
@@ -11717,7 +12844,7 @@ def runtime_service_lock(root):
     return fd
 
 
-def bootstrap_refusal_advice(error):
+def bootstrap_refusal_advice(error, password_min_length=1):
     """What the person at the terminal has to do about a refused ``--bootstrap-user``.
 
     Only "a superuser already exists" can be answered with "add this person as an account
@@ -11727,8 +12854,12 @@ def bootstrap_refusal_advice(error):
     """
     if getattr(error, 'status', None) == 409:
         return 'Add this person as an account inside the service instead.'
+    if 'only spaces' in getattr(error, 'message', ''):
+        # kittrial-5bb.363: a whitespace-only password is refused with its own sentence.
+        return 'Run the command again with a password that is not only spaces.'
     if 'Password' in getattr(error, 'message', ''):
-        return 'Run the command again with a password of 8 to 1024 characters.'
+        return ('Run the command again with a password of %d to %d characters.'
+                % (password_min_length, MAX_PASSWORD))
     return 'Run the command again with a name of 2 to 64 characters of letters, digits, . _ @ -.'
 
 
@@ -11809,6 +12940,10 @@ def main(argv=None):
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
+    parser.add_argument('--password-min-length', type=int, default=1, metavar='N',
+                        help='the installation password minimum: 1 to 1024 characters (default 1, '
+                             'any non-empty password). The 1024 maximum is a bound on the work one '
+                             'request may ask for, not a policy')
     parser.add_argument('--bootstrap-user', help='one-time operator bootstrap superuser')
     parser.add_argument('--list-unconfirmed-projects', action='store_true',
                         help='print the project records the endpoint backend will not serve (an upgrade '
@@ -11822,6 +12957,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         validate_agent_credential_days(args.agent_credential_days)
+        # The installation's password minimum (kittrial-5bb.363) is refused the same way:
+        # one sentence, a non-zero exit, before the state store is opened or a port is bound.
+        password_min_length = validate_password_min_length(args.password_min_length)
         # Refused here, before the state store is opened: a limit that is out of bounds, not
         # a whole number, or shorter than the idle window is one sentence and a non-zero exit,
         # never a clamped value (kittrial-5bb.330). An omitted flag keeps 30 min / 12 h.
@@ -11873,13 +13011,22 @@ def main(argv=None):
         try:
             store = Store(args.state)
             password = getpass.getpass('New superuser password: ')
-            Service.bootstrap_superuser(store, args.bootstrap_user, password)
+            confirmation = getpass.getpass('Repeat new superuser password: ')
+            if password != confirmation:
+                # The host bootstrap is one of the places a password is set (kittrial-5bb.363):
+                # ask twice and refuse a mismatch before the store is written.
+                print('Refusing to bootstrap %s: the two passwords do not match.'
+                      % args.bootstrap_user, file=sys.stderr)
+                return 1
+            Service.bootstrap_superuser(store, args.bootstrap_user, password,
+                                        password_min_length=password_min_length)
         except HttpError as error:
             # A second bootstrap, a refused user name or a password the kit refuses: one
             # sentence and the one thing to do about it, never a traceback
             # (kittrial-5bb.176 items 2 and 3).
             print('Refusing to bootstrap %s: %s. %s'
-                  % (args.bootstrap_user, error.message, bootstrap_refusal_advice(error)), file=sys.stderr)
+                  % (args.bootstrap_user, error.message,
+                     bootstrap_refusal_advice(error, password_min_length)), file=sys.stderr)
             return 1
         finally:
             import fcntl
@@ -11908,6 +13055,7 @@ def main(argv=None):
         trusted.append('localhost')
     service = Service(store, public_url=args.public_url, approval_by_another_party=args.approval_by_another_party,
                       agent_credential_days=args.agent_credential_days,
+                      password_min_length=password_min_length,
                       session_idle=session_idle, session_absolute=session_absolute)
     service.LOGINS_PER_ADDRESS = args.logins_per_address
     backend = build_backend(service, args)

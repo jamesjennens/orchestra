@@ -182,6 +182,25 @@ else:
         with self.assertRaisesRegex(ValueError, 'Unknown'):
             service_config(self.config)
 
+    def test_password_minimum_is_read_and_forwarded(self):
+        # kittrial-5bb.363: the office setting is the web flag; invalid values are refused
+        # by the same helper and are never clamped.
+        from office_service import service_config, web_command
+        self.config.write_text('{"schema_version":1,"password_min_length":8}', encoding='utf-8')
+        settings = service_config(self.config)
+        self.assertEqual(8, settings['password_min_length'])
+        command = web_command(settings, Path('/tmp/root'), 8443, '/usr/bin/python3',
+                              Path('/tmp/http_service.py'))
+        self.assertEqual(8, command[command.index('--password-min-length') + 1])
+        for bad in (0, 1025, True, '8'):
+            with self.subTest(value=bad):
+                self.config.write_text(json.dumps({'schema_version': 1,
+                                                   'password_min_length': bad}), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'password_min_length'):
+                    service_config(self.config)
+        self.config.write_text('{"schema_version":1}', encoding='utf-8')
+        self.assertEqual(1, service_config(self.config).get('password_min_length', 1))
+
     def test_private_root_accepts_a_root_with_a_space(self):
         """kittrial-5bb.220 revision: run/health on an existing runtime with a space in its root
         must not be refused."""

@@ -94,11 +94,63 @@ class AuthCase(unittest.TestCase):
         self.assertFalse(needs_rehash(verifier))
 
     def test_password_length_is_bounded(self):
-        with self.assertRaises(HttpError) as caught:
-            hash_password('short')
-        self.assertEqual(caught.exception.status, 422)
+        # kittrial-5bb.363: the default minimum is 1, so any non-empty password is enough;
+        # empty is still refused, and 1024 stays a bound on the work one request may ask for.
+        verifier = hash_password('x')
+        self.assertTrue(verify_password(verifier, 'x'))
+        for refused in ('', None):
+            with self.assertRaises(HttpError) as caught:
+                hash_password(refused)
+            self.assertEqual(caught.exception.status, 422)
+            self.assertEqual('Password must be 1-1024 characters', caught.exception.message)
         with self.assertRaises(HttpError):
             hash_password('x' * 2000)
+
+    def test_a_configured_minimum_is_enforced_and_names_its_range(self):
+        with self.assertRaises(HttpError) as caught:
+            hash_password('short', minimum=8)
+        self.assertEqual('Password must be 8-1024 characters', caught.exception.message)
+        self.assertTrue(verify_password(hash_password('12345678', minimum=8), '12345678'))
+
+    def test_the_service_minimum_applies_to_a_change_and_a_one_character_default(self):
+        admin = self.principal_for(self.service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
+        created = self.service.create_user(admin, 'alex')
+        # The default: one character is accepted end to end.
+        self.service.change_password(admin, created['id'], None, 'x')
+        self.assertTrue(self.service.login('alex', 'x')['session_token'])
+        # A raised setting refuses a shorter password with the configured range, and writes
+        # nothing; a password at the new minimum is then accepted.
+        service = Service(self.store, password_min_length=8)
+        with self.assertRaises(HttpError) as caught:
+            service.change_password(admin, created['id'], None, 'short')
+        self.assertEqual(422, caught.exception.status)
+        self.assertEqual('Password must be 8-1024 characters', caught.exception.message)
+        self.assertTrue(verify_password(self.service.state['users'][created['id']]['password'], 'x'))
+        service.change_password(admin, created['id'], None, 'long-enough')
+        self.assertTrue(self.service.login('alex', 'long-enough')['session_token'])
+
+    def test_a_whitespace_only_password_is_refused_on_every_surface(self):
+        # kittrial-5bb.363 item s2 (coordinator decision): a password of nothing but spaces
+        # is a mistake, not a choice. The rule is in _validate_password, so every place that
+        # sets a password gets the same one sentence, and nothing is written.
+        for value in (' ', '   ', '\t', '\n \t'):
+            with self.assertRaises(HttpError) as caught:
+                hash_password(value)
+            self.assertEqual(422, caught.exception.status)
+            self.assertEqual('A password cannot be only spaces.', caught.exception.message)
+        # This is not a character-set rule: spaces inside a password are still allowed.
+        self.assertTrue(verify_password(hash_password('a b'), 'a b'))
+        admin = self.principal_for(self.service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
+        created = self.service.create_user(admin, 'alex')
+        with self.assertRaises(HttpError) as caught:
+            self.service.change_password(admin, created['id'], None, '   ')
+        self.assertEqual('A password cannot be only spaces.', caught.exception.message)
+        self.assertIsNone(self.service.state['users'][created['id']].get('password'))
+        reset = self.service.issue_reset(admin, created['id'])
+        with self.assertRaises(HttpError) as caught:
+            self.service.redeem_reset(created['id'], reset['reset_value'], '\t ')
+        self.assertEqual('A password cannot be only spaces.', caught.exception.message)
+        self.assertIsNone(self.service.state['users'][created['id']].get('password'))
 
     def test_low_cost_verifier_requests_rehash(self):
         weak = hash_password('a-good-password', n=2 ** 8)

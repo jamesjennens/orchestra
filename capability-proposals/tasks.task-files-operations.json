@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb380-tasks-task-files-operations-0001",
+  "key": "tasks.task-files-operations",
+  "name": "Task files operations: backup beside the project, checked restore, verify, purge, proxy check",
+  "aliases": [
+    "task files backup",
+    "restore task files",
+    "verify task files",
+    "purge task files",
+    "task-files purge",
+    "task-files verify",
+    "task-files proxy-check",
+    "reverse proxy upload limit",
+    "client_max_body_size",
+    "purged task file",
+    "lingering close"
+  ],
+  "summary": "admin.py backup mirrors projects/NAME/.task-files into backups/NAME.task-files: the bytes a record names and every journal entry, re-hashed while copied (a file that no longer matches its name is reported, not copied), incremental, manifest.json written last; the status file records task_files, and backup-copy carries the folder. restore-new checks every file against the manifest before placing any; a mismatch places none and exits 3. task-files verify re-hashes what the records need (exit 1 on a problem). task-files purge (operator allowlist, --dry-run, project lock, one audit line) removes withdrawn files, files of tasks closed before a date, and orphans and temp files older than a day, never a file a live record needs, and marks entries purged (download 410). task-files proxy-check --url sends an unsigned upload of the per-file limit; Orchestra's own 401 passes. A refused upload is closed lingering (5 s, 64 MiB, at most 8 at once); its discard waits at most 10 s and never replaces the refusal.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#files-attached-to-tasks-backup-restore-verify-purge"
+  ],
+  "code": [
+    "task_files.py::backup_folder",
+    "task_files.py::restore_folder",
+    "task_files.py::verify",
+    "task_files.py::purge_plan",
+    "task_files.py::purge",
+    "task_files.py::proxy_check",
+    "task_files.py::held",
+    "task_files.py::purged_sentence",
+    "admin.py::backup_task_files",
+    "admin.py::restore_task_files",
+    "admin.py::task_files_command",
+    "http_service.py::ApiHandler._linger"
+  ],
+  "tests": [
+    "tests/test_task_files_ops.py",
+    "tests/test_task_files_ops_real_bd.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "tasks",
+    "files",
+    "backup",
+    "operations"
+  ]
+}

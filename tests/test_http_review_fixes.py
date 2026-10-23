@@ -201,7 +201,7 @@ class Harness(unittest.TestCase):
 
     def request(self, method, path, body=None, token=None, cookie=None, csrf=None,
                 key=None, headers=None, content_type='application/json'):
-        client = http.client.HTTPConnection('127.0.0.1', self.port, timeout=20)
+        client = http.client.HTTPConnection('127.0.0.1', self.port, timeout=getattr(self, 'http_timeout', 20))
         request_headers = {}
         if body is not None:
             request_headers['Content-Type'] = content_type

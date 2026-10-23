@@ -1,6 +1,7 @@
 // Direct owner editing. Content is always text; the BRD is generated read-only.
 import { h } from '../dom.js';
 import { pageHead, describe } from '../ui.js';
+import { baselinePanel } from './requirement_baselines.js';
 
 const expected = (record) => ({ expected_revision: record.revision, expected_sha256: record.sha256 });
 // Keep stored text unchanged; make invisible controls explicit in reading views.
@@ -259,6 +260,7 @@ export async function brd(ctx, { pid }, project, data) {
   data.items.filter((item) => item.unreadable).map(card),
   !data.items.length ? h('p', null, 'No requirements yet.') : null, add,
   batchable.length ? batchAccept(ctx, pid, batchable) : null, recovery,
+  baselinePanel(ctx, pid, data.can_cut_baseline === true && simple),
   h('section', { class: 'panel' }, h('h2', null, 'Decisions'), (document.decisions || []).map((d) => h('p', null, `${displayText(d.title)} · revision ${d.revision}`))));
 }
 

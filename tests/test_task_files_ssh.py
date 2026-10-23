@@ -405,5 +405,29 @@ class TaskFilesOverSshTests(unittest.TestCase):
         self.assertEqual((2, 422), (answer['returncode'], answer['task_file_status']))
 
 
+@unittest.skipIf(fixture.endpoint is None, 'task files over SSH need POSIX endpoint imports')
+class FramedHeaderDeadlineTests(unittest.TestCase):
+    def test_a_head_that_can_still_become_a_framed_header_is_recognised(self):
+        could = fixture.endpoint.could_be_framed
+        for head in (b'', b'  ', b'{', b'{"ac', b'{ "action" :', b'{"action": "fi', b'{"action": "file-', b'{"action": "file-g',
+                     b'{"action": "file-get"', b'{"action": "file-put", "task": "x"'):
+            self.assertTrue(could(head), head)
+        for head in (b'[', b'{"project"', b'{"action": "run"', b'{"action": "file-x', b'hello'):
+            self.assertFalse(could(head), head)
+
+    def test_a_header_that_stalls_before_its_action_is_known_is_cut_off(self):
+        from unittest import mock
+        for sent in (b'', b'{"act'):
+            read, write = os.pipe()
+            try:
+                os.write(write, sent)
+                with mock.patch('time.monotonic', side_effect=[0, 100, 100]):
+                    request, frame, refusal = fixture.endpoint.read_request(read)
+            finally:
+                os.close(read)
+                os.close(write)
+            self.assertEqual((None, None, 408), (request, frame, refusal.status), sent)
+
+
 if __name__ == '__main__':
     unittest.main()

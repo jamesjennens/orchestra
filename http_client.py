@@ -35,12 +35,14 @@ if sys.version_info < (3, 10):
                      % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable))
     sys.exit(2)
 import argparse
+import hashlib
 import http.client
 import json
 import os
 import secrets
 import ssl
 import sys
+import tempfile
 from urllib.parse import quote, urlencode, urlsplit
 
 
@@ -165,6 +167,15 @@ class Client:
                                                context=context)
         return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
 
+    @staticmethod
+    def _decode_body(raw):
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw.decode('utf-8', 'replace')
+
     # -- wire ------------------------------------------------------------------
     def request(self, method, path, body=None, *, key=None, anonymous=False, headers=None):
         headers = dict(headers or {})
@@ -193,12 +204,7 @@ class Client:
             header_list = response.getheaders()
         finally:
             connection.close()
-        data = None
-        if raw:
-            try:
-                data = json.loads(raw)
-            except ValueError:
-                data = raw.decode('utf-8', 'replace')
+        data = self._decode_body(raw)
         if status >= 400:
             error = data.get('error', {}) if isinstance(data, dict) else {}
             request_id = data.get('request_id') if isinstance(data, dict) else None
@@ -317,6 +323,26 @@ class Client:
     def lifecycle(self, project, task):
         return self.request('GET', '/v1/projects/%s/tasks/%s/lifecycle'
                             % (quote(project, safe=''), quote(task, safe='')))
+
+    def integration_check(self, project, task, target=None):
+        """The read-only merge check and its step ledger (kittrial-5bb.383)."""
+        path = '/v1/projects/%s/tasks/%s/integration-check' % (
+            quote(project, safe=''), quote(task, safe=''))
+        if target is not None:
+            path += '?' + urlencode({'target': target})
+        return self.request('GET', path)
+
+    def ledger(self, project, task, target=None):
+        """The writes still owed, from the same read-only integration check.
+
+        Returns the task, target, `merge_ready` and the `next` rows only: a
+        coordinator reads the check before merging and this ledger to resume from the
+        first row that is not `committed`.
+        """
+        state = self.integration_check(project, task, target)
+        return {'task': state.get('task'), 'target': state.get('target'),
+                'merge_ready': state.get('merge_ready'),
+                'next': state.get('next') or []}
 
     def _write_lifecycle(self, project, task, operation, body, key=None, dimension=None):
         identity = key or new_idempotency_key()
@@ -571,6 +597,128 @@ class Client:
         return self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
                             % (quote(project, safe=''), quote(task, safe='')), body, key=key)
 
+    def delivery(self, project, task, *, contribution=None):
+        qs = ('?' + urlencode({'contribution': contribution})) if contribution is not None else ''
+        return self.request('GET', '/v1/projects/%s/tasks/%s/delivery%s'
+                            % (quote(project, safe=''), quote(task, safe=''), qs))
+
+    def delivery_bundle(self, project, task, out_path, *, contribution=None, max_bytes=256 * 1024 * 1024):
+        out = str(out_path)
+        if os.path.islink(out):
+            raise ValueError('Refusing to write delivered bundle through symlink: %s' % out)
+        if os.path.isdir(out):
+            raise ValueError('Refusing to overwrite directory with delivered bundle: %s' % out)
+        parent = os.path.dirname(os.path.abspath(out)) or '.'
+        if os.path.islink(parent) or not os.path.isdir(parent):
+            raise ValueError('Output parent directory does not exist: %s' % parent)
+        meta = self.delivery(project, task, contribution=contribution)
+        if not isinstance(meta, dict):
+            raise ValueError('Invalid delivery metadata response')
+        delivery_block = meta.get('delivery') if isinstance(meta.get('delivery'), dict) else {}
+        expected_sha = meta.get('sha256') or delivery_block.get('sha256')
+        expected_bytes = meta.get('bytes')
+        serve_limit = meta.get('serve_limit')
+        limit = int(max_bytes)
+        if isinstance(serve_limit, int) and serve_limit > 0:
+            limit = min(limit, serve_limit)
+        qs = ('?' + urlencode({'contribution': contribution})) if contribution is not None else ''
+        path = '/v1/projects/%s/tasks/%s/delivery/bundle%s' % (
+            quote(project, safe=''),
+            quote(task, safe=''),
+            qs,
+        )
+        headers = {}
+        if self.use_cookie and self.cookie:
+            headers['Cookie'] = self.cookie
+        elif self.token:
+            headers['Authorization'] = 'Bearer ' + self.token
+        if self.request_id:
+            headers['X-Request-Id'] = self.request_id
+        connection = self._connection()
+        tmp_path = None
+        try:
+            connection.request('GET', self.prefix + path, headers=headers)
+            response = connection.getresponse()
+            if response.status >= 400:
+                raw = response.read()
+                data = self._decode_body(raw)
+                error = data.get('error', {}) if isinstance(data, dict) else {}
+                request_id = data.get('request_id') if isinstance(data, dict) else None
+                raise HttpApiError(
+                    response.status,
+                    error.get('code', 'http_error'),
+                    error.get('message', 'Request failed'),
+                    error.get('detail'),
+                    request_id,
+                )
+            if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+                raise ValueError('The delivered bundle does not match its recorded checksum.')
+            expected_sha_lower = expected_sha.lower()
+            etag = (response.getheader('ETag') or '').strip().strip('"').lower()
+            header_sha = (response.getheader('X-Orchestra-Bundle-Sha256') or etag).strip().lower()
+            if not etag or etag != expected_sha_lower or header_sha != expected_sha_lower:
+                raise ValueError('The delivered bundle does not match its recorded checksum.')
+            content_length_raw = response.getheader('Content-Length')
+            expected_length = None
+            if content_length_raw is not None:
+                try:
+                    expected_length = int(content_length_raw)
+                except ValueError:
+                    raise ValueError('The delivered bundle does not match its recorded checksum.') from None
+                if expected_length < 0 or expected_length > limit:
+                    raise ValueError('The delivered bundle exceeds the %d-byte serve limit.' % limit)
+                if isinstance(expected_bytes, int) and expected_length != expected_bytes:
+                    raise ValueError('The delivered bundle does not match its recorded checksum.')
+            fd, tmp_path = tempfile.mkstemp(prefix='.delivery-', suffix='.bundle.tmp', dir=parent)
+            digest = hashlib.sha256()
+            total = 0
+            try:
+                with os.fdopen(fd, 'wb') as tmp_file:
+                    while True:
+                        chunk = response.read(65536)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > limit:
+                            raise ValueError('The delivered bundle exceeds the %d-byte serve limit.' % limit)
+                        digest.update(chunk)
+                        tmp_file.write(chunk)
+                    tmp_file.flush()
+            except BaseException:
+                raise
+            if expected_length is not None and total != expected_length:
+                raise ValueError('The delivered bundle does not match its recorded checksum.')
+            if isinstance(expected_bytes, int) and total != expected_bytes:
+                raise ValueError('The delivered bundle does not match its recorded checksum.')
+            actual_sha = digest.hexdigest().lower()
+            if actual_sha != expected_sha_lower:
+                raise ValueError('The delivered bundle does not match its recorded checksum.')
+            if os.path.islink(out) or os.path.isdir(out):
+                raise ValueError('Refusing to overwrite symlink or directory: %s' % out)
+            os.replace(tmp_path, out)
+            tmp_path = None
+            return {
+                'task': meta.get('task') or task,
+                'project': meta.get('project') or project,
+                'contribution': meta.get('contribution'),
+                'revision': meta.get('revision'),
+                'kind': meta.get('kind') or 'bundle',
+                'commit': meta.get('commit'),
+                'base_commit': meta.get('base_commit'),
+                'sha256': actual_sha,
+                'bytes': total,
+                'path': meta.get('path') or delivery_block.get('path'),
+                'out': out,
+                'verified': True,
+            }
+        finally:
+            connection.close()
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
     def history(self, project, task, limit=None, cursor=None):
         return self.request('GET', '/v1/projects/%s/tasks/%s/history%s'
                             % (quote(project, safe=''), quote(task, safe=''),
@@ -768,6 +916,14 @@ def _build_parser():
     life.add_argument('--dimension', choices=('implemented','tested','reviewed','integrated','deployed','live-verified'))
     life.add_argument('--file', help='UTF-8 JSON HTTP request body for scope or fact')
     life.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
+    check = sub.add_parser('integration-check',
+                           help='read the merge check: checks, unchecked rows and the step ledger')
+    check.add_argument('project');check.add_argument('task')
+    check.add_argument('--target', help='target branch to compare with the held merge slot')
+    ledger = sub.add_parser('ledger',
+                            help='read only the step ledger: the writes still owed, in order')
+    ledger.add_argument('project');ledger.add_argument('task')
+    ledger.add_argument('--target', help='target branch to compare with the held merge slot')
     ref = sub.add_parser('ref', help='read or mutate project reference records')
     ref.add_argument('project')
     ref.add_argument('operation', choices=('list', 'find', 'get', 'propose', 'revise', 'accept', 'retire'))
@@ -799,6 +955,16 @@ def _build_parser():
     cap.add_argument('--cursor')
     cap.add_argument('--file', help='UTF-8 JSON HTTP request body for mutations')
     cap.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
+    dlv = sub.add_parser('delivery', help='read delivery metadata or fetch and verify a delivered bundle')
+    dlv.add_argument('project')
+    dlv.add_argument('task')
+    dlv.add_argument('--contribution', help='contribution record id (default: current contribution)')
+    dlv.add_argument('--verify', action='store_true', help='verify bundle digest when fetching')
+    dlv.add_argument('--out', help='write verified bundle bytes to this path')
+    dlv.add_argument('--credential',
+                     help='use this worker credential for the call; pass it as '
+                          '--credential=VALUE so a secret beginning with "-" is not read '
+                          'as an option')
     call = sub.add_parser('call', help='issue one raw JSON request')
     call.add_argument('method')
     call.add_argument('path')
@@ -820,6 +986,8 @@ def main(argv=None):
                     use_cookie=args.use_cookie)
     if args.token:
         client.token = args.token
+    if getattr(args, 'credential', None):
+        client.use_credential(args.credential)
     try:
         if args.command == 'login':
             password = os.environ.get(args.password_env)
@@ -874,6 +1042,12 @@ def main(argv=None):
                 result = client._write_lifecycle(args.project, args.task, args.operation, body,
                                                  args.idempotency_key, args.dimension)
             print(json.dumps(result, indent=2));return 0
+        if args.command == 'integration-check':
+            print(json.dumps(client.integration_check(args.project, args.task, args.target), indent=2))
+            return 0
+        if args.command == 'ledger':
+            print(json.dumps(client.ledger(args.project, args.task, args.target), indent=2))
+            return 0
         if args.command == 'ref':
             op = args.operation
             if op == 'list':
@@ -937,6 +1111,17 @@ def main(argv=None):
                         'reject-alias': client.reject_capability_alias,
                     }
                     result = method_map[op](args.project, rk, body, args.idempotency_key)
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.command == 'delivery':
+            if args.out:
+                result = client.delivery_bundle(args.project, args.task, args.out,
+                                                contribution=args.contribution)
+            else:
+                if args.verify:
+                    parser.error('delivery --verify requires --out FILE')
+                result = client.delivery(args.project, args.task,
+                                         contribution=args.contribution)
             print(json.dumps(result, indent=2))
             return 0
         if args.credential:

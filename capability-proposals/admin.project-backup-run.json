@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb380-admin-project-backup-run-0001",
+  "key": "admin.project-backup-run",
+  "name": "admin.py backup: one run backs up projects and publishes a validated status file",
+  "aliases": [
+    "project backup and restore",
+    "backup status file",
+    "admin.py backup",
+    "backup pair"
+  ],
+  "summary": "admin.py backup [NAMES | --all] backs up each initialized project as a pair (the native backup under backups/NAME and the coordination sidecar backups/NAME.coordination.json) and writes one status file for the run: each project complete (with its pair paths and time), failed or skipped (with a reason), and the run complete only when every entry is. The record is validated before it is written or trusted (validate_backup_status refuses an unknown status or scope, a complete entry without its exact pair, an empty list, a run status that disagrees with its entries). restore-new restores a project from that pair.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#backups"
+  ],
+  "code": [
+    "admin.py::backup_projects",
+    "admin.py::backup_status_record",
+    "admin.py::validate_backup_status",
+    "admin.py::finish_restore"
+  ],
+  "tests": [
+    "tests/test_backup_multi.py",
+    "tests/test_backup.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "admin",
+    "backup",
+    "restore"
+  ]
+}

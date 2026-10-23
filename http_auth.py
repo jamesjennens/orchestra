@@ -51,9 +51,10 @@ from pathlib import Path
 import claim_limit
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
+                            CAP_ROOMS_POST,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_RECORDS,
                             CAP_REVIEWS, CAP_TASKS,
-                            CAP_COORDINATE, coordinator_grant,
+                            CAP_COORDINATE, CAP_RELEASE, coordinator_grant, release_grant,
                             GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
@@ -71,7 +72,10 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF
 # memory-hard scheme available in the standard library without third-party wheels.
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
 SCRYPT_DKLEN, SCRYPT_SALT = 32, 16
-MIN_PASSWORD, MAX_PASSWORD = 8, 1024
+#: The installation's password rule (kittrial-5bb.363). The minimum is a setting,
+#: default 1: any non-empty password is accepted. The maximum is a bound on the work
+#: one request may ask for, not a policy about what a password should look like.
+MIN_PASSWORD, MAX_PASSWORD = 1, 1024
 
 # Provisional local lifecycle defaults from the reviewed design, all configurable
 # at the Service boundary.
@@ -358,8 +362,8 @@ class _PasswordWorker:
 _PASSWORD_WORKER = _PasswordWorker()
 
 
-def hash_password(password, *, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
-    _validate_password(password)
+def hash_password(password, *, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, minimum=MIN_PASSWORD):
+    _validate_password(password, minimum)
     salt = os.urandom(SCRYPT_SALT)
     derived = _PASSWORD_WORKER.scrypt(password.encode('utf-8'), salt=salt, n=n, r=r, p=p,
                                       dklen=SCRYPT_DKLEN)
@@ -391,9 +395,25 @@ def needs_rehash(verifier):
     return scheme != 'scrypt' or int(n) < SCRYPT_N or int(r) < SCRYPT_R or int(p) < SCRYPT_P
 
 
-def _validate_password(password):
-    if not isinstance(password, str) or not MIN_PASSWORD <= len(password) <= MAX_PASSWORD:
-        raise invalid('Password must be %d-%d characters' % (MIN_PASSWORD, MAX_PASSWORD))
+def validate_password_min_length(value):
+    """The installation's password minimum: a whole number from 1 to ``MAX_PASSWORD``.
+
+    One rule for the web service flag and the office configuration, so neither clamps
+    a value to the bounds (kittrial-5bb.363). The default is 1: any non-empty password.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not MIN_PASSWORD <= value <= MAX_PASSWORD:
+        raise ValueError('password_min_length must be a whole number from %d to %d'
+                         % (MIN_PASSWORD, MAX_PASSWORD))
+    return value
+
+
+def _validate_password(password, minimum=MIN_PASSWORD):
+    # A password of nothing but spaces is a mistake, not a choice: refused here for every
+    # surface that sets one (change, reset redeem, bootstrap), in one sentence (5bb.363).
+    if isinstance(password, str) and password and not password.strip():
+        raise invalid('A password cannot be only spaces.')
+    if not isinstance(password, str) or not minimum <= len(password) <= MAX_PASSWORD:
+        raise invalid('Password must be %d-%d characters' % (minimum, MAX_PASSWORD))
 
 
 # A fixed verifier used to spend the same work when an account does not exist, so a
@@ -1035,7 +1055,8 @@ class Service:
                  result_retention=RESULT_RETENTION_SECONDS,
                  login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None,
                  lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
-                 approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT):
+                 approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT,
+                 password_min_length=MIN_PASSWORD):
         self.store = store
         #: Per-agent locks spanning the claim gate's held-set read and the claim write
         #: (kittrial-5bb.276 revision; per-agent in kittrial-5bb.300). Keyed by the
@@ -1049,6 +1070,10 @@ class Service:
         self.approval_by_another_party = approval_by_another_party is True
         self.session_idle = session_idle
         self.session_absolute = session_absolute
+        #: The installation's password minimum (kittrial-5bb.363), default 1. Every
+        #: writer goes through hash_password/redeem_reset with this value, so the rule
+        #: cannot drift between the bootstrap prompt and the web forms.
+        self.password_min_length = validate_password_min_length(password_min_length)
         self.credential_ttl = credential_ttl
         # Preserve the existing test/embedding injection of credential_ttl when no new
         # option was supplied. The command line always supplies the installation days.
@@ -1275,8 +1300,10 @@ class Service:
 
     # -- bootstrap (operator, out of band; never an HTTP route) -----------------
     @classmethod
-    def bootstrap_superuser(cls, store, username, password, display_name=None):
+    def bootstrap_superuser(cls, store, username, password, display_name=None,
+                            password_min_length=MIN_PASSWORD):
         """Create the first protected superuser. Refuses once any account exists."""
+        minimum = validate_password_min_length(password_min_length)
         with store.lock:
             if store.state['users']:
                 raise conflict('A superuser already exists')
@@ -1286,7 +1313,7 @@ class Service:
                 'id': 'usr_' + secrets.token_hex(8),
                 'username': username,
                 'display_name': display_name or username,
-                'password': hash_password(password),
+                'password': hash_password(password, minimum=minimum),
                 'superuser': True,
                 'disabled': False,
                 'created_at': now_iso(store.now()),
@@ -1448,7 +1475,7 @@ class Service:
                     raise forbidden('Current password is incorrect')
             if verify_password(user.get('password'), new_password):
                 raise invalid('New password must differ from the current password')
-            user['password'] = hash_password(new_password)
+            user['password'] = hash_password(new_password, minimum=self.password_min_length)
             if user.get('reset_token'):
                 user.pop('reset_token')
             self._revoke_sessions_for(user_id)
@@ -1485,7 +1512,7 @@ class Service:
                 'expires_at': now_iso(moment + self.reset_ttl), 'single_use': True}
 
     def redeem_reset(self, user_id, reset_value, new_password):
-        _validate_password(new_password)
+        _validate_password(new_password, self.password_min_length)
         digest = token_hash(reset_value)
         with self.store.lock:
             record = self.state['reset_tokens'].get(digest)
@@ -1496,7 +1523,7 @@ class Service:
                 raise unauthenticated('Invalid or expired reset value')
             user = self._user(user_id)
             record['used'] = True
-            user['password'] = hash_password(new_password)
+            user['password'] = hash_password(new_password, minimum=self.password_min_length)
             self._revoke_sessions_for(user_id)
             self._revoke_credentials_for(user_id)
             self.store.save()
@@ -3093,10 +3120,13 @@ class Service:
         'agents.project.revoke': 'removed from the project',
         'agents.coordinator.grant': 'coordinator grant given',
         'agents.coordinator.revoke': 'coordinator grant ended',
+        'agents.release.grant': 'release grant given',
+        'agents.release.revoke': 'release grant ended',
     }
     #: Project-bound kinds: a project's view lists them only for its own project.
     AGENT_HISTORY_PROJECT_KINDS = ('agents.project.granted', 'agents.project.revoke',
-                                   'agents.coordinator.grant', 'agents.coordinator.revoke')
+                                   'agents.coordinator.grant', 'agents.coordinator.revoke',
+                                   'agents.release.grant', 'agents.release.revoke')
     AGENT_HISTORY_DROPPED = ('Older history is no longer kept: the service keeps the last %d audit events '
                              'for all projects together.' % AUDIT_LIMIT)
     AGENT_HISTORY_GRANT_UNKNOWN = ('This agent was given this project before the time of a grant was recorded, so its '
@@ -3297,6 +3327,9 @@ class Service:
             # when, and whether the grant has effect now (its account must itself be a
             # coordinator or an owner here); null when it holds none.
             view['coordinator'] = self.coordinator_view(project_id, agent)
+            # Whether this agent may RECORD A RELEASE here (kittrial-5bb.378): the same
+            # shape as the coordinator row, so one panel can show both grants.
+            view['release'] = self.release_view(project_id, agent)
         return view
 
     def coordinator_view(self, project_id, agent):
@@ -3310,6 +3343,31 @@ class Service:
                                       'account-disabled' if owner.get('disabled') else 'account-role')
         return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
                 'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
+
+    def release_view(self, project_id, agent):
+        """Whether this agent may record a release in this project now (kittrial-5bb.378).
+
+        Mirrors :meth:`coordinator_view`, but the grant only takes effect while the
+        agent's account still holds ``project.admin`` here (owner, or a superuser). Null
+        when the agent holds no release grant.
+        """
+        grant = release_grant(self.state, project_id, agent['id'])
+        if grant is None:
+            return None
+        effective = self._may_release(project_id, agent)
+        owner = self.state['users'].get(agent.get('owner')) or {}
+        why = None if effective else ('agent-disabled' if not agent.get('enabled') else
+                                      'account-disabled' if owner.get('disabled') else 'account-role')
+        return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
+                'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
+
+    def _may_release(self, project_id, agent):
+        """Whether the agent's account holds the owner's capabilities in the project now."""
+        owner = self.state['users'].get(agent.get('owner')) or {}
+        if owner.get('disabled') or not agent.get('enabled'):
+            return False
+        role = self.state.get('memberships', {}).get(project_id, {}).get(agent.get('owner'))
+        return bool(owner.get('superuser')) or CAP_PROJECT_ADMIN in ROLE_CAPABILITIES.get(role, frozenset())
 
     def coordinators_of(self, principal, project_id):
         """Who coordinates the project, for any reader of it (kittrial-5bb.198). Changes nothing.
@@ -3395,25 +3453,33 @@ class Service:
             return self.project_agent_view(agent, project_id)
 
     def _end_coordinator_grants(self, agent, project_ids, principal, request_id, reason):
-        """Delete the agent's coordinator grant in each of ``project_ids``, and say so in the audit.
+        """Delete the agent's coordinator AND release grants in each of ``project_ids``.
 
-        The ONE place for every way an agent stops being in a project: out of the project, out
-        of its coordinators. A grant must not wait in the state for the project to be put back.
-        Caller holds ``store.lock`` and saves. Each grant that was there is audited as a revoke
-        in its project, with who did what ended it and why.
+        The ONE place for every way an agent stops being in a project: out of the project,
+        out of its coordinators, out of its release grant. A grant must not wait in the
+        state for the project to be put back. Caller holds ``store.lock`` and saves. Each
+        grant that was there is audited as a revoke in its project, with who did what
+        ended it and why. ``release_grants`` (kittrial-5bb.378) is the same family: an
+        agent that leaves takes its release authority with it.
         """
         grants = self.state.get('coordinator_grants')
-        if not isinstance(grants, dict):
-            return []
+        releases = self.state.get('release_grants')
         ended = []
         for project_id in project_ids:
-            held = grants.get(project_id)
+            held = grants.get(project_id) if isinstance(grants, dict) else None
             if isinstance(held, dict) and agent['id'] in held:
                 del held[agent['id']]
                 if not held:
                     del grants[project_id]
                 ended.append(project_id)
                 self.audit(request_id, principal, 'agents.coordinator.revoke', 'committed', project_id=project_id,
+                           reason='agent %s: %s' % (agent['id'], reason))
+            released = releases.get(project_id) if isinstance(releases, dict) else None
+            if isinstance(released, dict) and agent['id'] in released:
+                del released[agent['id']]
+                if not released:
+                    del releases[project_id]
+                self.audit(request_id, principal, 'agents.release.revoke', 'committed', project_id=project_id,
                            reason='agent %s: %s' % (agent['id'], reason))
         return ended
 
@@ -3429,6 +3495,62 @@ class Service:
             if not isinstance(held, dict) or agent_id not in held:
                 raise not_found('Agent not found' if project_id not in (agent.get('projects') or [])
                                 else 'This agent holds no coordinator grant in this project')
+            del held[agent_id]
+            if not held:
+                del grants[project_id]
+            self.store.save()
+            return self.project_agent_view(agent, project_id)
+
+    NOT_A_RELEASE_OWNER = ('This agent\'s account is not an owner of this project, so a release grant would '
+                           'have no effect. Make the account an owner first (Members), then grant the agent.')
+
+    def grant_release(self, principal, project_id, agent_id, request_id=None):
+        """Let one agent record releases in one project (kittrial-5bb.378).
+
+        The route holds the ``CAP_PROJECT_ADMIN`` boundary: an owner of the project or a
+        superuser, never a credential. The agent must be a personal agent granted this
+        project, enabled, and its account must itself be an owner of the project (or a
+        superuser): a release grant that could not take effect is not written. Stored
+        under ``release_grants[project][agent]`` beside the coordinator grant; read live
+        on every release write, so a revocation or a demotion refuses the next request.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change a release grant')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            if project_id not in (agent.get('projects') or []):
+                raise not_found('Agent not found')
+            if not agent.get('enabled'):
+                raise conflict('A disabled agent cannot be granted')
+            if not self._may_release(project_id, agent):
+                raise conflict(self.NOT_A_RELEASE_OWNER)
+            stored = self.state.get('release_grants')
+            # An ABSENT key is every installation before its first release grant. A key
+            # that is there with anything but an object is damage and fails closed.
+            if 'release_grants' in self.state and (not isinstance(stored, dict)
+                                                   or not isinstance(stored.get(project_id, {}), dict)):
+                raise HttpError(503, 'unavailable',
+                                'The record of release grants in the service state is damaged (it is not an object), '
+                                'so no grant was written. An operator must repair the state file')
+            grants = self.state.setdefault('release_grants', {}).setdefault(project_id, {})
+            if release_grant(self.state, project_id, agent_id) is None:
+                grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
+                self.store.save()
+            return self.project_agent_view(agent, project_id)
+
+    def revoke_release(self, principal, project_id, agent_id, request_id=None):
+        """Take the release grant away. From the next request the agent releases nothing here."""
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change a release grant')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            agent = self._agent(agent_id)
+            grants = self.state.get('release_grants')
+            held = grants.get(project_id) if isinstance(grants, dict) else None
+            if not isinstance(held, dict) or agent_id not in held:
+                raise not_found('Agent not found' if project_id not in (agent.get('projects') or [])
+                                else 'This agent holds no release grant in this project')
             del held[agent_id]
             if not held:
                 del grants[project_id]

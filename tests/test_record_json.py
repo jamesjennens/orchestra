@@ -206,10 +206,10 @@ class NoUnguardedParseTests(unittest.TestCase):
                            'a damaged, unreadable or nested file is caught and read as the restrictive '
                            '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
                            'permissive default'),
-        'client.py': (16, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
-                         'kittrial-5bb.285 added two of the thirteen: the wait read\'s answer from the endpoint and the '
-                         'wait command\'s own read of the config file (both the same kind of text as the other ten, '
-                         "and neither is a record comment or a caller's payload). The thirteenth (kittrial-5bb.327 "
+        'client.py': (15, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
+                         'kittrial-5bb.285 added the wait read\'s answer from the endpoint (and wait\'s --config read, '
+                         'which kittrial-5bb.373 merged with main()\'s --config read into one parse after delivery; '
+                         "neither is a record comment or a caller's payload). The twelfth (kittrial-5bb.327 "
                          "review 2) is the wait's own small state file: text this client wrote beside its config, "
                          'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
                          'treated as absent. The last three (kittrial-5bb.384) are the `files` command\'s reads of the endpoint\'s own answer line '
@@ -263,7 +263,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py', 'task_assignment.py')
+    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'requirement_baseline_records.py', 'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -311,7 +311,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # completeness record already at the operator's destination: text this kit did
             # not just write itself, so a deeply nested one is described rather than
             # crashing the copy out of the guard.
-            'admin.py': 9,
+            'admin.py': 10,
+            # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
+            # message line through the guard: a room post is text a person wrote, and a
+            # nested or lookalike file must be a refusal, never a RecursionError.
+            'rooms.py': 4,
             # kittrial-5bb.339: read_cache parses the kit's own cached export rows
             # through the guard (corrupt = a miss and a fresh export). The second
             # (kittrial-5bb.346 r2/r4) is the cache file's HEADER line, read by both
@@ -339,11 +343,17 @@ class NoUnguardedParseTests(unittest.TestCase):
             # note or withdrawal reason this caller transports).
             # task_files.py (kittrial-5bb.370): a host journal entry, the task row bd prints and
             # the two `comments add` answers; a nested or damaged one is no entry, never a
-            # traceback.
+            # traceback. kittrial-5bb.380 adds four: the entries a backup, verify or purge
+            # walks, a backup's manifest.json (a copy that may have been altered), and the
+            # answer a reverse proxy or the site gives the proxy check. kittrial-5bb.380 r2: and the backup's
+            # previous manifest, read to keep the last good copy of an entry that cannot be read now.
+            # kittrial-5bb.378: the thirteenth guards the web release body (a query scope or one
+            # deploy group the route transports); web_release has already validated its field
+            # set, and the guard bounds its nesting before it is parsed.
             # endpoint.py (kittrial-5bb.384): the framed task-file header line, and the request text read
             # whole (the same guarded parse the old reader made, now in two places: a pipe and a text stream).
-            'task_files.py': 4,
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 14, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'task_files.py': 9,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 15, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
@@ -357,6 +367,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # Assignment adds closed roster/request payloads at the endpoint and
             # guards both its native task reply and its reserved notice body.
             'task_assignment.py': 2,
+            # B2 frozen snapshot bytes and sidecar records are bounded untrusted
+            # text, parsed through the nesting guard with duplicate-key refusal.
+            'requirement_baseline_records.py': 1, 'requirement_baselines.py': 1,
+
             # Service-only guidance bodies are caller text, parsed through the nesting guard.
             'web_guidance.py': 2,
             'web_merge_slot.py': 4,

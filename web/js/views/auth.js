@@ -1,5 +1,6 @@
 import { h, brandMark } from '../dom.js';
-import { field, setFieldError, formValues, describe } from '../ui.js';
+import { field, setFieldError, formValues, describe,
+         passwordHint, passwordTooShort, PASSWORD_MISMATCH } from '../ui.js';
 
 export function login(ctx, message) {
   const status = h('div', { class: 'banner crit', role: 'alert', hidden: !message }, message || '');
@@ -49,13 +50,17 @@ export function redeem(ctx) {
   const form = h('form', { class: 'form', novalidate: true },
     field({ id: 'account', label: 'Account ID', hint: 'Shown next to the reset code your administrator gave you, e.g. usr_…', required: true }),
     field({ id: 'code', label: 'Reset code', autocomplete: 'one-time-code', required: true }),
-    field({ id: 'new_password', label: 'New password', type: 'password', autocomplete: 'new-password', hint: 'At least 12 characters.', required: true }),
+    field({ id: 'new_password', label: 'New password', type: 'password', autocomplete: 'new-password', hint: passwordHint(ctx.me), required: true }),
+    field({ id: 'confirm_password', label: 'Repeat new password', type: 'password', autocomplete: 'new-password', required: true }),
     h('button', { type: 'submit', class: 'primary' }, 'Set password'));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const v = formValues(form);
-    if (String(v.new_password).length < 12) return setFieldError(form, 'new_password', 'Use at least 12 characters.');
+    const tooShort = passwordTooShort(ctx.me, v.new_password);
+    if (tooShort) return setFieldError(form, 'new_password', tooShort);
     setFieldError(form, 'new_password', '');
+    if (v.new_password !== v.confirm_password) return setFieldError(form, 'confirm_password', PASSWORD_MISMATCH);
+    setFieldError(form, 'confirm_password', '');
     try {
       await ctx.api.redeemReset(v.account.trim(), v.code.trim(), v.new_password);
       ctx.root.replaceChildren(login(ctx));

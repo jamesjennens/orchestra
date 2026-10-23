@@ -1136,7 +1136,14 @@ class ProxyAwareSelfCheckCase(unittest.TestCase):
                   "const p = m.secretlessPayload({agent:{id:'a',name:'Kestrel',projects:['p1']}}, 'https://orchestra.office.example:8443');"
                   "console.log(m.agentGuide(p))")
         guide = run_node_module(self, node, script, SETUP_JS.as_uri()).stdout
-        self.assertEqual(3, guide.count('--noproxy orchestra.office.example --max-time 60'), guide)
+        # kittrial-5bb.386: the task-file lines keep the same bypass and limit too, so the three
+        # calls counted before become nine (the two in "Every call", step 2, and list/download/
+        # upload in both shells).
+        self.assertEqual(9, guide.count('--noproxy orchestra.office.example --max-time 60'), guide)
+        for fragment in ("/v1/projects/PROJECT/tasks/TASK/files'",
+                         "/v1/projects/PROJECT/tasks/TASK/files/SHA256'",
+                         "/v1/projects/PROJECT/tasks/TASK/files?name=NAME&direction=from-worker'"):
+            self.assertEqual(2, guide.count(fragment), fragment)      # PowerShell and POSIX
 
     def run_check(self, shell, server, env_extra=None):
         cmds = self.commands(server)
@@ -1344,6 +1351,8 @@ class TheServerAddressStaysTextCase(unittest.TestCase):
         cmds = self.commands(self.HOSTILE_SH)
         self.assertEqual('<ORCHESTRA_SERVER_URL>', cmds['refused']['server'])     # the wizard never builds from it
         self.assertTrue(cmds['refused']['serverRefused'])
+        # kittrial-5bb.386: the two "Every call" lines and the task-file list/download/upload lines.
+        self.assertEqual(4, len(cmds['guideSh']))
         home = self.home()
         env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
         for command in [cmds['test']['posix'], cmds['check']['posix'], cmds['rewrite']['posix']] + cmds['guideSh']:
@@ -1357,6 +1366,7 @@ class TheServerAddressStaysTextCase(unittest.TestCase):
         if not POWERSHELL or os.name != 'nt':
             self.skipTest('runs where Windows PowerShell is installed')
         cmds = self.commands(self.HOSTILE_PS)
+        self.assertEqual(4, len(cmds['guidePs']))       # kittrial-5bb.386: the task-file lines run too
         home = self.home()
         env = dict(os.environ, HOME=str(home), USERPROFILE=str(home), LOCALAPPDATA=str(home))
         for command in [cmds['test']['powershell'], cmds['check']['powershell'], cmds['rewrite']['powershell']] + cmds['guidePs']:

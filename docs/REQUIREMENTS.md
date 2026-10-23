@@ -327,3 +327,61 @@ Record the resulting receipt and manifest hashes back in Beads before describing
 An interruption before pointer replacement leaves the previous current publication intact. Retry the same inputs to finish a complete candidate that was written before interruption. Temporary staging directories are never current. Keep historical named publications; do not edit their files in place.
 
 When code exposes a problem, record a linked defect, ambiguity or scope-change proposal in Beads, with the affected requirement IDs/revisions and original assertion. An accepted change gets a new source revision and baseline; earlier snapshots remain reproducible. `requirement_impact.py` traverses an explicit work graph and emits reassessment results. Automatic writes of those results into task state and lifecycle tables remain separate pending features. Unrecorded implementation/test/review/integration/deployment/live-verification facts remain unknown.
+
+
+## Named requirements snapshots and Markdown
+
+The project's Business requirements page lets a signed-in current human owner in
+simple mode **cut a baseline**. This freezes the current view; it does not accept
+pending requirements, pending narrative, a decision or an offline publication.
+Every pending requirement and narrative section in the exported Markdown says
+**Pending - not accepted**. Open native decisions/questions are observations,
+not acceptance evidence. The generated BRD remains a view of canonical records.
+
+A project may hold **64 baselines including unfinished cuts**. Names contain
+1–64 ASCII letters/digits with internal hyphens/underscores, are stored lowercase,
+and cannot be Windows device names. Snapshot and Markdown limits are each
+**4194304 UTF-8 bytes**. A complete selected native export is required; incomplete
+or unreadable selected requirements, decisions or questions stop the cut.
+Provably unrelated malformed rows do not invalidate a healthy selected record.
+No caller chooses a filesystem destination.
+
+All current human members, including viewers, may list named baselines, select a
+frozen document, export Markdown, and compare current requirements with a named
+baseline. This adds no agent or worker-credential authority. The owner cut form
+is unavailable to human coordinators and granted agents: their B1 requirement
+editing authority does not grant permission to cut a baseline. The form
+requires confirmation and the ordinary session/CSRF checks. Current ownership
+and simple mode are checked again under the canonical locks, including retries
+of a previously successful request. Changing mode does not rewrite frozen files.
+
+The document selector offers **Current requirements** and named frozen views.
+The last cut is a pointer, not a timestamp ordering. Changes separately show
+added, removed, edited, pending, newly accepted, withdrawn and superseded
+requirements with exact revision/hash references. Decision/question changes and
+governance changes are reported separately. No baseline is an explicit empty
+state. A missing or damaged selected baseline gives an error; it is never replaced
+with today's document. Other healthy named baselines remain independently readable.
+
+The browser saves only account-scoped baseline names and request keys in tab
+storage **before** sending a cut. After a lost response, reload or a new login to
+the same account, use the saved **Retry NAME** control. Retries reconcile the exact
+saved capture, even if requirements changed later. Do not clear tab storage or
+change a pending name to work around an uncertain result. An incomplete capture
+requires the host operator to reconcile it. If tab storage cannot be read or
+written, the browser refuses a new cut until storage is repaired. Restoring
+ownership or simple mode is still required before an old request may replay.
+
+The HTTP routes are:
+
+- `POST /v1/projects/{pid}/requirements/baselines` with exactly `{name}`.
+- `GET /v1/projects/{pid}/requirements/baselines` and `/baselines/{name}`.
+- `GET /v1/projects/{pid}/brd/export` with optional `baseline=NAME`; returns a
+  fixed safe filename, Markdown text and its UTF-8 SHA-256.
+- `GET /v1/projects/{pid}/brd/changes?baseline=NAME`; omitting the name compares
+  with the last successful cut, or reports that no baseline exists.
+
+The normal requirements read adapter also accepts `baselines`, `baseline NAME`,
+`export [NAME]` and `changes [NAME]`. These return data; they do not write an export
+to a caller path. See [installation and recovery](OPERATIONS.md) before restoring
+or rolling back a project that has cut a baseline.

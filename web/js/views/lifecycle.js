@@ -31,11 +31,15 @@ function integrationCheck(ctx, project, task) {
       h('h4', null, 'Writes still owed'),
       h('ol', null, (state.next || []).map(step => h('li', null,
         h('strong', null, step.step + ': '), step.state,
+        step.response_state && step.response_state !== step.state
+          ? h('span', { class: 'muted' }, ' · last response ' + step.response_state) : null,
         h('div', { class: 'muted' }, step.route,
           step.operation_id ? ' · operation ' + step.operation_id : ' · new operation identity'),
+        step.fact ? h('div', { class: 'muted' }, 'fact ' + step.fact) : null,
         step.operation_id_note ? h('div', { class: 'muted' }, step.operation_id_note) : null,
+        step.fact_note ? h('div', { class: 'muted' }, step.fact_note) : null,
         step.reason ? h('div', { class: 'muted' }, step.reason) : null))),
-      h('p', { class: 'muted' }, 'The server never performs the merge, the test run or the push; those stay a person\'s step.'));
+      h('p', { class: 'muted' }, 'The server never performs the merge, the test run or the push; a coordinator agent may push only with its own repository-scoped credential, and the push is recorded as that agent\'s word.'));
   }
   button.addEventListener('click', async () => {
     if (reading) return;

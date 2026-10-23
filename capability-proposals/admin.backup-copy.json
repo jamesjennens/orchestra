@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb380-admin-backup-copy-0001",
+  "key": "admin.backup-copy",
+  "name": "admin.py backup-copy: copy complete backup pairs to an off-machine directory",
+  "aliases": [
+    "off-machine backup copy",
+    "backup-copy",
+    "copy backups off the machine"
+  ],
+  "summary": "admin.py backup-copy DEST copies, under DEST, every project whose last backup pair is complete (with its task-files folder when there is one); a project that is not complete is skipped and named, and the run then exits non-zero and publishes no completeness record. --all-or-nothing copies nothing unless every initialized project has a complete pair; --require-clean also refuses a project recorded degraded.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#backups"
+  ],
+  "code": [
+    "admin.py::backup_copy",
+    "admin.py::backup_copy_skips",
+    "admin.py::backup_copy_run_record"
+  ],
+  "tests": [
+    "tests/test_backup_multi.py",
+    "tests/test_backup_native_sync.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "admin",
+    "backup"
+  ]
+}

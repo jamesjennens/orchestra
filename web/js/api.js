@@ -38,7 +38,7 @@ export const KEEP_ALIVE_WARN_MS = 2 * 60 * 1000;
 function later(callback, ms) { return globalThis.setTimeout(callback, ms); }
 function cancel(handle) { if (handle !== null && handle !== undefined) globalThis.clearTimeout(handle); }
 
-export function createApi(transport) {
+export function createApi(transport, binaryTransport = fetchBinaryTransport) {
   let csrf = null;
 
   async function call(method, path, { body, params, key } = {}) {
@@ -172,6 +172,127 @@ export function createApi(transport) {
       }
       throw error;
     }
+  }
+
+  // Baseline names and request keys only, scoped to the freshly read account.
+  // Save before sending: a reload/new session must never recapture an uncertain
+  // cut under a fresh key. A failed retry retains its original intent too.
+  async function baselineIntents() {
+    const current = await call('GET', '/v1/sessions/current');
+    if (current.csrf_token) csrf = current.csrf_token;
+    const actor = current.user?.id;
+    if (current.via !== 'session' || current.credential || !/^usr_[a-f0-9]{16}$/.test(actor || ''))
+      throw new ApiError(403, 'baseline_session', 'Baseline cuts need a signed-in project owner.', null, null);
+    const storage = 'orchestra-baseline-retries-v1:' + actor;
+    let entries;
+    try {
+      const raw = sessionStorage.getItem(storage);
+      if (raw && raw.length > 32768) throw new Error();
+      entries = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(entries) || entries.length > 64) throw new Error();
+      const seen = new Set();
+      for (const entry of entries) {
+        if (!entry || Object.keys(entry).sort().join(',') !== 'key,name,project'
+            || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$/.test(entry.project || '')
+            || !/^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/.test(entry.name || '')
+            || !/^[A-Za-z0-9_-]{8,128}$/.test(entry.key || '')) throw new Error();
+        const identity = entry.project + '/' + entry.name;
+        if (seen.has(identity)) throw new Error();
+        seen.add(identity);
+      }
+    } catch {
+      throw new ApiError(409, 'baseline_retry_storage', 'Saved baseline retries cannot be read. Ask the host operator to reconcile them before clearing tab storage.', null, null);
+    }
+    const save = () => {
+      try {
+        if (entries.length > 64) throw new Error();
+        sessionStorage.setItem(storage, JSON.stringify(entries));
+      } catch {
+        throw new ApiError(409, 'baseline_retry_storage', 'Baseline retry keys cannot be saved. Restore tab storage before cutting a baseline.', null, null);
+      }
+    };
+    return { entries, save };
+  }
+  let baselineQueue = Promise.resolve();
+  function cutBaseline(pid, body) {
+    const next = baselineQueue.then(() => performBaselineCut(pid, body));
+    baselineQueue = next.catch(() => {});
+    return next;
+  }
+  async function performBaselineCut(pid, body) {
+    if (!body || Object.keys(body).join(',') !== 'name' || typeof body.name !== 'string'
+        || !/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$/.test(body.name))
+      throw new ApiError(422, 'baseline_name', 'Use a baseline name of 1 to 64 letters or digits, with internal hyphens or underscores.', null, null);
+    const name = body.name.toLowerCase();
+    const saved = await baselineIntents();
+    let entry = saved.entries.find(item => item.project === pid && item.name === name);
+    if (!entry) {
+      entry = { project: pid, name, key: newKey() };
+      saved.entries.push(entry);
+    }
+    saved.save();
+    let result;
+    try {
+      result = await call('POST', `/v1/projects/${encodeURIComponent(pid)}/requirements/baselines`,
+                          { body: { name }, key: entry.key });
+    } catch (caught) {
+      const error = caught instanceof ApiError ? caught : new ApiError(0, 'network',
+        'The baseline response was lost. Retry the same named cut.', null, null);
+      error.retry = () => cutBaseline(pid, { name });
+      throw error;
+    }
+    saved.entries.splice(saved.entries.indexOf(entry), 1);
+    try { saved.save(); }
+    catch {
+      throw new ApiError(503, 'baseline_retry_cleanup', 'The cut completed but its retry key could not be cleared. Retry the same named cut to reconcile it.', null, null);
+    }
+    return result;
+  }
+  async function pendingBaselineCuts(pid) {
+    const saved = await baselineIntents();
+    return saved.entries.filter(entry => entry.project === pid).map(entry =>
+      ({ name: entry.name, retry: () => cutBaseline(pid, { name: entry.name }) }));
+  }
+
+  // Task files (kittrial-5bb.376). The bytes travel through the binary transport, never
+  // through the JSON one; the CSRF token and the idempotency key are the ones the JSON
+  // calls use. The browser sets Content-Length from the body it is given.
+  function filesPath(pid, tid) {
+    return `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/files`;
+  }
+  async function binaryCall(method, path, { headers, body, key } = {}) {
+    const sent = { ...(headers || {}) };
+    if (method !== 'GET' && csrf) sent['X-CSRF-Token'] = csrf;
+    if (key) sent['Idempotency-Key'] = key;
+    const response = await binaryTransport(method, path, sent, body);
+    if (response.status >= 200 && response.status < 300) return response;
+    const data = response.data;
+    const error = (data && data.error) || {};
+    throw new ApiError(response.status, error.code, error.message, error.detail, data && data.request_id);
+  }
+  async function uploadTaskFile(pid, tid, { name, direction, bytes, sha256 }) {
+    const path = filesPath(pid, tid) + query({ name, direction });
+    const intent = 'PUT ' + path + ' ' + sha256;
+    const key = uncertainKeys.get(intent) || newKey();
+    try {
+      const response = await binaryCall('PUT', path, {
+        headers: { Accept: 'application/json', 'Content-Type': 'application/octet-stream', 'X-Orchestra-SHA256': sha256 },
+        body: bytes, key,
+      });
+      uncertainKeys.delete(intent);
+      return response.data;
+    } catch (error) {
+      uncertainKeys.delete(intent);
+      if (error instanceof ApiError && error.uncertain) {
+        uncertainKeys.set(intent, key);
+        if (uncertainKeys.size > UNCERTAIN_KEYS_MAX) uncertainKeys.delete(uncertainKeys.keys().next().value);
+      }
+      throw error;
+    }
+  }
+  async function downloadTaskFile(pid, tid, sha256) {
+    const response = await binaryCall('GET', filesPath(pid, tid) + '/' + encodeURIComponent(sha256), { headers: { Accept: '*/*' } });
+    return { bytes: response.bytes, digest: response.digest || null };
   }
 
   // The authenticated session read. It is also the keep-alive touch: the service refreshes
@@ -389,8 +510,16 @@ export function createApi(transport) {
     projectAgentHistory: (pid, aid) => call('GET', `/v1/projects/${pid}/agents/${aid}/history`),
     grantCoordinator: (pid, aid) => mutate('PUT', `/v1/projects/${pid}/agents/${aid}/coordinator`, {}),
     revokeCoordinator: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/coordinator`),
+    // The project's release grant (kittrial-5bb.378): an owner gives one agent the right
+    // to RECORD releases here; a coordinator grant does not carry it.
+    grantRelease: (pid, aid) => mutate('PUT', `/v1/projects/${pid}/agents/${aid}/release`, {}),
+    revokeRelease: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/release`),
     // Who coordinates the project and the rules that bind them, for any member; read only (kittrial-5bb.198).
     coordination: (pid) => call('GET', `/v1/projects/${pid}/coordination`),
+    // Release facts (kittrial-5bb.378). The query writes nothing; a deploy records ONE
+    // group of at most 200 already-resolved targets and is idempotent per intent.
+    releaseQuery: (pid, scope) => call('POST', `/v1/projects/${pid}/releases/query`, { body: { scope } }),
+    deployRelease: (pid, body) => mutate('POST', `/v1/projects/${pid}/releases`, body),
     removeMember: (pid, uid) => mutate('DELETE', `/v1/projects/${pid}/members/${uid}`),
     credentials: (pid) => call('GET', `/v1/projects/${pid}/worker-credentials`, { params: { limit: 100 } }),
     issueCredential: (pid, scopes, label) => mutate('POST', `/v1/projects/${pid}/worker-credentials`, { scopes, label }),
@@ -439,9 +568,24 @@ export function createApi(transport) {
     myContributions: (params) => call('GET', '/v1/me/contributions', { params }),
     feedback: (pid, params) => call('GET', `/v1/projects/${pid}/feedback`, { params }),
     addFeedback: (pid, body) => mutate('POST', `/v1/projects/${pid}/feedback`, body),
+    // project rooms (kittrial-5bb.385); the post/moderation/archive writes each carry one
+    // Idempotency-Key, which is also the room line's operation_id on the server.
+    rooms: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/rooms`, { params }),
+    room: (pid, rid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}`, { params }),
+    createRoom: (pid, name) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms`, { name }),
+    postRoomMessage: (pid, rid, text) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/messages`, { text }),
+    archiveRoom: (pid, rid, reason) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/archive`, reason ? { reason } : {}),
+    moderateRoomMessage: (pid, rid, sequence, reason) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/messages/${sequence}/moderate`, { reason }),
+    exportRoom: (pid, rid, format) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/export`, { params: { format } }),
     requirements: (pid) => call('GET', `/v1/projects/${pid}/requirements`),
     requirement: (pid, rid) => call('GET', `/v1/projects/${pid}/requirements/${rid}`),
     brd: (pid) => call('GET', `/v1/projects/${pid}/brd`),
+    baselines: (pid) => call('GET', `/v1/projects/${pid}/requirements/baselines`),
+    baseline: (pid, name) => call('GET', `/v1/projects/${pid}/requirements/baselines/${encodeURIComponent(name)}`),
+    exportBrd: (pid, baseline) => call('GET', `/v1/projects/${pid}/brd/export`, { params: { baseline } }),
+    brdChanges: (pid, baseline) => call('GET', `/v1/projects/${pid}/brd/changes`, { params: { baseline } }),
+    cutBaseline,
+    pendingBaselineCuts,
     createRequirement: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements`, body),
     reviseRequirement: (pid, rid, body) => mutate('PATCH', `/v1/projects/${pid}/requirements/${rid}`, body),
     acceptRequirement: (pid, rid, body) => mutate('POST', `/v1/projects/${pid}/requirements/${rid}/accept`, body),
@@ -476,6 +620,10 @@ export function createApi(transport) {
     proposeCapabilityAlias: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}/aliases`, body),
     rejectCapabilityAlias: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}/aliases/reject`, body),
     audit: (pid, params) => call('GET', `/v1/projects/${pid}/audit`, { params }),
+    taskFiles: (pid, tid) => call('GET', filesPath(pid, tid)),
+    uploadTaskFile,
+    downloadTaskFile,
+    withdrawTaskFile: (pid, tid, sha256, reason) => mutate('POST', `${filesPath(pid, tid)}/${encodeURIComponent(sha256)}/withdraw`, { reason }),
   };
 }
 
@@ -487,6 +635,24 @@ export async function fetchTransport(method, path, headers, body) {
   } catch (error) {
     // Network failure: the write may or may not have happened.
     return { status: 0, data: { error: { code: 'network', message: 'The server could not be reached. Your change may not have been saved; retry to check.' } } };
+  }
+  let data = null;
+  const text = await response.text();
+  if (text) { try { data = JSON.parse(text); } catch { data = null; } }
+  return { status: response.status, data };
+}
+
+// Real transport for task-file bytes: same-origin fetch. A successful download answers its
+// bytes and the digest the server recorded; every other answer is read as the JSON error.
+export async function fetchBinaryTransport(method, path, headers, body) {
+  let response;
+  try {
+    response = await fetch(path, { method, headers, body, credentials: 'same-origin', cache: 'no-store' });
+  } catch (error) {
+    return { status: 0, data: { error: { code: 'network', message: 'The server could not be reached. Nothing was confirmed; retry to check.' } } };
+  }
+  if (response.ok && method === 'GET') {
+    return { status: response.status, bytes: new Uint8Array(await response.arrayBuffer()), digest: response.headers.get('X-Orchestra-SHA256') };
   }
   let data = null;
   const text = await response.text();

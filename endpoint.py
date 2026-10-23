@@ -916,7 +916,7 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
 #: which a bound key is not told.
-SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-guidance',
+SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
                       'task-file')
 
@@ -1168,6 +1168,9 @@ READ_ONLY_ACTIONS={
     # take the project lock exclusively or write.
     'web-lifecycle':lambda args,operation:operation in ('read','check'),
     'web-merge-slot':lambda args,operation:operation=='check',
+    # The release query writes nothing (kittrial-5bb.378); a deploy reserves an
+    # operation identity and stays exclusive.
+    'web-release':lambda args,operation:operation=='query',
     'web-guidance':_web_guidance_read_only,
     # kittrial-5bb.291 item 1: the roster read takes the project lock shared through
     # the one table, not a hand-coded LOCK_SH at its own call site. task-assign is
@@ -1210,6 +1213,9 @@ def held_coordination_lock(path,shared=False):
 
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None,frame=None):
     key_project_refusal(request,key_projects)
+    if isinstance(request,dict) and request.get('action')=='delivery':
+        from review_workflow import DELIVERY_SSH_ONLY_HTTP
+        raise ValueError(DELIVERY_SSH_ONLY_HTTP)
     # Rule 2: a key bound to a principal is refused the web-only actions here, before their
     # name is looked at. The gate proper needs the project's registry and is asked below,
     # after the project is known; this structural refusal means no action at all is answered
@@ -1221,7 +1227,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1537,6 +1543,44 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         classified=record_json.classify(raw_rows,anchor_run,sorted(RECORD_ANCHOR_LABELS)) if raw_rows else []
         if anchor_warnings:warnings=(warnings+'\n'+'\n'.join(anchor_warnings)).strip()
         return {'returncode':0,'stdout':json.dumps({'schema_version':1,'anchors':record_anchor_ids(classified)})+'\n','stderr':warnings}
+    if action=='delivery-record':
+        # Read-only (docs/design/DELIVERY_CODE_OVER_HTTP.md, kittrial-5bb.373): the recorded
+        # contribution delivery blocks of one task for the HTTP delivery routes. Like
+        # `anchors`, it runs one `bd show --json --include-comments` without taking
+        # `.coordination.lock` or `authority_config.lock` and writes no state.
+        if authority_config is None:
+            raise ValueError('delivery-record is available only to the web service')
+        ids=request.get('args') or []
+        if (not isinstance(ids,list) or len(ids)!=1 or not isinstance(ids[0],str)
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}',ids[0])):
+            raise ValueError('delivery-record takes exactly one task id')
+        task_id=ids[0]
+        completed=native.run(native.argv(root,path,actor,['show',task_id,'--json','--include-comments']),environment(root))
+        missing=completed.returncode==1 and 'no issues found matching the provided IDs' in (completed.stdout or '')
+        if missing or (completed.returncode and 'no issue found' in (completed.stderr or '')):
+            return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':False})+'\n','stderr':completed.stderr or ''}
+        stdout,warnings=native.split(completed)
+        raw_rows=record_json.loads_array_rows(stdout or '[]')
+        matched=[r for r in raw_rows if isinstance(r,dict) and str(r.get('id') or '')==task_id]
+        if not matched:
+            return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':False})+'\n','stderr':warnings}
+        row=matched[0]
+        if row.get('malformed'):
+            return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':True,'malformed':True,'id':row.get('id') or task_id})+'\n','stderr':warnings}
+        from reserved_comments import RECORD_ANCHOR_LABELS
+        anchor_warnings=[]
+        def delivery_anchor_run(argv):
+            result,warning=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warning:anchor_warnings.append(warning)
+            return result
+        classified=record_json.classify([row],delivery_anchor_run,sorted(RECORD_ANCHOR_LABELS))
+        if anchor_warnings:warnings=(warnings+'\n'+'\n'.join(anchor_warnings)).strip()
+        row=classified[0] if classified else row
+        if is_record_anchor(row) or is_merge_slot(row) or row.get('issue_type')=='event':
+            return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':False})+'\n','stderr':warnings}
+        from review_workflow import contribution_delivery_records
+        contributions=[dict(item,project=str(name)) for item in contribution_delivery_records(row,configured_operators(root))]
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'found':True,'project':str(name),'task':str(row['id']),'contributions':contributions})+'\n','stderr':warnings}
     if action in ('ref','capability'):
         class RecordsRefusal(ValueError):
             def __init__(self,status,message):
@@ -2211,6 +2255,101 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 return answer
         except web_lifecycle.LifecycleError as error:
             return {'returncode':2,'stdout':'','stderr':str(error)+'\n','lifecycle_status':error.status}
+    if action=='web-release':
+        # ``verified_web_authority`` is imported at module scope; importing it again here
+        # would make it a local of ``execute`` and break every earlier action's use of it.
+        from http_authority import file_lock
+        import lifecycle
+        import web_release
+        args=request.get('args',[])
+        run_warnings=[]
+        def release_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        # A release preflight compares every named target against ONE native export; the
+        # writer below reads its own fresh export, as the host command does.
+        runner=NativeRunner(release_run, project=path)
+        denied_status=[]
+        try:
+            if not isinstance(args,list) or len(args)!=1 or not isinstance(args[0],str):
+                raise web_release.ReleaseError(422,'Expected one release JSON payload')
+            body=record_json.loads(args[0])
+            operation,payload=web_release.validate(body,actor,request.get('operation_id'))
+            capability=required_capability(request)
+            if capability is None:
+                raise web_release.ReleaseError(403,'This release operation has no endpoint capability binding')
+            def release_authority():
+                # Live re-check: the descriptor alone is never authority, and a release
+                # grant revoked, or an owner demoted, refuses the next request. A deploy
+                # needs coordination AND the release authority (design section 4), the
+                # same pair the HTTP gate checked; the table names both.
+                if not verified_web_authority(request,authority_config,capability,name):
+                    denied_status.append(403)
+                    raise web_release.ReleaseError(403,'Verified web authority required for this release operation')
+                if operation=='deploy':
+                    from http_authority import read_state
+                    record=(read_state(authority_config.store).get('projects') or {}).get(request.get('project')) or {}
+                    if record.get('archived'):
+                        denied_status.append(409)
+                        raise web_release.ReleaseError(409,'This project is archived; release facts cannot be recorded')
+                return True
+            def release_effect():
+                try:
+                    return release_work()
+                except web_release.ReleaseError:
+                    raise
+                except ValueError as error:
+                    # A validation refusal before the first native write is safe to hand
+                    # back whole (the hold, a stale scope, the release-author rule). A
+                    # ValueError after a write may have left facts behind: keep the
+                    # uncertain answer instead of calling it a clean refusal.
+                    if runner.attempted_write:
+                        raise
+                    raise web_release.ReleaseError(422, str(error)) from None
+            def release_work():
+                try:operators=configured_operators(root)
+                except ConfigurationUnreadable as error:
+                    raise web_release.ReleaseError(503,'The installation operator list cannot be read, so the '
+                                                        'host revert and hold set is unavailable: '+str(error)[:160])
+                if operation=='query':
+                    result=lifecycle.release_query(payload,actor,runner,operators=operators,journal=path)
+                else:
+                    rules=configured_coordinator_rules(root,warnings=run_warnings)
+                    rows=lifecycle.read_event_rows(runner)
+                    resolved,skipped=web_release.resolve_targets(rows,payload['targets'])
+                    if skipped:
+                        payload.update(targets=resolved)
+                    if not resolved and not (payload.get('rollback') or payload.get('supersede')
+                                             or payload.get('supersede_scopes')):
+                        reasons='; '.join('%s: %s'%(row['task'],row['reason']) for row in skipped[:5])
+                        raise web_release.ReleaseError(422,
+                            'No named target is integrated at the commits it names, so nothing was written'
+                            + (': '+reasons if reasons else ''))
+                    result=lifecycle.apply_release(payload,actor,runner,operators=operators,journal=path,
+                                                   lifecycle_authors=rules['lifecycle_authors'],
+                                                   owners=(owner_loader(path,'web release lifecycle_authors')
+                                                           if rules['lifecycle_authors'] else None))
+                    result.update(groups_completed=1,groups_total=1,skipped=skipped,
+                                  resolved=[target['task'] for target in resolved],
+                                  flags=web_release.flags(result.get('targets')))
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                        'stderr':warning_text(run_warnings)}
+            if operation=='query':
+                if authority_config is None:
+                    raise web_release.ReleaseError(403,'Configured web authority required for a release query')
+                with held_coordination_lock(path,shared=True):
+                    with file_lock(authority_config.lock):
+                        release_authority()
+                        return release_effect()
+            answer=guarded_write(root,request,journal_path(path),release_effect,
+                                 authority_config=authority_config,require_authority=True,
+                                 runner=runner,identity_check=release_authority)
+            if denied_status and answer.get('returncode')==2:
+                answer['release_status']=denied_status[-1]
+            return answer
+        except web_release.ReleaseError as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','release_status':error.status}
     if action=='web-merge-slot':
         from http_authority import CAP_READ, CAP_COORDINATE, file_lock
         from web_merge_slot import SlotError, validate as slot_validate, apply as slot_apply
@@ -2658,6 +2797,7 @@ CONTRIBUTOR_COMMANDS = (
     ('files list|get|put ...', "a task's files over SSH: list them, get one by its sha256 into a folder, put one"),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
     ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
+    ('delivery TASK [--contribution ID] [--out FILE]', 'fetch and verify a delivered bundle over HTTP'),
     ('handoff ...', 'hand a task to another actor, and read what the endpoint reconciled'),
     ('guidance get|ack', 'the worker guidance in force, and the acknowledgement of a version'),
     ('onboard', 'what a new worker is told about this project'),
@@ -2702,7 +2842,7 @@ NEAREST_COMMANDS = {'briefing': 'brief TASK', 'workerguide': 'docs worker-guide'
 #: The actions the client dispatches itself; every other name in the table above is passed to the
 #: endpoint. The dispatch in main() is written in terms of this tuple, and a test holds every one of
 #: its names to a line of the table, so the help cannot fall behind the commands (kittrial-5bb.283).
-CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','work',
+CLIENT_ACTIONS = ('brief','history','checkpoint','onboard','docs','session','handoff','review','delivery','work',
                   'wait','feedback','requirement','requirements','ref','capability','proposal','guidance',
                   'coordinator')
 
@@ -2784,6 +2924,18 @@ def outside_contributor_interface(name):
 # then the raw bytes of a file-get. Every rule (limits, digest, journal, authority of the record) is
 # task_files', the same code the web service runs; this section only moves bytes between a pipe and it.
 FRAME_SNIFF=re.compile(rb'\s*\{\s*"action"\s*:\s*"file-(?:list|get|put)"')
+
+def could_be_framed(head):
+    """True when ``head`` is, or can still grow into, the start of a framed header (an empty head included)."""
+    text=head.lstrip()
+    for literal in (b'{',b'"action"',b':',b'"file-'):
+        text=text.lstrip()
+        if not text:return True
+        n=min(len(literal),len(text))
+        if text[:n]!=literal[:n]:return False
+        if n<len(literal):return True
+        text=text[n:]
+    return any(word.startswith(text) or text.startswith(word) for word in (b'list"',b'get"',b'put"'))
 
 class Frame:
     """The bytes after a framed header: what was read past the line, then the pipe itself."""
@@ -2948,7 +3100,7 @@ def read_request(fd):
     import select,time
     ends=time.monotonic()+60
     while b'\n' not in head and len(head)<=task_files.HEADER_LIMIT:
-        if FRAME_SNIFF.match(head) and not select.select([fd],[],[],max(0,ends-time.monotonic()))[0]:
+        if could_be_framed(head) and not select.select([fd],[],[],max(0,ends-time.monotonic()))[0]:
             # A framed header that does not finish (no newline, stdin left open) must not hold the process.
             return None,None,task_files.Refusal(408,'request_timeout','The request header did not arrive in 60 seconds; nothing was read or stored.')
         chunk=os.read(fd,task_files.HEADER_LIMIT+1-len(head))
