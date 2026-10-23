@@ -74,6 +74,12 @@ RESTORE_TIMEOUT=BACKUP_SYNC_TIMEOUT
 #: failed or interrupted run must never destroy the previous restorable pair, so the
 #: last complete sidecar is kept here and ``coordination_backup`` can fall back to it.
 LAST_COMPLETE_SUFFIX='.coordination.last-complete.json'
+#: The rooms backup is its OWN file beside the coordination sidecar (rooms design section 2,
+#: option B): an older kit ignores it, so its fixed restore list never sees an unknown path and
+#: its restore still works, without rooms. The schema is the rooms module's; this kit validates
+#: every digest before it writes one byte.
+ROOMS_SUFFIX='.rooms.json'
+ROOMS_LAST_COMPLETE_SUFFIX='.rooms.last-complete.json'
 
 #: Additive key in a COMPLETE coordination sidecar that records a manifest of the native
 #: backup directory at the moment that generation completed. ``restore-new`` recomputes it
@@ -4808,6 +4814,13 @@ def backup_project(root,name):
                 manifest,problem=native_backup_manifest(root/'backups'/name)
                 if manifest is not None:record[NATIVE_MANIFEST_KEY]=manifest
                 atomic(bundle,record)
+                # The separate rooms file belongs to this generation too, and it is written
+                # only after the complete sidecar: a failure here leaves the previous sidecar
+                # (the guard below) with the previous or no rooms file, never a half pair.
+                import rooms
+                rooms_record=rooms.backup_record(path)
+                if rooms_record is not None:
+                    atomic(root/'backups'/(name+ROOMS_SUFFIX),rooms_record)
                 # The new generation is now native + complete sidecar + promoted journal;
                 # from here the guard must not put the previous sidecar back. SIGTERM is
                 # held across the promotion and the flag together: a stop landing between
@@ -4822,6 +4835,8 @@ def backup_project(root,name):
                 # A failure here leaves the new complete generation in place (the guard no
                 # longer rolls it back), and the next run's guard refreshes this copy.
                 _atomic_copy(bundle,last_complete)
+                if rooms_record is not None:
+                    _atomic_copy(root/'backups'/(name+ROOMS_SUFFIX),last_complete_rooms_path(root,name))
             finally:
                 # On ANY path that is not a normally-finished client - SIGTERM/SIGINT, the
                 # explicit ceiling, an exception - stop the whole process group here, while
@@ -6404,6 +6419,75 @@ def resolved_coordination_sidecar(root,source):
     last-complete copy is the fallback (see ``coordination_sidecar_source``).
     """
     return coordination_sidecar_source(root,source)[1]
+
+def last_complete_rooms_path(root,name):
+    validate_name(name)
+    return root/'backups'/(name+ROOMS_LAST_COMPLETE_SUFFIX)
+
+def complete_rooms_backup(path):
+    """The complete, digest-verified rooms record at ``path``, or ``(None, problem)``."""
+    path=Path(path)
+    if path.is_symlink():return None,'it is a symlink'
+    if not path.is_file():return None,None
+    try:
+        import rooms
+        data=record_json.loads(path.read_text(encoding='utf-8'))
+        rooms.validate_backup(data)
+        return data,None
+    except (OSError,ValueError,UnicodeDecodeError) as error:
+        return None,str(error) or 'it cannot be read'
+
+def rooms_backup_outcome(root,source):
+    """What the separate rooms file allows: ('answer',path,data,None), ('absent',...), ('refuse',...,problem).
+
+    The canonical ``backups/<name>.rooms.json`` is preferred; the durable last-complete copy
+    is the fallback, exactly as the coordination sidecar prefers its two copies. A copy that
+    exists but cannot be verified refuses rather than silently restoring half the rooms.
+    """
+    validate_name(source)
+    canonical=root/'backups'/(source+ROOMS_SUFFIX)
+    fallback=last_complete_rooms_path(root,source)
+    problems=[]
+    for path in (canonical,fallback):
+        data,problem=complete_rooms_backup(path)
+        if data is not None:return 'answer',path,data,None
+        if problem is not None:problems.append((path,problem))
+    if problems:
+        return 'refuse',None,None,'; '.join('%s: %s'%(path.relative_to(root).as_posix(),problem)
+                                            for path,problem in problems)
+    return 'absent',None,None,None
+
+def unusable_rooms_message(root,source,problem):
+    return ('The rooms backup of %s cannot be used (%s). Nothing was changed: repair or remove '
+            'backups/%s and backups/%s, or restore the tracker alone with '
+            '`restore-new %s DEST --without-rooms`.'
+            %(source,problem,source+ROOMS_SUFFIX,source+ROOMS_LAST_COMPLETE_SUFFIX,source))
+
+def restore_rooms(root,source,destination,without_rooms=False):
+    """Restore the separate rooms file into a fresh destination; return a report line."""
+    outcome,path,data,problem=rooms_backup_outcome(root,source)
+    if without_rooms:
+        if outcome=='absent':
+            return None
+        if outcome=='answer':
+            return ('NOT restored (--without-rooms): the rooms backup %s and its last-complete copy; '
+                    'the tracker and coordination data restored without rooms.'
+                    %path.relative_to(root).as_posix())
+        return ('NOT restored (--without-rooms): the rooms backup of %s (%s); the tracker and '
+                'coordination data restored without rooms.'%(source,problem))
+    if outcome=='absent':
+        return ('This backup has no separate rooms file: no rooms were restored (an older kit or a '
+                'project that never had rooms).')
+    if outcome=='refuse':
+        raise ValueError(unusable_rooms_message(root,source,problem))
+    import rooms
+    destination_path=project_dir(root,destination)
+    try:
+        count=rooms.restore_files(destination_path,data)
+    except ValueError as error:
+        raise ValueError('Cannot restore the rooms backup %s: %s'
+                         %(path.relative_to(root).as_posix(),error)) from None
+    return ('Restored %d rooms files from %s.'%(count,path.relative_to(root).as_posix()))
 
 def coordination_backup(root,source):
     # None only for a truly legacy backup (no sidecar copy at all). A copy that exists but
@@ -10236,6 +10320,10 @@ def main():
                    help='restore only the native tracker data of a backup whose coordination sidecar exists but '
                         'cannot be used (restore-new refuses such a backup without this flag); its sessions, '
                         'handoffs, requests, merge context and recorded operators and verifiers are not restored')
+    a.add_argument('--without-rooms',action='store_true',dest='without_rooms',
+                   help='do not restore this backup set\'s separate rooms file (backups/PROJECT.rooms.json); '
+                        'the tracker, coordination sidecar and journals restore as usual, without rooms. '
+                        'A damaged rooms file otherwise refuses the restore before anything is created')
     a.add_argument('--restore-http-state',action='store_true',dest='restore_http_state',
                    help='ALSO restore the runtime HTTP state pair this backup set carries (accounts, agents, '
                         'memberships; mode 0600). The ONLY way it comes back: without the flag a restore never '
@@ -11272,6 +11360,13 @@ def main():
             else:
                 coordination_backup(root,args.project)
             args.flag_had_nothing=args.without_coordination and outcome=='legacy'
+            # The rooms file is validated BEFORE the destination exists too: a damaged one must
+            # not leave a half-restored project behind (the same rule as the sidecar).
+            rooms_outcome,rooms_path,rooms_data,rooms_problem=rooms_backup_outcome(root,args.project)
+            if rooms_outcome=='refuse' and not args.without_rooms:
+                raise ValueError(unusable_rooms_message(root,args.project,rooms_problem))
+            if args.without_rooms and rooms_outcome=='answer':
+                args.rooms_skipped=rooms_path
             # Validate the journal snapshot BEFORE creating anything: a corrupt snapshot
             # must fail the restore with no destination project, Dolt restore or
             # coordination files left behind.
@@ -11411,6 +11506,11 @@ def finish_restore(root,args,snapshot,step=None):
         sidecar=False
     else:
         sidecar=restore_coordination(root,args.project,args.destination,authority=False)
+    # Rooms are their own backup file, not coordination: restore them on both the sidecar and
+    # --without-coordination paths. A damaged file refused before the destination existed.
+    rooms_line=restore_rooms(root,args.project,args.destination,
+                             without_rooms=getattr(args,'without_rooms',False))
+    if rooms_line:print(rooms_line)
     # What the deployment-authority step at the END of this function needed: it does not run when
     # the merge-slot step below fails, so the notice must say what was not compared and not
     # re-granted, and it can only say that knowing this (kittrial-5bb.240 F1).

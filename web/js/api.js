@@ -439,6 +439,15 @@ export function createApi(transport) {
     myContributions: (params) => call('GET', '/v1/me/contributions', { params }),
     feedback: (pid, params) => call('GET', `/v1/projects/${pid}/feedback`, { params }),
     addFeedback: (pid, body) => mutate('POST', `/v1/projects/${pid}/feedback`, body),
+    // project rooms (kittrial-5bb.385); the post/moderation/archive writes each carry one
+    // Idempotency-Key, which is also the room line's operation_id on the server.
+    rooms: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/rooms`, { params }),
+    room: (pid, rid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}`, { params }),
+    createRoom: (pid, name) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms`, { name }),
+    postRoomMessage: (pid, rid, text) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/messages`, { text }),
+    archiveRoom: (pid, rid, reason) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/archive`, reason ? { reason } : {}),
+    moderateRoomMessage: (pid, rid, sequence, reason) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/messages/${sequence}/moderate`, { reason }),
+    exportRoom: (pid, rid, format) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/export`, { params: { format } }),
     requirements: (pid) => call('GET', `/v1/projects/${pid}/requirements`),
     requirement: (pid, rid) => call('GET', `/v1/projects/${pid}/requirements/${rid}`),
     brd: (pid) => call('GET', `/v1/projects/${pid}/brd`),

@@ -262,7 +262,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py', 'task_assignment.py')
+    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -310,7 +310,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # completeness record already at the operator's destination: text this kit did
             # not just write itself, so a deeply nested one is described rather than
             # crashing the copy out of the guard.
-            'admin.py': 9,
+            'admin.py': 10,
+            # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
+            # message line through the guard: a room post is text a person wrote, and a
+            # nested or lookalike file must be a refusal, never a RecursionError.
+            'rooms.py': 4,
             # kittrial-5bb.339: read_cache parses the kit's own cached export rows
             # through the guard (corrupt = a miss and a fresh export). The second
             # (kittrial-5bb.346 r2/r4) is the cache file's HEADER line, read by both

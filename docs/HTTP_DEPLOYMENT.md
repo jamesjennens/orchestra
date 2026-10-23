@@ -3995,3 +3995,95 @@ object:
   `open_failing` and `state: "drifted"` intact until a trusted host `capability-verify --repo`
   at an integrated commit passes.
 
+
+## Project rooms over HTTP (slice 1, kittrial-5bb.385)
+
+Slice 1 of `docs/PROJECT_ROOMS_DESIGN.md` (section 10): rooms for people. Items, the
+`rooms` scope, the scribe, the wake and the summary are later slices. Room text is
+discussion, never an instruction to an agent: an agent credential cannot write in this
+slice at all, and the capability the page uses is on no credential scope.
+
+**Where the bytes live.** Beside the project, never in the tracker and never in source
+control:
+
+```
+projects/NAME/.rooms/index.json
+projects/NAME/.rooms/<room-id>/room.json
+projects/NAME/.rooms/<room-id>/messages-0001.jsonl
+projects/NAME/.rooms/<room-id>/messages-0002.jsonl
+projects/NAME/.rooms/<room-id>/messages-0001.jsonl.<sha16>.incomplete
+```
+
+`room.json` and `index.json` are written by atomic rename. Every message line carries a
+consecutive `sequence` and an `operation_id`; each append is flushed and fsynced. A
+segment rolls over at 5,000 messages or 4 MiB, and the next segment continues the
+sequence. A torn last line is split off, stored as `.incomplete` exactly as
+`.feedback.jsonl` does, and the valid prefix is kept; any other invalid line or a
+sequence gap refuses the read as damaged data rather than dropping text.
+
+**Bounds** are settings in `deployment.private.json` under `rooms`, read like
+`task_files`: a bad value keeps the default with a warning and never lifts the bound.
+
+| Setting | Default |
+|---|---|
+| `rooms.max_message_chars` | 4,000 |
+| `rooms.segment_messages` | 5,000 |
+| `rooms.segment_bytes` | 4 MiB |
+| `rooms.max_open_rooms` | 50 |
+
+Archived rooms do not count against the open-room bound. Nothing is deleted
+automatically.
+
+**Routes** (every read is `CAP_READ`, so every project member, viewers included, reads;
+no private rooms):
+
+| Route | Body / query | Authority |
+|---|---|---|
+| `GET /v1/projects/{pid}/rooms` | `?archived=1` includes archived rooms | `read` |
+| `POST /v1/projects/{pid}/rooms` | `{"name": "..."}` | `coordinate` (coordinator/owner) |
+| `GET /v1/projects/{pid}/rooms/{rid}` | `?since=N&limit=1..500` | `read` |
+| `POST /v1/projects/{pid}/rooms/{rid}/messages` | `{"text": "..."}` | the new `rooms.post` (contributor/coordinator/owner) |
+| `POST /v1/projects/{pid}/rooms/{rid}/archive` | `{}` or `{"reason": "..."}` | `coordinate` |
+| `POST /v1/projects/{pid}/rooms/{rid}/messages/{seq}/moderate` | `{"reason": "..."}` | `coordinate` |
+| `GET /v1/projects/{pid}/rooms/{rid}/export?format=markdown\|jsonl` | | `read` |
+
+A failed authority check, a room of another project, a viewer posting, a contributor
+creating/archiving/moderating, and any credential write are refused. `rooms.post` is
+deliberately not in `SCOPE_CAPABILITIES`, so no agent credential holds it; the route
+also refuses any credential by name in this slice.
+
+**Text rules (R8).** A post is at most `rooms.max_message_chars` characters, non-empty,
+and may not start with a reserved machine-record prefix (`Kind: ...`, BOM/CRLF lookalikes
+included). The room page renders every message through `dom.js` (`textContent`, never
+`innerHTML`), so `<img onerror=...>` and `javascript:` links are literal text and make no
+element.
+
+**Retries.** The `Idempotency-Key` of a post is the line's `operation_id`. A retry with
+the same key answers the original sequence and never writes a second line, also after
+`index.json` is rebuilt: the segment lines are the truth and the index is only a cache.
+
+**Moderation (R10).** A moderated message becomes a tombstone line whose text is
+`removed by NAME at TIME: REASON`, and the act is in the service audit
+(`rooms.moderate`). Every read and both exports hide the original text, including the
+raw JSON-lines export, which emits the redacted tombstone in the original message's
+place. The original remains only in the stored segment and in the separate rooms backup
+until an operator purges it; the room page shows a `removed` chip. `moderations` in a
+read answer lists tombstone events after `since`, so a client that already holds an
+earlier message can replace it.
+
+**Export.** `format=markdown` answers one Markdown document (room header, state, then
+`#sequence` author and text); `format=jsonl` answers the raw JSON lines with every
+moderated original already redacted. The answer is `{"room": ..., "format": ...,
+"text": ...}`; the page offers both as a download. The service is JSON over HTTP and
+does not add a second content-type transport for this slice.
+
+**Backup and restore.** `admin.py backup PROJECT` writes `backups/<name>.rooms.json`
+atomically in the same backup run as the coordination sidecar, and keeps a durable
+`backups/<name>.rooms.last-complete.json`. The coordination sidecar is untouched and
+`validate_coordination_files` has no rooms path: an older kit ignores the rooms file,
+so its restore still works (without rooms). A restore-new prefers the canonical file,
+falls back to the last-complete copy, verifies every path, sha256 and byte count before
+writing a byte, and refuses a damaged file before the destination is created;
+`--without-rooms` restores the tracker and coordination data without rooms and says so.
+The rooms file is written only after the complete sidecar, so a failed backup never
+pairs a new rooms file with an older sidecar.

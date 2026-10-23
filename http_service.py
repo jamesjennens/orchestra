@@ -41,6 +41,7 @@ import ssl
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
@@ -52,12 +53,13 @@ import claim_limit
 import project_setup
 import project_coordination
 import task_files
+import rooms
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_APPROVE,
-                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
+                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_COORDINATE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
                        CAP_RECORDS, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
@@ -936,6 +938,9 @@ class InProcessBackend:
 
     def files_limits(self):
         return dict(task_files.LIMIT_DEFAULTS)
+
+    def rooms_limits(self, warnings=None):
+        return dict(rooms.LIMIT_DEFAULTS)
 
     def files_discard(self, project_id, sha256):
         # r3 (review discard-race): under the lock every record is written under (invoke holds it around apply), so a
@@ -2134,6 +2139,9 @@ class EndpointBackend:
 
     def files_limits(self, warnings=None):
         return task_files.limits(Path(self.root), warnings=warnings)
+
+    def rooms_limits(self, warnings=None):
+        return rooms.limits(Path(self.root), warnings=warnings)
 
     def files_discard(self, project_id, sha256):
         # r3 (review discard-race): the endpoint's task-file action reads the blob, writes the comment and the journal
@@ -4488,6 +4496,23 @@ def route(method, pattern, *, anonymous=False, csrf=True, stream=False):
     return register
 
 
+@contextmanager
+def project_room_lock(project):
+    """Hold a project's ``.coordination.lock`` exclusively for one rooms operation.
+
+    ``fcntl`` is imported inside, never at import time: this module must import on
+    Windows (the kit's tests import it there), and the lock is taken only on the Linux
+    service path, exactly as admin.py and the task-file routes do it.
+    """
+    import fcntl
+    with (Path(project) / '.coordination.lock').open('a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 #: Said when the service is moving as many files as it allows (kittrial-5bb.370, design 4).
 TRANSFERS_BUSY = ('The server is moving as many files as it allows at once (%s); send this again in a moment.')
 
@@ -6064,6 +6089,179 @@ class ApiHandler(BaseHTTPRequestHandler):
         return bool(read.get('complete'))
 
     # -- session and account routes -------------------------------------------
+    # -- project rooms (kittrial-5bb.385, docs/PROJECT_ROOMS_DESIGN.md section 10) ---------------
+    #: Said when the backend has no host project folder to keep rooms beside.
+    ROOMS_UNAVAILABLE = 'Rooms are not available on this server.'
+
+    def _rooms_project(self, ctx):
+        place = getattr(self.backend, 'files_project', None)
+        project = place(ctx.params['pid']) if place is not None else None
+        if project is None:
+            raise not_implemented(self.ROOMS_UNAVAILABLE)
+        return project
+
+    def _rooms_limits(self):
+        read = getattr(self.backend, 'rooms_limits', None)
+        if read is None:
+            return dict(rooms.LIMIT_DEFAULTS)
+        warnings = []
+        try:
+            values = read(warnings=warnings)
+        except TypeError:
+            values = read()
+        for line in warnings:
+            print('rooms: ' + ascii(line[:300]), file=sys.stderr, flush=True)
+        return values
+
+    def _rooms_lock(self, project):
+        # Imported here, not at module top: http_service must import on Windows (the kit's
+        # tests import it there), and the project lock is a Linux runtime path, as in
+        # admin.py and the task-file routes (kittrial-5bb.352's CI lesson).
+        return project_room_lock(project)
+
+    def _rooms_actor(self, ctx, role):
+        user = self.service.state['users'].get(ctx.principal.user_id) or {}
+        name = user.get('display_name') or user.get('username') or ctx.principal.user_id
+        return {'id': ctx.principal.user_id, 'name': str(name)[:200], 'role': role}
+
+    def _rooms_refusal(self, error):
+        return HttpError(error.status, error.code, str(error))
+
+    def _rooms_write(self, ctx, action, capability, fn, *, status=200, reason=None):
+        # Rooms are for people in this slice: the new rooms.post capability is on no
+        # credential scope, and a coordinator grant must not become a room-write grant.
+        if ctx.principal.via == 'credential':
+            raise forbidden('Rooms are for people in this slice: an agent credential cannot write to a room.')
+        record, _role = self._project(ctx, CAP_READ)
+        if isinstance(record, dict) and record.get('archived'):
+            raise conflict('The project is archived: its rooms can be read and exported, and no room is written.')
+        def write():
+            project = self._rooms_project(ctx)
+            try:
+                with self._rooms_lock(project):
+                    result = fn(project)
+            except rooms.Refusal as refusal:
+                raise self._rooms_refusal(refusal) from None
+            return result, result
+        return self._mutate(ctx, action, ctx.params['pid'], write, capability=capability,
+                            serialize=False, status=status, reason=reason)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms')
+    def rooms_list(self, ctx):
+        project = self._rooms_project(ctx)
+        record, role = self._project(ctx, CAP_READ)
+        pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(pairs) - {'archived'} or any(len(values) != 1 for values in pairs.values()):
+            raise invalid('Use only one archived flag')
+        archived = pairs.get('archived', ['0'])[0] in ('1', 'true', 'yes')
+        try:
+            with self._rooms_lock(project):
+                items = rooms.list_rooms(project, include_archived=archived)
+        except rooms.Refusal as refusal:
+            raise self._rooms_refusal(refusal) from None
+        capabilities = self.service.capabilities_for(ctx.principal, ctx.params['pid'])
+        return 200, {'items': items, 'total': len(items),
+                     'can_post': CAP_ROOMS_POST in capabilities,
+                     'can_coordinate': CAP_COORDINATE in capabilities}
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms')
+    def rooms_create(self, ctx):
+        self._rooms_project(ctx)
+        _record, role = self._project(ctx, CAP_COORDINATE)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'name'}:
+            raise invalid('Send exactly: name')
+        limits_values = self._rooms_limits()
+        actor = self._rooms_actor(ctx, role)
+        def write(project):
+            return rooms.create(project, payload['name'], actor, limits_values)
+        return self._rooms_write(ctx, 'rooms.create', CAP_COORDINATE, write, status=201,
+                                 reason='room create')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')')
+    def rooms_read(self, ctx):
+        project = self._rooms_project(ctx)
+        self._project(ctx, CAP_READ)
+        pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(pairs) - {'since', 'limit'} or any(len(values) != 1 for values in pairs.values()):
+            raise invalid('Use only one since and limit')
+        try:
+            since = int(pairs.get('since', ['0'])[0])
+            limit = int(pairs.get('limit', ['100'])[0])
+        except (ValueError, TypeError):
+            raise invalid('Use an integer since and limit') from None
+        try:
+            with self._rooms_lock(project):
+                return 200, rooms.read_messages(project, ctx.params['rid'], since, limit)
+        except rooms.Refusal as refusal:
+            raise self._rooms_refusal(refusal) from None
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/messages')
+    def rooms_post(self, ctx):
+        self._rooms_project(ctx)
+        _record, role = self._project(ctx, CAP_ROOMS_POST)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'text'}:
+            raise invalid('Send exactly: text')
+        limits_values = self._rooms_limits()
+        actor = self._rooms_actor(ctx, role)
+        operation_id = ctx.idempotency_key or ctx.request_id
+        def write(project):
+            return rooms.post(project, ctx.params['rid'], payload['text'], operation_id,
+                              actor, limits_values)
+        return self._rooms_write(ctx, 'rooms.post', CAP_ROOMS_POST, write, status=201,
+                                 reason='room %s' % ctx.params['rid'])
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/archive')
+    def rooms_archive(self, ctx):
+        self._rooms_project(ctx)
+        _record, role = self._project(ctx, CAP_COORDINATE)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) - {'reason'}:
+            raise invalid('A room archive takes only an optional reason')
+        actor = self._rooms_actor(ctx, role)
+        operation_id = ctx.idempotency_key or ctx.request_id
+        def write(project):
+            return rooms.archive(project, ctx.params['rid'], actor, operation_id,
+                                 payload.get('reason'))
+        return self._rooms_write(ctx, 'rooms.archive', CAP_COORDINATE, write,
+                                 reason='room %s' % ctx.params['rid'])
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/messages/(?P<seq>[0-9]{1,12})/moderate')
+    def rooms_moderate(self, ctx):
+        self._rooms_project(ctx)
+        _record, role = self._project(ctx, CAP_COORDINATE)
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'reason'}:
+            raise invalid('Send exactly: reason')
+        actor = self._rooms_actor(ctx, role)
+        operation_id = ctx.idempotency_key or ctx.request_id
+        sequence = int(ctx.params['seq'])
+        def write(project):
+            return rooms.moderate(project, ctx.params['rid'], sequence, payload['reason'],
+                                  operation_id, actor, self._rooms_limits())
+        return self._rooms_write(ctx, 'rooms.moderate', CAP_COORDINATE, write, status=201,
+                                 reason='room %s message %d' % (ctx.params['rid'], sequence))
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/export')
+    def rooms_export(self, ctx):
+        project = self._rooms_project(ctx)
+        self._project(ctx, CAP_READ)
+        pairs = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if set(pairs) - {'format'} or any(len(values) != 1 for values in pairs.values()):
+            raise invalid('Use only one format')
+        wanted = pairs.get('format', ['markdown'])[0]
+        if wanted not in ('markdown', 'jsonl'):
+            raise invalid('format must be markdown or jsonl')
+        try:
+            with self._rooms_lock(project):
+                text = (rooms.export_markdown(project, ctx.params['rid']) if wanted == 'markdown'
+                        else rooms.export_jsonl(project, ctx.params['rid']))
+                room = rooms.read_room(project, ctx.params['rid'])
+        except rooms.Refusal as refusal:
+            raise self._rooms_refusal(refusal) from None
+        return 200, {'room': rooms._room_view(room), 'format': wanted, 'text': text}
+
     @route('POST', r'/v1/sessions', anonymous=True, csrf=False)
     def sessions_create(self, ctx):
         payload = ctx.payload or {}

@@ -346,3 +346,6 @@ dialog.dialog-wide { width: min(760px, calc(100vw - 32px)); }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* A room message is text, exactly as typed: preserve its line breaks and spacing. */
+.room-text { white-space: pre-wrap; overflow-wrap: anywhere; }

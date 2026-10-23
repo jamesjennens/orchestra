@@ -13,6 +13,7 @@ import * as records from './views/records.js';
 import * as agents from './views/agents.js';
 import * as setup from './views/setup.js';
 import * as how from './views/how.js';
+import * as rooms from './views/rooms.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
@@ -21,6 +22,7 @@ const VIEWS = {
   newTask: task.create, task: task.detail,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
   records: records.page, referenceRecord: records.referencePage, capabilityRecord: records.capabilityPage,
+  rooms: rooms.list, room: rooms.detail,
   users: admin.users, account: admin.account,
 };
 
@@ -101,6 +103,7 @@ export async function start(root, options = {}) {
             ctx.features.requirements ? link('/p/' + pid + '/requirements', 'Requirements') : null,
             link('/p/' + pid + '/records', 'Records'),
             ctx.features.records ? link('/p/' + pid + '/decisions', 'Decisions') : null,
+            link('/p/' + pid + '/rooms', 'Rooms'),
             link('/p/' + pid + '/feedback', 'Orchestra feedback'),
             link('/p/' + pid + '/settings', 'Members & settings'),
             ['owner', 'superuser'].includes(current.role) ? link('/p/' + pid + '/setup', 'Set up') : null,
