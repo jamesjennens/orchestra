@@ -38,7 +38,7 @@ export const KEEP_ALIVE_WARN_MS = 2 * 60 * 1000;
 function later(callback, ms) { return globalThis.setTimeout(callback, ms); }
 function cancel(handle) { if (handle !== null && handle !== undefined) globalThis.clearTimeout(handle); }
 
-export function createApi(transport) {
+export function createApi(transport, binaryTransport = fetchBinaryTransport) {
   let csrf = null;
 
   async function call(method, path, { body, params, key } = {}) {
@@ -172,6 +172,47 @@ export function createApi(transport) {
       }
       throw error;
     }
+  }
+
+  // Task files (kittrial-5bb.376). The bytes travel through the binary transport, never
+  // through the JSON one; the CSRF token and the idempotency key are the ones the JSON
+  // calls use. The browser sets Content-Length from the body it is given.
+  function filesPath(pid, tid) {
+    return `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/files`;
+  }
+  async function binaryCall(method, path, { headers, body, key } = {}) {
+    const sent = { ...(headers || {}) };
+    if (method !== 'GET' && csrf) sent['X-CSRF-Token'] = csrf;
+    if (key) sent['Idempotency-Key'] = key;
+    const response = await binaryTransport(method, path, sent, body);
+    if (response.status >= 200 && response.status < 300) return response;
+    const data = response.data;
+    const error = (data && data.error) || {};
+    throw new ApiError(response.status, error.code, error.message, error.detail, data && data.request_id);
+  }
+  async function uploadTaskFile(pid, tid, { name, direction, bytes, sha256 }) {
+    const path = filesPath(pid, tid) + query({ name, direction });
+    const intent = 'PUT ' + path + ' ' + sha256;
+    const key = uncertainKeys.get(intent) || newKey();
+    try {
+      const response = await binaryCall('PUT', path, {
+        headers: { Accept: 'application/json', 'Content-Type': 'application/octet-stream', 'X-Orchestra-SHA256': sha256 },
+        body: bytes, key,
+      });
+      uncertainKeys.delete(intent);
+      return response.data;
+    } catch (error) {
+      uncertainKeys.delete(intent);
+      if (error instanceof ApiError && error.uncertain) {
+        uncertainKeys.set(intent, key);
+        if (uncertainKeys.size > UNCERTAIN_KEYS_MAX) uncertainKeys.delete(uncertainKeys.keys().next().value);
+      }
+      throw error;
+    }
+  }
+  async function downloadTaskFile(pid, tid, sha256) {
+    const response = await binaryCall('GET', filesPath(pid, tid) + '/' + encodeURIComponent(sha256), { headers: { Accept: '*/*' } });
+    return { bytes: response.bytes, digest: response.digest || null };
   }
 
   // The authenticated session read. It is also the keep-alive touch: the service refreshes
@@ -476,6 +517,10 @@ export function createApi(transport) {
     proposeCapabilityAlias: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}/aliases`, body),
     rejectCapabilityAlias: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/capabilities/${encodeURIComponent(key)}/aliases/reject`, body),
     audit: (pid, params) => call('GET', `/v1/projects/${pid}/audit`, { params }),
+    taskFiles: (pid, tid) => call('GET', filesPath(pid, tid)),
+    uploadTaskFile,
+    downloadTaskFile,
+    withdrawTaskFile: (pid, tid, sha256, reason) => mutate('POST', `${filesPath(pid, tid)}/${encodeURIComponent(sha256)}/withdraw`, { reason }),
   };
 }
 
@@ -487,6 +532,24 @@ export async function fetchTransport(method, path, headers, body) {
   } catch (error) {
     // Network failure: the write may or may not have happened.
     return { status: 0, data: { error: { code: 'network', message: 'The server could not be reached. Your change may not have been saved; retry to check.' } } };
+  }
+  let data = null;
+  const text = await response.text();
+  if (text) { try { data = JSON.parse(text); } catch { data = null; } }
+  return { status: response.status, data };
+}
+
+// Real transport for task-file bytes: same-origin fetch. A successful download answers its
+// bytes and the digest the server recorded; every other answer is read as the JSON error.
+export async function fetchBinaryTransport(method, path, headers, body) {
+  let response;
+  try {
+    response = await fetch(path, { method, headers, body, credentials: 'same-origin', cache: 'no-store' });
+  } catch (error) {
+    return { status: 0, data: { error: { code: 'network', message: 'The server could not be reached. Nothing was confirmed; retry to check.' } } };
+  }
+  if (response.ok && method === 'GET') {
+    return { status: response.status, bytes: new Uint8Array(await response.arrayBuffer()), digest: response.headers.get('X-Orchestra-SHA256') };
   }
   let data = null;
   const text = await response.text();
