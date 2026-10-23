@@ -100,6 +100,11 @@ class CoordinatorGuideTests(unittest.TestCase):
             self.assertFalse(other['coordinating'], coordinates)
         self.assertIn('3. Only when none of your own tasks needs action: the tasks the same reply says you could claim. Claim exactly one that nobody holds', plain['guide'])
         self.assertNotIn('## You coordinate', plain['guide'])
+        # The worker's steps keep their numbers: the shared 401 step is the worker's 6 (the coordinator's 7).
+        lines = plain['guide'].split('\n')
+        self.assertTrue(any(line.startswith('6. If a call returns 401, the secret file is missing or wrong') for line in lines))
+        self.assertIn('7. Stop and ask your owner if anything is unclear.', lines)
+        self.assertEqual(['1.', '2.', '3.', '4.', '5.', '6.', '7.'], [line[:2] for line in lines if line[:2] in ('1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.')])
         self.assertIn("7. This window's role is reviewer", plain['prompt'])
 
     def test_an_agent_with_an_effective_grant_gets_the_coordinator_text(self):
