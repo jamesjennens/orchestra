@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb379-wait-http-coordinator-1",
+  "key": "wait.http-coordinator",
+  "name": "Coordinator wait over HTTP with live project grants",
+  "aliases": ["coordinator HTTP wait", "agents me coordinator wait"],
+  "summary": "An agent with an effective coordinator grant can read the canonical coordinator wait over HTTP, limited to granted projects, with one canonical read per project, exact single-project CLI fingerprints and caller-supplied since comparison; worker credentials and agents without an effective grant are refused.",
+  "requirements": [],
+  "anchors": ["docs/HTTP_DEPLOYMENT.md#coordinator-wait-for-an-agent"],
+  "code": [
+    "http_service.py::ApiHandler._agent_coordinator_wait",
+    "http_service.py::EndpointBackend.coordinator_wait",
+    "http_authority.py::required_capability",
+    "waiting.py::coordinator_view"
+  ],
+  "tests": ["tests/test_coordinator_http_wait.py", "tests/test_http_web.py"],
+  "owner": "person:orchestra-coordinator",
+  "tags": ["http", "wait", "coordinator", "grants"]
+}
