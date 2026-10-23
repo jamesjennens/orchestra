@@ -339,8 +339,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # task_files.py (kittrial-5bb.370): a host journal entry, the task row bd prints and
             # the two `comments add` answers; a nested or damaged one is no entry, never a
             # traceback.
+            # kittrial-5bb.378: the thirteenth guards the web release body (a query scope or one
+            # deploy group the route transports); web_release has already validated its field
+            # set, and the guard bounds its nesting before it is parsed.
             'task_files.py': 4,
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 12, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 13, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through

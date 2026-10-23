@@ -57,7 +57,7 @@ from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_r
                                is_record_anchor)
 from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
                        CAP_APPROVE,
-                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE,
+                       CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_COORDINATE, CAP_RELEASE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
                        CAP_RECORDS, CAP_REVIEWS,
                        CAP_TASKS, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
@@ -2122,6 +2122,9 @@ class EndpointBackend:
     ROUTES = InProcessBackend.ROUTES + (
         'tasks.assign', 'tasks.release', 'merge-slot.acquire',
         'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create',
+        # The release routes (kittrial-5bb.378): one canonical release-query or one
+        # release-deploy group per request. The endpoint holds the host tracker.
+        'release.query', 'release.deploy',
         # The coordinator's recorded hand-back (kittrial-5bb.343). Both operations run
         # the one canonical `assignee-followon` action, which calls the same library
         # function as `coordinator followon`.
@@ -2459,6 +2462,18 @@ class EndpointBackend:
             if text.startswith('ValueError: '):
                 text = text[len('ValueError: '):]
             error = HttpError(status, FILE_CODES.get(status, 'invalid'), text)
+            error.nothing_done = True
+            raise error
+        if action == 'web-release' and isinstance(reply, dict) and (
+                reply.get('release_status') or reply.get('records_status')):
+            # The release routes (kittrial-5bb.378): a live-authority refusal, a hold, a
+            # stale target or a release-writer refusal keeps its own status instead of
+            # collapsing into 422. Both keys are read: an identity check reports the
+            # shared ledger key, the route's own errors report release_status.
+            status = reply.get('release_status') or reply.get('records_status')
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid', 503: 'unavailable'}.get(status, 'unavailable'),
+                              (reply.get('stderr') or 'Release facts cannot be recorded').strip())
             error.nothing_done = True
             raise error
         if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
@@ -2914,6 +2929,20 @@ class EndpointBackend:
             # A task file's record or withdrawal (kittrial-5bb.370). The bytes are stored and
             # checked already; the action reads the row live and writes under the project lock.
             return 'task-file', project_id, [json.dumps(file_body(payload), ensure_ascii=False)], {}
+        if route.startswith('release.'):
+            # The release routes (kittrial-5bb.378): one body carrying the unchanged
+            # host field set; the endpoint supplies the actor and the operation id from
+            # the request envelope, exactly as the lifecycle routes do.
+            import web_release
+            operation = route.split('.', 1)[1]
+            body = {'operation': operation}
+            if operation == 'query':
+                body['scope'] = payload['scope']
+            else:
+                for key in web_release.DEPLOY_FIELDS | web_release.DEPLOY_OPTIONAL:
+                    if key in payload:
+                        body[key] = payload[key]
+            return 'web-release', project_id, [json.dumps(body, ensure_ascii=False)], {}
         if route.startswith('followons.'):
             # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
             # `assignee-followon` action derives every record fact under the project
@@ -5252,7 +5281,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 audit_success=True, state_saved=None, audit_metadata=None, replay_check=None):
         """Run one authorized, idempotent mutation.
 
-        ``capability`` names the authority the route needs. The idempotency key is
+        ``capability`` names the authority the route needs: one capability, or a tuple
+        of them all required (kittrial-5bb.378 review s1: a release deploy needs
+        ``coordinate`` plus the release authority). The idempotency key is
         *reserved atomically* (:meth:`Service.idempotency_reserve`) before the effect,
         so two concurrent identical requests cannot both create the effect: the
         second either replays a committed result or receives a 409. ``serialize=True``
@@ -5264,8 +5295,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         (for example the target's identity) added to the route's audit events; it must
         never carry a secret or request body.
         """
-        ctx.authorize = (lambda: self.service.check_authority(
-            ctx.principal, project_id, capability, allow_self_user=allow_self_user))
+        if isinstance(capability, str):
+            ctx.authorize = (lambda: self.service.check_authority(
+                ctx.principal, project_id, capability, allow_self_user=allow_self_user))
+        else:
+            # Every named capability is re-checked inside the same in-lock boundary, so a
+            # two-capability route cannot pass on one of them being revoked in between.
+            needed = tuple(capability)
+
+            def authorize():
+                decision = None
+                for name in needed:
+                    decision = self.service.check_authority(
+                        ctx.principal, project_id, name, allow_self_user=allow_self_user)
+                return decision
+            ctx.authorize = authorize
         idem_route = '%s %s' % (route_name, ctx.route_target)
         key = ctx.idempotency_key if idempotent else None
         digest = None
@@ -6940,6 +6984,89 @@ class ApiHandler(BaseHTTPRequestHandler):
     def lifecycle_fact(self, ctx):
         return self._lifecycle_write(ctx, 'fact')
 
+    # -- release query and one release group (kittrial-5bb.378) --------------------
+    #
+    # Slice 2 of docs/design/WEB_COORDINATOR_INTEGRATION.md, section 4. The server never
+    # chooses release membership (it has no checkout): the caller resolves targets with
+    # git and sends ONE group, at most 200 targets; the endpoint re-verifies every named
+    # target against its own export and skips a target that is not integrated there. The
+    # query is the read-only pre-flight: the host-issued reverted set and the recorded
+    # live releases for one environment, writing nothing.
+    def _release_backend(self, route):
+        if not hasattr(self.backend, 'ROUTES') or route not in self.backend.ROUTES:
+            raise not_implemented('Release facts are unavailable on this server')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/releases/query')
+    def release_query(self, ctx):
+        import web_release
+        # A coordinator read: the query writes nothing and discloses only the reverted
+        # set and the environment's live releases this project already knows.
+        self._project(ctx, CAP_COORDINATE)
+        try:
+            _, fields = web_release.fields(dict(ctx.payload or {}, operation='query'))
+        except web_release.ReleaseError as error:
+            raise invalid(str(error)) from None
+        self._release_backend('release.query')
+        result = self.backend.invoke('release.query', ctx.principal, ctx.params['pid'], fields,
+                                     None, target=ctx.route_target, capability=CAP_COORDINATE)
+        return 200, result
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/releases')
+    def release_deploy(self, ctx):
+        import web_release
+        # The project's release authority AND coordination, checked live (design section
+        # 4): an owner or superuser holds both. An agent reaches it only with the project's
+        # release grant AND its coordinator grant, because a release is a decision plus a
+        # coordination step. A coordinator alone, or a release grant alone, is refused
+        # before the body is even read. An archived project records nothing new.
+        project, _role = self._project(ctx, CAP_COORDINATE)
+        self._project(ctx, CAP_RELEASE)
+        if isinstance(project, dict) and project.get('archived'):
+            raise conflict('This project is archived; release facts cannot be recorded')
+        try:
+            _, fields = web_release.fields(dict(ctx.payload or {}, operation='deploy'))
+        except web_release.ReleaseError as error:
+            raise invalid(str(error)) from None
+        self._release_backend('release.deploy')
+        metadata = {}
+
+        def write():
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request '
+                              'after an uncertain outcome')
+            result = self.backend.invoke('release.deploy', ctx.principal, ctx.params['pid'], fields,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_RELEASE)
+            metadata.update({key: result.get(key) for key in
+                             ('operation_id', 'release_id', 'environment', 'groups_completed',
+                              'groups_total')})
+            # The audit is a shared capped list: keep counts and only the first few ids of
+            # the up-to-200 skipped/flags rows. The answer itself still carries every row.
+            skipped = result.get('skipped') or []
+            flags = result.get('flags') or []
+            metadata.update(skipped_count=len(skipped),
+                            skipped_first=[row.get('task') for row in skipped[:5]],
+                            flags_count=len(flags),
+                            flags_first=[row.get('task') for row in flags[:5]])
+            with self.service.store.lock:
+                existing = any(event.get('action') == 'releases.deploy'
+                               and event.get('project_id') == ctx.params['pid']
+                               and event.get('operation_id') == result.get('operation_id')
+                               and event.get('outcome') == 'committed'
+                               for event in self.service.state['audit'])
+                if not existing:
+                    event = self.service.audit(ctx.request_id, ctx.principal, 'releases.deploy', 'committed',
+                                               project_id=ctx.params['pid'])
+                    event.update(metadata)
+                try:
+                    self.service.store.save()
+                except (OSError, TimeoutError):
+                    raise UncertainOutcome() from None
+            return result, result
+        return self._mutate(ctx, 'releases.deploy', ctx.params['pid'], write,
+                            capability=(CAP_COORDINATE, CAP_RELEASE), status=201, serialize=False,
+                            canonical=True, audit_success=False)
+
     def _merge_slot_backend(self):
         if not hasattr(self.backend, 'merge_slot_read'):
             raise not_implemented('Merge-slot coordination is unavailable on this server')
@@ -8116,6 +8243,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                      request_id=ctx.request_id)
             return result, result
         return self._mutate(ctx, 'agents.coordinator.revoke', ctx.params['pid'], revoke,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
+    # The project's release grant (kittrial-5bb.378): an owner gives and revokes one
+    # agent's authority to RECORD releases here. It is stored beside the coordinator grant
+    # and read live on every release write; the coordinator grant does not imply it.
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/release')
+    def project_agent_release_grant(self, ctx):
+        refuse_unknown_fields(dict(ctx.payload or {}), (), 'A release grant')
+
+        def grant():
+            result = self.service.grant_release(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.release.grant', ctx.params['pid'], grant,
+                            capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
+
+    @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')/release')
+    def project_agent_release_revoke(self, ctx):
+        def revoke():
+            result = self.service.revoke_release(ctx.principal, ctx.params['pid'], ctx.params['aid'],
+                                                 request_id=ctx.request_id)
+            return result, result
+        return self._mutate(ctx, 'agents.release.revoke', ctx.params['pid'], revoke,
                             capability=CAP_PROJECT_ADMIN, reason='agent %s' % ctx.params['aid'])
 
     @route('DELETE', r'/v1/projects/(?P<pid>' + ID + r')/agents/(?P<aid>' + ID + r')')
