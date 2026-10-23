@@ -772,13 +772,14 @@ class AdminTaskFilesTests(unittest.TestCase):
         self.rows = [{'id': 't-old', 'status': 'closed', 'closed_at': '2026-01-15T10:00:00Z'},
                      {'id': 't1', 'status': 'open'}]
 
-    def run_admin(self, *argv):
+    def run_admin(self, *argv, run_bd=None):
         out, err = io.StringIO(), io.StringIO()
+        rows = '\n'.join(json.dumps(r) for r in self.rows)
         code = 0
         with mock.patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), 'task-files'] + list(argv)), \
                 mock.patch.object(admin, 'root_path', return_value=self.root), \
                 mock.patch.object(admin, 'operators', return_value=['op']), \
-                mock.patch.object(admin, 'run_bd', return_value='\n'.join(json.dumps(r) for r in self.rows)), \
+                mock.patch.object(admin, 'run_bd', side_effect=run_bd or (lambda *a, **k: rows)), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 admin.run_main()
@@ -828,8 +829,8 @@ class AdminTaskFilesTests(unittest.TestCase):
                 except BlockingIOError:
                     seen.append('held')
             return '\n'.join(json.dumps(r) for r in self.rows)
-        with mock.patch.object(admin, 'run_bd', side_effect=run_bd):
-            code, out, err = self.run_admin('purge', 'p1', '--closed-before', '2026-02-01', '--actor', 'op', '--dry-run')
+        code, out, err = self.run_admin('purge', 'p1', '--closed-before', '2026-02-01', '--actor', 'op', '--dry-run',
+                                        run_bd=run_bd)
         self.assertEqual(0, code, err)
         self.assertEqual(['held'], seen)
 
