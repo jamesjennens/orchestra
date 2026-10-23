@@ -154,10 +154,13 @@ class BoundEndpointTests(unittest.TestCase):
         # service stores the bytes and calls it under live authority; no bound key may name it.
         self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignee-followon', 'assignment-roster', 'create-project', 'creation-standing', 'host-coordination',
                                                                  'host-projects', 'project-creations', 'task-assign', 'task-file', 'task-release', 'web-guidance',
-                                                                 'web-lifecycle', 'web-merge-slot'])
+                                                                 'web-lifecycle', 'web-merge-slot',
+                                                                 # kittrial-5bb.378: the release query and one release group; the canonical write is
+                                                                 # `web-release`, which a bound key may not name directly.
+                                                                 'web-release'])
         for action in ('create-project', 'project-creations', 'creation-standing', 'web-merge-slot',
                        'host-coordination', 'host-projects', 'web-guidance', 'web-lifecycle', 'assignment-roster', 'task-assign', 'task-release',
-                       'assignee-followon', 'task-file'):
+                       'assignee-followon', 'task-file', 'web-release'):
             for project in ('alpha', 'beta', 'Not A Name', None):
                 with self.subTest(action=action, project=project):
                     self.refused({'project': project, 'actor': 'a', 'action': action},

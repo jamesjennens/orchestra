@@ -206,10 +206,10 @@ class NoUnguardedParseTests(unittest.TestCase):
                            'a damaged, unreadable or nested file is caught and read as the restrictive '
                            '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
                            'permissive default'),
-        'client.py': (13, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
-                         'kittrial-5bb.285 added two of the thirteen: the wait read\'s answer from the endpoint and the '
-                         'wait command\'s own read of the config file (both the same kind of text as the other ten, '
-                         "and neither is a record comment or a caller's payload). The thirteenth (kittrial-5bb.327 "
+        'client.py': (12, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
+                         'kittrial-5bb.285 added the wait read\'s answer from the endpoint (and wait\'s --config read, '
+                         'which kittrial-5bb.373 merged with main()\'s --config read into one parse after delivery; '
+                         "neither is a record comment or a caller's payload). The twelfth (kittrial-5bb.327 "
                          "review 2) is the wait's own small state file: text this client wrote beside its config, "
                          'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
                          'treated as absent'),
@@ -262,7 +262,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py')
+    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'requirement_baseline_records.py', 'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -343,8 +343,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # task_files.py (kittrial-5bb.370): a host journal entry, the task row bd prints and
             # the two `comments add` answers; a nested or damaged one is no entry, never a
             # traceback.
+            # kittrial-5bb.378: the thirteenth guards the web release body (a query scope or one
+            # deploy group the route transports); web_release has already validated its field
+            # set, and the guard bounds its nesting before it is parsed.
             'task_files.py': 4,
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 12, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 13, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
@@ -358,6 +361,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # Assignment adds closed roster/request payloads at the endpoint and
             # guards both its native task reply and its reserved notice body.
             'task_assignment.py': 2,
+            # B2 frozen snapshot bytes and sidecar records are bounded untrusted
+            # text, parsed through the nesting guard with duplicate-key refusal.
+            'requirement_baseline_records.py': 1, 'requirement_baselines.py': 1,
+
             # Service-only guidance bodies are caller text, parsed through the nesting guard.
             'web_guidance.py': 2,
             'web_merge_slot.py': 4,

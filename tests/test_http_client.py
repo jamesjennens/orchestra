@@ -4,7 +4,9 @@ They run the real service on loopback and drive it only through :class:`http_cli
 including the uncertain-write reconciliation path and the plaintext refusal.
 """
 import contextlib
+import copy
 import io
+import json
 import os
 import secrets
 import shutil
@@ -141,6 +143,32 @@ class ClientCase(unittest.TestCase):
         self.assertTrue(alex.audit(project)['items'])
         self.assertEqual('session', alex.whoami()['via'])
         alex.logout()
+
+    def test_integration_check_and_ledger_are_read_only_client_reads(self):
+        """kittrial-5bb.383: the check and its step ledger through the copied client and CLI."""
+        self.make_user('alex', 'alex-password-1')
+        client = self.client()
+        client.login('alex', 'alex-password-1')
+        project = client.create_project('Alpha')['id']
+        task = client.create_task(project, 'ledger read')['id']
+        before = copy.deepcopy(self.service.state['canonical']['tasks'][task])
+        check = client.integration_check(project, task, 'main')
+        self.assertEqual([row['check'] for row in check['checks']],
+                         ['approval', 'source_commit', 'slot', 'hold', 'reverted'])
+        self.assertEqual([step['step'] for step in check['next']],
+                         ['scope', 'reviewed', 'integrated', 'integrated-mark', 'slot-release'])
+        ledger = client.ledger(project, task, 'main')
+        self.assertEqual(set(ledger), {'task', 'target', 'merge_ready', 'next'})
+        self.assertEqual(ledger['target'], 'main')
+        self.assertEqual(ledger['next'], check['next'])
+        for command, expected in (('integration-check', 'checks'), ('ledger', 'next')):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = http_client.main(['--base-url', self.url, '--token=' + client.token,
+                                         command, project, task, '--target', 'main'])
+            self.assertEqual(code, 0)
+            self.assertIn(expected, json.loads(output.getvalue()))
+        self.assertEqual(self.service.state['canonical']['tasks'][task], before)
 
     def test_uncertain_outcome_must_be_retried_with_the_same_key(self):
         self.make_user('alex', 'alex-password-1')

@@ -15,7 +15,7 @@ const owner = context(ownerToken);
 const viewer = context(viewerToken);
 let data = await owner.api.requirements(pid);
 let page = await view.brd(owner, { pid }, {}, data);
-if (!page.querySelector('form')) {
+if (!page.querySelector('#requirement-title')) {
   const start = Array.from(page.querySelectorAll('button')).find((b) => b.textContent === 'Start requirements');
   assert.ok(start, page.textContent);
   await start.dispatch('click');
@@ -83,7 +83,8 @@ assert.ok(readOnly.textContent.includes('Pending edit · revision 3'));
 assert.ok(readOnly.textContent.indexOf('Owner intent as text') < readOnly.textContent.indexOf('Changed intent'));
 const viewerDocument = await view.brd(viewer, { pid }, {}, await viewer.api.requirements(pid));
 assert.equal(viewerDocument.querySelectorAll('form').length, 0);
-assert.equal(viewerDocument.querySelectorAll('button').length, 0);
+const documentReadControls = ['Export Markdown', 'Changes since baseline', 'Reload baselines'];
+assert.equal(Array.from(viewerDocument.querySelectorAll('button')).filter(button => !documentReadControls.includes(button.textContent)).length, 0);
 assert.ok(viewerDocument.textContent.includes('Owner intent as text'));
 assert.ok(viewerDocument.textContent.includes('Pending edit'));
 assert.ok(!viewerDocument.textContent.includes('Open questions'));

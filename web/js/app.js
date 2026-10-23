@@ -14,11 +14,12 @@ import * as agents from './views/agents.js';
 import * as setup from './views/setup.js';
 import * as how from './views/how.js';
 import * as rooms from './views/rooms.js';
+import * as releases from './views/releases.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
   home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list, agentSetup: agents.setupWizardPage,
-  project: project.overview, reviews: project.reviews, feedback: project.feedback, settings: project.settings, setup: setup.page, how: how.page,
+  project: project.overview, reviews: project.reviews, releases: releases.page, feedback: project.feedback, settings: project.settings, setup: setup.page, how: how.page,
   newTask: task.create, task: task.detail,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
   records: records.page, referenceRecord: records.referencePage, capabilityRecord: records.capabilityPage,
@@ -100,6 +101,7 @@ export async function start(root, options = {}) {
           current ? [
             link('/p/' + pid, 'Tasks'),
             link('/p/' + pid + '/reviews', 'Reviews'),
+            link('/p/' + pid + '/releases', 'Releases'),
             ctx.features.requirements ? link('/p/' + pid + '/requirements', 'Requirements') : null,
             link('/p/' + pid + '/records', 'Records'),
             ctx.features.records ? link('/p/' + pid + '/decisions', 'Decisions') : null,

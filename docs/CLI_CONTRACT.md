@@ -279,7 +279,12 @@ or edited comment, another actor's checkpoint, and a field edit move that marker
 `review_state`, `whose_move`, `next_actor`, `owner` (assignment), `status`
 (claim/release), `pending_review_items`, `contribution_id` and `redelivered` are compared
 directly. The caller's own delivery or review response takes the row out of its move, so
-the write's answer prints the post-write fingerprint to pass as `--since`. The
+the write's answer prints the post-write fingerprint to pass as `--since`. The caller's
+own claim or status change (for example `--status blocked` or `--status in_progress`)
+changes the worker fingerprint and wakes its wait once; this behavior is unchanged.
+Parent and sub-label authors (`agent` and `agent/sub0`) count as the same actor for
+activity markers and own/other counts; a different prefix actor such as `agent2` does
+not. The
 COORDINATOR form and its fingerprint are unchanged. The fields are defined once in
 docs/BRIEFINGS.md, "Newer activity: one definition".
 

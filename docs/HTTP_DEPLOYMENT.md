@@ -70,16 +70,27 @@ permission (no `coordinate`), takes nothing and writes nothing. It answers
 `task`, the current `contribution` and review state, five `checks` (`approval`,
 `source_commit`, `slot`, `hold`, `reverted`), three `unchecked` rows
 (`base_membership`, `tests`, `pushed_result`, each `known: false` because the
-server has no code-host access), and `next`: the writes still owed in order
-(scope, reviewed, integrated, the integrated mark, slot release), each with its
-route and the operation identity its native event records when the write was
-already made. A refused row is HTTP 200 with the writer's own sentence, not an
-error, so every reason is visible at once; an absent task is 404. The optional
-`target` query is the branch name the merge-slot acquire accepts. The route is
-classified read-only in `endpoint.py` and `http_authority.py`, so it cannot take
-the slot, write a fact or merge. `merge_ready` covers only the five checks; it
-does not turn the three unchecked rows into a pass. The task page has a lazy
-"Integration check" panel for the refused and unchecked rows.
+server has no code-host access), and `next`: the step ledger, the writes still owed
+in order (scope, reviewed, integrated, the integrated mark, slot release). Each
+ledger row carries its `route`, its `operation_id` (the identity its native event
+records when the write was made), its `state` and its canonical `fact`. `state` is
+`committed`, `not-attempted`, `unknown` (a native integration exists but its host
+mark is not confirmed, or the step's last HTTP answer was uncertain) or `not-held`
+for a slot that is not held. `fact` is the native event id for the scope and the
+facts, the host mark sha256 for the integrated mark, and absent for a slot release
+(which has no native fact; its `fact_note` says so). A not-yet-committed step whose
+last lifecycle answer was uncertain reads `unknown` with the deterministic
+operation identity the server used, so a coordinator retries that identity instead
+of minting a new one; a committed row keeps its fact id and reports the last
+response beside it as `response_state`. Audit activity from before this ledger
+carries no step metadata and is ignored rather than guessed. A refused row is HTTP
+200 with the writer's own sentence, not an error, so every reason is visible at
+once; an absent task is 404. The optional `target` query is the branch name the
+merge-slot acquire accepts. The route is classified read-only in `endpoint.py` and
+`http_authority.py`, so it cannot take the slot, write a fact or merge.
+`merge_ready` covers only the five checks; it does not turn the three unchecked
+rows into a pass. The task page has a lazy "Integration check" panel for the
+refused and unchecked rows.
 
 | Route | Closed request body | Confirmed result |
 | --- | --- | --- |
@@ -131,7 +142,50 @@ Copied `http_client.py` methods are `lifecycle`, `set_lifecycle_scope` and
 `record_lifecycle_fact`. The standard-library CLI is
 `http_client.py lifecycle PROJECT TASK read|scope|fact`; writes take `--file` with
 the HTTP JSON body, `--idempotency-key`, and `--dimension` for a fact. Reuse that
-file and key when reconciling an ambiguous request.
+file and key when reconciling an ambiguous request. The same client has
+`integration_check(project, task, target=None)` and `ledger(project, task,
+target=None)` for the read-only merge check and its step ledger; the CLI is
+`http_client.py integration-check PROJECT TASK [--target BRANCH]` for the whole
+answer and `http_client.py ledger PROJECT TASK [--target BRANCH]` for the `task`,
+`target`, `merge_ready` and `next` rows alone.
+
+### The web-only merge and push recipe (an agent with its own repository credential)
+
+This is the sequence for a coordinator agent that reaches Orchestra only over HTTP
+and has its own repository-scoped credential. The server never merges, tests or
+pushes; it records the coordinator's word, and `unchecked` says so.
+
+1. **Read before touching the repository.** `GET .../tasks/{task}/integration-check`
+   (or `http_client.py integration-check`/`ledger`). Stop on any refused `checks`
+   row, and treat every `unchecked` row as unknown, never as a pass.
+2. **Take the slot** with `POST .../merge-slot/acquire` for the task and target
+   branch, with one stable `Idempotency-Key`.
+3. **Fetch, check out and merge** in a clone the agent can push from. The approved
+   commit is merged as a merge commit; the target branch is never force-pushed and
+   the approved commit is never rewritten. The agent's repository credential is its
+   own, scoped to that repository. It is never the server's credential, the
+   Orchestra secret, or another person's credential.
+4. **Run the project's tests** in that checkout and record the result as `tested`
+   evidence if the project wants it on the tracker; it is not `integrated`.
+5. **Push the target branch** with the agent's own credential. The server cannot see
+   the push: the integration records it as the agent's word.
+6. **Record the facts** with one stable `Idempotency-Key` per step: the scope with
+   `source_commit` = the approved commit and `integration_commit` = the pushed merge
+   commit, then `reviewed=passed`, then `integrated=passed` (which also publishes
+   the host mark when the writer is enabled), then release the slot.
+7. **Resume from the ledger after a failure.** Read the check again. Retry only the
+   first row whose `state` is not `committed`, with the *same* `operation_id`/key
+   and the identical body. `unknown` means the outcome was not observed: keep the
+   identity, inspect canonical state, and reconcile. A `409` means state changed:
+   read again before a changed request. Never mint a second identity to "fix" a
+   native integration whose mark is missing; an operator repairs the mark family.
+
+The push and its credential are the agent's own act and record. What stays a
+person's step: approving the repository-scoped credential and deciding the agent
+may push with it; the contribution approval unless a granted agent already holds
+it; deciding whether the tests and merge base are enough when an `unchecked` row
+says the server cannot know; a forced release of a slot; and every void, revert and
+reconciliation.
 
 ### Passed integration marks and operator recovery
 
@@ -3646,6 +3700,18 @@ original comments remain in task history. The assignment-roster read uses shared
 project and authority locks so concurrent readers do not queue behind an exclusive
 read lock; assignment effects retain their exclusive guards.
 
+### Named requirements baseline readers
+
+Baseline cuts require compatible readers on every installation that may restore
+the project. The member routes and owner cut use the canonical endpoint; their
+new sidecar files are included in the explicit backup allowlist. A cut freezes
+pending wording without accepting it. See REQUIREMENTS.md for fixed routes,
+names, limits and same-account saved retry behavior, and OPERATIONS.md for
+interrupted-cut/restore handling and the forward-only older-reader boundary.
+Install compatible readers before creating new baseline-family files; retain a
+verified backup from before the first new-family write for any older-kit rollback.
+This does not choose office settings or a deployment schedule.
+
 ## Session idle and absolute limits
 
 An installation sets how long a browser session may sit unused before it signs out, and
@@ -4089,3 +4155,36 @@ The rooms file is written only after the complete sidecar, so a failed backup ne
 pairs a new rooms file with an older sidecar. `backup-copy` carries the same two rooms
 files (and pins their SHA-256 in the run record), so an off-machine copy does not lose
 rooms silently; `backup-status` names them when the project has them.
+## Serving delivered bundles over HTTP
+
+Web reviewers holding `reviews.write` or `reviews.approve` in a project can read a contribution's
+delivery metadata at `GET /v1/projects/{id}/tasks/{task_id}/delivery[?contribution=ID]` and fetch
+its verified git bundle at `GET /v1/projects/{id}/tasks/{task_id}/delivery/bundle[?contribution=ID]`
+(or via `http_client.py delivery PROJECT TASK [--contribution ID] [--out FILE] [--verify]`; on the
+SSH/host `client.py`, `client.py delivery` refuses with the fixed host-transport sentence and reads
+nothing from disk).
+
+- **`delivery_roots` in `deployment.private.json`** (list of absolute directory paths, default
+  `[]`): the only directories from which `GET .../delivery/bundle` (and the verified `bytes` field
+  of `GET .../delivery`) will open a recorded bundle file (for example `["/srv/orchestra-drop"]`).
+  The service strips any `HOST:` prefix from the contribution's recorded `delivery.path` without
+  comparing host names and resolves only the absolute path below it under a registered
+  `delivery_roots` directory, opening the file with `O_NOFOLLOW` and requiring a regular file. A
+  symlinked `delivery_roots` root directory refuses everything under it (`410`), and any symlinked
+  parent directory or symlinked bundle file below a root is likewise refused (`410`). When a worker
+  drops a bundle on another host (for example `goomba:/srv/orchestra-drop/<lane>/...` read from a
+  `koopa` service), the operator copies or mounts the drop folder at the matching real directory
+  path under a registered `delivery_roots` directory on the serving host; a bundle that is missing,
+  outside every registered root, a directory or FIFO, or under/at a symlink answers `410`
+  (`"The delivered bundle is not available on this service."`).
+- **`delivery_serve_max_bytes` in `deployment.private.json`** (positive integer up to 2 GiB,
+  default `268435456` = 256 MiB): maximum bundle size served over HTTP; a larger bundle answers
+  `413 payload_too_large` before any byte is streamed.
+- **Serve-time verification and audit:** before sending any bytes, the service checks that the
+  file size does not exceed `delivery_serve_max_bytes`, verifies the git bundle header and full
+  file SHA-256 against the contribution's recorded `delivery.sha256`, and runs `git bundle
+  list-heads` (60 s timeout) to verify that the bundle advertises the contribution's recorded
+  40-hex `commit`. Any checksum, header, or `list-heads` mismatch or timeout answers `503`
+  (`"The delivered bundle does not match its recorded checksum."`) with zero bytes sent. Every
+  bundle download and every post-authorization refusal records a `delivery.bundle.read` entry in
+  the HTTP audit log.

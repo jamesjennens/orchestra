@@ -15,6 +15,7 @@ import csv
 import hashlib
 import io
 import json
+import ntpath
 import os
 import posixpath
 import re
@@ -693,6 +694,116 @@ def review_workflow_writes(root, strict=False, warnings=None):
             else:
                 print('WARNING: ' + message,file=sys.stderr)
     return enabled
+
+# ---------------------------------------------------------------------------
+# Delivered code over HTTP (docs/design/DELIVERY_CODE_OVER_HTTP.md, kittrial-5bb.373):
+# `delivery_roots` and `delivery_serve_max_bytes` in `deployment.private.json`.
+#
+#   delivery_roots           - list of absolute directory paths under which the
+#                              HTTP service may open a recorded bundle path
+#                              (default `()`, so a service that does not configure
+#                              it refuses every bundle read with 410).
+#   delivery_serve_max_bytes - maximum byte size of a served bundle (default
+#                              268435456 = 256 MiB, hard cap 2 GiB).
+#
+# As with `review_workflow_writes`, a malformed value logs a warning (or appends
+# to `warnings` when supplied) and falls back to the safe default rather than
+# breaking unrelated endpoint or HTTP reads.
+# ---------------------------------------------------------------------------
+DELIVERY_SERVE_MAX_BYTES = 256 * 1024 * 1024
+DELIVERY_SERVE_MAX_BYTES_CAP = 2 * 1024 ** 3
+
+
+def _warn_deployment_setting(warnings, message):
+    if warnings is not None:
+        warnings.append('WARNING: ' + message)
+    else:
+        print('WARNING: ' + message, file=sys.stderr)
+
+
+def _normalize_delivery_root_entry(item):
+    """Normalize a non-root POSIX or Windows drive-letter absolute path for ``delivery_roots``."""
+    if not isinstance(item, str) or '\x00' in item:
+        return None, 'not_absolute'
+    if item.startswith('/') and not item.startswith('//') and '\\' not in item:
+        if item == '/':
+            return None, 'root'
+        normalized = posixpath.normpath(item)
+        if not normalized.startswith('/') or normalized.startswith('//') or normalized == '/':
+            return None, 'root'
+        return normalized, None
+    if len(item) >= 3 and item[0].isalpha() and item[1] == ':' and item[2] in ('/', '\\'):
+        if len(item) >= 4 and item[3] in ('/', '\\'):
+            return None, 'not_absolute'
+        if len(item.rstrip('/\\')) <= 2:
+            return None, 'root'
+        normalized = ntpath.normpath(item)
+        if not (len(normalized) > 3 and normalized[0].isalpha() and normalized[1:3] == ':\\'):
+            return None, 'root'
+        return normalized, None
+    return None, 'not_absolute'
+
+
+def delivery_roots(root, doc=None, warnings=None):
+    """Configured bundle drop-root directories from `deployment.private.json` (`()` by default)."""
+    if doc is None:
+        marker = Path(root) / 'deployment.private.json'
+        if not marker.is_file():
+            return ()
+        doc = deployment_document(marker)
+    if not isinstance(doc, dict):
+        return ()
+    value = doc.get('delivery_roots')
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        _warn_deployment_setting(
+            warnings,
+            'deployment delivery_roots is %r, not a list of absolute paths; reading it as empty' % (value,),
+        )
+        return ()
+    roots = []
+    for item in value:
+        normalized, problem = _normalize_delivery_root_entry(item)
+        if problem == 'not_absolute':
+            _warn_deployment_setting(
+                warnings,
+                'deployment delivery_roots entry %r is not a non-root absolute path; reading delivery_roots as empty'
+                % (item,),
+            )
+            return ()
+        if problem == 'root':
+            _warn_deployment_setting(
+                warnings,
+                'deployment delivery_roots entry %r resolves to root; reading delivery_roots as empty' % (item,),
+            )
+            return ()
+        if normalized not in roots:
+            roots.append(normalized)
+    return tuple(roots)
+
+
+def delivery_serve_max_bytes(root, doc=None, warnings=None):
+    """Configured byte cap for served bundles from `deployment.private.json` (256 MiB default)."""
+    if doc is None:
+        marker = Path(root) / 'deployment.private.json'
+        if not marker.is_file():
+            return DELIVERY_SERVE_MAX_BYTES
+        doc = deployment_document(marker)
+    if not isinstance(doc, dict):
+        return DELIVERY_SERVE_MAX_BYTES
+    value = doc.get('delivery_serve_max_bytes')
+    if value is None:
+        return DELIVERY_SERVE_MAX_BYTES
+    if type(value) is int and 0 < value <= DELIVERY_SERVE_MAX_BYTES_CAP:
+        return value
+    _warn_deployment_setting(
+        warnings,
+        'deployment delivery_serve_max_bytes is %r, not a positive integer <= %d; reading it as %d'
+        % (value, DELIVERY_SERVE_MAX_BYTES_CAP, DELIVERY_SERVE_MAX_BYTES),
+    )
+    return DELIVERY_SERVE_MAX_BYTES
+
 
 # ---------------------------------------------------------------------------
 # Slices 6 and 7 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.197) and
@@ -4156,7 +4267,8 @@ def validate_coordination_files(files):
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
         journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
-        if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal:raise ValueError('Invalid coordination backup path')
+        baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
+        if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
         if name=='.sessions.json':
             from sessions import validate
@@ -4231,6 +4343,8 @@ def validate_coordination_files(files):
             validate_quarantine_record(name,record)
     from requirement_governance import validate_files as validate_governance_files
     validate_governance_files(files)
+    from requirement_baselines import validate_backup as validate_baseline_backup
+    validate_baseline_backup(files)
     from lifecycle_voids import validate_backup as validate_void_backup
     validate_void_backup(files)
     from web_lifecycle_marks import validate_backup as validate_mark_backup
@@ -4662,6 +4776,8 @@ def backup_project(root,name):
             raise ValueError('Cannot back up an unreadable/incomplete lifecycle VOID family')
         from requirement_governance import snapshot as governance_snapshot
         files.update(governance_snapshot(path,name))
+        from requirement_baselines import backup_files as baseline_backup_files
+        files.update(baseline_backup_files(path,name))
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
         for record in sorted((path/'.coordination-requests').glob('*.json')):
             if record.is_symlink():raise ValueError('Coordination receipt must not be a symlink')
@@ -6812,18 +6928,35 @@ def restore_web_lifecycle_mark_family(root,destination,files):
         return marks.restore_files(path,files,native_rows)
 
 
+def restore_requirement_baseline_family(root,destination,files):
+    from requirement_baselines import restore_files, PREFIX, DIRECTORY, RESTORE_MARKER
+    path=project_dir(root,destination)
+    if (not any(name.startswith(PREFIX) for name in files)
+            and not os.path.lexists(path/DIRECTORY) and not os.path.lexists(path/RESTORE_MARKER)):
+        return False
+    import fcntl
+    if (path/'.coordination.lock').is_symlink():
+        raise ValueError('Coordination restore lock must not be a symlink')
+    with (path/'.coordination.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        return restore_files(path,files,destination)
+
+
 def restore_coordination(root,source,destination,restore_operators=False,restore_verifiers=False,authority=True,
                          actor=None,reason=None):
     from coordination import atomic
     path=project_dir(root,destination)
     files=coordination_backup(root,source)
     if files is None:
+        restore_requirement_baseline_family(root,destination,{})
         restore_lifecycle_void_family(root,destination,{})
         restore_web_lifecycle_mark_family(root,destination,{})
         print('Legacy backup has no coordination journal. Reconcile outstanding child requests and merge ownership before accepting writes.')
         return False
     from requirement_governance import restored_files as restored_governance_files
     files=restored_governance_files(files,source,destination)
+    from requirement_baselines import restored_files as restored_baseline_files
+    files=restored_baseline_files(files,source,destination)
     if using_last_complete_sidecar(root,source):
         print('The canonical coordination sidecar backups/%s.coordination.json is not complete, so this restore '
               'uses the durable last-complete copy %s (the previous complete generation, restored with the '
@@ -6895,8 +7028,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
     restore_lifecycle_void_family(root,destination,files)
     import web_lifecycle_marks as marks
     restore_web_lifecycle_mark_family(root,destination,files)
+    restore_requirement_baseline_family(root,destination,files)
     for name,record in files.items():
-        if name in (voids.MANIFEST,marks.MANIFEST,voids.ABANDON_FILE) or name.startswith((voids.DIRECTORY+'/',marks.DIRECTORY+'/')):
+        if name in (voids.MANIFEST,marks.MANIFEST,voids.ABANDON_FILE) or name.startswith((voids.DIRECTORY+'/',marks.DIRECTORY+'/', '.requirements-baselines/')):
             continue
         target=project_dir(root,destination)/name
         target.parent.mkdir(exist_ok=True)
