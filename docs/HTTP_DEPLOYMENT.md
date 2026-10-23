@@ -4270,7 +4270,7 @@ person and refuse every agent credential, even one holding the coordinator grant
 | `POST /v1/projects/{pid}/rooms/{rid}/items` | `{"item_kind","title","text","supersedes"?,"parent"?}` | the `rooms.post` capability (contributor/coordinator/owner) |
 | `POST .../items/{seq}/accept` | `{}`, `{"note": "..."}` or `{"parent": "..."}` | requirement: `requirement_editor` -> `coordinate`, otherwise `proposals.write`; decision: `coordinate` (owner/coordinator); question: 400 |
 | `POST .../items/{seq}/reject` | `{"reason": "..."}` | the item's author, or a project owner/coordinator |
-| `POST .../items/{seq}/amend` | `{"title": "...", "text": "..."}` | the item's author, or a project owner/coordinator |
+| `POST .../items/{seq}/amend` | `{"title": "...", "text": "..."}` or with `"parent": "..."` for a requirement | the item's author, or a project owner/coordinator |
 | `POST .../items/{seq}/answer` | `{"text": "..."}` | `read` (any member) on a question |
 
 **Accepted items become the kit's existing records, in existing fields only.** The pointer
@@ -4288,19 +4288,26 @@ Reject, amend and answer create no record.
 **One record per item, written after the checks.** The HTTP route takes the project's
 item-decision lock, re-reads the item, and checks its state, moderation, room and (for an
 accept) the parent job before any native record is written; the room is locked only for the
-append, so the endpoint's own `.coordination.lock` is never nested inside it. The record
-write and the item-event use an operation identity naming the room, the item sequence and
-the action — never the current event count or the client's key — so a retry reconciles on
-the same record. A second accept with a *fresh* client key after the item is decided is
-refused (409) and writes no second record, proposal or decision; a contributor accept and an
-owner accept racing each other produce exactly one record, decided by whichever took the
-item-decision lock first. The client `Idempotency-Key` still guards the HTTP mutation.
+append, so the endpoint's own `.coordination.lock` is never nested inside it. A room archive
+takes the same item-decision lock *before* the room lock, so it cannot slip between an
+accept's check and its append: the accept either finishes and is recorded, or the archive
+came first and nothing is written. The record write and the item-event use an operation
+identity naming the room, the item sequence and the action — never the current event count
+or the client's key — so a retry reconciles on the same record. An acceptance's identity also
+follows the title and text it records, and an amendment's follows the new title, text and
+parent, so a second amendment applies (the page offers Amend on an amended item) and an
+accept retried after a failed append records the current text instead of colliding with the
+native record the earlier attempt made. A second accept with a *fresh* client key after the
+item is decided is refused (409) and writes no second record, proposal or decision; a
+contributor accept and an owner accept racing each other produce exactly one record,
+decided by whichever took the item-decision lock first. The client `Idempotency-Key` still
+guards the HTTP mutation.
 
 **The items cache.** `index.json` gains a per-room `items` list: the current views and their
 decision history. It is a cache only. `rooms.py` builds it with the same function that a
 rebuild uses from the segment lines, so deleting the index or any stale byte check rebuilds
-identical states; the lines stay the truth. A moderated item's title, text and every
-user-written event field are dropped on moderation and on rebuild.
+identical states; the lines stay the truth. A moderated item's title, text, parent job and
+every user-written event field are dropped on moderation and on rebuild.
 
 **Rollback.** An older kit reads the requirements, proposals and decisions created here
 unchanged (the pointer rides in fields it already has). A `.385` reader does not know the

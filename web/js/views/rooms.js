@@ -157,22 +157,25 @@ export async function detail(ctx, { pid, rid }) {
     async function acceptItem() {
       let parent = item.parent || null;
       // Only an owner/coordinator's accept creates a requirement that needs a job; a
-      // contributor's accept is a proposal and needs none (review n1).
+      // contributor's accept is a proposal and needs none (review n1). Review n2/r3: the
+      // editor chooses the parent here, so a parent stored on the item is a suggestion,
+      // not a choice the page silently repeats.
       if (item.item_kind === 'requirement' && canModerate(project)) {
         const known = await jobList();
-        if (!parent && known.length === 1) parent = known[0][0];
-        if (!parent) {
-          if (!known.length) {
-            decision.replaceChildren(h('div', { class: 'small warn' },
-              'This project has no job yet; create one before accepting a requirement.'));
-            return;
-          }
-          form([field({ id: 'accept-parent-' + item.sequence, label: 'Parent job',
-            type: 'select', options: known })], 'Accept',
-          (values) => ctx.api.acceptRoomItem(pid, rid, item.sequence, null,
-            values['accept-parent-' + item.sequence]), 'Item accepted');
+        if (!known.length) {
+          decision.replaceChildren(h('div', { class: 'small warn' },
+            'This project has no job yet; create one before accepting a requirement.'));
           return;
         }
+        const ids = known.map(([id]) => id);
+        if (!parent || ids.indexOf(parent) < 0) {
+          parent = known.length === 1 ? known[0][0] : '';
+        }
+        form([field({ id: 'accept-parent-' + item.sequence, label: 'Parent job',
+          type: 'select', options: known, value: parent })], 'Accept',
+        (values) => ctx.api.acceptRoomItem(pid, rid, item.sequence, null,
+          values['accept-parent-' + item.sequence]), 'Item accepted');
+        return;
       }
       const saved = await act(actions.querySelector('button.primary'),
         () => ctx.api.acceptRoomItem(pid, rid, item.sequence, null, parent),
@@ -204,11 +207,25 @@ export async function detail(ctx, { pid, rid }) {
       if (item.item_kind !== 'question') {
         actions.append(h('button', {
           type: 'button', class: 'ghost',
-          onclick: () => form([
-            field({ id: 'amend-title-' + item.sequence, label: 'New title', maxlength: 200, value: item.title || '' }),
-            field({ id: 'amend-text-' + item.sequence, label: 'New text', type: 'textarea', rows: 4, maxlength: 4000, value: item.text || '' }),
-          ], 'Amend', (values) => ctx.api.amendRoomItem(pid, rid, item.sequence,
-            values['amend-title-' + item.sequence], values['amend-text-' + item.sequence]), 'Item amended'),
+          onclick: async () => {
+            // Review n2/r3: an editor can correct the parent job on an amendment instead of
+            // superseding the item, so the parent is one of the form's choices.
+            const known = (item.item_kind === 'requirement' && canModerate(project))
+              ? await jobList() : [];
+            const fields = [
+              field({ id: 'amend-title-' + item.sequence, label: 'New title', maxlength: 200, value: item.title || '' }),
+              field({ id: 'amend-text-' + item.sequence, label: 'New text', type: 'textarea', rows: 4, maxlength: 4000, value: item.text || '' }),
+            ];
+            if (known.length) {
+              const ids = known.map(([id]) => id);
+              fields.push(field({ id: 'amend-parent-' + item.sequence, label: 'Parent job',
+                type: 'select', options: known,
+                value: ids.indexOf(item.parent) >= 0 ? item.parent : '' }));
+            }
+            form(fields, 'Amend', (values) => ctx.api.amendRoomItem(pid, rid, item.sequence,
+              values['amend-title-' + item.sequence], values['amend-text-' + item.sequence],
+              known.length ? values['amend-parent-' + item.sequence] : null), 'Item amended');
+          },
         }, 'Amend'));
       }
     }
@@ -228,7 +245,7 @@ export async function detail(ctx, { pid, rid }) {
       h('p', { class: 'event-body prose room-text' }, item.text || ''),
       h('div', { class: 'small muted' }, (item.author && item.author.name || 'a member'), ' ', time(item.created_at),
         item.evidence ? ' · ' + item.evidence : '',
-        item.parent ? ' · job ' + item.parent : ''),
+        (!item.moderated && item.parent) ? ' · job ' + item.parent : ''),
       record,
       history.length ? h('div', { class: 'stack' }, history) : null,
       actions.childNodes.length ? actions : null,

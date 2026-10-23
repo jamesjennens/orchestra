@@ -85,8 +85,10 @@ ITEM_FIELDS_PARENT = ITEM_FIELDS | {'parent'}
 ITEM_FIELDS_PARENT_SUPERSEDES = ITEM_FIELDS | {'parent', 'supersedes'}
 ITEM_EVENT_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind', 'target_sequence',
                      'event', 'state', 'author', 'created_at', 'text', 'record'}
-#: An amended item-event also carries the new title; the body is its ``text``.
+#: An amended item-event also carries the new title; the body is its ``text``. Review n2 of
+#: kittrial-5bb.388 lets an editor name the parent job on an amendment too.
 ITEM_EVENT_FIELDS_AMEND = ITEM_EVENT_FIELDS | {'title'}
+ITEM_EVENT_FIELDS_AMEND_PARENT = ITEM_EVENT_FIELDS_AMEND | {'parent'}
 RECORD_FIELDS = {'kind', 'id', 'revision', 'sha256', 'decision_id', 'evidence'}
 RECORD_KINDS = ('requirement', 'proposal', 'decision')
 EVIDENCE = re.compile(r'orchestra:room/(r-[0-9a-f]{12})#([0-9]{1,12})\Z')
@@ -297,14 +299,28 @@ def item_operation(room_id, sequence, revision, action):
     return 'room-%s-%d-%d-%s' % (room_id, sequence, revision, action)
 
 
-def item_decision_operation(room_id, sequence, action):
-    """The stable operation id of one item decision (review b1/b2 of kittrial-5bb.388).
+def item_decision_operation(room_id, sequence, action, content=None):
+    """The deterministic operation id of one item decision (review b1/b2 of kittrial-5bb.388).
 
-    It names the item and the action, never the current event count: a retried native write
-    reconciles on the same identity instead of creating a second record, and the route can
-    refuse an already-decided item before it calls the native write at all.
+    It names the item and the action, never the current event count or the client's key: a
+    retried native write reconciles on the same identity instead of creating a second record,
+    and the route can refuse an already-decided item before it calls the native write at all.
+
+    Review b1/r3 and s1/r3: ``content`` is the digest of what the decision records (or the
+    new text an amendment writes).  An amendment and an acceptance therefore get a fresh
+    identity when the item's text changed, so a second amendment applies and an accept after
+    a failed append still records the current text; an unchanged retry keeps its identity and
+    reconciles on the same native record.
     """
-    return 'room-%s-%d-%s' % (room_id, sequence, action)
+    if content is None:
+        return 'room-%s-%d-%s' % (room_id, sequence, action)
+    return 'room-%s-%d-%s-%s' % (room_id, sequence, content, action)
+
+
+def item_content_digest(*values):
+    """A short, stable digest of the item fields a decision records (review b1/s1, r3)."""
+    joined = '\x1f'.join(value if isinstance(value, str) else '' for value in values)
+    return hashlib.sha256(joined.encode('utf-8')).hexdigest()[:16]
 
 
 # -- paths and atomic writes ----------------------------------------------------------------------
@@ -394,7 +410,11 @@ def _validate_line(line, expected=None):
         else:
             required = ITEM_FIELDS_SUPERSEDES if 'supersedes' in line else ITEM_FIELDS
     elif kind == 'item-event':
-        required = ITEM_EVENT_FIELDS_AMEND if line.get('event') == 'amend' else ITEM_EVENT_FIELDS
+        if line.get('event') == 'amend':
+            required = (ITEM_EVENT_FIELDS_AMEND_PARENT if 'parent' in line
+                        else ITEM_EVENT_FIELDS_AMEND)
+        else:
+            required = ITEM_EVENT_FIELDS
     else:
         raise ValueError('Invalid room line kind')
     if set(line) != required:
@@ -439,6 +459,9 @@ def _validate_line(line, expected=None):
         if event == 'amend' and (not isinstance(line.get('title'), str) or not line['title'].strip()
                                  or len(line['title']) > TITLE_LIMIT):
             raise ValueError('Invalid room item-event title')
+        if 'parent' in line and (not isinstance(line['parent'], str)
+                                 or not OPERATION_ID.fullmatch(line['parent'])):
+            raise ValueError('Invalid room item-event parent')
         check_record(line['record'])
     elif not line['text'].strip():
         raise ValueError('Invalid room message text')
@@ -881,6 +904,8 @@ def _item_event_view(line, redacted=None):
             'created_at': line['created_at'], 'record': line['record']}
     if line['event'] == 'amend':
         view['title'] = line.get('title')
+        if 'parent' in line:
+            view['parent'] = line['parent']
     if redacted is not None:
         # Review b4 of kittrial-5bb.388: every field a person wrote on a moderated item's
         # event is replaced, including an amendment's title (only text was replaced before).
@@ -888,6 +913,8 @@ def _item_event_view(line, redacted=None):
         view['record'] = None
         if 'title' in view:
             view['title'] = None
+        if 'parent' in view:
+            view['parent'] = None
         view['redacted'] = True
     else:
         view['text'] = line['text']
@@ -943,6 +970,8 @@ def items_from_lines(lines, room_id):
             elif event == 'amend':
                 target['title'] = line['title']
                 target['text'] = line['text']
+                if 'parent' in line:
+                    target['parent'] = line['parent']
                 target['amended_by'] = dict(line['author'])
                 target['amended_at'] = line['created_at']
             elif event == 'answer':
@@ -955,7 +984,8 @@ def items_from_lines(lines, room_id):
             continue
         target.update({'moderated': True, 'title': None, 'text': tombstone['text'],
                        'author': dict(tombstone['author']),
-                       'created_at': tombstone['created_at'], 'record': None, 'history': []})
+                       'created_at': tombstone['created_at'], 'record': None, 'history': [],
+                       'parent': None})
     return [items[key] for key in sorted(items)]
 
 
@@ -1173,7 +1203,7 @@ def post_item(project, room_id, item_kind, title, text, operation_id, author, li
 
 
 def _decide_item(project, room_id, sequence, event, operation_id, author, limits_values,
-                 text='', title=None, record=None):
+                 text='', title=None, record=None, parent=None):
     """Append one item-event after checking the item's current state (the truth)."""
     operation_id = check_operation_id(operation_id)
     if type(sequence) is not int or sequence < 1:
@@ -1186,7 +1216,8 @@ def _decide_item(project, room_id, sequence, event, operation_id, author, limits
     if existing is not None:
         matches = (existing['kind'] == 'item-event' and existing['target_sequence'] == sequence
                    and existing['event'] == event and existing['text'] == text
-                   and existing.get('title') == title and existing['record'] == record)
+                   and existing.get('title') == title and existing['record'] == record
+                   and existing.get('parent') == parent)
         if matches:
             view = next(item for item in items_from_lines(lines, room_id)
                         if item['sequence'] == sequence)
@@ -1224,7 +1255,14 @@ def _decide_item(project, room_id, sequence, event, operation_id, author, limits
     elif event == 'amend':
         title = check_title(title)
         text = check_item_text(text, limits_values['max_message_chars'], 'An amendment')
+        if parent is not None:
+            if current['item_kind'] != 'requirement':
+                raise Refusal(422, 'invalid', 'Only a requirement item names a parent job')
+            if not isinstance(parent, str) or not OPERATION_ID.fullmatch(parent):
+                raise Refusal(422, 'invalid', 'Invalid parent job id')
     else:
+        if parent is not None:
+            raise Refusal(422, 'invalid', 'Only an amendment or an acceptance names a parent job')
         if not isinstance(text, str) or len(text) > limits_values['max_message_chars']:
             raise Refusal(422, 'invalid', 'An acceptance note is at most %d characters'
                           % limits_values['max_message_chars'])
@@ -1236,6 +1274,8 @@ def _decide_item(project, room_id, sequence, event, operation_id, author, limits
             'author': dict(author), 'created_at': now_iso(), 'text': text, 'record': record}
     if event == 'amend':
         line['title'] = title
+        if parent is not None:
+            line['parent'] = parent
     _append(project, room_id, line, limits_values)
     view = next(item for item in items_from_lines(load_lines(project, room_id), room_id)
                 if item['sequence'] == sequence)
@@ -1252,9 +1292,10 @@ def reject_item(project, room_id, sequence, operation_id, author, limits_values,
                         limits_values, text=reason)
 
 
-def amend_item(project, room_id, sequence, operation_id, author, limits_values, title, text):
+def amend_item(project, room_id, sequence, operation_id, author, limits_values, title, text,
+               parent=None):
     return _decide_item(project, room_id, sequence, 'amend', operation_id, author,
-                        limits_values, text=text, title=title)
+                        limits_values, text=text, title=title, parent=parent)
 
 
 def answer_item(project, room_id, sequence, operation_id, author, limits_values, text):

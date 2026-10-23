@@ -417,6 +417,15 @@ class RoomsItemsTest(unittest.TestCase):
                             rooms.item_decision_operation(self.room['id'], 4, 'accept'))
         self.assertNotEqual(rooms.item_decision_operation(self.room['id'], 3, 'accept'),
                             rooms.item_decision_operation(self.room['id'], 3, 'reject'))
+        # Review b1/s1 of r3: content the decision records moves the identity, so a second
+        # amendment and an accept of the amended text are new, not operation_reused.
+        one = rooms.item_content_digest('Title', 'First body')
+        two = rooms.item_content_digest('Title', 'Second body')
+        self.assertNotEqual(one, two)
+        self.assertEqual(rooms.item_decision_operation(self.room['id'], 3, 'amend', content=one),
+                         rooms.item_decision_operation(self.room['id'], 3, 'amend', content=one))
+        self.assertNotEqual(rooms.item_decision_operation(self.room['id'], 3, 'amend', content=one),
+                            rooms.item_decision_operation(self.room['id'], 3, 'amend', content=two))
 
     def test_export_includes_the_item_and_its_pointer(self):
         self.item()

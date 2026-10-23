@@ -5,6 +5,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -38,6 +39,10 @@ class ItemsBackend(http_service.InProcessBackend):
         #: Set by the concurrency test: both accept paths meet here, so a route that did
         #: not serialize the decision would let both create a record.
         self.accept_barrier = None
+        #: Set by the archive-race test: the accept's native record write is inside the
+        #: item-decision lock, so the test can hold it there while an archive arrives.
+        self.record_entered = None
+        self.record_release = None
 
     def rendezvous(self):
         barrier = self.accept_barrier
@@ -46,6 +51,12 @@ class ItemsBackend(http_service.InProcessBackend):
                 barrier.wait(timeout=2)
             except threading.BrokenBarrierError:
                 pass
+
+    def record_gate(self):
+        if self.record_entered is not None:
+            self.record_entered.set()
+        if self.record_release is not None:
+            self.record_release.wait(timeout=10)
 
     def requirements_read(self, project_id, args):
         if args[:1] == ['get']:
@@ -64,12 +75,14 @@ class ItemsBackend(http_service.InProcessBackend):
         self.calls.append(('owner_requirements', action, key, task))
         if action == 'create':
             self.rendezvous()
+            self.record_gate()
             known = self.requirement_by_key.get(key)
             if known is not None:
                 return dict(self.requirements[known])
             record = {'id': 'task_requirement_%d' % (len(self.requirements) + 1),
                       'revision': 1, 'sha256': 'a' * 64, 'title': fields['title'],
-                      'description': fields['description'], 'decision_id': None}
+                      'description': fields['description'], 'decision_id': None,
+                      'parent': fields.get('parent')}
             self.requirements[record['id']] = record
             self.requirement_by_key[key] = record['id']
             return dict(record)
@@ -428,6 +441,155 @@ class RoomsItemsHttpTests(agents.AgentHarness):
         final = self.accept(self.tokens['owner'], key='accept-final')
         self.assertEqual(409, final.status, final.data)
 
+    def test_amend_twice_with_different_text_then_accept_latest(self):
+        # Review b1/r3: amend's identity follows the content it writes, so a second
+        # amendment applies instead of answering 409 operation_reused.
+        self.post_item(self.tokens['worker'])
+        first = self.request('POST', self.path('/items/1/amend'),
+                             {'title': 'First title', 'text': 'First body.'},
+                             token=self.tokens['owner'], key='amend-once')
+        self.assertEqual(200, first.status, first.data)
+        second = self.request('POST', self.path('/items/1/amend'),
+                              {'title': 'Second title', 'text': 'Second body.'},
+                              token=self.tokens['owner'], key='amend-twice')
+        self.assertEqual(200, second.status, second.data)
+        self.assertEqual(('amended', 'Second title', 'Second body.'),
+                         (second.data['state'], second.data['title'], second.data['text']))
+        accepted = self.accept(self.tokens['owner'], key='accept-amended')
+        self.assertEqual(200, accepted.status, accepted.data)
+        self.assertEqual('accepted', accepted.data['state'])
+        record = accepted.data['record']
+        self.assertIn('Second body.',
+                      self.backend.requirements[record['id']]['description'])
+        amendments = [event for event in self.items()[0]['history']
+                      if event['event'] == 'amend']
+        self.assertEqual(['First title', 'Second title'],
+                         [event['title'] for event in amendments])
+
+    def test_archive_waits_for_an_accept_inside_its_record_write(self):
+        # Review b2/r3: an archive takes the item-decision lock BEFORE the room lock, so it
+        # cannot slip into the accept's native record write. Either the accept finishes and
+        # is recorded, or nothing is written; here the accept got the lock first.
+        self.post_item(self.tokens['worker'])
+        entered = threading.Event()
+        release = threading.Event()
+        self.backend.record_entered = entered
+        self.backend.record_release = release
+        answers = {}
+        def run_accept():
+            answers['accept'] = self.accept(self.tokens['owner'], key='race-accept')
+        def run_archive():
+            answers['archive'] = self.request('POST', self.path('/archive'), {'reason': 'racing'},
+                                              token=self.tokens['coord'], key='race-archive')
+        worker = threading.Thread(target=run_accept)
+        worker.start()
+        archiver = None
+        try:
+            self.assertTrue(entered.wait(10), 'the accept reached its record write')
+            archiver = threading.Thread(target=run_archive)
+            archiver.start()
+            archiver.join(1)
+            self.assertTrue(archiver.is_alive(), 'the archive waited for the item-decision lock')
+        finally:
+            release.set()
+            worker.join(30)
+            if archiver is not None:
+                archiver.join(30)
+        self.assertEqual(200, answers['accept'].status, answers['accept'].data)
+        self.assertEqual(200, answers['archive'].status, answers['archive'].data)
+        self.assertEqual(1, len(self.backend.requirements), 'one requirement, written before the archive')
+        self.assertEqual(1, len(self.backend.decisions))
+        events = [line for line in rooms.load_lines(Path(self.rooms_root) / self.pid, self.room['id'])
+                  if line['kind'] == 'item-event']
+        self.assertEqual(1, len(events), 'the acceptance was recorded before the room was archived')
+        self.assertEqual('accepted', self.items()[0]['state'])
+
+    def test_accept_after_a_failed_append_records_the_amended_text(self):
+        # Review s1/r3: a failed room append after the native write used to leave an identity
+        # the next accept could never reuse. The accept identity follows the content it
+        # records, so an amendment is followed by an accept of the amended text.
+        self.post_item(self.tokens['worker'])
+        real_append = rooms._append
+        state = {'failed': False}
+        def flaky(*args, **kwargs):
+            if not state['failed']:
+                state['failed'] = True
+                raise OSError(5, 'injected append failure')
+            return real_append(*args, **kwargs)
+        with mock.patch.object(rooms, '_append', flaky):
+            failed = self.accept(self.tokens['owner'], key='accept-fail')
+        self.assertEqual(500, failed.status, failed.data)
+        self.assertEqual(1, len(self.backend.requirements), 'the native record was written')
+        self.assertEqual('proposed', self.items()[0]['state'])
+        amended = self.request('POST', self.path('/items/1/amend'),
+                               {'title': 'Amended export', 'text': 'Amended body with a header row.'},
+                               token=self.tokens['owner'], key='amend-after-fail')
+        self.assertEqual(200, amended.status, amended.data)
+        accepted = self.accept(self.tokens['owner'], key='accept-after-fail')
+        self.assertEqual(200, accepted.status, accepted.data)
+        self.assertEqual('accepted', accepted.data['state'])
+        record = accepted.data['record']
+        self.assertEqual(2, len(self.backend.requirements))
+        self.assertIn('Amended body with a header row.',
+                      self.backend.requirements[record['id']]['description'])
+
+    def test_a_moderated_items_parent_is_not_served(self):
+        # Review n1/r3: the parent job is user-chosen item data too; moderation clears it in
+        # the room read and the index cache.
+        self.post_item(self.tokens['worker'], parent='job_0001')
+        moderated = self.request('POST', self.path('/messages/1/moderate'),
+                                 {'reason': 'private'}, token=self.tokens['coord'], key='mod-parent')
+        self.assertEqual(201, moderated.status, moderated.data)
+        read = self.read(self.tokens['viewer'])
+        self.assertNotIn('job_0001', json.dumps(read.data))
+        self.assertIsNone(read.data['items'][0]['parent'])
+        index = (Path(self.rooms_root) / self.pid / rooms.FOLDER / rooms.INDEX).read_text(
+            encoding='utf-8')
+        self.assertNotIn('job_0001', index)
+
+    def test_an_editor_can_choose_the_parent_on_an_amendment(self):
+        # Review n2/r3: an editor can correct the parent job by amending; an explicit accept
+        # parent wins over the stored one, and a parent that is not a job is refused.
+        self.post_item(self.tokens['worker'], parent='job_0001')
+        self.backend.requirements_read = lambda pid, args: {
+            'items': [], 'decisions': [],
+            'jobs': [{'id': 'job_0001', 'title': 'One'}, {'id': 'job_0002', 'title': 'Two'}]}
+        wrong = self.request('POST', self.path('/items/1/amend'),
+                             {'title': 'Export', 'text': 'Body.', 'parent': 'not-a-job'},
+                             token=self.tokens['owner'], key='amend-wrong-parent')
+        self.assertEqual(422, wrong.status, wrong.data)
+        amended = self.request('POST', self.path('/items/1/amend'),
+                               {'title': 'Export', 'text': 'Body.', 'parent': 'job_0002'},
+                               token=self.tokens['owner'], key='amend-parent')
+        self.assertEqual(200, amended.status, amended.data)
+        self.assertEqual('job_0002', amended.data['parent'])
+        accepted = self.accept(self.tokens['owner'], key='accept-parent-choice',
+                               body={'parent': 'job_0002'})
+        self.assertEqual(200, accepted.status, accepted.data)
+        record = accepted.data['record']
+        self.assertEqual('job_0002', self.backend.requirements[record['id']]['parent'])
+
+    def test_a_symlinked_room_or_item_lock_is_refused(self):
+        # Review n3/r3: a lock is never opened through a symlink (as admin.py checks the
+        # coordination lock for lifecycle writes).
+        project = Path(self.rooms_root) / self.pid
+        target = project / 'elsewhere'
+        coordination = project / '.coordination.lock'
+        coordination.unlink(missing_ok=True)
+        coordination.symlink_to(target)
+        refused = self.read(self.tokens['viewer'])
+        self.assertEqual(500, refused.status, refused.data)
+        self.assertEqual('damaged', refused.data['error']['code'])
+        coordination.unlink()
+        self.post_item(self.tokens['worker'])
+        item_lock = project / '.item-decisions.lock'
+        item_lock.unlink(missing_ok=True)
+        item_lock.symlink_to(target)
+        refused = self.accept(self.tokens['owner'], key='symlink-accept')
+        self.assertEqual(500, refused.status, refused.data)
+        self.assertEqual('damaged', refused.data['error']['code'])
+        self.assertEqual({}, self.backend.requirements)
+
     def test_supersede_and_bounds(self):
         first = self.post_item(self.tokens['worker'])
         self.assertEqual(201, first.status, first.data)
@@ -520,6 +682,11 @@ class RoomsItemsPageTests(unittest.TestCase):
         self.assertGreaterEqual(seen['coordinator']['forms'], 3)
         self.assertIn('orchestra:room/r-0123456789ab#1', seen['contributor']['text'])
         self.assertIn('amended', seen['contributor']['text'])
+        # Review b1/r3: the page offers Amend on an already amended item (the server applies
+        # a second amendment now), and a moderated item's parent job is never shown.
+        self.assertIn('Amend', seen['coordinator']['buttons'])
+        for role in ('viewer', 'contributor', 'coordinator'):
+            self.assertNotIn('job_0001_secret', seen[role]['text'])
 
 
 if __name__ == '__main__':

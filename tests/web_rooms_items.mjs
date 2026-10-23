@@ -68,8 +68,14 @@ const data = {
       author: { id: 'usr_2', name: 'Alice', role: 'contributor' },
       created_at: '2026-10-23T04:03:00Z', text: 'Comma or semicolon?',
       evidence: 'orchestra:room/r-0123456789ab#3', moderated: false, record: null, history: [] },
+    // Review n1/r3: a moderated item's parent job is user data and must not be shown.
+    { sequence: 4, kind: 'item', item_kind: 'requirement', title: '(removed)',
+      state: 'proposed', moderated: true, parent: 'job_0001_secret',
+      author: { id: 'usr_2', name: 'Alice', role: 'contributor' },
+      created_at: '2026-10-23T04:04:00Z', text: 'removed by Carol at 04:04: private',
+      evidence: 'orchestra:room/r-0123456789ab#4', record: null, history: [] },
   ],
-  moderations: [], since: 0, last_sequence: 3, next_since: 3, has_more: false,
+  moderations: [], since: 0, last_sequence: 4, next_since: 4, has_more: false,
 };
 
 async function detail(role) {
