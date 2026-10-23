@@ -1902,14 +1902,18 @@ class EndpointBackend:
         project = self.files_project(project_id)
         with (project / '.coordination.lock').open('a') as lock:
             ends = time.monotonic() + DISCARD_LOCK_SECONDS
-            while True:
+            locked = False
+            for _ in range(int(DISCARD_LOCK_SECONDS / 0.05) + 2):   # a bounded number of tries, never an open loop
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
                     break
                 except BlockingIOError:
                     if time.monotonic() >= ends:
-                        raise TimeoutError('the project lock was not free within %d s' % DISCARD_LOCK_SECONDS) from None
+                        break
                     time.sleep(0.05)
+            if not locked:
+                raise TimeoutError('the project lock was not free within %d s' % DISCARD_LOCK_SECONDS)
             return task_files.discard(project, sha256)
 
     def assignment_roster(self, principal, project_id, offset=0, limit=200):
