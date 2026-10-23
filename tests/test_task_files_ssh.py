@@ -421,7 +421,11 @@ class FramedHeaderDeadlineTests(unittest.TestCase):
             read, write = os.pipe()
             try:
                 os.write(write, sent)
-                with mock.patch('time.monotonic', side_effect=[0, 100, 100]):
+                # The first reading starts the 60 s deadline; every later one is past it. A callable,
+                # not a list: other threads of the suite read time.monotonic while it is patched, and
+                # a list they use up ends in StopIteration (coordinator, 1023e suite).
+                readings = iter([0])
+                with mock.patch('time.monotonic', side_effect=lambda: next(readings, 100)):
                     request, frame, refusal = fixture.endpoint.read_request(read)
             finally:
                 os.close(read)
