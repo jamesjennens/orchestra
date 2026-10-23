@@ -43,7 +43,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import actor_names
 import agent_prompts
@@ -628,11 +628,22 @@ class InProcessBackend:
     #: service's namespace only; no row rule is applied or recorded (kittrial-5bb.188 item 4).
     ACTOR_ROWS = False
 
-    def __init__(self, service, actor_namespace=None):
+    def __init__(self, service, actor_namespace=None, *, delivery_roots=(), delivery_serve_max_bytes=None):
         import actor_names
+        from review_workflow import DELIVERY_SERVE_MAX_BYTES
         self.service = service
         self.actor_namespace = actor_namespace or actor_names.SERVICE_NAMESPACE
         self.faults = {}
+        self.delivery_roots = tuple(delivery_roots or ())
+        self.delivery_serve_max_bytes = (
+            DELIVERY_SERVE_MAX_BYTES if delivery_serve_max_bytes is None else int(delivery_serve_max_bytes)
+        )
+
+    def get_delivery_roots(self):
+        return tuple(self.delivery_roots or ())
+
+    def get_delivery_serve_max_bytes(self):
+        return int(self.delivery_serve_max_bytes)
 
     def fail_next(self, route, times=1):
         """Test hook: commit, then raise :class:`UncertainOutcome` for the next call(s)."""
@@ -1143,8 +1154,19 @@ class InProcessBackend:
                 raise invalid('bundle_sha256 must be a 64-character lowercase hex digest')
             if not isinstance(summary, str) or not summary.strip() or len(summary) > 1200:
                 raise invalid('Contribution summary must be 1-1200 characters')
+            repository = payload.get('repository')
+            repository = repository.strip() if isinstance(repository, str) else ''
+            if isinstance(delivery, dict) and delivery.get('kind') == 'remote':
+                delivery_block = {'kind': 'remote', 'remote': delivery['remote'].strip(), 'branch': branch.strip()}
+            elif isinstance(delivery, dict) and delivery.get('kind') == 'bundle':
+                delivery_block = {'kind': 'bundle', 'path': str(delivery.get('path') or ''), 'sha256': digest}
+            elif branch is not None:
+                delivery_block = {'kind': 'remote', 'remote': '', 'branch': branch}
+            else:
+                delivery_block = {'kind': 'bundle', 'path': '', 'sha256': digest}
             record = {'id': 'con_' + secrets.token_hex(6), 'task_id': task['id'],
                       'kind': 'contribution', 'commit': commit, 'base_commit': base_commit,
+                      'repository': repository, 'delivery': delivery_block,
                       'bundle_sha256': digest, 'branch': branch, 'summary': summary.strip(),
                       'actor': payload.get('actor') or principal.actor,
                       'created_at': now_iso(self.service._now())}
@@ -1455,6 +1477,54 @@ class InProcessBackend:
 
     def get_task(self, project_id, task_id):
         return dict(self._task(project_id, task_id))
+
+    def task_delivery_record(self, project_id, task_id, contribution_id=None):
+        task = self._task(project_id, task_id)
+        if isinstance(task, dict) and task.get('malformed'):
+            raise unreadable_row(task.get('id') or task_id)
+        if is_record_anchor(task) or is_merge_slot(task):
+            raise not_found('Task not found')
+        records = self.state.get('contributions', {}).get(task['id'], [])
+        contributions = []
+        revision = 0
+        for rec in records:
+            if not isinstance(rec, dict) or rec.get('kind') != 'contribution':
+                continue
+            revision += 1
+            delivery = rec.get('delivery')
+            if not isinstance(delivery, dict):
+                if rec.get('branch') is not None:
+                    delivery = {
+                        'kind': 'remote',
+                        'remote': rec.get('remote') or '',
+                        'branch': rec['branch'],
+                    }
+                else:
+                    delivery = {
+                        'kind': 'bundle',
+                        'path': rec.get('bundle_path') or '',
+                        'sha256': rec.get('bundle_sha256') or '',
+                    }
+            contributions.append({
+                'project': project_id,
+                'task': task['id'],
+                'contribution': rec['id'],
+                'revision': revision,
+                'commit': rec['commit'],
+                'base_commit': rec['base_commit'],
+                'repository': rec.get('repository') or '',
+                'author': rec.get('actor') or '',
+                'at': rec.get('created_at') or '',
+                'delivery': dict(delivery),
+            })
+        if not contributions:
+            raise not_found('Contribution not found')
+        if contribution_id is None:
+            return contributions[-1]
+        for item in contributions:
+            if item['contribution'] == contribution_id:
+                return item
+        raise not_found('Contribution not found')
 
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
                      recent=False, since_checkpoint=False):
@@ -3254,6 +3324,62 @@ class EndpointBackend:
         if isinstance(row, dict) and row.get('project_id') not in (None, project_id):
             raise not_found('Task not found')
         return self._with_record_comments(project_id, [row])[0]
+
+    def _read_deployment_setting(self, fn):
+        from admin import ConfigurationUnreadable
+        try:
+            return fn(Path(self.root))
+        except ConfigurationUnreadable as exc:
+            print(
+                'configuration: the service could not read the deployment configuration: %s'
+                % ascii(str(exc)[:600]),
+                file=sys.stderr,
+                flush=True,
+            )
+            refused = HttpError(503, 'server_configuration', self.CONFIGURATION_UNREADABLE)
+            refused.nothing_done = True
+            raise refused from None
+
+    def get_delivery_roots(self):
+        from admin import delivery_roots
+        return self._read_deployment_setting(delivery_roots)
+
+    def get_delivery_serve_max_bytes(self):
+        from admin import delivery_serve_max_bytes
+        return self._read_deployment_setting(delivery_serve_max_bytes)
+
+    def task_delivery_record(self, project_id, task_id, contribution_id=None):
+        reply = self._endpoint(
+            'delivery-record',
+            project_id,
+            self.actor_namespace + '/read',
+            [str(task_id)],
+        )
+        code = reply.get('returncode') if isinstance(reply, dict) else None
+        stderr = (reply.get('stderr') or '') if isinstance(reply, dict) else ''
+        if code == 2 and 'Unknown action' in stderr:
+            raise not_implemented(
+                'The canonical endpoint is older than this HTTP service and has no delivery '
+                'record read; install the same kit for both'
+            )
+        payload = self._checked(reply, 'delivery-record', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical delivery record read returned an unexpected shape')
+        if not payload.get('found'):
+            raise not_found('Task not found')
+        if payload.get('malformed'):
+            raise unreadable_row(payload.get('id') or task_id)
+        if payload.get('project') not in (None, project_id) or payload.get('task') not in (None, task_id):
+            raise not_found('Task not found')
+        contributions = [c for c in (payload.get('contributions') or []) if isinstance(c, dict)]
+        if not contributions:
+            raise not_found('Contribution not found')
+        if contribution_id is None:
+            return contributions[-1]
+        for item in contributions:
+            if item.get('contribution') == contribution_id:
+                return item
+        raise not_found('Contribution not found')
 
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
                      recent=False, since_checkpoint=False):
@@ -10741,6 +10867,336 @@ class ApiHandler(BaseHTTPRequestHandler):
     ALREADY_RECOMMENDED = ('%s has already recommended this contribution, and that recommendation stands until the '
                            'contribution is revised or decided. To ask for changes instead, request changes: the '
                            'recommendation then stops counting. A recommendation cannot be withdrawn.')
+
+    def _project_delivery(self, ctx):
+        """Authorize a delivery read: ``CAP_REVIEWS``, or ``CAP_APPROVE`` on the same project.
+
+        The ``CAP_APPROVE`` fallback runs ONLY after a ``403`` from the ``CAP_REVIEWS``
+        check for the SAME route project (kittrial-5bb.373 precision 2); any other
+        refusal (``404`` unknown project, ``401``) is returned as is, and a principal
+        with neither capability gets the original ``403``.
+        """
+        try:
+            self._project(ctx, CAP_REVIEWS)
+            return
+        except HttpError as first_error:
+            if first_error.status != 403:
+                raise
+            try:
+                self._project(ctx, CAP_APPROVE)
+                return
+            except HttpError:
+                raise first_error from None
+
+    @staticmethod
+    def _delivery_contribution_query(query):
+        unknown = sorted(set(query) - {'contribution'})
+        if unknown:
+            raise invalid('Unsupported query parameter(s): %s' % ', '.join(unknown))
+        if 'contribution' not in query:
+            return None
+        contribution_id = query.get('contribution')
+        if not isinstance(contribution_id, str) or not SAFE_ID.fullmatch(contribution_id):
+            raise not_found('Contribution not found')
+        return contribution_id
+
+    def _audit_bundle_read(
+        self,
+        ctx,
+        pid,
+        record,
+        outcome,
+        *,
+        reason=None,
+        sha256=None,
+        size_bytes=None,
+        task=None,
+        contribution=None,
+    ):
+        with self.service.store.lock:
+            event = self.service.audit(
+                ctx.request_id,
+                ctx.principal,
+                'delivery.bundle.read',
+                outcome,
+                project_id=pid,
+                reason=reason,
+            )
+            if isinstance(record, dict):
+                event['task'] = record.get('task') or task
+                event['contribution'] = record.get('contribution') or contribution
+                event['commit'] = record.get('commit')
+                if sha256 is None and isinstance(record.get('delivery'), dict):
+                    sha256 = record['delivery'].get('sha256')
+            else:
+                if task is not None:
+                    event['task'] = task
+                if contribution is not None:
+                    event['contribution'] = contribution
+            if sha256 is not None:
+                event['sha256'] = sha256
+            if size_bytes is not None:
+                event['bytes'] = size_bytes
+            self.service.store.save_soon('the audit entry of a bundle read')
+
+    def _send_bundle_stream(self, handle_fd, record, verified):
+        from review_workflow import BUNDLE_BLOCK_BYTES
+        headers_sent = False
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(verified['bytes']))
+            self.send_header('ETag', str(verified['sha256']))
+            self.send_header('X-Contribution', str(record['contribution']))
+            self.send_header('X-Orchestra-Contribution', str(record['contribution']))
+            self.send_header('X-Orchestra-Commit', str(record['commit']))
+            self.send_header('X-Orchestra-Base-Commit', str(record['base_commit']))
+            self.send_header('X-Orchestra-Bundle-Sha256', str(verified['sha256']))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self._send_hsts()
+            self.send_header('X-Request-Id', getattr(self, '_current_request_id', '') or '')
+            if getattr(self, '_say_close', False):
+                self.send_header('Connection', 'close')
+                self._say_close = False
+            if getattr(self, '_set_cookie_token', None):
+                self._send_cookie(self._set_cookie_token)
+            self.end_headers()
+            headers_sent = True
+            if self.command == 'HEAD':
+                return 'ok', None
+            os.lseek(handle_fd, 0, os.SEEK_SET)
+            expected_bytes = int(verified['bytes'])
+            expected_sha = str(verified['sha256']).lower()
+            expected_stat = verified.get('stat_snapshot')
+            remaining = expected_bytes
+            stream_digest = hashlib.sha256()
+            held_block = None
+            while remaining > 0:
+                chunk = os.read(handle_fd, min(BUNDLE_BLOCK_BYTES, remaining))
+                if not chunk:
+                    self.close_connection = True
+                    try:
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+                    return 'interrupted', 'short_read'
+                stream_digest.update(chunk)
+                remaining -= len(chunk)
+                if held_block is not None:
+                    self.wfile.write(held_block)
+                held_block = chunk
+            extra = os.read(handle_fd, 1)
+            info_after = os.fstat(handle_fd)
+            stat_after = (
+                info_after.st_dev,
+                info_after.st_ino,
+                info_after.st_size,
+                info_after.st_mtime_ns,
+                info_after.st_ctime_ns,
+            )
+            if (
+                extra
+                or stream_digest.hexdigest().lower() != expected_sha
+                or (expected_stat is not None and stat_after != expected_stat)
+            ):
+                self.close_connection = True
+                try:
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                return 'interrupted', 'bundle_checksum_mismatch'
+            if held_block is not None:
+                self.wfile.write(held_block)
+            self.wfile.flush()
+            return 'ok', None
+        except Exception:
+            self.close_connection = True
+            if not headers_sent:
+                raise
+            try:
+                self.wfile.flush()
+            except OSError:
+                pass
+            return 'interrupted', 'stream_error'
+        finally:
+            try:
+                os.close(handle_fd)
+            except OSError:
+                pass
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/delivery')
+    def tasks_delivery(self, ctx):
+        """Return the contribution's recorded delivery metadata (kittrial-5bb.373)."""
+        from review_workflow import (
+            DeliveryCorruptError,
+            DeliveryTooLargeError,
+            DeliveryUnavailableError,
+            resolve_delivery_bundle_path,
+            verify_served_bundle,
+        )
+        self._project_delivery(ctx)
+        pid = ctx.params['pid']
+        tid = ctx.params['tid']
+        contribution_id = ctx.query.get('contribution') if isinstance(ctx.query.get('contribution'), str) else None
+        record = None
+        try:
+            contribution_id = self._delivery_contribution_query(ctx.query)
+            candidate = self.backend.task_delivery_record(
+                pid,
+                tid,
+                contribution_id=contribution_id,
+            )
+            if candidate.get('task') != tid or candidate.get('project') not in (None, pid):
+                raise not_found('Contribution not found')
+            record = candidate
+            delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
+            kind = delivery.get('kind')
+            roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
+            max_bytes = (
+                self.backend.get_delivery_serve_max_bytes()
+                if hasattr(self.backend, 'get_delivery_serve_max_bytes')
+                else 256 * 1024 * 1024
+            )
+        except HttpError as error:
+            self._audit_bundle_read(
+                ctx,
+                pid,
+                record,
+                'refused',
+                reason=error.code,
+                task=tid,
+                contribution=contribution_id,
+            )
+            raise
+        sha256 = delivery.get('sha256') if kind == 'bundle' else None
+        path = delivery.get('path') if kind == 'bundle' else None
+        bundle_bytes = None
+        if kind == 'bundle':
+            try:
+                resolved_path, handle_fd, raw_size = resolve_delivery_bundle_path(path, roots)
+            except DeliveryUnavailableError:
+                bundle_bytes = None
+            else:
+                try:
+                    verified = verify_served_bundle(
+                        resolved_path,
+                        handle_fd,
+                        raw_size,
+                        sha256,
+                        record.get('commit'),
+                        max_bytes=max_bytes,
+                        git=getattr(self.backend, 'bundle_git', None),
+                    )
+                except (DeliveryUnavailableError, DeliveryTooLargeError, DeliveryCorruptError):
+                    bundle_bytes = None
+                else:
+                    bundle_bytes = verified['bytes']
+                    try:
+                        os.close(handle_fd)
+                    except OSError:
+                        pass
+        cid = record.get('contribution')
+        qs = ('?' + urlencode({'contribution': cid})) if cid else ''
+        base_url = '/v1/projects/%s/tasks/%s/delivery' % (quote(pid, safe=''), quote(tid, safe=''))
+        links = {
+            'self': base_url + qs,
+            'bundle': (base_url + '/bundle' + qs) if kind == 'bundle' else None,
+        }
+        return 200, {
+            'task': tid,
+            'project': pid,
+            'contribution': cid,
+            'revision': record.get('revision'),
+            'kind': kind,
+            'commit': record.get('commit'),
+            'base_commit': record.get('base_commit'),
+            'sha256': sha256,
+            'bytes': bundle_bytes,
+            'path': path,
+            'serve_limit': max_bytes,
+            'repository': record.get('repository'),
+            'author': record.get('author'),
+            'at': record.get('at'),
+            'delivery': delivery,
+            'links': links,
+        }
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/delivery/bundle')
+    def tasks_delivery_bundle(self, ctx):
+        """Verify and stream the contribution's delivered git bundle (kittrial-5bb.373)."""
+        from review_workflow import (
+            DELIVERY_CHECKSUM_MISMATCH,
+            DELIVERY_NOT_AVAILABLE,
+            DELIVERY_REMOTE_NO_BUNDLE,
+            DeliveryCorruptError,
+            DeliveryTooLargeError,
+            DeliveryUnavailableError,
+            resolve_delivery_bundle_path,
+            verify_served_bundle,
+        )
+        self._project_delivery(ctx)
+        pid = ctx.params['pid']
+        tid = ctx.params['tid']
+        contribution_id = ctx.query.get('contribution') if isinstance(ctx.query.get('contribution'), str) else None
+        record = None
+        size = None
+        try:
+            contribution_id = self._delivery_contribution_query(ctx.query)
+            candidate = self.backend.task_delivery_record(pid, tid, contribution_id=contribution_id)
+            if candidate.get('task') != tid or candidate.get('project') not in (None, pid):
+                raise not_found('Contribution not found')
+            record = candidate
+            delivery = record.get('delivery') if isinstance(record.get('delivery'), dict) else {}
+            if delivery.get('kind') != 'bundle':
+                raise invalid(DELIVERY_REMOTE_NO_BUNDLE)
+            roots = self.backend.get_delivery_roots() if hasattr(self.backend, 'get_delivery_roots') else ()
+            max_bytes = (
+                self.backend.get_delivery_serve_max_bytes()
+                if hasattr(self.backend, 'get_delivery_serve_max_bytes')
+                else 256 * 1024 * 1024
+            )
+            try:
+                resolved_path, handle_fd, size = resolve_delivery_bundle_path(delivery.get('path'), roots)
+                verified = verify_served_bundle(
+                    resolved_path,
+                    handle_fd,
+                    size,
+                    delivery.get('sha256'),
+                    record.get('commit'),
+                    max_bytes=max_bytes,
+                    git=getattr(self.backend, 'bundle_git', None),
+                )
+            except DeliveryUnavailableError:
+                raise HttpError(410, 'bundle_unavailable', DELIVERY_NOT_AVAILABLE) from None
+            except DeliveryTooLargeError as error:
+                raise HttpError(413, 'payload_too_large', str(error)) from None
+            except DeliveryCorruptError:
+                raise HttpError(503, 'bundle_checksum_mismatch', DELIVERY_CHECKSUM_MISMATCH) from None
+        except HttpError as error:
+            self._audit_bundle_read(
+                ctx,
+                pid,
+                record,
+                'refused',
+                reason=error.code,
+                size_bytes=size,
+                task=tid,
+                contribution=contribution_id,
+            )
+            raise
+        outcome, interrupt_reason = self._send_bundle_stream(handle_fd, record, verified)
+        self._audit_bundle_read(
+            ctx,
+            pid,
+            record,
+            outcome,
+            reason=interrupt_reason,
+            sha256=verified['sha256'],
+            size_bytes=verified['bytes'],
+        )
+        return None, None
 
     #: Every field a recommendation may carry over HTTP (``task_id`` is set by the route).
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/history')

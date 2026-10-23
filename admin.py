@@ -15,6 +15,7 @@ import csv
 import hashlib
 import io
 import json
+import ntpath
 import os
 import posixpath
 import re
@@ -687,6 +688,116 @@ def review_workflow_writes(root, strict=False, warnings=None):
             else:
                 print('WARNING: ' + message,file=sys.stderr)
     return enabled
+
+# ---------------------------------------------------------------------------
+# Delivered code over HTTP (docs/design/DELIVERY_CODE_OVER_HTTP.md, kittrial-5bb.373):
+# `delivery_roots` and `delivery_serve_max_bytes` in `deployment.private.json`.
+#
+#   delivery_roots           - list of absolute directory paths under which the
+#                              HTTP service may open a recorded bundle path
+#                              (default `()`, so a service that does not configure
+#                              it refuses every bundle read with 410).
+#   delivery_serve_max_bytes - maximum byte size of a served bundle (default
+#                              268435456 = 256 MiB, hard cap 2 GiB).
+#
+# As with `review_workflow_writes`, a malformed value logs a warning (or appends
+# to `warnings` when supplied) and falls back to the safe default rather than
+# breaking unrelated endpoint or HTTP reads.
+# ---------------------------------------------------------------------------
+DELIVERY_SERVE_MAX_BYTES = 256 * 1024 * 1024
+DELIVERY_SERVE_MAX_BYTES_CAP = 2 * 1024 ** 3
+
+
+def _warn_deployment_setting(warnings, message):
+    if warnings is not None:
+        warnings.append('WARNING: ' + message)
+    else:
+        print('WARNING: ' + message, file=sys.stderr)
+
+
+def _normalize_delivery_root_entry(item):
+    """Normalize a non-root POSIX or Windows drive-letter absolute path for ``delivery_roots``."""
+    if not isinstance(item, str) or '\x00' in item:
+        return None, 'not_absolute'
+    if item.startswith('/') and not item.startswith('//') and '\\' not in item:
+        if item == '/':
+            return None, 'root'
+        normalized = posixpath.normpath(item)
+        if not normalized.startswith('/') or normalized.startswith('//') or normalized == '/':
+            return None, 'root'
+        return normalized, None
+    if len(item) >= 3 and item[0].isalpha() and item[1] == ':' and item[2] in ('/', '\\'):
+        if len(item) >= 4 and item[3] in ('/', '\\'):
+            return None, 'not_absolute'
+        if len(item.rstrip('/\\')) <= 2:
+            return None, 'root'
+        normalized = ntpath.normpath(item)
+        if not (len(normalized) > 3 and normalized[0].isalpha() and normalized[1:3] == ':\\'):
+            return None, 'root'
+        return normalized, None
+    return None, 'not_absolute'
+
+
+def delivery_roots(root, doc=None, warnings=None):
+    """Configured bundle drop-root directories from `deployment.private.json` (`()` by default)."""
+    if doc is None:
+        marker = Path(root) / 'deployment.private.json'
+        if not marker.is_file():
+            return ()
+        doc = deployment_document(marker)
+    if not isinstance(doc, dict):
+        return ()
+    value = doc.get('delivery_roots')
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        _warn_deployment_setting(
+            warnings,
+            'deployment delivery_roots is %r, not a list of absolute paths; reading it as empty' % (value,),
+        )
+        return ()
+    roots = []
+    for item in value:
+        normalized, problem = _normalize_delivery_root_entry(item)
+        if problem == 'not_absolute':
+            _warn_deployment_setting(
+                warnings,
+                'deployment delivery_roots entry %r is not a non-root absolute path; reading delivery_roots as empty'
+                % (item,),
+            )
+            return ()
+        if problem == 'root':
+            _warn_deployment_setting(
+                warnings,
+                'deployment delivery_roots entry %r resolves to root; reading delivery_roots as empty' % (item,),
+            )
+            return ()
+        if normalized not in roots:
+            roots.append(normalized)
+    return tuple(roots)
+
+
+def delivery_serve_max_bytes(root, doc=None, warnings=None):
+    """Configured byte cap for served bundles from `deployment.private.json` (256 MiB default)."""
+    if doc is None:
+        marker = Path(root) / 'deployment.private.json'
+        if not marker.is_file():
+            return DELIVERY_SERVE_MAX_BYTES
+        doc = deployment_document(marker)
+    if not isinstance(doc, dict):
+        return DELIVERY_SERVE_MAX_BYTES
+    value = doc.get('delivery_serve_max_bytes')
+    if value is None:
+        return DELIVERY_SERVE_MAX_BYTES
+    if type(value) is int and 0 < value <= DELIVERY_SERVE_MAX_BYTES_CAP:
+        return value
+    _warn_deployment_setting(
+        warnings,
+        'deployment delivery_serve_max_bytes is %r, not a positive integer <= %d; reading it as %d'
+        % (value, DELIVERY_SERVE_MAX_BYTES_CAP, DELIVERY_SERVE_MAX_BYTES),
+    )
+    return DELIVERY_SERVE_MAX_BYTES
+
 
 # ---------------------------------------------------------------------------
 # Slices 6 and 7 of docs/COORDINATORS_PER_PROJECT_DESIGN.md (kittrial-5bb.197) and
