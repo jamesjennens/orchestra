@@ -945,6 +945,12 @@ def _old_manifest(path):
     return manifest if isinstance(manifest, dict) else None
 
 
+def _backed_up(entries_now, unreadable):
+    # The blobs a backup carries: those a non-purged entry names, and those an unreadable journal file is named after.
+    return ({entry['sha256'] for _, entry in entries_now if not entry.get('purged')}
+            | {item['sha256'] for item in unreadable if item['sha256']})
+
+
 def backup_folder(project, target, now=None, lock=None):
     """Mirror the project's task files into ``target`` (``backups/<name>.task-files``); returns the summary.
 
@@ -975,8 +981,7 @@ def backup_folder(project, target, now=None, lock=None):
             os.unlink(str(manifest))
         unreadable = []
         entries_now = all_entries(project, unreadable) if source is not None else []
-        wanted = ({entry['sha256'] for _, entry in entries_now if not entry.get('purged')}
-                  | {item['sha256'] for item in unreadable if item['sha256']})
+        wanted = _backed_up(entries_now, unreadable)
         sizes = {sha256: blob_size(project, sha256) for sha256 in wanted}
     copied, problems = {}, []
 
@@ -1009,8 +1014,7 @@ def backup_folder(project, target, now=None, lock=None):
     with lock():
         unreadable = []
         entries_now = all_entries(project, unreadable) if source is not None else []
-        wanted = ({entry['sha256'] for _, entry in entries_now if not entry.get('purged')}
-                  | {item['sha256'] for item in unreadable if item['sha256']})
+        wanted = _backed_up(entries_now, unreadable)
         named = {item['sha256'] for item in problems}
         for sha256 in sorted(wanted - set(copied) - named):   # attached while the others were copied
             copy_blob(sha256, blob_size(project, sha256))
