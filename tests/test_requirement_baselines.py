@@ -129,6 +129,76 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(listing['current'])
         self.assertIsNotNone(listing['current_error'])
 
+    def test_damaged_old_receipt_is_isolated_only_with_proven_unrelated_name(self):
+        self.cut(); self.cut('healthy', 'cut-healthy')
+        path = self.path / store.DIRECTORY / 'review-1' / 'receipt.json'
+        original = schema.decode_snapshot((path.parent / 'snapshot.json').read_bytes())
+        receipt = schema.receipt(original)
+        receipt['sha256'] = '0' * 64
+        path.write_bytes(schema.json_bytes(receipt))
+        damaged = self.frozen_bytes()
+        self.assertTrue(self.cut('new', 'cut-new')['created'])
+        self.assertEqual(damaged, self.frozen_bytes())
+        self.assertFalse(store.list_baselines(self.path, 'alpha')['items'][-1]['readable'])
+        for broken in (dict(receipt, name='new-target'),
+                       {key: value for key, value in receipt.items() if key != 'name'},
+                       b'{"name":'):
+            with self.subTest(broken=broken):
+                path.write_bytes(broken if isinstance(broken, bytes) else schema.json_bytes(broken))
+                before = {p.name for p in path.parent.parent.iterdir()}
+                with self.assertRaisesRegex(ValueError, 'cannot be verified'):
+                    store.cut(self.path, self.context, 'new-target', 'new-target', self.no_native,
+                              '2026-01-01T00:00:00Z')
+                self.assertEqual(before, {p.name for p in path.parent.parent.iterdir()})
+
+    def test_damaged_selected_receipt_and_current_pointer_still_refuse(self):
+        self.cut(); self.cut('healthy', 'cut-healthy')
+        receipt = self.path / store.DIRECTORY / 'review-1' / 'receipt.json'
+        receipt.write_bytes(b'{}')
+        with self.assertRaisesRegex(ValueError, 'cannot be verified'):
+            store.cut(self.path, self.context, 'review-1', 'cut-one', self.no_native,
+                      '2026-01-01T00:00:00Z')
+        pointer = self.path / store.DIRECTORY / 'current.json'
+        pointer.write_bytes(b'{}')
+        with self.assertRaisesRegex(ValueError, 'cannot be verified'):
+            store.cut(self.path, self.context, 'new', 'new', self.no_native,
+                      '2026-01-01T00:00:00Z')
+
+    def test_legacy_multiline_reason_artifact_replay_backup_and_restore_keep_bytes(self):
+        from requirement_brd import render
+        accepted = http.apply(self.path, self.context, 'accept', dict(
+            expected_revision=self.created['revision'], expected_sha256=self.created['sha256']),
+            'accept-one', self.native, self.created['id'])
+        http.apply(self.path, self.context, 'withdraw', dict(expected_revision=accepted['revision'],
+            expected_sha256=accepted['sha256'], expected_state_sha256=None, reason='Old reason\n==='),
+            'withdraw-one', self.native, self.created['id'])
+        self.cut()
+        folder = self.path / store.DIRECTORY / 'review-1'
+        snapshot = schema.decode_snapshot((folder / 'snapshot.json').read_bytes())
+        legacy = render(snapshot['view'], _legacy_reason=True)
+        self.assertIn(b'Reason: Old reason\n===', legacy)
+        receipt = schema.receipt(snapshot, markdown=legacy)
+        (folder / 'BRD.md').write_bytes(legacy)
+        (folder / 'receipt.json').write_bytes(schema.json_bytes(receipt))
+        pointer = dict(schema_version=1, name='review-1', receipt_sha256=schema.byte_hash(schema.json_bytes(receipt)))
+        (folder.parent / 'current.json').write_bytes(schema.json_bytes(pointer))
+        frozen = self.frozen_bytes()
+        self.assertEqual(store.get(self.path, 'alpha', 'review-1')['markdown'], legacy)
+        store.cut(self.path, self.context, 'review-1', 'cut-one', self.no_native, '2026-01-01T00:00:00Z')
+        restored = self.install_sidecar('beta', store.restored_files(store.backup_files(self.path, 'alpha'), 'alpha', 'beta'))
+        self.assertEqual(store.get(restored, 'beta', 'review-1')['markdown'], legacy)
+        self.assertEqual(frozen, self.frozen_bytes())
+        stage = folder.parent / ('.pending-' + content_hash(dict(project='alpha', account_id=ACCOUNT,
+                                                               operation_id='cut-one')))
+        (folder.parent / 'current.json').unlink()
+        folder.rename(stage)
+        store.cut(self.path, self.context, 'review-1', 'cut-one', self.no_native, '2026-01-01T00:00:00Z')
+        self.assertFalse(stage.exists())
+        self.assertEqual(frozen, self.frozen_bytes())
+        (folder / 'BRD.md').write_bytes(render(snapshot['view']))
+        with self.assertRaisesRegex(ValueError, 'cannot be verified'):
+            store.get(self.path, 'alpha', 'review-1')
+
     def test_sixty_four_baselines_is_the_actual_boundary_and_refusal_has_no_effect(self):
         self.cut()
         for index in range(1, 64):

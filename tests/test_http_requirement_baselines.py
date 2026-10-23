@@ -137,6 +137,50 @@ class BaselineHttpTests(EndpointCase):
                 self.assertEqual(refused.status, 403, refused.data)
         self.assertEqual(store.list_baselines(self.path, self.project)['total'], 1)
 
+    def test_member_receipt_and_both_change_states_use_editor_projection(self):
+        first = self.create_requirement()
+        self.assertEqual(self.cut().status, 201)
+        frozen = self.frozen()
+        full = self.request('GET', self.collection + '/review-1', token=self.owner_token).data
+        state = {'account_id': self.account, 'operation_id': 'private-operation',
+                 'sha256': 'a' * 64, 'status': 'withdrawn'}
+        changes = dict(changes=[dict(id=first['id'], before_state=state, after_state=state)], available=True)
+        admin = self.admin_token()
+        for role in ('viewer', 'contributor', 'coordinator', 'owner'):
+            if role == 'owner':
+                token = self.owner_token
+            else:
+                account = self.create_account(admin, 'projection-' + role, role + '-password-1')
+                token = self.login('projection-' + role, role + '-password-1')[0]
+                self.assertEqual(self.request('PUT', self.base + '/members/' + account,
+                    {'role': role}, token=admin).status, 200)
+            with self.subTest(role=role):
+                receipt = self.request('GET', self.collection + '/review-1', token=token)
+                self.assertEqual(receipt.status, 200, receipt.data)
+                if role in ('owner', 'coordinator'):
+                    self.assertEqual(receipt.data, full)
+                else:
+                    self.assertNotIn('account_id', receipt.data['receipt'])
+                    self.assertNotIn('operation_id', receipt.data['receipt'])
+                    self.assertTrue(receipt.data['author_name'])
+                    self.assertEqual(receipt.data['receipt_sha256'], full['receipt_sha256'])
+                with mock.patch.object(self.backend, 'requirements_read', side_effect=lambda *args: copy.deepcopy(changes)), \
+                        mock.patch.object(self.service, 'actor_names', return_value={self.account: self.account}):
+                    response = self.request('GET', self.base + '/brd/changes', token=token)
+                self.assertEqual(response.status, 200, response.data)
+                row = response.data['changes'][0]
+                for side in ('before', 'after'):
+                    self.assertEqual(row[side + '_state_author_name'], 'Former project owner')
+                    projected = row[side + '_state']
+                    if role in ('owner', 'coordinator'):
+                        self.assertEqual(projected, state)
+                    else:
+                        self.assertNotIn('operation_id', projected)
+                        # Same account-id policy as the existing BRD state projection.
+                        self.assertEqual(projected['account_id'], self.account)
+        self.assertEqual(self.frozen(), frozen)
+        self.assertIn('operation_id', state)
+
     def test_canonical_cut_refuses_coordinator_and_granted_agent_before_reservation(self):
         from http_authority import (AuthorityConfig, CAP_COORDINATE, NativeRunner,
                                     authority_request, journal_path, run_guarded)

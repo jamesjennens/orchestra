@@ -169,9 +169,9 @@ def _artifact(base, name):
         snapshot_raw = _read(path / 'snapshot.json', schema.MAX_SNAPSHOT_BYTES)
         snapshot = schema.decode_snapshot(snapshot_raw)
         receipt_raw = _read(path / 'receipt.json', MAX_RECEIPT_BYTES)
-        receipt = schema.validate_receipt(_json(receipt_raw), snapshot)
         markdown = _read(path / 'BRD.md', schema.MAX_MARKDOWN_BYTES)
-        if markdown != render(snapshot['view']) or snapshot['name'] != name:
+        receipt = schema.validate_receipt(_json(receipt_raw), snapshot, markdown=markdown)
+        if snapshot['name'] != name:
             raise ValueError(REPAIR)
         return dict(snapshot=snapshot, receipt=receipt, markdown=markdown,
                     receipt_sha256=schema.byte_hash(receipt_raw))
@@ -281,6 +281,7 @@ def cut(project_path, context, name, operation_id, run, at, operators=None):
         binding = _source(base, context.project)
         if binding is not None and set(binding['baselines']) - set(names):
             raise ValueError(REPAIR)
+    previous = current(project_path, context.project)
     stage_name = '.pending-' + content_hash(dict(project=context.project, account_id=context.account_id,
                                                operation_id=operation_id))
     if name in names:
@@ -301,9 +302,18 @@ def cut(project_path, context, name, operation_id, run, at, operators=None):
         if existing_path is None:
             raise ValueError(REPAIR)
         entry = _json(_read(existing_path / 'receipt.json', MAX_RECEIPT_BYTES))
-        schema._closed(entry, schema.RECEIPT_FIELDS, 'receipt')
-        if content_hash(entry) != entry['sha256']:
+        # A readable canonical name is required BEFORE considering isolation.
+        # Missing/ambiguous identity or a receipt naming the selected target is
+        # never evidence that the damaged record belongs to another cut.
+        if (not isinstance(entry, dict) or entry.get('name') != existing_name
+                or entry.get('name') == name):
             raise ValueError(REPAIR)
+        try:
+            schema._closed(entry, schema.RECEIPT_FIELDS, 'receipt')
+            if content_hash(entry) != entry['sha256']:
+                raise ValueError(REPAIR)
+        except (ValueError, TypeError, KeyError):
+            continue
         if all(entry[key] == value for key, value in dict(project=context.project,
                 account_id=context.account_id, operation_id=operation_id).items()):
             raise ValueError(CONFLICT)
@@ -316,7 +326,6 @@ def cut(project_path, context, name, operation_id, run, at, operators=None):
     else:
         if len(names) + len(stages) >= schema.MAX_BASELINES:
             raise ValueError(FULL)
-        previous = current(project_path, context.project)
         snapshot = schema.build(context.project, name, context.account_id, operation_id,
                                 schema.capture(project_path, context.project, run, operators), at, previous)
         # Verify both bounded artifacts BEFORE creating any sidecar path.
@@ -327,16 +336,18 @@ def cut(project_path, context, name, operation_id, run, at, operators=None):
         if hasattr(run, 'wrote'):
             run.wrote = True
         _write_once(stage / 'snapshot.json', schema.json_bytes(snapshot))
-    receipt = schema.receipt(snapshot)
+    markdown = _read(stage / 'BRD.md', schema.MAX_MARKDOWN_BYTES, missing=True)
+    if markdown is None:
+        markdown = render(snapshot['view'])
+    receipt = schema.receipt(snapshot, markdown=markdown)
     _mark_write(run)
-    _write_once(stage / 'BRD.md', render(snapshot['view']))
+    _write_once(stage / 'BRD.md', markdown)
     _write_once(stage / 'receipt.json', schema.json_bytes(receipt))
     # Read back every exact file before publishing its directory or pointer.
     staged = dict(snapshot=schema.decode_snapshot(_read(stage / 'snapshot.json', schema.MAX_SNAPSHOT_BYTES)),
                   receipt=_json(_read(stage / 'receipt.json', MAX_RECEIPT_BYTES)))
-    schema.validate_receipt(staged['receipt'], staged['snapshot'])
-    if _read(stage / 'BRD.md', schema.MAX_MARKDOWN_BYTES) != render(staged['snapshot']['view']):
-        raise ValueError(REPAIR)
+    schema.validate_receipt(staged['receipt'], staged['snapshot'],
+                            markdown=_read(stage / 'BRD.md', schema.MAX_MARKDOWN_BYTES))
     try:
         os.rename(stage, base / name)
     except OSError:
@@ -368,11 +379,29 @@ def recoverable(project_path, context, name, operation_id):
     return snapshot
 
 
+def pending_backup_message(project_path, project):
+    """Read-only bounded diagnostic; retry only the exact original owner request.
+
+    Do not infer an HTTP idempotency key from an internal operation id, or read
+    a possibly partial stage as if it were an authoritative new request.
+    """
+    governance.project_name(project)
+    _, stages = _entries(_root(project_path))
+    if not stages:
+        return None
+    command = ('python3 http_client.py --token="$ORCHESTRA_OWNER_TOKEN" call POST /v1/projects/' + project
+               + '/requirements/baselines --body "$ORIGINAL_BODY"'
+               + ' --idempotency-key "$ORIGINAL_KEY"')
+    return ('Project ' + project + ': unfinished baseline stage ' + stages[0]
+            + (' (and %d more)' % (len(stages) - 1) if len(stages) > 1 else '')
+            + '. Retry as the original owner: ' + command)
+
+
 def backup_files(project_path, project):
     base = _root(project_path)
     names, stages = _entries(base)
     if stages:
-        raise ValueError('Finish or reconcile unfinished baseline cuts before backing up this project.')
+        raise ValueError(pending_backup_message(project_path, project))
     if not names:
         if base is not None and (_pointer(base) is not None
                 or _read(base / 'source.json', MAX_RECEIPT_BYTES, missing=True) is not None):
@@ -422,11 +451,12 @@ def validate_files(files, project):
     for name in names:
         prefix = PREFIX + name + '/'
         snapshot = schema.validate_snapshot(family[prefix + 'snapshot.json'])
-        receipt = schema.validate_receipt(family[prefix + 'receipt.json'], snapshot)
         markdown = family[prefix + 'BRD.md']
         schema._closed(markdown, {'text'}, 'Markdown file')
-        if not isinstance(markdown['text'], str) or markdown['text'].encode('utf-8') != render(snapshot['view']):
+        if not isinstance(markdown['text'], str):
             raise ValueError(REPAIR)
+        receipt = schema.validate_receipt(family[prefix + 'receipt.json'], snapshot,
+                                          markdown=markdown['text'].encode('utf-8'))
         if snapshot['name'] != name:
             raise ValueError(REPAIR)
         digest = schema.byte_hash(schema.json_bytes(receipt)); receipts[name] = digest

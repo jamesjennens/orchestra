@@ -330,9 +330,16 @@ def exact_references(value):
     return sorted(refs, key=lambda ref: (ref['id'], ref['revision'], ref['sha256']))
 
 
-def receipt(value):
+def receipt(value, *, markdown=None):
     validate_snapshot(value)
-    data = dict(snapshot=json_bytes(value), markdown=render(value['view']))
+    # Reader compatibility is restricted to the two exact deterministic layouts.
+    # The receipt still binds the actual bytes, never a newly rendered substitute.
+    current_markdown = render(value['view'])
+    if markdown is None:
+        markdown = current_markdown
+    elif markdown != current_markdown and markdown != render(value['view'], _legacy_reason=True):
+        raise ValueError('Requirements baseline Markdown does not match its frozen view')
+    data = dict(snapshot=json_bytes(value), markdown=markdown)
     if len(data['markdown']) > MAX_MARKDOWN_BYTES:
         raise ValueError('The requirements Markdown exceeds the 4194304-byte export limit.')
     result = {key: value[key] for key in ('schema_version', 'project', 'name', 'account_id', 'operation_id', 'at', 'source_sha256')}
@@ -343,9 +350,12 @@ def receipt(value):
     return result
 
 
-def validate_receipt(value, snapshot):
+def validate_receipt(value, snapshot, *, markdown=None):
     _closed(value, RECEIPT_FIELDS, 'receipt')
-    if value != receipt(snapshot):
+    candidates = [receipt(snapshot, markdown=markdown)]
+    if markdown is None:
+        candidates.append(receipt(snapshot, markdown=render(snapshot['view'], _legacy_reason=True)))
+    if value not in candidates:
         raise ValueError('Requirements baseline receipt does not match its frozen bytes')
     return value
 
