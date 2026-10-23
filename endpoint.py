@@ -1208,7 +1208,7 @@ def held_coordination_lock(path,shared=False):
         yield
 
 
-def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None):
+def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None,frame=None):
     key_project_refusal(request,key_projects)
     # Rule 2: a key bound to a principal is refused the web-only actions here, before their
     # name is looked at. The gate proper needs the project's registry and is asked below,
@@ -1287,6 +1287,13 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         return answer
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}',actor):raise ValueError('Supply a short contributor/session actor')
     action=request.get('action','bd')
+    import task_files
+    if action in task_files.FRAMED_ACTIONS:
+        # Only the framed reader of main() builds a Frame; a JSON request that names one of these actions has no
+        # bytes to take or to give, and the web service never carries them (kittrial-5bb.384).
+        if frame is None or authority_config is not None:
+            raise ValueError('%s is a framed request: use the client\'s files command over SSH'%action)
+        return framed_files(root,path,actor,request,frame)
     if action in ('handoff','review','work','wait'):
         from work import execute as work_execute
         args=request.get('args',[])
@@ -2648,6 +2655,7 @@ CONTRIBUTOR_COMMANDS = (
     ('work', 'the tasks whose move is yours, and the ones you may claim'),
     ('wait', 'block until something is your move, then print it and its fingerprint'),
     ('ready', 'the tasks nobody holds that you may claim'),
+    ('files list|get|put ...', "a task's files over SSH: list them, get one by its sha256 into a folder, put one"),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
     ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
     ('handoff ...', 'hand a task to another actor, and read what the endpoint reconciled'),
@@ -2771,6 +2779,180 @@ def outside_contributor_interface(name):
     raise ValueError(contributor_help_text(None if name in ('help', '-h', '--help') else name))
 
 
+# -- framed task-file requests over SSH (kittrial-5bb.384, docs/TASK_FILES_DESIGN.md 3b option B) -----
+# One JSON header line on stdin, then exactly ``bytes`` raw bytes (file-put); the answer is one JSON line,
+# then the raw bytes of a file-get. Every rule (limits, digest, journal, authority of the record) is
+# task_files', the same code the web service runs; this section only moves bytes between a pipe and it.
+FRAME_SNIFF=re.compile(rb'\s*\{\s*"action"\s*:\s*"file-(?:list|get|put)"')
+
+class Frame:
+    """The bytes after a framed header: what was read past the line, then the pipe itself."""
+    def __init__(self,fd,leftover=b''):
+        self.fd=fd;self.leftover=bytearray(leftover);self.ends=None
+    def reader(self,length,limit):
+        """``read(n)`` for task_files.receive: ends the transfer when it is slower than the limit allows."""
+        import select,time,task_files
+        self.ends=time.monotonic()+task_files.transfer_seconds(length,limit)
+        def read(count):
+            if self.leftover:
+                chunk=bytes(self.leftover[:count]);del self.leftover[:count];return chunk
+            wait=self.ends-time.monotonic()
+            if wait<=0 or not select.select([self.fd],[],[],wait)[0]:
+                raise task_files.too_slow(length,limit)
+            return os.read(self.fd,count)
+        return read
+
+class Transfer:
+    """A file-get answer's bytes: copied to stdout after the answer line, holding one transfer slot."""
+    def __init__(self,handle,size,slot,limit):
+        self.handle=handle;self.size=size;self.slot=slot;self.limit=limit
+    def copy(self,out):
+        import select,time,task_files
+        ends=time.monotonic()+task_files.transfer_seconds(self.size,self.limit);sent=0
+        while sent<self.size:
+            chunk=self.handle.read(min(task_files.STEP,self.size-sent))
+            if not chunk:break
+            view=memoryview(chunk)
+            while view:
+                wait=ends-time.monotonic()
+                if wait<=0 or not select.select([],[out],[],wait)[1]:return False
+                view=view[os.write(out,view):]
+            sent+=len(chunk)
+        return sent==self.size
+    def close(self):
+        self.handle.close();self.slot.close()
+
+def take_transfer_slot(root,limit):
+    """One of the installation's ``max_transfers`` slots, held while a file moves; closing it frees it.
+
+    Each SSH call is its own process, so the bound is a set of slot files under the runtime root, each
+    taken with a non-blocking flock: a process that ends or dies frees its slot with it. None free is
+    one sentence, answered before a byte is read.
+    """
+    import stat,task_files
+    folder=Path(root)/'.task-file-slots'
+    try:
+        os.mkdir(str(folder),0o700)
+    except FileExistsError:pass
+    if not stat.S_ISDIR(os.lstat(str(folder)).st_mode):
+        raise task_files.Refusal(503,'unavailable','The task-file slot folder cannot be used; nothing was read. An operator must look at it.')
+    flags=os.O_RDWR|os.O_CREAT|getattr(os,'O_NOFOLLOW',0)
+    for number in range(limit['max_transfers']):
+        handle=os.fdopen(os.open(str(folder/('slot-%d'%number)),flags,0o600),'r+b')
+        try:
+            fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            handle.close()
+    raise task_files.Refusal(503,'unavailable','The server is already moving %d files (%s); nothing was read. Try again shortly.'
+                             %(limit['max_transfers'],task_files.setting('max_transfers')),retry_after=1)
+
+def framed_files(root,path,actor,header,frame):
+    """file-list, file-get and file-put under the gates ``execute`` has already passed."""
+    import task_files
+    from http_authority import server_time
+    warnings=[]
+    def run(argv):
+        stdout,more=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+        if more:warnings.append(more)
+        return stdout
+    runner=NativeRunner(run,project=path)
+    def answer(result,status=None):
+        if status is not None:result=dict(result,status=status)
+        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(warnings)}
+    try:
+        header=task_files.frame_check(header)
+        action,task=header['action'],header['task']
+        limit=task_files.limits(root,warnings=warnings)
+        row=task_files.task_row(runner,task)
+        coordinates=_listed_operator(actor,root,path)
+        assignee=task_files.is_assignee(row,actor)
+        if action=='file-list':
+            may=coordinates or assignee
+            items=task_files.listing(path,task,may)
+            return answer({'task':task,'items':items,'total':len(items),'may_download':may})
+        if action=='file-get':
+            if not (coordinates or assignee):
+                raise task_files.Refusal(403,'forbidden','Only the task\'s current assignee and the project\'s coordinators may download its files.')
+            entry,handle=task_files.download_target(path,task,header['sha256'])
+            try:
+                slot=take_transfer_slot(root,limit)
+            except BaseException:
+                handle.close();raise
+            result=answer(task_files.view(entry))
+            result['frame_bytes']=entry['bytes']
+            result['_stream']=Transfer(handle,entry['bytes'],slot,limit)
+            return result
+        direction=task_files.check_direction(header['direction'])
+        if direction==task_files.TO_WORKER:
+            if not coordinates:
+                raise task_files.Refusal(403,'forbidden','Only the project\'s coordinators attach files to the worker.')
+            operation='coordinator-record'
+        else:
+            if not assignee:
+                raise task_files.Refusal(403,'forbidden','Only the task\'s current assignee attaches files from the worker, and only while the task is open.')
+            operation='assignee-record'
+        name=task_files.clean_name(header['name'])
+        sha256=task_files.check_sha256(header['sha256'])
+        known=task_files.read_entry(path,task,sha256)
+        if known is not None and known.get('withdrawn') is None and known['name']==name and task_files.blob_size(path,sha256)==known['bytes']:
+            return answer(dict(task_files.view(known),replayed=True),200)
+        length=header['bytes']
+        task_files.check_room(path,task,length,limit)
+        slot=take_transfer_slot(root,limit)
+        try:
+            stored,size,created=task_files.receive(frame.reader(length,limit),length,path,sha256)
+        finally:
+            slot.close()
+        body={'schema_version':1,'operation':operation,'task':task,'sha256':stored,'name':name,'bytes':size,
+              'media_type':task_files.check_media_type(header.get('media_type')),'direction':direction,
+              'note':task_files.check_text(header.get('note'),'note',task_files.NOTE_LIMIT)}
+        try:
+            with held_coordination_lock(path):
+                if operation=='coordinator-record' and not _listed_operator(actor,root,path):
+                    raise task_files.Refusal(403,'forbidden','Only the project\'s coordinators attach files to the worker.')
+                status,result=task_files.apply(body,actor,runner,path,server_time,limit=limit)
+        except task_files.Refusal:
+            if created:
+                with held_coordination_lock(path):task_files.discard(path,stored)
+            raise
+        return stamp_write(answer(result,status)) if status==201 else answer(result,status)
+    except task_files.Refusal as error:
+        return {'returncode':2,'stdout':'','stderr':str(error)+'\n','task_file_status':error.status}
+
+def read_request(fd):
+    """``(request, frame, refusal)``: the request on ``fd``, read as the old reader did unless it is a framed header.
+
+    A framed request is a first line (at most ``HEADER_LIMIT`` bytes) that is a JSON object naming one of the
+    three framed actions; everything after it stays in the pipe for the action to read. Any other request is
+    read exactly as before: up to 2,000,000 characters, more refused.
+    """
+    import codecs,task_files
+    head=b''
+    while b'\n' not in head and len(head)<=task_files.HEADER_LIMIT:
+        chunk=os.read(fd,task_files.HEADER_LIMIT+1-len(head))
+        if not chunk:break
+        head+=chunk
+    line,newline,rest=head.partition(b'\n')
+    if len(head)>task_files.HEADER_LIMIT and not newline:
+        if FRAME_SNIFF.match(head):return None,None,task_files.Refusal(413,'payload_too_large','The request header is over its %s limit; nothing was read or stored.'%task_files.size_text(task_files.HEADER_LIMIT))
+    else:
+        try:
+            header=record_json.loads(line.decode('utf-8'))
+        except (ValueError,UnicodeDecodeError):
+            header=None
+        if isinstance(header,dict) and header.get('action') in task_files.FRAMED_ACTIONS:
+            return header,Frame(fd,rest),None
+    decoder=codecs.getincrementaldecoder(sys.stdin.encoding or 'utf-8')(sys.stdin.errors or 'strict')
+    text=decoder.decode(head)
+    while len(text)<=2_000_000:
+        chunk=os.read(fd,65536)
+        if not chunk:
+            text+=decoder.decode(b'',True);break
+        text+=decoder.decode(chunk)
+    if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
+    return record_json.loads(text),None,None
+
 def main():
     # No prefix matching: the wrapper passes these flags exactly, and an abbreviation must
     # not silently select a different option (kittrial-5bb.223, finding 7).
@@ -2814,10 +2996,22 @@ def main():
                              %', '.join(str(value) for value in a.key_principal))
         from sessions import valid_principal
         key_principal=None if a.key_principal is None else valid_principal(a.key_principal[0],'--key-principal')
-        text=sys.stdin.read(2_000_001)
-        if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
-        answer=execute(root_path(a.root),record_json.loads(text),authority_config=authority_config,
-                       require_authority=a.require_authority,key_projects=key_projects,key_principal=key_principal)
+        try:
+            descriptor=sys.stdin.fileno()
+        except (AttributeError,OSError,ValueError):
+            descriptor=None  # stdin is not a process pipe (a caller supplied a text stream): the whole-text read below
+        if descriptor is None:
+            text=sys.stdin.read(2_000_001)
+            if len(text)>2_000_000:raise ValueError('Request exceeds 2 MB')
+            request,frame,refusal=record_json.loads(text),None,None
+        else:
+            request,frame,refusal=read_request(descriptor)
+        if refusal is not None:
+            answer={'returncode':2,'stdout':'','stderr':str(refusal)+'\n','task_file_status':refusal.status}
+        else:
+            answer=execute(root_path(a.root),request,authority_config=authority_config,
+                           require_authority=a.require_authority,key_projects=key_projects,key_principal=key_principal,
+                           frame=frame)
     except subprocess.TimeoutExpired:
         answer={'returncode':124,'stdout':'','stderr':'Command timed out; mutation outcome may be uncertain. Inspect state before retrying.\n'}
     except TimeoutError as waited:
@@ -2863,6 +3057,13 @@ def main():
             # say it in its own words and keep the path to its log (kittrial-5bb.156).
             if isinstance(e,ConfigurationUnreadable):answer['stderr']=f'ValueError: {e}\n'
             answer['fault']='configuration'
-    print(json.dumps(answer,ensure_ascii=False))
+    stream=answer.pop('_stream',None)
+    print(json.dumps(answer,ensure_ascii=False),flush=True)
+    if stream is not None:
+        # The bytes of a file-get follow its answer line; a cut-off or too slow reader just ends the transfer.
+        try:
+            stream.copy(sys.stdout.fileno())
+        except OSError:pass
+        finally:stream.close()
 
 if __name__=='__main__':main()

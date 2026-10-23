@@ -1277,6 +1277,7 @@ CONTRIBUTOR_COMMANDS = (
     ('work', 'the tasks whose move is yours, and the ones you may claim'),
     ('wait', 'block until something is your move, then print it and its fingerprint'),
     ('ready', 'the tasks nobody holds that you may claim'),
+    ('files list|get|put ...', "a task's files over SSH: list them, get one by its sha256 into a folder, put one"),
     ('session register|resume|end', 'the actor session the endpoint keeps for you'),
     ('review TASK --file FILE', 'contribute a delivery, answer review items, or record a review'),
     ('handoff ...', 'hand a task to another actor, and read what the endpoint reconciled'),
@@ -1368,6 +1369,192 @@ def contributor_help_text(unknown=None):
     return '\n'.join(lines)
 
 
+# -- task files over SSH (kittrial-5bb.384, docs/TASK_FILES_DESIGN.md 3b option B) ------------------------
+# One JSON header line, then exactly ``bytes`` raw bytes for a put; the answer is one JSON line, then the
+# raw bytes of a get. The limits here are the endpoint's own (task_files.py); this file stays self-contained.
+FILES_HEADER_LIMIT = 64 * 1024
+FILES_STEP = 64 * 1024
+SHA256_TEXT = re.compile(r'[0-9a-f]{64}')
+
+def _clean_file_name(name):
+    """The basename of ``name`` with nothing a path or a terminal obeys left in it; a refusal when none is left."""
+    base = re.split(r'[\\/]', name)[-1].strip()
+    base = TERMINAL_CONTROL.sub('', base)
+    if not base or base in ('.', '..') or len(base) > 255 or ':' in base[:2]:
+        raise ValueError('The file has no usable name; nothing was sent.')
+    return base
+
+def _frame_exchange(config, header, body=None, sink=None):
+    """Send one framed request; returns ``(answer dict, byte count received)``.
+
+    ``body`` is ``(file object, length)`` sent after the header; ``sink(chunk)`` receives the bytes that follow
+    the answer line. The whole exchange has TIMEOUT seconds of silence at most per step and an overall bound
+    that grows with the bytes, so a stuck server cannot hold the client for ever.
+    """
+    argv, label = _argv(config)
+    encoded = (json.dumps(header, ensure_ascii=False) + '\n').encode('utf-8')
+    if len(encoded) > FILES_HEADER_LIMIT:
+        raise ValueError('The request header is over its %d byte limit; nothing was sent.' % FILES_HEADER_LIMIT)
+    import select, tempfile, threading
+    size = body[1] if body else 0
+    deadline = time.monotonic() + TIMEOUT + size / 16384.0 + (header.get('bytes') or 0) / 16384.0
+    errors = tempfile.TemporaryFile()
+    proc = subprocess.Popen(argv, shell=False, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    timer = threading.Timer(max(1.0, deadline - time.monotonic()), proc.kill)
+    timer.daemon = True
+    timer.start()
+    received = 0
+    try:
+        try:
+            proc.stdin.write(encoded)
+            if body:
+                sent = 0
+                while sent < size:
+                    chunk = body[0].read(min(FILES_STEP, size - sent))
+                    if not chunk:
+                        raise ValueError('The file got shorter while it was sent; the server stored nothing.')
+                    proc.stdin.write(chunk)
+                    sent += len(chunk)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass  # the server answered without reading it all: its answer says why
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        first = proc.stdout.readline(FILES_HEADER_LIMIT * 4)
+        if not first.endswith(b'\n'):
+            proc.wait()
+            errors.seek(0)
+            tail = server_text(errors.read(1000).decode('utf-8', 'replace'))
+            raise RuntimeError('%s failed (%s); outcome may be uncertain. %s' % (label, proc.returncode, tail))
+        try:
+            answer = json.loads(first.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
+        if not isinstance(answer, dict) or not isinstance(answer.get('returncode'), int):
+            raise RuntimeError('Invalid endpoint response; inspect state before retrying.')
+        if sink is not None and answer['returncode'] == 0 and type(answer.get('frame_bytes')) is int:
+            want = answer['frame_bytes']
+            while received < want:
+                chunk = proc.stdout.read(min(FILES_STEP, want - received))
+                if not chunk:
+                    break
+                sink(chunk)
+                received += len(chunk)
+        return answer, received
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        for handle in (proc.stdin, proc.stdout, errors):
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+def _files_refusal(answer):
+    text = server_text((answer.get('stderr') or '').strip()) or 'The server refused the request.'
+    sys.stderr.write(text + '\n')
+    return 1
+
+def _files_command(args, config, project, actor):
+    parser = argparse.ArgumentParser(prog='files', add_help=True)
+    sub = parser.add_subparsers(dest='verb', required=True)
+    lister = sub.add_parser('list');lister.add_argument('task')
+    getter = sub.add_parser('get');getter.add_argument('task');getter.add_argument('sha256')
+    getter.add_argument('--out', required=True, help='an existing folder (not a link) to write the file in')
+    getter.add_argument('--force', action='store_true', help='replace a regular file of the same name')
+    putter = sub.add_parser('put');putter.add_argument('task');putter.add_argument('path')
+    putter.add_argument('--direction', required=True, choices=('to-worker', 'from-worker'))
+    putter.add_argument('--note');putter.add_argument('--media-type', dest='media_type')
+    a = parser.parse_args(args)
+    if not isinstance(actor, str) or not ACTOR.fullmatch(actor):
+        raise ValueError('Supply a short contributor/session actor')
+    header = {'action': 'file-' + a.verb, 'project': project, 'actor': actor, 'task': a.task}
+    if a.verb == 'list':
+        answer, _ = _frame_exchange(config, header)
+        if answer['returncode'] != 0:return _files_refusal(answer)
+        sys.stdout.write(answer['stdout']);sys.stderr.write(answer.get('stderr') or '')
+        return 0
+    if a.verb == 'put':
+        status = os.stat(a.path)
+        import stat as stat_module
+        if not stat_module.S_ISREG(status.st_mode) or os.path.islink(a.path):
+            raise ValueError('%s is not a regular file; nothing was sent.' % a.path)
+        digest = hashlib.sha256()
+        with open(a.path, 'rb') as source:
+            size = 0
+            for chunk in iter(lambda: source.read(FILES_STEP), b''):
+                digest.update(chunk);size += len(chunk)
+            header.update(name=_clean_file_name(os.path.basename(a.path)), direction=a.direction, bytes=size,
+                          sha256=digest.hexdigest())
+            if a.note is not None:header['note'] = a.note
+            if a.media_type is not None:header['media_type'] = a.media_type
+            source.seek(0)
+            answer, _ = _frame_exchange(config, header, body=(source, size))
+        if answer['returncode'] != 0:return _files_refusal(answer)
+        sys.stdout.write(answer['stdout']);sys.stderr.write(answer.get('stderr') or '')
+        return 0
+    return _files_get(a, config, header)
+
+def _files_get(a, config, header):
+    if not SHA256_TEXT.fullmatch(a.sha256):
+        raise ValueError('The file is named by its 64 hexadecimal sha256; nothing was asked for.')
+    folder = a.out
+    if os.path.islink(folder) or not os.path.isdir(folder):
+        raise ValueError('--out must be an existing folder and not a link; nothing was asked for.')
+    header['sha256'] = a.sha256
+    temporary = os.path.join(folder, '.orchestra-get-%d-%s.part' % (os.getpid(), a.sha256[:12]))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    digest = hashlib.sha256()
+    kept = False
+    try:
+        with os.fdopen(descriptor, 'wb') as target:
+            def sink(chunk):
+                digest.update(chunk);target.write(chunk)
+            answer, received = _frame_exchange(config, header, sink=sink)
+        if answer['returncode'] != 0:return _files_refusal(answer)
+        try:
+            item = json.loads(answer['stdout'])
+        except ValueError:
+            raise RuntimeError('Invalid endpoint response; inspect state before retrying.') from None
+        name = _clean_file_name(str(item.get('name', '')))
+        if (type(answer.get('frame_bytes')) is not int or received != answer['frame_bytes']
+                or item.get('bytes') != received or digest.hexdigest() != a.sha256
+                or item.get('sha256') != a.sha256):
+            raise RuntimeError('The file did not arrive whole and as named (size or sha256 differs); nothing was kept.')
+        final = os.path.join(folder, name)
+        if os.path.islink(final):
+            raise ValueError('%s is a link; it is never replaced. Nothing was kept.' % final)
+        if a.force and os.path.lexists(final):
+            import stat as stat_module
+            if not stat_module.S_ISREG(os.lstat(final).st_mode):
+                raise ValueError('%s is not a regular file; it is not replaced. Nothing was kept.' % final)
+            os.replace(temporary, final)
+        else:
+            try:
+                os.link(temporary, final)
+            except FileExistsError:
+                raise ValueError('%s exists; use --force to replace it. Nothing was kept.' % final) from None
+            except OSError:
+                if os.path.lexists(final):
+                    raise ValueError('%s exists; use --force to replace it. Nothing was kept.' % final) from None
+                os.rename(temporary, final)
+        kept = True
+        sys.stdout.write(json.dumps({'path': final, 'sha256': a.sha256, 'bytes': received}, ensure_ascii=False) + '\n')
+        sys.stderr.write(answer.get('stderr') or '')
+        return 0
+    finally:
+        if not kept or os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
 def main():
     p=argparse.ArgumentParser(epilog=contributor_help_text(),
                               formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1409,6 +1596,8 @@ def main():
     if args[0]=='wait':
         return _wait_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out,
                              config_path=a.config)
+    if args[0]=='files':
+        return _files_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor)
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
