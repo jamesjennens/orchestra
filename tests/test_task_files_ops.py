@@ -834,6 +834,20 @@ class AdminTaskFilesTests(unittest.TestCase):
         self.assertEqual(0, code, err)
         self.assertEqual(['held'], seen)
 
+    def test_r2_a_purge_item_that_fails_is_named_and_exits_1(self):
+        stuck = self.store.attach('t-old', b'cannot be removed')
+        real_unlink = os.unlink
+
+        def unlink(path, *a, **k):
+            if str(path).endswith(stuck):
+                raise PermissionError(13, 'in use')
+            return real_unlink(path, *a, **k)
+        with mock.patch.object(task_files.os, 'unlink', side_effect=unlink):
+            code, out, err = self.run_admin('purge', 'p1', '--closed-before', '2026-02-01', '--actor', 'op')
+        self.assertEqual(1, code, out + err)
+        self.assertIn('NOT purged: file %s: ' % stuck, err)
+        self.assertTrue(self.store.blob(stuck).exists())
+
     def test_r2_verify_names_an_unreadable_journal_file_and_exits_1(self):
         digest = self.store.attach('t1', b'abc')
         (self.project / task_files.FOLDER / task_files.RECORDS / task_files.task_key('t1') / (digest + '.json')).write_text('x')
