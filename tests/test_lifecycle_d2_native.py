@@ -158,4 +158,60 @@ class NativeAuditTests(fixture.RealBdLabelAliasTests):
             self.assertEqual(canonical_bytes(self.export_rows()),before)
 
 
+from test_coordinator_rules_endpoint import RulesHelpers
+import test_web_merge_slot as slot_fixture
+import task_assignment
+
+
+@unittest.skipIf(fixture.endpoint is None,'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(fixture.BD is None,'no pinned native bd (set ORCHESTRA_BD_BIN)')
+class NativeAssignmentAuditTests(RulesHelpers,unittest.TestCase):
+    web=slot_fixture.NativeWebSlotTests.web
+    inventory=NativeAuditTests.inventory
+
+    def test_actual_web_notice_then_raw_assignment_stays_attributed_only_when_proved(self):
+        harness,owner=self.web();previous=harness.admin_user['id']
+        target=harness.create_account(owner,'d2-assignee','native-assignment-password-1')
+        membership=harness.request('PUT','/v1/projects/pp/members/'+target,dict(role='contributor'),token=owner)
+        self.assertEqual(membership.status,200,membership.data)
+        task=self.task('Synthetic D2 web assignment',assignee=previous)
+        assigned=harness.request('POST','/v1/projects/pp/tasks/'+task+'/assign',
+            dict(expected_assignee=previous,assignee=target,reason='Synthetic D2 assignment proof',
+                 allow_pending_review=False,allow_held_slot=False),token=owner,key='d2-actual-web-assignment')
+        self.assertEqual(assigned.status,200,assigned.data)
+        issue=next(row for row in self.rows() if row['id']==task)
+        comments=[c for c in issue.get('comments') or [] if c.get('text','').startswith(task_assignment.PREFIX)]
+        self.assertEqual(len(comments),1)
+        notice=task_assignment.parse_comment(comments[0],project='pp',task=task)
+        self.assertIsNotNone(notice);self.assertEqual((notice['from'],notice['to'],notice['assigned_by']),(previous,target,previous))
+        native_scope=dict(source_commit='a'*40,integration_commit='b'*40,release_id='',environment='test')
+        result=self.lifecycle('synthetic-worker','lifecycle-scope',task,scope=native_scope,operation_id='d2-web-scope')
+        self.assertEqual(result['returncode'],0,result)
+        result=self.lifecycle('synthetic-worker','tested',task,scope=native_scope,operation_id='d2-web-tested')
+        self.assertEqual(result['returncode'],0,result);event=json.loads(result['stdout'])['event_id']
+        before=canonical_bytes(self.rows());families=self.inventory()
+        report=fixture.admin.lifecycle_audit_command(self.root,'pp',limit=100)
+        historical=next(item['historical_assignment'] for item in report['items'] if item['event_id']==event)
+        self.assertEqual((historical['state'],historical['assignee']),('known',target))
+        # Native rounding may leave notice/transition times ambiguous. Such an
+        # attribution stays unknown; a service committer is never the assigner.
+        if historical['assigned_by'] is not None:
+            self.assertEqual(historical['assigned_by'],notice['assigned_by'])
+            self.assertEqual(historical['notice_ids'],[str(comments[0]['id'])])
+        else:self.assertIsNotNone(historical['who_assigned_reason'])
+        self.assertEqual(before,canonical_bytes(self.rows()));self.assertEqual(families,self.inventory())
+        changed=self.r.bd('update',task,'--assignee','raw-holder','--json')
+        self.assertEqual(changed.returncode,0,changed.stderr)
+        result=self.lifecycle('raw-holder','tested',task,scope=native_scope,operation_id='d2-raw-tested')
+        self.assertEqual(result['returncode'],0,result);raw_event=json.loads(result['stdout'])['event_id']
+        before=canonical_bytes(self.rows());report=fixture.admin.lifecycle_audit_command(self.root,'pp',limit=100)
+        after={item['event_id']:item for item in report['items']}
+        self.assertEqual(after[raw_event]['historical_assignment']['assignee'],'raw-holder')
+        self.assertEqual(after[raw_event]['historical_assignment']['state'],'known')
+        self.assertIsNone(after[raw_event]['historical_assignment']['assigned_by'])
+        self.assertEqual(after[event]['historical_assignment']['assignee'],target)
+        self.assertEqual(after[event]['current_assignee'],'raw-holder')
+        self.assertEqual(before,canonical_bytes(self.rows()));self.assertEqual(families,self.inventory())
+
+
 if __name__=='__main__':unittest.main()
