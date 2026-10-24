@@ -1182,6 +1182,65 @@ def _capability_lookup(args,config,project,actor,out):
     payload['records_coverage'] = found.get('coverage')
     return _emit(0,json.dumps(payload,ensure_ascii=True,indent=2)+'\n',stderr,out)
 
+def _capability_validate(args,config,project,actor,out):
+    """Validate propose payloads through the read-only endpoint, then resolve pointers locally."""
+    module = _capabilities_module()
+    if module is None:
+        return _capability(['lookup'],out)
+    if any(token in ('--help','-h') for token in args):
+        return _emit(0,json.dumps({'schema_version':1,'contract':module.CONTRACT_VERSION,'command':'capability validate',
+            'usage':'capability validate --file entry.json [--repo PATH]',
+            'notes':['The file holds one propose payload or a list of propose payloads.',
+                     'The endpoint runs the shared schema, requirement and current-key preflight without a lock or write.',
+                     'The client resolves code, test and anchor pointers against --repo (default: current checkout).',
+                     'All independent errors are reported with their field and a fix hint; invalid items still produce a result.'],
+            'output':{'schema':'capability-validate-v1'},
+            'exit_codes':{'0':'validation result or help JSON on stdout, including invalid payloads',
+                          '2':'argument, JSON, repository or transport error on stderr; stdout is not written'}},indent=2)+'\n','',out)
+    try:
+        parser = module._Parser(prog='capability validate',add_help=False)
+        parser.add_argument('--file',required=True);parser.add_argument('--repo',default='.')
+        parser.add_argument('--json',action='store_true')
+        options = parser.parse_args(args)
+        repo = module.open_repo(options.repo)
+        result = request(config,project,actor,['validate','--file',options.file],'capability')
+        if result['returncode']:
+            raise ValueError((result.get('stderr') or 'capability validation failed').strip())
+        payload = json.loads(result['stdout'])
+        module._reset_parse_state()
+        try:
+            def resolve_items():
+                for item in payload.get('items') or []:
+                    raw = item.pop('pointer_values')
+                    pointers = []
+                    for field in ('code','tests','anchors'):
+                        values = raw.get(field) or []
+                        if not isinstance(values,list):
+                            continue
+                        for pointer in values:
+                            resolved = module.resolve_pointer(repo,pointer)
+                            pointers.append(dict(resolved,field=field))
+                            if resolved['resolved'] is False:
+                                item['errors'].append({'field':field,
+                                    'message':'%s does not resolve in --repo (%s)' % (pointer,resolved['reason']),
+                                    'hint':'Add the file, symbol or heading, or correct the pointer.'})
+                    item['pointers'] = pointers
+                    item['valid'] = not item['errors']
+                    item['state'] = 'draft' if item['valid'] else None
+            module.with_parse_stack(resolve_items)
+        finally:
+            module._reset_parse_state()
+        payload['valid'] = all(item['valid'] for item in payload['items'])
+        payload['summary'] = {'items':len(payload['items']),
+                              'valid':sum(item['valid'] for item in payload['items']),
+                              'invalid':sum(not item['valid'] for item in payload['items']),
+                              'errors':sum(len(item['errors']) for item in payload['items'])}
+        payload['repo'] = {'git':repo['git'],'commit':repo['commit'],'dirty':repo['dirty']}
+    except (ValueError,TypeError,OSError,RuntimeError) as error:
+        sys.stderr.write('ValueError: %s\n' % error);return 2
+    return _emit(0,json.dumps(payload,ensure_ascii=True,indent=2)+'\n',result.get('stderr') or '',out)
+
+
 def _capability_check(args,config,project,actor,out):
     """`capability check --repo PATH [--key KEY]... [--record | --payloads FILE]` (.60 section 5.1).
 
@@ -1380,7 +1439,7 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
-    ('capability ...', 'capability records: find, get, list, propose, revise, verify'),
+    ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),
     ('refresh', 'refresh the cached export the reads are answered from'),
@@ -1737,11 +1796,13 @@ def main():
     if args[:1]==['capability'] and not (len(args)>1 and args[1] in CAPABILITY_ENDPOINT):
         if len(args)>1 and args[1]=='lookup' and a.config and a.project:
             return _capability_lookup(args[2:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out)
-        if len(args)>1 and args[1]=='check':
+        if len(args)>1 and args[1] in ('validate','check'):
             if (not a.config or not a.project) and not any(token in ('--help','-h') for token in args):
                 p.error('the following arguments are required: --config, --project')
-            return _capability_check(args[2:],json.loads(Path(a.config).read_text()) if a.config else None,
-                                     a.project,a.actor,a.out)
+            local_config = json.loads(Path(a.config).read_text()) if a.config else None
+            if args[1]=='validate':
+                return _capability_validate(args[2:],local_config,a.project,a.actor,a.out)
+            return _capability_check(args[2:],local_config,a.project,a.actor,a.out)
         return _capability(args[1:],a.out)
     if ((not a.config or not a.project) and args[0] in contributor_command_names()
             and help_requested(args[1:])):

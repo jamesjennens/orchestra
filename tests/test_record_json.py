@@ -206,14 +206,15 @@ class NoUnguardedParseTests(unittest.TestCase):
                            'a damaged, unreadable or nested file is caught and read as the restrictive '
                            '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
                            'permissive default'),
-        'client.py': (15, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
+        'client.py': (16, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
                          'kittrial-5bb.285 added the wait read\'s answer from the endpoint (and wait\'s --config read, '
                          'which kittrial-5bb.373 merged with main()\'s --config read into one parse after delivery; '
                          "neither is a record comment or a caller's payload). The twelfth (kittrial-5bb.327 "
                          "review 2) is the wait's own small state file: text this client wrote beside its config, "
                          'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
                          'treated as absent. The last three (kittrial-5bb.384) are the `files` command\'s reads of the endpoint\'s own answer line '
-                         'and of the file record inside it, on the caller\'s machine'),
+                         'and of the file record inside it, on the caller\'s machine; kittrial-5bb.402 adds the '
+                         'validate command\'s read of the endpoint\'s validation result'),
         'coordination.py': (7, 'bd output'),
         'endpoint.py': (6, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
                            'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own); the sixth '

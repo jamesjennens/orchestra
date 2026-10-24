@@ -1731,9 +1731,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     if action=='capability':
         # The capability index (.60 slices 1a and 1b, kittrial-5bb.67/.69). get, list, find
         # and help are reads (one label-filtered bd list plus bd show; no lock, not
-        # run_guarded); misses is a read of the lookup-miss log (capability_misses, kittrial-
+        # run_guarded); validate is the same read-only preflight as propose, without a lock
+        # or journal; misses is a read of the lookup-miss log (capability_misses, kittrial-
         # 5bb.77), which find feeds; propose, revise, propose-alias and verify are writes,
-        # under the lock and the journal. lookup, resolve, index and check run in the client.
+        # under the lock and the journal. lookup, resolve, index, check and validate's
+        # repository-pointer stage run in the client.
         # A verification written here is always `unverified`; the deployment verifiers list
         # only decides how host-written (`admin.py capability-verify`) records are read.
         import capability_records
@@ -1747,6 +1749,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         by_service=authority_config is not None and require_authority
         writes=capability_records.WRITE_COMMANDS+(capability_records.HTTP_WRITE_COMMANDS if by_service else ())
         if not args or args[0] not in writes:
+            if args[:1]==['validate'] and not any(token in ('--help','-h') for token in args):
+                result=capability_records.validate(args,request.get('attachments',{}),run,configured_operators(root))
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                        'stderr':''.join(run_warnings)}
             if args[:1]==['misses'] and not any(token in ('--help','-h') for token in args):
                 # The lookup-miss log (kittrial-5bb.77): read-only, no lock, not run_guarded.
                 # It reads the telemetry file, and the records once (only when the log holds
@@ -2848,7 +2854,7 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
-    ('capability ...', 'capability records: find, get, list, propose, revise, verify'),
+    ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),
     ('refresh', 'refresh the cached export the reads are answered from'),
