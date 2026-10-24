@@ -1394,6 +1394,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         lanes_scope=lanes_scope_requested(
             lanes_scope,request.get('lanes_scope') if isinstance(request,dict) else None)
         def work_effect():
+            read_context = {}
+            if action in ('work', 'wait'):
+                read_context['comment_authority'] = comment_contact_authority(root,path,operators,authority_config)
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,
                                 verifiers=configured_verifiers(root),
@@ -1405,7 +1408,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                 verified_web_authority=verified_web_authority(request,authority_config,CAP_APPROVE,name),
                                 lanes_scope=lanes_scope,
                                 identity_names=assignee_display_names(root,path,authority_config),
-                                comment_authority=comment_contact_authority(root,path,operators,authority_config))
+                                **read_context)
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.

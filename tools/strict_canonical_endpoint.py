@@ -367,7 +367,7 @@ def dispatch(canonical, request, tmp, run=None):
         from work import execute as work_execute
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
         options = {}
-        if 'comment_authority' in inspect.signature(work_execute).parameters:
+        if action == 'work' and 'comment_authority' in inspect.signature(work_execute).parameters:
             from briefing import comment_author_allowed
             state = None
             config = getattr(canonical, 'authority_config', None)
