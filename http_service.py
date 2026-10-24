@@ -3348,8 +3348,9 @@ class EndpointBackend:
         One indexed point read per call; it does not grow with the project.
         """
         from http_authority import OperationJournal, journal_path
+        from types import SimpleNamespace
         if operation_id is None:
-            principal = types.SimpleNamespace(user_id=user_id, credential_id=None)
+            principal = SimpleNamespace(user_id=user_id, credential_id=None)
             operation_id = self._result_key(principal, project_id, route, key, target)
         project = self.files_project(project_id)
         path = journal_path(project) if project is not None else None
