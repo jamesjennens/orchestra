@@ -309,6 +309,14 @@ While it applies, `work`/`brief`/`review`/`lanes` read the move as the assignee'
 
 **Deployment order.** The journal path must be whitelisted, backed up and restorable on a host **before** the first hand-back is recorded there: a host that cannot write and restore `<project>/.assignee-followons/` must not record one, and the writer refuses before its native comment when the path is unusable or not writable. Two-release staging is not required: the record has its own reserved `Kind:` prefix and the journal is a new sidecar path, so an older reader ignores both. Rolling the deployment back to a kit that predates this change gets no journal protection (it ignores the record entirely, so the `.336` coordinator move stands), and a restore taken while rolled back must be run with the new kit's `admin.py restore-new`; a backup taken by the old kit drops the journal, making every recorded hand-back inert until it is re-recorded.
 
+## Read what each round settled
+
+`review TASK --rounds` is a read-only, newest-first projection of the existing contribution-review chain. It writes no comment, label, checkpoint or other record. Bare `review TASK` remains the current-state read and `review TASK --file payload.json` remains the write route.
+
+Each round names its contribution record, commit, base, delivery, supersession/follow-on relation, disposition and next contribution. Its `outcome` names the settling review operation and record; `review_state` is computed through the same shared effective projection as `review TASK`, including scoped integration evidence. Requested items carry severity, state (`open`, `answered`, `settled`, `withdrawn`, `superseded` or `unknown`), response/resolution reason, evidence pointer and record. Attestations and holds belong to the contribution they name; a hold's `released_by` names its release record.
+
+The answer contains at most 20 rounds, 50 items per round, and 10 attestations and 10 holds per round. `rounds_omitted`, `items_omitted`, `attestations_omitted` and `holds_omitted` count anything outside those bounds. User-written text is terminal-escaped and clipped to 200 characters; evidence pointers are preserved up to 240 characters. The `text` rendering folds embedded newlines so a field cannot forge another line. `coverage.records` and `coverage.malformed` describe the scanned chain. `coverage.proved` is false for malformed or unlinked history, where uncertain item states and the latest outcome read `unknown` instead of being guessed.
+
 ## Request changes and respond
 
 A reviewer records requests against the **current contribution comment ID**:

@@ -521,7 +521,7 @@ def help_payload(action='work'):
         'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
                 '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
                 ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]',
-        'review': 'review TASK [--file payload.json]',
+        'review': 'review TASK [--rounds | --file payload.json]',
         'handoff': 'handoff TASK --file payload.json',
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
         'history': 'history TASK [--limit N | --recent N | --last N] [--since TIME] '
@@ -642,14 +642,18 @@ def help_payload(action='work'):
                      'caller only its own lane\'s row.',
         }
     elif action == 'review':
-        payload['operations'] = ['read (review TASK)', 'contribute', 'request-changes',
-                                 'respond', 'approve', 'withdraw', 'request-review',
-                                 'resolve-item', 'decline-review', 'recommend',
-                                 'attest', 'hold', 'release-hold']
+        payload['operations'] = ['read (review TASK)', 'rounds (review TASK --rounds)',
+                                 'contribute', 'request-changes', 'respond', 'approve',
+                                 'withdraw', 'request-review', 'resolve-item', 'decline-review',
+                                 'recommend', 'attest', 'hold', 'release-hold']
         payload['notes'] = [
             'Contribution payloads use contribution = the contribution record comment_id, '
             'never a Git SHA and never latest_comment_id.',
-            'A JSON file attachment is required for every operation except read.',
+            'A JSON file attachment is required for every operation except read and rounds.',
+            'review TASK --rounds is a read-only, newest-first projection of the existing review '
+            'chain. It shares the effective review-state projection with review TASK and never '
+            'writes a record. Rounds and their items, attestations and holds are bounded; omission '
+            'counts and coverage.proved make truncation or malformed history explicit.',
             'recommend records a reviewer\'s advice to approve the CURRENT contribution: '
             '{schema_version, operation, operation_id, task, contribution, commit, verdict: approve, '
             'summary, items}. It is never an approval, never changes whether approval is allowed, and '
@@ -689,6 +693,9 @@ def help_payload(action='work'):
         ]
         import review_recommendations
         payload['limits'] = dict(review_workflow_limits(), **review_recommendations.help_limits())
+        payload['limits']['rounds / items per round'] = '20 / 50'
+        payload['limits']['attestations / holds per round'] = '10 / 10'
+        payload['limits']['rounds text / evidence pointer'] = '<= 200 / <= 240 characters'
     elif action == 'handoff':
         payload['operations'] = ['transfer (from_actor/to_actor)', 'request', 'disposition']
         payload['notes'] = ['A JSON file attachment is required; payload.task must equal TASK.']
@@ -739,6 +746,7 @@ def help_options(action):
     if action == 'review':
         return [
             {'flag': 'TASK', 'description': 'task to read, or the task a payload applies to'},
+            {'flag': '--rounds', 'description': 'read up to 20 newest review rounds, with at most 50 items, 10 attestations and 10 holds per round; read-only'},
             {'flag': '--file payload.json', 'description': 'transport a contribution/review payload as text'},
             *common,
         ]
@@ -1472,9 +1480,9 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                      reference_attention=True, verifiers=verifiers,
                      independent_approval=independent_approval,owners=owners,
                      provenance_writes=provenance_writes,identity_names=identity_names,comment_authority=comment_authority)
-    if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
+    if len(args) not in (1,2):raise ValueError('Use review TASK [--rounds | --file payload.json] or handoff TASK --file payload.json')
     task=args[0]
-    if action=='review' and len(args)==1:
+    if action=='review' and (len(args)==1 or args[1:]==['--rounds']):
         from briefing import task_row
         from lifecycle import read_event_rows
         rows=read_event_rows(run)
@@ -1482,7 +1490,11 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rows=host_snapshot(rows, run=run, project=path)
         issue=task_row(rows,task)
         from review_state import scopes_for
-        return workflow(issue,scopes_for(rows,task),operators=operators,journal=path,
+        scopes=scopes_for(rows,task)
+        if args[1:]==['--rounds']:
+            from review_rounds import read
+            return read(issue,scopes,operators=operators,journal=path)
+        return workflow(issue,scopes,operators=operators,journal=path,
                         actor=actor,independent_approval=independent_approval,owners=owners,
                         provenance_writes=provenance_writes)
     if len(args)!=2 or not args[1].startswith('@attachment:'):raise ValueError('A JSON file attachment is required')
