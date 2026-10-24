@@ -366,7 +366,20 @@ def dispatch(canonical, request, tmp, run=None):
     if action in ('work', 'handoff'):
         from work import execute as work_execute
         items = {k: dict(v, path=str(Path(tmp) / k)) for k, v in attachments.items()}
-        result = work_execute(canonical.path, actor, action, args, items, run)
+        options = {}
+        if 'comment_authority' in inspect.signature(work_execute).parameters:
+            from briefing import comment_author_allowed
+            state = None
+            config = getattr(canonical, 'authority_config', None)
+            if config is not None:
+                from http_authority import read_state, AuthorityDenied
+                try:
+                    state = read_state(config.store)
+                except AuthorityDenied:
+                    pass
+            options['comment_authority'] = lambda author: comment_author_allowed(
+                author, authority=state, project=project)
+        result = work_execute(canonical.path, actor, action, args, items, run, **options)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action == 'docs' and args == ['project']:
         from onboarding import PROJECT_LIMIT, read_document

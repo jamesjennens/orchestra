@@ -89,4 +89,49 @@ class CommentHttpTests(AgentHarness):
         identity, base = self.task('awaiting-review')
         self.backend.state['tasks'][identity]['status'] = 'closed'
         self.note(base, self.owner)
+        self.assertFalse(self.backend._assignee_comment_pending(self.backend.state['tasks'][identity]))
         self.assertNotIn(identity, [row['task'] for row in self.wait()['items']])
+
+    def test_plain_member_is_quiet_and_current_promotion_and_removal_change_attention(self):
+        admin = self.admin_token()
+        member = self.create_account(admin, 'member', 'member-password-1')
+        token = self.login('member', 'member-password-1')[0]
+        route = '/v1/projects/%s/members/%s' % (self.project, member)
+        self.assertEqual(self.request('PUT', route, {'role': 'contributor'}, token=self.owner).status, 200)
+        identity, base = self.task('awaiting-review')
+        self.note(base, token)
+        self.assertNotIn(identity, [r['task'] for r in self.wait()['items']])
+        self.assertEqual(self.request('PUT', route, {'role': 'coordinator'}, token=self.owner).status, 200)
+        self.assertIn(identity, [r['task'] for r in self.wait()['items']])
+        self.assertEqual(self.request('PUT', route, {'role': 'contributor'}, token=self.owner).status, 200)
+        self.assertNotIn(identity, [r['task'] for r in self.wait()['items']])
+        self.assertEqual(self.request('PUT', route, {'role': 'coordinator'}, token=self.owner).status, 200)
+        self.checkpoint(base)
+        self.assertNotIn(identity, [r['task'] for r in self.wait()['items']])
+
+    def test_reserved_review_event_and_reserved_comment_body_never_add_attention(self):
+        identity, base = self.task('awaiting-integration')
+        self.assertFalse(self.backend._assignee_comment_pending(self.backend.state['tasks'][identity]))
+        self.backend.state['events'].append(dict(task=identity, project=self.project, action='approve',
+                                                actor='someone-else'))
+        self.assertFalse(self.backend._assignee_comment_pending(self.backend.state['tasks'][identity]))
+        owner_id = next(uid for uid, role in self.service.state['memberships'][self.project].items() if role == 'owner')
+        self.backend.state['events'].append(dict(task=identity, project=self.project, action='comment',
+                    actor=owner_id, detail='Kind: contribution-review-v1\n{}'))
+        self.assertFalse(self.backend._assignee_comment_pending(self.backend.state['tasks'][identity]))
+
+    def test_another_agents_old_comment_needs_its_effective_coordinator_grant(self):
+        admin = self.admin_token()
+        member = self.create_account(admin, 'coordinator', 'coordinator-password-1')
+        token = self.login('coordinator', 'coordinator-password-1')[0]
+        route = '/v1/projects/%s/members/%s' % (self.project, member)
+        self.assertEqual(self.request('PUT', route, {'role': 'coordinator'}, token=self.owner).status, 200)
+        helper, secret, _ = self.agent_secret(token, projects=[self.project])
+        identity, base = self.task('awaiting-review')
+        self.note(base, secret)
+        self.assertNotIn(identity, [r['task'] for r in self.wait()['items']])
+        grant = '/v1/projects/%s/agents/%s/coordinator' % (self.project, helper)
+        self.assertEqual(self.request('PUT', grant, {}, token=self.owner).status, 200)
+        self.assertIn(identity, [r['task'] for r in self.wait()['items']])
+        self.assertEqual(self.request('DELETE', grant, token=self.owner).status, 200)
+        self.assertNotIn(identity, [r['task'] for r in self.wait()['items']])

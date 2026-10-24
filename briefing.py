@@ -588,12 +588,40 @@ def wait_activity_marker(data,row):
     newest=max(entries,key=lambda entry:(parse_moment(entry['timestamp']),entry['entry_id'])) if entries else None
     return activity_marker(newest,fields_digest(row))
 
-def pending_other_comments(entries, owner, selected=None, acknowledged=None):
+def comment_author_allowed(author, operators=None, owners=None, authority=None, project=None):
+    """Current coordinator/owner membership or configured host operator, never history."""
+    from review_workflow import listed_operator_actor
+    if listed_operator_actor(author, operators, owners):
+        return True
+    state = authority() if callable(authority) else authority
+    if not isinstance(state, dict) or not isinstance(author, str):
+        return False
+    users, agents = state.get('users') or {}, state.get('agents') or {}
+    members = (state.get('memberships') or {}).get(project) or {}
+    user = users.get(author)
+    if isinstance(user, dict):
+        return not user.get('disabled') and members.get(author) in ('owner', 'coordinator')
+    agent_id = author.split('/', 1)[0]
+    agent = agents.get(agent_id)
+    if not isinstance(agent, dict) or not agent.get('enabled') or project not in (agent.get('projects') or []):
+        return False
+    account = agent.get('owner')
+    user = users.get(account)
+    if not isinstance(user, dict) or user.get('disabled'):
+        return False
+    from http_authority import coordinator_grant_capabilities, ROLE_CAPABILITIES, CAP_COORDINATE
+    held = ROLE_CAPABILITIES.get(members.get(account), frozenset())
+    return CAP_COORDINATE in coordinator_grant_capabilities(state, {'agent_id': agent_id}, project, held)
+
+
+def pending_other_comments(entries, owner, selected=None, acknowledged=None, authority=None):
     """One comment-attention decision over an already ordered activity snapshot.
 
-    The caller supplies the shared newer_selection result, not another clock.
+    The caller supplies the shared newer_selection result and current-authority
+    predicate. Reserved records and unknown bodies are never plain comments.
     A validated response consumes through its entry in that same snapshot.
     """
+    from reserved_comments import reserved_match
     remaining = entries
     if acknowledged is not None:
         position = next((i for i, entry in enumerate(entries)
@@ -602,7 +630,10 @@ def pending_other_comments(entries, owner, selected=None, acknowledged=None):
             remaining = entries[position + 1:]
     selected_ids = None if selected is None else {entry['entry_id'] for entry in selected}
     return any(entry.get('kind') == 'comment'
+               and isinstance(entry.get('body'), str) and bool(entry['body'].strip())
+               and reserved_match(entry.get('body')) is None
                and not same_activity_actor(entry.get('author'), owner)
+               and authority is not None and authority(entry.get('author'))
                and (selected_ids is None or entry['entry_id'] in selected_ids)
                for entry in remaining)
 
@@ -614,7 +645,7 @@ def checkpoint_snapshot(rows, row, state):
     return snapshot(rows, project, row['id'])
 
 
-def assignee_comment_pending(row, state=None, response=None, full=None):
+def assignee_comment_pending(row, state=None, response=None, full=None, authority=None):
     """Unconsumed comments for an open assignee, reusing checkpoint provenance.
 
     Review state does not decide whether a person has written to the assignee.
@@ -644,7 +675,7 @@ def assignee_comment_pending(row, state=None, response=None, full=None):
         acknowledged = None
         if isinstance(response, dict) and same_activity_actor(response.get('author'), owner):
             acknowledged = row['id'] + '-c' + str(response['comment_id'])
-        return pending_other_comments(full['entries'], owner, selected, acknowledged)
+        return pending_other_comments(full['entries'], owner, selected, acknowledged, authority=authority)
     except (ValueError, TypeError, KeyError, StopIteration):
         return False
 

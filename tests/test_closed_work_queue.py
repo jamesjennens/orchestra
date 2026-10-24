@@ -10,7 +10,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import briefing
 import review_state
 import work
-from test_briefing import rows, PROJECT, TASK, save_cp
+from test_briefing import rows, PROJECT, TASK
 from test_work_queue import add, contribute, reviewed_rows
 
 
@@ -39,7 +39,6 @@ class ClosedQueueTests(unittest.TestCase):
 
     def test_open_approved_control_keeps_integration_invitation_and_paging(self):
         data=self.approved(False)
-        save_cp(data, 'read-approval')
         row=work.queue(data,'alice/session',['--mine','--state','awaiting-integration'])['items'][0]
         self.assertEqual((row['whose_move'],row['next_actor']),('coordinator','coordinator'))
         self.assertIn('Authorized integrator: integrate',briefing.brief(data,PROJECT,TASK)['next_action'])

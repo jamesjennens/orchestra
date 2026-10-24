@@ -166,7 +166,6 @@ class EndpointAttentionTests(fixes.EndpointCase):
         delivered = self.contribute(third, commit=COMMIT2)
         self.review(self.people['blair'], third, 'approve', previous=delivered, contribution=delivered,
                     summary='accepted')
-        self.checkpoint(third, [])  # consume approval attention before testing waiting work
         data = self.next()
         self.assertEqual(kinds(data), [('changes-requested', first), ('blocked', second), ('claimable-task', spare),
                                        ('awaiting-integration', third)])
@@ -179,7 +178,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
                     resolutions=[{'request': request, 'item': 'tests', 'reason': 'added', 'evidence': 'commit'},
                                  {'request': request, 'item': 'docs', 'reason': 'said', 'evidence': 'commit'}])
         data = self.next()
-        self.assertEqual((data['attention']['state'], kinds(data)[0]), ('working', ('blocked', second)))
+        self.assertEqual((data['attention']['state'], kinds(data)[0]), ('blocked', ('blocked', second)))
         self.assertEqual(sorted(kinds(data)[-2:]), [('awaiting-integration', third), ('awaiting-review', first)])
         self.assertEqual([action['priority'] for action in data['next_actions']], [2, 4, 5, 5])
 
@@ -408,7 +407,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
     def test_closed_approved_task_leaves_queue_my_work_and_agent_actions(self):
         task=self.tasks[0];self.claim(task);delivery=self.contribute(task)
         self.review(self.people['blair'],task,'approve',previous=delivery,contribution=delivery,summary='Reviewed')
-        self.assertIn(('new-comments',task),kinds(self.next()))
+        self.assertIn(('awaiting-integration',task),kinds(self.next()))
         before=json.loads(self.native('blair')(['comments',task,'--json']))
         self.native('blair')(['update',task,'--status','closed'])
         for route in ('/queue',):
@@ -426,7 +425,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(json.loads(self.native('blair')(['comments',task,'--json'])),before)
 
     @patch.dict(os.environ, {'PYTHONUTF8': '1'})
-    def test_newer_comments_count_across_delivered_and_undelivered_states(self):
+    def test_newer_plain_coordinator_comments_count_in_all_review_states(self):
         blocked, working, delivered, approved = self.tasks
         for task in self.tasks:
             self.claim(task)
@@ -436,8 +435,10 @@ class EndpointAttentionTests(fixes.EndpointCase):
         contribution = self.contribute(approved)
         self.review(self.people['blair'], approved, 'approve', previous=contribution,
                     contribution=contribution, summary='Accepted')
+        owner_actor = next(uid for uid, user in self.service.state['users'].items()
+                           if user.get('username') == 'blair')
         for task in self.tasks:
-            self.native('blair')(['comments', 'add', task, 'New direction after the checkpoint.'])
+            self.native(owner_actor)(['comments', 'add', task, 'New direction after the checkpoint.'])
         data = self.next()
         self.assertEqual(data['attention']['counts']['newer_activity'], 4)
         actions = {x['task']: x for x in data['next_actions']}
@@ -446,7 +447,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         for task in (delivered, approved):
             self.assertTrue(actions[task]['newer_activity'])
             self.assertEqual(actions[task]['kind'], 'new-comments')
-        # Authorized brief reads expose the same newer activity for delivered tasks.
+        # Authorized briefs carry the same newer plain coordinator comments.
         for task in (delivered, approved):
             brief = self.request('GET', self.base(task)+'/brief', token=self.secret)
             self.assertEqual(brief.status, 200, brief.data)

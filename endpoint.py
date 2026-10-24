@@ -76,6 +76,32 @@ def owner_loader(path,rule):
     return load
 
 
+def comment_contact_authority(root, path, operators, authority_config=None):
+    """A lazy, per-read current membership/operator view for comment attention."""
+    cached = {}
+    def ownership():
+        if 'owners' not in cached:
+            try:
+                import sessions
+                cached['owners'] = sessions.owners(path)
+            except (ValueError, OSError):
+                cached['owners'] = {}
+        return cached['owners']
+    def authority():
+        if 'state' not in cached:
+            try:
+                from http_authority import read_state, AuthorityDenied
+                store = authority_config.store if authority_config is not None else root / 'http-state.json'
+                cached['state'] = read_state(store)
+            except (ValueError, OSError, AuthorityDenied):
+                cached['state'] = None
+        return cached['state']
+    def allowed(author):
+        from briefing import comment_author_allowed
+        return comment_author_allowed(author, operators, ownership, authority, path.name)
+    return allowed
+
+
 def party_owner_loader(path):
     """A lazy actor -> principal reader for the attest/hold/release-hold party rule.
 
@@ -1378,7 +1404,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                 owners=owners,
                                 verified_web_authority=verified_web_authority(request,authority_config,CAP_APPROVE,name),
                                 lanes_scope=lanes_scope,
-                                identity_names=assignee_display_names(root,path,authority_config))
+                                identity_names=assignee_display_names(root,path,authority_config),
+                                comment_authority=comment_contact_authority(root,path,operators,authority_config))
             # A handoff request and a decline are recorded in the kit's handoff journal and move
             # nothing in bd, so the runner saw no write; they are writes all the same (review
             # of kittrial-5bb.97). One that was already recorded (`reconciled`) wrote nothing.

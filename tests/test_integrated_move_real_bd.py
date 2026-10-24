@@ -1,5 +1,5 @@
 """kittrial-5bb.336 with a real pinned bd: an integrated-but-open task is not the
-assignee's move after comments are acknowledged, does not wake the worker's wait, and does not count against the
+assignee's move, does not wake the worker's wait, and does not count against the
 web claim limit.
 
 The chain is written through the canonical endpoint on a real tracker (contribute,
@@ -85,18 +85,6 @@ class IntegratedMoveRealBdTests(unittest.TestCase):
         release = json.dumps({'operation': 'merge-release'})
         reply = fixture.endpoint.execute(self.root, {'project': 'pp', 'actor': 'op',
             'action': 'coordinate', 'args': [release]})
-        self.assertEqual(reply['returncode'], 0, reply)
-        # Integration evidence remains authoritative; consume the approval comment's
-        # separate attention before asserting that the worker is idle.
-        history = self.answer('history', [task, '--recent', '10'], worker)
-        checkpoint = dict(schema_version=1, task=task, previous=None,
-            activity_cursor=history['activity_cursor'], source_commit='a' * 40,
-            branch='work/integrated', intent='Read integration comments',
-            acceptance='Wait for coordinator after acknowledgement', summary='Read approval and integration',
-            next_action='Coordinator closes or records remaining scope', open_items=[], resolved=[])
-        reply = fixture.endpoint.execute(self.root, {'project': 'pp', 'actor': worker,
-            'action': 'checkpoint', 'args': [task, '@attachment:0'],
-            'attachments': {'0': {'flag': '--file', 'text': json.dumps(checkpoint)}}})
         self.assertEqual(reply['returncode'], 0, reply)
         return task
 

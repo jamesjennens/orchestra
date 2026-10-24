@@ -62,6 +62,16 @@ class NativeCommentWaitTests(native.RealStackTests):
                         feedback = answer.data.get('comment_id') or (answer.data.get('review') or {}).get('id')
                         self.assertIsNotNone(feedback, answer.data)
                 self.checkpoint(base)
+                if state == 'awaiting-review':
+                    self.note(base, self.tokens['casey'], 'A plain member comment')
+                    self.assertNotIn(task, [r['task'] for r in self.wait()['items']])
+                    role_route = '/v1/projects/pp/members/' + self.ids['casey']
+                    changed = self.request('PUT', role_route, {'role': 'coordinator'}, token=self.tokens['alex'])
+                    self.assertEqual(changed.status, 200, changed.data)
+                    self.assertIn(task, [r['task'] for r in self.wait()['items']])
+                    changed = self.request('PUT', role_route, {'role': 'contributor'}, token=self.tokens['alex'])
+                    self.assertEqual(changed.status, 200, changed.data)
+                    self.assertNotIn(task, [r['task'] for r in self.wait()['items']])
                 before = self.wait()
                 self.note(base, self.agent, 'Own progress')
                 self.assertEqual(before['fingerprint'], self.wait()['fingerprint'])
@@ -98,6 +108,10 @@ class NativeCommentWaitTests(native.RealStackTests):
         task, base = final
         # A host worker exercises the actual kit wait command. HTTP-reserved actor
         # names require a live descriptor, so this host identity is separate.
+        config_path = self.root / 'deployment.private.json'
+        document = json.loads(config_path.read_text())
+        document['operators'] = list(document.get('operators') or []) + ['host-coordinator']
+        config_path.write_text(json.dumps(document))
         actor = 'native-comment-lane'
         made = self.bd('create', 'Host comment wait', '--assignee', actor, '--json')
         self.assertEqual(made.returncode, 0, made.stderr)

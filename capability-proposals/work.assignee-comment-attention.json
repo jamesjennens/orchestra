@@ -6,9 +6,10 @@
   "aliases": [
     "coordinator comment wakes worker wait",
     "comment during awaiting review",
-    "partial approval worker continuation"
+    "partial approval worker continuation",
+    "project membership coordinator owner comment author"
   ],
-  "summary": "On an open assigned task, unconsumed other-party comments, including coordinator/owner comments and structured review comments, return attention to the assignee across review states, including an integrated remainder. A valid assignee checkpoint or structured response consumes attention; own parent/sub-label progress stays quiet, closed tasks gain none and operator errors remain operator work. Work listings and HTTP next/worker wait share this decision and existing activity selection and stable wait markers; review/lifecycle facts and coordinator-wait trigger groups remain unchanged.",
+  "summary": "On an open assigned task, unconsumed plain comments return attention to the assignee across review states, including an integrated remainder, only while their author currently holds project owner/coordinator membership, an effective agent coordinator grant, or configured host operator authority through the existing principal map. Reserved review/integration/hand-back/checkpoint/receipt records never add comment attention. A valid assignee checkpoint or structured response consumes attention; own parent/sub-label progress stays quiet, closed tasks gain none and operator errors remain operator work. Work listings and HTTP next/worker wait share this decision and existing activity selection and stable wait markers; role grant/removal re-evaluates earlier comments at read time and review/lifecycle facts and coordinator-wait trigger groups remain unchanged.",
   "requirements": [],
   "anchors": [
     "docs/BRIEFINGS.md#new-comments-return-an-open-task-to-its-assignee-kittrial-5bb390"
@@ -21,7 +22,9 @@
     "review_workflow.py::projection",
     "http_service.py::ApiHandler._agent_attention",
     "http_service.py::ApiHandler.agents_me_wait",
-    "lanes.py::held_task"
+    "lanes.py::held_task",
+    "briefing.py::comment_author_allowed",
+    "endpoint.py::comment_contact_authority"
   ],
   "tests": [
     "tests/test_comment_attention.py",

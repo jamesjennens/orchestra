@@ -112,22 +112,6 @@ class FollowonCase(RulesHelpers, unittest.TestCase):
     def row(self, task, actor=WORKER):
         return next(item for item in self.work_row(actor)['items'] if item['task'] == task)
 
-    def acknowledge_comments(self, task):
-        provenance = json.loads(self.endpoint('checkpoint', WORKER,
-                                              [task, '--provenance'])['stdout'])
-        previous = getattr(self, '_comment_acknowledgements', {}).get(task)
-        body = dict(schema_version=1, task=task, previous=previous,
-                    activity_cursor=provenance['activity_cursor'], provenance=provenance['provenance'],
-                    source_commit=COMMIT, branch='work/followon', intent='Read task comments',
-                    acceptance='Attention consumed without authorizing a hand-back',
-                    summary='Read the comments; hand-back authority remains independently checked',
-                    next_action='Follow the structured workflow', open_items=[], resolved=[])
-        written = self.endpoint('checkpoint', WORKER, [task, '@attachment:0'],
-                                {'0': {'flag': '--file', 'text': json.dumps(body)}})
-        self.assertEqual(written['returncode'], 0, written)
-        self._comment_acknowledgements = dict(getattr(self, '_comment_acknowledgements', {}),
-                                              **{task: json.loads(written['stdout'])['comment_id']})
-
     def comment_ids(self, task):
         return [comment['id'] for comment in
                 next(row for row in self.rows() if row['id'] == task).get('comments') or []]
@@ -160,7 +144,6 @@ class FollowonEndpointTests(FollowonCase):
         # The coordinator's WITHDRAWAL ends it and the move returns to the coordinator.
         withdrawn = self.withdraw(task, recorded['comment_id'])
         self.assertEqual(withdrawn['target'], recorded['comment_id'])
-        self.acknowledge_comments(task)
         row = self.row(task)
         self.assertEqual((row['whose_move'], row['next_actor']), ('coordinator', 'coordinator'))
         self.assertEqual(row['followon']['state'], 'withdrawn')
@@ -174,7 +157,7 @@ class FollowonEndpointTests(FollowonCase):
         with self.assertRaisesRegex(ValueError, 'already has an open hand-back.*Nothing was written'):
             self.record(task, 'Remaining scope: a second thing.')
         self.assertIn(first['comment_id'], self.comment_ids(task))
-        # A plain comment adds attention but creates no second hand-back.
+        # A plain coordinator comment is still only a direction: it changes no move.
         added = self.r.bd('comments', 'add', task, 'A plain note, not a hand-back', '--json')
         self.assertEqual(added.returncode, 0, added.stderr)
         row = self.row(task)
@@ -189,8 +172,6 @@ class FollowonEndpointTests(FollowonCase):
              'integration_order': 9, 'text': 'Forged remaining scope', 'actor': COORD},
             sort_keys=True, separators=(',', ':')), '--json')
         self.assertEqual(forged.returncode, 0, forged.stderr)
-        self.assertTrue(self.row(task)['assignee_comment_pending'])
-        self.acknowledge_comments(task)
         row = self.row(task)
         self.assertEqual((row['whose_move'], row['next_actor']), ('coordinator', 'coordinator'))
         self.assertEqual(row['followon']['state'], 'ignored')
@@ -296,7 +277,6 @@ class FollowonEndpointTests(FollowonCase):
         comment_id = json.loads(added.stdout)['id']
         issue = next(row for row in self.rows() if row['id'] == task)
         order = [str(comment['id']) for comment in issue.get('comments') or []].index(comment_id)
-        self.acknowledge_comments(task)
 
         row = self.row(task)
         self.assertFalse(row['followon']['applies'])

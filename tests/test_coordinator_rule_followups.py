@@ -163,13 +163,9 @@ class WaitingReadersTests(unittest.TestCase):
                     row=next(r for r in queue['items'] if r['task']==TASK)
                     brief=briefing.brief(chain.rows,'trial',TASK,actor=actor,operators=[OPERATOR],
                                          independent_approval=enabled)
-                    expected=(work.APPROVAL_WAIT if enabled and actor in ('author','assignee') else
-                              work.review_move(row['review_state'],TASK,actor=='assignee',
-                                               named_reviewer=actor=='named')[1])
+                    expected=work.APPROVAL_WAIT if enabled and actor in ('author','assignee') else row['next']
                     self.assertEqual(row['waiting_for_approval'],expected)
                     self.assertEqual(brief['review']['waiting_for_approval'],expected)
-                    if row['assignee_comment_pending'] and actor != 'named':
-                        self.assertIn('New task comments',row['next'])
                     self.assertLess(len(expected),240)
                     self.assertEqual(row['approval_requires_other_party'],enabled)
 
@@ -262,9 +258,7 @@ class EndpointWithoutServiceTests(unittest.TestCase):
                         queue=json.loads(endpoint.execute(root,dict(project='alpha',actor=actor,action='work',args=['--json']))['stdout'])
                         row=next(r for r in queue['items'] if r['task']==TASK)
                         brief=json.loads(endpoint.execute(root,dict(project='alpha',actor=actor,action='brief',args=[TASK,'--json']))['stdout'])
-                        expected=(work.APPROVAL_WAIT if enabled and actor in ('author','assignee') else
-                              work.review_move(row['review_state'],TASK,actor=='assignee',
-                                               named_reviewer=actor=='named')[1])
+                        expected=work.APPROVAL_WAIT if enabled and actor in ('author','assignee') else row['next']
                         self.assertEqual(row['waiting_for_approval'],expected)
                         self.assertEqual(brief['review']['waiting_for_approval'],expected)
                         self.assertEqual(brief['review'].get('approval_requires_other_party',False),enabled)

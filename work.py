@@ -835,7 +835,7 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
           reference_attention=False, verifiers=None,independent_approval=False,owners=None,provenance_writes=True,
-          identity_names=None):
+          identity_names=None,comment_authority=None):
     """One page of the work queue.
 
     ``reverts`` and ``scopes`` are PER TASK: each is a mapping of task id to that
@@ -1164,7 +1164,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # this row already shows; no further read. `owned` is the SUBJECT's (kittrial-
         # 5bb.288): an open task assigned to the subject with no contribution and no
         # checkpoint by them reads `you` and counts in `your_move`.
-        from briefing import assignee_comment_pending, checkpoint_snapshot
+        from briefing import assignee_comment_pending, checkpoint_snapshot, comment_author_allowed
         checkpoint_data = checkpoint_states.get(row['id'])
         full = None
         if state != 'error' and row.get('status') != 'closed' and row.get('assignee'):
@@ -1174,7 +1174,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
             except (ValueError, TypeError, KeyError, StopIteration):
                 pass
         comment_pending = assignee_comment_pending(row, checkpoint_data,
-                                                   review.get('last_response'), full=full) if state != 'error' else False
+                                                   review.get('last_response'), full=full,
+                                                   authority=comment_authority or (lambda author: comment_author_allowed(author,operators,owners))) if state != 'error' else False
         move,move_text,role=move_decision(state,row['id'],bool(subject) and actor_holds(row.get('assignee'), subject),
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
@@ -1393,7 +1394,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
             independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False,
-            lanes_scope='all',provenance_writes=True,identity_names=None):
+            lanes_scope='all',provenance_writes=True,identity_names=None,comment_authority=None):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
@@ -1436,18 +1437,18 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                 lanes_payload=lanes_read(rows,actor,read_registry(path),
                                          ['--idle-minutes',str(parsed.idle_minutes),
                                           '--limit',str(LANES_LIMIT_MAX)],
-                                         operators=operators,journal=path,scope=lanes_scope)
+                                         operators=operators,journal=path,scope=lanes_scope,comment_authority=comment_authority)
                 queue_payload=queue(rows,actor,['--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
                                     operators=operators,journal=path,reference_attention=False,
                                     verifiers=verifiers,independent_approval=independent_approval,
                                     owners=owners,provenance_writes=provenance_writes,
-                                    identity_names=identity_names)
+                                    identity_names=identity_names,comment_authority=comment_authority)
                 return coordinator_view(queue_payload.get('items') or [],lanes_payload)
             queue_payload=queue(rows,actor,['--mine','--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
                                 operators=operators,journal=path,reference_attention=False,
                                 verifiers=verifiers,independent_approval=independent_approval,
                                 owners=owners,provenance_writes=provenance_writes,
-                                identity_names=identity_names)
+                                identity_names=identity_names,comment_authority=comment_authority)
             # The guidance acknowledgement is the caller's move too (kittrial-5bb.325): the
             # shared block carries the one item, and it joins the rows this projection
             # filters, so a worker waiting on `wait` WAKES for a new guidance version and
@@ -1466,11 +1467,11 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             from lanes import read as lanes_read
             from sessions import read_registry
             return lanes_read(rows,actor,read_registry(path),args[1:],operators=operators,
-                              journal=path,scope=lanes_scope)
+                              journal=path,scope=lanes_scope,comment_authority=comment_authority)
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers,
                      independent_approval=independent_approval,owners=owners,
-                     provenance_writes=provenance_writes,identity_names=identity_names)
+                     provenance_writes=provenance_writes,identity_names=identity_names,comment_authority=comment_authority)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:

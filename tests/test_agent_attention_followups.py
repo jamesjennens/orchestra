@@ -242,7 +242,7 @@ class EndpointFollowups(a.EndpointAttentionTests):
             self.assertEqual(action['kind'],'awaiting-review')
             self.review(self.people['blair'],task,'approve',previous=con,contribution=con,summary='ok')
             action=next(x for x in self.next()['next_actions'] if x['task']==task)
-            self.assertEqual(action['kind'],'new-comments')  # .390: acknowledge the owner's approval comment
+            self.assertEqual(action['kind'],'awaiting-integration')
 
     def test_native_unattributed_edits_stay_quiet_and_reassigned_authors_wake(self):
         task=self.tasks[0];self.claim(task)
@@ -405,7 +405,7 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
                 self.assertEqual('awaiting-review', self.action(task)['kind'])
                 self.review(task, 'approve', token=self.tokens['alex'], previous=contribution,
                             contribution=contribution, summary='checked')
-                self.assertEqual('new-comments', self.action(task)['kind'])  # approval is newer contact
+                self.assertEqual('awaiting-integration', self.action(task)['kind'])
         config_path = self.root / 'deployment.private.json'
         config = json.loads(config_path.read_text())
         config.update(review_workflow_writes=True, operators=['scratch-operator'])
@@ -422,7 +422,7 @@ class NativeAttentionFollowups(held_stack.RealStackTests):
                          args=[task, '@attachment:0'], attachments={'0': {'flag': '--file', 'text': json.dumps(record)}}))
             self.assertEqual(0, result['returncode'], result)
             action = self.action(task)
-            self.assertEqual(('new-comments', disposition), (action['kind'], action['review_state']))
+            self.assertEqual(('review-state', disposition), (action['kind'], action['review_state']))
         self.assertEqual(0, self.next()['attention']['counts']['blocked'])
 
     def test_native_edits_reassignment_isolation_and_error_summary(self):

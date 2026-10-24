@@ -25,7 +25,7 @@ class CommentAttentionTests(unittest.TestCase):
         return data
 
     def read(self, data):
-        return work.queue(data, 'alice/session', ['--mine'])
+        return work.queue(data, 'alice/session', ['--mine'], operators=['coordinator'])
 
     def note(self, data, identity, author='coordinator'):
         data[0]['comments'].append(comment(identity, 'Continue on the remainder',
@@ -128,7 +128,8 @@ class CommentAttentionTests(unittest.TestCase):
         data = self.fixture('awaiting-review')
         self.note(data, 'contact')
         entry = lanes.held_task(data[0], TASK, 'alice/session',
-            datetime(2026, 9, 18, tzinfo=timezone.utc), 60, review=work.workflow(data[0]))
+            datetime(2026, 9, 18, tzinfo=timezone.utc), 60, review=work.workflow(data[0]),
+            comment_authority=lambda author: author == 'coordinator')
         item = self.read(data)['items'][0]
         self.assertEqual((entry['whose_move'], entry['next_actor']),
                          (item['whose_move'], item['next_actor']))
@@ -152,10 +153,10 @@ class CommentAttentionTests(unittest.TestCase):
             previous='delivery', contribution='delivery', reviewer='blair/session'), 'asked', 'coordinator')
         self.note(data, 'contact')
         assignee = self.read(data)['items'][0]
-        reviewer = work.queue(data, 'blair/session', ['--mine'])['items'][0]
+        reviewer = work.queue(data, 'blair/session', ['--mine'], operators=['coordinator'])['items'][0]
         self.assertEqual((assignee['whose_move'], assignee['next_actor']), ('you', 'assignee'))
         self.assertEqual((reviewer['whose_move'], reviewer['next_actor']), ('you', 'reviewer'))
-        other = work.queue(data, 'unrelated/session', [])['items'][0]
+        other = work.queue(data, 'unrelated/session', [], operators=['coordinator'])['items'][0]
         self.assertEqual((other['whose_move'], other['next_actor']), ('unknown', 'assignee'))
 
     def test_forged_response_text_cannot_clear_attention(self):
@@ -171,3 +172,63 @@ class CommentAttentionTests(unittest.TestCase):
             assignee='alice/session', followon=followon, comment_pending=True)
         self.assertEqual((move, actor), ('you', 'assignee'))
         self.assertIn(followon['text'], text)
+
+    def test_every_reserved_prefix_is_evidence_not_a_contact(self):
+        from reserved_comments import RESERVED
+        for prefix, _kind, _operation in RESERVED:
+            for body in (prefix + '{}', '\ufeff' + (prefix + '{}').replace('\n', '\r\n')):
+                with self.subTest(prefix=prefix, body=body):
+                    entry = dict(entry_id='reserved', kind='comment', author='coordinator', body=body)
+                    self.assertFalse(briefing.pending_other_comments([entry], 'alice/session',
+                                                                    authority=lambda author: True))
+        unknown = dict(entry_id='unknown', kind='comment', author='coordinator')
+        self.assertFalse(briefing.pending_other_comments([unknown], 'alice/session', authority=lambda author: True))
+        plain = dict(entry_id='plain', kind='comment', author='coordinator', body='Please read Kind: as prose')
+        self.assertTrue(briefing.pending_other_comments([plain], 'alice/session', authority=lambda author: True))
+
+    def test_ordinary_member_comment_does_not_make_review_work_mine(self):
+        data = self.fixture('awaiting-review')
+        self.note(data, 'member-contact', 'contributor')
+        item = self.read(data)['items'][0]
+        self.assertFalse(item['assignee_comment_pending'])
+        self.assertEqual(item['next_actor'], 'reviewer')
+
+    def test_current_member_role_grant_and_removal_reconsider_an_earlier_comment(self):
+        data = self.fixture('awaiting-review')
+        self.note(data, 'old-contact', 'member')
+        state = dict(users={'member': {}}, agents={}, memberships={'p': {'member': 'contributor'}})
+        allowed = lambda author: briefing.comment_author_allowed(author, operators=(), authority=state, project='p')
+        read = lambda: work.queue(data, 'alice/session', ['--mine'], comment_authority=allowed)['items'][0]
+        self.assertFalse(read()['assignee_comment_pending'])
+        state['memberships']['p']['member'] = 'coordinator'
+        self.assertTrue(read()['assignee_comment_pending'])
+        state['memberships']['p']['member'] = 'contributor'
+        self.assertFalse(read()['assignee_comment_pending'])
+        state['memberships']['p']['member'] = 'owner'
+        self.assertTrue(read()['assignee_comment_pending'])
+        save_cp(data, 'read-granted-comment')
+        self.assertFalse(read()['assignee_comment_pending'])
+
+    def test_host_operator_principal_and_effective_agent_grant(self):
+        self.assertTrue(briefing.comment_author_allowed('ops-session', ['ops'],
+                       {'ops': 'person:ops', 'ops-session': 'person:ops'}))
+        state = dict(users={'human': {}}, memberships={'p': {'human': 'coordinator'}},
+                     agents={'helper': dict(owner='human', enabled=True, projects=['p'])},
+                     coordinator_grants={'p': {'helper': {'granted_by': 'human', 'granted_at': 'now'}}})
+        allowed = lambda: briefing.comment_author_allowed('helper', operators=(), authority=state, project='p')
+        self.assertTrue(allowed())
+        state['coordinator_grants']['p'].clear()
+        self.assertFalse(allowed())
+        state['coordinator_grants']['p']['helper'] = {'granted_by': 'human', 'granted_at': 'now'}
+        state['memberships']['p']['human'] = 'contributor'
+        self.assertFalse(allowed())
+
+    def test_valid_approval_after_checkpoint_is_not_a_plain_contact(self):
+        data = self.fixture('awaiting-review')
+        add(data, dict(schema_version=1, operation='approve', operation_id='review-after-cp',
+            task=TASK, previous='delivery', contribution='delivery', summary='Accepted'),
+            'approved-after-cp', 'coordinator')
+        item = self.read(data)['items'][0]
+        self.assertEqual(item['review_state'], 'awaiting-integration')
+        self.assertFalse(item['assignee_comment_pending'])
+        self.assertEqual((item['whose_move'], item['next_actor']), ('coordinator', 'coordinator'))

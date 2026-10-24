@@ -233,12 +233,18 @@ and lifecycle evidence. An `awaiting-review` contribution can therefore have
 `whose_move: you` and `next_actor: assignee`: the assignee must read the new comment;
 no approval, integration or other lifecycle fact has changed. A named reviewer
 still sees its own review assignment; assignee attention does not cancel it. An operator error
-still needs its operator. A structured review record is a comment too, so an
-approval can require that one acknowledgment before the lane waits again.
+still needs its operator. Only plain comments count: review, integration, scope,
+hand-back, receipt, lane-state, checkpoint and every other reserved record kind
+remain evidence and never add comment attention.
 
 The selection uses the existing `newer_selection` and `same_activity_actor` rules,
 including parent/sub-label ownership. The assignee's own comments do not add
 attention. A checkpoint by someone else does not acknowledge for the assignee.
+The author must currently be a project owner or coordinator, an agent with an
+effective coordinator grant, or a configured host operator (including its adopted
+session actor through the existing principal map). This is the current view on
+each read: granting a role makes an earlier unacknowledged plain comment count;
+removing the role makes it stop counting. No historical role is inferred or stamped.
 A response clears attention only when it comes from the validated linked review
 chain and its author is the assignee. Its boundary is its entry in the same ordered
 history; it does not claim new checkpoint digest coverage. Write a checkpoint when
@@ -248,7 +254,7 @@ Reading or posting an ordinary own progress comment acknowledges nothing.
 The `.351/.354` marker, count and coverage meanings remain unchanged. Worker wait
 continues to fingerprint the `.369` checkpoint-independent
 `wait_newer_activity_marker`; no second marker or polling clock is introduced.
-Two successive other-party comments each move it, while own comments and an
+Two successive eligible plain comments each move it, while own comments and an
 unchanged reread keep it identical. Recording a checkpoint can clear the attention
 row; it does not move that wait marker by itself.
 

@@ -1762,7 +1762,7 @@ class InProcessBackend:
                 'unresolved_directions':None}
 
     def _assignee_comment_pending(self, task):
-        from briefing import pending_other_comments, same_activity_actor
+        from briefing import pending_other_comments, same_activity_actor, comment_author_allowed
         from review_workflow import EXTRA
         owner = task.get('assignee')
         if task.get('status') == 'closed' or not owner:
@@ -1776,10 +1776,13 @@ class InProcessBackend:
             if action not in EXTRA and action not in ('comment', 'contribution', 'checkpoint-added'):
                 continue
             identity = str(event.get('entry_id') or '%s-e%d' % (task['id'], index))
-            entries.append(dict(entry_id=identity, kind='comment', author=event.get('actor')))
+            entries.append(dict(entry_id=identity, kind='comment' if action == 'comment' else 'event',
+                                body=event.get('detail'), author=event.get('actor')))
             if action in ('checkpoint-added', 'respond') and same_activity_actor(event.get('actor'), owner):
                 acknowledged = identity
-        return pending_other_comments(entries, owner, acknowledged=acknowledged)
+        return pending_other_comments(entries, owner, acknowledged=acknowledged,
+            authority=lambda author: comment_author_allowed(author, operators=(), authority=self.service.state,
+                                                           project=task.get('project_id')))
 
     def _wait_activity_marker(self, task):
         """The stable wait marker of one in-process task (kittrial-5bb.369).
@@ -9211,7 +9214,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 in_progress = (is_open and not blocked and not unreadable and not task.get('contribution_id')
                                and review in (None, 'none'))
                 integrating = review in ('awaiting-integration', 'approved')
-                counts['comment_attention'] += comment_pending
+                counts['comment_attention'] += comment_pending and delivered
                 counts['changes_requested'] += review == 'changes-requested'
                 counts['awaiting_review'] += review == 'awaiting-review'
                 counts['awaiting_integration'] += integrating

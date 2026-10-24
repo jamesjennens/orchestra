@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import http_service
 import review_state
 import work
-from test_briefing import PROJECT, TASK, append_checkpoint, blocker, checkpoint, rows, save_cp
+from test_briefing import PROJECT, TASK, append_checkpoint, blocker, checkpoint, rows
 from test_lanes import A, B, board, comment, entry_of, task
 from test_review_state import reviewed as integrated_open
 from test_work_queue import add, contribute
@@ -95,8 +95,6 @@ class WorkAssignedUntouchedTests(unittest.TestCase):
         # assignee's; .211's 'the assignee continues' answer buried every real task a
         # worker held beside integrated-but-open rows.
         store = integrated_open()
-        # .390: read and acknowledge the integration/approval comments first.
-        save_cp(store.rows, 'acknowledged-comments')
         page = owner_read(store.rows, 'alice/session', caller='coordinator/lane')
         item = row_of(page)
         self.assertEqual((item['review_state'], item['whose_move'], item['next_actor']),
