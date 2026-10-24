@@ -1855,7 +1855,7 @@ class InProcessBackend:
                 'omitted': max(0, len(remaining) - NEWER_MAX),
                 'note': 'Event history has no per-entry digests. Reading clears nothing; reconcile with task history.'}
 
-    def lanes_read(self, project_id, args, actor, scope='own'):
+    def lanes_read(self, project_id, principal, args, actor, scope='own'):
         """One page of the lanes board over this backend's own rows (kittrial-5bb.263).
 
         The board's aging and its three flags live in ``lanes.py`` only, so this backend
@@ -1890,7 +1890,7 @@ class InProcessBackend:
                 rows.append(row)
             return waiting.coordinator_view(
                 rows,
-                self.lanes_read(project_id, ['--idle-minutes', str(idle_minutes),
+                self.lanes_read(project_id, principal, ['--idle-minutes', str(idle_minutes),
                                             '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'))
 
     def review_queue(self, project_id):
@@ -3279,7 +3279,7 @@ class EndpointBackend:
     def capabilities_find(self, project_id, phrase, limit=5):
         return self._capability_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
 
-    def lanes_read(self, project_id, args, actor, scope):
+    def lanes_read(self, project_id, principal, args, actor, scope):
         """One page of the lanes board through the endpoint's ``work lanes`` action.
 
         ``args`` are the read's own arguments -- ``--idle-minutes``, ``--limit``,
@@ -3292,7 +3292,9 @@ class EndpointBackend:
         computing their scope themselves.
         """
         reply = self._endpoint('work', project_id, actor, ['lanes'] + list(args),
-                               extra={'lanes_scope': scope})
+                               authority=authority_request(principal, project_id, CAP_READ,
+                                                           now=self.service._expiry_now()),
+                               require_authority=True, extra={'lanes_scope': scope})
         payload = self._checked(reply, reading=True)
         if not isinstance(payload, dict):
             raise uncertain('The canonical lanes read returned an unexpected shape')
@@ -12095,7 +12097,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
         scope = self._lanes_scope(ctx.principal, ctx.params['pid'])
         read = self.backend.lanes_read(
-            ctx.params['pid'],
+            ctx.params['pid'], ctx.principal,
             ['--idle-minutes', str(idle_minutes), '--limit', str(limit), '--offset', str(state['o'])],
             self._lanes_actor(ctx.principal), scope)
         body = dict(read)

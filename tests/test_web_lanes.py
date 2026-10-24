@@ -21,6 +21,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
@@ -271,6 +272,10 @@ class LanesRouteCase(ServerHarness):
 class EndpointLanesReadCase(unittest.TestCase):
     """The production backend's request: what travels to the endpoint, unchanged."""
 
+    def setUp(self):
+        self.principal = SimpleNamespace(via='session', user_id='usr_alex', credential_id=None,
+                                         session_hash='session-hash')
+
     def backend(self):
         from http_service import EndpointBackend
         requests = []
@@ -279,18 +284,20 @@ class EndpointLanesReadCase(unittest.TestCase):
             def __init__(self):
                 # No endpoint process is ever launched: `_endpoint` answers for it below, so
                 # the transport's own set-up (paths, the store, the runner) is not needed.
-                pass
+                self.service = SimpleNamespace(_expiry_now=lambda: 12345)
 
             def _endpoint(self, action, project, actor, args, *rest, **kwargs):
                 requests.append({'action': action, 'project': project, 'actor': actor,
-                                 'args': list(args), 'extra': kwargs.get('extra')})
+                                 'args': list(args), 'extra': kwargs.get('extra'),
+                                 'authority': kwargs.get('authority'),
+                                 'require_authority': kwargs.get('require_authority')})
                 return {'returncode': 0, 'stdout': json.dumps({'schema': 'lanes-v1', 'items': [],
                                                                'total': 0}), 'stderr': ''}
         return Recording(), requests
 
     def test_the_work_action_carries_the_threshold_and_the_routes_own_scope(self):
         backend, requests = self.backend()
-        read = backend.lanes_read('alpha',
+        read = backend.lanes_read('alpha', self.principal,
                                   ['--idle-minutes', '45', '--limit', '10', '--offset', '10'],
                                   'alex', 'own')
         self.assertEqual('lanes-v1', read['schema'])
@@ -304,13 +311,17 @@ class EndpointLanesReadCase(unittest.TestCase):
         # The route's scope, as the request field the endpoint narrows its own scope to.
         self.assertEqual({'lanes_scope': 'own'}, sent['extra'])
         self.assertEqual('alex', sent['actor'])
+        self.assertEqual({'via': 'session', 'user_id': 'usr_alex', 'credential_id': None,
+                          'session_hash': 'session-hash', 'project': 'alpha', 'capability': 'read',
+                          'now': 12345}, sent['authority'])
+        self.assertTrue(sent['require_authority'])
 
     def test_a_read_that_does_not_answer_a_lanes_payload_is_an_uncertain_read(self):
         backend, _ = self.backend()
         backend._endpoint = lambda *args, **kwargs: {'returncode': 0, 'stdout': '"not an object"',
                                                      'stderr': ''}
         with self.assertRaises(Exception) as raised:
-            backend.lanes_read('alpha', ['--idle-minutes', '15'], 'alex', 'all')
+            backend.lanes_read('alpha', self.principal, ['--idle-minutes', '15'], 'alex', 'all')
         self.assertEqual(503, getattr(raised.exception, 'status', None))
 
 

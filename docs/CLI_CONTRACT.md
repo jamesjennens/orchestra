@@ -200,7 +200,9 @@ Help recognition is uniform: `-h`/`--help` is honoured wherever it appears as a
 standalone token, except when the token before it is an option that takes a value, so
 `work --owner -h` is still the option error it has always been and not a help request.
 `review TASK --help` and `handoff --json --help` return help, and help never runs a
-native command, takes the coordination lock or needs an attachment.
+native command, takes the coordination lock or needs an attachment. Review usage is
+`review TASK [--rounds | --file payload.json]`: `--rounds` selects the bounded, read-only
+round history; it cannot be combined with an attachment.
 
 `work --help` returns machine-readable usage, options, limits, output shape, identity
 fields and exit codes. The briefing commands return the same envelope with their own
@@ -1913,7 +1915,8 @@ text: 1105 characters, the limit is 1000`, `resolutions[1] (item second) resolut
 reason: ...`, `open_items[0].text (id blocked-on-keys): ...`. `review --help`,
 `handoff --help` and `checkpoint --help` list every field limit in `limits`, from the
 same numbers the validators enforce, so a caller can read a limit instead of finding
-it by failing.
+it by failing. `review --help` keeps those record-validation limits in `limits` and
+lists the read-only rounds view's display bounds separately in `rounds_limits`.
 
 | Command | Option | Range |
 | --- | --- | --- |
@@ -1945,6 +1948,9 @@ it by failing.
 | `history` | `--since-my-checkpoint` | the same read based on the calling actor's own newest valid checkpoint (no value) |
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
+| `review TASK --rounds` | rounds / items per round | 20 / 50, newest rounds first; omission counts report the rest |
+| `review TASK --rounds` | attestations / holds per round | 10 / 10 |
+| `review TASK --rounds` | user-written text / evidence pointer | <= 200 / <= 240 characters after terminal escaping |
 | `review` | `summary` (contribute, approve, request-changes, request-review) | <= 1200 characters |
 | `review` | item `severity` | `blocking` or `note` (absent means `blocking`) |
 | `review` | `withdraw` `reason` / `request-review` `reviewer` / `resolve-item` `reason` | <= 1000 characters / an actor identity (may contain `@` or `/`) / <= 1000 characters |

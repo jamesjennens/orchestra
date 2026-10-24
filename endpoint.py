@@ -1181,11 +1181,15 @@ def _web_guidance_read_only(args,operation):
     from web_guidance import READ_OPERATIONS
     return operation in READ_OPERATIONS
 
+def _review_rounds_read_only(args,operation):
+    return len(args)==2 and args[1]=='--rounds'
+
 READ_ONLY_ACTIONS={
     'brief':_read_only_always,
     'history':_read_only_always,
     'requirements':_read_only_always,
     'work':_read_only_always,
+    'review':_review_rounds_read_only,
     # kittrial-5bb.285: the blocking wait's per-poll read. It is one work read (one export)
     # and nothing is written, so it takes the project lock SHARED like the work read itself.
     'wait':_read_only_always,

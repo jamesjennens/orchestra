@@ -26,6 +26,8 @@ import briefing as b
 import lane_state
 import lanes
 import test_bd_label_aliases as rb
+import test_web_merge_slot as slot_fixture
+from test_coordinator_rules_endpoint import RulesHelpers
 import work
 
 RELEASED = os.environ.get('ORCHESTRA_LANES_RELEASED_KIT')
@@ -264,6 +266,58 @@ class RealBdLaneStateTests(unittest.TestCase):
         # The record is an ordinary comment to it, so it cannot know it belongs to the
         # checkpoint and reports the checkpoint stale (docs/LANE_BOARD_DESIGN.md section 5).
         self.assertTrue(read['newer_activity'])
+
+
+@unittest.skipIf(rb.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(rb.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
+class NativeLanesAuthorityTests(RulesHelpers, unittest.TestCase):
+    web = slot_fixture.NativeWebSlotTests.web
+
+    def test_real_http_roles_and_agent_read_with_required_live_authority(self):
+        harness, owner = self.web()
+        owner_id = harness.admin_user['id']
+        people = {}
+        for name, role in (('lane-coordinator', 'coordinator'), ('lane-contributor', 'contributor')):
+            uid = harness.create_account(owner, name, 'lane-password-1')
+            added = harness.request('PUT', '/v1/projects/pp/members/' + uid,
+                                    {'role': role}, token=owner)
+            self.assertEqual(200, added.status, added.data)
+            people[role] = (uid, harness.login(name, 'lane-password-1')[0])
+        coordinator_id, coordinator = people['coordinator']
+        contributor_id, contributor = people['contributor']
+        harness.create_account(owner, 'lane-outsider', 'lane-password-1')
+        outsider = harness.login('lane-outsider', 'lane-password-1')[0]
+        self.deployment(operators=[owner_id, coordinator_id])
+        owner_task = self.task('Owner lane', assignee=owner_id)
+        contributor_task = self.task('Contributor lane', assignee=contributor_id)
+
+        for label, token in (('owner', owner), ('coordinator', coordinator)):
+            with self.subTest(role=label):
+                read = harness.request('GET', '/v1/projects/pp/lanes', token=token)
+                self.assertEqual(200, read.status, read.data)
+                self.assertEqual('all', read.data['scope'])
+                self.assertEqual({owner_task, contributor_task},
+                                 {entry['task'] for row in read.data['items'] for entry in row['held']})
+        own = harness.request('GET', '/v1/projects/pp/lanes', token=contributor)
+        self.assertEqual(200, own.status, own.data)
+        self.assertEqual('own', own.data['scope'])
+        self.assertEqual([contributor_task],
+                         [entry['task'] for row in own.data['items'] for entry in row['held']])
+
+        made = harness.request('POST', '/v1/agents',
+                               {'name': 'Lane reader', 'working_directory': '/tmp/lane-reader',
+                                'projects': ['pp'], 'scopes': []}, token=contributor)
+        self.assertEqual(201, made.status, made.data)
+        agent = harness.request('GET', '/v1/projects/pp/lanes',
+                                token=made.data['credential']['secret'])
+        self.assertEqual(200, agent.status, agent.data)
+        self.assertEqual('own', agent.data['scope'])
+        self.assertNotIn(owner_task, json.dumps(agent.data))
+        self.assertNotIn(contributor_task, json.dumps(agent.data))
+
+        hidden = harness.request('GET', '/v1/projects/pp/lanes', token=outsider)
+        self.assertEqual(404, hidden.status, hidden.data)
+        self.assertEqual(401, harness.request('GET', '/v1/projects/pp/lanes').status)
 
 
 if __name__ == '__main__':

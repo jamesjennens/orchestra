@@ -218,9 +218,9 @@ def dispatched_actions():
 
 
 #: The actions this test knows can write. Each must stay OUT of the read-only table and
-#: take the exclusive lock (kills the review's M1: checkpoint shared; M3: review/handoff
-#: shared with work), whatever the table's predicates say.
-WRITE_ACTIONS = ('checkpoint', 'review', 'handoff', 'coordinate', 'lifecycle', 'requirement',
+#: take the exclusive lock (kills the review's M1: checkpoint shared; M3: handoff shared
+#: with work), whatever the table's predicates say. Review has its own argument test below.
+WRITE_ACTIONS = ('checkpoint', 'handoff', 'coordinate', 'lifecycle', 'requirement',
                  'owner-requirements', 'feedback', 'set-onboarding', 'session', 'refresh',
                  'create-project', 'project-creations', 'creation-standing')
 #: The actions that are read-only always.
@@ -257,6 +257,16 @@ class ReadOnlyActionTableTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertTrue(shared({'actor': 'a'}, action, args=[], operation=operation))
                 self.assertFalse(shared({'actor': 'a'}, action, args=[], operation='apply'))
+
+    def test_only_the_rounds_review_read_is_shared(self):
+        shared = endpoint.coordination_lock_shared
+        self.assertTrue(shared({'actor': 'a'}, 'review', args=['task', '--rounds']))
+        for args in (['task'], ['task', '@attachment:0'], ['task', '--rounds', '--json'],
+                     ['--rounds'], ['task', '--file']):
+            with self.subTest(args=args):
+                self.assertFalse(shared({'actor': 'a'}, 'review', args=args))
+        self.assertFalse(shared({'actor': 'a', 'operation_id': 'op-review-read'},
+                                'review', args=['task', '--rounds']))
 
     def test_guidance_read_identities_and_all_guidance_writes_are_exclusive(self):
         for operation in ('read', 'status', 'onboarding', 'onboarding-edit', 'coordinate-check'):
