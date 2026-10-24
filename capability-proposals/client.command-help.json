@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "operation_id": "f7f0b488-e2d5-4c2e-b3bf-ecb92b1f7357",
+  "key": "client.command-help",
+  "name": "Stand-alone known-command help without client configuration",
+  "aliases": [
+    "client command help config project",
+    "client.py COMMAND --help",
+    "command help without config",
+    "standalone client help"
+  ],
+  "summary": "client.main answers -h/--help for a known command before requiring or reading --config and --project. contributor_command_help keeps the usage text inside client.py, reuses the files and wait parsers, and performs no config reads, server contact or filesystem writes. Real-call refusals stay on their existing paths; an unknown command is not treated as known-command help. The copied-client tests cover files, checkpoint, brief, history, wait, review and docs with both help spellings in empty HOME, TMPDIR and working directories.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "client.py::main",
+    "client.py::contributor_command_help",
+    "client.py::_files_parser",
+    "client.py::_wait_parser"
+  ],
+  "tests": [
+    "tests/test_client_command_help.py",
+    "tests/test_endpoint_help.py",
+    "tests/test_standalone_client_wait.py",
+    "tests/test_cli_contract.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "client",
+    "help",
+    "standalone"
+  ]
+}
