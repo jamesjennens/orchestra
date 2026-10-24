@@ -1052,7 +1052,7 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0, *, assignment_h
         if event and event['dimension'] not in (*lifecycle.DIMENSIONS,'lifecycle-scope',lifecycle.ENABLED,lifecycle.LIVE) and lifecycle.PREFIX not in str(row.get('description','')):
             ordinary.append(dict(event_id=row.get('id'),task=event['task'],trust='data'))
         else:
-            unknown_native.append(dict(event_id=row.get('id'),row_sha256=content_hash(row),reason='native-event-unclassifiable',trust='data'))
+            unknown_native.append(dict(event_id=row.get('id'),row_sha256=hashlib.sha256(canonical_bytes(row)).hexdigest(),reason='native-event-unclassifiable',trust='data'))
     # Revised native totals count each named record once. Original counts above
     # retain the baseline's raw-row counts, so repeated/overlapping evidence is visible.
     ordinary=list({str(item['event_id']):item for item in ordinary}.values())

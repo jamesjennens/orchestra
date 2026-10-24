@@ -294,6 +294,14 @@ class AdditionalEvidenceTests(unittest.TestCase):
         self.assertTrue(all(i['historical_assignment']['state']=='unknown' for i in repeated))
         self.assertTrue(all('duplicate-native-event-id' in i['unclassifiable_causes'] for i in repeated))
         self.assertEqual(report['questionable_reason_counts']['duplicate-native-event-id'],1)
+    def test_unknown_row_hash_preserves_every_source_field_including_sha256(self):
+        data=rows();broken=dict(id=TASK+'.unknown',issue_type='event',title='Unclassifiable native row',description='Synthetic unknown',sha256='a'*64)
+        data += [broken,dict(broken,sha256='b'*64)]
+        report=voids.audit(data,operators=[],owners={})
+        item=report['unknown_native_events'][0]
+        self.assertEqual(item['raw_occurrences'],2)
+        self.assertEqual(len(item['row_sha256s']),2)
+        self.assertEqual(report['unclassifiable_native_event_count'],1)
     def test_naive_version_time_and_edited_event_history_are_unknown(self):
         harness=HistoricalTests()
         data,history=history_fixture();history.entries[TASK]['versions'][0]['CommitDate']='2026-10-01T00:00:10.5'
