@@ -442,7 +442,7 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     '',
     '## When you hold a coordinator grant',
     '',
-    `Read GET ${server}/v1/agents/me/wait?form=coordinator with the same curl -K credential file. Only projects where your coordinator grant is effective appear; a worker credential or an agent with no effective grant gets 403. The reply groups checkpoint-to-coordinator, awaiting-review, awaiting-integration and lane-quiet triggers. Act on what it returns, then read it again with &since=FINGERPRINT from the last reply; changed=false means the fact is unchanged. A single-project fingerprint is identical to the CLI coordinator wait. This is a read, never a server-side sleep or schedule. Keep using /v1/agents/me/next for your own work.`,
+    `Read GET ${server}/v1/agents/me/wait?form=coordinator with the same curl -K credential file. Only projects where your coordinator grant is effective appear; a worker credential or an agent with no effective grant gets 403. The reply groups checkpoint-to-coordinator, awaiting-review, awaiting-integration, lane-quiet and needs-investigation triggers. Act on what it returns, then read it again with &since=FINGERPRINT from the last reply; changed=false means the fact is unchanged. A single-project fingerprint is identical to the CLI coordinator wait. This is a read, never a server-side sleep or schedule. Keep using /v1/agents/me/next for your own work.`,
     '',
     '## Task files',
     '',
@@ -490,7 +490,7 @@ export function coordinating(payload) {
 
 //: What a coordinator handles at every run, in this order (the triggers of the coordinator wait,
 //: waiting.COORDINATOR_TRIGGERS, kit .379, with the checkpoints addressed to it before the quiet lanes).
-export const COORDINATOR_RUN_ORDER = Object.freeze(['awaiting-review', 'awaiting-integration', 'checkpoint-to-coordinator', 'lane-quiet']);
+export const COORDINATOR_RUN_ORDER = Object.freeze(['awaiting-review', 'awaiting-integration', 'checkpoint-to-coordinator', 'lane-quiet', 'needs-investigation']);
 //: The one rule that sets a coordinator apart from a worker.
 export const NEVER_CLAIM = 'You coordinate: never claim a worker task. A task that needs doing is assigned to a worker (POST .../assign) or left for a worker to claim.';
 //: agent_prompts.WEB_WORKER_TOOLS and WORKER_ON_ANOTHER_MACHINE (kittrial-5bb.357, .366), word for word:

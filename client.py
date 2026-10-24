@@ -347,7 +347,7 @@ class _InlineWait:
                           'contribution_id', 'pending_review_items', 'redelivered',
                           'guidance_version', 'wait_newer_activity_marker')
     COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
-                            'checkpoint-to-coordinator', 'lane-quiet')
+                            'checkpoint-to-coordinator', 'lane-quiet', 'needs-investigation')
     LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')
     AWAITING_REVIEW_STATES = ('awaiting-review', 'legacy-review-ready')
     AWAITING_INTEGRATION_STATES = ('awaiting-integration', 'approved')
@@ -718,6 +718,14 @@ class _InlineWait:
                 'flags': sorted(set(entry.get('flags') or []))}
 
     @staticmethod
+    def _fault_row(lane, fault):
+        return {'lane': _InlineWait._scalar(lane.get('lane')),
+                'actor': _InlineWait._scalar(lane.get('actor')),
+                'task': _InlineWait._scalar(fault.get('about_task') or fault.get('task')),
+                'state': 'needs-investigation', 'reason': _InlineWait._scalar(fault.get('reason')),
+                'record': _InlineWait._scalar(fault.get('record'))}
+
+    @staticmethod
     def coordinator_view(queue_items, lanes_payload):
         lanes = lanes_payload if isinstance(lanes_payload, dict) else {}
         triggers = {name: [] for name in _InlineWait.COORDINATOR_TRIGGERS}
@@ -750,11 +758,15 @@ class _InlineWait:
                              or entry.get('next_actor') == 'coordinator')
                 if addressed:
                     triggers['checkpoint-to-coordinator'].append(_InlineWait._lane_row(lane, entry))
+            fault = lane.get('needs_investigation')
+            if isinstance(fault, dict):
+                triggers['needs-investigation'].append(_InlineWait._fault_row(lane, fault))
         grouped = {name: _InlineWait._sorted_rows(rows) for name, rows in triggers.items()}
         flat = [dict(row, trigger=name) for name in _InlineWait.COORDINATOR_TRIGGERS
                 for row in grouped[name]]
         fingerprinted = {name: _InlineWait._sorted_rows(
-            [_InlineWait._fingerprinted(row) for row in rows])
+            [dict(row) if name == 'needs-investigation' else _InlineWait._fingerprinted(row)
+             for row in rows])
             for name, rows in triggers.items()}
         return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
                 'items': flat, 'fingerprint': _InlineWait.digest(fingerprinted)}

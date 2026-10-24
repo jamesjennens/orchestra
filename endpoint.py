@@ -1032,7 +1032,7 @@ def key_principal_refusal(request,path,key_principal):
 #: deliberately absent (James's answer to question 5, 2026-10-07).
 COORDINATOR_COMMANDS=('guidance-set','guidance-clear','guidance-status','reference-apply',
                       'capability-apply','capability-verify','proposal-review','proposal-decide',
-                      'handoff','set-onboarding','followon')
+                      'handoff','set-onboarding','followon','fault-clear')
 #: The coordinator commands that only read (no journal, no server time; the read takes the
 #: project's coordination lock, exactly as the host command does).
 COORDINATOR_READS=('guidance-status',)
@@ -1967,6 +1967,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 # under this lock and writes the native comment plus its host journal entry.
                 import followon
                 result=followon.apply(payload,actor,runner,path,operators=operators)
+            elif command=='fault-clear':
+                # A lane's needs-investigation flag is cleared only here and by the host
+                # command (kittrial-5bb.398). coordinator_refusal has already required a
+                # configured operator behind a bound key, so the lane that raised the fault and
+                # every other member are refused before this call; the library writes the clear
+                # record and its host journal entry under this lock.
+                import fault_clear
+                result=fault_clear.apply(payload,actor,runner,path,operators=operators)
             elif command=='reference-apply':
                 import reference_records
                 if isinstance(payload,dict) and 'items' in payload:

@@ -55,6 +55,30 @@ class CoordinatorWaitTests(grants.Grants):
         self.assertIs(False, same.data['changed'])
         self.assertIs(True, self.wait(query='&since=wait1:' + '0' * 64).data['changed'])
 
+    def test_a_raised_fault_wakes_the_coordinator_wait_and_changes_the_fingerprint(self):
+        import lane_state
+        from requirements import canonical_bytes
+        self.assertEqual(200, self.grant().status)
+        task, _contribution = self.deliver(self.tokens['carl'])
+        before = self.wait().data
+        self.assertEqual([], before['triggers']['needs-investigation'])
+        carl = self.ids['carl']
+        comments = self.backend.state['tasks'][task].setdefault('comments', [])
+        comments.append({'id': 'comment_fault_checkpoint', 'issue_id': task, 'author': carl,
+                         'text': 'a checkpoint', 'created_at': '2026-09-15T10:00:00+00:00'})
+        payload = {'schema_version': 1, 'task': task, 'checkpoint': 'comment_fault_checkpoint',
+                   'state': 'needs-investigation', 'reason': 'the merge slot is stuck'}
+        comments.append({'id': 'comment_fault', 'issue_id': task, 'author': carl,
+                         'text': lane_state.PREFIX + canonical_bytes(payload).decode(),
+                         'created_at': '2026-09-15T10:00:00+00:00'})
+        after = self.wait(query='&since=' + before['fingerprint'])
+        self.assertEqual(200, after.status, after.data)
+        self.assertIs(True, after.data['changed'])
+        rows = after.data['triggers']['needs-investigation']
+        self.assertEqual([(carl, 'the merge slot is stuck', task)],
+                         [(row['actor'], row['reason'], row['task']) for row in rows])
+        self.assertIn(task, [row['task'] for row in after.data['triggers']['awaiting-review']])
+
     def test_only_projects_with_effective_grants_are_read_and_multiple_are_namespaced(self):
         beta = self.create_project(self.admin, 'Beta')
         self.assertEqual(200, self.member('cora', 'coordinator', project=beta, token=self.admin).status)

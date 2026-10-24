@@ -130,9 +130,10 @@ WORKER_MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor', 'owner
                       'contribution_id', 'pending_review_items', 'redelivered',
                       'guidance_version', 'wait_newer_activity_marker')
 
-#: The four things a coordinator wakes for, in the order the task names them.
+#: The things a coordinator wakes for, in the order the task names them. ``needs-investigation``
+#: (kittrial-5bb.398) is a lane-raised fault that stays until a coordinator clears it.
 COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
-                        'checkpoint-to-coordinator', 'lane-quiet')
+                        'checkpoint-to-coordinator', 'lane-quiet', 'needs-investigation')
 
 #: The lane board flags a coordinator acts on: a lane quiet on its own move, or past a
 #: declared wait. ``waiting_too_long`` and ``expect_by_passed`` are the declared waits;
@@ -605,6 +606,14 @@ def _lane_row(lane, entry=None):
             'flags': sorted(set(entry.get('flags') or []))}
 
 
+def _fault_row(lane, fault):
+    """One raised fault, reduced to stable fields: no age, and the reason as already escaped."""
+    return {'lane': _scalar(lane.get('lane')), 'actor': _scalar(lane.get('actor')),
+            'task': _scalar(fault.get('about_task') or fault.get('task')),
+            'state': 'needs-investigation', 'reason': _scalar(fault.get('reason')),
+            'record': _scalar(fault.get('record'))}
+
+
 def coordinator_view(queue_items, lanes_payload):
     """The coordinator form's answer: the four trigger groups plus a fingerprint.
 
@@ -646,9 +655,13 @@ def coordinator_view(queue_items, lanes_payload):
                          or entry.get('next_actor') == 'coordinator')
             if addressed:
                 triggers['checkpoint-to-coordinator'].append(_lane_row(lane, entry))
+        fault = lane.get('needs_investigation')
+        if isinstance(fault, dict):
+            triggers['needs-investigation'].append(_fault_row(lane, fault))
     grouped = {name: _sorted_rows(rows) for name, rows in triggers.items()}
     flat = [dict(row, trigger=name) for name in COORDINATOR_TRIGGERS for row in grouped[name]]
-    fingerprinted = {name: _sorted_rows([_fingerprinted(row) for row in rows])
+    fingerprinted = {name: _sorted_rows([dict(row) if name == 'needs-investigation' else _fingerprinted(row)
+                                         for row in rows])
                      for name, rows in triggers.items()}
     return {'schema': WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
             'items': flat, 'fingerprint': digest(fingerprinted)}

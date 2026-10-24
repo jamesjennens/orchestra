@@ -211,6 +211,12 @@ COORDINATOR_DECISION_PREFIX = 'Kind: coordinator-decision-v1\n'
 # RECORD_ANCHOR_FAMILIES or RECORD_COMMENT_FAMILIES, so it anchors no row and every
 # surface -- an older kit included -- reads it as an ordinary comment.
 LANE_STATE_PREFIX = 'Kind: lane-state-v1\n'
+# kittrial-5bb.398. The coordinator's clear of a lane's needs-investigation flag. Reserved
+# so the raw `comments add` path can never plant one; a clear is honoured only with its
+# host journal entry (``<project>/.lane-fault-clears/``), so one planted where the prefix is
+# not reserved (an older kit) is inert and the flag stays shown. Not a record-anchor family:
+# every surface, an older kit included, reads it as an ordinary comment.
+LANE_FAULT_CLEAR_PREFIX = 'Kind: lane-fault-clear-v1\n'
 # kittrial-5bb.343. The coordinator's recorded hand-back of an integrated task to
 # its assignee. Reserved so the raw `comments add` path can never plant one; the
 # record is honoured only with its host journal entry
@@ -261,6 +267,7 @@ RESERVED = (
     (COORDINATOR_DECISION_PREFIX, 'coordinator decision',
      'decisions record on the coordination host or in the web interface'),
     (LANE_STATE_PREFIX, 'lane state', 'checkpoint TASK --file checkpoint.json (the lane_state key)'),
+    (LANE_FAULT_CLEAR_PREFIX, 'lane fault clear', 'coordinator fault-clear on the coordination host'),
     (ASSIGNEE_FOLLOWON_PREFIX, 'assignee follow-on record',
      'coordinator followon on the coordination host or the web route'),
     (TASK_FILE_PREFIX, 'task file record', 'the task files route (PUT /v1/projects/PID/tasks/TID/files)'),

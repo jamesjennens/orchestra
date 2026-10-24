@@ -324,6 +324,20 @@ act instead of leaving it to be discovered.
 waiting agent, so that work adds the push and does not redefine the state. The record lives beside
 the checkpoint precisely so that the push work can extend it without reopening the checkpoint schema.
 
+## 9a. Needs investigation (kittrial-5bb.398)
+
+A lane may raise a fault flag that is independent of its working/waiting state: a `lane-state-v1`
+record with `state: needs-investigation`, a required `reason` (at most 300 characters, one printable
+line) and an optional `about_task`. The reason is untrusted everywhere: escaped, clipped to 300 and
+folded onto one line in text views. The board's lane row carries `needs_investigation` (reason, task,
+record, since, age) on every lane, faulted lanes sort first, and the flags summary counts them. The
+flag is the lane's newest raise across all its tasks, closed ones included; a later state record never
+clears it. Only `coordinator fault-clear` (or the host `admin.py fault-clear`) clears it, writing a
+`lane-fault-clear-v1` comment plus a journal entry that records who and when. The coordinator wait gains
+a `needs-investigation` trigger (last in order). An older kit drops the unknown state and so does not
+show the flag; the clear reads there as an ordinary comment. Use it for process faults, not task
+blockers, which stay open items.
+
 ## 10. Decisions taken (the two former owner questions are closed)
 
 1. **Threshold** — 15 minutes by default, given as an argument of the read and of the page, **not** a

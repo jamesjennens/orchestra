@@ -32,9 +32,10 @@ from requirements import canonical_bytes
 from reserved_comments import LANE_STATE_PREFIX as PREFIX, _reserved_prefix_view
 
 SCHEMA_VERSION = 1
-#: The five declared states. The four ``waiting-*`` values are the waiting states: a
+#: The declared states. The four ``waiting-*`` values are the waiting states: a
 #: ``waiting_on`` is required with one and refused with any other.
-STATES = ('working', 'waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user', 'idle')
+STATES = ('working', 'waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user', 'idle',
+          'needs-investigation')
 WAITING_STATES = tuple(state for state in STATES if state.startswith('waiting-'))
 #: The roles ``waiting_on`` may name instead of an actor id. The flag keys off the role;
 #: an actor id is shown beside it and is never converted into a role by guessing.
@@ -45,12 +46,21 @@ CHECKPOINT_LIMIT = 128
 #: An actor id as the endpoint and the session registry accept one.
 ACTOR = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 
+#: ``needs-investigation`` (kittrial-5bb.398) is an out-of-band process-fault flag, not a wait:
+#: it carries a required one-line ``reason`` and an optional ``about_task``, refuses
+#: ``waiting_on``, and stays shown on the lane board until a coordinator clears it
+#: (fault_clear.py). The reason is untrusted text: bounded here, escaped when shown.
+FAULT_STATE = 'needs-investigation'
+REASON_LIMIT = 300
+TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
+
 REQUIRED_FIELDS = ('schema_version', 'task', 'state')
 #: ``checkpoint`` is NOT sent in the request: the writer sets it to the comment id it
 #: publishes, which is the only way the record can be guaranteed to name the task's
 #: newest checkpoint at write time. ``waiting_on`` and ``expect_by`` are optional by
-#: rule. The written record's field set is exactly these six.
-OPTIONAL_FIELDS = ('checkpoint', 'waiting_on', 'expect_by')
+#: rule. ``reason`` and ``about_task`` belong to ``needs-investigation`` only. The written
+#: record's field set is exactly these eight.
+OPTIONAL_FIELDS = ('checkpoint', 'waiting_on', 'expect_by', 'reason', 'about_task')
 FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
 
 
@@ -87,6 +97,26 @@ def _waiting_on_problems(value):
                 'characters' % ', '.join(ROLES)]
     return ['Invalid lane state: waiting_on must be a role (%s) or an actor id; %r is neither, and this kit '
             'infers no person' % (', '.join(ROLES), value)]
+
+
+def display_reason(value):
+    """A fault reason made safe to show: clipped to the limit before and after escaping, every non-printable character
+    (newline, control, bidirectional override) written as an escape, never executed or folded
+    into the surrounding line. The recorded text is never trusted to have been checked."""
+    text = str(value if value is not None else '')[:REASON_LIMIT]
+    shown = ''.join(ch if ch.isprintable() else ch.encode('unicode_escape').decode('ascii') for ch in text)
+    return shown[:REASON_LIMIT]
+
+
+def _reason_problems(value):
+    if not isinstance(value, str) or not value.strip():
+        return ['Invalid lane state: reason must be one line of text saying what needs investigating']
+    if len(value) > REASON_LIMIT:
+        return ['Invalid lane state: reason is longer than %d characters' % REASON_LIMIT]
+    if not value.isprintable():
+        return ['Invalid lane state: reason must be one line without newlines, control or direction '
+                'characters']
+    return []
 
 
 def problems(payload, task, checkpoint=None):
@@ -142,6 +172,19 @@ def problems(payload, task, checkpoint=None):
     elif waiting_on is not None:
         found.append('Invalid lane state: waiting_on is refused when state is %r; it names who is waited on '
                      'and is required only with a waiting state' % (state,))
+    if state == FAULT_STATE:
+        if 'reason' not in payload:
+            found.append('Invalid lane state: reason is required when state is %r' % state)
+        else:
+            found.extend(_reason_problems(payload['reason']))
+        if 'about_task' in payload and (not isinstance(payload['about_task'], str)
+                                        or not TASK_ID.fullmatch(payload['about_task'])):
+            found.append('Invalid lane state: about_task must be a task id')
+    else:
+        for name in ('reason', 'about_task'):
+            if name in payload:
+                found.append('Invalid lane state: %s is refused when state is %r; it belongs to %r'
+                             % (name, state, FAULT_STATE))
     if 'expect_by' in payload:
         try:
             parse_moment(payload['expect_by'])

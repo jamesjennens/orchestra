@@ -2396,6 +2396,7 @@ def help_limits(action):
             'item source/evidence':'<= %d characters'%CHECKPOINT_SOURCE_LIMIT,
             'payload':'<= %d KB canonical bytes'%(CHECKPOINT_MAX_BYTES//1000),
             'lane_state.waiting_on':'<= 96 characters (a role or an actor id)',
+            'lane_state.reason':'<= 300 characters (needs-investigation only)',
             'error field names':'<= %d names, each <= %d characters'%(FIELD_NAME_COUNT,FIELD_NAME_LIMIT)})
     return limits
 
@@ -2469,13 +2470,17 @@ def help_notes(action):
             'id, reason, evidence).',
             'An optional sibling key lane_state (kittrial-5bb.263) writes one Kind: lane-state-v1 record beside '
             'this checkpoint in the same act. Its fields are schema_version (1), task, state (one of working, '
-            'waiting-on-coordinator, waiting-on-review, waiting-on-user, idle), waiting_on (a role coordinator/'
+            'waiting-on-coordinator, waiting-on-review, waiting-on-user, idle, needs-investigation), waiting_on (a role coordinator/'
             'reviewer/user or an actor id; required with a waiting state and refused without one) and expect_by '
             '(optional ISO-8601 with an offset; a past value is accepted). Do not send checkpoint: the writer '
             'sets it to the comment id this checkpoint just published, which is what makes the record name the '
             'task\'s newest checkpoint at write time. It is NOT a checkpoint field: the checkpoint object '
             'above is unchanged and its field set stays closed, and lane_state is popped out before the checkpoint '
-            'is validated. Nothing is inferred: no person, and no actor turned into a role.',
+            'is validated. Nothing is inferred: no person, and no actor turned into a role. State '
+            'needs-investigation (kittrial-5bb.398) raises an out-of-band fault flag on the lane for the coordinator: '
+            'it requires reason (text, <= 300 characters, one printable line, shown escaped and clipped) and allows '
+            'about_task (a task id); it takes no waiting_on or expect_by, and every other state refuses reason and '
+            'about_task. Only the coordinator can clear it; a later state record never does.',
             'A refusal names every problem with the record at once: the sentence itself for one problem, and for '
             'more a numbered list of the same sentences ("Invalid checkpoint (N problems): [1] ... [2] ..."), at '
             'most %d of them. A stale previous and a changed activity cursor are separate refusals.'
