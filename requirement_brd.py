@@ -74,7 +74,7 @@ def _items(view):
     return result
 
 
-def render(view):
+def render(view, *, _legacy_reason=False):
     """UTF-8/LF Markdown; every pending section identifies unaccepted wording."""
     if not isinstance(view, dict):
         raise ValueError('Requirements document must be an object')
@@ -107,7 +107,11 @@ def render(view):
                 explanation = item['reason']
                 if not isinstance(explanation, dict) or not isinstance(explanation.get('reason'), str):
                     raise ValueError('Requirement state reason must retain its evidence')
-                lines.extend(['Reason: ' + literal(explanation['reason']), ''])
+                reason = literal(explanation['reason'])
+                if '\n' in reason and not _legacy_reason:
+                    lines.extend(['Reason:', '', *('> ' + line for line in reason.split('\n')), ''])
+                else:
+                    lines.extend(['Reason: ' + reason, ''])
             successor = (item.get('state') or {}).get('superseded_by')
             if successor:
                 identifier(successor['id'])

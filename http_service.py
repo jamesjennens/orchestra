@@ -10598,7 +10598,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines/(?P<baseline>[A-Za-z0-9_-]{1,64})')
     def requirements_baseline(self, ctx):
         self._requirements_baseline_member(ctx)
-        return 200, self.backend.requirements_read(ctx.params['pid'], ['baseline', ctx.params['baseline']])
+        result = self.backend.requirements_read(ctx.params['pid'], ['baseline', ctx.params['baseline']])
+        if self._requirement_editor_here(ctx, ctx.params['pid']) is None:
+            receipt = result.get('receipt')
+            if isinstance(receipt, dict):
+                names = self.service.actor_names([receipt.get('account_id')])
+                account = receipt.get('account_id')
+                name = names.get(account)
+                result['author_name'] = name if name and name != account else 'Former project owner'
+                result['receipt'] = {key: value for key, value in receipt.items()
+                                     if key not in ('account_id', 'operation_id')}
+        return 200, result
 
     def _requirements_document_args(self, ctx, action):
         if set(ctx.query) - {'baseline'}:
@@ -10621,8 +10631,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd/changes')
     def requirements_baseline_changes(self, ctx):
         self._requirements_baseline_member(ctx)
-        return 200, self.backend.requirements_read(ctx.params['pid'],
+        result = self.backend.requirements_read(ctx.params['pid'],
             self._requirements_document_args(ctx, 'changes'))
+        for change in result.get('changes', []):
+            for side in ('before', 'after'):
+                projected = {'state': change.get(side + '_state')}
+                self._requirements_state_only(ctx, projected)
+                self._requirements_names(projected)
+                change[side + '_state'] = projected['state']
+                if 'state_author_name' in projected:
+                    change[side + '_state_author_name'] = projected['state_author_name']
+        return 200, result
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
