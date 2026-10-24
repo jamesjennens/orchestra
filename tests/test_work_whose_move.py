@@ -20,7 +20,7 @@ import review_workflow as rw
 import work
 import worker
 from requirements import canonical_bytes
-from test_briefing import rows, checkpoint, append_checkpoint, TASK, PROJECT
+from test_briefing import rows, checkpoint, append_checkpoint, save_cp, TASK, PROJECT
 import test_work_checkpoint_wait
 import test_work_queue
 
@@ -76,6 +76,8 @@ class ReviewMoveTests(unittest.TestCase):
         add_to(data[0], dict(schema_version=1, operation='approve', operation_id='approve-1', task=TASK,
                              previous='delivery', contribution='delivery', summary='Accepted'),
                'approval', 'reviewer')
+        self.assertEqual(owned(data)['items'][0]['whose_move'], 'you')  # read the newer approval comment
+        save_cp(data, 'approval-read')
         item = owned(data)['items'][0]
         self.assertEqual((item['review_state'], item['whose_move']), ('awaiting-integration', 'coordinator'))
         self.assertEqual(item['next'], "Nothing is for you to do: the next move is the coordinator's.")

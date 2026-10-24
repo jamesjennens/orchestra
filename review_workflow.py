@@ -2250,7 +2250,7 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
     warned about (item 5), so a chain that already holds two still reads."""
     contribution = None; prior = []; pending = {}; notes = {}; reviews = {}
     declined = []; approved = False; approved_id = None; latest = None; withdrawal = None
-    ignored_withdrawals = []
+    ignored_withdrawals = []; last_response = None
     # Verifier attestations and explicit integration holds (kittrial-5bb.10). An
     # attestation belongs to the revision it was recorded against, so it resets with a
     # new contribution; a HOLD does not: it survives retries and new revisions and is
@@ -2311,6 +2311,7 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                     raise ValueError('At most 20 unresolved review items are allowed')
                 approved = False
             elif op == 'respond':
+                last_response = dict(metadata)
                 for item in p['resolutions']:
                     key = (item['request'], item['item'])
                     if key in pending:
@@ -2545,6 +2546,7 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                         'and changes nothing else')
     answer = dict(contribution=contribution, prior_contributions=prior, review_state=state,
                   pending_requests=list(pending.values()), latest_comment_id=latest,
+                  last_response=last_response,
                   # Additive (kittrial-5bb.94): non-blocking items, open first-class
                   # review requests, the requests their named reviewer declined, and
                   # the withdrawal/supersede record for the current contribution. All

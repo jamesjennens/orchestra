@@ -154,6 +154,7 @@ class SharedNextActorTests(unittest.TestCase):
 
     def test_open_integrated_work_is_the_coordinators_and_free_work_anyone(self):
         store = shared.reviewed()
+        save_cp(store.rows, 'read-integration')
         review, brief, item = surfaces(store.rows)
         # kittrial-5bb.336: integration of one revision leaves the OPEN task the
         # coordinator's to close or record, on every surface alike.
@@ -224,6 +225,7 @@ class ReconciliationTests(unittest.TestCase):
 
     def test_disagreeing_integration_facts_are_filterable_and_shown_on_every_view(self):
         store = self.disagreeing()
+        save_cp(store.rows, 'read-integration')
         review, brief, item = surfaces(store.rows)
         self.assertEqual(review['review_state'], 'integrated')
         self.assertEqual([review['work_state'], brief['review']['work_state'],
@@ -285,9 +287,13 @@ class ReconciliationTests(unittest.TestCase):
                                     ['--state', 'awaiting-review'])['total'], 1)
         self.assertEqual(work.queue(store.rows, 'alice/session',
                                     ['--state', 'changes-requested'])['total'], 0)
-        # The role is the review state's (`awaiting-review` -> reviewer); the reconciliation
-        # signal is `work_state` and must not replace it (next-actor-from-work-state).
-        self.assertEqual([review['next_actor'], item['next_actor']], ['reviewer'] * 2)
+        # Reconciliation keeps the evidence-only review role. Independently, unread
+        # coordinator comments make the assignee acknowledge them before waiting again.
+        self.assertEqual(review['next_actor'], 'reviewer')
+        self.assertTrue(item['assignee_comment_pending'])
+        self.assertEqual(item['next_actor'], 'assignee')
+        save_cp(store.rows, 'read-lagging-scope')
+        self.assertEqual(surfaces(store.rows)[2]['next_actor'], 'reviewer')
 
     def test_an_unrelated_newest_scope_is_not_a_lag(self):
         """lag-raised-for-unrelated-scope: only a PRIOR revision of the current

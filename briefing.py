@@ -588,6 +588,60 @@ def wait_activity_marker(data,row):
     newest=max(entries,key=lambda entry:(parse_moment(entry['timestamp']),entry['entry_id'])) if entries else None
     return activity_marker(newest,fields_digest(row))
 
+def pending_other_comments(entries, owner, selected=None, acknowledged=None):
+    """One comment-attention decision over an already ordered activity snapshot.
+
+    The caller supplies the shared newer_selection result, not another clock.
+    A validated response consumes through its entry in that same snapshot.
+    """
+    remaining = entries
+    if acknowledged is not None:
+        position = next((i for i, entry in enumerate(entries)
+                         if entry['entry_id'] == acknowledged), None)
+        if position is not None:
+            remaining = entries[position + 1:]
+    selected_ids = None if selected is None else {entry['entry_id'] for entry in selected}
+    return any(entry.get('kind') == 'comment'
+               and not same_activity_actor(entry.get('author'), owner)
+               and (selected_ids is None or entry['entry_id'] in selected_ids)
+               for entry in remaining)
+
+
+def assignee_comment_pending(row, state=None, response=None):
+    """Unconsumed comments for an open assignee, reusing checkpoint provenance.
+
+    Review state does not decide whether a person has written to the assignee.
+    It remains independent evidence; an invalid checkpoint cannot assert freshness.
+    """
+    owner = row.get('assignee')
+    if row.get('status') == 'closed' or not owner:
+        return False
+    try:
+        state = state if state is not None else checkpoint_state(row)
+        if state['invalid']:
+            return False
+        if not state['provenance']:
+            state = dict(state, provenance={cid:normalize_provenance(payload)
+                                           for cid,payload in state['history']})
+        comments = {str(c['id']): c for c in row.get('comments') or []}
+        own = [(i, cid, payload) for i, (cid, payload) in enumerate(state['history'])
+               if same_activity_actor(comments[str(cid)].get('author'), owner)]
+        full = snapshot([row], 'comment-attention', row['id'])
+        selected = None
+        if own:
+            index, cid, payload = own[-1]
+            comment = comments[str(cid)]
+            data = excluding_checkpoint(full, cid, comment.get('author'))
+            selected = newer_selection(data, retained_provenance(state, upto=index),
+                                       comment.get('created_at'))[1]
+        acknowledged = None
+        if isinstance(response, dict) and same_activity_actor(response.get('author'), owner):
+            acknowledged = row['id'] + '-c' + str(response['comment_id'])
+        return pending_other_comments(full['entries'], owner, selected, acknowledged)
+    except (ValueError, TypeError, KeyError, StopIteration):
+        return False
+
+
 def newer_comment_by_other(row,checkpoint_comment):
     """The released ``newer_activity`` boolean, in ONE place (kittrial-5bb.354).
 

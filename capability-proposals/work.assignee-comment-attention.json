@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb390-assignee-comment-attention-1",
+  "key": "work.assignee-comment-attention",
+  "name": "Coordinator comments reach the assignee through review states",
+  "aliases": [
+    "coordinator comment wakes worker wait",
+    "comment during awaiting review",
+    "partial approval worker continuation"
+  ],
+  "summary": "On an open assigned task, unconsumed other-party comments, including coordinator/owner comments and structured review comments, return attention to the assignee across review states, including an integrated remainder. A valid assignee checkpoint or structured response consumes attention; own parent/sub-label progress stays quiet, closed tasks gain none and operator errors remain operator work. Work listings and HTTP next/worker wait share this decision and existing activity selection and stable wait markers; review/lifecycle facts and coordinator-wait trigger groups remain unchanged.",
+  "requirements": [],
+  "anchors": [
+    "docs/BRIEFINGS.md#new-comments-return-an-open-task-to-its-assignee-kittrial-5bb390"
+  ],
+  "code": [
+    "briefing.py::pending_other_comments",
+    "briefing.py::assignee_comment_pending",
+    "work.py::move_decision",
+    "work.py::queue",
+    "review_workflow.py::projection",
+    "http_service.py::ApiHandler._agent_attention",
+    "http_service.py::ApiHandler.agents_me_wait",
+    "lanes.py::held_task"
+  ],
+  "tests": [
+    "tests/test_comment_attention.py",
+    "tests/test_comment_attention_http.py",
+    "tests/test_comment_attention_real_bd.py",
+    "tests/test_blocking_wait.py",
+    "tests/test_coordinator_http_wait.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "work",
+    "wait",
+    "comments",
+    "checkpoint",
+    "review"
+  ]
+}

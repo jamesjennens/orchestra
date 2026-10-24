@@ -192,6 +192,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None):
         redelivered = bool(contribution_id) and bool(pending_requests) and all(
             str(pending.get('contribution') or '') != str(contribution_id) for pending in pending_requests)
         from work import claimable, move_decision
+        from briefing import assignee_comment_pending
         row_claimable = claimable(row.get('issue_type'), row.get('status'), row.get('assignee'),
                                   contribution.get('comment_id'), state, labels=row.get('labels'))
         # THE one whose-move decision (kittrial-5bb.6). The decision is taken with the
@@ -201,6 +202,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None):
             state, task, True, pending_items=pending_items, redelivered=redelivered,
             assignee=row.get('assignee'), closed=row.get('status') == 'closed',
             claimable=row_claimable,
+            comment_pending=assignee_comment_pending(row, response=review.get('last_response')),
             # The shared projection carries the newest hand-back block, and when it
             # applies it made the move the assignee's (kittrial-5bb.343). The lane
             # board passes that SAME block through the ONE decision, so a lane row

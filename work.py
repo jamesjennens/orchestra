@@ -342,7 +342,7 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
 
 def move_decision(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
                   assignee=None, closed=False, claimable=None, way_back=None, followon=None,
-                  checkpoint_available=True):
+                  checkpoint_available=True, comment_pending=False):
     """THE one whose-move decision (kittrial-5bb.6 review item 2): `(move, next, next_actor)`.
 
     One function gives all three answers, so no reader can be told one mover by
@@ -356,11 +356,11 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
       told. It is never null; a malformed row reads ``operator``.
 
     ``assignee``, ``closed``, ``pending_items`` and ``claimable`` are the row facts
-    that role needs; they are the same facts the shared projection passes, so a
-    ``work`` row and the ``review`` read of the same task cannot disagree.
+    that role needs. ``comment_pending`` adds the assignee attention decision without
+    changing the evidence-only review projection; checkpointing restores its role.
 
     ``followon`` is an APPLYING hand-back block (kittrial-5bb.343); it is the ONE
-    branch that makes an integrated task the assignee's move, and it forces
+    branch that holds an integrated task's assignee move until resolved, and it forces
     ``next_actor`` to ``'assignee'`` from the same decision.
 
     ``way_back`` is the reference the sentence tells the caller to follow, passed through
@@ -371,6 +371,14 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
         return ('unknown', 'This task is closed; its review and lifecycle records remain in history.',
                 next_actor(state, assignee, closed, pending_items=pending_items, claimable=claimable))
     applied=isinstance(followon,dict) and followon.get('applies')
+    if (comment_pending and not applied and not closed and assignee
+            and not (named_reviewer and not owned)
+            and state not in ('none', 'changes-requested', 'error')):
+        way = way_back or ('history ' + task + ' --recent 10')
+        recipient = 'your' if owned else "the assignee's"
+        text = ('New task comments need ' + recipient + ' attention; read ' + way
+                + ' and record the next step.')
+        return ('you' if owned else 'unknown', text, 'assignee')
     move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered,
                              way_back=way_back, followon=followon,
                              checkpoint_available=checkpoint_available)
@@ -381,15 +389,16 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
 
 
 def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                way_back=None, followon=None, checkpoint_available=True):
-    """`(whose_move, next)`: one plain sentence from the validated review state alone.
+                way_back=None, followon=None, checkpoint_available=True, comment_pending=False, assignee=None):
+    """`(whose_move, next)`: one plain sentence from the shared move decision.
 
     The public two-answer shape (kittrial-5bb.249), unchanged. The decision it comes
     from is :func:`move_decision`, which yields ``next_actor`` as well.
     """
     move, text, _ = move_decision(state, task, owned, named_reviewer, pending_items, redelivered,
                                   way_back=way_back, followon=followon,
-                                  checkpoint_available=checkpoint_available)
+                                  checkpoint_available=checkpoint_available, comment_pending=comment_pending,
+                                  assignee=assignee)
     return move, text
 
 
@@ -605,6 +614,7 @@ def help_payload(action='work'):
                             'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
                             'blocking_items', 'checkpoint_at', 'newer_activity', 'checkpoint_wait',
+                            'assignee_comment_pending',
                             'pending_handoff_requests',
                             'pending_handoff_total', 'pending_handoff_next_offset', 'lifecycle',
                             'lifecycle_scope', 'lifecycle_matches_contribution', 'error',
@@ -1153,12 +1163,15 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # this row already shows; no further read. `owned` is the SUBJECT's (kittrial-
         # 5bb.288): an open task assigned to the subject with no contribution and no
         # checkpoint by them reads `you` and counts in `your_move`.
+        from briefing import assignee_comment_pending
+        comment_pending = assignee_comment_pending(row, checkpoint_states.get(row['id']),
+                                                   review.get('last_response')) if state != 'error' else False
         move,move_text,role=move_decision(state,row['id'],bool(subject) and actor_holds(row.get('assignee'), subject),
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
                                           closed=row.get('status')=='closed',claimable=row_claimable,
                                           followon=task_followon.get('block') if task_followon else None,
-                                          checkpoint_available=provenance_writes)
+                                          checkpoint_available=provenance_writes, comment_pending=comment_pending)
         # A standing hold (or a failed attestation) is shown BESIDE the state the row
         # already reads (kittrial-5bb.10 item 7): a revision still awaiting review stays in
         # the reviewers' queue, and an author with open requested changes is told the
@@ -1181,6 +1194,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
                       'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row_owner,'status':row.get('status'),'review_state':state,
                       **({'owner_name':owner_name} if owner_name and owner_name!=row_owner else {}),
+                      'assignee_comment_pending':comment_pending,
                       'whose_move':move,'next':move_text,
                       # Additive (kittrial-5bb.343): the newest recorded hand-back and
                       # whether it applies, so a reader sees why an unjournalled or
@@ -1268,7 +1282,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # that blocker or dependency ENTRY itself (its raw text, escaped once) and says no
         # person was inferred. The move stays the subject's: `whose_move` is not rewritten
         # and the row stays in `your_move`.
-        if item['checkpoint_wait'].get('active'):
+        if item['checkpoint_wait'].get('active') and not item.get('assignee_comment_pending'):
             wait_text=waiting_move(checkpoint_wait_move_text(checkpoint_states.get(item['task'])))
             if wait_text:
                 item['next']=wait_text
