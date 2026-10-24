@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "operation_id": "f7f0b488-e2d5-4c2e-b3bf-ecb92b1f7357",
+  "key": "client.command-help",
+  "name": "Stand-alone known-command help without client configuration",
+  "aliases": [
+    "client command help config project",
+    "client command help parser validation",
+    "client.py COMMAND --help",
+    "command help without config",
+    "standalone client help"
+  ],
+  "summary": "client.main answers -h/--help for a known command only when --config or --project is missing; configured calls retain the endpoint JSON help envelope. The standalone help_requested copy follows work.py's value-option rule without importing server modules. contributor_command_help keeps usage text inside client.py, reuses the files and wait parsers, and performs no config reads, server contact or filesystem writes. Tests pin the copied rule and static usage to work.py, cover configured brief/work JSON, option-value -h, positional help, and copied-client operation in empty HOME, TMPDIR and working directories.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "client.py::main",
+    "client.py::contributor_command_help",
+    "client.py::help_requested",
+    "client.py::_files_parser",
+    "client.py::_wait_parser",
+    "work.py::help_requested",
+    "work.py::help_payload"
+  ],
+  "tests": [
+    "tests/test_client_command_help.py",
+    "tests/test_endpoint_help.py",
+    "tests/test_standalone_client_wait.py",
+    "tests/test_cli_contract.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "client",
+    "help",
+    "standalone"
+  ]
+}

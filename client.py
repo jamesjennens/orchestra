@@ -774,20 +774,7 @@ class _InlineWait:
 
     @staticmethod
     def parse_client_args(args):
-        parser = _InlineWait.Parser(prog='wait', add_help=False)
-        parser.add_argument('--coordinator', action='store_true')
-        parser.add_argument('--idle-minutes', type=int, default=_InlineWait.DEFAULT_IDLE_MINUTES,
-                            dest='idle_minutes')
-        parser.add_argument('--interval', type=int, default=_InlineWait.DEFAULT_INTERVAL)
-        parser.add_argument('--timeout', type=float, default=None)
-        parser.add_argument('--since')
-        parser.add_argument('--fresh', action='store_true')
-        parser.add_argument('--idle-since')
-        parser.add_argument('--max-timeout', type=float, default=None, dest='max_timeout')
-        parser.add_argument('--give-up-after', type=float,
-                            default=_InlineWait.DEFAULT_GIVE_UP_AFTER, dest='give_up_after')
-        parser.add_argument('--json', action='store_true')
-        parsed = parser.parse_args(args)
+        parsed = _wait_parser().parse_args(args)
         if parsed.interval < _InlineWait.MIN_INTERVAL:
             raise ValueError('Invalid wait: --interval must be at least %d seconds (the default is %d)'
                              % (_InlineWait.MIN_INTERVAL, _InlineWait.DEFAULT_INTERVAL))
@@ -949,6 +936,24 @@ def _wait_client_prefix(config_path,project,actor):
     if actor:
         tokens += ['--actor',str(actor)]
     return ' '.join(shlex.quote(token) for token in tokens)
+
+
+def _wait_parser(add_help=False):
+    parser = _InlineWait.Parser(prog='wait', add_help=add_help)
+    parser.add_argument('--coordinator', action='store_true')
+    parser.add_argument('--idle-minutes', type=int, default=_InlineWait.DEFAULT_IDLE_MINUTES,
+                        dest='idle_minutes')
+    parser.add_argument('--interval', type=int, default=_InlineWait.DEFAULT_INTERVAL)
+    parser.add_argument('--timeout', type=float, default=None)
+    parser.add_argument('--since')
+    parser.add_argument('--fresh', action='store_true')
+    parser.add_argument('--idle-since')
+    parser.add_argument('--max-timeout', type=float, default=None, dest='max_timeout')
+    parser.add_argument('--give-up-after', type=float,
+                        default=_InlineWait.DEFAULT_GIVE_UP_AFTER, dest='give_up_after')
+    parser.add_argument('--json', action='store_true')
+    return parser
+
 
 def _wait_command(args,config,project,actor,out,config_path=None):
     """``client.py wait``: block until something is the caller's move (kittrial-5bb.285).
@@ -1389,6 +1394,53 @@ def contributor_help_text(unknown=None):
     return '\n'.join(lines)
 
 
+# Copy of work.py:502-507 and its constants at 213-218; client.py stays standalone.
+HELP_TOKENS = ('-h', '--help')
+VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
+                 '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
+                 '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
+                 '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset',
+                 '--recent', '--last', '--kind'}
+
+
+def help_requested(args):
+    """True when args ask for help; side-effect free for every command."""
+    for index, token in enumerate(args):
+        if token in HELP_TOKENS and not (index and args[index - 1] in VALUE_OPTIONS):
+            return True
+    return False
+
+
+_COMMAND_HELP_USAGE = {
+    'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
+            '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
+            ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]',
+    'review': 'review TASK [--file payload.json]',
+    'handoff': 'handoff TASK --file payload.json',
+    'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
+    'history': 'history TASK [--limit N | --recent N | --last N] [--since TIME] '
+               '[--since-checkpoint | --since-my-checkpoint] [--kind comment|event] [--cursor TOKEN] '
+               '[--body-budget BYTES]',
+    'checkpoint': 'checkpoint TASK --file checkpoint.json [--json] | checkpoint TASK --provenance | '
+                  'checkpoint TASK --verify | checkpoint TASK --latest [--provenance] | '
+                  'checkpoint TASK --directions [--offset N] [--limit N]',
+    'docs': 'docs [NAME] | docs --status',
+}
+
+
+def contributor_command_help(command):
+    """Static help for one known command, without configuration or server modules."""
+    if command == 'files':
+        return _files_parser().format_help()
+    if command == 'wait':
+        return _wait_parser(add_help=True).format_help()
+    listed_usage, description = next(item for item in CONTRIBUTOR_COMMANDS
+                                     if item[0].split()[0] == command)
+    usage = _COMMAND_HELP_USAGE.get(command, listed_usage)
+    return ('usage: %s\n\n%s\n\noptions:\n  -h, --help  show this help message and exit\n'
+            % (usage, description))
+
+
 # -- task files over SSH (kittrial-5bb.384, docs/TASK_FILES_DESIGN.md 3b option B) ------------------------
 # One JSON header line, then exactly ``bytes`` raw bytes for a put; the answer is one JSON line, then the
 # raw bytes of a get. The limits here are the endpoint's own (task_files.py); this file stays self-contained.
@@ -1499,7 +1551,7 @@ def _files_refusal(answer):
     sys.stderr.write(text + '\n')
     return 1
 
-def _files_command(args, config, project, actor):
+def _files_parser():
     parser = argparse.ArgumentParser(prog='files', add_help=True)
     sub = parser.add_subparsers(dest='verb', required=True)
     lister = sub.add_parser('list');lister.add_argument('task')
@@ -1509,7 +1561,11 @@ def _files_command(args, config, project, actor):
     putter = sub.add_parser('put');putter.add_argument('task');putter.add_argument('path')
     putter.add_argument('--direction', required=True, choices=('to-worker', 'from-worker'))
     putter.add_argument('--note');putter.add_argument('--media-type', dest='media_type')
-    a = parser.parse_args(args)
+    return parser
+
+
+def _files_command(args, config, project, actor):
+    a = _files_parser().parse_args(args)
     if not isinstance(actor, str) or not ACTOR.fullmatch(actor):
         raise ValueError('Supply a short contributor/session actor')
     header = {'action': 'file-' + a.verb, 'project': project, 'actor': actor, 'task': a.task}
@@ -1620,6 +1676,10 @@ def main():
             return _capability_check(args[2:],json.loads(Path(a.config).read_text()) if a.config else None,
                                      a.project,a.actor,a.out)
         return _capability(args[1:],a.out)
+    if ((not a.config or not a.project) and args[0] in contributor_command_names()
+            and help_requested(args[1:])):
+        sys.stdout.write(contributor_command_help(args[0]))
+        return 0
     if not a.config or not a.project:
         p.error('the following arguments are required: --config, --project')
     # A command outside the contributor interface is answered, not refused with a pointer at the
