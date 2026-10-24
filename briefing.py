@@ -591,7 +591,7 @@ class ContextPointers:
                         from work import workflow
                         self.reviews[row['id']]=workflow(row,operators=self.operators)
                     prior=self.reviews[row['id']].get('prior_contributions') or []
-                    if any(str(item.get('comment_id'))==value for item in prior):
+                    if any(str(item.get('comment_id'))==value and item.get('relation')=='supersedes' for item in prior):
                         entry['state']='superseded'
         else:
             if kind not in self.catalogs:

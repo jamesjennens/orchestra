@@ -12,7 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import briefing as b
 from requirements import canonical_bytes
-from test_briefing import rows,checkpoint,append_checkpoint,comment,contribution,add_review,TASK,PROJECT
+from test_briefing import rows,checkpoint,append_checkpoint,comment,contribution,approval,add_review,TASK,PROJECT
 from test_reference_records import ReferenceCase,OPERATOR,acceptance
 
 
@@ -89,6 +89,14 @@ class ResolutionTests(unittest.TestCase):
         second=dict(contribution('d'*40),operation_id='second',previous='old',supersedes='old')
         add_review(data,second,'new')
         self.assertEqual(self.resolve('comment:old',data)['state'],'superseded')
+        self.assertEqual(self.resolve('comment:new',data)['state'],'live')
+
+    def test_followed_delivery_stays_live_historical_evidence(self):
+        data=rows();add_review(data,contribution('a'*40),'old')
+        add_review(data,approval('old'),'approved',author='reviewer')
+        second=dict(contribution('d'*40),operation_id='follow',previous='approved',follows='old',supersedes=None)
+        add_review(data,second,'new')
+        self.assertEqual(self.resolve('comment:old',data)['state'],'live')
         self.assertEqual(self.resolve('comment:new',data)['state'],'live')
 
     def test_record_catalog_uses_loaded_projection_and_retirement(self):

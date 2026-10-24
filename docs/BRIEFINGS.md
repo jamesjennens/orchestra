@@ -294,7 +294,7 @@ Resolution uses only already-loaded, caller-authorized project data, with no new
 - `live`: a task, comment, reference or capability target exists. This proves existence,
   not the checkpoint's claim, and grants no authority to the pointed text.
 - `superseded`: the loaded target is explicitly superseded, including retired references
-  and prior contribution comments.
+  and explicitly superseded contribution comments. Additive `follows` deliveries remain live historical evidence.
 - `unavailable`: a resolvable target is absent or inaccessible. Both receive the same
   answer without a target label or follow command.
 - `unchecked`: uniform for every target of a kind the brief does not load: file, room,
