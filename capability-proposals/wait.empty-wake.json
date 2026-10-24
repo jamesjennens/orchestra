@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "operation_id": "cap397-wait-empty-wake-0001",
+  "operation_id": "cap397-wait-empty-wake-0002",
   "key": "wait.empty-wake",
-  "revision": 1,
-  "expected_sha256": null,
+  "revision": 2,
+  "expected_sha256": "4bbce1ca3130818a32fbbfb356fc99e407cac0c86dfdc2fda63b1310b5704c45",
   "name": "An empty worker wake is recorded and shown",
   "aliases": [
     "empty wake",
