@@ -139,19 +139,46 @@ class BoardTests(unittest.TestCase):
         lane_row = next(item for item in tl.board([row])['items'] if item['actor'] == A)
         fault = lane_row['needs_investigation']
         self.assertEqual({'record': 'f1', 'task': 't1', 'about_task': 't9',
-                          'reason': 'the merge slot is stuck', 'since': RAISED, 'age_seconds': 7200}, fault)
+                          'reason': 'the merge slot is stuck', 'since': RAISED, 'age_seconds': 7200,
+                          'earlier': []}, fault)
         self.assertEqual([A], [item['actor'] for item in tl.board([row])['items']])
         self.assertEqual(1, tl.board([row])['flags']['needs_investigation'])
 
+    def waiting_row(self):
+        row = tl.task('t1', A)
+        tl.add_checkpoint(row, 'cp1', '2026-09-15T08:00:00Z')
+        tl.add_lane_state(row, 'ls1', 'cp1', '2026-09-15T08:00:00Z', state='waiting-on-coordinator',
+                          waiting_on='coordinator', expect_by='2026-09-15T09:00:00+00:00')
+        return row
+
     def test_it_changes_neither_the_move_nor_the_other_flags(self):
-        plain = tl.task('t1', A)
-        tl.add_checkpoint(plain, 'cp1', RAISED)
+        plain = self.waiting_row()
         flagged = json.loads(json.dumps(plain))
-        raise_fault(flagged, cid='f1', stamp=RAISED, checkpoint='cp1')
+        raise_fault(flagged, cid='f1', stamp='2026-09-15T10:00:00Z')
         before = tl.entry_of(tl.board([plain]), 't1')[1]
         after = tl.entry_of(tl.board([flagged]), 't1')[1]
-        for name in ('review_state', 'work_state', 'whose_move', 'next_actor', 'next', 'flags'):
+        self.assertEqual(['waiting_too_long', 'expect_by_passed'], [f for f in before['flags'] if f != 'your_move_idle'][:2])
+        for name in ('review_state', 'work_state', 'whose_move', 'next_actor', 'next', 'flags', 'state',
+                     'waiting_on', 'expect_by', 'declared', 'inferred', 'checkpoint', 'state_since'):
             self.assertEqual(before[name], after[name], name)
+        # The held task still reads as waiting on the coordinator: the checkpoint-to-coordinator
+        # trigger of the wait is the declared state's, not the fault's.
+        view = waiting.coordinator_view([], lanes.read(
+            [flagged], A, tl.registry(('lane-a', A)), [], now=NOW, journal=None))
+        self.assertEqual(['t1'], [item['task'] for item in view['triggers']['checkpoint-to-coordinator']])
+
+    def test_a_clear_gives_back_the_previous_declared_state_and_the_trigger(self):
+        row = self.waiting_row()
+        raise_fault(row, cid='f1', stamp='2026-09-15T10:00:00Z')
+        with tempfile.TemporaryDirectory() as directory:
+            FakeNative([row]).apply(Path(directory), clear_request())
+            result = lanes.read([row], A, tl.registry(('lane-a', A)), [], now=NOW, journal=Path(directory))
+            entry = tl.entry_of(result, 't1')[1]
+            self.assertEqual(('waiting-on-coordinator', 'coordinator'), (entry['state'], entry['waiting_on']))
+            self.assertIsNone(tl.entry_of(result, 't1')[0]['needs_investigation'])
+            view = waiting.coordinator_view([], result)
+            self.assertEqual(['t1'], [i['task'] for i in view['triggers']['checkpoint-to-coordinator']])
+            self.assertEqual([], view['triggers']['needs-investigation'])
 
     def test_a_later_state_record_never_clears_it_but_a_new_raise_replaces_it(self):
         row = tl.task('t1', A)
@@ -306,6 +333,88 @@ class ClearTests(unittest.TestCase):
                     endpoint.coordinator_refusal({'actor': COORD, 'args': ['fault-clear']}, Path(root), None)
 
 
+class JournalGateTests(unittest.TestCase):
+    """The clear's journal gate with other entries present, and each binding the entry carries."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.project = Path(self.directory.name)
+        self.row_a, self.row_b = tl.task('t1', A), tl.task('t2', B)
+        raise_fault(self.row_a, cid='fa', reason='lane a fault')
+        raise_fault(self.row_b, cid='fb', reason='lane b fault')
+        self.native = FakeNative([self.row_a, self.row_b])
+
+    def faults(self):
+        return fault_clear.open_faults(self.native.rows, fault_clear.host_journal(self.project)[0])
+
+    def clear_payload(self, task, target, lane):
+        return fault_clear.payload_check(
+            {'schema_version': 1, 'task': task, 'target': target, 'lane': lane, 'reason': 'ok', 'actor': COORD})
+
+    def test_an_unjournaled_clear_for_one_lane_clears_nothing_while_another_lane_has_an_entry(self):
+        self.native.apply(self.project, clear_request(task='t1', target='fa'))
+        self.assertEqual({B}, set(self.faults()))
+        forged = self.clear_payload('t2', 'fb', B)
+        self.row_b['comments'].append(tl.comment('forged-b', fault_clear.body(forged), COORD, '2026-09-15T11:00:00Z'))
+        self.assertEqual({B}, set(self.faults()))
+        self.assertEqual('fb', self.faults()[B]['record'])
+
+    def test_the_entry_must_match_the_comment_payload_and_the_task_the_comment_is_on(self):
+        payload = self.clear_payload('t1', 'fa', A)
+        # The same comment, journaled, but sitting on another task: not honoured.
+        self.row_b['comments'].append(tl.comment('moved', fault_clear.body(payload), COORD, '2026-09-15T11:00:00Z'))
+        fault_clear.publish(self.project, fault_clear.journal_entry(payload, 'moved', COORD, 0))
+        self.assertEqual({A, B}, set(self.faults()))
+        # On its own task it is honoured, so the refusal above was the task binding.
+        self.row_a['comments'].append(tl.comment('home', fault_clear.body(payload), COORD, '2026-09-15T11:00:00Z'))
+        fault_clear.publish(self.project, fault_clear.journal_entry(payload, 'home', COORD, 0))
+        self.assertEqual({B}, set(self.faults()))
+
+    def test_the_entry_file_name_is_bound_to_the_payload_hash(self):
+        payload = self.clear_payload('t1', 'fa', A)
+        entry = fault_clear.journal_entry(payload, 'home', COORD, 0)
+        self.assertIs(entry, fault_clear.validate_entry(entry, entry['sha256'] + '.json'))
+        with self.assertRaisesRegex(ValueError, 'hash or path mismatch'):
+            fault_clear.validate_entry(entry, '0' * 64 + '.json')
+        self.row_a['comments'].append(tl.comment('home', fault_clear.body(payload), COORD, '2026-09-15T11:00:00Z'))
+        directory = fault_clear.open_journal(self.project)
+        (directory / ('0' * 64 + '.json')).write_text(json.dumps(entry), encoding='utf-8')
+        self.assertEqual({}, fault_clear.host_journal(self.project)[0])
+        self.assertEqual({A, B}, set(self.faults()))
+
+    def test_the_lane_and_actor_of_the_payload_are_validated(self):
+        payload = self.clear_payload('t1', 'fa', A)
+        for field in ('lane', 'actor'):
+            for bad in ('', None, 7, 'two words'):
+                with self.assertRaises(ValueError, msg=(field, bad)):
+                    fault_clear.payload_check(dict(payload, **{field: bad}))
+            entry = fault_clear.journal_entry(payload, 'home', COORD, 0)
+            with self.assertRaises(ValueError):
+                fault_clear.validate_entry(dict(entry, payload=dict(payload, **{field: ''})))
+        with self.assertRaises(ValueError):
+            fault_clear.validate_entry(dict(fault_clear.journal_entry(payload, 'home', COORD, 0), actor=''))
+
+    def test_a_symlinked_journal_directory_is_refused_before_anything_is_written(self):
+        elsewhere = self.project / 'elsewhere'
+        elsewhere.mkdir()
+        (self.project / fault_clear.JOURNAL_DIR).symlink_to(elsewhere)
+        with self.assertRaises(ValueError):
+            self.native.apply(self.project, clear_request(task='t1', target='fa'))
+        self.assertEqual([], self.native.added)
+        self.assertEqual([], list(elsewhere.iterdir()))
+
+    def test_older_open_raises_stay_visible_until_the_newest_is_cleared(self):
+        raise_fault(self.row_a, cid='fa2', stamp='2026-09-15T10:30:00Z', reason='benign')
+        shown = self.faults()[A]
+        self.assertEqual(('fa2', 'benign'), (shown['record'], shown['reason']))
+        self.assertEqual(['lane a fault'], [item['reason'] for item in shown['earlier']])
+        self.native.apply(self.project, clear_request(task='t1', target='fa2'))
+        self.assertNotIn(A, self.faults())
+        raise_fault(self.row_a, cid='fa3', stamp='2026-09-15T11:30:00Z', reason='third')
+        self.assertEqual([], self.faults()[A]['earlier'])
+
+
 class WaitTests(unittest.TestCase):
     def lanes_payload(self, *rows):
         return lanes.read(list(rows), A, tl.registry(('lane-a', A), ('lane-b', B)), [], now=NOW, journal=None)
@@ -317,8 +426,14 @@ class WaitTests(unittest.TestCase):
         view = waiting.coordinator_view([], self.lanes_payload(row))
         rows = view['triggers']['needs-investigation']
         self.assertEqual([{'lane': 'lane-a', 'actor': A, 'task': 't9', 'state': 'needs-investigation',
-                           'reason': 'the merge slot is stuck', 'record': 'f1'}], rows)
+                           'raised_on': 't1', 'reason': 'the merge slot is stuck', 'record': 'f1',
+                           'earlier': []}], rows)
         self.assertIn({'trigger': 'needs-investigation', **rows[0]}, view['items'])
+        # The raise's own task is shown beside the task it is about.
+        self.assertEqual(('t9', 't1'), (rows[0]['task'], rows[0]['raised_on']))
+        raise_fault(row, cid='f2', stamp='2026-09-15T11:00:00Z', reason='benign')
+        again = waiting.coordinator_view([], self.lanes_payload(row))['triggers']['needs-investigation']
+        self.assertEqual(('benign', ['the merge slot is stuck']), (again[0]['reason'], again[0]['earlier']))
 
     def test_the_trigger_fires_for_a_fault_and_leaves_the_other_triggers_alone(self):
         quiet = tl.task('t1', B)
@@ -349,6 +464,147 @@ class WaitTests(unittest.TestCase):
         payload = self.lanes_payload(row)
         self.assertEqual(waiting.coordinator_view([], payload),
                          client._InlineWait.coordinator_view([], payload))
+
+
+class AdminCommandTests(unittest.TestCase):
+    """``admin.py fault-clear``: the operator check, taken again under the lock, then the same apply."""
+
+    def setUp(self):
+        import io
+        import contextlib
+        import types
+        self.io, self.contextlib = io, contextlib
+        try:
+            import admin
+        except ImportError:
+            self.skipTest('admin.py needs a POSIX interpreter')
+        self.admin = admin
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.project = self.root / 'projects' / 'pp'
+        (self.project / '.beads').mkdir(parents=True)
+        (self.project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        self.row = tl.task('t1', A)
+        raise_fault(self.row)
+        self.native = FakeNative([self.row])
+        fake = types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        patcher = mock.patch.dict(sys.modules, {'fcntl': fake})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_bd(self, root, project, argv):
+        assert argv[:2] == ['--actor', argv[1]], argv
+        return self.native(argv[2:])
+
+    def command(self, payload, actor=COORD, operators=None):
+        path = self.root / 'payload.json'
+        path.write_text(json.dumps(payload), encoding='utf-8')
+        argv = ['admin.py', '--root', str(self.root), 'fault-clear', '--project', 'pp',
+                '--actor', actor, '--file', str(path)]
+        out = self.io.StringIO()
+        listed = frozenset([COORD]) if operators is None else operators
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(self.admin, 'root_path', return_value=self.root), \
+                mock.patch.object(self.admin, 'project_dir', return_value=self.project), \
+                mock.patch.object(self.admin, 'operators', side_effect=listed if callable(listed) else None,
+                                  return_value=None if callable(listed) else listed), \
+                mock.patch.object(self.admin, 'run_bd', side_effect=self.run_bd), \
+                mock.patch.object(self.admin, 'deployment_config_lock', self.contextlib.nullcontext), \
+                mock.patch.object(fault_clear, '_rows', return_value=self.native.rows), \
+                self.contextlib.redirect_stdout(out):
+            self.admin.main()
+        return json.loads(out.getvalue())
+
+    def refusal(self, *args, **kwargs):
+        with self.assertRaises(ValueError) as refused:
+            self.command(*args, **kwargs)
+        return str(refused.exception)
+
+    def journal_names(self):
+        directory = self.project / fault_clear.JOURNAL_DIR
+        return sorted(path.name for path in directory.glob('*.json')) if directory.is_dir() else []
+
+    def test_an_operator_clears_the_fault_and_the_journal_names_who(self):
+        answer = self.command(clear_request())
+        self.assertEqual(('f1', A, False), (answer['target'], answer['lane'], answer['reconciled']))
+        entry = fault_clear.host_journal(self.project)[0][answer['comment_id']]
+        self.assertEqual(COORD, entry['actor'])
+        self.assertEqual({}, fault_clear.open_faults(self.native.rows, fault_clear.host_journal(self.project)[0]))
+
+    def test_a_non_operator_is_refused_before_the_lock_and_writes_nothing(self):
+        for actor in (A, 'someone-else'):
+            message = self.refusal(clear_request(), actor=actor)
+            self.assertIn('is not a server-side configured operator', message)
+        self.assertEqual([], self.native.added)
+        self.assertEqual([], self.journal_names())
+        self.assertFalse((self.project / '.coordination.lock').exists())
+
+    def test_the_operator_list_is_read_again_inside_the_lock(self):
+        calls = []
+
+        def changing(root, **kwargs):
+            calls.append(kwargs)
+            return frozenset([COORD]) if len(calls) == 1 else frozenset([A])
+
+        message = self.refusal(clear_request(), operators=changing)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertIn('is not a server-side configured operator', message)
+        self.assertEqual([], self.native.added)
+        self.assertEqual([], self.journal_names())
+
+
+class BackupTests(unittest.TestCase):
+    """The journal travels with a backup and a restore (it lives outside the tracker)."""
+
+    def setUp(self):
+        import types
+        try:
+            import admin
+        except ImportError:
+            self.skipTest('admin.py needs a POSIX interpreter')
+        self.admin = admin
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / 'projects' / 'source'
+        self.destination = self.root / 'projects' / 'destination'
+        self.source.mkdir(parents=True)
+        self.destination.mkdir()
+        (self.root / 'backups' / 'source').mkdir(parents=True)
+        fake = types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        patcher = mock.patch.dict(sys.modules, {'fcntl': fake})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name, value in (('backup_lifecycle_void_family', {}), ('restore_lifecycle_void_family', False)):
+            patched = mock.patch.object(admin, name, return_value=value)
+            patched.start()
+            self.addCleanup(patched.stop)
+
+    def test_backup_and_restore_carry_the_journal_and_a_restored_clear_still_clears(self):
+        row = tl.task('t1', A)
+        raise_fault(row)
+        native = FakeNative([row])
+        native.apply(self.source, clear_request())
+        name = next((self.source / fault_clear.JOURNAL_DIR).glob('*.json')).name
+        with mock.patch.object(self.admin, 'run_bd', return_value='synced'):
+            self.admin.backup_project(self.root, 'source')
+        bundle = json.loads((self.root / 'backups' / 'source.coordination.json').read_text(encoding='utf-8'))
+        self.assertIn(fault_clear.JOURNAL_DIR + '/' + name, bundle['files'])
+        self.admin.restore_coordination(self.root, 'source', 'destination')
+        self.assertTrue((self.destination / fault_clear.JOURNAL_DIR / name).is_file())
+        entries = fault_clear.host_journal(self.destination)[0]
+        self.assertEqual({}, fault_clear.open_faults([row], entries))
+        (self.destination / fault_clear.JOURNAL_DIR / name).unlink()
+        self.assertEqual({A}, set(fault_clear.open_faults([row], fault_clear.host_journal(self.destination)[0])))
+
+    def test_a_damaged_entry_is_refused_by_backup_validation(self):
+        payload = fault_clear.payload_check(dict(clear_request(), lane=A, actor=COORD))
+        entry = fault_clear.journal_entry(payload, 'c1', COORD, 0)
+        path = fault_clear.JOURNAL_DIR + '/' + entry['sha256'] + '.json'
+        self.admin.validate_coordination_files({path: entry})
+        with self.assertRaises(ValueError):
+            self.admin.validate_coordination_files({path: dict(entry, sha256='0' * 64)})
 
 
 if __name__ == '__main__':

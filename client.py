@@ -722,8 +722,11 @@ class _InlineWait:
         return {'lane': _InlineWait._scalar(lane.get('lane')),
                 'actor': _InlineWait._scalar(lane.get('actor')),
                 'task': _InlineWait._scalar(fault.get('about_task') or fault.get('task')),
+                'raised_on': _InlineWait._scalar(fault.get('task')),
                 'state': 'needs-investigation', 'reason': _InlineWait._scalar(fault.get('reason')),
-                'record': _InlineWait._scalar(fault.get('record'))}
+                'record': _InlineWait._scalar(fault.get('record')),
+                'earlier': [_InlineWait._scalar(item.get('reason')) for item in fault.get('earlier') or []
+                            if isinstance(item, dict)]}
 
     @staticmethod
     def coordinator_view(queue_items, lanes_payload):

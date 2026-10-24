@@ -31,6 +31,7 @@ from reserved_comments import LANE_FAULT_CLEAR_PREFIX as PREFIX
 
 KIND = 'lane-fault-clear-v1'
 JOURNAL_KIND = 'lane-fault-clear'
+EARLIER_LIMIT = 5
 JOURNAL_DIR = '.lane-fault-clears'
 #: Bound on the clearing reason and on one journal file (a planted giant file is never read whole).
 REASON_LIMIT = 300
@@ -273,23 +274,33 @@ def open_faults(rows, entries=None):
     honours no clear. The fault carries the raise's own task, its optional ``about_task``,
     the display-safe reason and the raise time; nothing here is derived from another record.
     """
-    newest = {}
+    every = {}
     for issue in rows:
         if not isinstance(issue, dict) or not issue.get('id') or issue.get('malformed'):
             continue
         for author, stamp, index, comment, payload in raises(issue):
-            key = (stamp, str(issue['id']), index)
-            if author not in newest or key > newest[author][0]:
-                newest[author] = (key, issue, comment, payload)
+            every.setdefault(author, []).append(((stamp, str(issue['id']), index), issue, comment, payload))
     cleared = honoured_clears(rows, entries or {}) if entries else {}
     faults = {}
-    for author, (_key, issue, comment, payload) in newest.items():
+    for author, found in every.items():
+        found.sort(key=lambda item: item[0])
+        _key, issue, comment, payload = found[-1]
         if str(comment.get('id')) in cleared:
             continue
+        # A clear names the newest raise, so it also ends every older one: only raises after the
+        # newest cleared one are still open. The newest is shown; the older open ones stay
+        # visible, so a serious reason cannot be replaced by a benign one before it is read.
+        last_cleared = max((i for i, item in enumerate(found) if str(item[2].get('id')) in cleared), default=-1)
+        opened = found[last_cleared + 1:-1]
         faults[author] = {'record': str(comment.get('id')), 'task': str(issue['id']),
                           'about_task': payload.get('about_task'),
                           'reason': lane_state.display_reason(payload.get('reason')),
-                          'since': comment.get('created_at')}
+                          'since': comment.get('created_at'),
+                          'earlier': [{'record': str(item[2].get('id')), 'task': str(item[1]['id']),
+                                       'about_task': item[3].get('about_task'),
+                                       'reason': lane_state.display_reason(item[3].get('reason')),
+                                       'since': item[2].get('created_at')}
+                                      for item in opened[-EARLIER_LIMIT:]]}
     return faults
 
 

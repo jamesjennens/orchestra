@@ -48,6 +48,9 @@ const FREE_LANE = {
   expect_by: null, inferred: false, state_since: null, state_age_seconds: null,
   last_write: '2026-10-17T20:00:00Z', last_write_age_seconds: 300,
   waiting_too_long: false, expect_by_passed: false, your_move_idle: false, flag_tasks: {},
+  needs_investigation: { record: 'c-9', task: 'alpha-4', about_task: 'alpha-5', reason: 'the <b>merge</b> slot is stuck',
+    since: '2026-10-17T19:00:00Z', age_seconds: 3900,
+    earlier: [{ record: 'c-8', task: 'alpha-4', about_task: null, reason: 'credentials leaked', since: '2026-10-17T18:00:00Z' }] },
 };
 
 function board(idleMinutes, extra) {
@@ -124,6 +127,8 @@ const out = {
     .map((e) => e.textContent),
   threshold: panel.querySelector('#lanes-idle-minutes')
     ? panel.querySelector('#lanes-idle-minutes').value : null,
+  fault: panel.all((e) => e.attributes && e.attributes['data-fault']).map((e) => e.textContent),
+  faultEarlier: panel.all((e) => e.attributes && e.attributes['data-fault-earlier']).map((e) => e.textContent),
   nextEnabled: !button(panel, 'Next').disabled,
 };
 // 2. The overview composes it.

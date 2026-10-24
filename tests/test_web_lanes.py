@@ -412,6 +412,12 @@ class LanesPageTests(unittest.TestCase):
         self.assertTrue(seen['countsLine'], seen['text'])
         self.assertIn('15 idle minutes', seen['countsLine'][0])
         self.assertIn('1 waiting too long', seen['countsLine'][0])
+        # A raised fault shows its reason as text (never markup), where and how long, and the
+        # older open reasons, beside the lane that raised it (kittrial-5bb.398).
+        self.assertEqual(1, len(seen['fault']), seen['fault'])
+        for wanted in ('Needs investigation', 'the <b>merge</b> slot is stuck', '1 h ago', 'alpha-4', 'alpha-5'):
+            self.assertIn(wanted, seen['fault'][0], wanted)
+        self.assertEqual(['Earlier open: credentials leaked'], seen['faultEarlier'])
         # The panel is composed into the project overview.
         self.assertEqual(1, seen['overviewHasPanel'])
         # Next reads the read's own next page, with the SAME threshold.

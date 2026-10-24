@@ -242,7 +242,8 @@ def newest(comments, task):
     Usable means: the body parses, every field is valid for this task, and the checkpoint
     it names is a comment on this task -- so a record can never be shown beside a
     checkpoint it does not belong to. Malformed or unusable records are skipped, never
-    raised; ``None`` means the task carries no usable record (an older checkpoint).
+    raised, and so are needs-investigation records: a fault is its own channel (fault_clear)
+    and is never the task's declared wait state; ``None`` means the task carries no usable record (an older checkpoint).
     """
     comments = [comment for comment in (comments or []) if isinstance(comment, dict)]
     ids = {str(comment.get('id')) for comment in comments if comment.get('id') is not None}
@@ -255,6 +256,8 @@ def newest(comments, task):
         if not isinstance(named, str) or named not in ids:
             continue
         if problems(payload, task, named):
+            continue
+        if payload.get('state') == FAULT_STATE:
             continue
         usable.append((_stamp(comment), index, comment, payload))
     if not usable:

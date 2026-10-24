@@ -610,8 +610,11 @@ def _fault_row(lane, fault):
     """One raised fault, reduced to stable fields: no age, and the reason as already escaped."""
     return {'lane': _scalar(lane.get('lane')), 'actor': _scalar(lane.get('actor')),
             'task': _scalar(fault.get('about_task') or fault.get('task')),
+            'raised_on': _scalar(fault.get('task')),
             'state': 'needs-investigation', 'reason': _scalar(fault.get('reason')),
-            'record': _scalar(fault.get('record'))}
+            'record': _scalar(fault.get('record')),
+            'earlier': [_scalar(item.get('reason')) for item in fault.get('earlier') or []
+                        if isinstance(item, dict)]}
 
 
 def coordinator_view(queue_items, lanes_payload):

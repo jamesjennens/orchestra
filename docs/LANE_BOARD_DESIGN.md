@@ -326,15 +326,21 @@ the checkpoint precisely so that the push work can extend it without reopening t
 
 ## 9a. Needs investigation (kittrial-5bb.398)
 
-A lane may raise a fault flag that is independent of its working/waiting state: a `lane-state-v1`
+A lane may raise a fault flag that is its own channel (`lane_state.newest()` and so the held task's
+declared state skip needs-investigation records, so a raise never replaces `waiting_on`, `expect_by` or the
+`checkpoint-to-coordinator` trigger, and a clear gives nothing back because nothing was taken). It is independent of its working/waiting state: a `lane-state-v1`
 record with `state: needs-investigation`, a required `reason` (at most 300 characters, one printable
 line) and an optional `about_task`. The reason is untrusted everywhere: escaped, clipped to 300 and
 folded onto one line in text views. The board's lane row carries `needs_investigation` (reason, task,
 record, since, age) on every lane, faulted lanes sort first, and the flags summary counts them. The
 flag is the lane's newest raise across all its tasks, closed ones included; a later state record never
 clears it. Only `coordinator fault-clear` (or the host `admin.py fault-clear`) clears it, writing a
-`lane-fault-clear-v1` comment plus a journal entry that records who and when. The coordinator wait gains
-a `needs-investigation` trigger (last in order). An older kit drops the unknown state and so does not
+`lane-fault-clear-v1` comment plus a journal entry that records who and when. A newer raise does not hide an older open one: the
+row's `needs_investigation.earlier` lists up to five older open raises (a clear of the newest ends them all), and
+the wait row carries `task` (the `about_task`, else the raised-on task), `raised_on` and the older reasons. The web
+Lanes panel renders the reason as text. The coordinator wait gains a `needs-investigation` trigger (last in
+order); because the trigger set gained a key, EVERY coordinator wait fingerprint changes once on deploy (not only
+the empty one), so a waiting coordinator wakes once. An older kit drops the unknown state and so does not
 show the flag; the clear reads there as an ordinary comment. Use it for process faults, not task
 blockers, which stay open items.
 
