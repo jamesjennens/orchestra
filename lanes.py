@@ -174,7 +174,7 @@ def holder_idle_seconds(row, actor, now):
     return seconds_since(row.get('updated_at') or row.get('created_at'), now)
 
 
-def held_task(row, task, actor, now, threshold, review=None, error=None):
+def held_task(row, task, actor, now, threshold, review=None, error=None, comment_authority=None):
     """One held task's row: the shared review facts plus the declared wait state."""
     from lane_state import parse_moment
     if error is not None:
@@ -192,6 +192,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None):
         redelivered = bool(contribution_id) and bool(pending_requests) and all(
             str(pending.get('contribution') or '') != str(contribution_id) for pending in pending_requests)
         from work import claimable, move_decision
+        from briefing import assignee_comment_pending
         row_claimable = claimable(row.get('issue_type'), row.get('status'), row.get('assignee'),
                                   contribution.get('comment_id'), state, labels=row.get('labels'))
         # THE one whose-move decision (kittrial-5bb.6). The decision is taken with the
@@ -201,6 +202,7 @@ def held_task(row, task, actor, now, threshold, review=None, error=None):
             state, task, True, pending_items=pending_items, redelivered=redelivered,
             assignee=row.get('assignee'), closed=row.get('status') == 'closed',
             claimable=row_claimable,
+            comment_pending=assignee_comment_pending(row, response=review.get('last_response'), authority=comment_authority),
             # The shared projection carries the newest hand-back block, and when it
             # applies it made the move the assignee's (kittrial-5bb.343). The lane
             # board passes that SAME block through the ONE decision, so a lane row
@@ -275,7 +277,7 @@ def _review(row, task, evidence, revert_map, revert_problems, operators, journal
         return None, str(error)[:300]
 
 
-def read(rows, actor, registry, args, now=None, operators=None, journal=None, scope='all'):
+def read(rows, actor, registry, args, now=None, operators=None, journal=None, scope='all', comment_authority=None):
     """The bounded lanes page. ``rows`` is the export, ``registry`` the session registry.
 
     ``scope`` is ``'all'`` on the host route and the bound-key coordinator route, and
@@ -323,12 +325,16 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
         group = groups.setdefault(holder, [])
         group.append((task, row))
     lanes = []
+    from briefing import comment_author_allowed
+    if comment_authority is None:
+        comment_authority = lambda author: comment_author_allowed(author,operators,(registry or {}).get('owners'))
     for holder, held in groups.items():
         held.sort(key=lambda item: item[0])
         entries = []
         for task, row in held:
             review, error = _review(row, task, evidence, revert_map, revert_problems, operators, journal)
-            entries.append(held_task(row, task, holder, now, threshold, review=review, error=error))
+            entries.append(held_task(row, task, holder, now, threshold, review=review, error=error,
+                                     comment_authority=comment_authority))
         flags = {}
         for name in FLAG_NAMES:
             named = [entry['task'] for entry in entries if name in entry['flags']]

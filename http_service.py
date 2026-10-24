@@ -1739,7 +1739,8 @@ class InProcessBackend:
         # is unknown and the stable marker is honestly null (kittrial-5bb.351); the
         # counts are the same summary its brief route already answers with.
         activity=self._agent_activity_summary(task,last) if last and not unreadable else None
-        return {'pending_change_requests':[r['id'] for r in review['requests'] if r['status']=='open'][:20],
+        return {'assignee_comment_pending':self._assignee_comment_pending(task) if not unreadable else False,
+                'pending_change_requests':[r['id'] for r in review['requests'] if r['status']=='open'][:20],
                 'open_items':None if unreadable else (len(last.get('open_items') or []) if last else 0),
                 'blocking_items':None if unreadable else sum(item.get('kind') in ('blocker','dependency')
                                                             for item in (last.get('open_items') or []) if isinstance(item,dict)) if last else 0,
@@ -1759,6 +1760,29 @@ class InProcessBackend:
                 'newer_activity_own':(activity or {}).get('own_count'),
                 'newer_activity_coverage':(activity or {}).get('coverage'),
                 'unresolved_directions':None}
+
+    def _assignee_comment_pending(self, task):
+        from briefing import pending_other_comments, same_activity_actor, comment_author_allowed
+        from review_workflow import EXTRA
+        owner = task.get('assignee')
+        if task.get('status') == 'closed' or not owner:
+            return False
+        entries = []
+        acknowledged = None
+        for index, event in enumerate(self.state.get('events') or []):
+            if event.get('task') != task['id']:
+                continue
+            action = event.get('action')
+            if action not in EXTRA and action not in ('comment', 'contribution', 'checkpoint-added'):
+                continue
+            identity = str(event.get('entry_id') or '%s-e%d' % (task['id'], index))
+            entries.append(dict(entry_id=identity, kind='comment' if action == 'comment' else 'event',
+                                body=event.get('detail'), author=event.get('actor')))
+            if action in ('checkpoint-added', 'respond') and same_activity_actor(event.get('actor'), owner):
+                acknowledged = identity
+        return pending_other_comments(entries, owner, acknowledged=acknowledged,
+            authority=lambda author: comment_author_allowed(author, operators=(), authority=self.service.state,
+                                                           project=task.get('project_id')))
 
     def _wait_activity_marker(self, task):
         """The stable wait marker of one in-process task (kittrial-5bb.369).
@@ -1855,7 +1879,8 @@ class InProcessBackend:
                 row['whose_move'], _text, row['next_actor'] = move_decision(
                     row['review_state'], row['task'], claim_limit.actor_holds(row['owner'], actor),
                     pending_items=row['pending_review_items'], redelivered=bool(row['redelivered']),
-                    assignee=row['owner'], closed=row['status'] == 'closed', claimable=item['claimable'])
+                    assignee=row['owner'], closed=row['status'] == 'closed', claimable=item['claimable'],
+                    comment_pending=attention_field(item, 'assignee_comment_pending') is True)
                 rows.append(row)
             return waiting.coordinator_view(
                 rows,
@@ -2095,7 +2120,7 @@ def attention_field(row, name):
 
 
 def holder_move(status, task_id, assignee, review_state, open_requests, contribution_id,
-                redelivered=None, claimable_value=None):
+                redelivered=None, claimable_value=None, comment_pending=False):
     """The HOLDER's move reading for a projection row, from the ONE shared decision.
 
     A page shows a task's move for the actor who holds it, and the work row that names
@@ -2109,7 +2134,7 @@ def holder_move(status, task_id, assignee, review_state, open_requests, contribu
     pending = open_requests if type(open_requests) is int and open_requests >= 0 else 0
     return move_decision(review_state, task_id, True, pending_items=pending,
                          redelivered=bool(redelivered), assignee=assignee,
-                         closed=status == 'closed', claimable=claimable_value)
+                         closed=status == 'closed', claimable=claimable_value, comment_pending=comment_pending)
 
 
 def own_queue_tasks(queue, actor=None):
@@ -2123,7 +2148,7 @@ def own_queue_tasks(queue, actor=None):
         move, move_text, move_role = holder_move(
             row.get('status'), row.get('id'), row.get('assignee'), row.get('review_state'),
             row.get('open_requests'), (row.get('contribution') or {}).get('id'),
-            fields.get('redelivered'), row.get('claimable'))
+            fields.get('redelivered'), row.get('claimable'), fields.get('assignee_comment_pending') is True)
         tasks.append({'id':row.get('id'),'title':row.get('title'),'status':row.get('status'),
                       'assignee':row.get('assignee'),'review_state':row.get('review_state'),
                       'contribution_id':(row.get('contribution') or {}).get('id'),
@@ -2131,6 +2156,7 @@ def own_queue_tasks(queue, actor=None):
                       # canonical `work --owner ACTOR` row (kittrial-5bb.288), so the
                       # agents page and the bridge show what the queue row shows.
                       'whose_move':move,'next':move_text,'next_actor':move_role,
+                      'assignee_comment_pending':fields.get('assignee_comment_pending') is True,
                       'pending_change_requests':list(fields.get('pending_change_requests') or [])[:20],
                       # The canonical item count, so the move sentence says the same N as the
                       # `work` row it came from (kittrial-5bb.249).
@@ -4196,7 +4222,8 @@ class EndpointBackend:
         raw_pending = row.get('pending_change_requests')
         if isinstance(raw_pending, (str, bytes)) or not hasattr(raw_pending, '__iter__'):
             raw_pending = []
-        return {'pending_change_requests': [value for value in raw_pending
+        return {'assignee_comment_pending':row.get('assignee_comment_pending') is True,
+                'pending_change_requests': [value for value in raw_pending
                                             if isinstance(value, str)][:20],
                 'open_items': open_items if type(open_items) is int and open_items>=0 else None,
                 'blocking_items':blocking_items if type(blocking_items) is int and blocking_items>=0 else None,
@@ -4264,6 +4291,7 @@ class EndpointBackend:
                              'pending_review_items': item.get('open_requests'),
                              'open_items': attention.get('open_items',0),
                              'blocking_items':attention_blocking_items(attention),
+                             'assignee_comment_pending':attention.get('assignee_comment_pending') is True,
                              # The superseding-redelivery fact (kittrial-5bb.253 item 1).
                              'redelivered': attention.get('redelivered'),
                              'checkpoint_at': attention.get('checkpoint_at'),
@@ -8216,7 +8244,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                     state, task.get('id'), claim_limit.actor_holds(task.get('assignee'), actor),
                     pending_items=pending, redelivered=bool(task.get('redelivered')),
                     assignee=task.get('assignee'), closed=task.get('status') == 'closed',
-                    claimable=task.get('claimable') if isinstance(task.get('claimable'), bool) else None)
+                    claimable=task.get('claimable') if isinstance(task.get('claimable'), bool) else None,
+                    comment_pending=attention_field(task, 'assignee_comment_pending') is True)
                 if move == 'you':
                     rows.append(dict(task, task=task.get('id'), project=project_id,
                                      whose_move=move, next_actor=next_actor_value,
@@ -9120,7 +9149,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         counts = {'claimable': 0, 'claimed': 0, 'changes_requested': 0,
                   'awaiting_review': 0, 'blocked': 0, 'in_progress': 0, 'awaiting_integration': 0,
                   'review_errors': 0, 'checkpoint_errors': 0, 'read_errors': 0,
-                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0, 'guidance': 0}
+                  'review_recommended': 0, 'to_review': 0, 'newer_activity': 0, 'guidance': 0,
+                  'comment_attention': 0}
         #: The rows that count against this agent's claim limit and hard cap, by the one
         #: rule the gate uses, so /v1/agents/me/next and the gate cannot disagree about
         #: held and available (kittrial-5bb.276 revision; hard cap in kittrial-5bb.300).
@@ -9177,46 +9207,48 @@ class ApiHandler(BaseHTTPRequestHandler):
                 is_open = task.get('status') != 'closed'
                 open_items = task.get('open_items',0)
                 blocking_items = attention_blocking_items(task)
+                comment_pending = is_open and task.get('assignee_comment_pending') is True and review != 'error'
                 delivered=bool(task.get('contribution_id')) or review not in (None,'none')
                 unreadable = is_open and (open_items is None or blocking_items is None)
                 blocked = is_open and not delivered and type(blocking_items) is int and blocking_items > 0
                 in_progress = (is_open and not blocked and not unreadable and not task.get('contribution_id')
                                and review in (None, 'none'))
                 integrating = review in ('awaiting-integration', 'approved')
+                counts['comment_attention'] += comment_pending and delivered
                 counts['changes_requested'] += review == 'changes-requested'
                 counts['awaiting_review'] += review == 'awaiting-review'
                 counts['awaiting_integration'] += integrating
                 counts['blocked'] += blocked
                 counts['in_progress'] += in_progress
-                counts['newer_activity'] += (blocked or in_progress) and task.get('newer_activity') is True
+                counts['newer_activity'] += (blocked or in_progress or comment_pending) and task.get('newer_activity') is True
                 counts['review_errors'] += review=='error'
                 counts['checkpoint_errors'] += unreadable and review!='error' and not delivered
                 details = {'requests': list(task.get('pending_change_requests') or [])[:20], 'open_items': open_items,
                            'blocking_items':blocking_items,
                            'blocked_since': task.get('checkpoint_at') if blocked else None,
-                           'newer_activity': task.get('newer_activity') if blocked or in_progress else None,
+                           'newer_activity': task.get('newer_activity') if blocked or in_progress or comment_pending else None,
                            # A stable marker of the newest other-party activity after the
                            # checkpoint, plus the counts it was read with (kittrial-5bb.351).
                            # Held actions only, exactly like the boolean it refines; a
                            # legacy checkpoint yields null and a reader falls back to it.
                            'newer_activity_marker': task.get('newer_activity_marker')
-                           if blocked or in_progress else None,
+                           if blocked or in_progress or comment_pending else None,
                            # The current fields digest alone (kittrial-5bb.367 F2b).
                            'newer_activity_fields': task.get('newer_activity_fields')
-                           if blocked or in_progress else None,
+                           if blocked or in_progress or comment_pending else None,
                            # The checkpoint-independent wait marker (kittrial-5bb.369),
                            # carried beside the marker on held actions so /next, /wait and
                            # the task read answer the same fields.
                            'wait_newer_activity_marker': task.get('wait_newer_activity_marker')
-                           if blocked or in_progress else None,
+                           if blocked or in_progress or comment_pending else None,
                            'newer_activity_by_others': task.get('newer_activity_by_others')
-                           if blocked or in_progress else None,
+                           if blocked or in_progress or comment_pending else None,
                            'newer_activity_own': task.get('newer_activity_own')
-                           if blocked or in_progress else None,
+                           if blocked or in_progress or comment_pending else None,
                            'newer_activity_coverage': task.get('newer_activity_coverage')
-                           if blocked or in_progress else None,
+                           if blocked or in_progress or comment_pending else None,
                            'unresolved_directions': task.get('unresolved_directions')
-                           if blocked or in_progress else None}
+                           if blocked or in_progress or comment_pending else None}
                 # Whose move it is, in the same words as the canonical `work --mine` row
                 # (kittrial-5bb.249): one helper, so the two answers cannot disagree about the
                 # move, the item count or the redelivery fact. The one deliberate difference is
@@ -9232,9 +9264,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                                               actor_holds(task.get('assignee'), actor),
                                               pending_items=item_count,
                                               redelivered=bool(task.get('redelivered')),
-                                              way_back='`%s`' % (task_base + '/brief'))
+                                              way_back='`%s`' % (task_base + '/brief'),
+                                              comment_pending=comment_pending, assignee=task.get('assignee'))
                 details['whose_move'], details['next'] = move, move_text
-                if review != 'changes-requested' and not in_progress:
+                if review != 'changes-requested' and not in_progress and not comment_pending:
                     # The task asked for the two fields only where the kind is
                     # changes-requested (review item 2b): every other kind has a mover who is
                     # not this agent (an operator reconciles a review error or an unreadable
@@ -9247,7 +9280,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                     # the canonical `work --owner ACTOR` row.
                     details.pop('whose_move', None)
                     details.pop('next', None)
-                if review == 'changes-requested':
+                if comment_pending and delivered and review != 'changes-requested':
+                    own_actions.append(self._agent_action(
+                        1, 'new-comments', project_id, task,
+                        'New task comments need your attention; read the task history and record the next step.',
+                        **details))
+                elif review == 'changes-requested':
                     own_actions.append(self._agent_action(
                         1, 'changes-requested', project_id, task,
                         'A reviewer requested changes on this contribution.', **details))
@@ -9327,6 +9365,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'changes-requested'
         elif counts['review_errors'] or counts['checkpoint_errors']:
             state = 'error'
+        elif counts['comment_attention']:
+            state = 'working'
         elif counts['blocked']:
             state = 'blocked'
         elif counts['in_progress']:
@@ -9343,8 +9383,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             state = 'idle'
         summary = (self._agent_summary(state, counts, snapshot_truncated, own_tasks_truncated)
                    + self._agent_review_summary(counts, snapshot_truncated)
-                   + ((' %s%d owned undelivered task(s) have newer activity; read their linked briefs and history.'
-                       % ('at least ' if own_tasks_truncated else '', counts['newer_activity']))
+                   + ((' %s%d %s task(s) have newer activity; read their linked briefs and history.'
+                       % ('at least ' if own_tasks_truncated else '', counts['newer_activity'],
+                          'assigned' if counts['comment_attention'] else 'owned undelivered'))
                       if counts['newer_activity'] else ''))
         if guidance_actions:
             # A changed guidance version leads, because it changes what the agent should do
@@ -9386,6 +9427,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         if state == 'blocked':
             return ('%s task(s) have unresolved blockers or dependencies.'
                     % own_count('blocked'))
+        if state == 'working' and counts.get('comment_attention'):
+            return ('%s assigned task(s) have new comments; read their history and record the next step.'
+                    % own_count('comment_attention'))
         if state == 'working':
             return ('%s claimed task(s) in flight, %s not delivered yet; %s claimable.'
                     % (own_count('claimed'), own_count('in_progress'), claimable))

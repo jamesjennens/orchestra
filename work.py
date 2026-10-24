@@ -342,7 +342,7 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
 
 def move_decision(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
                   assignee=None, closed=False, claimable=None, way_back=None, followon=None,
-                  checkpoint_available=True):
+                  checkpoint_available=True, comment_pending=False):
     """THE one whose-move decision (kittrial-5bb.6 review item 2): `(move, next, next_actor)`.
 
     One function gives all three answers, so no reader can be told one mover by
@@ -356,11 +356,11 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
       told. It is never null; a malformed row reads ``operator``.
 
     ``assignee``, ``closed``, ``pending_items`` and ``claimable`` are the row facts
-    that role needs; they are the same facts the shared projection passes, so a
-    ``work`` row and the ``review`` read of the same task cannot disagree.
+    that role needs. ``comment_pending`` adds the assignee attention decision without
+    changing the evidence-only review projection; checkpointing restores its role.
 
     ``followon`` is an APPLYING hand-back block (kittrial-5bb.343); it is the ONE
-    branch that makes an integrated task the assignee's move, and it forces
+    branch that holds an integrated task's assignee move until resolved, and it forces
     ``next_actor`` to ``'assignee'`` from the same decision.
 
     ``way_back`` is the reference the sentence tells the caller to follow, passed through
@@ -371,6 +371,14 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
         return ('unknown', 'This task is closed; its review and lifecycle records remain in history.',
                 next_actor(state, assignee, closed, pending_items=pending_items, claimable=claimable))
     applied=isinstance(followon,dict) and followon.get('applies')
+    if (comment_pending and not applied and not closed and assignee
+            and not (named_reviewer and not owned)
+            and state not in ('none', 'changes-requested', 'error')):
+        way = way_back or ('history ' + task + ' --recent 10')
+        recipient = 'your' if owned else "the assignee's"
+        text = ('New task comments need ' + recipient + ' attention; read ' + way
+                + ' and record the next step.')
+        return ('you' if owned else 'unknown', text, 'assignee')
     move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered,
                              way_back=way_back, followon=followon,
                              checkpoint_available=checkpoint_available)
@@ -381,15 +389,16 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
 
 
 def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                way_back=None, followon=None, checkpoint_available=True):
-    """`(whose_move, next)`: one plain sentence from the validated review state alone.
+                way_back=None, followon=None, checkpoint_available=True, comment_pending=False, assignee=None):
+    """`(whose_move, next)`: one plain sentence from the shared move decision.
 
     The public two-answer shape (kittrial-5bb.249), unchanged. The decision it comes
     from is :func:`move_decision`, which yields ``next_actor`` as well.
     """
     move, text, _ = move_decision(state, task, owned, named_reviewer, pending_items, redelivered,
                                   way_back=way_back, followon=followon,
-                                  checkpoint_available=checkpoint_available)
+                                  checkpoint_available=checkpoint_available, comment_pending=comment_pending,
+                                  assignee=assignee)
     return move, text
 
 
@@ -605,6 +614,7 @@ def help_payload(action='work'):
                             'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
                             'blocking_items', 'checkpoint_at', 'newer_activity', 'checkpoint_wait',
+                            'assignee_comment_pending',
                             'pending_handoff_requests',
                             'pending_handoff_total', 'pending_handoff_next_offset', 'lifecycle',
                             'lifecycle_scope', 'lifecycle_matches_contribution', 'error',
@@ -825,7 +835,7 @@ def workflow(issue,scopes=None,operators=None,reverts=None,journal=None,invalid_
 
 def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes=None, journal=None,
           reference_attention=False, verifiers=None,independent_approval=False,owners=None,provenance_writes=True,
-          identity_names=None):
+          identity_names=None,comment_authority=None):
     """One page of the work queue.
 
     ``reverts`` and ``scopes`` are PER TASK: each is a mapping of task id to that
@@ -908,6 +918,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     evidence={r['id']:r['scopes'] for r in integration_evidence(rows,events=page_events)}
     items=[]
     checkpoint_states={}
+    attention_snapshots={}
     from review_state import is_integration_warning, reverts_by_task
     if reverts is None:
         revert_map,revert_problems=reverts_by_task(rows,operators,journal)
@@ -1153,18 +1164,30 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # this row already shows; no further read. `owned` is the SUBJECT's (kittrial-
         # 5bb.288): an open task assigned to the subject with no contribution and no
         # checkpoint by them reads `you` and counts in `your_move`.
+        from briefing import assignee_comment_pending, checkpoint_snapshot, comment_author_allowed
+        checkpoint_data = checkpoint_states.get(row['id'])
+        full = None
+        if state != 'error' and row.get('status') != 'closed' and row.get('assignee'):
+            try:
+                full = checkpoint_snapshot(rows, row, checkpoint_data)
+                attention_snapshots[row['id']] = full
+            except (ValueError, TypeError, KeyError, StopIteration):
+                pass
+        comment_pending = assignee_comment_pending(row, checkpoint_data,
+                                                   review.get('last_response'), full=full,
+                                                   authority=comment_authority or (lambda author: comment_author_allowed(author,operators,owners))) if state != 'error' else False
         move,move_text,role=move_decision(state,row['id'],bool(subject) and actor_holds(row.get('assignee'), subject),
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
                                           closed=row.get('status')=='closed',claimable=row_claimable,
                                           followon=task_followon.get('block') if task_followon else None,
-                                          checkpoint_available=provenance_writes)
+                                          checkpoint_available=provenance_writes, comment_pending=comment_pending)
         # A standing hold (or a failed attestation) is shown BESIDE the state the row
         # already reads (kittrial-5bb.10 item 7): a revision still awaiting review stays in
         # the reviewers' queue, and an author with open requested changes is told the
         # changes are owed AND that the contribution is held, rather than "nothing is for
         # you to do". The `held` state's own sentence already says it.
-        if state != 'held' and (review.get('holds') or review.get('verification') == 'failed'):
+        if (state != 'held' or comment_pending) and (review.get('holds') or review.get('verification') == 'failed'):
             from review_workflow import integration_hold_sentence
             hold_sentence=integration_hold_sentence(review)
             if hold_sentence and hold_sentence not in move_text:
@@ -1181,6 +1204,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'pending_change_requests':pending_change_requests[:PENDING_REQUEST_IDS_MAX],
                       'task':row['id'],'title':str(row.get('title',''))[:200],'owner':row_owner,'status':row.get('status'),'review_state':state,
                       **({'owner_name':owner_name} if owner_name and owner_name!=row_owner else {}),
+                      'assignee_comment_pending':comment_pending,
                       'whose_move':move,'next':move_text,
                       # Additive (kittrial-5bb.343): the newest recorded hand-back and
                       # whether it applies, so a reader sees why an unjournalled or
@@ -1232,7 +1256,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings,
                       'approval_requires_other_party':bool(independent_approval),
                       'waiting_for_approval':approval_wait(state,row['id'],actor,row.get('assignee'),
-                          contribution.get('author'),independent_approval,owners,review_request,move_text)})
+                          contribution.get('author'),independent_approval,owners,review_request,
+                          review_move(state,row['id'],bool(subject) and actor_holds(row.get('assignee'),subject),
+                              named_reviewer=review_request,pending_items=pending_items,
+                              redelivered=redelivered)[1] if comment_pending else move_text)})
         # Additive (kittrial-5bb.210 F0): the void snapshot's per-dimension reason is carried
         # on the row so a reader can say WHY a lifecycle dimension reads the way it does. Kept
         # BESIDE this lane's held state, not instead of it: a voided dimension and a hold are
@@ -1268,7 +1295,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # that blocker or dependency ENTRY itself (its raw text, escaped once) and says no
         # person was inferred. The move stays the subject's: `whose_move` is not rewritten
         # and the row stays in `your_move`.
-        if item['checkpoint_wait'].get('active'):
+        if item['checkpoint_wait'].get('active') and not item.get('assignee_comment_pending'):
             wait_text=waiting_move(checkpoint_wait_move_text(checkpoint_states.get(item['task'])))
             if wait_text:
                 item['next']=wait_text
@@ -1314,7 +1341,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     for item in result['items']:
         if item['task'] in task_rows:
             item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task']),
-                                                provenance_writes=provenance_writes))
+                                                provenance_writes=provenance_writes,
+                                                full=attention_snapshots.get(item['task'])))
     # The count of the QUEUE's items where the next move is the caller's, from the same
     # reconciled rows the sort used, so every page reports the same number
     # (kittrial-5bb.249 review, item 2a).
@@ -1366,7 +1394,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
 
 def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None,review_writes=None,
             independent_approval=False,coordinator_writes=False,owners=None,verified_web_authority=False,
-            lanes_scope='all',provenance_writes=True,identity_names=None):
+            lanes_scope='all',provenance_writes=True,identity_names=None,comment_authority=None):
     """``independent_approval``, ``coordinator_writes`` and ``owners`` are the slices
     6 and 7 settings and the project's actor -> principal map (kittrial-5bb.197),
     supplied by the endpoint; all default OFF/absent, so nothing changes for an
@@ -1409,18 +1437,18 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                 lanes_payload=lanes_read(rows,actor,read_registry(path),
                                          ['--idle-minutes',str(parsed.idle_minutes),
                                           '--limit',str(LANES_LIMIT_MAX)],
-                                         operators=operators,journal=path,scope=lanes_scope)
+                                         operators=operators,journal=path,scope=lanes_scope,comment_authority=comment_authority)
                 queue_payload=queue(rows,actor,['--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
                                     operators=operators,journal=path,reference_attention=False,
                                     verifiers=verifiers,independent_approval=independent_approval,
                                     owners=owners,provenance_writes=provenance_writes,
-                                    identity_names=identity_names)
+                                    identity_names=identity_names,comment_authority=comment_authority)
                 return coordinator_view(queue_payload.get('items') or [],lanes_payload)
             queue_payload=queue(rows,actor,['--mine','--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
                                 operators=operators,journal=path,reference_attention=False,
                                 verifiers=verifiers,independent_approval=independent_approval,
                                 owners=owners,provenance_writes=provenance_writes,
-                                identity_names=identity_names)
+                                identity_names=identity_names,comment_authority=comment_authority)
             # The guidance acknowledgement is the caller's move too (kittrial-5bb.325): the
             # shared block carries the one item, and it joins the rows this projection
             # filters, so a worker waiting on `wait` WAKES for a new guidance version and
@@ -1439,11 +1467,11 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             from lanes import read as lanes_read
             from sessions import read_registry
             return lanes_read(rows,actor,read_registry(path),args[1:],operators=operators,
-                              journal=path,scope=lanes_scope)
+                              journal=path,scope=lanes_scope,comment_authority=comment_authority)
         return queue(rows,actor,args,path/'.handoff-requests', operators=operators, journal=path,
                      reference_attention=True, verifiers=verifiers,
                      independent_approval=independent_approval,owners=owners,
-                     provenance_writes=provenance_writes,identity_names=identity_names)
+                     provenance_writes=provenance_writes,identity_names=identity_names,comment_authority=comment_authority)
     if len(args) not in (1,2):raise ValueError('Use review TASK [--file payload.json] or handoff TASK --file payload.json')
     task=args[0]
     if action=='review' and len(args)==1:

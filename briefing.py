@@ -588,6 +588,98 @@ def wait_activity_marker(data,row):
     newest=max(entries,key=lambda entry:(parse_moment(entry['timestamp']),entry['entry_id'])) if entries else None
     return activity_marker(newest,fields_digest(row))
 
+def comment_author_allowed(author, operators=None, owners=None, authority=None, project=None):
+    """Current coordinator/owner membership or configured host operator, never history."""
+    from review_workflow import listed_operator_actor
+    if listed_operator_actor(author, operators, owners):
+        return True
+    state = authority() if callable(authority) else authority
+    if not isinstance(state, dict) or not isinstance(author, str):
+        return False
+    users, agents = state.get('users') or {}, state.get('agents') or {}
+    members = (state.get('memberships') or {}).get(project) or {}
+    user = users.get(author)
+    if isinstance(user, dict):
+        return not user.get('disabled') and members.get(author) in ('owner', 'coordinator')
+    agent_id = author.split('/', 1)[0]
+    agent = agents.get(agent_id)
+    if not isinstance(agent, dict) or not agent.get('enabled') or project not in (agent.get('projects') or []):
+        return False
+    account = agent.get('owner')
+    user = users.get(account)
+    if not isinstance(user, dict) or user.get('disabled'):
+        return False
+    from http_authority import coordinator_grant_capabilities, ROLE_CAPABILITIES, CAP_COORDINATE
+    held = ROLE_CAPABILITIES.get(members.get(account), frozenset())
+    return CAP_COORDINATE in coordinator_grant_capabilities(state, {'agent_id': agent_id}, project, held)
+
+
+def pending_other_comments(entries, owner, selected=None, acknowledged=None, authority=None):
+    """One comment-attention decision over an already ordered activity snapshot.
+
+    The caller supplies the shared newer_selection result and current-authority
+    predicate. Reserved records and unknown bodies are never plain comments.
+    A validated response consumes through its entry in that same snapshot.
+    """
+    from reserved_comments import reserved_match
+    remaining = entries
+    if acknowledged is not None:
+        position = next((i for i, entry in enumerate(entries)
+                         if entry['entry_id'] == acknowledged), None)
+        if position is not None:
+            remaining = entries[position + 1:]
+    selected_ids = None if selected is None else {entry['entry_id'] for entry in selected}
+    return any(entry.get('kind') == 'comment'
+               and isinstance(entry.get('body'), str) and bool(entry['body'].strip())
+               and reserved_match(entry.get('body')) is None
+               and not same_activity_actor(entry.get('author'), owner)
+               and authority is not None and authority(entry.get('author'))
+               and (selected_ids is None or entry['entry_id'] in selected_ids)
+               for entry in remaining)
+
+
+def checkpoint_snapshot(rows, row, state):
+    """One full activity snapshot for both queue selection and displayed fields."""
+    has_checkpoint = state['current'] is not None and not state['invalid']
+    project = untoken(state['current'][0]['activity_cursor']).get('project', 'work-queue') if has_checkpoint else 'work-queue'
+    return snapshot(rows, project, row['id'])
+
+
+def assignee_comment_pending(row, state=None, response=None, full=None, authority=None):
+    """Unconsumed comments for an open assignee, reusing checkpoint provenance.
+
+    Review state does not decide whether a person has written to the assignee.
+    It remains independent evidence; an invalid checkpoint cannot assert freshness.
+    """
+    owner = row.get('assignee')
+    if row.get('status') == 'closed' or not owner:
+        return False
+    try:
+        state = state if state is not None else checkpoint_state(row)
+        if state['invalid']:
+            return False
+        if not state['provenance']:
+            state = dict(state, provenance={cid:normalize_provenance(payload)
+                                           for cid,payload in state['history']})
+        comments = {str(c['id']): c for c in row.get('comments') or []}
+        own = [(i, cid, payload) for i, (cid, payload) in enumerate(state['history'])
+               if same_activity_actor(comments[str(cid)].get('author'), owner)]
+        full = full if full is not None else checkpoint_snapshot([row], row, state)
+        selected = None
+        if own:
+            index, cid, payload = own[-1]
+            comment = comments[str(cid)]
+            data = excluding_checkpoint(full, cid, comment.get('author'))
+            selected = newer_selection(data, retained_provenance(state, upto=index),
+                                       comment.get('created_at'))[1]
+        acknowledged = None
+        if isinstance(response, dict) and same_activity_actor(response.get('author'), owner):
+            acknowledged = row['id'] + '-c' + str(response['comment_id'])
+        return pending_other_comments(full['entries'], owner, selected, acknowledged, authority=authority)
+    except (ValueError, TypeError, KeyError, StopIteration):
+        return False
+
+
 def newer_comment_by_other(row,checkpoint_comment):
     """The released ``newer_activity`` boolean, in ONE place (kittrial-5bb.354).
 
@@ -1221,6 +1313,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                       reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None,
                       integration=compact_integration(review.get('integration')))
     brief_review.pop('reconciliation_needed',None)
+    # Internal attention acknowledgement metadata belongs in the full projection.
+    brief_review.pop('last_response',None)
     # The coordinator's recorded hand-back (kittrial-5bb.343): the same additive
     # block a work row carries. An APPLYING one is the assignee's move, so `next`
     # quotes the recorded text once and the shared review block names the role.
@@ -1620,7 +1714,7 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
             'fields':list(fields or []),'fields_note':None if current else fields_note,
             'history':history,'note':note}
 
-def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
+def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None):
     """Bounded queue fields; share the brief's linked state and full-row snapshot.
 
     This is the ONE computation of the newer-activity fields (kittrial-5bb.354,
@@ -1646,8 +1740,7 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
         # task's full snapshot for every row. The project name only seeds the snapshot's
         # task key; the marker reads entries and task fields, never the project.
         has_checkpoint=state['current'] is not None and not state['invalid']
-        project=untoken(state['current'][0]['activity_cursor']).get('project','work-queue') if has_checkpoint else 'work-queue'
-        full=snapshot(rows,project,row['id'])
+        full=full if full is not None else checkpoint_snapshot(rows,row,state)
         wait_marker=wait_activity_marker(full,row)
         if not has_checkpoint:
             return dict(empty,wait_newer_activity_marker=wait_marker)

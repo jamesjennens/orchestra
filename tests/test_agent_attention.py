@@ -425,7 +425,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(json.loads(self.native('blair')(['comments',task,'--json'])),before)
 
     @patch.dict(os.environ, {'PYTHONUTF8': '1'})
-    def test_only_undelivered_blocked_or_working_tasks_count_as_newer(self):
+    def test_newer_plain_coordinator_comments_count_in_all_review_states(self):
         blocked, working, delivered, approved = self.tasks
         for task in self.tasks:
             self.claim(task)
@@ -435,17 +435,19 @@ class EndpointAttentionTests(fixes.EndpointCase):
         contribution = self.contribute(approved)
         self.review(self.people['blair'], approved, 'approve', previous=contribution,
                     contribution=contribution, summary='Accepted')
+        owner_actor = next(uid for uid, user in self.service.state['users'].items()
+                           if user.get('username') == 'blair')
         for task in self.tasks:
-            self.native('blair')(['comments', 'add', task, 'New direction after the checkpoint.'])
+            self.native(owner_actor)(['comments', 'add', task, 'New direction after the checkpoint.'])
         data = self.next()
-        self.assertEqual(data['attention']['counts']['newer_activity'], 2)
+        self.assertEqual(data['attention']['counts']['newer_activity'], 4)
         actions = {x['task']: x for x in data['next_actions']}
         self.assertTrue(actions[blocked]['newer_activity'])
         self.assertTrue(actions[working]['newer_activity'])
         for task in (delivered, approved):
-            self.assertIsNone(actions[task]['newer_activity'])
-        # Authorized brief reads confirm the delivered tasks have newer activity;
-        # exclusion must happen in attention's current undelivered state rule.
+            self.assertTrue(actions[task]['newer_activity'])
+            self.assertEqual(actions[task]['kind'], 'new-comments')
+        # Authorized briefs carry the same newer plain coordinator comments.
         for task in (delivered, approved):
             brief = self.request('GET', self.base(task)+'/brief', token=self.secret)
             self.assertEqual(brief.status, 200, brief.data)
@@ -622,6 +624,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertEqual(([task['id'] for task in read['tasks']], read['complete']), (['mine'], True))
         self.assertEqual(read['tasks'][0], {
             'id': 'mine', 'title': 'm', 'status': 'in_progress', 'assignee': 'me', 'review_state': 'none',
+            'assignee_comment_pending': False,
             'contribution_id': None, 'pending_change_requests': [], 'open_items': 2, 'blocking_items':2,
             # The canonical page says no item count here, so the move sentence falls back
             # to the request ids it can see (kittrial-5bb.249).
@@ -720,7 +723,7 @@ class InProcessAttentionTests(test_http_agents.AgentHarness):
         # `pending_review_items` is additive (kittrial-5bb.249): the canonical open-item
         # count the move sentence needs, carried by both backends alike. `redelivered` is
         # additive too (kittrial-5bb.253 item 1).
-        self.assertEqual(sorted(row), ['assignee', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
+        self.assertEqual(sorted(row), ['assignee', 'assignee_comment_pending', 'blocking_items', 'checkpoint_at', 'contribution_id', 'id', 'newer_activity',
                                        'newer_activity_by_others', 'newer_activity_coverage',
                                        'newer_activity_fields', 'newer_activity_marker', 'newer_activity_own',
                                        'open_items', 'pending_change_requests', 'pending_review_items',
