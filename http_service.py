@@ -1617,6 +1617,9 @@ class InProcessBackend:
     def task_brief(self, project_id, task_id):
         """Everything the task page shows, from one read of the in-process state."""
         task = self._task(project_id, task_id)
+        from briefing import ContextPointers
+        pointer_rows=[row for row in self.state.get('tasks',{}).values() if row.get('project_id')==project_id]
+        pointers=ContextPointers(pointer_rows,project_id,operators=())
         checkpoints = self.state.get('checkpoints', {}).get(task_id) or []
         checkpoint = None
         if checkpoints:
@@ -1628,6 +1631,9 @@ class InProcessBackend:
             checkpoint = {'id': last['id'], 'at': last['created_at'], 'author': last['actor'],
                           'summary': last['summary'], 'next_action': last.get('next_action'),
                           'open_items': items,
+                          'pointer_items': pointers.item_pointers(items,'source'),
+                          'resolved': [dict(item) for item in last.get('resolved') or []],
+                          'resolved_pointer_items': pointers.item_pointers(last.get('resolved') or [],'evidence'),
                           # This backend holds the checkpoint in memory and always reads
                           # every item, so the shown list is the whole list, with no note.
                           'open_items_shown': len(items), 'open_items_total': len(items)}
@@ -3668,7 +3674,8 @@ class EndpointBackend:
         if data.get('checkpoint'):
             point = data['checkpoint']
             unresolved = data.get('unresolved') or {}
-            carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved)
+            pointer_items={}
+            carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved,pointer_items)
             shown_items = [{'id': item.get('id'), 'kind': item.get('kind'),
                             'text': item.get('text'), 'source': item.get('source')}
                            for item in unresolved.get('items') or []
@@ -3695,9 +3702,18 @@ class EndpointBackend:
                           'acceptance': (data.get('acceptance') or {}).get('text'),
                           'newer_activity': point.get('newer_activity'),
                           'open_items': shown_items,
+                          'pointer_items': pointer_items if carry is not None else
+                                           {item['id']:pointer_items[item['id']] for item in shown_items if item['id'] in pointer_items},
+                          'resolved': (data.get('resolved') or {}).get('items',[]),
+                          'resolved_pointer_items': (data.get('resolved') or {}).get('pointer_items',{}),
+                          'resolved_total': (data.get('resolved') or {}).get('total',0),
+                          'resolved_omitted': (data.get('resolved') or {}).get('omitted',0),
                           'open_items_shown': shown,
                           'open_items_total': total,
                           **({'open_items_note': note} if note else {})}
+            from briefing import bound_context_pointer_display
+            checkpoint['pointer_items'],checkpoint['resolved_pointer_items']=bound_context_pointer_display(
+                [checkpoint['pointer_items'],checkpoint['resolved_pointer_items']])
         review = data.get('review') or {}
         current = review.get('contribution')
         priors = review.get('prior_contributions_total') or 0
@@ -3842,7 +3858,7 @@ class EndpointBackend:
         from briefing import changes_since_checkpoint
         return changes_since_checkpoint({'task': task, 'entries': []}, None, None, None)
 
-    def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
+    def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved, pointer_items=None):
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
 
         The next checkpoint must carry each one forward unchanged, ``source`` included, so
@@ -3853,7 +3869,10 @@ class EndpointBackend:
         reads. A checkpoint written between two reads makes the list unusable, and the
         template then says to read again.
         """
-        items = [dict(item) for item in unresolved.get('items') or [] if isinstance(item, dict)]
+        if pointer_items is not None:
+            pointer_items.clear()
+            pointer_items.update(unresolved.get('pointer_items') or {})
+        items = [{key:value for key,value in item.items() if key not in ('pointers','pointers_omitted')} for item in unresolved.get('items') or [] if isinstance(item, dict)]
         offset = unresolved.get('next_offset')
         if offset is None:
             return items
@@ -3870,7 +3889,10 @@ class EndpointBackend:
             every = whole.get('unresolved') or {}
             if every.get('next_offset') is not None:
                 return None
-            return [dict(item) for item in every.get('items') or [] if isinstance(item, dict)]
+            if pointer_items is not None:
+                pointer_items.clear()
+                pointer_items.update(every.get('pointer_items') or {})
+            return [{key:value for key,value in item.items() if key not in ('pointers','pointers_omitted')} for item in every.get('items') or [] if isinstance(item, dict)]
         for _ in range(self.OPEN_ITEM_PAGES):
             if offset is None:
                 return items
@@ -3880,7 +3902,9 @@ class EndpointBackend:
             if not isinstance(page, dict) or (page.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
                 return None
             more = page.get('unresolved') or {}
-            items += [dict(item) for item in more.get('items') or [] if isinstance(item, dict)]
+            if pointer_items is not None:
+                pointer_items.update(more.get('pointer_items') or {})
+            items += [{key:value for key,value in item.items() if key not in ('pointers','pointers_omitted')} for item in more.get('items') or [] if isinstance(item, dict)]
             offset = more.get('next_offset')
         return items if offset is None else None
 

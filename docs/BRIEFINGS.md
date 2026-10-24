@@ -323,3 +323,51 @@ History snapshots live in each private runtime project's `.history-snapshots` di
 `checkpoint` requires the current `activity_cursor` for the same task. History continuation instead reads the immutable snapshot bound to its cursor, even after live activity changes. It fails explicitly if that saved snapshot is unavailable or its scope is invalid; start without a cursor to read newer activity. Checkpoint freshness and history continuation are separate contracts.
 
 Copy tokens exactly. Malformed or altered tokens can fail decoding, schema, scope or snapshot validation; the error text depends on the failure. Do not rely on one universal error string or reconstruct a token from a displayed abbreviation.
+
+
+## Pointers in checkpoint source and evidence
+
+Open-item `source` and resolved-item `evidence` may mix prose and whitespace-separated
+`KIND:VALUE` tokens. The ten lowercase kinds are `task`, `comment`, `ref`, `cap`, `item`,
+`file`, `room`, `commit`, `doc` and `archive`; values have 1–200 characters from
+`[A-Za-z0-9._/#:-]`. A nonmatching token is ordinary prose. Punctuation is literal:
+`task:x.` names `x.`, not `x`; separate sentence punctuation with whitespace.
+No checkpoint field, validation rule or stored byte changes, and an older kit can carry
+the strings unchanged.
+
+`unresolved.items` retains its original checkpoint item shape, so a complete list can
+be copied verbatim into the next checkpoint. Pointer metadata is separate under
+`unresolved.pointer_items`, keyed by item id; each value has `pointers` and
+`pointers_omitted`. The new resolved view likewise keeps raw `resolved.items` separate
+from `resolved.pointer_items`. HTTP keeps `checkpoint.open_items` raw, with metadata in
+`checkpoint.pointer_items` and `checkpoint.resolved_pointer_items`. The complete
+`carry_open_items` and template body remain write-ready. Respect the existing item
+paging; a first page is not the complete carry list. Web and text views join the maps
+for display without changing raw items.
+
+Resolution uses only loaded, caller-authorized project data, with no new I/O.
+The five states are:
+
+- `live`: a task, comment, reference or capability target exists. This proves existence,
+  not the checkpoint's claim, and grants no authority to pointed text.
+- `superseded`: an explicitly retired entry or superseded contribution. Additive
+  `follows` deliveries remain live historical evidence.
+- `unavailable`: absent, inaccessible, malformed, conflicted or ambiguous targets,
+  including task/comment requests for record anchors and comments hidden by the existing
+  brief/history record-comment filter. No target label or follow command distinguishes them.
+- `unchecked`: uniform for every target of a kind the brief does not load: file, room,
+  item, commit, doc and archive. No file, room, repository or document is fetched.
+- `unresolved`: beyond 10 resolved pointers per item or 50 per brief. Tokens remain
+  listed and contribute to `pointers_omitted`.
+
+Every pointer carries `trust: data`. Labels pass through `plain_text` before clipping
+at 120 characters, without leaving a partial Unicode escape. Text display folds line
+breaks and Unicode separators in labels, source, reason and evidence; direction marks
+(including LRM, RLM and ALM) are escaped. Web rendering uses text nodes. Follow commands
+are kit reads, never arbitrary URLs. Pointed comments do not become new directions.
+The index is lazy: pure prose and unchecked kinds never scan the export for targets.
+Production supplies already-authorized project rows; the optional `can_read` library
+predicate can only restrict them further for direct embedders and tests.
+
+The latest checkpoint's resolved list is shown within the requested item limit, with
+its total and omitted count, independently of the open-item page.
