@@ -1394,6 +1394,23 @@ def contributor_help_text(unknown=None):
     return '\n'.join(lines)
 
 
+# Copy of work.py:502-507 and its constants at 213-218; client.py stays standalone.
+HELP_TOKENS = ('-h', '--help')
+VALUE_OPTIONS = {'--owner', '--state', '--limit', '--offset', '--handoff-limit',
+                 '--handoff-offset', '--file', '-f', '--items-offset', '--items-limit',
+                 '--since', '--cursor', '--body-budget', '--ref-limit', '--ref-offset',
+                 '--proposal-limit', '--proposal-offset', '--capability-limit', '--capability-offset',
+                 '--recent', '--last', '--kind'}
+
+
+def help_requested(args):
+    """True when args ask for help; side-effect free for every command."""
+    for index, token in enumerate(args):
+        if token in HELP_TOKENS and not (index and args[index - 1] in VALUE_OPTIONS):
+            return True
+    return False
+
+
 _COMMAND_HELP_USAGE = {
     'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
             '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
@@ -1659,8 +1676,8 @@ def main():
             return _capability_check(args[2:],json.loads(Path(a.config).read_text()) if a.config else None,
                                      a.project,a.actor,a.out)
         return _capability(args[1:],a.out)
-    if (args[0] in contributor_command_names()
-            and any(token in ('--help', '-h') for token in args[1:])):
+    if ((not a.config or not a.project) and args[0] in contributor_command_names()
+            and help_requested(args[1:])):
         sys.stdout.write(contributor_command_help(args[0]))
         return 0
     if not a.config or not a.project:
