@@ -3331,6 +3331,43 @@ class EndpointBackend:
                 else invalid(text)
         return self._checked(reply)
 
+    def prior_room_write(self, project_id, user_id, route=None, key=None, target=None,
+                         operation_id=None):
+        """What one earlier room-item attempt by ``user_id`` wrote (kittrial-5bb.388 round 5, b1).
+
+        Read from the endpoint's operation journal only: that row is written by the endpoint
+        alone, keyed by that person's OWN operation id, so nothing a project member can write
+        (a requirement, a proposal, a label, a room line) is ever matched. Answers:
+
+        * ``('committed', payload)`` - the attempt wrote, and this is its recorded result;
+        * ``('none', None)`` - the attempt's write was refused and recorded as refused;
+        * ``('uncertain', None)`` - in flight, unknown, expired, recorded by digest only, or
+          MISSING. Committed rows are kept for about a day, so a missing row never proves
+          that nothing was written (the coordinator's condition on the plan).
+
+        One indexed point read per call; it does not grow with the project.
+        """
+        from http_authority import OperationJournal, journal_path
+        if operation_id is None:
+            principal = types.SimpleNamespace(user_id=user_id, credential_id=None)
+            operation_id = self._result_key(principal, project_id, route, key, target)
+        project = self.files_project(project_id)
+        path = journal_path(project) if project is not None else None
+        if path is None or not path.is_file():
+            return ('uncertain', None)
+        entry = OperationJournal(path).lookup(operation_id)
+        if (not isinstance(entry, dict) or entry.get('state') != 'committed'
+                or entry.get('envelope_omitted') or not isinstance(entry.get('envelope'), dict)):
+            return ('uncertain', None)
+        envelope = entry['envelope']
+        if envelope.get('returncode') != 0:
+            return ('none', None)
+        try:
+            payload = self._checked(envelope)
+        except HttpError:
+            return ('uncertain', None)
+        return ('committed', payload) if isinstance(payload, dict) else ('uncertain', None)
+
     def owner_requirement_recoveries(self, principal, project_id):
         authority=authority_request(principal,project_id,CAP_COORDINATE,now=self.service._expiry_now())
         reply=self._endpoint('owner-requirements',project_id,principal.user_id,['recoveries'],
@@ -6445,6 +6482,14 @@ class ApiHandler(BaseHTTPRequestHandler):
     ROOMS_UNAVAILABLE = 'Rooms are not available on this server.'
 
     def _rooms_project(self, ctx):
+        # Round 5 of kittrial-5bb.388 (b2): a client key in the room's own namespaces
+        # (item decisions and accept intents) is refused on EVERY room write route, messages
+        # included, before anything is read, so no line can occupy an identity an
+        # acceptance needs.
+        key = getattr(ctx, 'idempotency_key', None)
+        if self.command == 'POST' and isinstance(key, str) and key.startswith(rooms.RESERVED_KEY_PREFIXES):
+            raise invalid('An Idempotency-Key may not start with %s: those names belong to the '
+                          'room itself.' % ' or '.join(rooms.RESERVED_KEY_PREFIXES))
         place = getattr(self.backend, 'files_project', None)
         project = place(ctx.params['pid']) if place is not None else None
         if project is None:
@@ -6614,47 +6659,177 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise forbidden('Only the project owner or a coordinator can decide a decision item.')
         return CAP_READ
 
-    def _room_item_record(self, ctx, pid, item, evidence, parent=None, base=None):
-        """Create the existing record an accepted requirement/decision item becomes."""
-        # Review b1: the identity names the item and action, never the event count, so the
-        # record write is idempotent and a retry never creates a second record. Review s1/r3:
-        # it also follows the content the acceptance records. Review b1/r4: an accept intent
-        # in the room log holds that identity, and an amendment is refused until the matching
-        # accepted event exists, so a retry after a failed append always names this record.
+    @staticmethod
+    def _room_decision_operation(base, user_id):
+        """One person's own operation id for a room decision write (round 5, b1).
+
+        The endpoint journal binds an operation id to the principal that first used it
+        (http_authority: "Operation identity belongs to a different principal"), so each
+        person writes under their own id and a retry by someone else finds the earlier
+        attempt through the journal instead of colliding with it.
+        """
+        digest = hashlib.sha256(str(user_id).encode('utf-8')).hexdigest()[:12]
+        return '%s-decision-%s' % (base, digest)
+
+    def _room_prior_record(self, pid, intent, author_id, base, evidence):
+        """What one earlier attempt on ``intent`` by ``author_id`` wrote (round 5, b1).
+
+        Returns ``('record', record)`` for a finished record, ``('created', created)`` for a
+        requirement created but not yet accepted, ``('none', None)`` when that attempt is
+        recorded as having written nothing, or ``('uncertain', None)``. Only the endpoint's
+        operation journal is read (EndpointBackend.prior_room_write), never tracker text.
+        """
+        lookup = getattr(self.backend, 'prior_room_write', None)
+        if lookup is None:
+            return ('uncertain', None)
+        kind = intent.get('record_kind')
+        if kind == 'decision':
+            state, payload = lookup(pid, author_id, operation_id=self._room_decision_operation(
+                base, author_id))
+            if state != 'committed':
+                return (state, None)
+            decision_id = payload.get('decision_id')
+            if not isinstance(decision_id, str) or not decision_id:
+                return ('uncertain', None)
+            return ('record', {'kind': 'decision', 'id': decision_id, 'revision': None,
+                               'sha256': None, 'decision_id': decision_id, 'evidence': evidence})
+        if kind == 'proposal':
+            state, payload = lookup(pid, author_id, 'proposals.submit', base + '-proposal',
+                                    evidence)
+            if state != 'committed':
+                return (state, None)
+            identity = payload.get('key') or payload.get('id') or payload.get('native_id')
+            if not isinstance(identity, str) or not identity:
+                return ('uncertain', None)
+            return ('record', {'kind': 'proposal', 'id': identity, 'revision': None,
+                               'sha256': None, 'decision_id': None, 'evidence': evidence})
+        state, created = lookup(pid, author_id, 'requirements.create',
+                                base + '-requirement-create', None)
+        if state != 'committed':
+            return (state, None)
+        if not isinstance(created.get('id'), str) or not created['id']:
+            return ('uncertain', None)
+        state, accepted = lookup(pid, author_id, 'requirements.accept',
+                                 base + '-requirement-accept', created['id'])
+        if state == 'committed':
+            read = self.backend.requirements_read(pid, ['get', created['id']]) or {}
+            decision_id = (((read.get('acceptance') or {}).get('decision') or {})
+                           .get('decision_id'))
+            return ('record', {'kind': 'requirement', 'id': created['id'],
+                               'revision': accepted.get('revision'),
+                               'sha256': accepted.get('sha256'),
+                               'decision_id': decision_id, 'evidence': evidence})
+        return ('created', created)
+
+    def _room_attempt_outcomes(self, pid, project, room_id, pending):
+        """The records an intent's attempts wrote, and whether any outcome is unknown.
+
+        Used when an intent is cancelled (moderation, archive, a coordinator), so the cancel
+        line names the records known from the journal and marks ``record_may_exist`` when an
+        attempt's outcome is not known (the coordinator's answer to Q1 on the plan).
+        """
+        evidence = rooms._item_evidence(room_id, pending['target_sequence'])
+        records = []
+        unknown = False
+        lines = rooms.load_lines(project, room_id)
+        for author in rooms.intent_authors(lines, pending['identity']):
+            try:
+                state, value = self._room_prior_record(pid, pending, author['id'],
+                                                       pending['identity'], evidence)
+            except (HttpError, ValueError, OSError):
+                state, value = 'uncertain', None
+            if state == 'record':
+                records.append(value['id'])
+            elif state == 'created':
+                records.append(value['id'])
+            elif state != 'none':
+                unknown = True
+        return records, unknown
+
+    def _room_item_record(self, ctx, pid, item, evidence, parent=None, base=None,
+                          record_kind=None, earlier=(), intent=None, log_attempt=None):
+        """The record an accepted requirement/decision item becomes (round 5, b1).
+
+        ``record_kind`` and ``parent`` come from the intent, never from the caller's role
+        now. ``earlier`` lists everyone who tried this intent before the caller: each of
+        their outcomes is read from the endpoint's operation journal first, and a finished
+        record is adopted, a created but unaccepted requirement is accepted by the caller,
+        and an unknown outcome is refused (409) until a coordinator cancels the intent. Only
+        when every earlier attempt is recorded as having written nothing does the caller
+        write, under the caller's own operation ids, and ``log_attempt`` records the caller's
+        attempt in the room log immediately BEFORE that write (never for a refused or adopting
+        retry, so a refusal cannot make a later retry uncertain).
+        """
         if base is None:
             base = rooms.item_decision_operation(ctx.params['rid'], item['sequence'], 'accept')
-        if item['item_kind'] == 'requirement':
-            if self._requirement_editor_here(ctx, pid) is None:
-                # A contributor's accepted requirement is a proposal, as that person.
-                self._proposals_backend()
-                body = {'schema_version': 1, 'operation': 'submit',
-                        'submitter': 'account:' + ctx.principal.user_id,
-                        'target': {'kind': 'requirement-new'},
-                        'text': item['text'], 'rationale': item['title'],
-                        'evidence': [evidence], 'operation_id': base + '-proposal'}
-                result = self.backend.invoke(
-                    'proposals.submit', ctx.principal, pid,
-                    {'command': 'submit', 'body': body}, base + '-proposal',
-                    target=evidence, capability=CAP_PROPOSALS)
-                if not isinstance(result, dict):
-                    raise uncertain('The canonical proposal write returned an unexpected shape')
-                identity = result.get('key') or result.get('id') or result.get('native_id')
-                if not isinstance(identity, str) or not identity:
-                    raise uncertain('The canonical proposal write named no proposal; reconcile it')
-                revision = result.get('revision')
-                digest = result.get('sha256') or result.get('proposal_sha256')
-                return {'kind': 'proposal', 'id': identity,
-                        'revision': revision if type(revision) is int and revision >= 1 else None,
-                        'sha256': digest if isinstance(digest, str) else None,
-                        'decision_id': None, 'evidence': evidence}
+        if record_kind is None:
+            if item['item_kind'] == 'decision':
+                record_kind = 'decision'
+            else:
+                record_kind = ('requirement' if self._requirement_editor_here(ctx, pid) is not None
+                               else 'proposal')
+        adopt = None
+        for author in earlier:
+            state, value = self._room_prior_record(pid, dict(intent or {}, record_kind=record_kind),
+                                                   author['id'], base, evidence)
+            if state == 'record':
+                return value
+            if state == 'created':
+                adopt = value
+                continue
+            if state != 'none':
+                raise conflict('An earlier acceptance of this item by %s has an unknown outcome; '
+                               'a project owner or coordinator cancels it, and the item then '
+                               'names what may have been written.' % author.get('name', 'someone'))
+        if log_attempt is not None:
+            log_attempt()
+        if record_kind == 'proposal':
+            # A contributor's accepted requirement is a proposal, as that person.
+            self._proposals_backend()
+            body = {'schema_version': 1, 'operation': 'submit',
+                    'submitter': 'account:' + ctx.principal.user_id,
+                    'target': {'kind': 'requirement-new'},
+                    'text': item['text'], 'rationale': item['title'],
+                    'evidence': [evidence], 'operation_id': base + '-proposal'}
+            result = self.backend.invoke(
+                'proposals.submit', ctx.principal, pid,
+                {'command': 'submit', 'body': body}, base + '-proposal',
+                target=evidence, capability=CAP_PROPOSALS)
+            if not isinstance(result, dict):
+                raise uncertain('The canonical proposal write returned an unexpected shape')
+            identity = result.get('key') or result.get('id') or result.get('native_id')
+            if not isinstance(identity, str) or not identity:
+                raise uncertain('The canonical proposal write named no proposal; reconcile it')
+            revision = result.get('revision')
+            digest = result.get('sha256') or result.get('proposal_sha256')
+            return {'kind': 'proposal', 'id': identity,
+                    'revision': revision if type(revision) is int and revision >= 1 else None,
+                    'sha256': digest if isinstance(digest, str) else None,
+                    'decision_id': None, 'evidence': evidence}
+        if record_kind == 'requirement':
             if not hasattr(self.backend, 'owner_requirements'):
                 raise not_implemented('Requirements editing needs the canonical tracker backend')
-            description = item['text'] + '\n\n' + evidence
-            fields = {'kind': 'requirement', 'title': item['title'], 'description': description}
-            if parent is not None:
-                fields['parent'] = parent
-            created = self.backend.owner_requirements(
-                ctx.principal, pid, 'create', fields, base + '-requirement-create')
+            if adopt is not None:
+                created = adopt
+                read = self.backend.requirements_read(pid, ['get', created['id']]) or {}
+                acceptance = read.get('acceptance') or {}
+                if acceptance.get('decision'):
+                    # Accepted, though the attempt that accepted it is no longer in the
+                    # journal: adopt it as it stands now.
+                    return {'kind': 'requirement', 'id': created['id'],
+                            'revision': read.get('revision') if type(read.get('revision')) is int
+                            else None,
+                            'sha256': read.get('sha256') if isinstance(read.get('sha256'), str)
+                            else None,
+                            'decision_id': acceptance['decision'].get('decision_id'),
+                            'evidence': evidence}
+            else:
+                description = item['text'] + '\n\n' + evidence
+                fields = {'kind': 'requirement', 'title': item['title'], 'description': description}
+                if parent is not None:
+                    fields['parent'] = parent
+                created = self.backend.owner_requirements(
+                    ctx.principal, pid, 'create', fields, base + '-requirement-create')
             accepted = self.backend.owner_requirements(
                 ctx.principal, pid, 'accept',
                 {'expected_revision': created['revision'],
@@ -6668,12 +6843,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     'decision_id': decision_id, 'evidence': evidence}
         if not hasattr(self.backend, 'room_decision'):
             raise not_implemented('Room decisions need the canonical tracker backend')
+        operation = self._room_decision_operation(base, ctx.principal.user_id)
         result = self.backend.room_decision(
             ctx.principal, pid,
             {'operation': 'issue', 'room': ctx.params['rid'], 'sequence': item['sequence'],
              'title': item['title'], 'text': item['text'], 'evidence': evidence,
-             'operation_id': base},
-            base)
+             'operation_id': operation},
+            operation)
         decision_id = (result or {}).get('decision_id') if isinstance(result, dict) else None
         if not isinstance(decision_id, str) or not decision_id:
             raise uncertain('The canonical decision write named no decision; reconcile it')
@@ -6732,67 +6908,105 @@ class ApiHandler(BaseHTTPRequestHandler):
         note = (payload.get('note') or '').strip()
         payload_parent = payload.get('parent')
         editor = self._requirement_editor_here(ctx, ctx.params['pid']) is not None
-        # Review b1: the item is decided from a CURRENT read under the item lock, its state
-        # and room are checked BEFORE the native record is written, and the record write
-        # itself carries an identity so a retry reconciles. Review s1/r3: that identity
-        # follows the content the acceptance records, so an accept after a failed append or
-        # an amendment writes the current title and text rather than the old native record.
+        rid = ctx.params['rid']
+        # Review b1: the item is decided from a CURRENT read under the item lock, and its
+        # state and room are checked BEFORE any native record is written. Round 5 (request
+        # 01a16bd3): the accept INTENT decides what the record is (kind, parent, content),
+        # whoever completes it; each person's attempt is logged before their native write,
+        # and every earlier attempt's outcome is read from the endpoint's operation journal
+        # first, so a retry by anyone reconciles onto one record or is refused.
         def write():
             try:
                 with self._rooms_item_lock(project):
                     with self._rooms_lock(project):
-                        current = rooms.read_item(project, ctx.params['rid'],
-                                                  int(ctx.params['seq']))
-                        operation_id = rooms.item_decision_operation(
-                            ctx.params['rid'], current['sequence'], 'accept',
-                            content=rooms.item_content_digest(current['title'], current['text']))
-                        existing = rooms.find_operation(project, ctx.params['rid'], operation_id)
-                    if existing is not None:
-                        # An exact retry of the SAME client key is replayed by _mutate before
-                        # this point. Any other request that reaches here names an item whose
-                        # decision line already exists: it is refused before the native write,
-                        # never a second record (review b1).
+                        current = rooms.read_item(project, rid, int(ctx.params['seq']))
+                        lines = rooms.load_lines(project, rid)
+                        decided = rooms.decision_event(lines, current['sequence'])
+                        pending = rooms.pending_accept_intent(lines, current['sequence'])
+                    if decided is not None:
+                        # Only a real accept/reject event of this item makes it decided
+                        # (round 5, N8b): an exact retry of the SAME client key was already
+                        # replayed by _mutate before this point.
                         raise rooms.Refusal(409, 'final', 'That item is already decided.')
                     # The project may have been archived since the route's first read.
                     live, _role = self._project(ctx, CAP_READ)
                     if isinstance(live, dict) and live.get('archived'):
                         raise conflict('The project is archived: its rooms can be read and exported, '
                                        'and no room is written.')
-                    current = rooms.decidable_item(project, ctx.params['rid'],
-                                                   current['sequence'], 'accept')
-                    # Review n2/r3: an editor's explicit choice wins over the parent stored on
-                    # the item, so a wrong parent can be amended instead of forcing a supersede.
-                    chosen = (payload_parent or current.get('parent')) if editor \
-                        else current.get('parent')
-                    if current['item_kind'] == 'requirement' and editor:
-                        jobs = []
-                        if hasattr(self.backend, 'requirements_read'):
-                            listing = self.backend.requirements_read(ctx.params['pid'], ['list']) or {}
-                            jobs = listing.get('jobs') or []
-                        ids = [job.get('id') for job in jobs]
-                        if chosen is None and len(jobs) == 1:
-                            chosen = jobs[0].get('id')
-                        if chosen is None:
-                            raise invalid('A requirement item needs an existing job to hang under; '
-                                          'name one with the item (or accept it while the project '
-                                          'has exactly one job).')
-                        if chosen not in ids:
-                            raise invalid('That parent is not a job of this project; a requirement '
-                                          'hangs under an existing job.')
-                    # Review b1/r4: name this acceptance's native identity in the room log
-                    # BEFORE the record write. While the intent has no matching accepted
-                    # event, an amend, supersede, moderation or a different decision is
-                    # refused (409 accepting), so only a retry of this identity may proceed
-                    # and reconcile on the record the failed attempt already wrote.
+                    current = rooms.decidable_item(project, rid, current['sequence'], 'accept')
+                    if pending is None:
+                        if current['item_kind'] == 'decision':
+                            record_kind = 'decision'
+                        else:
+                            record_kind = 'requirement' if editor else 'proposal'
+                        # Review n2/r3: an editor's explicit choice wins over the parent stored
+                        # on the item, so a wrong parent can be amended instead of superseded.
+                        chosen = (payload_parent or current.get('parent')) if editor \
+                            else current.get('parent')
+                        if record_kind == 'requirement':
+                            jobs = []
+                            if hasattr(self.backend, 'requirements_read'):
+                                listing = self.backend.requirements_read(ctx.params['pid'], ['list']) or {}
+                                jobs = listing.get('jobs') or []
+                            ids = [job.get('id') for job in jobs]
+                            if chosen is None and len(jobs) == 1:
+                                chosen = jobs[0].get('id')
+                            if chosen is None:
+                                raise invalid('A requirement item needs an existing job to hang under; '
+                                              'name one with the item (or accept it while the project '
+                                              'has exactly one job).')
+                            if chosen not in ids:
+                                raise invalid('That parent is not a job of this project; a requirement '
+                                              'hangs under an existing job.')
+                        else:
+                            chosen = None
+                        with self._rooms_lock(project):
+                            lines = rooms.load_lines(project, rid)
+                            identity = rooms.accept_identity(lines, rid, current)
+                            intent = rooms.intend_accept(
+                                project, rid, current['sequence'], identity, actor, limits_values,
+                                record_kind, rooms.item_content_digest(current['title'],
+                                                                       current['text']),
+                                chosen)
+                    else:
+                        intent = pending
+                        identity = pending['identity']
+                        # A pre-round-5 intent carries no kind: decide it as before.
+                        record_kind = pending.get('record_kind') or (
+                            'decision' if current['item_kind'] == 'decision'
+                            else ('requirement' if editor else 'proposal'))
+                        chosen = pending.get('parent')
+                        if payload_parent is not None and payload_parent != chosen:
+                            raise conflict('This acceptance was started under parent %s; retry '
+                                           'without a parent, or a project owner or coordinator '
+                                           'cancels it first.' % (chosen or '(none)'))
+                    # Who may complete it is checked LIVE, against the intent's kind: a
+                    # requirement or decision needs a current editor (a person demoted since
+                    # is refused, never turned into a proposal); a proposal is submitted as
+                    # its author, so only that person finishes it.
+                    if record_kind in ('requirement', 'decision'):
+                        if not editor:
+                            raise forbidden('Only a current project owner or coordinator can '
+                                            'complete this acceptance.')
+                    elif intent['author']['id'] != ctx.principal.user_id:
+                        raise conflict('This acceptance is a proposal by %s; only they can finish '
+                                       'it, or a project owner or coordinator cancels it.'
+                                       % intent['author']['name'])
                     with self._rooms_lock(project):
-                        rooms.intend_accept(project, ctx.params['rid'], current['sequence'],
-                                            operation_id, actor, limits_values)
+                        earlier = [author for author in rooms.intent_authors(
+                            rooms.load_lines(project, rid), identity)
+                            if author['id'] != actor['id']]
+                    def log_attempt():
+                        with self._rooms_lock(project):
+                            rooms.record_attempt(project, rid, current['sequence'], identity,
+                                                 actor, limits_values)
                     record = self._room_item_record(ctx, ctx.params['pid'], current,
-                                                    current['evidence'], chosen,
-                                                    base=operation_id)
+                                                    current['evidence'], chosen, base=identity,
+                                                    record_kind=record_kind, earlier=earlier,
+                                                    intent=intent, log_attempt=log_attempt)
                     with self._rooms_lock(project):
-                        result = rooms.accept_item(project, ctx.params['rid'], current['sequence'],
-                                                   operation_id, actor, limits_values, record,
+                        result = rooms.accept_item(project, rid, current['sequence'],
+                                                   identity, actor, limits_values, record,
                                                    text=note)
             except rooms.Refusal as refusal:
                 raise self._rooms_refusal(refusal) from None
@@ -6800,6 +7014,54 @@ class ApiHandler(BaseHTTPRequestHandler):
                             ('sequence', 'kind', 'item_kind', 'state', 'accepted_at')}
         return self._mutate(ctx, 'rooms.item.accept', ctx.params['pid'], write,
                             capability=capability, serialize=False)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/items/(?P<seq>[0-9]{1,12})/intent/cancel')
+    def rooms_item_intent_cancel(self, ctx):
+        """Cancel a pending accept intent (round 5, b2), audited as a room line.
+
+        Owners and coordinators cancel any intent; the intent's author cancels only their
+        own proposal-kind intent; nobody else (the coordinator's answer to Q3). The cancel
+        line names the identity, the records the attempts are known to have written, and
+        whether one may exist, so the record can be found and retired.
+        """
+        project = self._rooms_project(ctx)
+        self._rooms_item_session(ctx)
+        record, role = self._project(ctx, CAP_READ)
+        if isinstance(record, dict) and record.get('archived'):
+            raise conflict('The project is archived: its rooms can be read and exported, and no room is written.')
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'reason'}:
+            raise invalid('Send exactly: reason')
+        self._rooms_item(ctx, project)
+        actor = self._rooms_actor(ctx, role)
+        limits_values = self._rooms_limits()
+        rid = ctx.params['rid']
+        sequence = int(ctx.params['seq'])
+        def write():
+            try:
+                with self._rooms_item_lock(project):
+                    with self._rooms_lock(project):
+                        pending = rooms.pending_accept_intent(rooms.load_lines(project, rid), sequence)
+                    if pending is None:
+                        raise rooms.Refusal(409, 'not_accepting', 'That item has no acceptance in progress.')
+                    if role not in ('owner', 'coordinator', 'superuser'):
+                        if not (pending.get('record_kind') == 'proposal'
+                                and pending['author']['id'] == ctx.principal.user_id):
+                            raise forbidden('Only a project owner or coordinator can cancel this '
+                                            'acceptance; its author can cancel only their own proposal.')
+                    records, unknown = self._room_attempt_outcomes(ctx.params['pid'], project, rid,
+                                                                   pending)
+                    with self._rooms_lock(project):
+                        result = rooms.cancel_intent(project, rid, sequence, payload['reason'], actor,
+                                                     limits_values, records, unknown)
+            except rooms.Refusal as refusal:
+                raise self._rooms_refusal(refusal) from None
+            return result, {key: result.get(key) for key in
+                            ('sequence', 'kind', 'target_sequence', 'identity', 'records',
+                             'record_may_exist')}
+        return self._mutate(ctx, 'rooms.item.intent.cancel', ctx.params['pid'], write,
+                            capability=CAP_READ, serialize=False,
+                            reason='room %s item %d intent' % (rid, sequence))
 
     def _rooms_item_rights(self, ctx, item, role, event):
         """Who may amend or reject an item (review b3 of kittrial-5bb.388).
@@ -6940,8 +7202,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         actor = self._rooms_actor(ctx, role)
         operation_id = ctx.idempotency_key or ctx.request_id
         def write(project):
+            # Round 5 (b2): archive cancels every pending accept intent in the room first.
             return rooms.archive(project, ctx.params['rid'], actor, operation_id,
-                                 payload.get('reason'))
+                                 payload.get('reason'), self._rooms_limits(),
+                                 outcome=lambda pending: self._room_attempt_outcomes(
+                                     ctx.params['pid'], project, ctx.params['rid'], pending))
         return self._rooms_write(ctx, 'rooms.archive', CAP_COORDINATE, write,
                                  reason='room %s' % ctx.params['rid'], item_first=True)
 
@@ -6965,9 +7230,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 with self._rooms_item_lock(project):
                     with self._rooms_lock(project):
-                        result = rooms.moderate(project, ctx.params['rid'], sequence,
-                                                payload['reason'], operation_id, actor,
-                                                self._rooms_limits())
+                        # Round 5 (b2): moderation always wins. A pending accept intent on
+                        # the item is cancelled in the same section, naming what the
+                        # attempts are known to have written.
+                        result = rooms.moderate(
+                            project, ctx.params['rid'], sequence, payload['reason'],
+                            operation_id, actor, self._rooms_limits(),
+                            outcome=lambda pending: self._room_attempt_outcomes(
+                                ctx.params['pid'], project, ctx.params['rid'], pending))
             except rooms.Refusal as refusal:
                 raise self._rooms_refusal(refusal) from None
             return result, result

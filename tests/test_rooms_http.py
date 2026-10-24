@@ -45,7 +45,7 @@ class RoomsHttpTests(agents.AgentHarness):
         self.assertEqual(201, made.status, made.data)
         return made.data
 
-    def post(self, token, text, key='room-key-1', rid=None):
+    def post(self, token, text, key='msg-key-1', rid=None):
         return self.request('POST', self.rooms_path(rid or self.room['id'], '/messages'),
                             {'text': text}, token=token, key=key)
 

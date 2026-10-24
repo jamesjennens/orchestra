@@ -4312,15 +4312,60 @@ or the client's key — so a retry reconciles on the same record. An acceptance'
 follows the title and text it records, and an amendment's follows the new title, text and
 parent and the line it follows, so a second amendment applies (the page offers Amend on an
 amended item), amending back to an earlier text applies again, and an unchanged request
-replays. Before the native write the route appends an `item-intent` line naming that
-identity. While the intent has no matching accepted event (the record was written but the
-room append failed), an amendment, a supersede, a moderation or any other decision is
-refused (409 `accepting`); only a retry of that exact identity proceeds and reconciles on the
-record the failed attempt wrote, so one item still becomes one native record. A second accept
-with a *fresh* client key after the item is decided is refused (409) and writes no second
-record, proposal or decision; a contributor accept and an owner accept racing each other
-produce exactly one record, decided by whichever took the item-decision lock first. The
-client `Idempotency-Key` still guards the HTTP mutation.
+replays.
+
+**The accept intent, and who completes it.** Before any native write, the route appends an
+`item-intent` line. It names the identity, what the acceptance becomes (`record_kind`:
+requirement, proposal or decision, decided once from the first person's authority), the
+content digest it binds and the parent job chosen. A retry by anyone completes exactly that
+intent: same kind, same parent (a retry naming another parent is refused, 409).
+
+Who may complete it is checked live. A requirement or decision intent needs a current project
+owner or coordinator; a person demoted since is refused (403), never turned into a proposal. A
+proposal intent is submitted as its author, so only its author finishes it.
+
+**How a retry reconciles.** Each person writes under their own operation id, because the
+endpoint journal binds an id to the principal that first used it. A retry by someone else
+first reads every earlier attempt on the intent from the endpoint's operation journal. That
+row is written only by the endpoint, so a planted record or label is never matched.
+- An attempt that finished: its record is adopted.
+- A requirement that was created but not yet accepted: the retrying editor accepts it.
+- An attempt recorded as refused: it wrote nothing.
+- An attempt whose row is in flight, unknown or missing (committed rows are kept about a day):
+  uncertain. The retry is refused (409) until a coordinator cancels the intent.
+
+A person's attempt is logged as an `item-intent-attempt` line immediately before their own
+native write, and only then, so a refused or adopting retry logs nothing. At most five people
+try one intent.
+
+So one item becomes one native record, unless an intent whose outcome is unknown is cancelled.
+That is the one way two can exist, and the cancel line says so.
+
+**Moderation always wins, and nothing stays stuck.** While an intent is pending, an
+amendment, a supersede or another decision is refused (409 `accepting`). Three things cancel
+it with an `item-intent-cancel` line:
+- moderation, in the same room-lock section as its tombstone;
+- archiving a room, which cancels every pending intent in it first;
+- an owner or coordinator, through `POST .../rooms/{rid}/items/{seq}/intent/cancel {reason}`.
+  An intent's author may cancel only their own proposal-kind intent.
+
+The cancel line names the identity, the records the attempts are known to have written (from
+the journal), and `record_may_exist` when an outcome is unknown, so a coordinator can find and
+retire a stray record. A cancelled identity is refused for ever. The item's next acceptance
+uses a fresh identity, which counts the cancels.
+
+With no pending intent, moderation is exactly as before.
+
+**Room operation-id namespaces.** Accept intents are found by their kind and identity, never
+by a bare operation id. "Already decided" means only that an accept or reject event of that
+item exists. A client `Idempotency-Key` starting with `room-` or `intent-` is refused (422) on
+every room write route, messages included, so no line can occupy an identity an acceptance
+needs. The web page's keys start with `web-`.
+
+A second accept with a *fresh* client key after the item is decided is refused (409) and
+writes no second record, proposal or decision. A contributor accept and an owner accept
+racing each other produce exactly one record, decided by whichever took the item-decision lock
+first. The client `Idempotency-Key` still guards the HTTP mutation.
 
 **The items cache.** `index.json` gains a per-room `items` list: the current views and their
 decision history. It is a cache only. `rooms.py` builds it with the same function that a
@@ -4330,14 +4375,14 @@ every user-written event field are dropped on moderation and on rebuild.
 
 **Rollback.** An older kit reads the requirements, proposals and decisions created here
 unchanged (the pointer rides in fields it already has). A `.385` reader, and a `.388` reader
-older than this revision, does not know the `item`, `item-event` and `item-intent` line
-kinds, so it names such a room damaged instead of serving it; a kit without rooms ignores
+older than this revision, does not know the `item`, `item-event`, `item-intent`,
+`item-intent-attempt` and `item-intent-cancel` line kinds, so it names such a room damaged instead of serving it; a kit without rooms ignores
 `.rooms` entirely. Nothing in the tracker or the coordination sidecar changes shape.
 
 **Export.** The Markdown export adds each item with its state, evidence pointer and record,
-then its item events; the JSON-lines export carries the item, item-event and item-intent
-lines, with a moderated item's title, text, parent and every user-written event field
-replaced by its tombstone.
+then its item events. The JSON-lines export carries the item, item-event and intent lines,
+with a moderated item's title, text, parent and every user-written event field replaced by
+its tombstone (an intent's recorded parent is dropped too).
 
 ## Serving delivered bundles over HTTP
 

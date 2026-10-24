@@ -94,6 +94,30 @@ ITEM_EVENT_FIELDS_AMEND_PARENT = ITEM_EVENT_FIELDS_AMEND | {'parent'}
 #: skip it, while the raw JSONL export keeps it like every other stored line.
 ITEM_INTENT_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind',
                       'target_sequence', 'action', 'identity', 'author', 'created_at'}
+#: Round 5 (request 01a16bd3, b1): the intent also records what the acceptance becomes
+#: (``record_kind``), the content digest it binds and the parent job chosen, so a retry by
+#: anyone writes exactly that record under that parent instead of deciding again from the
+#: retrying caller's own role.
+ITEM_INTENT_FIELDS_RECORD = ITEM_INTENT_FIELDS | {'record_kind', 'content'}
+ITEM_INTENT_FIELDS_RECORD_PARENT = ITEM_INTENT_FIELDS_RECORD | {'parent'}
+#: One line per further person who tries to complete an intent, written BEFORE that person's
+#: native write, so a later retry knows every earlier attempt whose outcome it must check.
+ITEM_INTENT_ATTEMPT_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind',
+                              'target_sequence', 'identity', 'author', 'created_at'}
+#: An intent cancelled by moderation, archive or a coordinator (b2). ``records`` names the
+#: native records the earlier attempts are known to have written; ``record_may_exist`` says
+#: an attempt's outcome is not known, so a coordinator looks for the record by ``identity``.
+ITEM_INTENT_CANCEL_FIELDS = {'schema_version', 'sequence', 'operation_id', 'kind',
+                             'target_sequence', 'identity', 'reason', 'records',
+                             'record_may_exist', 'author', 'created_at'}
+#: Client keys may not start with these: they are the room's own operation-id namespaces
+#: (item decisions and intents), so no message, item or moderation line can occupy one (b2).
+RESERVED_KEY_PREFIXES = ('room-', 'intent-')
+#: At most this many different people may try to complete one intent; after that a
+#: coordinator cancels it.
+MAX_ATTEMPT_AUTHORS = 5
+CONTENT_DIGEST = re.compile(r'[0-9a-f]{16}\Z')
+INTENT_KINDS = ('item-intent', 'item-intent-attempt', 'item-intent-cancel')
 RECORD_FIELDS = {'kind', 'id', 'revision', 'sha256', 'decision_id', 'evidence'}
 RECORD_KINDS = ('requirement', 'proposal', 'decision')
 EVIDENCE = re.compile(r'orchestra:room/(r-[0-9a-f]{12})#([0-9]{1,12})\Z')
@@ -299,6 +323,20 @@ def check_operation_id(value):
     return value
 
 
+def check_client_operation_id(value):
+    """A client-chosen operation id: valid, and outside the room's own namespaces (b2/r5).
+
+    Item decisions and accept intents use ``room-...`` and ``intent-...`` ids derived from
+    the item. A message, item, moderation or archive keyed into either namespace could
+    otherwise occupy an identity an acceptance needs (review N8, N8b), so it is refused.
+    """
+    value = check_operation_id(value)
+    if value.startswith(RESERVED_KEY_PREFIXES):
+        raise Refusal(422, 'invalid', 'An Idempotency-Key may not start with %s: those names '
+                      'belong to the room itself.' % ' or '.join(RESERVED_KEY_PREFIXES))
+    return value
+
+
 def item_operation(room_id, sequence, revision, action):
     """The deterministic operation id of one item decision (never the client's key)."""
     return 'room-%s-%d-%d-%s' % (room_id, sequence, revision, action)
@@ -334,46 +372,98 @@ def item_intent_operation(identity):
     return 'intent-' + identity
 
 
+def item_intent_attempt_operation(identity, author_id):
+    """The room-line operation id of one further person's attempt on an intent (b1/r5)."""
+    digest = hashlib.sha256(('%s\x1f%s' % (identity, author_id)).encode('utf-8')).hexdigest()[:24]
+    return 'intent-attempt-' + digest
+
+
+def item_intent_cancel_operation(identity):
+    """The room-line operation id of the cancellation of one intent (b2/r5)."""
+    return 'intent-cancel-' + identity
+
+
+def accept_identity(lines, room_id, item):
+    """The native identity an acceptance of ``item`` uses now (b1 and b2 of round 5).
+
+    It names the room, the item, the content the acceptance records (review s1/r3) and how
+    many intents on the item were cancelled before, so an item whose intent a coordinator,
+    a moderation or an archive cancelled can be accepted afresh under a NEW identity, while
+    the cancelled identity itself is refused for ever.
+    """
+    cancelled = sum(1 for line in lines if line['kind'] == 'item-intent-cancel'
+                    and line['target_sequence'] == item['sequence'])
+    content = item_content_digest(item['title'], item['text'])
+    if cancelled:
+        content = '%s-c%d' % (content, cancelled)
+    return item_decision_operation(room_id, item['sequence'], 'accept', content=content)
+
+
+def _cancelled_identities(lines):
+    return {line['identity'] for line in lines if line['kind'] == 'item-intent-cancel'}
+
+
+def _accepted_identities(lines, sequence):
+    return {line['operation_id'] for line in lines
+            if line['kind'] == 'item-event' and line['event'] == 'accept'
+            and line['target_sequence'] == sequence}
+
+
 def pending_accept_intent(lines, sequence):
-    """The accept intent on an item that has no matching accepted event yet, or None.
+    """The accept intent on an item that is neither accepted nor cancelled yet, or None.
 
     Review b1/r4: the route appends this line before the native write. While it is pending,
-    an amendment, a supersede, a moderation or any decision other than a retry of that exact
-    identity is refused (409 ``accepting``), so the item cannot change under the native
-    record the failed attempt already wrote.
+    an amendment, a supersede or a decision other than completing that intent is refused
+    (409 ``accepting``), so the item cannot change under the native record an attempt may
+    already have written. Round 5 (b2): moderation, archive and a coordinator CANCEL it, and
+    a cancelled intent is never pending again.
     """
-    accepted = {line['operation_id'] for line in lines
-                if line['kind'] == 'item-event' and line['event'] == 'accept'
-                and line['target_sequence'] == sequence}
+    accepted = _accepted_identities(lines, sequence)
+    cancelled = _cancelled_identities(lines)
     for line in reversed(lines):
         if line['kind'] != 'item-intent' or line['target_sequence'] != sequence:
             continue
-        if line['identity'] in accepted:
+        if line['identity'] in accepted or line['identity'] in cancelled:
             continue
         return line
     return None
 
 
-def intend_accept(project, room_id, sequence, identity, author, limits_values):
-    """Write the accept intent before the native record (review b1/r4).
+def intent_authors(lines, identity):
+    """Everyone who has tried to complete one intent, the intent's author first (b1/r5)."""
+    authors = []
+    for line in lines:
+        if line['kind'] in ('item-intent', 'item-intent-attempt') and line['identity'] == identity:
+            if line['author']['id'] not in [author['id'] for author in authors]:
+                authors.append(dict(line['author']))
+    return authors
 
-    The line names the identity of the native record about to be written. A retry of that
-    same identity reuses the line and proceeds; any other decision on the item is refused
-    until the matching accepted event exists.
+
+def intend_accept(project, room_id, sequence, identity, author, limits_values,
+                  record_kind=None, content=None, parent=None):
+    """Write the accept intent before the native record (review b1/r4; round 5 b1).
+
+    The line names the identity of the native record about to be written, the record kind
+    it becomes, the content digest and the parent job, so a retry by anyone writes exactly
+    that record. A retry of the same identity reuses the line; any other decision on the
+    item is refused until the matching accepted event exists or the intent is cancelled.
+    Intents are found by their kind and identity, never by a bare operation id, so no other
+    line can occupy or impersonate one (b2/r5).
     """
     identity = check_operation_id(identity)
     if type(sequence) is not int or sequence < 1:
         raise Refusal(422, 'invalid', 'The item number must be a positive whole number')
+    if record_kind is not None and record_kind not in RECORD_KINDS:
+        raise Refusal(422, 'invalid', 'Unknown record kind')
+    if record_kind is not None and (not isinstance(content, str) or not CONTENT_DIGEST.fullmatch(content)):
+        raise Refusal(422, 'invalid', 'The intent needs the content digest it binds')
+    if parent is not None and (not isinstance(parent, str) or not OPERATION_ID.fullmatch(parent)):
+        raise Refusal(422, 'invalid', 'Invalid parent job id')
     _room_open(project, room_id)
     lines = load_lines(project, room_id)
-    operation_id = item_intent_operation(identity)
-    existing = _find_operation(lines, operation_id)
-    if existing is not None:
-        if (existing['kind'] == 'item-intent' and existing['target_sequence'] == sequence
-                and existing['identity'] == identity):
-            return dict(existing, replayed=True)
-        raise Refusal(409, 'operation_reused',
-                      'That operation id already wrote a different room line.')
+    if identity in _cancelled_identities(lines):
+        raise Refusal(409, 'cancelled', 'That acceptance was cancelled; reload the item and '
+                      'decide it afresh.')
     pending = pending_accept_intent(lines, sequence)
     if pending is not None:
         if pending['identity'] == identity:
@@ -389,11 +479,85 @@ def intend_accept(project, room_id, sequence, identity, author, limits_values):
     if current['state'] not in ('proposed', 'amended'):
         raise Refusal(409, 'final', 'That item is already decided.')
     line = {'schema_version': SCHEMA_VERSION, 'sequence': lines[-1]['sequence'] + 1,
-            'operation_id': operation_id, 'kind': 'item-intent',
+            'operation_id': item_intent_operation(identity), 'kind': 'item-intent',
             'target_sequence': sequence, 'action': 'accept', 'identity': identity,
             'author': dict(author), 'created_at': now_iso()}
+    if record_kind is not None:
+        line['record_kind'] = record_kind
+        line['content'] = content
+        if parent is not None:
+            line['parent'] = parent
     _append(project, room_id, line, limits_values)
     return dict(line, replayed=False)
+
+
+def record_attempt(project, room_id, sequence, identity, author, limits_values):
+    """Log one further person's attempt on a pending intent, before their native write.
+
+    Returns everyone who tried BEFORE this person (b1/r5): the route checks each of their
+    outcomes in the endpoint's operation journal before it writes anything itself.
+    """
+    lines = load_lines(project, room_id)
+    pending = pending_accept_intent(lines, sequence)
+    if pending is None or pending['identity'] != identity:
+        raise Refusal(409, 'accepting', 'That acceptance is no longer pending; reload the item.')
+    authors = intent_authors(lines, identity)
+    earlier = [dict(entry) for entry in authors if entry['id'] != author['id']]
+    if any(entry['id'] == author['id'] for entry in authors):
+        return earlier
+    if len(authors) >= MAX_ATTEMPT_AUTHORS:
+        raise Refusal(409, 'accepting', 'Too many people have tried to accept this item; a '
+                      'project owner or coordinator cancels the acceptance first.')
+    line = {'schema_version': SCHEMA_VERSION, 'sequence': lines[-1]['sequence'] + 1,
+            'operation_id': item_intent_attempt_operation(identity, author['id']),
+            'kind': 'item-intent-attempt', 'target_sequence': sequence, 'identity': identity,
+            'author': dict(author), 'created_at': now_iso()}
+    _append(project, room_id, line, limits_values)
+    return earlier
+
+
+def _cancel_line(lines, pending, reason, author, records, record_may_exist):
+    return {'schema_version': SCHEMA_VERSION, 'sequence': lines[-1]['sequence'] + 1,
+            'operation_id': item_intent_cancel_operation(pending['identity']),
+            'kind': 'item-intent-cancel', 'target_sequence': pending['target_sequence'],
+            'identity': pending['identity'], 'reason': reason,
+            'records': sorted(set(records or ())), 'record_may_exist': bool(record_may_exist),
+            'author': dict(author), 'created_at': now_iso()}
+
+
+def cancel_intent(project, room_id, sequence, reason, author, limits_values, records=(),
+                  record_may_exist=True, require_room_open=True):
+    """Cancel the pending accept intent on one item (b2/r5), or refuse when none is pending.
+
+    The cancel line names the identity, the native records the earlier attempts are known to
+    have written, and whether an attempt's outcome is unknown (``record_may_exist``), so a
+    coordinator can find any record by the identity. A cancelled identity is never accepted.
+    """
+    reason = check_reason(reason)
+    if type(sequence) is not int or sequence < 1:
+        raise Refusal(422, 'invalid', 'The item number must be a positive whole number')
+    if require_room_open:
+        _room_open(project, room_id)
+    lines = load_lines(project, room_id)
+    pending = pending_accept_intent(lines, sequence)
+    if pending is None:
+        raise Refusal(409, 'not_accepting', 'That item has no acceptance in progress.')
+    line = _cancel_line(lines, pending, reason, author, records, record_may_exist)
+    _append(project, room_id, line, limits_values)
+    return dict(line, replayed=False)
+
+
+def decision_event(lines, sequence):
+    """The accept or reject event of an item, or None (round 5, s-notes: N8b).
+
+    "Already decided" is answered only when such an event exists, never because some other
+    line happens to carry the same operation id.
+    """
+    for line in lines:
+        if (line['kind'] == 'item-event' and line['target_sequence'] == sequence
+                and line['event'] in ('accept', 'reject')):
+            return line
+    return None
 
 
 # -- paths and atomic writes ----------------------------------------------------------------------
@@ -489,7 +653,15 @@ def _validate_line(line, expected=None):
         else:
             required = ITEM_EVENT_FIELDS
     elif kind == 'item-intent':
-        required = ITEM_INTENT_FIELDS
+        if 'record_kind' not in line:
+            required = ITEM_INTENT_FIELDS
+        else:
+            required = (ITEM_INTENT_FIELDS_RECORD_PARENT if 'parent' in line
+                        else ITEM_INTENT_FIELDS_RECORD)
+    elif kind == 'item-intent-attempt':
+        required = ITEM_INTENT_ATTEMPT_FIELDS
+    elif kind == 'item-intent-cancel':
+        required = ITEM_INTENT_CANCEL_FIELDS
     else:
         raise ValueError('Invalid room line kind')
     if set(line) != required:
@@ -519,6 +691,28 @@ def _validate_line(line, expected=None):
             raise ValueError('Invalid room item-intent action')
         if not isinstance(line['identity'], str) or not OPERATION_ID.fullmatch(line['identity']):
             raise ValueError('Invalid room item-intent identity')
+        if 'record_kind' in line:
+            if line['record_kind'] not in RECORD_KINDS:
+                raise ValueError('Invalid room item-intent record kind')
+            if not isinstance(line['content'], str) or not CONTENT_DIGEST.fullmatch(line['content']):
+                raise ValueError('Invalid room item-intent content')
+            if 'parent' in line and (not isinstance(line['parent'], str)
+                                     or not OPERATION_ID.fullmatch(line['parent'])):
+                raise ValueError('Invalid room item-intent parent')
+    if kind in ('item-intent-attempt', 'item-intent-cancel'):
+        if type(line['target_sequence']) is not int or line['target_sequence'] < 1:
+            raise ValueError('Invalid room %s target' % kind)
+        if not isinstance(line['identity'], str) or not OPERATION_ID.fullmatch(line['identity']):
+            raise ValueError('Invalid room %s identity' % kind)
+    if kind == 'item-intent-cancel':
+        if not isinstance(line['reason'], str) or not line['reason'].strip() or len(line['reason']) > 500:
+            raise ValueError('Invalid room item-intent-cancel reason')
+        if (not isinstance(line['records'], list) or len(line['records']) > MAX_ATTEMPT_AUTHORS * 2
+                or any(not isinstance(value, str) or not OPERATION_ID.fullmatch(value)
+                       for value in line['records'])):
+            raise ValueError('Invalid room item-intent-cancel records')
+        if type(line['record_may_exist']) is not bool:
+            raise ValueError('Invalid room item-intent-cancel record_may_exist')
     if kind == 'item':
         if line['item_kind'] not in ITEM_KINDS:
             raise ValueError('Invalid room item kind')
@@ -910,13 +1104,30 @@ def create(project, name, actor, limits_values):
     return _room_view(room)
 
 
-def archive(project, room_id, actor, operation_id, reason=None):
-    operation_id = check_operation_id(operation_id)
+def archive(project, room_id, actor, operation_id, reason=None, limits_values=None, outcome=None):
+    """Archive a room. Every pending accept intent in it is cancelled first (round 5, b2).
+
+    Otherwise an item whose acceptance failed would stay pending in a room that can no
+    longer be written, so it could never be moderated again (review N2). ``outcome(pending)``
+    comes from the route, which can read the endpoint journal; the route holds the
+    item-decision lock, so no acceptance is in flight while this runs.
+    """
+    operation_id = check_client_operation_id(operation_id)
     if reason is not None:
         reason = check_reason(reason)
     room = read_room(project, room_id)
     if room['state'] == 'archived':
         return dict(_room_view(room), replayed=room.get('archive_operation_id') == operation_id)
+    lines = load_lines(project, room_id)
+    for item in items_from_lines(lines, room_id):
+        pending = pending_accept_intent(lines, item['sequence'])
+        if pending is None:
+            continue
+        records, may_exist = outcome(pending) if outcome is not None else ((), True)
+        _append(project, room_id, _cancel_line(lines, pending, 'room archived', actor, records,
+                                               may_exist),
+                limits_values if limits_values is not None else dict(LIMIT_DEFAULTS))
+        lines = load_lines(project, room_id)
     room['state'] = 'archived'
     room['archived_by'] = actor['id']
     room['archived_by_name'] = actor['name']
@@ -1096,9 +1307,9 @@ def read_messages(project, room_id, since=0, limit=100):
     last_visible = since
     more = False
     for line in lines:
-        # An accept intent is internal bookkeeping (review b1/r4): the page sees the item
-        # and its eventual decision, not the pending line.
-        if line['kind'] in ('tombstone', 'item-intent'):
+        # Accept intents, attempts and cancels are internal bookkeeping (review b1/r4, round
+        # 5): the page sees the item and its eventual decision, not those lines.
+        if line['kind'] == 'tombstone' or line['kind'] in INTENT_KINDS:
             continue
         if line['sequence'] <= since:
             continue
@@ -1116,7 +1327,7 @@ def read_messages(project, room_id, since=0, limit=100):
         last_visible = line['sequence']
     if not more:
         # Is there a visible line after the page even when no tombstone followed it?
-        more = any(line['kind'] not in ('tombstone', 'item-intent')
+        more = any(line['kind'] != 'tombstone' and line['kind'] not in INTENT_KINDS
                    and line['sequence'] > last_visible for line in lines)
     moderations = [_tombstone_view(line) for line in events if line['sequence'] > since]
     index = read_index(project)
@@ -1211,7 +1422,7 @@ def _append(project, room_id, line, limits_values):
 
 
 def post(project, room_id, text, operation_id, author, limits_values):
-    operation_id = check_operation_id(operation_id)
+    operation_id = check_client_operation_id(operation_id)
     text = check_text(text, limits_values['max_message_chars'])
     room = read_room(project, room_id)
     if room['state'] != 'open':
@@ -1241,7 +1452,7 @@ def _room_open(project, room_id):
 def post_item(project, room_id, item_kind, title, text, operation_id, author, limits_values,
               supersedes=None, parent=None):
     """Post one item line: a proposed requirement, decision or question."""
-    operation_id = check_operation_id(operation_id)
+    operation_id = check_client_operation_id(operation_id)
     item_kind = check_item_kind(item_kind)
     title = check_title(title)
     text = check_item_text(text, limits_values['max_message_chars'])
@@ -1301,7 +1512,11 @@ def _decide_item(project, room_id, sequence, event, operation_id, author, limits
         raise Refusal(422, 'invalid', 'Unknown item decision')
     _room_open(project, room_id)
     lines = load_lines(project, room_id)
-    existing = _find_operation(lines, operation_id)
+    # Round 5 (N8b): only an item-event line of this item can be this decision's earlier
+    # write; a line of any other kind under the same id is not (and client keys cannot use
+    # the room's namespaces any more, check_client_operation_id).
+    existing = next((line for line in reversed(lines) if line['kind'] == 'item-event'
+                     and line['operation_id'] == operation_id), None)
     if existing is not None:
         matches = (existing['kind'] == 'item-event' and existing['target_sequence'] == sequence
                    and existing['event'] == event and existing['text'] == text
@@ -1313,6 +1528,9 @@ def _decide_item(project, room_id, sequence, event, operation_id, author, limits
             return dict(view, replayed=True)
         raise Refusal(409, 'operation_reused',
                       'That operation id already wrote a different room line.')
+    if event == 'accept' and operation_id in _cancelled_identities(lines):
+        raise Refusal(409, 'cancelled', 'That acceptance was cancelled; reload the item and '
+                      'decide it afresh.')
     pending = pending_accept_intent(lines, sequence)
     if pending is not None and not (event == 'accept' and operation_id == pending['identity']):
         raise Refusal(409, 'accepting',
@@ -1401,8 +1619,16 @@ def answer_item(project, room_id, sequence, operation_id, author, limits_values,
                         limits_values, text=text)
 
 
-def moderate(project, room_id, target_sequence, reason, operation_id, author, limits_values):
-    operation_id = check_operation_id(operation_id)
+def moderate(project, room_id, target_sequence, reason, operation_id, author, limits_values,
+             outcome=None):
+    """Replace a message or item by a tombstone. Moderation always wins (round 5, b2).
+
+    A pending accept intent on the item does not block it: the intent is cancelled first,
+    in the same room-lock section, and ``outcome(pending)`` (from the route, which can read
+    the endpoint journal) names what the earlier attempts are known to have written. With
+    no pending intent nothing changes from slice 1.
+    """
+    operation_id = check_client_operation_id(operation_id)
     reason = check_reason(reason)
     if type(target_sequence) is not int or target_sequence < 1:
         raise Refusal(422, 'invalid', 'target_sequence must be a positive whole number')
@@ -1418,12 +1644,14 @@ def moderate(project, room_id, target_sequence, reason, operation_id, author, li
     target = next((line for line in lines if line['sequence'] == target_sequence), None)
     if target is None or target['kind'] not in ('message', 'item'):
         raise Refusal(404, 'not_found', 'No such message or item in this room.')
-    if target['kind'] == 'item' and pending_accept_intent(lines, target_sequence) is not None:
-        raise Refusal(409, 'accepting',
-                      'That item is being accepted; it cannot be moderated until the acceptance '
-                      'is recorded.')
     if any(line['kind'] == 'tombstone' and line['target_sequence'] == target_sequence for line in lines):
         raise Refusal(409, 'already_moderated', 'That line is already a tombstone.')
+    pending = pending_accept_intent(lines, target_sequence) if target['kind'] == 'item' else None
+    if pending is not None:
+        records, may_exist = outcome(pending) if outcome is not None else ((), True)
+        _append(project, room_id, _cancel_line(lines, pending, 'moderated', author, records,
+                                               may_exist), limits_values)
+        lines = load_lines(project, room_id)
     at = now_iso()
     text = 'removed by %s at %s: %s' % (author['name'], at, reason)
     line = {'schema_version': SCHEMA_VERSION, 'sequence': lines[-1]['sequence'] + 1,
@@ -1529,6 +1757,11 @@ def export_jsonl(project, room_id):
             # Review n2/r4: an amendment's parent is user-chosen data too; the JSONL export
             # clears it with the title when the item was moderated.
             safe.pop('title', None)
+            safe.pop('parent', None)
+        elif line['kind'] == 'item-intent' and line['target_sequence'] in tombstones:
+            # Round 5: the intent records the parent job an editor chose; that is the item's
+            # data too, so a moderated item's intent loses it like its amendments do.
+            safe = dict(line)
             safe.pop('parent', None)
         else:
             safe = dict(line)

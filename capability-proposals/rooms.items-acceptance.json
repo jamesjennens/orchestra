@@ -8,9 +8,12 @@
     "accept reject amend a room item",
     "candidate requirement from a room",
     "room decision item to native decision",
-    "orchestra:room pointer in existing fields"
+    "orchestra:room pointer in existing fields",
+    "cancel a room item acceptance",
+    "stuck room item",
+    "room accept intent"
   ],
-  "summary": "Slice 2 of project rooms. Item and item-event lines in the append-only room files; states proposed, accepted, rejected, amended, superseded; accept/reject/amend/answer by a signed-in person only (R7, never an agent credential). A requirement-editor accept creates and accepts a requirement through the B1 routes; a contributor accept submits a requirement proposal as that person; a decision accept creates the native decision through the service-only room-decision action, which re-checks live owner/coordinator membership and the item's room, title, text and evidence in the endpoint before a guarded write; a question answer stays a room item with who and when. Rejecting or amending needs the item author or an owner/coordinator; answering a question is a member action. The pointer orchestra:room/<room-id>#<seq> rides only in an existing description, proposal evidence list or decision rationale; no record shape changes and no source field. A stable item identity and a project item-decision lock make one record per item; a derived items cache in index.json rebuilds identically from the segment lines; a moderated item's title, text and every user-written event field are served nowhere.",
+  "summary": "Slice 2 of project rooms. Item and item-event lines in the append-only room files; states proposed, accepted, rejected, amended, superseded; accept/reject/amend/answer by a signed-in person only (R7). A requirement-editor accept creates and accepts a requirement through the B1 routes; a contributor accept submits a proposal as that person; a decision accept creates a native decision through the service-only room-decision action, which re-checks live authority and the item before a guarded write. The pointer orchestra:room/<room-id>#<seq> rides only in existing fields. An accept intent (record kind, parent, content) and the item-decision lock make one record per item: another person's retry adopts earlier attempts' records from the endpoint operation journal (unknown outcomes refused until cancelled); moderation, archive or an owner/coordinator cancel a pending intent. A derived items cache rebuilds identically from the lines; a moderated item's text is served nowhere.",
   "requirements": [],
   "anchors": [
     "docs/HTTP_DEPLOYMENT.md#project-room-items-and-acceptance-over-http-slice-2-kittrial-5bb388",
@@ -32,7 +35,15 @@
     "requirement_http.py::room_decision",
     "requirement_http.py::create_decision",
     "http_authority.py::required_capability",
-    "project_creation.py::service_descriptor"
+    "project_creation.py::service_descriptor",
+    "rooms.py::intend_accept",
+    "rooms.py::record_attempt",
+    "rooms.py::cancel_intent",
+    "rooms.py::accept_identity",
+    "rooms.py::pending_accept_intent",
+    "http_service.py::ApiHandler.rooms_item_intent_cancel",
+    "http_service.py::ApiHandler._room_prior_record",
+    "http_service.py::EndpointBackend.prior_room_write"
   ],
   "tests": [
     "tests/test_rooms.py::RoomsItemsTest",

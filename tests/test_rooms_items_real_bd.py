@@ -299,6 +299,115 @@ class RoomsItemsRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTest
         self.assertEqual(2, closed.get('returncode'), closed)
         self.assertEqual(before, len(self.export_rows()))
 
+    # -- round 5 (request 01a16bd3): retries across people, through the REAL operation journal --
+    def promote(self, who, role):
+        admin = self.admin_token()
+        put = self.request('PUT', '/v1/projects/pp/members/%s' % self.ids[who], {'role': role},
+                           token=admin)
+        self.assertIn(put.status, (200, 201), put.data)
+
+    def fail_first_append(self):
+        import rooms
+        original = rooms.accept_item
+        state = {'n': 0}
+        def failing(*args, **kwargs):
+            state['n'] += 1
+            if state['n'] == 1:
+                raise OSError('injected append failure after the native write')
+            return original(*args, **kwargs)
+        rooms.accept_item = failing
+        self.addCleanup(setattr, rooms, 'accept_item', original)
+
+    def rows_with_pointer(self, rid):
+        pointer = self.pointer(rid)
+        return [row for row in self.export_rows() if pointer in (row.get('description') or '')]
+
+    def test_r5_a_retry_by_another_editor_adopts_the_record_from_the_journal(self):
+        # Review N1 with the real endpoint: alex's record lands, the room append fails, and
+        # drew (a coordinator) retries. Drew reads alex's attempt from the endpoint journal
+        # and adopts that record: one requirement and one decision, not two.
+        self.promote('drew', 'coordinator')
+        self.addCleanup(self.promote, 'drew', 'contributor')
+        rid = self.room('R5 adopt')
+        self.assertEqual(201, self.item(rid, parent=self.job, key='r5a-item-key').status)
+        self.fail_first_append()
+        failed = self.decide(rid, 'alex', key='r5a-accept-alex')
+        self.assertEqual(500, failed.status, failed.data)
+        retried = self.decide(rid, 'drew', key='r5a-accept-drew')
+        self.assertEqual(200, retried.status, retried.data)
+        rows = self.rows_with_pointer(rid)
+        self.assertEqual(1, len([row for row in rows if 'requirement' in (row.get('labels') or [])]),
+                         rows)
+        self.assertEqual(retried.data['record']['id'],
+                         next(row['id'] for row in rows if 'requirement' in (row.get('labels') or [])))
+
+    def test_r5_a_decision_retry_by_another_coordinator_adopts_the_decision(self):
+        self.promote('drew', 'coordinator')
+        self.addCleanup(self.promote, 'drew', 'contributor')
+        rid = self.room('R5 decision')
+        self.assertEqual(201, self.item(rid, kind='decision', title='Use CSV', text='CSV first.',
+                                        key='r5d-item-key').status)
+        self.fail_first_append()
+        failed = self.decide(rid, 'alex', key='r5d-accept-alex')
+        self.assertEqual(500, failed.status, failed.data)
+        retried = self.decide(rid, 'drew', key='r5d-accept-drew')
+        self.assertEqual(200, retried.status, retried.data)
+        decisions = [row for row in self.rows_with_pointer(rid)
+                     if (row.get('issue_type') or row.get('type')) == 'decision']
+        self.assertEqual(1, len(decisions), decisions)
+        self.assertEqual(retried.data['record']['decision_id'], decisions[0]['id'])
+
+    def test_r5_a_missing_journal_row_is_uncertain_not_nothing_written(self):
+        # The coordinator's condition: committed rows are kept about a day; a logged attempt
+        # whose row is gone is uncertain (409), never "nothing was written".
+        import sqlite3
+        from http_authority import journal_path
+        self.promote('drew', 'coordinator')
+        self.addCleanup(self.promote, 'drew', 'contributor')
+        rid = self.room('R5 expired')
+        self.assertEqual(201, self.item(rid, parent=self.job, key='r5e-item-key').status)
+        self.fail_first_append()
+        self.assertEqual(500, self.decide(rid, 'alex', key='r5e-accept-alex').status)
+        with sqlite3.connect(str(journal_path(self.project))) as connection:
+            deleted = connection.execute(
+                "DELETE FROM operations WHERE route IN ('requirements.create', 'requirements.accept')").rowcount
+        self.assertGreaterEqual(deleted, 1)
+        refused = self.decide(rid, 'drew', key='r5e-accept-drew')
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertEqual(1, len([row for row in self.rows_with_pointer(rid)
+                                 if 'requirement' in (row.get('labels') or [])]))
+        cancelled = self.request('POST', '/v1/projects/pp/rooms/%s/items/1/intent/cancel' % rid,
+                                 {'reason': 'outcome unknown'}, token=self.tokens['alex'],
+                                 key='r5e-cancel-key')
+        self.assertEqual(200, cancelled.status, cancelled.data)
+        self.assertTrue(cancelled.data['record_may_exist'])
+
+    def test_r5_a_planted_record_carrying_the_pointer_is_not_adopted(self):
+        # The coordinator's condition: a record whose text merely mentions the pointer is
+        # never matched; only the journal rows of the room path's own attempts are.
+        self.promote('drew', 'coordinator')
+        self.addCleanup(self.promote, 'drew', 'contributor')
+        rid = self.room('R5 planted')
+        self.assertEqual(201, self.item(rid, parent=self.job, key='r5p-item-key').status)
+        planted = self.bd('create', 'Add export', '--description',
+                          'We need CSV export.\n\n' + self.pointer(rid), '--json')
+        self.assertEqual(0, planted.returncode, planted.stderr)
+        planted_id = json.loads(planted.stdout)['id']
+        original = self.backend.owner_requirements
+        def refuse_create(principal, pid, action, *args, **kwargs):
+            if action == 'create':
+                raise OSError('injected: bd unavailable, nothing written')
+            return original(principal, pid, action, *args, **kwargs)
+        self.backend.owner_requirements = refuse_create
+        failed = self.decide(rid, 'alex', key='r5p-accept-alex')
+        self.backend.owner_requirements = original
+        self.assertEqual(500, failed.status, failed.data)
+        refused = self.decide(rid, 'drew', key='r5p-accept-drew')
+        self.assertEqual(409, refused.status, refused.data)
+        accepted = self.decide(rid, 'alex', key='r5p-accept-alex-2')
+        self.assertEqual(200, accepted.status, accepted.data)
+        self.assertNotEqual(planted_id, accepted.data['record']['id'])
+
 
 if __name__ == '__main__':
     unittest.main()
