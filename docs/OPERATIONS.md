@@ -16,6 +16,70 @@ operator relationship is shown separately from approval at recording time;
 historical principal ownership cannot be proved by today's registry. Questionable
 evidence is for operator review, not a finding of fraud. Reads create no store.
 
+### D2 audit and release diagnostics
+
+Keep audit reports and their frozen native/protected evidence on the host, outside
+the source repository. The report is untrusted, advisory data for operator review.
+It records no correction, lifecycle fact, assignment or approval.
+
+A complete kit retry pair appears in `kit_intermediates`: the exact retry reason,
+same task/dimension/author, consecutive unique native child orders and a canonical
+following payload are required. Existing previous-value evidence must agree.
+Second-resolution timestamps may be equal when those native child IDs prove the
+order; missing/duplicate orders and reversed or unusable times stay unknown.
+Only the intermediate leaves revised questionable/unclassifiable totals. The
+following fact retains its own recorder, approval and correction assessment.
+Unpaired retry candidates remain explicit unknown evidence. Ordinary non-lifecycle
+native events have a separate stream. `original_counts` preserves the old audit's
+raw-row counts; revised totals and overlapping reason/cause counts deduplicate
+native event IDs. Raw page items can repeat an ambiguous native ID: reconcile
+revised totals using ID unions, rather than adding overlapping categories or pages.
+
+Only this host audit adapter reads native version history. It uses read-only
+`bd history ID --json --limit N` for parent tasks and their lifecycle event IDs.
+The history enrichment budget is 24 native calls, 128 versions per issue plus one
+truncation sentinel, 1,024 returned versions across the audit, 1 MiB stdout per
+call, 4 MiB charged stdout across the audit, and ten seconds across history reads;
+each call receives at most three seconds or the remaining deadline. The existing
+bounded native runner stops overlarge output and times out the native process;
+its bounded pipe/cleanup overhead is additional. The existing export and audit
+analysis are outside this history-read deadline. `historical_read_coverage`
+reports the limits, calls, returned versions, received/charged bytes, elapsed time,
+unread ID count and stop reason. A failed byte-cap read is charged its byte allowance.
+
+A native version proves the assignee field at that commit. The audit joins the
+parent's exact commit to the lifecycle event's first native creation commit,
+checks both current heads and unchanged event bytes, and reports that commit as
+its basis. It never interpolates a holder between versions. Missing/truncated,
+damaged, tied, mismatched or gapped history remains `unknown`; a backdated/imported
+creation outside native one-second timestamp rounding is unproved. Today's holder
+stays separate. The committer is the service identity, never who assigned.
+`assigned_by` additionally needs a unique validated assignment notice connected
+to the actual native holder and a matching native holder transition with strict
+time ordering. Even that is attributed evidence, not authenticated historical
+principal ownership. An exported JSON field cannot supply host history context.
+
+Every event, correction, pair, unpaired retry, ordinary/unknown native row and
+unreadable-chain stream shares `limit`/`offset`; follow `next_offset` until null.
+Each stream reports totals and omissions. Retain the snapshot and all pages with
+their history coverage. A cap is unknown evidence, not an empty clean category;
+concurrent native edits can cause a head mismatch and require a fresh audit.
+
+Release selection, query and CLI dry-run reports can include bounded
+`review_void_diagnostics` for an individually validated, currently ineligible
+review VOID of a hold/release. They name exact task/hold/release/VOID IDs, issuer,
+current result/reason and an explanatory counterfactual. At most 50 are shown,
+with total/omitted counts. Historical operator membership stays unproved unless
+separately established; the report says currently ineligible, not proved revoked.
+A canonical review VOID repairs malformed/forked history; it cannot remove a
+protected linked hold. Removing its issuer can therefore make the current chain
+unreadable: that result remains unreadable and the existing release refusal
+still applies. A counterfactual is never used for target selection, reverts,
+attestations, gates or writes. Irrelevant, damaged or protected VOIDs do not gain
+this diagnostic. These paths never load native assignment history.
+
+### Host corrections
+
 The host-only writer is OFF on a new installation and stays OFF on upgrade unless
 an operator explicitly changes it. First install this reader, backup and restore
 support on **every installation that may hold or restore the project**. Then a

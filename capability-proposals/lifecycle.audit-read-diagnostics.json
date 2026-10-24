@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5988c79e39f1404084b6cc4f73648dcf",
+  "key": "lifecycle.audit-read-diagnostics",
+  "name": "Read-only lifecycle audit and release diagnostics",
+  "aliases": [
+    "D2 intermediate historical assignment lifecycle audit decisive inactive review VOID",
+    "kit intermediate audit pairs",
+    "historical assignee at native creation commit",
+    "inactive review void release warning"
+  ],
+  "summary": "Read-only audit separates exact complete kit retry pairs, preserves baseline counts and reports revised deduplicated reasons and paged evidence. Host admin audit alone loads bounded native histories (versions, calls, bytes and deadline); exact parent/event creation-commit joins prove a field at that commit only. Caps, ties, gaps, damaged/missing history and head mismatches stay unknown; validated anchored notices separately attribute assignment. Release/query/dry-run diagnostics name currently ineligible review VOIDs and the current canonical result, with explanatory counterfactuals that never govern selection or gates. Legacy facts, writer policies and stores are unchanged; audit output is private untrusted data.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#d2-audit-and-release-diagnostics",
+    "docs/CLI_CONTRACT.md#read-only-lifecycle-audit-and-release-diagnostics"
+  ],
+  "code": [
+    "lifecycle_audit.py::intermediate_pairs",
+    "lifecycle_audit.py::load_assignment_history",
+    "lifecycle_audit.py::historical_assignment",
+    "lifecycle_audit.py::review_void_report",
+    "lifecycle_voids.py::audit",
+    "admin.py::lifecycle_audit_command",
+    "lifecycle.py::release_selection",
+    "lifecycle.py::release_query"
+  ],
+  "tests": [
+    "tests/test_lifecycle_d2_audit.py",
+    "tests/test_lifecycle_d2_native.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "lifecycle",
+    "audit",
+    "history",
+    "release",
+    "read-only"
+  ]
+}

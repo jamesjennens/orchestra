@@ -2217,3 +2217,67 @@ work in both simple and governed projects. Missing historical governance and
 restores from backups without governance remain governed; only a new durable
 creation intent opts into the simple provisioning default. See
 [REQUIREMENTS.md](REQUIREMENTS.md) for the trust boundary and export procedure.
+
+
+## Read-only lifecycle audit and release diagnostics
+
+The host `admin.py lifecycle-audit` report has additive D2 fields. Ordinary
+lifecycle facts, reader overlays, raw-write protection and writer switches retain
+their existing contracts. Audit classifications are advisory untrusted data
+(`trust: data`), and the complete audit stays private on the host.
+
+`original_counts` contains the baseline audit's raw-row counts. Root revised
+`questionable_fact_count`, `questionable_native_record_count`,
+`unclassifiable_classification_count` and `unclassifiable_fact_count` count distinct
+native IDs. `questionable_reason_counts` and `unclassifiable_cause_counts` overlap;
+each reason counts a named event once. `deduplicated_event_count` and
+`duplicate_native_event_id_count` disclose repeated raw IDs. The root `total` and
+`items` pagination retain raw event occurrences. Each item adds `classification`,
+`native_occurrences`, `questionable_reasons`, `unclassifiable_causes`,
+`historical_assignment` and `recorder_is_historical_assignee` (null when unknown).
+The existing current-assignee, operator and issued-mark columns remain separate.
+
+`kit_intermediates` binds `event_id`, `following_event_id`, operation ID, dimension
+and native-order basis. Only its intermediate row is excluded from revised counts;
+its following fact is audited normally. `unpaired_intermediates`,
+`ordinary_native_events`, `unknown_native_events` and `unreadable_hold_chains` are
+separate streams. Each has a total/count and before/after omission fields;
+`page_total`/`next_offset` cover all streams, including corrections. Unknown native
+rows also carry source row hashes, occurrence counts and at most ten distinct
+hash variants with an omitted count. Reconcile unique totals by IDs/hashes across
+all pages; raw per-page occurrence counts are not deduplicated global totals.
+
+`historical_assignment.state` is `known` only for an exact shared parent/event
+creation commit, with `basis: same-native-event-creation-commit`, `at_commit`,
+`native_versions` and the assignee field at that commit. It proves no interval.
+Otherwise the state is `unknown`, assignee null, and reason names the cap,
+missing/damaged/tied history, head mismatch, raw gap or other unproved evidence.
+`assigned_by`/`notice_ids` require separately validated, anchored notice/native
+transition evidence; the native committer never supplies them.
+`historical_principal_ownership_verified` remains false. A missing history context
+on a direct library call stays unknown; it never falls back to today's holder.
+
+Only the host audit adapter constructs `AssignmentHistory` and calls native
+history. Its `historical_read_coverage.limits` states 128 versions per issue plus
+one detection version, 24 calls, 1,024 versions and 4 MiB charged stdout per audit,
+1 MiB per call, a ten-second history deadline and at most three seconds per call.
+`received_bytes` counts complete returned responses; `charged_bytes` also charges
+failed byte-cap reads. Unknown/unread coverage and elapsed time are explicit.
+The existing bounded native pipe reader can consume its final detection chunk and
+bounded cleanup beyond these allowances. The export and pure audit analysis have
+no new latency guarantee. Ordinary lifecycle/work/brief/wait/gate readers never
+invoke history enrichment or accept native-row JSON as a history context.
+
+Release selection, rollback selection, `release-query`, and CLI release/dry-run
+reports optionally carry `review_void_diagnostics` (at most 50),
+`review_void_diagnostics_total` and `review_void_diagnostics_omitted`. Entries name
+`task`, `void_id`, `target_id`, `hold_id`, `release_id`, `issuer`,
+`current_result` (`held`, `unheld` or `unreadable`), reasons and a separately named
+counterfactual result/reason, plus `trust: data` and unproved historical operator
+eligibility. Held includes the existing integration hold/failed-attestation
+refusal. Current unreadable chains remain refused; a counterfactual supplies no
+operative result or authority. The CLI labels diagnostic context `host` when its
+read-only endpoint query succeeded, otherwise `local`; a dry run is local.
+Reports with no diagnostic preserve the previous optional-field shape. No
+checkpoint/lifecycle/review payload, writer gate, protected store or write format
+grows a field. JSON output escapes diagnostic text; consumers render it as data.

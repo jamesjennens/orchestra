@@ -994,8 +994,22 @@ def lifecycle_audit_command(root, project, limit=50, offset=0):
     def run(argv):
         return run_bd(root, project, argv)
     run.lifecycle_project = path
-    report = audit(lifecycle.read_event_rows(run), operators(root), operator_owners(path),
-                   limit=limit, offset=offset)
+    rows=lifecycle.read_event_rows(run)
+    from lifecycle_audit import load_assignment_history,HistoryReadError
+    import native
+    def read_history(identity,version_limit,byte_limit,timeout):
+        command=[str(root/'bin/bd'),'--directory',str(path),'--sandbox','--readonly',
+                 'history',identity,'--json','--limit',str(version_limit)]
+        try:
+            done,over=native.run_bounded(command,environment(root),byte_limit,timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise HistoryReadError('native-history-timeout') from None
+        if over:raise HistoryReadError('native-history-byte-cap',byte_limit)
+        if done.returncode:raise HistoryReadError('native-history-unavailable')
+        return done.stdout
+    history=load_assignment_history(rows,read_history)
+    report = audit(rows, operators(root), operator_owners(path),limit=limit,offset=offset,
+                   assignment_history=history,project=project)
     report['project'] = project
     return report
 

@@ -1245,9 +1245,12 @@ def release_selection(rows,scope,is_ancestor,previous_commit=None,subset=None,re
                           'reason':'the deployed fact would be for delivery %s but the task\'s current contribution is %s'%(target['source_commit'],current),
                           'delivery':dict(scope,source_commit=target['source_commit'],integration_commit=target['integration_commit']),
                           'current_contribution':current})
-    return {'targets':sorted(targets,key=lambda t:t['task']),'skipped':sorted(skipped,key=lambda t:t['task']),
+    result={'targets':sorted(targets,key=lambda t:t['task']),'skipped':sorted(skipped,key=lambda t:t['task']),
             'flags':sorted(flags,key=lambda t:t['task']),'verify_only':sorted(verifying),
             'supersede':[],'restored':sorted(restoring)}
+    from lifecycle_audit import review_void_report
+    result.update(review_void_report(rows,operators,journal,wanted))
+    return result
 
 
 def release_targets(rows,scope,is_ancestor,previous_commit=None):
@@ -1365,8 +1368,11 @@ def rollback_selection(rows,scope,is_ancestor,reverted=None,current_commits=None
     supersede=sorted(set(supersede)-carried)
     superseded_scopes=sorted(beyond.values(),
                              key=lambda item:(item['task'],item['scope']['release_id']))
-    return {'targets':targets,'supersede':supersede,'supersede_scopes':superseded_scopes,
+    result={'targets':targets,'supersede':supersede,'supersede_scopes':superseded_scopes,
             'skipped':skipped}
+    from lifecycle_audit import review_void_report
+    result.update(review_void_report(rows,operators,journal))
+    return result
 
 
 def git_ancestry(repo):
@@ -2076,10 +2082,13 @@ def release_query(payload,actor,run,operators=None,journal=None):
         if key in seen:continue
         seen.add(key)
         live.append({'task':task,'release_id':key[1],'integration_commit':key[2],'liveness':value})
-    return {'schema_version':1,'dimension':RELEASE_QUERY,'query':True,
+    result={'schema_version':1,'dimension':RELEASE_QUERY,'query':True,
             'environment':environment,
             'reverted':[{'task':task,'integration_commit':commit} for task,commit in reverted],
             'live_releases':live}
+    from lifecycle_audit import review_void_report
+    result.update(review_void_report(rows,operators,journal))
+    return result
 
 
 def require_unheld_fact(issue, dimension, task, operators=None, journal=None):
@@ -2495,6 +2504,7 @@ def main():
             # caller-side journal. A dry run stays offline and views reverts locally
             # (pass --journal PROJECT for a host-accurate dry run).
             endpoint_reverts=None
+            endpoint_diagnostics=None
             # kittrial-5bb.297 review item 'operators-on-every-surface': the offline
             # dry run consults the SAME configured operators the canonical readers
             # use (from the config's runtime root), so an operator void that repairs
@@ -2523,8 +2533,11 @@ def main():
                 try:
                     answer=request(config,a.project,a.actor,[canonical_bytes(query).decode()],action='lifecycle')
                     if answer['returncode']:raise ValueError(answer['stderr'])
+                    query_view=json.loads(answer['stdout'])
                     endpoint_reverts={(item['task'],str(item['integration_commit']).lower())
-                                      for item in (json.loads(answer['stdout']).get('reverted') or [])}
+                                      for item in (query_view.get('reverted') or [])}
+                    endpoint_diagnostics={key:query_view[key] for key in
+                        ('review_void_diagnostics','review_void_diagnostics_total','review_void_diagnostics_omitted') if key in query_view}
                 except (ValueError,OSError,RuntimeError) as exc:
                     warnings.append('the endpoint could not be asked which integrations are reverted (%s); '
                                     'using the local journal view instead'%exc)
@@ -2695,6 +2708,12 @@ def main():
                         +negative_writes),
                     'reader_note':SCOPE_ROLL_NOTE,'dry_run':bool(a.dry_run),
                     'rollback':bool(data['rollback'])}
+            diagnostic_keys=('review_void_diagnostics','review_void_diagnostics_total','review_void_diagnostics_omitted')
+            diagnostics=(endpoint_diagnostics if endpoint_diagnostics is not None else
+                         {key:selection[key] for key in diagnostic_keys if key in selection})
+            if diagnostics:
+                report.update(diagnostics)
+                report['review_void_diagnostics_source']='host' if endpoint_diagnostics is not None else 'local'
             if a.dry_run:
                 # The dry run is offline, so it cannot ask the endpoint which
                 # integrations a host-issued revert record excludes; say so plainly

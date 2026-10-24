@@ -1016,7 +1016,7 @@ def correction_audit(correction, operators=None):
                                        str(x['operation_id'] or ''),str(x['comment_id'])))
 
 
-def audit(rows, operators=None, owners=None, limit=50, offset=0):
+def audit(rows, operators=None, owners=None, limit=50, offset=0, *, assignment_history=None, project=None):
     """Read-only bounded event page; attribution/approval evidence is not fraud detection.
 
     Historical principal ownership cannot be proved by today's registry. The
@@ -1036,9 +1036,35 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
     native_events = [r for r in rows if isinstance(r, dict)
                      and (r.get('issue_type') == 'event' or record_json.selected(r, types=['event']))]
     classified = {e['id'] for e in events}
+    from collections import Counter
+    native_id_counts=Counter(row.get('id') for row in native_events if isinstance(row.get('id'),str))
+    duplicate_ids={identity for identity,count in native_id_counts.items() if count>1}
     unclassifiable = sum(1 for row in native_events if row.get('id') not in classified)
     ordered = sorted(events, key=lambda e: (e['task'], e['dimension'],
                      e['order'] if e['order'] is not None else -1, e['id']))
+    from lifecycle_audit import intermediate_pairs,historical_assignment
+    pairs,unpaired=intermediate_pairs(rows,events)
+    pair_ids={item['event_id'] for item in pairs}
+    ordinary=[];unknown_native=[]
+    for row in native_events:
+        if row.get('id') in classified:continue
+        event=lifecycle.native_event(row)
+        if event and event['dimension'] not in (*lifecycle.DIMENSIONS,'lifecycle-scope',lifecycle.ENABLED,lifecycle.LIVE) and lifecycle.PREFIX not in str(row.get('description','')):
+            ordinary.append(dict(event_id=row.get('id'),task=event['task'],trust='data'))
+        else:
+            unknown_native.append(dict(event_id=row.get('id'),row_sha256=content_hash(row),reason='native-event-unclassifiable',trust='data'))
+    # Revised native totals count each named record once. Original counts above
+    # retain the baseline's raw-row counts, so repeated/overlapping evidence is visible.
+    ordinary=list({str(item['event_id']):item for item in ordinary}.values())
+    unknown_groups={}
+    for item in unknown_native:
+        key=('id',item['event_id']) if isinstance(item['event_id'],str) else ('row',item['row_sha256'])
+        group=unknown_groups.setdefault(key,dict(item,raw_occurrences=0,row_sha256s=set()))
+        group['raw_occurrences']+=1;group['row_sha256s'].add(item['row_sha256'])
+    unknown_native=[]
+    for group in unknown_groups.values():
+        variants=sorted(group['row_sha256s']);group.update(row_sha256s=variants[:10],row_sha256s_omitted=max(0,len(variants)-10))
+        unknown_native.append(group)
     # kittrial-5bb.297 review item 'audit-reports-unreadable-chains': a task whose
     # hold chain cannot be read is its own counted category here, whether or not it
     # has lifecycle events - the per-event reason below only reaches tasks that
@@ -1050,12 +1076,17 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
         if reason:
             unreadable_chains.append(dict(task=row['id'], reason=reason))
     corrections=correction_audit(correction,operators)
-    page_total=max(len(ordered),len(corrections))
+    page_total=max(len(ordered),len(corrections),len(pairs),len(unpaired),len(ordinary),len(unknown_native),len(unreadable_chains))
     if offset > page_total:
         raise ValueError('Lifecycle audit offset exceeds its total')
     items = []
     questionable_total=0
     unclassifiable_total=0
+    legacy_questionable_total=0
+    legacy_classification_total=0
+    from collections import Counter
+    reason_counts={};cause_counts={}
+    questionable_ids=set();unclassifiable_ids=set()
     loaded_owners = []
     def once_owners():
         if not loaded_owners:
@@ -1126,14 +1157,58 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
             item['classification_reason'] = reason
         if event.get('void_reason'):
             item['lifecycle_reason'] = event['void_reason']
-        item['questionable'] = bool(reason or event.get('void_reason') or
+        legacy_questionable_total+=bool(reason or event.get('void_reason') or
             (not item['recorder_is_current_assignee'] and operator is not True and not marked) or
-            (event['dimension'] in ('reviewed', 'integrated') and approval is not True))
-        questionable_total+=item['questionable']
-        unclassifiable_total+=bool(item.get('classification_reason'))
+            (event['dimension'] in ('reviewed','integrated') and approval is not True))
+        legacy_classification_total+=bool(reason)
+        historical=historical_assignment(issue,event,project or issue.get('project_id'),assignment_history,native_by_id.get(event['id']))
+        if event['id'] in duplicate_ids:
+            historical=dict(historical,state='unknown',assignee=None,assigned_by=None,
+                native_versions=[],notice_ids=[],reason='duplicate-native-event-id',basis='none')
+        item['historical_assignment']=historical
+        item['trust']='data'
+        item['native_occurrences']=native_id_counts.get(event['id'],0)
+        item['recorder_is_historical_assignee']=(recorder==historical['assignee']
+            if historical['state']=='known' else None)
+        causes=[reason] if reason else []
+        reasons=list(causes)
+        if event['id'] in duplicate_ids:
+            causes.append('duplicate-native-event-id');reasons.append('duplicate-native-event-id')
+        if event.get('void_reason'):reasons.append('lifecycle-correction:'+event['void_reason'])
+        if operator is not True and not marked:
+            if event['dimension'] in lifecycle.ASSIGNEE_DIMENSIONS:
+                if historical['state']!='known':
+                    causes.append('historical-assignment-unavailable');reasons.append('historical-assignment-unavailable')
+                elif not item['recorder_is_historical_assignee']:reasons.append('recorder-not-historical-assignee')
+            else:reasons.append('recorder-not-current-operator-or-issued-mark')
+        if event['dimension'] in ('reviewed','integrated') and approval is not True:
+            reasons.append('independent-approval-unproved')
+        if event['id'] in pair_ids:
+            item['classification']='kit-intermediate'
+            if reason:item['original_classification_reason']=reason
+            item.pop('classification_reason',None);reasons=[];causes=[]
+        else:
+            item['classification']='lifecycle-fact'
+            if causes and not reason:item['classification_reason']=causes[0]
+        item['questionable_reasons']=list(dict.fromkeys(reasons))
+        item['unclassifiable_causes']=list(dict.fromkeys(causes))
+        item['questionable']=bool(reasons)
+        for reason_key in item['questionable_reasons']:reason_counts.setdefault(reason_key,set()).add(event['id'])
+        for cause in item['unclassifiable_causes']:cause_counts.setdefault(cause,set()).add(event['id'])
+        if item['questionable']:questionable_ids.add(event['id'])
+        if item['unclassifiable_causes']:unclassifiable_ids.add(event['id'])
+        questionable_total=len(questionable_ids)
+        unclassifiable_total=len(unclassifiable_ids)
         if offset<=index<offset+limit:items.append(item)
+    original_counts=dict(questionable_fact_count=legacy_questionable_total,
+        questionable_native_record_count=legacy_questionable_total+unclassifiable,
+        unclassifiable_classification_count=legacy_classification_total,
+        unclassifiable_native_event_count=unclassifiable,
+        unclassifiable_fact_count=sum(e['payload'] is None or reviews._recorded_at(e['created_at']) is None for e in ordered))
     return dict(items=items, total=len(ordered), offset=offset, limit=limit,
-                unreadable_hold_chains=unreadable_chains,
+                unreadable_hold_chains=unreadable_chains[offset:offset+limit],
+                unreadable_hold_chains_omitted_before=min(offset,len(unreadable_chains)),
+                unreadable_hold_chains_omitted_after=max(0,len(unreadable_chains)-offset-limit),
                 unreadable_hold_chain_count=len(unreadable_chains),
                 omitted_before=min(offset,len(ordered)), omitted_after=max(0, len(ordered) - offset - len(items)),
                 next_offset=offset+limit if offset+limit<page_total else None,
@@ -1159,13 +1234,30 @@ def audit(rows, operators=None, owners=None, limit=50, offset=0):
                                    or correction.get('abandon_problems')
                                    else 'incomplete' if correction.get('incomplete') else 'complete'),
                 questionable_fact_count=questionable_total,
-                questionable_native_record_count=questionable_total+unclassifiable,
+                questionable_native_record_count=questionable_total+len(unknown_native),
                 unclassifiable_classification_count=unclassifiable_total,
-                unclassifiable_native_event_count=unclassifiable,
-                unclassifiable_fact_count=sum(e['payload'] is None or reviews._recorded_at(e['created_at']) is None
-                                              for e in ordered),
+                unclassifiable_native_event_count=len(unknown_native),
+                unclassifiable_fact_count=len({e['id'] for e in ordered if (e['payload'] is None or reviews._recorded_at(e['created_at']) is None)
+                                              and e['id'] not in pair_ids}),
                 unclassifiable_in_page=sum(bool(item.get('classification_reason')) for item in items),
                 questionable_in_page=sum(item['questionable'] for item in items),
+                original_counts=original_counts,
+                questionable_reason_counts={key:len(value) for key,value in reason_counts.items()},
+                unclassifiable_cause_counts={key:len(value) for key,value in cause_counts.items()},
+                deduplicated_event_count=len(classified),duplicate_native_event_id_count=len(duplicate_ids),trust='data',
+                kit_intermediates=pairs[offset:offset+limit],kit_intermediate_count=len(pairs),
+                kit_intermediates_omitted_before=min(offset,len(pairs)),
+                kit_intermediates_omitted_after=max(0,len(pairs)-offset-limit),
+                unpaired_intermediates=unpaired[offset:offset+limit],unpaired_intermediate_count=len(unpaired),
+                unpaired_intermediates_omitted_before=min(offset,len(unpaired)),
+                unpaired_intermediates_omitted_after=max(0,len(unpaired)-offset-limit),
+                ordinary_native_events=ordinary[offset:offset+limit],ordinary_native_event_count=len(ordinary),
+                ordinary_native_events_omitted_before=min(offset,len(ordinary)),
+                ordinary_native_events_omitted_after=max(0,len(ordinary)-offset-limit),
+                unknown_native_events=unknown_native[offset:offset+limit],
+                unknown_native_events_omitted_before=min(offset,len(unknown_native)),
+                unknown_native_events_omitted_after=max(0,len(unknown_native)-offset-limit),
+                historical_read_coverage=getattr(assignment_history,'coverage',dict(available=False,reason='native-history-not-supplied')),
                 meaning='Questionable evidence for operator review, not a finding of fraud. Historical '
                         'principal ownership is not proved by the current registry.')
 
