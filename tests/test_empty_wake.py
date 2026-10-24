@@ -27,6 +27,15 @@ import wake_log
 import waiting
 import work
 
+try:
+    import fcntl as _fcntl_module
+except ImportError:                   # Windows: the empty-wake log is unavailable there
+    _fcntl_module = None
+#: The recording half of this module needs a lane lock, i.e. ``fcntl`` (POSIX).  On a
+#: platform without it the wait still runs and answers exactly as before; only the log
+#: is unavailable, so the tests that append to it are skipped rather than failed.
+HAS_FCNTL = _fcntl_module is not None
+
 A = 'session-aaaaaaaa-1111-4111-8111-111111111111'
 B = 'session-bbbbbbbb-2222-4222-8222-222222222222'
 
@@ -61,6 +70,7 @@ def append_in_child(arguments):
     return subprocess.run([sys.executable, '-c', code], capture_output=True, timeout=30).returncode
 
 
+@unittest.skipUnless(HAS_FCNTL, 'the empty-wake log needs fcntl (POSIX)')
 class EmptyWakeRecordTests(unittest.TestCase):
 
     def setUp(self):
@@ -349,6 +359,7 @@ class EmptyWakeRecordTests(unittest.TestCase):
         self.assertFalse(wake_log._own_change(before, edit))
 
 
+@unittest.skipUnless(HAS_FCNTL, 'the empty-wake log needs fcntl (POSIX)')
 class LaneBoardTests(unittest.TestCase):
 
     def setUp(self):
@@ -409,6 +420,66 @@ class LaneBoardTests(unittest.TestCase):
         self.assertEqual(row['lane'], A)
         self.assertEqual(row['task'], 't1')
         self.assertEqual(row['empty_wakes_24h'], 3)
+
+
+class FcntlUnavailableTests(unittest.TestCase):
+    """Review ci-windows-fcntl: without fcntl the log is unavailable, the wait unchanged.
+
+    Windows has no ``fcntl``.  ``wake_log`` must still import there (``work.py``'s wait
+    path imports it), recording must be a silent no-op that writes nothing, and the
+    wait's answer must be exactly the answer it gave before this feature existed.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix='empty-nofcntl-'))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.project = self.root / 'projects' / 'p'
+        self.project.mkdir(parents=True)
+        wake_log._reset_warnings()
+        self.addCleanup(wake_log._reset_warnings)
+
+    def row(self, status='open'):
+        return {'id': 't1', 'title': 'Task t1', 'issue_type': 'task', 'status': status,
+                'assignee': A, 'description': 'Intent', 'acceptance_criteria': 'Acceptance',
+                'labels': [], 'priority': 2, 'created_by': A,
+                'created_at': '2026-09-01T00:00:00Z', 'updated_at': '2026-09-15T09:00:00Z',
+                'dependencies': [], 'comments': []}
+
+    def run_wait(self, project, rows, args):
+        lines = '\n'.join(json.dumps(row) for row in rows)
+
+        def runner(_argv):
+            return lines
+        return work.execute(project, A, 'wait', args, {}, runner, operators=[A])
+
+    def test_observe_records_nothing_and_adds_nothing_to_the_answer(self):
+        from unittest import mock
+        observe_root = self.root / 'projects' / 'observe'
+        observe_root.mkdir(parents=True)
+        changed = [a_row(whose_move='coordinator', review_state='integrated',
+                         newer_activity_by_others=1)]
+        view = waiting.worker_view([])
+        since = waiting.fingerprint([a_row()])
+        self.assertNotEqual(view['fingerprint'], since)
+        with mock.patch.dict(sys.modules, {'fcntl': None}):
+            warnings = wake_log.observe(observe_root, A, since, view, changed)
+        # No record, no warning, and not even the log directory: the wait's answer is
+        # untouched (review ci-windows-fcntl).
+        self.assertEqual(warnings, [])
+        self.assertEqual(wake_log.read(observe_root, A)['empty_wakes_24h'], 0)
+        self.assertFalse((observe_root / wake_log.DIRECTORY).exists())
+
+    def test_the_wait_answers_identically_when_fcntl_is_unavailable(self):
+        from unittest import mock
+        rows = [self.row()]
+        expected = self.run_wait(self.project, rows, [])
+        blocked = self.root / 'projects' / 'blocked'
+        blocked.mkdir(parents=True)
+        with mock.patch.dict(sys.modules, {'fcntl': None}):
+            answered = self.run_wait(blocked, rows, [])
+        self.assertEqual(answered, expected)
+        self.assertEqual(wake_log.read(blocked, A)['empty_wakes_24h'], 0)
+        self.assertFalse((blocked / wake_log.DIRECTORY).exists())
 
 
 class WorkWaitRecordingTests(unittest.TestCase):

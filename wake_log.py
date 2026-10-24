@@ -38,10 +38,14 @@ No file here is ever opened in a way that can block: the lane lock is tried with
 and ``O_NOFOLLOW`` and must be a regular file on its descriptor.  A held ``flock``, a
 FIFO planted at any lane file, or a symlink is refused with a warning instead of
 stalling a wait or an HTTP handler thread.
+
+This module is import-safe on every platform: ``fcntl`` is imported only when the lane
+lock is taken, so ``work.py``'s wait path (and every HTTP handler) imports it on
+Windows too.  Where ``fcntl`` is unavailable nothing is recorded (the log is
+unavailable, not an error), no file is written, and the wait's answer is unchanged.
 """
 import contextlib
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -306,6 +310,22 @@ def _thread_guard():
         _THREAD_LOCK.release()
 
 
+def _fcntl():
+    """The ``fcntl`` module, or ``None`` where the platform has none (Windows).
+
+    Imported HERE, lazily, and never at module import: ``work.py``'s wait path imports
+    this module on every platform, so a module-level ``import fcntl`` made the wait
+    (and ``test_blocking_wait``) fail with ``ModuleNotFoundError`` on Windows.  Every
+    caller treats ``None`` as "the log is unavailable": no record, no snapshot, and the
+    wait's answer is untouched.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    return fcntl
+
+
 class _Lock:
     """An exclusive ``flock`` on the lane's lock file, tried without blocking.
 
@@ -317,14 +337,19 @@ class _Lock:
     def __init__(self, path):
         self.path = path
         self.handle = None
+        self.fcntl = None
 
     def __enter__(self):
+        module = _fcntl()
+        if module is None:
+            raise OSError(errno.ENOSYS, 'the wait-wake lane lock needs fcntl (unavailable)')
         _refuse_symlink(self.path)
         self.handle = _open_fd(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.fcntl = module
         deadline = time.monotonic() + LOCK_BUDGET_SECONDS
         while True:
             try:
-                fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                module.flock(self.handle, module.LOCK_EX | module.LOCK_NB)
                 return self
             except OSError as error:
                 if error.errno not in (errno.EACCES, errno.EAGAIN):
@@ -340,7 +365,7 @@ class _Lock:
     def __exit__(self, *_exc):
         if self.handle is not None:
             try:
-                fcntl.flock(self.handle, fcntl.LOCK_UN)
+                self.fcntl.flock(self.handle, self.fcntl.LOCK_UN)
             finally:
                 os.close(self.handle)
                 self.handle = None
@@ -361,6 +386,9 @@ def append(project, actor, entries, now=None):
     """
     place = paths(project, actor)
     if place is None or not entries:
+        return 0
+    if _fcntl() is None:
+        # Recording needs the lane lock; without fcntl (Windows) the log is unavailable.
         return 0
     directory, audit, _snapshot, lock = place
     moment = _now(now)
@@ -654,6 +682,11 @@ def observe(project, actor, since, view, rows, now=None):
     """
     warnings = []
     try:
+        if _fcntl() is None:
+            # The lane lock needs fcntl. Where it is missing (Windows) the log is
+            # UNAVAILABLE, not broken: no record, no snapshot file and no warning, so
+            # the wait's answer is byte-for-byte what it was before the log existed.
+            return warnings
         if project is None or not isinstance(actor, str) or not actor:
             return warnings
         if not isinstance(view, dict):
