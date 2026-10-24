@@ -1,0 +1,156 @@
+test_a_failed_intent_append_writes_no_native_record (test_rev388r3new.Rev388r3New) ... ok
+test_a_moderated_items_amended_parent_is_not_served (test_rev388r3new.Rev388r3New) ... ok
+test_a_moderated_items_amended_title_is_not_served (test_rev388r3new.Rev388r3New) ... ok
+test_a_moderated_items_parent_is_not_served (test_rev388r3new.Rev388r3New) ... ok
+test_a_requirement_parent_must_be_an_existing_job (test_rev388r3new.Rev388r3New) ... ok
+test_a_symlinked_room_or_item_lock_is_refused (test_rev388r3new.Rev388r3New) ... ok
+test_a_viewer_cannot_amend_or_reject_another_members_question (test_rev388r3new.Rev388r3New) ... ok
+test_accept_after_a_failed_append_keeps_one_record_and_refuses_amend (test_rev388r3new.Rev388r3New) ... ok
+test_accept_twice_converges_on_one_record_and_one_event (test_rev388r3new.Rev388r3New) ... ok
+test_amend_back_to_an_earlier_text_applies_and_an_exact_retry_replays (test_rev388r3new.Rev388r3New) ... ok
+test_amend_twice_with_different_text_then_accept_latest (test_rev388r3new.Rev388r3New) ... ok
+test_an_archived_project_refuses_every_item_decision (test_rev388r3new.Rev388r3New) ... ok
+test_an_editor_accept_with_no_jobs_is_refused (test_rev388r3new.Rev388r3New) ... ok
+test_an_editor_can_choose_the_parent_on_accept (test_rev388r3new.Rev388r3New) ... ok
+test_an_editor_can_choose_the_parent_on_an_amendment (test_rev388r3new.Rev388r3New) ... ok
+test_an_outsider_gets_no_item_existence_oracle (test_rev388r3new.Rev388r3New) ... ok
+test_archive_waits_for_an_accept_inside_its_record_write (test_rev388r3new.Rev388r3New) ... ok
+test_archived_room_and_project_refuse_item_writes (test_rev388r3new.Rev388r3New) ... ok
+test_concurrent_accepts_create_only_one_record (test_rev388r3new.Rev388r3New) ... ok
+test_contributor_accept_is_a_proposal_not_a_requirement (test_rev388r3new.Rev388r3New) ... ok
+test_d1b_amend_a_b_a (test_rev388r3new.Rev388r3New) ... ok
+test_d1c_concurrent_amends (test_rev388r3new.Rev388r3New) ... ok
+test_d1d_amend_twice_then_accept_records_latest (test_rev388r3new.Rev388r3New) ... ok
+test_d2_room_archived_during_record_write (test_rev388r3new.Rev388r3New) ... ok
+test_d2b_moderation_during_record_write (test_rev388r3new.Rev388r3New) ... ok
+test_d2c_supersede_during_record_write (test_rev388r3new.Rev388r3New) ... ok
+test_d2d_project_archived_during_record_write (test_rev388r3new.Rev388r3New) ... ok
+test_decision_owner_or_coordinator_only (test_rev388r3new.Rev388r3New) ... ok
+test_every_decision_route_is_csrf_protected (test_rev388r3new.Rev388r3New) ... ok
+test_item_post_and_read_are_members_only (test_rev388r3new.Rev388r3New) ... ok
+test_moderated_item_cannot_be_decided_and_its_text_is_not_served (test_rev388r3new.Rev388r3New) ... ok
+test_n1b_moderated_amend_parent (test_rev388r3new.Rev388r3New) ... ok
+test_n2_parent_choices (test_rev388r3new.Rev388r3New) ... ok
+test_n2b_editor_choice_wins_on_accept (test_rev388r3new.Rev388r3New) ... ok
+test_n3_symlinked_locks (test_rev388r3new.Rev388r3New) ... ok
+test_question_answer_is_a_member_action_with_who_and_when (test_rev388r3new.Rev388r3New) ... ok
+test_r7_an_agent_credential_is_refused_before_any_grant (test_rev388r3new.Rev388r3New) ... ok
+test_reject_and_amend_then_decide (test_rev388r3new.Rev388r3New) ... ok
+test_requirement_owner_accept_creates_a_requirement_and_its_decision (test_rev388r3new.Rev388r3New) ... ok
+test_s1a_failed_append_amend_accept (test_rev388r3new.Rev388r3New) ... ok
+test_s1b_failed_append_retry_unchanged (test_rev388r3new.Rev388r3New) ... ok
+test_s1c_a_fail_b_fail_a (test_rev388r3new.Rev388r3New) ... ok
+test_s1d_failed_append_then_reject (test_rev388r3new.Rev388r3New) ... ok
+test_supersede_and_bounds (test_rev388r3new.Rev388r3New) ... ok
+test_a_failed_intent_append_writes_no_native_record (tests.test_rev388r4.Rev388r4) ... ok
+test_a_moderated_items_amended_parent_is_not_served (tests.test_rev388r4.Rev388r4) ... ok
+test_a_moderated_items_amended_title_is_not_served (tests.test_rev388r4.Rev388r4) ... ok
+test_a_moderated_items_parent_is_not_served (tests.test_rev388r4.Rev388r4) ... ok
+test_a_requirement_parent_must_be_an_existing_job (tests.test_rev388r4.Rev388r4) ... ok
+test_a_symlinked_room_or_item_lock_is_refused (tests.test_rev388r4.Rev388r4) ... ok
+test_a_viewer_cannot_amend_or_reject_another_members_question (tests.test_rev388r4.Rev388r4) ... ok
+test_accept_after_a_failed_append_keeps_one_record_and_refuses_amend (tests.test_rev388r4.Rev388r4) ... ok
+test_accept_twice_converges_on_one_record_and_one_event (tests.test_rev388r4.Rev388r4) ... ok
+test_amend_back_to_an_earlier_text_applies_and_an_exact_retry_replays (tests.test_rev388r4.Rev388r4) ... ok
+test_amend_twice_with_different_text_then_accept_latest (tests.test_rev388r4.Rev388r4) ... ok
+test_an_archived_project_refuses_every_item_decision (tests.test_rev388r4.Rev388r4) ... ok
+test_an_editor_accept_with_no_jobs_is_refused (tests.test_rev388r4.Rev388r4) ... ok
+test_an_editor_can_choose_the_parent_on_accept (tests.test_rev388r4.Rev388r4) ... ok
+test_an_editor_can_choose_the_parent_on_an_amendment (tests.test_rev388r4.Rev388r4) ... ok
+test_an_outsider_gets_no_item_existence_oracle (tests.test_rev388r4.Rev388r4) ... ok
+test_archive_waits_for_an_accept_inside_its_record_write (tests.test_rev388r4.Rev388r4) ... ok
+test_archived_room_and_project_refuse_item_writes (tests.test_rev388r4.Rev388r4) ... ok
+test_concurrent_accepts_create_only_one_record (tests.test_rev388r4.Rev388r4) ... ok
+test_contributor_accept_is_a_proposal_not_a_requirement (tests.test_rev388r4.Rev388r4) ... ok
+test_decision_owner_or_coordinator_only (tests.test_rev388r4.Rev388r4) ... ok
+test_every_decision_route_is_csrf_protected (tests.test_rev388r4.Rev388r4) ... ok
+test_item_post_and_read_are_members_only (tests.test_rev388r4.Rev388r4) ... ok
+test_moderated_item_cannot_be_decided_and_its_text_is_not_served (tests.test_rev388r4.Rev388r4) ... ok
+test_n2_jsonl_parent_cleared (tests.test_rev388r4.Rev388r4) ... FAIL
+test_question_answer_is_a_member_action_with_who_and_when (tests.test_rev388r4.Rev388r4) ... ok
+test_r7_an_agent_credential_is_refused_before_any_grant (tests.test_rev388r4.Rev388r4) ... ok
+test_reject_and_amend_then_decide (tests.test_rev388r4.Rev388r4) ... ok
+test_requirement_owner_accept_creates_a_requirement_and_its_decision (tests.test_rev388r4.Rev388r4) ... ok
+test_s_a_b_a_b (tests.test_rev388r4.Rev388r4) ... ok
+test_s_amend_pending_then_reconciled (tests.test_rev388r4.Rev388r4) ... ok
+test_s_concurrent_same_and_different (tests.test_rev388r4.Rev388r4) ... ok
+test_supersede_and_bounds (tests.test_rev388r4.Rev388r4) ... ok
+
+======================================================================
+FAIL: test_n2_jsonl_parent_cleared (tests.test_rev388r4.Rev388r4)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r4/rev/w/./tests/test_rev388r4.py", line 73, in test_n2_jsonl_parent_cleared
+    self.assertEqual(200, self.amend(self.tokens['owner'], 'TSECRET', 'XSECRET', 'n2j-am-r4key',
+AssertionError: 200 != 422
+
+----------------------------------------------------------------------
+Ran 77 tests in 138.171s
+
+FAILED (failures=1)
+
+D1b A->B->A statuses 200 200 200 | third answer title/text TA XA | item now amended TA XA | amend lines 3
+D1b amend back to the POSTED text 200 | item now T0 X0 | amend lines 4
+D1b accept 200 | record rows [('task_requirement_1', 'T0', 'X0', 'job_0001', 'task_decision_1')]
+
+D1c concurrent amends {'coord': 200, 'owner': 200} | lines [('TC', 'XC'), ('TO', 'XO')] | item now TO XO
+D1c accept 200 | record rows [('task_requirement_1', 'TO', 'XO', 'job_0001', 'task_decision_1')]
+
+D1d accept 200 | rows [('task_requirement_1', 'TC', 'XC', 'job_0001', 'task_decision_1')]
+
+D2 room state while the record write ran open | archive 200 (took 1.54s) | owner accept 200 None | item events 1 | item state accepted
+D2 requirements/proposals/decisions = (1, 0, 1)
+
+D2b moderation during write: moderate 201 | accept 200 | item accepted True
+D2b requirements/proposals/decisions = (1, 0, 1)
+
+D2c supersede during write: supersede 409 final | accept 200 | items [(1, 'accepted')]
+D2c requirements/proposals/decisions = (1, 0, 1)
+
+D2d project archived during write: accept 200 None | item events 1 | item accepted
+D2d requirements/proposals/decisions = (1, 0, 1)
+
+N1b moderated item: secret words / amend parent per surface {'read': ([], 0), 'export_md': ([], 0), 'export_jsonl': ([], 0), 'index.json': ([], 0)}
+N2 ('owner accept parent missing', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept parent int', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept parent list', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept parent other-proj', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('rows after refused accepts', 0)
+N2 ('contributor amend own item bad parent', 422)
+N2 ('contributor amend own item good parent', 200)
+N2 ('contributor amend owner item with parent', 403)
+N2 ('contributor accept with bad parent', 200, 'proposal')
+N2 ('amend decision with parent', 422)
+N2 ('owner accept, project has no jobs, item parent job_0001', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept, no jobs, explicit parent', 422)
+N2 ('owner amend, no jobs, parent', 422)
+N2 ('rows for item 5', 0)
+N2 requirements/proposals/decisions = (0, 1, 0)
+
+N2b editor picks job_0002 over item parent job_0001: 200 [('task_requirement_1', 'Add export', 'We need CSV export.', 'job_0002', 'task_decision_1')]
+N3 ('.item-decisions.lock', 'accept', 500, 'damaged', 'post', 201, 'read', 200, 'victim created', False)
+N3 ('.coordination.lock', 'accept', 500, 'damaged', 'post', 500, 'read', 500, 'victim created', False)
+N3 ('project dir symlink', 'accept', 200, None, 'lock created in real dir', True)
+N3 requirements/proposals/decisions = (1, 0, 1)
+
+S1a first accept 500 Internal error | rows after first [('task_requirement_1', 'TA', 'XA', 'job_0001', 'task_decision_1')]
+S1a amend 409 | second accept 200 task_requirement_1 | rows after [('task_requirement_1', 'TA', 'XA', 'job_0001', 'task_decision_1')] | item accepted TA task_requirement_1
+S1a requirements/proposals/decisions = (1, 0, 1)
+
+S1b first 500 | retry (fresh key, no change) 200 task_requirement_1 | rows [('task_requirement_1', 'Add export', 'We need CSV export.', 'job_0001', 'task_decision_1')]
+S1b requirements/proposals/decisions = (1, 0, 1)
+
+S1c statuses acc/amend/acc/amend/acc [500, 409, 500, 409, 200] | rows [('task_requirement_1', 'TA', 'XA', 'job_0001', 'task_decision_1')] | item accepted TA task_requirement_1
+S1c requirements/proposals/decisions = (1, 0, 1)
+
+S1d failed accept 500 | reject 409 | rows [('task_requirement_1', 'Add export', 'We need CSV export.', 'job_0001', 'task_decision_1')] | item proposed
+S1d requirements/proposals/decisions = (1, 0, 1)
+
+SABAB [('TA', 200, False, 'TA'), ('TB', 200, False, 'TB'), ('TA', 200, False, 'TA'), ('TB', 200, False, 'TB')] | unchanged fresh-key 200 True | amend lines 4
+SABAB accept 200 [('task_requirement_1', 'TB', 'XB', 'job_0001', 'task_decision_1')]
+
+SP accept 500 | amend while pending 409 accepting | retry accept 200 | amend after reconcile 409 final | rows [('task_requirement_1', 'TA', 'XA', 'job_0001', 'task_decision_1')]
+SP requirements/proposals/decisions = (1, 0, 1)
+
+SCC {'cc-owner-r4key': (200, False), 'cc-coord-r4key': (200, True), 'cc-worker-r4key': (200, False)} | lines [('TO', 'owner'), ('TW', 'worker')] | item TW
+exit=1

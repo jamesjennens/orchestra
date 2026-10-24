@@ -1,0 +1,163 @@
+FFFFFFFFFF.F.
+======================================================================
+FAIL: test_f1_accept_after_accept_creates_orphan_requirement (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 44, in test_f1_accept_after_accept_creates_orphan_requirement
+    self.assertEqual(1, len(self.backend.requirements), 'orphan requirement created')
+AssertionError: 1 != 2 : orphan requirement created
+
+======================================================================
+FAIL: test_f1b_accept_rejected_item_creates_record (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 52, in test_f1b_accept_rejected_item_creates_record
+    self.assertEqual({}, self.backend.requirements)
+AssertionError: {} != {'task_requirement_1': {'id': 'task_requir[283 chars]#1'}}
+- {}
++ {'task_requirement_1': {'decision_id': 'task_decision_1',
++                         'decision_pointer': 'orchestra:room/r-1d30d835419c#1',
++                         'description': 'We need CSV export.\n'
++                                        '\n'
++                                        'orchestra:room/r-1d30d835419c#1',
++                         'id': 'task_requirement_1',
++                         'revision': 2,
++                         'sha256': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
++                         'title': 'Add export'}}
+
+======================================================================
+FAIL: test_f1c_contributor_accept_of_rejected_item_creates_proposal (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 59, in test_f1c_contributor_accept_of_rejected_item_creates_proposal
+    self.assertEqual({}, self.backend.proposals)
+AssertionError: {} != {'proposal_1': {'key': 'proposal_1', 'revi[212 chars]rt'}}
+- {}
++ {'proposal_1': {'evidence': ['orchestra:room/r-5b19725a7ccf#1'],
++                 'key': 'proposal_1',
++                 'rationale': 'Add export',
++                 'revision': 1,
++                 'sha256': 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
++                 'state': 'submitted',
++                 'text': 'We need CSV export.'}}
+
+======================================================================
+FAIL: test_f1d_accept_in_archived_room_creates_record (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 67, in test_f1d_accept_in_archived_room_creates_record
+    self.assertEqual({}, self.backend.requirements)
+AssertionError: {} != {'task_requirement_1': {'id': 'task_requir[283 chars]#1'}}
+- {}
++ {'task_requirement_1': {'decision_id': 'task_decision_1',
++                         'decision_pointer': 'orchestra:room/r-540801a18d9f#1',
++                         'description': 'We need CSV export.\n'
++                                        '\n'
++                                        'orchestra:room/r-540801a18d9f#1',
++                         'id': 'task_requirement_1',
++                         'revision': 2,
++                         'sha256': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
++                         'title': 'Add export'}}
+
+======================================================================
+FAIL: test_f1e_moderated_item_accept_reaches_record_write_with_tombstone (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 76, in test_f1e_moderated_item_accept_reaches_record_write_with_tombstone
+    self.assertEqual({}, self.backend.proposals)
+AssertionError: {} != {'proposal_1': {'key': 'proposal_1', 'revi[234 chars]one}}
+- {}
++ {'proposal_1': {'evidence': ['orchestra:room/r-947ba1d1a897#1'],
++                 'key': 'proposal_1',
++                 'rationale': None,
++                 'revision': 1,
++                 'sha256': 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
++                 'state': 'submitted',
++                 'text': 'removed by coord at 2026-10-23T17:10:03Z: private'}}
+
+======================================================================
+FAIL: test_f2_concurrent_accept_two_records (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 95, in test_f2_concurrent_accept_two_records
+    self.assertFalse(self.backend.requirements and self.backend.proposals)
+AssertionError: {'proposal_1': {'key': 'proposal_1', 'revision': 1, 'sha256': 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'state': 'submitted', 'evidence': ['orchestra:room/r-e2e867c3fc61#1'], 'text': 'We need CSV export.', 'rationale': 'Add export'}} is not false
+
+======================================================================
+FAIL: test_f3_viewer_amends_question (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 104, in test_f3_viewer_amends_question
+    self.assertEqual(403, amended.status)
+AssertionError: 403 != 200
+
+======================================================================
+FAIL: test_f3b_viewer_rejects_question (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 111, in test_f3b_viewer_rejects_question
+    self.assertEqual(403, rejected.status)
+AssertionError: 403 != 200
+
+======================================================================
+FAIL: test_f4_moderated_amend_title_leaks (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 128, in test_f4_moderated_amend_title_leaks
+    self.assertNotIn('SECRET-AMENDED-TITLE', dumped)
+AssertionError: 'SECRET-AMENDED-TITLE' unexpectedly found in '{"room": {"id": "r-12f8a5502ffd", "name": "Planning", "state": "open", "created_by": "usr_f288e25f21bc95af", "created_by_name": "coord", "created_at": "2026-10-23T17:10:09Z", "archived_by": null, "archived_by_name": null, "archived_at": null, "archive_reason": null}, "messages": [{"sequence": 1, "kind": "tombstone", "moderated": true, "item_kind": "requirement", "title": null, "author": {"id": "usr_f288e25f21bc95af", "name": "coord", "role": "coordinator"}, "created_at": "2026-10-23T17:10:09Z", "text": "removed by coord at 2026-10-23T17:10:09Z: private", "reason": "private", "target_sequence": 1, "evidence": "orchestra:room/r-12f8a5502ffd#1"}, {"sequence": 2, "kind": "item-event", "target_sequence": 1, "event": "amend", "state": "amended", "author": {"id": "usr_30aae0695fdd1dad", "name": "owner", "role": "owner"}, "created_at": "2026-10-23T17:10:09Z", "record": null, "title": "SECRET-AMENDED-TITLE", "text": "removed by coord at 2026-10-23T17:10:09Z: private", "redacted": true}], "moderations": [{"sequence": 3, "target_sequence": 1, "author": {"id": "usr_f288e25f21bc95af", "name": "coord", "role": "coordinator"}, "created_at": "2026-10-23T17:10:09Z", "text": "removed by coord at 2026-10-23T17:10:09Z: private", "reason": "private"}], "items": [{"accepted_at": null, "accepted_by": null, "amended_at": "2026-10-23T17:10:09Z", "amended_by": {"id": "usr_30aae0695fdd1dad", "name": "owner", "role": "owner"}, "answered_at": null, "answered_by": null, "author": {"id": "usr_f288e25f21bc95af", "name": "coord", "role": "coordinator"}, "created_at": "2026-10-23T17:10:09Z", "evidence": "orchestra:room/r-12f8a5502ffd#1", "history": [], "item_kind": "requirement", "kind": "item", "moderated": true, "parent": null, "record": null, "rejected_at": null, "rejected_by": null, "sequence": 1, "state": "amended", "supersedes": null, "text": "removed by coord at 2026-10-23T17:10:09Z: private", "title": null}], "since": 0, "last_sequence": 3, "next_since": 3, "has_more": false}'
+
+======================================================================
+FAIL: test_f5_archived_project_item_events (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 141, in test_f5_archived_project_item_events
+    self.assertNotEqual(200, answered.status)
+AssertionError: 200 == 200
+
+======================================================================
+FAIL: test_f7_hand_edited_cache_served (tests.test_rev388.Rev388)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388.py", line 164, in test_f7_hand_edited_cache_served
+    self.assertEqual('proposed', served[0]['state'])
+AssertionError: 'proposed' != 'accepted'
+- proposed
++ accepted
+
+
+----------------------------------------------------------------------
+Ran 13 tests in 21.782s
+
+FAILED (failures=11)
+
+F1 second accept status 409 final
+F1 requirements in tracker: ['task_requirement_1', 'task_requirement_2']
+F1 owner_requirements calls: [('owner_requirements', 'create', 'room-r-3623acd376dc-1-0-accept-requirement-create', None), ('owner_requirements', 'accept', 'room-r-3623acd376dc-1-0-accept-requirement-accept', 'task_requirement_1'), ('owner_requirements', 'create', 'room-r-3623acd376dc-1-1-accept-requirement-create', None), ('owner_requirements', 'accept', 'room-r-3623acd376dc-1-1-accept-requirement-accept', 'task_requirement_2')]
+
+F1b accept-after-reject 409 requirements: ['task_requirement_1']
+
+F1c 409 proposals: {'proposal_1': {'key': 'proposal_1', 'revision': 1, 'sha256': 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'state': 'submitted', 'evidence': ['orchestra:room/r-5b19725a7ccf#1'], 'text': 'We need CSV export.', 'rationale': 'Add export'}}
+
+F1d 409 requirements: ['task_requirement_1']
+
+F1e 409 proposals: {"proposal_1": {"key": "proposal_1", "revision": 1, "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "state": "submitted", "evidence": ["orchestra:room/r-947ba1d1a897#1"], "text": "removed by coord at 2026-10-23T17:10:03Z: private", "rationale": null}}
+
+F2 worker 200 owner 409 operation_reused
+F2 requirements ['task_requirement_1'] proposals ['proposal_1']
+F2 events [('accept', 'proposal')]
+
+F3 viewer amend 200 Viewer wrote this Viewer text
+
+F3b viewer reject 200 rejected
+
+F4 title in read: True text in read: False
+F4 exports 200 200
+
+F5 archived project answer 200 accept 200 requirements ['task_requirement_1']
+
+F6 outsider 404 404 404 {'error': {'code': 'not_found', 'message': 'Project not found'}, 'request_id': 'req_3f1147b80b2f8f9b'} {'error': {'code': 'not_found', 'message': 'No such item in this room.'}, 'request_id': 'req_d06508458a94b98d'}
+
+F7 served accepted FORGED
+F7 truth proposed
+exit=1

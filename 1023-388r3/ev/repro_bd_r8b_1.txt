@@ -1,0 +1,11 @@
+test_r8b_contributor_and_owner_concurrently_counted (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 21.672s
+
+OK
+  [proposals GET 200 total 0 items 0 None ]
+  [proposals GET 200 total 0 items 0 None ]
+
+R8bc contributor+owner [('alex', 200, None), ('casey', 409, 'final')] rows [('pp-bxb', 'decision', 'Accept requirement pp-fcl.1', 'open'), ('pp-fcl.1', 'task', 'Add export', 'open')] new proposals [] events 1
+exit=0

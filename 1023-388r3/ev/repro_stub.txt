@@ -1,0 +1,228 @@
+test_a_moderated_items_amended_title_is_not_served (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_a_moderated_items_parent_is_not_served (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_a_requirement_parent_must_be_an_existing_job (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_a_symlinked_room_or_item_lock_is_refused (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_a_viewer_cannot_amend_or_reject_another_members_question (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_accept_after_a_failed_append_records_the_amended_text (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_accept_twice_converges_on_one_record_and_one_event (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_amend_twice_with_different_text_then_accept_latest (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_an_archived_project_refuses_every_item_decision (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_an_editor_can_choose_the_parent_on_an_amendment (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_an_outsider_gets_no_item_existence_oracle (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_archive_waits_for_an_accept_inside_its_record_write (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_archived_room_and_project_refuse_item_writes (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_concurrent_accepts_create_only_one_record (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_contributor_accept_is_a_proposal_not_a_requirement (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_d1_second_amend (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_decision_owner_or_coordinator_only (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_every_decision_route_is_csrf_protected (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f1_accept_after_accept (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f1b_accept_rejected_item (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f1c_contributor_accept_of_rejected_item (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f1d_accept_in_archived_room (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f1e_moderated_item_accept (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f1f_superseded_item_accept (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f2_concurrent_accept_one_record (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f3_viewer_amends_question (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f3b_viewer_rejects_question (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f3c_viewer_answers_question (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f3d_contributor_amends_owners_requirement (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f3e_contributor_amends_other_contributors_item (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f3f_agent_credential (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f4_moderated_item_every_surface (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f5_archived_project_item_events (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f6_outsider_probe (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_f7_hand_edited_cache_served (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_item_post_and_read_are_members_only (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_l1_item_lock_held_elsewhere (tests.test_rev388r3seq.Rev388r3Seq) ... busy: a wait for a lock ran out in the service for POST: 'Timed out waiting for lock /home/james/orchestra-review-evidence/1023-388r3/rev/w/.runtime/test-tmp/rooms-items-http-891c01709673/proj_3d15cf1dc75d94a3/.item-decisions.lock'
+ok
+test_moderated_item_cannot_be_decided_and_its_text_is_not_served (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_question_answer_is_a_member_action_with_who_and_when (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_r7_an_agent_credential_is_refused_before_any_grant (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_reject_and_amend_then_decide (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_requirement_owner_accept_creates_a_requirement_and_its_decision (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_supersede_and_bounds (tests.test_rev388r3seq.Rev388r3Seq) ... ok
+test_a_moderated_items_amended_title_is_not_served (tests.test_rev388r3new.Rev388r3New) ... ok
+test_a_moderated_items_parent_is_not_served (tests.test_rev388r3new.Rev388r3New) ... ok
+test_a_requirement_parent_must_be_an_existing_job (tests.test_rev388r3new.Rev388r3New) ... ok
+test_a_symlinked_room_or_item_lock_is_refused (tests.test_rev388r3new.Rev388r3New) ... ok
+test_a_viewer_cannot_amend_or_reject_another_members_question (tests.test_rev388r3new.Rev388r3New) ... ok
+test_accept_after_a_failed_append_records_the_amended_text (tests.test_rev388r3new.Rev388r3New) ... ok
+test_accept_twice_converges_on_one_record_and_one_event (tests.test_rev388r3new.Rev388r3New) ... ok
+test_amend_twice_with_different_text_then_accept_latest (tests.test_rev388r3new.Rev388r3New) ... ok
+test_an_archived_project_refuses_every_item_decision (tests.test_rev388r3new.Rev388r3New) ... ok
+test_an_editor_can_choose_the_parent_on_an_amendment (tests.test_rev388r3new.Rev388r3New) ... ok
+test_an_outsider_gets_no_item_existence_oracle (tests.test_rev388r3new.Rev388r3New) ... ok
+test_archive_waits_for_an_accept_inside_its_record_write (tests.test_rev388r3new.Rev388r3New) ... ok
+test_archived_room_and_project_refuse_item_writes (tests.test_rev388r3new.Rev388r3New) ... ok
+test_concurrent_accepts_create_only_one_record (tests.test_rev388r3new.Rev388r3New) ... ok
+test_contributor_accept_is_a_proposal_not_a_requirement (tests.test_rev388r3new.Rev388r3New) ... ok
+test_d1b_amend_a_b_a (tests.test_rev388r3new.Rev388r3New) ... FAIL
+test_d1c_concurrent_amends (tests.test_rev388r3new.Rev388r3New) ... ok
+test_d1d_amend_twice_then_accept_records_latest (tests.test_rev388r3new.Rev388r3New) ... ok
+test_d2_room_archived_during_record_write (tests.test_rev388r3new.Rev388r3New) ... ok
+test_d2b_moderation_during_record_write (tests.test_rev388r3new.Rev388r3New) ... ok
+test_d2c_supersede_during_record_write (tests.test_rev388r3new.Rev388r3New) ... ok
+test_d2d_project_archived_during_record_write (tests.test_rev388r3new.Rev388r3New) ... ok
+test_decision_owner_or_coordinator_only (tests.test_rev388r3new.Rev388r3New) ... ok
+test_every_decision_route_is_csrf_protected (tests.test_rev388r3new.Rev388r3New) ... ok
+test_item_post_and_read_are_members_only (tests.test_rev388r3new.Rev388r3New) ... ok
+test_moderated_item_cannot_be_decided_and_its_text_is_not_served (tests.test_rev388r3new.Rev388r3New) ... ok
+test_n1b_moderated_amend_parent (tests.test_rev388r3new.Rev388r3New) ... ok
+test_n2_parent_choices (tests.test_rev388r3new.Rev388r3New) ... ok
+test_n3_symlinked_locks (tests.test_rev388r3new.Rev388r3New) ... ok
+test_question_answer_is_a_member_action_with_who_and_when (tests.test_rev388r3new.Rev388r3New) ... ok
+test_r7_an_agent_credential_is_refused_before_any_grant (tests.test_rev388r3new.Rev388r3New) ... ok
+test_reject_and_amend_then_decide (tests.test_rev388r3new.Rev388r3New) ... ok
+test_requirement_owner_accept_creates_a_requirement_and_its_decision (tests.test_rev388r3new.Rev388r3New) ... ok
+test_s1a_failed_append_amend_accept (tests.test_rev388r3new.Rev388r3New) ... FAIL
+test_s1b_failed_append_retry_unchanged (tests.test_rev388r3new.Rev388r3New) ... ok
+test_s1c_a_fail_b_fail_a (tests.test_rev388r3new.Rev388r3New) ... ok
+test_s1d_failed_append_then_reject (tests.test_rev388r3new.Rev388r3New) ... ok
+test_supersede_and_bounds (tests.test_rev388r3new.Rev388r3New) ... ok
+
+======================================================================
+FAIL: test_d1b_amend_a_b_a (tests.test_rev388r3new.Rev388r3New)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r3/rev/w/tests/test_rev388r3new.py", line 85, in test_d1b_amend_a_b_a
+    self.assertEqual(('TA', 'XA'), (cur3['title'], cur3['text']), 'third amend (back to A) did not apply')
+AssertionError: Tuples differ: ('TA', 'XA') != ('TB', 'XB')
+
+First differing element 0:
+'TA'
+'TB'
+
+- ('TA', 'XA')
+?    ^     ^
+
++ ('TB', 'XB')
+?    ^     ^
+ : third amend (back to A) did not apply
+
+======================================================================
+FAIL: test_s1a_failed_append_amend_accept (tests.test_rev388r3new.Rev388r3New)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r3/rev/w/tests/test_rev388r3new.py", line 234, in test_s1a_failed_append_amend_accept
+    self.assertEqual(1, len(rows2), 'two requirement records carry this item pointer')
+AssertionError: 1 != 2 : two requirement records carry this item pointer
+
+----------------------------------------------------------------------
+Ran 81 tests in 205.318s
+
+FAILED (failures=2)
+
+D1 first amend 200 | second amend (different text) 200 None None | third amend (same text as first) 200 True | current amended T2 X2
+D1 r1 operation ids would have been room-r-b67dcd54354a-1-0-amend room-r-b67dcd54354a-1-1-amend
+
+F1 second accept status 409 final
+F1 requirements/proposals/decisions = (1, 0, 1)
+
+F1b accept-after-reject 409
+F1b requirements/proposals/decisions = (0, 0, 0)
+
+F1c 409
+F1c requirements/proposals/decisions = (0, 0, 0)
+
+F1d 409
+F1d requirements/proposals/decisions = (0, 0, 0)
+
+F1e 409
+F1e requirements/proposals/decisions = (0, 0, 0)
+
+F1f superseded accept 409
+F1f requirements/proposals/decisions = (0, 0, 0)
+
+F2 owner 200 worker 409 final elapsed 1.6s
+F2 events [('accept', 'requirement')]
+F2 requirements/proposals/decisions = (1, 0, 1)
+
+F3 viewer amend 403 Only the item author or a project owner or coordinator can amend or reject it.
+
+F3b viewer reject 403
+
+F3c viewer answer 200 accepted Viewer answer
+
+F3d contributor on owner item: amend 403 reject 403
+
+F3e worker2 on worker items (seq, amend, reject): [(1, 403, 403), (2, 403, 403)]
+
+F3f grant 200 agent statuses {'/items': 403, '/items/1/answer': 403, '/items/1/amend': 403, '/items/1/reject': 403, '/items/1/accept': 403, '/messages/1/moderate': 403}
+
+F4 leaks per surface: {"read": [], "read_since0_limit1": [], "export_md": [], "export_jsonl": [], "list": [], "index.json": []}
+F4 item 1 superseded record None superseded_by 9 supersedes None parent None history 0
+F4 item 3 accepted record None superseded_by None supersedes None parent None history 0
+F4 item 5 rejected record None superseded_by None supersedes None parent None history 0
+F4 item 7 accepted record None superseded_by None supersedes None parent None history 0
+F4 item 9 proposed record None superseded_by None supersedes 1 parent None history 0
+
+F5 archived project {'answer': 409, 'accept': 409, 'post': 409, 'moderate': 409, 'amend': 409}
+F5 requirements/proposals/decisions = (0, 0, 0)
+
+F6 outsider [(1, 'answer', 404, 'Project not found'), (9, 'answer', 404, 'Project not found'), (1, 'reject', 404, 'Project not found'), (9, 'reject', 404, 'Project not found'), (1, 'accept', 404, 'Project not found'), (9, 'accept', 404, 'Project not found'), (1, 'amend', 404, 'Project not found')]
+
+F7 served accepted FORGED
+F7 accept after forged cache 200 None
+
+L1 lock path exists True /home/james/orchestra-review-evidence/1023-388r3/rev/w/.runtime/test-tmp/rooms-items-http-891c01709673/proj_3d15cf1dc75d94a3/.item-decisions.lock other project lock path /home/james/orchestra-review-evidence/1023-388r3/rev/w/.runtime/test-tmp/rooms-items-http-891c01709673/proj_ed1b64c9f48e248d/.item-decisions.lock
+L1 accept while lock held elsewhere 503 {'code': 'uncertain', 'message': 'The server was busy and cannot say whether this request was carried out. Look before you repeat it, or send it again with the same idempotency key.'} after 60.0s
+L1 message post while item lock held 201 after 0.0s
+L1 requirements/proposals/decisions = (0, 0, 0)
+L1 accept after release 200
+
+D1b A->B->A statuses 200 200 200 | third answer title/text TB XB | item now amended TB XB | amend lines 2
+D1b amend back to the POSTED text 200 | item now T0 X0 | amend lines 3
+D1b accept 200 | record rows [('task_requirement_1', 'T0', 'X0', 'job_0001', 'task_decision_1')]
+
+D1c concurrent amends {'owner': 200, 'coord': 200} | lines [('TO', 'XO'), ('TC', 'XC')] | item now TC XC
+D1c accept 200 | record rows [('task_requirement_1', 'TC', 'XC', 'job_0001', 'task_decision_1')]
+
+D1d accept 200 | rows [('task_requirement_1', 'TC', 'XC', 'job_0001', 'task_decision_1')]
+
+D2 room state while the record write ran open | archive 200 (took 1.53s) | owner accept 200 None | item events 1 | item state accepted
+D2 requirements/proposals/decisions = (1, 0, 1)
+
+D2b moderation during write: moderate 201 | accept 200 | item accepted True
+D2b requirements/proposals/decisions = (1, 0, 1)
+
+D2c supersede during write: supersede 409 final | accept 200 | items [(1, 'accepted')]
+D2c requirements/proposals/decisions = (1, 0, 1)
+
+D2d project archived during write: accept 200 None | item events 1 | item accepted
+D2d requirements/proposals/decisions = (1, 0, 1)
+
+N1b moderated item: secret words / amend parent per surface {'read': ([], 0), 'export_md': ([], 0), 'export_jsonl': ([], 1), 'index.json': ([], 0)}
+N2 ('owner accept parent missing', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept parent int', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept parent list', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept parent other-proj', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('rows after refused accepts', 0)
+N2 ('contributor amend own item bad parent', 422)
+N2 ('contributor amend own item good parent', 200)
+N2 ('contributor amend owner item with parent', 404)
+N2 ('contributor accept with bad parent', 200, 'proposal')
+N2 ('amend decision with parent', 200)
+N2 ('owner accept, project has no jobs, item parent job_0001', 404, 'No such item in this room.')
+N2 ('owner accept, no jobs, explicit parent', 404)
+N2 ('owner amend, no jobs, parent', 404)
+N2 ('rows for item 5', 0)
+N2 requirements/proposals/decisions = (0, 1, 0)
+N3 ('.item-decisions.lock', 'accept', 500, 'damaged', 'post', 201, 'read', 200, 'victim created', False)
+N3 ('.coordination.lock', 'accept', 500, 'damaged', 'post', 500, 'read', 500, 'victim created', False)
+N3 ('project dir symlink', 'accept', 200, None, 'lock created in real dir', True)
+N3 requirements/proposals/decisions = (1, 0, 1)
+
+S1a first accept 500 Internal error | rows after first [('task_requirement_1', 'TA', 'XA', 'job_0001', 'task_decision_1')]
+S1a amend 200 | second accept 200 task_requirement_2 | rows after [('task_requirement_1', 'TA', 'XA', 'job_0001', 'task_decision_1'), ('task_requirement_2', 'TB', 'XB', 'job_0001', 'task_decision_2')] | item accepted TB task_requirement_2
+S1a requirements/proposals/decisions = (2, 0, 2)
+
+S1b first 500 | retry (fresh key, no change) 200 task_requirement_1 | rows [('task_requirement_1', 'Add export', 'We need CSV export.', 'job_0001', 'task_decision_1')]
+S1b requirements/proposals/decisions = (1, 0, 1)
+
+S1c statuses acc/amend/acc/amend/acc [500, 200, 500, 200, 200] | rows [('task_requirement_1', 'TA', 'XA', 'job_0001', 'task_decision_1'), ('task_requirement_2', 'TB', 'XB', 'job_0001', 'task_decision_2')] | item accepted TA task_requirement_1
+S1c requirements/proposals/decisions = (2, 0, 2)
+
+S1d failed accept 500 | reject 200 | rows [('task_requirement_1', 'Add export', 'We need CSV export.', 'job_0001', 'task_decision_1')] | item rejected
+S1d requirements/proposals/decisions = (1, 0, 1)
+exit=1

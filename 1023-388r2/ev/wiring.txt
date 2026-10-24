@@ -1,0 +1,29 @@
+test_a_transport_failure_stops_recording_and_says_how_to_resume (tests.test_capability_wiring.ClientCheckTests) ... ok
+test_check_needs_a_config_and_help_does_not (tests.test_capability_wiring.ClientCheckTests) ... ok
+test_check_resolves_every_pointer_and_writes_nothing (tests.test_capability_wiring.ClientCheckTests) ... ok
+test_key_filters_and_refusals (tests.test_capability_wiring.ClientCheckTests) ... ok
+test_payloads_writes_a_file_for_the_host_command_and_posts_nothing (tests.test_capability_wiring.ClientCheckTests) ... ok
+test_record_posts_one_verification_per_capability_at_head (tests.test_capability_wiring.ClientCheckTests) ... ok
+test_record_refuses_a_checkout_that_is_not_a_clean_full_commit (tests.test_capability_wiring.ClientCheckTests) ... ok
+test_the_payloads_file_is_never_written_through_a_symbolic_link (tests.test_capability_wiring.ClientCheckTests) ... ok
+test_the_payloads_file_is_private_and_replaced_whole (tests.test_capability_wiring.ClientCheckTests)
+Review 01a0fe9e `smaller` (a). ... ok
+test_the_release_payload_rule_is_the_documented_one (tests.test_capability_wiring.ClientCheckTests)
+kittrial-5bb.179: the release check set is derived, and the rule is the written one. ... ok
+test_an_unreachable_endpoint_keeps_the_local_lookup (tests.test_capability_wiring.ClientSplitTests) ... ok
+test_endpoint_subcommands_need_a_config_and_reach_the_endpoint (tests.test_capability_wiring.ClientSplitTests) ... ok
+test_lookup_resolve_and_index_stay_local (tests.test_capability_wiring.ClientSplitTests) ... ok
+test_lookup_with_a_config_merges_records_resolved_live (tests.test_capability_wiring.ClientSplitTests) ... ok
+test_verify_is_a_locked_guarded_write_that_is_never_verified (tests.test_capability_wiring.EndpointDispatchTests) ... ok
+test_writes_are_locked_and_guarded_and_reads_are_neither (tests.test_capability_wiring.EndpointDispatchTests) ... ok
+test_apply_retire_and_alias_reject_through_admin (tests.test_capability_wiring.OperatorCommandTests) ... ok
+test_every_file_is_named_for_its_key_and_passes_the_payload_validator (tests.test_capability_wiring.ProposalFolderTests) ... ok
+test_every_pointer_in_the_folder_resolves_at_head (tests.test_capability_wiring.ProposalFolderTests) ... ok
+test_an_exact_hit_carries_no_hint_at_all (tests.test_capability_wiring.ProposalHintTests) ... ok
+test_the_miss_hint_names_a_payload_file_and_never_a_live_propose (tests.test_capability_wiring.ProposalHintTests) ... ok
+
+----------------------------------------------------------------------
+Ran 21 tests in 84.009s
+
+OK
+exit=0

@@ -1,0 +1,28 @@
+Fbusy: a wait for a lock ran out in the service for POST: 'Timed out waiting for lock /home/james/orchestra-review-evidence/1023-388r2/rev/w/.runtime/test-tmp/rooms-items-http-668723a61a3d/proj_1e8dc5bace9b3a77/.item-decisions.lock'
+.
+======================================================================
+FAIL: test_f4_moderated_item_every_surface (tests.test_rev388r2.Rev388r2)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r2/rev/w/tests/test_rev388r2.py", line 276, in test_f4_moderated_item_every_surface
+    self.assertFalse(any(leaks.values()), leaks)
+AssertionError: True is not false : {'read': ['SECRET-PARENT'], 'read_since0_limit1': [], 'export_md': [], 'export_jsonl': [], 'list': [], 'index.json': ['SECRET-PARENT']}
+
+----------------------------------------------------------------------
+Ran 2 tests in 63.588s
+
+FAILED (failures=1)
+
+F4 leaks per surface: {"read": ["SECRET-PARENT"], "read_since0_limit1": [], "export_md": [], "export_jsonl": [], "list": [], "index.json": ["SECRET-PARENT"]}
+F4 item 1 superseded record None superseded_by 9 supersedes None parent job_0001 history 0
+F4 item 3 accepted record None superseded_by None supersedes None parent None history 0
+F4 item 5 rejected record None superseded_by None supersedes None parent None history 0
+F4 item 7 accepted record None superseded_by None supersedes None parent job_0001 history 0
+F4 item 9 proposed record None superseded_by None supersedes 1 parent SECRET-PARENT history 0
+
+L1 lock path exists True /home/james/orchestra-review-evidence/1023-388r2/rev/w/.runtime/test-tmp/rooms-items-http-668723a61a3d/proj_1e8dc5bace9b3a77/.item-decisions.lock other project lock path /home/james/orchestra-review-evidence/1023-388r2/rev/w/.runtime/test-tmp/rooms-items-http-668723a61a3d/proj_a2cc12dd3217212c/.item-decisions.lock
+L1 accept while lock held elsewhere 503 {'code': 'uncertain', 'message': 'The server was busy and cannot say whether this request was carried out. Look before you repeat it, or send it again with the same idempotency key.'} after 60.0s
+L1 message post while item lock held 201 after 0.0s
+L1 requirements/proposals/decisions = (0, 0, 0)
+L1 accept after release 200
+exit=1

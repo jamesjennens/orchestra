@@ -1,0 +1,9 @@
+test_n2b_editor_choice_wins_on_accept (tests.test_rev388r3new.Rev388r3New) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 1.574s
+
+OK
+
+N2b editor picks job_0002 over item parent job_0001: 200 [('task_requirement_1', 'Add export', 'We need CSV export.', 'job_0002', 'task_decision_1')]
+exit=0

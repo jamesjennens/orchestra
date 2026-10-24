@@ -1,0 +1,109 @@
+applied M1-role-recheck
+M1-role-recheck SURVIVED | fast: Ran 155 tests in 73.989s OK (skipped=2)  | slow: Ran 108 tests in 164.669s OK (skipped=3) 
+applied M2-via-session
+M2-via-session SURVIVED | fast: Ran 155 tests in 70.888s OK (skipped=2)  | slow: Ran 108 tests in 164.109s OK (skipped=3) 
+applied M3-project-match
+M3-project-match SURVIVED | fast: Ran 155 tests in 70.717s OK (skipped=2)  | slow: Ran 108 tests in 164.115s OK (skipped=3) 
+applied M4-route-r7
+FAIL: test_r7_an_agent_credential_is_refused_before_any_grant (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M4-route-r7 KILLED-fast | fast: Ran 155 tests in 73.686s FAILED (failures=1, skipped=2)  | slow: -
+applied M5-item-content-bind
+FAIL: test_the_room_decision_action_binds_content_state_and_room (tests.test_rooms_items_real_bd.RoomsItemsRealBdTests)
+M5-item-content-bind KILLED-slow | fast: Ran 155 tests in 73.928s OK (skipped=2)  | slow: Ran 108 tests in 160.945s FAILED (failures=1, skipped=3) 
+applied M6-item-state-bind
+FAIL: test_the_room_decision_action_binds_content_state_and_room (tests.test_rooms_items_real_bd.RoomsItemsRealBdTests)
+M6-item-state-bind KILLED-slow | fast: Ran 155 tests in 70.943s OK (skipped=2)  | slow: Ran 108 tests in 170.065s FAILED (failures=1, skipped=3) 
+applied M7-cache-stale-check
+M7-cache-stale-check SURVIVED | fast: Ran 155 tests in 69.933s OK (skipped=2)  | slow: Ran 108 tests in 161.195s OK (skipped=3) 
+applied M8-cache-refresh-on-append
+ERROR: test_supersede_makes_the_older_item_final (tests.test_rooms.RoomsItemsTest)
+ERROR: test_a_viewer_cannot_amend_or_reject_another_members_question (tests.test_rooms_items_http.RoomsItemsHttpTests)
+ERROR: test_accept_after_a_failed_append_records_the_amended_text (tests.test_rooms_items_http.RoomsItemsHttpTests)
+ERROR: test_amend_twice_with_different_text_then_accept_latest (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M8-cache-refresh-on-append KILLED-fast | fast: Ran 155 tests in 71.464s FAILED (failures=2, errors=6, skipped=2)  | slow: -
+applied M9-moderated-items-filter
+FAIL: test_moderated_item_text_is_served_nowhere (tests.test_rooms.RoomsItemsTest)
+FAIL: test_a_moderated_items_amended_title_is_not_served (tests.test_rooms_items_http.RoomsItemsHttpTests)
+FAIL: test_moderated_item_cannot_be_decided_and_its_text_is_not_served (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M9-moderated-items-filter KILLED-fast | fast: Ran 155 tests in 72.940s FAILED (failures=3, skipped=2)  | slow: -
+applied M10-jsonl-item-tombstone
+FAIL: test_moderated_item_text_is_served_nowhere (tests.test_rooms.RoomsItemsTest)
+M10-jsonl-item-tombstone KILLED-fast | fast: Ran 155 tests in 70.469s FAILED (failures=1, skipped=2)  | slow: -
+applied M11-endpoint-flock
+M11-endpoint-flock SURVIVED | fast: Ran 155 tests in 74.856s OK (skipped=2)  | slow: Ran 108 tests in 165.528s OK (skipped=3) 
+applied M12-route-accept-lock
+M12-route-accept-lock SURVIVED | fast: Ran 155 tests in 71.816s OK (skipped=2)  | slow: Ran 108 tests in 163.709s OK (skipped=3) 
+applied M13-service-only
+FAIL: test_the_web_only_actions_are_refused_before_their_name_is_looked_at (tests.test_key_projects.BoundEndpointTests)
+M13-service-only KILLED-fast | fast: Ran 155 tests in 71.698s FAILED (failures=1, skipped=2)  | slow: -
+applied M14-decide-moderated
+FAIL: test_moderated_item_text_is_served_nowhere (tests.test_rooms.RoomsItemsTest)
+FAIL: test_moderated_item_cannot_be_decided_and_its_text_is_not_served (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M14-decide-moderated KILLED-fast | fast: Ran 155 tests in 71.496s FAILED (failures=2, skipped=2)  | slow: -
+applied M15-route-decision-editor
+M15-route-decision-editor SURVIVED | fast: Ran 155 tests in 69.666s OK (skipped=2)  | slow: Ran 108 tests in 172.286s OK (skipped=3) 
+applied M16-block-capability
+M16-block-capability SURVIVED | fast: Ran 155 tests in 72.344s OK (skipped=2)  | slow: Ran 108 tests in 171.770s OK (skipped=3) 
+applied M14b-decidable-moderated
+FAIL: test_refused_accepts_create_no_native_record (tests.test_rooms_items_real_bd.RoomsItemsRealBdTests)
+M14b-decidable-moderated KILLED-slow | fast: Ran 155 tests in 71.625s OK (skipped=2)  | slow: Ran 108 tests in 156.455s FAILED (failures=1, skipped=3) 
+applied M17r3-no-item-lock
+FAIL: test_archive_waits_for_an_accept_inside_its_record_write (tests.test_rooms_items_http.RoomsItemsHttpTests)
+FAIL: test_concurrent_accepts_create_only_one_record (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M17r3-no-item-lock KILLED-fast | fast: Ran 155 tests in 66.846s FAILED (failures=2, skipped=2)  | slow: -
+applied M18-no-existing-refusal
+M18-no-existing-refusal SURVIVED | fast: Ran 155 tests in 71.295s OK (skipped=2)  | slow: Ran 108 tests in 170.534s OK (skipped=3) 
+applied M19-no-rights
+FAIL: test_a_viewer_cannot_amend_or_reject_another_members_question (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M19-no-rights KILLED-fast | fast: Ran 155 tests in 69.175s FAILED (failures=1, skipped=2)  | slow: -
+applied M20-no-decidable
+FAIL: test_refused_accepts_create_no_native_record (tests.test_rooms_items_real_bd.RoomsItemsRealBdTests)
+M20-no-decidable KILLED-slow | fast: Ran 155 tests in 71.097s OK (skipped=2)  | slow: Ran 108 tests in 154.986s FAILED (failures=1, skipped=3) 
+applied M22-no-endpoint-room-open
+FAIL: test_the_room_decision_action_binds_content_state_and_room (tests.test_rooms_items_real_bd.RoomsItemsRealBdTests)
+M22-no-endpoint-room-open KILLED-slow | fast: Ran 155 tests in 72.038s OK (skipped=2)  | slow: Ran 108 tests in 175.000s FAILED (failures=1, skipped=3) 
+applied M23-no-event-archived-project
+FAIL: test_an_archived_project_refuses_every_item_decision (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M23-no-event-archived-project KILLED-fast | fast: Ran 155 tests in 70.614s FAILED (failures=1, skipped=2)  | slow: -
+applied M24-no-amend-title-redaction
+FAIL: test_a_moderated_items_amended_title_is_not_served (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M24-no-amend-title-redaction KILLED-fast | fast: Ran 155 tests in 69.887s FAILED (failures=1, skipped=2)  | slow: -
+applied M25-no-live-archive-recheck
+M25-no-live-archive-recheck SURVIVED | fast: Ran 155 tests in 71.870s OK (skipped=2)  | slow: Ran 108 tests in 168.876s OK (skipped=3) 
+applied M26-no-post-credential-refusal
+M26-no-post-credential-refusal SURVIVED | fast: Ran 155 tests in 73.715s OK (skipped=2)  | slow: Ran 108 tests in 164.143s OK (skipped=3) 
+applied M27-no-rights-recheck-in-lock
+M27-no-rights-recheck-in-lock SURVIVED | fast: Ran 155 tests in 72.070s OK (skipped=2)  | slow: Ran 108 tests in 171.086s OK (skipped=3) 
+applied M21r3-no-parent-job-check
+FAIL: test_a_requirement_parent_must_be_an_existing_job (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M21r3-no-parent-job-check KILLED-fast | fast: Ran 155 tests in 76.466s FAILED (failures=1, skipped=2)  | slow: -
+applied M28-amend-stable-identity
+FAIL: test_amend_twice_with_different_text_then_accept_latest (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M28-amend-stable-identity KILLED-fast | fast: Ran 155 tests in 74.383s FAILED (failures=1, skipped=2)  | slow: -
+applied M29-accept-stable-identity
+FAIL: test_accept_after_a_failed_append_records_the_amended_text (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M29-accept-stable-identity KILLED-fast | fast: Ran 155 tests in 74.610s FAILED (failures=1, skipped=2)  | slow: -
+applied M30-archive-no-item-lock
+FAIL: test_archive_waits_for_an_accept_inside_its_record_write (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M30-archive-no-item-lock KILLED-fast | fast: Ran 155 tests in 72.262s FAILED (failures=1, skipped=2)  | slow: -
+applied M31-item-lock-follows-symlink
+FAIL: test_a_symlinked_room_or_item_lock_is_refused (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M31-item-lock-follows-symlink KILLED-fast | fast: Ran 155 tests in 74.312s FAILED (failures=1, skipped=2)  | slow: -
+applied M32-room-lock-follows-symlink
+FAIL: test_a_symlinked_room_or_item_lock_is_refused (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M32-room-lock-follows-symlink KILLED-fast | fast: Ran 155 tests in 74.570s FAILED (failures=1, skipped=2)  | slow: -
+applied M33-amend-parent-unchecked
+FAIL: test_an_editor_can_choose_the_parent_on_an_amendment (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M33-amend-parent-unchecked KILLED-fast | fast: Ran 155 tests in 73.261s FAILED (failures=1, skipped=2)  | slow: -
+applied M34-editor-choice-ignored
+M34-editor-choice-ignored SURVIVED | fast: Ran 155 tests in 74.192s OK (skipped=2)  | slow: Ran 108 tests in 171.681s OK (skipped=3) 
+applied M35-moderated-item-parent-served
+FAIL: test_a_moderated_items_parent_is_not_served (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M35-moderated-item-parent-served KILLED-fast | fast: Ran 155 tests in 74.630s FAILED (failures=1, skipped=2)  | slow: -
+applied M36-moderated-amend-parent-served
+M36-moderated-amend-parent-served SURVIVED | fast: Ran 155 tests in 74.196s OK (skipped=2)  | slow: Ran 108 tests in 169.707s OK (skipped=3) 
+applied M37-empty-jobs-skip
+M37-empty-jobs-skip SURVIVED | fast: Ran 155 tests in 74.758s OK (skipped=2)  | slow: Ran 108 tests in 169.159s OK (skipped=3) 
+applied M38-replay-ignores-parent
+M38-replay-ignores-parent SURVIVED | fast: Ran 155 tests in 73.195s OK (skipped=2)  | slow: Ran 108 tests in 181.819s OK (skipped=3) 
+DONE

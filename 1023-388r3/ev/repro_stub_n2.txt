@@ -1,0 +1,22 @@
+test_n2_parent_choices (tests.test_rev388r3new.Rev388r3New) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 1.937s
+
+OK
+N2 ('owner accept parent missing', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept parent int', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept parent list', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept parent other-proj', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('rows after refused accepts', 0)
+N2 ('contributor amend own item bad parent', 422)
+N2 ('contributor amend own item good parent', 200)
+N2 ('contributor amend owner item with parent', 403)
+N2 ('contributor accept with bad parent', 200, 'proposal')
+N2 ('amend decision with parent', 422)
+N2 ('owner accept, project has no jobs, item parent job_0001', 422, 'That parent is not a job of this project; a requirement hang')
+N2 ('owner accept, no jobs, explicit parent', 422)
+N2 ('owner amend, no jobs, parent', 422)
+N2 ('rows for item 5', 0)
+N2 requirements/proposals/decisions = (0, 1, 0)
+exit=0

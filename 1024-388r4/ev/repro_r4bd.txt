@@ -1,0 +1,64 @@
+test_n1_retry_by_different_editor (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n2_retry_after_room_archived (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n3_retry_after_decider_lost_role (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n4_editor_fails_then_contributor_accepts (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n5_contributor_fails_then_editor_accepts (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n6_native_write_fails_then_moderation (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n7_contributor_intent_blocks_owner_moderation (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n8_squat_intent_key (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n8b_squat_identity_after_failed_append (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n9_editor_parent_choice_then_retry (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 158.463s
+
+OK
+
+N1 alex 500 | pending (2, 'alex', '11d2-1-aa25a028b42b5b19-accept') | drew retry 200  | rows [('pp-cvp', 'decision', 'Accept requirement pp-o38.2', 'open'), ('pp-o38.2', 'task', 'Add export', 'open'), ('pp-u5r', 'decision', 'Accept requirement pp-o38.1', 'open'), ('pp-o38.1', 'task', 'Add export', 'open')] | events 1 | pending after None
+
+N2 accept 500 | archive 200 | retry 409 archived | moderate item 409 accepting | moderate message (control) 201 | reject 409 archived
+N2 item proposed False Add export We need CSV export. | pending (3, 'alex', '1b0b-1-aa25a028b42b5b19-accept') | rows [('pp-90i', 'decision', 'Accept requirement pp-dn3.1', 'open'), ('pp-dn3.1', 'task', 'Add export', 'open')] | served (200, [(1, 'item', 'Add export', 'We need CSV export.'), (2, 'tombstone', None, 'removed by alex at 2026-10-24T')], [(1, 'proposed', 'Add export', 'We need CSV export.')])
+  [proposals GET 200 total 0 items 0 None ]
+  [proposals GET 200 total 1 items 1 None ]
+
+N3 drew(coord) accept 500 | rows [('pp-dz2', 'decision', 'Accept requirement pp-6my.1', 'open'), ('pp-6my.1', 'task', 'Add export', 'open')] | drew demoted retry 200 None {'decision_id': None, 'evidence': 'orchestra:room/r-4cd52035c5db#1', 'id': 'p-4250ff7559a1', 'kind': 'proposal', 'revision': 1, 'sha256': 'b345ee2a6e14ecd95cb1790896ff84028ce0224f5aec15fdab0a1537302c39d4'} | rows after [('pp-dz2', 'decision', 'Accept requirement pp-6my.1', 'open'), ('pp-6my.1', 'task', 'Add export', 'open')] | new proposals [('p-4250ff7559a1', 'We need CSV export.', 'submitted')] | events 1 | pending None | item accepted
+N3 drew viewer retry 403 forbidden
+  [proposals GET 200 total 1 items 1 None ]
+  [proposals GET 200 total 2 items 2 None ]
+
+N4 alex 500 | rows [('pp-e7j', 'decision', 'Accept requirement pp-ksu.1', 'open'), ('pp-ksu.1', 'task', 'Add export', 'open')] | casey 200 None {'decision_id': None, 'evidence': 'orchestra:room/r-cf23d388c127#1', 'id': 'p-a3b6c0d793da', 'kind': 'proposal', 'revision': 1, 'sha256': 'f518eb644532149e391cf29b42a99aac75a795e77d606cadaf34b2fac3c3b956'} | rows after [('pp-e7j', 'decision', 'Accept requirement pp-ksu.1', 'open'), ('pp-ksu.1', 'task', 'Add export', 'open')] | new proposals [('p-a3b6c0d793da', 'We need CSV export.', 'submitted')] | events 1
+  [proposals GET 200 total 2 items 2 None ]
+  [proposals GET 200 total 3 items 3 None ]
+  [proposals GET 200 total 3 items 3 None ]
+
+N5 casey 500 | props [('p-377494d94dd2', 'We need CSV export.', 'submitted')] | alex 200 None {'decision_id': 'pp-pv8', 'evidence': 'orchestra:room/r-bd06716c1024#1', 'id': 'pp-0et.1', 'kind': 'requirement', 'revision': 2, 'sha256': 'c9d415be1051bea93c6bf70d184c94debd17a45064a762eec04947f33ba4d143'} | rows after [('pp-pv8', 'decision', 'Accept requirement pp-0et.1', 'open'), ('pp-0et.1', 'task', 'Add export', 'open')] | new proposals [('p-377494d94dd2', 'We need CSV export.', 'submitted')] | events 1
+N6 ('accept', 500, 'internal_error')
+N6 ('pending', (2, 'alex', '5629-1-e1c2be5e9ad0f4ca-accept'))
+N6 ('moderate', 409, 'accepting', 'That item is being accepted; it cannot be moderated until th')
+N6 ('reject', 409, 'accepting', 'That item is being accepted; retry that acceptance.')
+N6 ('amend', 409, 'accepting', 'That item is being accepted; retry that acceptance.')
+N6 ('supersede', 422, 'invalid_payload', 'Idempotency-Key must be 8-128 URL-safe characters')
+N6 ('served to casey', (200, [(1, 'item', 'Slur title', 'abusive text')], [(1, 'proposed', 'Slur title', 'abusive text')]))
+N6 ('rows', [])
+N6 ('moderate again later', 409, 'accepting')
+
+N7 casey accept 500 | pending (2, 'casey', 'a948-1-6c8caf6d7110cefa-accept') | owner moderate 422 invalid_payload | owner reject 409 accepting | served to drew (200, [(1, 'item', 'Abusive', 'abusive text')], [(1, 'proposed', 'Abusive', 'abusive text')])
+
+N8 drew posts message keyed intent-room-r-0a2a103c4b1d-1-aa25a028b42b5b19-accept 201 | alex accept 409 operation_reused That operation id already wrote a different room line. | pending None | rows []
+N8 amend 200 | accept after amend 200 None
+N8b ('accept', 500)
+N8b ('drew message keyed with identity', 201, 'room-r-265135ad7862-1-aa25a028b42b5b19-accept')
+N8b ('pending', (2, 'alex', '7862-1-aa25a028b42b5b19-accept'))
+N8b ('retry accept', 409, 'final', 'That item is already decided.')
+N8b ('moderate', 422, 'invalid_payload', 'Idempotency-Key must be 8-128 URL-safe characters')
+N8b ('reject', 409, 'accepting', 'That item is being accepted; retry that acceptance.')
+N8b ('amend', 409, 'accepting', 'That item is being accepted; retry that acceptance.')
+N8b ('supersede', 422, 'invalid_payload', 'Idempotency-Key must be 8-128 URL-safe characters')
+N8b ('item', 'proposed')
+N8b ('rows', [('pp-qm9', 'decision', 'Accept requirement pp-1g3.1', 'open'), ('pp-1g3.1', 'task', 'Add export', 'open')])
+N8b ('lines', [(1, 'item', '', ''), (2, 'item-intent', 'accept', 1), (3, 'message', '', '')])
+N8b ('served to casey', (200, [(1, 'item', 'Add export', 'We need CSV export.'), (3, 'message', None, 'hello')], [(1, 'proposed', 'Add export', 'We need CSV export.')]))
+
+N9 accept(job2) 500 | retry default parent 409 Requirements changed. Reload and try again. | moderate 422 invalid_payload | close job2 rc 1 cannot close epic pp-dmq: 1 open child issue(s); close children first or use --force to override
+ | retry job2 after close 200  | pending None | rows [('pp-9nj', 'decision', 'Accept requirement pp-dmq.1', 'open'), ('pp-dmq.1', 'task', 'Add export', 'open')]
+exit=0

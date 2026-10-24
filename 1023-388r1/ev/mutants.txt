@@ -1,0 +1,44 @@
+applied M1-role-recheck
+M1-role-recheck SURVIVED | fast: Ran 143 tests in 52.754s OK (skipped=2)  | slow: Ran 106 tests in 132.377s OK (skipped=3) 
+applied M2-via-session
+M2-via-session SURVIVED | fast: Ran 143 tests in 52.089s OK (skipped=2)  | slow: Ran 106 tests in 133.909s OK (skipped=3) 
+applied M3-project-match
+M3-project-match SURVIVED | fast: Ran 143 tests in 53.891s OK (skipped=2)  | slow: Ran 106 tests in 139.283s OK (skipped=3) 
+applied M4-route-r7
+FAIL: test_r7_an_agent_credential_is_refused_before_any_grant (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M4-route-r7 KILLED-fast | fast: Ran 143 tests in 52.722s FAILED (failures=1, skipped=2)  | slow: -
+applied M5-item-content-bind
+M5-item-content-bind SURVIVED | fast: Ran 143 tests in 57.479s OK (skipped=2)  | slow: Ran 106 tests in 137.924s OK (skipped=3) 
+applied M6-item-state-bind
+M6-item-state-bind SURVIVED | fast: Ran 143 tests in 55.230s OK (skipped=2)  | slow: Ran 106 tests in 136.388s OK (skipped=3) 
+applied M7-cache-stale-check
+M7-cache-stale-check SURVIVED | fast: Ran 143 tests in 52.702s OK (skipped=2)  | slow: Ran 106 tests in 136.084s OK (skipped=3) 
+applied M8-cache-refresh-on-append
+ERROR: test_supersede_makes_the_older_item_final (tests.test_rooms.RoomsItemsTest)
+ERROR: test_supersede_and_bounds (tests.test_rooms_items_http.RoomsItemsHttpTests)
+FAIL: test_items_cache_rebuild_is_identical_and_index_is_only_a_cache (tests.test_rooms.RoomsItemsTest)
+FAIL: test_item_post_and_read_are_members_only (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M8-cache-refresh-on-append KILLED-fast | fast: Ran 143 tests in 54.747s FAILED (failures=2, errors=2, skipped=2)  | slow: -
+applied M9-moderated-items-filter
+FAIL: test_moderated_item_text_is_served_nowhere (tests.test_rooms.RoomsItemsTest)
+FAIL: test_moderated_item_cannot_be_decided_and_its_text_is_not_served (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M9-moderated-items-filter KILLED-fast | fast: Ran 143 tests in 53.145s FAILED (failures=2, skipped=2)  | slow: -
+applied M10-jsonl-item-tombstone
+FAIL: test_moderated_item_text_is_served_nowhere (tests.test_rooms.RoomsItemsTest)
+M10-jsonl-item-tombstone KILLED-fast | fast: Ran 143 tests in 53.784s FAILED (failures=1, skipped=2)  | slow: -
+applied M11-endpoint-flock
+M11-endpoint-flock SURVIVED | fast: Ran 143 tests in 53.106s OK (skipped=2)  | slow: Ran 106 tests in 136.741s OK (skipped=3) 
+applied M12-route-accept-lock
+M12-route-accept-lock SURVIVED | fast: Ran 143 tests in 53.345s OK (skipped=2)  | slow: Ran 106 tests in 136.443s OK (skipped=3) 
+applied M13-service-only
+FAIL: test_the_web_only_actions_are_refused_before_their_name_is_looked_at (tests.test_key_projects.BoundEndpointTests)
+M13-service-only KILLED-fast | fast: Ran 143 tests in 55.279s FAILED (failures=1, skipped=2)  | slow: -
+applied M14-decide-moderated
+FAIL: test_moderated_item_text_is_served_nowhere (tests.test_rooms.RoomsItemsTest)
+FAIL: test_moderated_item_cannot_be_decided_and_its_text_is_not_served (tests.test_rooms_items_http.RoomsItemsHttpTests)
+M14-decide-moderated KILLED-fast | fast: Ran 143 tests in 53.902s FAILED (failures=2, skipped=2)  | slow: -
+applied M15-route-decision-editor
+M15-route-decision-editor SURVIVED | fast: Ran 143 tests in 53.337s OK (skipped=2)  | slow: Ran 106 tests in 137.179s OK (skipped=3) 
+applied M16-block-capability
+M16-block-capability SURVIVED | fast: Ran 143 tests in 53.763s OK (skipped=2)  | slow: Ran 106 tests in 136.171s OK (skipped=3) 
+DONE

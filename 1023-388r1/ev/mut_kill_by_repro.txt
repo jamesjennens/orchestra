@@ -1,0 +1,27 @@
+== M1-role-recheck
+FAIL: test_r1_accept_after_accept_second_requirement (tests.test_rev388_bd.Rev388Bd)
+Ran 3 tests in 40.693s
+FAILED (failures=1)
+R1 rows carrying the pointer: [('pp-0kb', 'decision', 'Accept requirement pp-nmx.2'), ('pp-nmx.2', 'task', 'Add export'), ('pp-7w9', 'decision', 'Accept requirement pp-nmx.1'), ('pp-nmx.1', 'task', 'Add export')]
+R4 owner-forged-text ('REFUSED', 'HttpError', 'The room decision item changed; reload the room and try again')
+R4 owner-wrong-item-evidence ('REFUSED', 'HttpError', 'The room decision item changed; reload the room and try again')
+R6 admin superuser True member role None
+R6 REFUSED HttpError AuthorityDenied: Editing a project's requirements needs its owner or a coordinator: a signed-in member with the coordinator or owner role, or an agent holding the project's coordinator grant.
+== M5-item-content-bind
+FAIL: test_r1_accept_after_accept_second_requirement (tests.test_rev388_bd.Rev388Bd)
+Ran 3 tests in 41.350s
+FAILED (failures=1)
+R1 rows carrying the pointer: [('pp-vt1', 'decision', 'Accept requirement pp-3iu.2'), ('pp-3iu.2', 'task', 'Add export'), ('pp-9g1', 'decision', 'Accept requirement pp-3iu.1'), ('pp-3iu.1', 'task', 'Add export')]
+R4 owner-forged-text ('ANSWER', "{'schema_version': 1, 'decision_id': 'pp-879', 'evidence': 'orchestra:room/r-8493829c3c3a#1'}")
+R4 owner-wrong-item-evidence ('REFUSED', 'HttpError', 'Operation identity reused with a different request')
+R6 admin superuser True member role None
+R6 REFUSED HttpError AuthorityDenied: Editing a project's requirements needs its owner or a coordinator: a signed-in member with the coordinator or owner role, or an agent holding the project's coordinator grant.
+== M6-item-state-bind
+FAIL: test_r1_accept_after_accept_second_requirement (tests.test_rev388_bd.Rev388Bd)
+Ran 3 tests in 40.261s
+FAILED (failures=1)
+R1 rows carrying the pointer: [('pp-i93', 'decision', 'Accept requirement pp-dy6.2'), ('pp-dy6.2', 'task', 'Add export'), ('pp-9me', 'decision', 'Accept requirement pp-dy6.1'), ('pp-dy6.1', 'task', 'Add export')]
+R4 owner-forged-text ('REFUSED', 'HttpError', 'The room decision item changed; reload the room and try again')
+R4 owner-wrong-item-evidence ('REFUSED', 'HttpError', 'The room decision item changed; reload the room and try again')
+R6 admin superuser True member role None
+R6 REFUSED HttpError AuthorityDenied: Editing a project's requirements needs its owner or a coordinator: a signed-in member with the coordinator or owner role, or an agent holding the project's coordinator grant.

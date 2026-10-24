@@ -1,0 +1,27 @@
+FF
+======================================================================
+FAIL: test_r5_contributor_chosen_parent_is_a_decision_row (tests.test_rev388_bd.Rev388Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388_bd.py", line 167, in test_r5_contributor_chosen_parent_is_a_decision_row
+    self.assertNotEqual(200, accepted.status)
+AssertionError: 200 == 200
+
+======================================================================
+FAIL: test_r6_superuser_non_member_direct (tests.test_rev388_bd.Rev388Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r1/rev/w/tests/test_rev388_bd.py", line 182, in test_r6_superuser_non_member_direct
+    self.assertIsNone(answer)
+AssertionError: {'schema_version': 1, 'decision_id': 'pp-8i8', 'evidence': 'orchestra:room/r-e04c196a5374#1'} is not None
+
+----------------------------------------------------------------------
+Ran 2 tests in 24.939s
+
+FAILED (failures=2)
+R5 post with decision-row parent 201
+R5 owner accept 200 {'sequence': 1, 'kind': 'item', 'item_kind': 'requirement', 'title': 'Add export', 'state': 'accepted', 'text': 'We need CSV export.', 'author': {'id': 'usr_034fe22033387edf', 'name': 'casey', 'role':
+R5 requirement parent/deps pp-zs4 [{'id': 'pp-zs4', 'title': 'A decision row', 'status': 'open', 'priority': 2, 'issue_type': 'decision', 'created_at': '2026-10-23T17:53:13Z', 'created_by': 'op', 'updated_at': '2026-10-23T17:53:13Z', 'dependency_type': 'parent-child'}]
+R6 admin superuser True member role owner
+R6 ANSWER {'schema_version': 1, 'decision_id': 'pp-8i8', 'evidence': 'orchestra:room/r-e04c196a5374#1'}
+exit=1

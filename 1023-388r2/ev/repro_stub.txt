@@ -1,0 +1,107 @@
+.........FF...............F....E......
+======================================================================
+ERROR: test_l1_item_lock_held_elsewhere (tests.test_rev388r2.Rev388r2)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r2/rev/w/tests/test_rev388r2.py", line 126, in test_l1_item_lock_held_elsewhere
+    answer = self.accept(self.tokens['owner'], key='k-lock-rev388key')
+  File "/home/james/orchestra-review-evidence/1023-388r2/rev/w/tests/test_rooms_items_http.py", line 165, in accept
+    return self.request('POST', self.path('/items/%d/accept' % sequence, rid), body or {},
+  File "/home/james/orchestra-review-evidence/1023-388r2/rev/w/tests/test_http_agents.py", line 102, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+FAIL: test_d1_second_amend (tests.test_rev388r2.Rev388r2)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r2/rev/w/tests/test_rev388r2.py", line 329, in test_d1_second_amend
+    self.assertEqual(200, second.status)
+AssertionError: 200 != 409
+
+======================================================================
+FAIL: test_d2_room_archived_during_record_write (tests.test_rev388r2.Rev388r2)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r2/rev/w/tests/test_rev388r2.py", line 350, in test_d2_room_archived_during_record_write
+    self.assertEqual((0, 0, 0), self.counts('D2'))
+AssertionError: Tuples differ: (0, 0, 0) != (1, 0, 1)
+
+First differing element 0:
+0
+1
+
+- (0, 0, 0)
++ (1, 0, 1)
+
+======================================================================
+FAIL: test_f4_moderated_item_every_surface (tests.test_rev388r2.Rev388r2)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r2/rev/w/tests/test_rev388r2.py", line 224, in test_f4_moderated_item_every_surface
+    self.assertEqual(200, self.request('POST', self.path('/items/2/answer'), {'text': 'SECRET-ANSWER'},
+AssertionError: 200 != 404
+
+----------------------------------------------------------------------
+Ran 38 tests in 78.745s
+
+FAILED (failures=3, errors=1)
+
+D1 first amend 200 | second amend (different text) 409 operation_reused That operation id already wrote a different room line. | third amend (same text as first) 200 True | current amended T1 X1
+D1 r1 operation ids would have been room-r-82ca5dcf589a-1-0-amend room-r-82ca5dcf589a-1-1-amend
+
+D2 archive during write 200 (took 0.02s) | owner accept 409 archived | item events 0 | item state proposed
+D2 requirements/proposals/decisions = (1, 0, 1)
+
+F1 second accept status 409 final
+F1 requirements/proposals/decisions = (1, 0, 1)
+
+F1b accept-after-reject 409
+F1b requirements/proposals/decisions = (0, 0, 0)
+
+F1c 409
+F1c requirements/proposals/decisions = (0, 0, 0)
+
+F1d 409
+F1d requirements/proposals/decisions = (0, 0, 0)
+
+F1e 409
+F1e requirements/proposals/decisions = (0, 0, 0)
+
+F1f superseded accept 409
+F1f requirements/proposals/decisions = (0, 0, 0)
+
+F2 owner 200 worker 409 final elapsed 1.6s
+F2 events [('accept', 'requirement')]
+F2 requirements/proposals/decisions = (1, 0, 1)
+
+F3 viewer amend 403 Only the item author or a project owner or coordinator can amend or reject it.
+
+F3b viewer reject 403
+
+F3c viewer answer 200 accepted Viewer answer
+
+F3d contributor on owner item: amend 403 reject 403
+
+F3e worker2 on worker items (seq, amend, reject): [(1, 403, 403), (2, 403, 403)]
+
+F3f grant 200 agent statuses {'/items': 403, '/items/1/answer': 403, '/items/1/amend': 403, '/items/1/reject': 403, '/items/1/accept': 403, '/messages/1/moderate': 403}
+
+F5 archived project {'answer': 409, 'accept': 409, 'post': 409, 'moderate': 409, 'amend': 409}
+F5 requirements/proposals/decisions = (0, 0, 0)
+
+F6 outsider [(1, 'answer', 404, 'Project not found'), (9, 'answer', 404, 'Project not found'), (1, 'reject', 404, 'Project not found'), (9, 'reject', 404, 'Project not found'), (1, 'accept', 404, 'Project not found'), (9, 'accept', 404, 'Project not found'), (1, 'amend', 404, 'Project not found')]
+
+F7 served accepted FORGED
+F7 accept after forged cache 200 None
+
+L1 lock path exists True /home/james/orchestra-review-evidence/1023-388r2/rev/w/.runtime/test-tmp/rooms-items-http-eca5528ab3d6/proj_d1eeb3caef3be359/.item-decisions.lock other project lock path /home/james/orchestra-review-evidence/1023-388r2/rev/w/.runtime/test-tmp/rooms-items-http-eca5528ab3d6/proj_9cdd98b5e0be0481/.item-decisions.lock
+exit=1

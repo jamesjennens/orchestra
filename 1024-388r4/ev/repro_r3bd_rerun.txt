@@ -1,0 +1,64 @@
+test_a_decision_item_needs_a_live_owner_or_coordinator (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_a_native_call_that_never_answers_fails_with_its_command (tests.test_rev388r3new_bd.Rev388r3Bd)
+kittrial-5bb.344: the reported hang was an unbounded native call. ... ok
+test_contributor_accept_is_a_proposal_with_the_pointer (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_create_label_spellings_refuse_every_reserved_value (tests.test_rev388r3new_bd.Rev388r3Bd) ... skipped 'covered by tests/test_bd_label_aliases.py'
+test_ordinary_labels_still_reach_real_bd (tests.test_rev388r3new_bd.Rev388r3Bd) ... skipped 'covered by tests/test_bd_label_aliases.py'
+test_r10_retry_after_failed_append_then_amend_decision (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r11_retry_after_failed_append_requirement (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r12_failed_append_amend_accept_requirement (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r13_failed_append_then_other_parent (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r14_a_fail_b_fail_a (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r15_contributor_failed_append_amend_accept (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r16_amend_parents (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r8b_contributor_and_owner_concurrently_counted (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r9_room_archived_during_requirement_write (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r9b_room_archived_during_contributor_proposal (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_refused_accepts_create_no_native_record (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_requirement_accept_creates_the_existing_records_with_the_pointer (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_the_created_rows_keep_their_existing_shape (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_the_room_decision_action_binds_content_state_and_room (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_update_label_spellings_refuse_every_reserved_value (tests.test_rev388r3new_bd.Rev388r3Bd) ... skipped 'covered by tests/test_bd_label_aliases.py'
+
+----------------------------------------------------------------------
+Ran 20 tests in 226.963s
+
+OK (skipped=3)
+
+R10 first accept 500 Internal error | rows after first [('pp-luc', 'decision', 'Use CSV', 'open')]
+R10 amend 409 | retry accept 200  {'decision_id': 'pp-luc', 'evidence': 'orchestra:room/r-c4d9e861de51#1', 'id': 'pp-luc', 'kind': 'decision', 'revision': None, 'sha256': None}
+R10 rows after retry [('pp-luc', 'decision', 'Use CSV', 'open')] | item now accepted Use CSV {'decision_id': 'pp-luc', 'evidence': 'orchestra:room/r-c4d9e861de51#1', 'id': 'pp-luc', 'kind': 'decision', 'revision': None, 'sha256': None}
+
+R11 first 500 | rows [('pp-8f3', 'decision', 'Accept requirement pp-aga.1', 'open'), ('pp-aga.1', 'task', 'Add export', 'open')] | retry (fresh key) 200 {'decision_id': 'pp-8f3', 'evidence': 'orchestra:room/r-a589bd9411a8#1', 'id': 'pp-aga.1', 'kind': 'requirement', 'revision': 2, 'sha256': '6f5914bef7889b5798e477bf52053a52045021f121296bd6329844c3438dee67'} | rows after [('pp-8f3', 'decision', 'Accept requirement pp-aga.1', 'open'), ('pp-aga.1', 'task', 'Add export', 'open')]
+
+R12 first accept 500 Internal error | rows after first [('pp-c3s', 'decision', 'Accept requirement pp-pmd.1', 'open'), ('pp-pmd.1', 'task', 'Add export', 'open')]
+R12 amend 409 | second accept 200  pp-pmd.1
+R12 rows after [('pp-c3s', 'decision', 'Accept requirement pp-pmd.1', 'open'), ('pp-pmd.1', 'task', 'Add export', 'open')] | item accepted Add export pp-pmd.1
+
+R13 first 500 | second (editor picks job2 pp-9zg) 409 Requirements changed. Reload and try again. None | rows [('pp-cum', 'decision', 'Accept requirement pp-cs9.1', 'open'), ('pp-cs9.1', 'task', 'Add export', 'open')] | parents [('pp-cs9.1', 'pp-cs9', [None])] | item proposed
+
+R14 statuses acc/amend/acc/amend/acc [500, 409, 500, 409, 200]  | rows [('pp-m9c', 'decision', 'Accept requirement pp-044.1', 'open'), ('pp-044.1', 'task', 'Add export', 'open')] | item accepted Add export pp-044.1
+  [proposals GET 200 total 1 items 1 None ]
+  [proposals GET 200 total 2 items 2 None ]
+
+R15 contributor first 500 | amend 409 | second 200  {'decision_id': None, 'evidence': 'orchestra:room/r-a723037436c7#1', 'id': 'p-d986e66f44a2', 'kind': 'proposal', 'revision': 1, 'sha256': 'f19e7cf48a12ac042ae50b3f41494fb73a8557f367919b195b0d52c2521f2745'} | new proposals [('p-d986e66f44a2', 'We need CSV export.', 'submitted')]
+R16 ('decision-row', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('decision-row accept', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('other-project', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('other-project accept', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('missing', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('missing accept', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('plain-task', 200, '')
+R16 ('plain-task accept', 200, '')
+R16 ('rows', [('pp-oik', 'decision', 'Accept requirement pp-aif.1', 'open'), ('pp-aif.1', 'task', 'Add export', 'open')])
+  [proposals GET 200 total 2 items 2 None ]
+  [proposals GET 200 total 2 items 2 None ]
+
+R8bc contributor+owner [('alex', 200, None), ('casey', 409, 'final')] rows [('pp-tg5', 'decision', 'Accept requirement pp-hw1.1', 'open'), ('pp-hw1.1', 'task', 'Add export', 'open')] new proposals [] events 1
+
+R9 room state during write open | archive 200 11.3s | accept 200 None | rows [('pp-pri', 'decision', 'Accept requirement pp-a75.1', 'open'), ('pp-a75.1', 'task', 'Add export', 'open')] | events 1 | room now archived
+  [proposals GET 200 total 2 items 2 None ]
+  [proposals GET 200 total 3 items 3 None ]
+
+R9b room state during proposal open | archive 200 | accept 200 None | new proposals [('p-afe3f312a495', 'We need CSV export.', 'submitted')] | events 1
+exit=0

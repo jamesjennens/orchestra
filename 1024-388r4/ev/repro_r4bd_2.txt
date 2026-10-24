@@ -1,0 +1,40 @@
+test_n6_native_write_fails_then_moderation (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n7_contributor_intent_blocks_owner_moderation (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n8_squat_intent_key (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n8b_squat_identity_after_failed_append (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n9_editor_parent_choice_then_retry (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 58.897s
+
+OK
+N6 ('accept', 500, 'internal_error')
+N6 ('pending', (2, 'alex', '77ed-1-e1c2be5e9ad0f4ca-accept'))
+N6 ('moderate', 409, 'accepting', 'That item is being accepted; it cannot be moderated until th')
+N6 ('reject', 409, 'accepting', 'That item is being accepted; retry that acceptance.')
+N6 ('amend', 409, 'accepting', 'That item is being accepted; retry that acceptance.')
+N6 ('supersede', 409, 'accepting', 'That item is being accepted; a new item cannot supersede it.')
+N6 ('served to casey', (200, [(1, 'item', 'Slur title', 'abusive text')], [(1, 'proposed', 'Slur title', 'abusive text')]))
+N6 ('rows', [])
+N6 ('moderate again later', 409, 'accepting')
+
+N7 casey accept 500 | pending (2, 'casey', '4ba4-1-6c8caf6d7110cefa-accept') | owner moderate 409 accepting | owner reject 409 accepting | served to drew (200, [(1, 'item', 'Abusive', 'abusive text')], [(1, 'proposed', 'Abusive', 'abusive text')])
+
+N8 drew posts message keyed intent-room-r-7b95c5d0691c-1-aa25a028b42b5b19-accept 201 | alex accept 409 operation_reused That operation id already wrote a different room line. | pending None | rows []
+N8 amend 200 | accept after amend 200 None
+N8b ('accept', 500)
+N8b ('drew message keyed with identity', 201, 'room-r-f4b4dec369bb-1-aa25a028b42b5b19-accept')
+N8b ('pending', (2, 'alex', '69bb-1-aa25a028b42b5b19-accept'))
+N8b ('retry accept', 409, 'final', 'That item is already decided.')
+N8b ('moderate', 409, 'accepting', 'That item is being accepted; it cannot be moderated until the acceptan')
+N8b ('reject', 409, 'accepting', 'That item is being accepted; retry that acceptance.')
+N8b ('amend', 409, 'accepting', 'That item is being accepted; retry that acceptance.')
+N8b ('supersede', 409, 'accepting', 'That item is being accepted; a new item cannot supersede it.')
+N8b ('item', 'proposed')
+N8b ('rows', [('pp-hqt', 'decision', 'Accept requirement pp-lq5.1', 'open'), ('pp-lq5.1', 'task', 'Add export', 'open')])
+N8b ('lines', [(1, 'item', '', ''), (2, 'item-intent', 'accept', 1), (3, 'message', '', '')])
+N8b ('served to casey', (200, [(1, 'item', 'Add export', 'We need CSV export.'), (3, 'message', None, 'hello')], [(1, 'proposed', 'Add export', 'We need CSV export.')]))
+
+N9 accept(job2) 500 | retry default parent 409 Requirements changed. Reload and try again. | moderate 409 accepting | close job2 rc 1 cannot close epic pp-2zj: 1 open child issue(s); close children first or use --force to override
+ | retry job2 after close 200  | pending None | rows [('pp-gzz', 'decision', 'Accept requirement pp-2zj.1', 'open'), ('pp-2zj.1', 'task', 'Add export', 'open')]
+exit=0

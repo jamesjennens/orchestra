@@ -1,0 +1,10 @@
+.
+----------------------------------------------------------------------
+Ran 1 test in 16.781s
+
+OK
+
+R9b proposals total before/after 0 1 keys ['schema_version', 'total', 'items', 'next_offset', 'untrusted', 'coverage', 'next_cursor', 'can_triage'] last item {"kind": "requirement", "proposal": "p-ddbb46a6282d", "key": "p-ddbb46a6282d", "task": "pp-j2h", "state": "submitted", "stale": false, "age_days": 0, "submitted_at": "2026-10-23T18:53:12Z", "revision": 1, "submitter": "account:usr_ac2f817025378bdc", "identity": "verified", "target": {"kind": "requirement-new"}, "title": {"text": "We need CSV export.", "omitted_chars": 0, "trust": "unreviewed"}, "next_actor": "coordinator", "incorporated_unaccepted": false, "next_action": "A coordinator claims it with admin.py proposal-review (to_state under-review).", "time_to_disposition_days": null, "linked_requirement": null, "disposition": null, "submitter_name": "casey", "mine": false}
+
+R9b archive during proposal 200 | accept 409 archived | proposals with pointer 0
+exit=0

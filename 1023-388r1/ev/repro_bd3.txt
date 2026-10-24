@@ -1,0 +1,8 @@
+.
+----------------------------------------------------------------------
+Ran 1 test in 11.407s
+
+OK
+R6 admin superuser True member role None
+R6 REFUSED HttpError AuthorityDenied: Editing a project's requirements needs its owner or a coordinator: a signed-in member with the coordinator or owner role, or an agent holding the project's coordinator grant.
+exit=0

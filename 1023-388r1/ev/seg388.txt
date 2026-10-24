@@ -1,0 +1,5 @@
+segments ['messages-0001.jsonl']
+duplicated-item-line {"read_item": "REFUSED Refusal: Room messages-0001.jsonl is damaged: Invalid room line sequence", "rebuild": ["proposed"], "read_messages.items": "REFUSED Refusal: Room messages-0001.jsonl is damaged: Invalid room line sequence"}
+malformed-line {"read_item": "REFUSED Refusal: Room messages-0001.jsonl is damaged: Expecting property name enclosed in double quotes: li", "rebuild": "REFUSED Refusal: Room r-cf2524b358fd is damaged: Expecting property name enclosed in double quotes: line 1 ", "read_messages.items": "REFUSED Refusal: Room messages-0001.jsonl is damaged: Expecting property name enclosed in double quotes: li"}
+event-state-edited {"read_item": "REFUSED Refusal: Room messages-0001.jsonl is damaged: Invalid room item-event event", "rebuild": "REFUSED Refusal: Room r-efd05c421d7e is damaged: Invalid room item-event event", "read_messages.items": "REFUSED Refusal: Room messages-0001.jsonl is damaged: Invalid room item-event event"}
+truncated-index {"read_item": "accepted", "rebuild": ["accepted"], "read_messages.items": ["accepted"]}

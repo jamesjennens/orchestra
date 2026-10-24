@@ -1,0 +1,7 @@
+.......................................s..................s...........................warning: the operator line is unrestricted service-account shell access; Unrestricted service-account shell access: this key can run admin.py, bd and anything else the account can. It is deliberately not confined. Grant it only to an allowlisted operator.
+....................................................................................
+----------------------------------------------------------------------
+Ran 170 tests in 154.605s
+
+OK (skipped=2)
+exit=0

@@ -1,0 +1,16 @@
+test_r9b_room_archived_during_contributor_proposal (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+test_r15_contributor_failed_append_amend_accept (tests.test_rev388r3new_bd.Rev388r3Bd) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 29.629s
+
+OK
+  [proposals GET 200 total 0 items 0 None ]
+  [proposals GET 200 total 1 items 1 None ]
+
+R9b room state during proposal open | archive 200 | accept 200 None | new proposals [('p-0d143e6ef5c0', 'We need CSV export.', 'submitted')] | events 1
+  [proposals GET 200 total 1 items 1 None ]
+  [proposals GET 200 total 3 items 3 None ]
+
+R15 contributor first 500 | amend 200 | second 200  {'decision_id': None, 'evidence': 'orchestra:room/r-e39f2075c25a#1', 'id': 'p-dd3cc30065f2', 'kind': 'proposal', 'revision': 1, 'sha256': '4ceb7cfdc4dbd2962e623a5bedcd798316a727ba08bd27f5a74e7b1403dc81d6'} | new proposals [('p-f29c999a37ee', 'We need CSV export.', 'submitted'), ('p-dd3cc30065f2', 'We need TSV.', 'submitted')]
+exit=0

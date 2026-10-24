@@ -1,0 +1,58 @@
+test_a_decision_item_needs_a_live_owner_or_coordinator (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_a_native_call_that_never_answers_fails_with_its_command (tests.test_rev388r3seq_bd.Rev388r3SeqBd)
+kittrial-5bb.344: the reported hang was an unbounded native call. ... ok
+test_contributor_accept_is_a_proposal_with_the_pointer (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_create_label_spellings_refuse_every_reserved_value (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... skipped 'covered by tests/test_bd_label_aliases.py'
+test_ordinary_labels_still_reach_real_bd (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... skipped 'covered by tests/test_bd_label_aliases.py'
+test_r10_retry_after_failed_append_then_amend (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_r11_retry_after_failed_append_requirement (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_r1_accept_after_accept (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_r2_contributor_accept_of_moderated_item (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_r3_decision_in_archived_room (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_r5_parent_variants (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_r8_two_owner_accepts_concurrently (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_r8b_contributor_and_owner_concurrently (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... FAIL
+test_refused_accepts_create_no_native_record (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_requirement_accept_creates_the_existing_records_with_the_pointer (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_the_created_rows_keep_their_existing_shape (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_the_room_decision_action_binds_content_state_and_room (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... ok
+test_update_label_spellings_refuse_every_reserved_value (tests.test_rev388r3seq_bd.Rev388r3SeqBd) ... skipped 'covered by tests/test_bd_label_aliases.py'
+
+======================================================================
+FAIL: test_r8b_contributor_and_owner_concurrently (tests.test_rev388r3seq_bd.Rev388r3SeqBd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r3/rev/w/./tests/test_rev388r3seq_bd.py", line 165, in test_r8b_contributor_and_owner_concurrently
+    self.assertTrue((len(rows) == 2 and not props) or (not rows and len(props) == 1))
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 18 tests in 195.834s
+
+FAILED (failures=1, skipped=3)
+
+R10 first accept 500 Internal error | rows after first [('pp-cu8', 'decision', 'Use CSV', 'open')]
+R10 amend 200 | retry accept 200  {'decision_id': 'pp-8gv', 'evidence': 'orchestra:room/r-32d1fdd12a4c#1', 'id': 'pp-8gv', 'kind': 'decision', 'revision': None, 'sha256': None}
+R10 rows after retry [('pp-8gv', 'decision', 'Use TSV', 'open'), ('pp-cu8', 'decision', 'Use CSV', 'open')] | item now accepted Use TSV {'decision_id': 'pp-8gv', 'evidence': 'orchestra:room/r-32d1fdd12a4c#1', 'id': 'pp-8gv', 'kind': 'decision', 'revision': None, 'sha256': None}
+
+R11 first 500 | rows [('pp-8za', 'decision', 'Accept requirement pp-50p.1', 'open'), ('pp-50p.1', 'task', 'Add export', 'open')] | retry (fresh key) 200 {'decision_id': 'pp-8za', 'evidence': 'orchestra:room/r-adca5ea70b51#1', 'id': 'pp-50p.1', 'kind': 'requirement', 'revision': 2, 'sha256': 'd38f072c9285255a8a165ddebea2ec71d58e069c3b471212a0c5c3806a3df47a'} | rows after [('pp-8za', 'decision', 'Accept requirement pp-50p.1', 'open'), ('pp-50p.1', 'task', 'Add export', 'open')]
+
+R1 second accept 409 final
+R1 rows carrying the pointer: [('pp-2vy', 'decision', 'Accept requirement pp-3l3.1', 'open'), ('pp-3l3.1', 'task', 'Add export', 'open')] events 1
+
+R2 contributor accept of moderated item 409 moderated proposals before/after 1 1 pointer proposals 0 rows []
+
+R3 archived-room decision accept 409 archived rows: []
+
+R5 closed epic pp-635 close rc 0
+R5 ('decision-row', 'pp-rum', 422, 'That parent is not a job of this project; a requirement hangs under an existing ', None, 0)
+R5 ('closed-epic', 'pp-635', 200, '', 'pp-635', 2)
+R5 ('other-project', 'qq-abc', 422, 'That parent is not a job of this project; a requirement hangs under an existing ', None, 0)
+R5 ('missing', 'pp-zzzz9', 422, 'That parent is not a job of this project; a requirement hangs under an existing ', None, 0)
+R5 ('plain-task', 'pp-jh9', 200, '', 'pp-jh9', 2)
+R5 ('self-job', 'pp-htg', 200, '', 'pp-htg', 2)
+
+R8 two owner accepts [('drew', 200, None), ('alex', 409, 'final')] elapsed 10.3s rows [('pp-9vi', 'decision', 'Accept requirement pp-cm3.1', 'open'), ('pp-cm3.1', 'task', 'Add export', 'open')] events 1
+
+R8b contributor+owner [('casey', 200, None), ('alex', 409, 'final')] rows [] proposals 0 events 1
+exit=1

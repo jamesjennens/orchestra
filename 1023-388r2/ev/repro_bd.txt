@@ -1,0 +1,51 @@
+...ss........F.....s
+======================================================================
+FAIL: test_r9_room_archived_during_requirement_write (tests.test_rev388r2_bd.Rev388r2Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1023-388r2/rev/w/tests/test_rev388r2_bd.py", line 186, in test_r9_room_archived_during_requirement_write
+    self.assertEqual([], rows)
+AssertionError: Lists differ: [] != [('pp-7nn', 'decision', 'Accept requiremen[60 chars]en')]
+
+Second list contains 2 additional elements.
+First extra element 0:
+('pp-7nn', 'decision', 'Accept requirement pp-roi.1', 'open')
+
+- []
++ [('pp-7nn', 'decision', 'Accept requirement pp-roi.1', 'open'),
++  ('pp-roi.1', 'task', 'Add export', 'open')]
+
+----------------------------------------------------------------------
+Ran 20 tests in 221.054s
+
+FAILED (failures=1, skipped=3)
+
+R10 first accept 500 Internal error | rows after first [('pp-b8h', 'decision', 'Use CSV', 'open')]
+R10 amend 200 | retry accept 422 Operation identity reused with a different request None
+R10 rows after retry [('pp-b8h', 'decision', 'Use CSV', 'open')] | item now amended Use TSV None
+
+R11 first 500 | rows [('pp-9nd', 'decision', 'Accept requirement pp-oqn.1', 'open'), ('pp-oqn.1', 'task', 'Add export', 'open')] | retry (fresh key) 200 {'decision_id': 'pp-9nd', 'evidence': 'orchestra:room/r-2bf687fd6965#1', 'id': 'pp-oqn.1', 'kind': 'requirement', 'revision': 2, 'sha256': 'e64f4db4316f5e3460f2430919811e6e34604e1462458bb8ecdacfb04dfaa763'} | rows after [('pp-9nd', 'decision', 'Accept requirement pp-oqn.1', 'open'), ('pp-oqn.1', 'task', 'Add export', 'open')]
+
+R1 second accept 409 final
+R1 rows carrying the pointer: [('pp-775', 'decision', 'Accept requirement pp-biq.1', 'open'), ('pp-biq.1', 'task', 'Add export', 'open')] events 1
+
+R2 contributor accept of moderated item 409 moderated proposals before/after 1 1 pointer proposals 0 rows []
+
+R3 archived-room decision accept 409 archived rows: []
+
+R5 closed epic pp-m8f close rc 0
+R5 ('decision-row', 'pp-nnb', 422, 'That parent is not a job of this project; a requirement hangs under an existing ', None, 0)
+R5 ('closed-epic', 'pp-m8f', 200, '', 'pp-m8f', 2)
+R5 ('other-project', 'qq-abc', 422, 'That parent is not a job of this project; a requirement hangs under an existing ', None, 0)
+R5 ('missing', 'pp-zzzz9', 422, 'That parent is not a job of this project; a requirement hangs under an existing ', None, 0)
+R5 ('plain-task', 'pp-3xo', 200, '', 'pp-3xo', 2)
+R5 ('self-job', 'pp-ju4', 200, '', 'pp-ju4', 2)
+
+R8 two owner accepts [('alex', 200, None), ('drew', 409, 'final')] elapsed 10.5s rows [('pp-r63', 'decision', 'Accept requirement pp-a2y.1', 'open'), ('pp-a2y.1', 'task', 'Add export', 'open')] events 1
+
+R8b contributor+owner [('alex', 200, None), ('casey', 409, 'final')] rows [('pp-25u', 'decision', 'Accept requirement pp-v94.1', 'open'), ('pp-v94.1', 'task', 'Add export', 'open')] proposals 0 events 1
+
+R9 archive during write 200 | accept 409 archived | rows [('pp-7nn', 'decision', 'Accept requirement pp-roi.1', 'open'), ('pp-roi.1', 'task', 'Add export', 'open')] | events 0
+
+R9b archive during proposal 200 | accept 409 archived | proposals with pointer 0
+exit=1
