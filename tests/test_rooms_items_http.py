@@ -517,6 +517,86 @@ class RoomsItemsHttpTests(agents.AgentHarness):
         self.assertEqual('accepted', accepted.data['state'])
         self.assertEqual(1, len(self.backend.requirements))
 
+    def test_r5_a_second_persons_attempt_is_logged_so_a_third_retry_adopts_it(self):
+        # M59: the coordinator writes after the owner's attempt is recorded as having written
+        # nothing; the coordinator's attempt is logged BEFORE its write, so when its room
+        # append fails, the owner's retry finds the coordinator's record instead of writing
+        # a second one.
+        self.post_item(self.tokens['worker'])
+        self.backend.fail_native = 'requirements.create'
+        self.assertEqual(503, self.accept(self.tokens['owner'], key='m59-owner').status)
+        identity = self.kinds('item-intent')[0]['identity']
+        self.backend.journal[(self.ids['owner'], 'requirements.create',
+                              identity + '-requirement-create', None)] = ('none', None)
+        self.fail_after_native(self.tokens['coord'], 'm59-coord')
+        attempts = self.kinds('item-intent-attempt')
+        self.assertEqual([self.ids['coord']], [line['author']['id'] for line in attempts])
+        retried = self.accept(self.tokens['owner'], key='m59-owner-retry')
+        self.assertEqual(200, retried.status, retried.data)
+        self.assertEqual(1, len(self.backend.requirements), 'adopted, not written twice')
+
+    def test_r5_the_rooms_module_refuses_a_reserved_key_too(self):
+        # M61: the module refuses the room's own namespaces whatever route reaches it, not
+        # only behind the HTTP check.
+        project = Path(self.rooms_root) / self.pid
+        author = {'id': self.ids['worker'], 'name': 'worker', 'role': 'contributor'}
+        for prefix in rooms.RESERVED_KEY_PREFIXES:
+            with self.assertRaises(rooms.Refusal) as caught:
+                rooms.post(project, self.room['id'], 'hello', prefix + 'module-key', author,
+                           self.limit)
+            self.assertEqual(422, caught.exception.status)
+            with self.assertRaises(rooms.Refusal):
+                rooms.post_item(project, self.room['id'], 'question', 'Q', 'Why?',
+                                prefix + 'module-key', author, self.limit)
+        self.assertEqual([], self.lines())
+
+    def test_r5_a_moderated_items_intent_parent_is_not_exported(self):
+        # M66: the parent an editor chose is the item's data; once the item is moderated the
+        # JSON-lines export drops it from the intent line too.
+        self.backend.jobs.append({'id': 'job_0002_secret', 'title': 'Second job'})
+        self.post_item(self.tokens['worker'])
+        self.fail_after_native(self.tokens['owner'], 'm66-owner', body={'parent': 'job_0002_secret'})
+        self.assertEqual(201, self.moderate(self.tokens['coord'], key='m66-moderate').status)
+        exported = self.request('GET', self.path('/export?format=jsonl'), token=self.tokens['owner'])
+        self.assertEqual(200, exported.status)
+        text = exported.data if isinstance(exported.data, str) else json.dumps(exported.data)
+        self.assertIn('item-intent', text)
+        self.assertNotIn('job_0002_secret', text)
+
+    def test_an_index_without_its_items_cache_is_rebuilt_not_served_empty(self):
+        # M7 (a survivor since round 1): an index written by slice 1 has no items cache; a
+        # read rebuilds it from the lines instead of serving "no items".
+        self.post_item(self.tokens['worker'])
+        project = Path(self.rooms_root) / self.pid
+        index_path = rooms._index_path(project)
+        index = json.loads(index_path.read_text(encoding='utf-8'))
+        index['rooms'][self.room['id']].pop('items')
+        index_path.write_text(json.dumps(index), encoding='utf-8')
+        self.assertEqual(['Add export'], [item['title'] for item in self.items()])
+
+    def test_a_named_parent_is_refused_when_the_project_has_no_jobs(self):
+        # M37 (a survivor since round 3): with no jobs at all, a named parent is still not a
+        # job, so the accept is refused before any record is written.
+        self.backend.jobs = []
+        self.post_item(self.tokens['worker'])
+        refused = self.accept(self.tokens['owner'], key='no-jobs-parent', body={'parent': 'job_0001'})
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertEqual({}, self.backend.requirements)
+
+    def test_an_item_replay_must_match_its_parent(self):
+        # The same client operation id with another parent is a different item, refused,
+        # never answered as a replay of the first. (Round 3's M38 mutates the AMEND replay
+        # instead; an amendment's operation id already digests its parent, so that mutant is
+        # equivalent.)
+        project = Path(self.rooms_root) / self.pid
+        author = {'id': self.ids['worker'], 'name': 'worker', 'role': 'contributor'}
+        rooms.post_item(project, self.room['id'], 'requirement', 'T', 'Body.', 'item-replay-1',
+                        author, self.limit, parent='job_0001')
+        with self.assertRaises(rooms.Refusal) as caught:
+            rooms.post_item(project, self.room['id'], 'requirement', 'T', 'Body.', 'item-replay-1',
+                            author, self.limit)
+        self.assertEqual('operation_reused', caught.exception.code)
+
     def test_r5_at_most_five_people_try_one_intent(self):
         # M68: after five different people, a sixth attempt is refused until a coordinator
         # cancels the intent, so the earlier attempts a retry must check stay bounded.
