@@ -300,7 +300,8 @@ def open_faults(rows, entries=None):
                                        'about_task': item[3].get('about_task'),
                                        'reason': lane_state.display_reason(item[3].get('reason')),
                                        'since': item[2].get('created_at')}
-                                      for item in opened[-EARLIER_LIMIT:]]}
+                                      for item in opened[-EARLIER_LIMIT:]],
+                          'earlier_omitted': max(0, len(opened) - EARLIER_LIMIT)}
     return faults
 
 

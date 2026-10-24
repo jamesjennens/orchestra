@@ -418,6 +418,7 @@ class LanesPageTests(unittest.TestCase):
         for wanted in ('Needs investigation', 'the <b>merge</b> slot is stuck', '1 h ago', 'alpha-4', 'alpha-5'):
             self.assertIn(wanted, seen['fault'][0], wanted)
         self.assertEqual(['Earlier open: credentials leaked'], seen['faultEarlier'])
+        self.assertEqual(['+3 more earlier open not shown'], seen['faultOmitted'])
         # The panel is composed into the project overview.
         self.assertEqual(1, seen['overviewHasPanel'])
         # Next reads the read's own next page, with the SAME threshold.

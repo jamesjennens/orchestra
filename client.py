@@ -725,8 +725,18 @@ class _InlineWait:
                 'raised_on': _InlineWait._scalar(fault.get('task')),
                 'state': 'needs-investigation', 'reason': _InlineWait._scalar(fault.get('reason')),
                 'record': _InlineWait._scalar(fault.get('record')),
+                'since': _InlineWait._scalar(fault.get('since')),
                 'earlier': [_InlineWait._scalar(item.get('reason')) for item in fault.get('earlier') or []
-                            if isinstance(item, dict)]}
+                            if isinstance(item, dict)],
+                'earlier_omitted': _InlineWait._count(fault.get('earlier_omitted'))}
+
+    @staticmethod
+    def _count(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    @staticmethod
+    def _fault_fingerprinted(row):
+        return {name: row.get(name) for name in ('lane', 'actor', 'task', 'raised_on', 'record', 'since')}
 
     @staticmethod
     def coordinator_view(queue_items, lanes_payload):
@@ -768,9 +778,9 @@ class _InlineWait:
         flat = [dict(row, trigger=name) for name in _InlineWait.COORDINATOR_TRIGGERS
                 for row in grouped[name]]
         fingerprinted = {name: _InlineWait._sorted_rows(
-            [dict(row) if name == 'needs-investigation' else _InlineWait._fingerprinted(row)
-             for row in rows])
-            for name, rows in triggers.items()}
+            [_InlineWait._fault_fingerprinted(row) if name == 'needs-investigation'
+             else _InlineWait._fingerprinted(row) for row in rows])
+            for name, rows in triggers.items() if rows or name != 'needs-investigation'}
         return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
                 'items': flat, 'fingerprint': _InlineWait.digest(fingerprinted)}
 

@@ -612,9 +612,19 @@ def _fault_row(lane, fault):
             'task': _scalar(fault.get('about_task') or fault.get('task')),
             'raised_on': _scalar(fault.get('task')),
             'state': 'needs-investigation', 'reason': _scalar(fault.get('reason')),
-            'record': _scalar(fault.get('record')),
+            'record': _scalar(fault.get('record')), 'since': _scalar(fault.get('since')),
             'earlier': [_scalar(item.get('reason')) for item in fault.get('earlier') or []
-                        if isinstance(item, dict)]}
+                        if isinstance(item, dict)],
+            'earlier_omitted': _count(fault.get('earlier_omitted'))}
+
+
+def _count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _fault_fingerprinted(row):
+    """The stable identity of one raise: who, where, which record and when; never the prose."""
+    return {name: row.get(name) for name in ('lane', 'actor', 'task', 'raised_on', 'record', 'since')}
 
 
 def coordinator_view(queue_items, lanes_payload):
@@ -663,9 +673,10 @@ def coordinator_view(queue_items, lanes_payload):
             triggers['needs-investigation'].append(_fault_row(lane, fault))
     grouped = {name: _sorted_rows(rows) for name, rows in triggers.items()}
     flat = [dict(row, trigger=name) for name in COORDINATOR_TRIGGERS for row in grouped[name]]
-    fingerprinted = {name: _sorted_rows([dict(row) if name == 'needs-investigation' else _fingerprinted(row)
-                                         for row in rows])
-                     for name, rows in triggers.items()}
+    # An empty fault group never enters the fingerprint, so it is unchanged while nothing is flagged.
+    fingerprinted = {name: _sorted_rows([_fault_fingerprinted(row) if name == 'needs-investigation'
+                                         else _fingerprinted(row) for row in rows])
+                     for name, rows in triggers.items() if rows or name != 'needs-investigation'}
     return {'schema': WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
             'items': flat, 'fingerprint': digest(fingerprinted)}
 

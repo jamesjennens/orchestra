@@ -336,11 +336,13 @@ record, since, age) on every lane, faulted lanes sort first, and the flags summa
 flag is the lane's newest raise across all its tasks, closed ones included; a later state record never
 clears it. Only `coordinator fault-clear` (or the host `admin.py fault-clear`) clears it, writing a
 `lane-fault-clear-v1` comment plus a journal entry that records who and when. A newer raise does not hide an older open one: the
-row's `needs_investigation.earlier` lists up to five older open raises (a clear of the newest ends them all), and
-the wait row carries `task` (the `about_task`, else the raised-on task), `raised_on` and the older reasons. The web
-Lanes panel renders the reason as text. The coordinator wait gains a `needs-investigation` trigger (last in
-order); because the trigger set gained a key, EVERY coordinator wait fingerprint changes once on deploy (not only
-the empty one), so a waiting coordinator wakes once. An older kit drops the unknown state and so does not
+row's `needs_investigation.earlier` lists up to five older open raises and `earlier_omitted` counts the rest (a clear
+of the newest ends them all), and the wait row carries `task` (the `about_task`, else the raised-on task),
+`raised_on`, the older reasons and `earlier_omitted`. The web Lanes panel renders the reason as text, with the
+omitted count. The coordinator wait gains a `needs-investigation` trigger, ordered before any empty-wake trigger.
+An EMPTY group never enters the coordinator fingerprint, so every fingerprint is unchanged while nothing is
+flagged; a non-empty group is fingerprinted by stable fields only (lane, actor, task, raised-on task, raise
+record and time), never by the reason text or the age. An older kit drops the unknown state and so does not
 show the flag; the clear reads there as an ordinary comment. Use it for process faults, not task
 blockers, which stay open items.
 

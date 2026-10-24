@@ -140,7 +140,7 @@ class BoardTests(unittest.TestCase):
         fault = lane_row['needs_investigation']
         self.assertEqual({'record': 'f1', 'task': 't1', 'about_task': 't9',
                           'reason': 'the merge slot is stuck', 'since': RAISED, 'age_seconds': 7200,
-                          'earlier': []}, fault)
+                          'earlier': [], 'earlier_omitted': 0}, fault)
         self.assertEqual([A], [item['actor'] for item in tl.board([row])['items']])
         self.assertEqual(1, tl.board([row])['flags']['needs_investigation'])
 
@@ -282,6 +282,17 @@ class ClearTests(unittest.TestCase):
         fault_clear.publish(self.project, fault_clear.journal_entry(other, 'forged', COORD, 0))
         self.assertEqual('f1', self.board_fault()['record'])
 
+    def test_a_valid_entry_behind_a_symlinked_journal_directory_clears_nothing(self):
+        self.native.apply(self.project, clear_request())
+        self.assertIsNone(self.board_fault())
+        journal = self.project / fault_clear.JOURNAL_DIR
+        moved = self.project / 'elsewhere'
+        journal.rename(moved)
+        journal.symlink_to(moved)
+        self.assertEqual(1, len(list(moved.glob('*.json'))))
+        self.assertEqual('f1', self.board_fault()['record'])
+        self.assertIsNone(fault_clear._directory(self.project))
+
     def test_a_symlinked_or_damaged_journal_clears_nothing(self):
         self.native.apply(self.project, clear_request())
         journal = self.project / fault_clear.JOURNAL_DIR
@@ -414,6 +425,16 @@ class JournalGateTests(unittest.TestCase):
         raise_fault(self.row_a, cid='fa3', stamp='2026-09-15T11:30:00Z', reason='third')
         self.assertEqual([], self.faults()[A]['earlier'])
 
+    def test_more_than_five_older_open_raises_report_how_many_are_not_shown(self):
+        for number in range(2, 9):
+            raise_fault(self.row_a, cid='fa%d' % number, stamp='2026-09-15T1%d:00:00Z' % number,
+                        reason='raise %d' % number)
+        shown = self.faults()[A]
+        self.assertEqual('raise 8', shown['reason'])
+        self.assertEqual(fault_clear.EARLIER_LIMIT, len(shown['earlier']))
+        self.assertEqual(['raise %d' % n for n in range(4, 8)], [item['reason'] for item in shown['earlier']][1:])
+        self.assertEqual(8 - 1 - fault_clear.EARLIER_LIMIT, shown['earlier_omitted'])
+
 
 class WaitTests(unittest.TestCase):
     def lanes_payload(self, *rows):
@@ -427,7 +448,7 @@ class WaitTests(unittest.TestCase):
         rows = view['triggers']['needs-investigation']
         self.assertEqual([{'lane': 'lane-a', 'actor': A, 'task': 't9', 'state': 'needs-investigation',
                            'raised_on': 't1', 'reason': 'the merge slot is stuck', 'record': 'f1',
-                           'earlier': []}], rows)
+                           'earlier': [], 'earlier_omitted': 0, 'since': RAISED}], rows)
         self.assertIn({'trigger': 'needs-investigation', **rows[0]}, view['items'])
         # The raise's own task is shown beside the task it is about.
         self.assertEqual(('t9', 't1'), (rows[0]['task'], rows[0]['raised_on']))
@@ -456,6 +477,30 @@ class WaitTests(unittest.TestCase):
         self.assertEqual(first, waiting.coordinator_view([], later)['fingerprint'])
         raise_fault(row, cid='f2', stamp='2026-09-15T11:00:00Z', reason='another')
         self.assertNotEqual(first, waiting.coordinator_view([], self.lanes_payload(row))['fingerprint'])
+
+    def test_an_empty_fault_group_stays_out_of_the_fingerprint(self):
+        view = waiting.coordinator_view([], self.lanes_payload())
+        self.assertEqual([], view['triggers']['needs-investigation'])
+        old = {name: [] for name in waiting.COORDINATOR_TRIGGERS if name != 'needs-investigation'}
+        self.assertEqual(waiting.digest(old), view['fingerprint'])
+        import client
+        self.assertEqual(view['fingerprint'],
+                         client._InlineWait.coordinator_view([], self.lanes_payload())['fingerprint'])
+
+    def test_the_fingerprint_is_the_raise_not_its_prose_and_many_raises_stay_in_parity(self):
+        import client
+        row = tl.task('t1', A)
+        for number in range(8):
+            raise_fault(row, cid='f%d' % number, stamp='2026-09-15T1%d:00:00Z' % number, reason='r%d' % number)
+        payload = self.lanes_payload(row)
+        view = waiting.coordinator_view([], payload)
+        shown = view['triggers']['needs-investigation'][0]
+        self.assertEqual((5, 2), (len(shown['earlier']), shown['earlier_omitted']))
+        self.assertEqual(view, client._InlineWait.coordinator_view([], payload))
+        edited = json.loads(json.dumps(payload))
+        edited['items'][0]['needs_investigation']['reason'] = 'rewritten'
+        edited['items'][0]['needs_investigation']['earlier'] = []
+        self.assertEqual(view['fingerprint'], waiting.coordinator_view([], edited)['fingerprint'])
 
     def test_the_standalone_client_reads_the_same_way(self):
         import client

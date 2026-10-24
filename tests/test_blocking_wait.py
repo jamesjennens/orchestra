@@ -220,7 +220,8 @@ class CoordinatorFormTests(unittest.TestCase):
         view = self.coordinator(queue=[{'task': 't1', 'review_state': 'none'}],
                                 lanes=lanes_page(lane('lane-a', A, held=[
                                     {'task': 't1', 'state': 'working', 'flags': []}])))
-        self.assertEqual(view['fingerprint'], waiting.digest({name: [] for name in waiting.COORDINATOR_TRIGGERS}))
+        self.assertEqual(view['fingerprint'], waiting.digest({name: [] for name in waiting.COORDINATOR_TRIGGERS
+                                                                     if name != 'needs-investigation'}))
         self.assertEqual(view['items'], [])
 
 

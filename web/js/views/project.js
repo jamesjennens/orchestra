@@ -144,7 +144,9 @@ export function lanesPanel(ctx, project) {
           h('span', { class: 'mono' }, lane.needs_investigation.task),
           lane.needs_investigation.about_task ? [' about ', h('span', { class: 'mono' }, lane.needs_investigation.about_task)] : null),
         (lane.needs_investigation.earlier || []).map((older) => h('div', { class: 'muted', 'data-fault-earlier': 'true' },
-          'Earlier open: ', older.reason))) : null,
+          'Earlier open: ', older.reason)),
+        lane.needs_investigation.earlier_omitted > 0 ? h('div', { class: 'muted', 'data-fault-omitted': 'true' },
+          '+', lane.needs_investigation.earlier_omitted, ' more earlier open not shown') : null) : null,
       held.length ? h('ul', { class: 'lane-tasks' }, held.map((entry) => taskLine(entry))) : null,
       lane.idle ? h('p', { class: 'small muted' }, 'Holds nothing; free to take work. Last write ', ageText(lane.last_write_age_seconds), ' ago.') : null);
   }

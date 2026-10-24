@@ -79,6 +79,27 @@ class CoordinatorWaitTests(grants.Grants):
                          [(row['actor'], row['reason'], row['task']) for row in rows])
         self.assertIn(task, [row['task'] for row in after.data['triggers']['awaiting-review']])
 
+    def test_many_open_raises_show_five_earlier_and_how_many_are_omitted(self):
+        import lane_state
+        from requirements import canonical_bytes
+        self.assertEqual(200, self.grant().status)
+        task, _contribution = self.deliver(self.tokens['carl'])
+        carl = self.ids['carl']
+        comments = self.backend.state['tasks'][task].setdefault('comments', [])
+        for number in range(8):
+            stamp = '2026-09-15T10:%02d:00+00:00' % number
+            comments.append({'id': 'comment_cp%d' % number, 'issue_id': task, 'author': carl,
+                             'text': 'a checkpoint', 'created_at': stamp})
+            payload = {'schema_version': 1, 'task': task, 'checkpoint': 'comment_cp%d' % number,
+                       'state': 'needs-investigation', 'reason': 'reason %d' % number}
+            comments.append({'id': 'comment_raise%d' % number, 'issue_id': task, 'author': carl,
+                             'text': lane_state.PREFIX + canonical_bytes(payload).decode(),
+                             'created_at': stamp})
+        row = self.wait().data['triggers']['needs-investigation'][0]
+        self.assertEqual('reason 7', row['reason'])
+        self.assertEqual(['reason %d' % number for number in range(2, 7)], row['earlier'])
+        self.assertEqual(2, row['earlier_omitted'])
+
     def test_only_projects_with_effective_grants_are_read_and_multiple_are_namespaced(self):
         beta = self.create_project(self.admin, 'Beta')
         self.assertEqual(200, self.member('cora', 'coordinator', project=beta, token=self.admin).status)
