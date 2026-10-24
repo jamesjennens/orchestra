@@ -61,6 +61,17 @@
 - The authority column shows "—" for drafts whose authority is an attestation (the information is there; the cell is empty).
 - Two long propose forms are always open, although proposing is a rare, mostly agent-made action.
 
+## Lanes panel (#/p/pp), after merging main b9b1c12 (1024e), 1024 wide
+- **The panel loads now** (1024e's .399 fixed the authority error).
+- **The project owner sees no lanes.** The panel says "owners and coordinators see every lane", but the route's `_lanes_scope` (http_service.py) counts only an installation operator (`listed_operator_actor`) as an owner. The project's owner role is not enough, so alex reads scope `own` and gets "No lanes to show" while casey and drew hold three tasks. Either the sentence or the rule is wrong. A product decision, named in the slices, not changed here.
+- **Contributor view (casey, two tasks held, declared lane states):**
+  - **The lane is headed by the raw user id, twice** ("usr_… usr_…"), not "casey".
+  - **Machine words:** "review none · whose move you · next assignee", and the state as "waiting-on-review".
+  - **Raw times:** expect-by as "2026-10-26T12:00:00Z".
+  - **"Whose move: you"** shows on a lane that declares it is waiting on alex. The declared state and the computed move disagree on screen with no explanation.
+  - **Good:** the expect-by flag is shown twice (lane and row), the threshold is an argument, and each task links to its page.
+- **Placement:** still below the merge slot and guidance, above the task list.
+
 ## Room (#/p/pp/rooms/{rid}), owner view
 - Short page (126 words); a header, then numbered messages (#n, author, role, time, text).
 - Export links, the Post form, then a Moderation section ("Archive room", "Remove a message" by number).

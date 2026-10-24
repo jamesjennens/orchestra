@@ -80,4 +80,5 @@ details.fold .fold-hint { font-size: var(--t-sm); font-weight: 400; color: var(-
     padding: 10px 12px; border-bottom: 1px solid var(--line); }
   table.stack-narrow td { padding: 0; border: 0; }
   table.stack-narrow td.secondary { grid-column: 1 / -1; color: var(--muted); font-size: var(--t-xs); }
+  table.stack-narrow td.full-narrow { grid-column: 1 / -1; }
 }
