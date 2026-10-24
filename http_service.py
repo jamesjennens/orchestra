@@ -8237,8 +8237,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         if form == 'coordinator':
             return self._agent_coordinator_wait(ctx, agent)
         since = ctx.query.get('since')
+        # Review n4: the worker form always ignored an unusable since; the record-only
+        # feature made it a 400.  Keep the old worker behaviour and ignore it (the
+        # coordinator form still refuses it, as it always did).
         if since is not None and not waiting.is_fingerprint(since):
-            raise HttpError(400, 'invalid_request', 'since must be a wait fingerprint')
+            since = None
         rows = []
         #: One entry per project this read covered: its full queue rows (the closest
         #: HTTP fact to the CLI's ``work --mine`` list) and the rows that are its move.
@@ -8318,24 +8321,24 @@ class ApiHandler(BaseHTTPRequestHandler):
             view['changed'] = since != view['fingerprint']
         # kittrial-5bb.397: one bounded host log per project, written only for the actor
         # this credential resolves to. Any error is a warning on the answer, never a
-        # failed wait; no tracker record is written.
-        if since is None or since != view['fingerprint']:
-            import wake_log
-            warnings = []
-            for project_id, project_rows, project_move_rows in project_reads:
-                try:
-                    project_dir = self.backend.wake_project_dir(project_id)
-                except (OSError, ValueError):
-                    project_dir = None
-                if project_dir is None:
-                    continue
-                warnings.extend(wake_log.observe(
-                    project_dir, actor, since,
-                    dict(view, items=waiting.movement(project_move_rows),
-                         fingerprint=view['fingerprint']),
-                    project_rows))
-            if warnings:
-                view['warnings'] = warnings
+        # failed wait; no tracker record is written.  It runs on every poll, exactly as
+        # the CLI's read does (review n2); the shared observer skips an unchanged write.
+        import wake_log
+        warnings = []
+        for project_id, project_rows, project_move_rows in project_reads:
+            try:
+                project_dir = self.backend.wake_project_dir(project_id)
+            except (OSError, ValueError):
+                project_dir = None
+            if project_dir is None:
+                continue
+            warnings.extend(wake_log.observe(
+                project_dir, actor, since,
+                dict(view, items=waiting.movement(project_move_rows),
+                     fingerprint=view['fingerprint']),
+                project_rows))
+        if warnings:
+            view['warnings'] = warnings
         view['agent'] = agent.get('id')
         view['generated_at'] = now_iso(self.service._now())
         view['manual_cadence'] = ('Read this route again to see a change; it never blocks, '

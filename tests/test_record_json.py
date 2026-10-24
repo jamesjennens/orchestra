@@ -255,9 +255,11 @@ class NoUnguardedParseTests(unittest.TestCase):
                                      'host-written file itself and refuses a file it cannot read, a deeply nested '
                                      'one included'),
         'version.py': (1, "the kit's own version file"),
-        'wake_log.py': (1, 'the bounded empty-wake host log this kit writes (kittrial-5bb.397): '
-                          'one line at a time, read at most 32 KiB, and a damaged line is skipped '
-                          'rather than raised into a wait'),
+        'wake_log.py': (2, 'the bounded empty-wake host log this kit writes (kittrial-5bb.397): '
+                          'the audit is read one line at a time, at most 32 KiB, and a damaged line '
+                          'is skipped rather than raised into a wait; the .last.json snapshot is the '
+                          'kit\'s own small state, at most 64 KiB, and an unreadable, nested or corrupt '
+                          'value is caught and treated as no remembered rows'),
         'waiting.py': (1, "the wait's own small state file beside the caller's config (kittrial-5bb.327 "
                           'review 2): text this kit wrote, read at most 64 KiB at a time, and any unreadable, '
                           'nested or corrupt value is caught and treated as absent'),

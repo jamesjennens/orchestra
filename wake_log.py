@@ -32,11 +32,20 @@ interleave a half-file.  A symlinked directory or file is refused rather than
 followed.  Every public entry point that a wait calls is *best effort*: :func:`observe`
 swallows its own errors and returns warnings for the answer, so a lost or unreadable
 log can never fail, slow or change a wait's answer.
+
+No file here is ever opened in a way that can block: the lane lock is tried with
+``LOCK_NB`` for a short bounded budget, and every read/write open uses ``O_NONBLOCK``
+and ``O_NOFOLLOW`` and must be a regular file on its descriptor.  A held ``flock``, a
+FIFO planted at any lane file, or a symlink is refused with a warning instead of
+stalling a wait or an HTTP handler thread.
 """
+import contextlib
+import errno
 import fcntl
 import hashlib
 import json
 import os
+import stat
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -48,6 +57,14 @@ import waiting
 #: (a client and a service in the same process in a test), and flock is per open file
 #: description rather than per process, so the thread lock is what makes the pair safe.
 _THREAD_LOCK = threading.Lock()
+#: The most a wait may spend trying to take the lane locks before it gives up with a
+#: warning.  A wait is never allowed to stall behind another process's lock.
+LOCK_BUDGET_SECONDS = 1.0
+LOCK_POLL_SECONDS = 0.005
+#: Repeated warnings are emitted once per process, not once per poll (review n3).
+WARNING_MEMORY = 64
+_WARNINGS_SEEN = set()
+_WARNINGS_LOCK = threading.Lock()
 
 SCHEMA = 'wait-wake-v1'
 DIRECTORY = '.wait-wakes'
@@ -158,6 +175,39 @@ def _refuse_symlink(path):
         raise ValueError('the wait-wake file must not be a symlink')
 
 
+def _open_fd(path, flags, mode=0o600):
+    """Open a lane file without following a symlink and without ever blocking.
+
+    The descriptor must be a REGULAR file: a FIFO, device, directory or socket is
+    refused here, on the descriptor itself, because an ``lstat`` before the open can
+    race and a FIFO open can block.  ``O_NONBLOCK`` makes the open itself harmless for
+    a FIFO; the type check then refuses it.
+    """
+    flags = flags | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    descriptor = os.open(str(path), flags, mode)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('the wait-wake file must be a regular file')
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_regular(path, limit):
+    """At most ``limit`` bytes of a regular lane file; refuses symlinks and specials."""
+    _refuse_symlink(path)
+    descriptor = _open_fd(path, os.O_RDONLY)
+    try:
+        with os.fdopen(descriptor, 'rb') as handle:
+            descriptor = -1
+            return handle.read(limit)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _read_audit(audit, now):
     """The stored entries inside the window, oldest first; malformed lines are skipped.
 
@@ -166,9 +216,8 @@ def _read_audit(audit, now):
     """
     _refuse_symlink(audit)
     try:
-        with open(audit, 'rb') as handle:
-            raw = handle.read(MAX_BYTES * 8)
-    except OSError:
+        raw = _read_regular(audit, MAX_BYTES * 8)
+    except FileNotFoundError:
         return []
     entries = []
     for line in raw.splitlines():
@@ -209,16 +258,36 @@ def _bounded(entries):
 
 
 def _write_atomic(path, text):
-    """Replace ``path`` with ``text`` from a temporary file in the same directory."""
+    """Replace ``path`` with ``text`` from a temporary file in the same directory.
+
+    The temporary file is opened ``O_EXCL|O_NOFOLLOW|O_NONBLOCK`` and checked regular;
+    an existing target that is a symlink or a special file is refused instead of being
+    replaced, so a planted FIFO can neither stall nor redirect the write.
+    """
+    path = Path(path)
     _refuse_symlink(path)
     temporary = path.with_name('.%s.%d.%d.tmp' % (path.name, os.getpid(),
                                                    threading.get_ident()))
     _refuse_symlink(temporary)
+    descriptor = -1
     try:
-        with open(temporary, 'w', encoding='utf-8', newline='') as handle:
-            handle.write(text)
-        os.replace(temporary, path)
+        descriptor = _open_fd(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        data = text.encode('utf-8')
+        written = 0
+        while written < len(data):
+            written += os.write(descriptor, data[written:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError('the wait-wake file must be a regular file')
+        os.replace(str(temporary), str(path))
     finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             if temporary.exists() and not temporary.is_symlink():
                 temporary.unlink()
@@ -226,8 +295,24 @@ def _write_atomic(path, text):
             pass
 
 
+@contextlib.contextmanager
+def _thread_guard():
+    """Take the in-process lane lock, but never wait for it longer than the budget."""
+    if not _THREAD_LOCK.acquire(timeout=LOCK_BUDGET_SECONDS):
+        raise OSError(errno.EWOULDBLOCK, 'the wait-wake thread lock is busy')
+    try:
+        yield
+    finally:
+        _THREAD_LOCK.release()
+
+
 class _Lock:
-    """An exclusive ``flock`` on the lane's lock file (refusing a symlinked one)."""
+    """An exclusive ``flock`` on the lane's lock file, tried without blocking.
+
+    A second waiter retries ``LOCK_NB`` for at most :data:`LOCK_BUDGET_SECONDS` and
+    then gives up with ``EWOULDBLOCK``: a stalled lock holder can delay a wait by at
+    most that budget, never by the holder's lifetime.
+    """
 
     def __init__(self, path):
         self.path = path
@@ -235,16 +320,32 @@ class _Lock:
 
     def __enter__(self):
         _refuse_symlink(self.path)
-        self.handle = open(self.path, 'a+', encoding='utf-8')
-        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
-        return self
+        self.handle = _open_fd(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + LOCK_BUDGET_SECONDS
+        while True:
+            try:
+                fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN):
+                    os.close(self.handle)
+                    self.handle = None
+                    raise
+                if time.monotonic() >= deadline:
+                    os.close(self.handle)
+                    self.handle = None
+                    raise OSError(errno.EWOULDBLOCK, 'the wait-wake lane lock is busy')
+                time.sleep(LOCK_POLL_SECONDS)
 
     def __exit__(self, *_exc):
-        try:
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            self.handle.close()
+        if self.handle is not None:
+            try:
+                fcntl.flock(self.handle, fcntl.LOCK_UN)
+            finally:
+                os.close(self.handle)
+                self.handle = None
         return False
+
 
 
 def _key(entry):
@@ -265,7 +366,7 @@ def append(project, actor, entries, now=None):
     moment = _now(now)
     try:
         _ensure_directory(directory)
-        with _THREAD_LOCK, _Lock(lock):
+        with _thread_guard(), _Lock(lock):
             existing = _read_audit(audit, moment)
             seen = {_key(entry) for entry in existing}
             fresh = []
@@ -336,6 +437,19 @@ def summaries(project, actors, now=None):
     return result
 
 
+def _field(row, attention, name):
+    """A row field, else the same field in its nested ``attention`` block.
+
+    A canonical ``work`` row carries the checkpoint fields at the top level; the HTTP
+    service's queue row carries them under ``attention`` (the same fallback
+    ``http_service.attention_field`` uses).  Both transports must classify alike.
+    """
+    value = row.get(name)
+    if value is None and isinstance(attention, dict):
+        value = attention.get(name)
+    return value
+
+
 def normalize_row(row):
     """One queue row reduced to the fields two waits compare, JSON-safe."""
     if not isinstance(row, dict):
@@ -343,23 +457,34 @@ def normalize_row(row):
     task = row.get('task') if row.get('task') is not None else row.get('id')
     if task is None:
         return None
-    owner = row.get('owner') if row.get('owner') is not None else row.get('assignee')
-    review_state = row.get('review_state')
+    attention = row.get('attention') if isinstance(row.get('attention'), dict) else {}
+    owner = _field(row, attention, 'owner')
+    if owner is None:
+        owner = _field(row, attention, 'assignee')
+    review_state = _field(row, attention, 'review_state')
     return {
         'task': str(task)[:TASK_TEXT],
         'review_state': _scalar(review_state),
-        'work_state': _scalar(row.get('work_state') if row.get('work_state') is not None
+        'work_state': _scalar(_field(row, attention, 'work_state')
+                              if _field(row, attention, 'work_state') is not None
                               else review_state),
         'owner': _scalar(owner),
         'assignee': _scalar(owner),
-        'status': _scalar(row.get('status')),
-        'contribution_id': _scalar(row.get('contribution_id')),
-        'pending_review_items': _scalar(row.get('pending_review_items')),
-        'redelivered': _scalar(row.get('redelivered')),
-        'guidance_version': _scalar(row.get('guidance_version')),
-        'wait_newer_activity_marker': _scalar(row.get('wait_newer_activity_marker')),
-        'whose_move': _scalar(row.get('whose_move')),
-        'next_actor': _scalar(row.get('next_actor')),
+        'status': _scalar(_field(row, attention, 'status')),
+        'contribution_id': _scalar(_field(row, attention, 'contribution_id')),
+        'pending_review_items': _scalar(_field(row, attention, 'pending_review_items')),
+        'redelivered': _scalar(_field(row, attention, 'redelivered')),
+        'guidance_version': _scalar(_field(row, attention, 'guidance_version')),
+        'wait_newer_activity_marker': _scalar(_field(row, attention,
+                                                     'wait_newer_activity_marker')),
+        'whose_move': _scalar(_field(row, attention, 'whose_move')),
+        'next_actor': _scalar(_field(row, attention, 'next_actor')),
+        # Carried so a later read can tell an OTHER-PARTY change from the caller's own
+        # write (review b2).  They are deliberately NOT in WATCH_FIELDS: a count moving
+        # is not a trigger, and it must not change a fingerprint.
+        'newer_activity_by_others': _scalar(_field(row, attention,
+                                                   'newer_activity_by_others')),
+        'newer_activity_own': _scalar(_field(row, attention, 'newer_activity_own')),
     }
 
 
@@ -367,6 +492,41 @@ def _scalar(value):
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     return str(value)[:200]
+
+
+def _own_change(before, after):
+    """Whether a changed row changed because of the CALLER's own write, not another's.
+
+    The worker's wait marker is "the newest entry by anybody other than the task's
+    assignee", and the newer-activity counters say how many entries by others exist.
+    So when the other-party count did not grow and the wait marker did not move, no
+    other-party entry and no field edit arrived since the rows the caller last saw:
+    the change is the caller's own delivery, close, release or checkpoint and is not
+    an empty wake at all (review b2).  An added row is an assignment (not the
+    caller's write); a removed row left the caller's queue by the caller's release or
+    close (or was unassigned), which is likewise not a bad wake.
+    """
+    if before is None:
+        return False
+    if after is None:
+        return True
+    old_other = before.get('newer_activity_by_others')
+    new_other = after.get('newer_activity_by_others')
+    if isinstance(old_other, int) and isinstance(new_other, int):
+        if new_other > old_other:
+            return False
+        old_marker = before.get('wait_newer_activity_marker')
+        new_marker = after.get('wait_newer_activity_marker')
+        if (isinstance(old_marker, str) and isinstance(new_marker, str)
+                and old_marker != new_marker):
+            # No new entry, but an other party edited the task fields: not the caller.
+            return False
+        return True
+    old_marker = before.get('wait_newer_activity_marker')
+    new_marker = after.get('wait_newer_activity_marker')
+    if isinstance(old_marker, str) and isinstance(new_marker, str):
+        return old_marker == new_marker
+    return False
 
 
 def _trigger(diff):
@@ -377,13 +537,16 @@ def _trigger(diff):
 
 
 def changed_wakes(previous, rows, view):
-    """The changed rows behind one wake: ``[{'task', 'trigger', 'whose_move'}]``.
+    """The changed rows behind one wake.
 
-    ``previous`` is the bounded row list the caller last read (from ``.last.json``),
-    ``rows`` the caller's full queue rows now, and ``view`` the printed worker view
-    (its ``items`` are the rows that are actually the caller's move).  A row is
-    changed when any field in :data:`WATCH_FIELDS` differs; added and removed rows
-    count too.  The returned list is empty when the rows are the same.
+    Each item is ``{'task', 'trigger', 'whose_move', 'own'}``; ``own`` is true when
+    the change is the caller's own write (see :func:`_own_change`) and must not be
+    counted as an empty wake.  ``previous`` is the bounded row list the caller last
+    read (from ``.last.json``), ``rows`` the caller's full queue rows now, and
+    ``view`` the printed worker view (its ``items`` are the rows that are actually
+    the caller's move).  A row is changed when any field in :data:`WATCH_FIELDS`
+    differs; added and removed rows count too.  The returned list is empty when the
+    rows are the same.
     """
     old = {}
     for row in previous or []:
@@ -400,16 +563,48 @@ def changed_wakes(previous, rows, view):
         before, after = old.get(task), new.get(task)
         if before is None:
             changed.append({'task': task, 'trigger': 'assignment',
-                            'whose_move': (after or {}).get('whose_move')})
+                            'whose_move': (after or {}).get('whose_move'), 'own': False})
             continue
         if after is None:
-            changed.append({'task': task, 'trigger': 'edit', 'whose_move': None})
+            changed.append({'task': task, 'trigger': 'edit', 'whose_move': None, 'own': True})
             continue
         diff = [field for field in WATCH_FIELDS if before.get(field) != after.get(field)]
         if diff:
             changed.append({'task': task, 'trigger': _trigger(diff),
-                            'whose_move': after.get('whose_move')})
+                            'whose_move': after.get('whose_move'),
+                            'own': _own_change(before, after)})
     return changed
+
+
+def _read_snapshot(snapshot):
+    """The last rows the caller saw, read without following a symlink or blocking.
+
+    The format is the same small ``waiting.read_state`` file the wait already kept,
+    so an existing log keeps working; an absent, unreadable, malformed or special file
+    is simply no remembered rows.
+    """
+    _refuse_symlink(snapshot)
+    try:
+        raw = _read_regular(snapshot, waiting.MAX_STATE_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    if len(raw) > waiting.MAX_STATE_BYTES:
+        return None
+    try:
+        value = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeError):
+        return None
+    if not isinstance(value, dict) or value.get('schema') != waiting.WAIT_STATE_SCHEMA:
+        return None
+    fingerprint = value.get('fingerprint')
+    if not waiting.is_fingerprint(fingerprint):
+        fingerprint = None
+    items = value.get('items')
+    if not isinstance(items, list):
+        items = []
+    return {'fingerprint': fingerprint,
+            'items': [row for row in items[:waiting.MAX_STATE_ITEMS]
+                      if isinstance(row, dict)]}
 
 
 def _write_snapshot(project, actor, fingerprint, rows, now):
@@ -421,8 +616,27 @@ def _write_snapshot(project, actor, fingerprint, rows, now):
     _ensure_directory(directory)
     normalized = [normalize_row(row) for row in rows or []]
     normalized = [row for row in normalized if row is not None]
-    with _THREAD_LOCK, _Lock(lock):
-        return waiting.write_state(str(snapshot), fingerprint, normalized)
+    payload = {'schema': waiting.WAIT_STATE_SCHEMA, 'fingerprint': fingerprint,
+               'items': normalized[:waiting.MAX_STATE_ITEMS]}
+
+    def encoded(value):
+        return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+
+    try:
+        text = encoded(payload)
+    except (ValueError, TypeError):
+        return False
+    if len(text) > waiting.MAX_STATE_BYTES:
+        payload['items'] = []
+        try:
+            text = encoded(payload)
+        except (ValueError, TypeError):
+            return False
+        if len(text) > waiting.MAX_STATE_BYTES:
+            return False
+    with _thread_guard(), _Lock(lock):
+        _write_atomic(snapshot, text + '\n')
+    return True
 
 
 def observe(project, actor, since, view, rows, now=None):
@@ -449,17 +663,21 @@ def observe(project, actor, since, view, rows, now=None):
             return warnings
         moment = _now(now)
         previous = []
+        state = None
         place = paths(project, actor)
         if place is None:
             return warnings
         try:
-            state = waiting.read_state(str(place[2]))
+            state = _read_snapshot(place[2])
             previous = state.get('items') if state else []
         except Exception as error:                            # noqa: BLE001 - best effort
             warnings.append('empty-wake log: could not read the last rows: %s' % str(error)[:160])
         changed = changed_wakes(previous, rows, view)
+        # A change the caller caused (its own delivery, close, release or checkpoint)
+        # is not an empty wake at all (review b2).
+        foreign = [item for item in changed if not item.get('own')]
         if (isinstance(since, str) and waiting.is_fingerprint(since)
-                and fingerprint != since and changed and not (view.get('items') or [])):
+                and fingerprint != since and foreign and not (view.get('items') or [])):
             entries = [{
                 'schema': SCHEMA,
                 'at': _stamp(moment),
@@ -468,16 +686,40 @@ def observe(project, actor, since, view, rows, now=None):
                 'task': item['task'],
                 'trigger': item['trigger'],
                 'empty': True,
-            } for item in changed]
+            } for item in foreign]
             try:
                 append(project, actor, entries, now=moment)
             except Exception as error:                        # noqa: BLE001 - best effort
                 warnings.append('empty-wake log: could not record: %s' % str(error)[:160])
-        try:
-            if not _write_snapshot(project, actor, fingerprint, rows, moment):
-                warnings.append('empty-wake log: could not keep the last rows')
-        except Exception as error:                            # noqa: BLE001 - best effort
-            warnings.append('empty-wake log: could not keep the last rows: %s' % str(error)[:160])
+        # The snapshot only changes with the fingerprint or the rows; an unchanged poll
+        # never rewrites it (review n2: the CLI and HTTP read paths now agree and both
+        # call this on every poll).
+        unchanged = (state is not None and state.get('fingerprint') == fingerprint
+                     and not changed)
+        if not unchanged:
+            try:
+                if not _write_snapshot(project, actor, fingerprint, rows, moment):
+                    warnings.append('empty-wake log: could not keep the last rows')
+            except Exception as error:                        # noqa: BLE001 - best effort
+                warnings.append('empty-wake log: could not keep the last rows: %s' % str(error)[:160])
     except Exception as error:                                # noqa: BLE001 - best effort
         warnings.append('empty-wake log: %s' % str(error)[:160])
-    return warnings
+    return _warn_once(warnings)
+
+
+def _warn_once(warnings):
+    """The warnings a process has not emitted yet (review n3: once, not every poll)."""
+    fresh = []
+    with _WARNINGS_LOCK:
+        for warning in warnings:
+            if warning in _WARNINGS_SEEN or len(_WARNINGS_SEEN) >= WARNING_MEMORY:
+                continue
+            _WARNINGS_SEEN.add(warning)
+            fresh.append(warning)
+    return fresh
+
+
+def _reset_warnings():
+    """Forget emitted warnings (tests only; a real process emits each one once)."""
+    with _WARNINGS_LOCK:
+        _WARNINGS_SEEN.clear()

@@ -9,8 +9,11 @@ import json
 import concurrent.futures
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -33,7 +36,8 @@ def a_row(task='t1', whose_move='you', review_state='changes-requested', **extra
            'next_actor': 'assignee' if whose_move == 'you' else 'coordinator',
            'owner': A, 'assignee': A, 'status': 'open', 'contribution_id': 'c1',
            'pending_review_items': 0, 'redelivered': False,
-           'wait_newer_activity_marker': 'm1'}
+           'wait_newer_activity_marker': 'm1',
+           'newer_activity_by_others': 0, 'newer_activity_own': 0}
     row.update(extra)
     return row
 
@@ -46,11 +50,24 @@ def append_one(arguments):
                                     'task': 't%d' % index, 'trigger': 'edit', 'empty': True}])
 
 
+def append_in_child(arguments):
+    root, index = arguments
+    code = ('import sys; sys.path.insert(0, %r); import wake_log; '
+            'wake_log.append(%r, %r, [{"schema": wake_log.SCHEMA, '
+            '"at": "2026-10-24T12:00:00Z", "actor": %r, '
+            '"fingerprint": "wait1:" + ("%%064x" %% %d), "task": "t%d", '
+            '"trigger": "edit", "empty": True}])'
+            % (str(KIT), root, A, A, index, index))
+    return subprocess.run([sys.executable, '-c', code], capture_output=True, timeout=30).returncode
+
+
 class EmptyWakeRecordTests(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix='empty-wake-'))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        wake_log._reset_warnings()
+        self.addCleanup(wake_log._reset_warnings)
 
     def baseline(self, rows=None):
         rows = rows or [a_row()]
@@ -62,7 +79,10 @@ class EmptyWakeRecordTests(unittest.TestCase):
 
     def test_an_empty_wake_is_recorded_once_and_shown(self):
         first = self.baseline()
-        changed = [a_row(whose_move='coordinator', review_state='integrated')]
+        # An OTHER party's entry: the by-others count grew (the wait marker normally
+        # moves too, but the trigger asserted below is the review-state one).
+        changed = [a_row(whose_move='coordinator', review_state='integrated',
+                         newer_activity_by_others=1)]
         view = waiting.worker_view([])
         self.assertNotEqual(view['fingerprint'], first['fingerprint'])
         self.assertEqual(wake_log.observe(self.root, A, first['fingerprint'], view, changed), [])
@@ -71,9 +91,12 @@ class EmptyWakeRecordTests(unittest.TestCase):
         self.assertEqual(summary['empty_wake_task'], 't1')
         self.assertEqual(summary['empty_wake_trigger'], 'review-state')
         self.assertTrue(summary['empty_wake_at'].endswith('Z'))
-        # The same wake is never recorded twice.
+        # The same wake is never recorded twice, and dedupe is a LINE count, not the
+        # distinct-fingerprint count the summary shows (mutation: dedupe off).
         wake_log.observe(self.root, A, first['fingerprint'], view, changed)
         self.assertEqual(wake_log.read(self.root, A)['empty_wakes_24h'], 1)
+        lane = self.root / wake_log.DIRECTORY / (wake_log.actor_key(A) + '.jsonl')
+        self.assertEqual(len(lane.read_text(encoding='utf-8').splitlines()), 1)
         # Only this actor's own lane exists.
         self.assertEqual(wake_log.read(self.root, B)['empty_wakes_24h'], 0)
         lane_dir = self.root / wake_log.DIRECTORY
@@ -83,11 +106,45 @@ class EmptyWakeRecordTests(unittest.TestCase):
 
     def test_a_real_wake_is_not_recorded(self):
         first = self.baseline()
-        row = a_row(review_state='changes-requested', pending_review_items=2)
+        row = a_row(review_state='changes-requested', pending_review_items=2,
+                    newer_activity_by_others=1)
         view = waiting.worker_view([row])
         self.assertNotEqual(view['fingerprint'], first['fingerprint'])
         wake_log.observe(self.root, A, first['fingerprint'], view, [row])
         self.assertEqual(wake_log.read(self.root, A)['empty_wakes_24h'], 0)
+
+    def test_a_change_the_caller_caused_is_not_an_empty_wake(self):
+        # Review b2: after the caller's own delivery/close/release/checkpoint the move
+        # leaves the caller, but that is not a bad wake and must not be recorded.
+        first = self.baseline()
+        changed = [a_row(whose_move='reviewer', review_state='awaiting-review',
+                         contribution_id='c2', newer_activity_by_others=0,
+                         newer_activity_own=1)]
+        view = waiting.worker_view([])
+        self.assertNotEqual(view['fingerprint'], first['fingerprint'])
+        self.assertEqual(wake_log.observe(self.root, A, first['fingerprint'], view, changed), [])
+        self.assertEqual(wake_log.read(self.root, A)['empty_wakes_24h'], 0)
+
+    def test_an_other_party_field_edit_is_still_an_empty_wake(self):
+        first = self.baseline()
+        # No new entry (counts unchanged), but the wait marker moved: another party
+        # edited the task, so this is NOT the caller's own write.
+        changed = [a_row(whose_move='coordinator', review_state='integrated',
+                         wait_newer_activity_marker='m2')]
+        view = waiting.worker_view([])
+        self.assertEqual(wake_log.observe(self.root, A, first['fingerprint'], view, changed), [])
+        self.assertEqual(wake_log.read(self.root, A)['empty_wakes_24h'], 1)
+
+    def test_warnings_are_emitted_once_per_process_not_every_poll(self):
+        broken = self.root / 'not-a-directory'
+        broken.write_text('x', encoding='utf-8')
+        view = waiting.worker_view([])
+        args = (broken, A, waiting.fingerprint([a_row()]), view,
+                [a_row(whose_move='coordinator')])
+        first = wake_log.observe(*args)
+        second = wake_log.observe(*args)
+        self.assertTrue(first)
+        self.assertEqual(second, [])
 
     def test_a_change_with_no_fingerprint_change_is_not_a_wake(self):
         first = self.baseline()
@@ -104,11 +161,24 @@ class EmptyWakeRecordTests(unittest.TestCase):
         self.assertEqual(wake_log.read(self.root, A, now='2026-10-24T12:00:00Z')['empty_wakes_24h'], 0)
 
     def test_the_file_is_bounded_and_keeps_the_newest(self):
-        for index in range(wake_log.MAX_ENTRIES + 12):
-            wake_log.append(self.root, A, [
-                {'schema': wake_log.SCHEMA, 'at': '2026-10-24T12:00:00Z', 'actor': A,
-                 'fingerprint': 'wait1:%064x' % index, 'task': 't%d' % index,
-                 'trigger': 'edit', 'empty': True}])
+        # A time limit turns a broken bound (an unbounded rewrite loop) into a failure
+        # instead of a hang (review tests-and-notes).
+        def timeout(_signum, _frame):
+            raise AssertionError('the bounded rewrite did not finish in 20 s')
+        previous = None
+        if hasattr(signal, 'SIGALRM'):
+            previous = signal.signal(signal.SIGALRM, timeout)
+            signal.alarm(20)
+        try:
+            for index in range(wake_log.MAX_ENTRIES + 12):
+                wake_log.append(self.root, A, [
+                    {'schema': wake_log.SCHEMA, 'at': '2026-10-24T12:00:00Z', 'actor': A,
+                     'fingerprint': 'wait1:%064x' % index, 'task': 't%d' % index,
+                     'trigger': 'edit', 'empty': True}])
+        finally:
+            if previous is not None:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, previous)
         lane = self.root / wake_log.DIRECTORY / (wake_log.actor_key(A) + '.jsonl')
         raw = lane.read_bytes()
         self.assertLessEqual(len(raw), wake_log.MAX_BYTES)
@@ -125,6 +195,88 @@ class EmptyWakeRecordTests(unittest.TestCase):
         self.assertEqual(sorted(results), [1] * 8)
         summary = wake_log.read(self.root, A)
         self.assertEqual(summary['empty_wakes_24h'], 8)
+
+    def test_two_processes_writers_lose_nothing_and_duplicate_nothing(self):
+        # A thread test is masked by the in-process lock; two real processes prove the
+        # file lock itself (mutation: flock off).
+        indexes = list(range(8))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            codes = list(pool.map(append_in_child,
+                                  [(str(self.root), index) for index in indexes]))
+        self.assertEqual(codes, [0] * len(indexes))
+        lane = self.root / wake_log.DIRECTORY / (wake_log.actor_key(A) + '.jsonl')
+        entries = [json.loads(line) for line in lane.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(sorted(entry['task'] for entry in entries),
+                         sorted('t%d' % index for index in indexes))
+        self.assertEqual(wake_log.read(self.root, A)['empty_wakes_24h'], len(indexes))
+
+    def test_a_held_lane_lock_never_stalls_the_wait(self):
+        import fcntl
+        directory = self.root / wake_log.DIRECTORY
+        directory.mkdir()
+        lock_path = directory / (wake_log.actor_key(A) + '.lock')
+        holder = open(lock_path, 'w', encoding='utf-8')
+        self.addCleanup(holder.close)
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        warnings = wake_log.observe(self.root, A, waiting.fingerprint([a_row()]),
+                                    waiting.worker_view([]),
+                                    [a_row(whose_move='coordinator')])
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.5)
+        self.assertTrue(warnings, 'a held lock must be reported')
+
+    def test_a_fifo_at_each_lane_file_never_stalls(self):
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('no FIFOs on this host')
+        directory = self.root / wake_log.DIRECTORY
+        names = (wake_log.actor_key(A) + '.jsonl',
+                 wake_log.actor_key(A) + '.last.json',
+                 wake_log.actor_key(A) + '.lock')
+        for name in names:
+            with self.subTest(name=name):
+                wake_log._reset_warnings()
+                shutil.rmtree(directory, ignore_errors=True)
+                directory.mkdir()
+                os.mkfifo(directory / name)
+                started = time.monotonic()
+                warnings = wake_log.observe(self.root, A, waiting.fingerprint([a_row()]),
+                                            waiting.worker_view([]),
+                                            [a_row(whose_move='coordinator')])
+                read = wake_log.read(self.root, A)
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 2.0)
+                self.assertIsInstance(read['empty_wakes_24h'], int)
+                self.assertTrue(warnings, 'a FIFO must be reported')
+
+    def test_a_crash_between_write_and_rename_leaves_the_old_audit(self):
+        from unittest import mock
+        first = self.baseline()
+        lane = self.root / wake_log.DIRECTORY / (wake_log.actor_key(A) + '.jsonl')
+        wake_log.observe(self.root, A, first['fingerprint'], waiting.worker_view([]),
+                         [a_row(whose_move='coordinator', review_state='integrated',
+                                newer_activity_by_others=1)])
+        before = lane.read_bytes()
+        with mock.patch.object(wake_log.os, 'replace', side_effect=OSError('crash before rename')):
+            with self.assertRaises(OSError):
+                wake_log.append(self.root, A, [
+                    {'schema': wake_log.SCHEMA, 'at': '2026-10-24T13:00:00Z', 'actor': A,
+                     'fingerprint': 'wait1:' + '2' * 64, 'task': 't2',
+                     'trigger': 'edit', 'empty': True}])
+        self.assertEqual(lane.read_bytes(), before)
+        self.assertEqual(wake_log.read(self.root, A)['empty_wakes_24h'], 1)
+
+    def test_a_symlinked_last_json_is_refused(self):
+        directory = self.root / wake_log.DIRECTORY
+        directory.mkdir()
+        outside = self.root / 'outside-last.json'
+        outside.write_text('{"schema": "wait-state-v1"}', encoding='utf-8')
+        (directory / (wake_log.actor_key(A) + '.last.json')).symlink_to(outside)
+        warnings = wake_log.observe(self.root, A, waiting.fingerprint([a_row()]),
+                                    waiting.worker_view([]),
+                                    [a_row(whose_move='coordinator')])
+        self.assertTrue(any('symlink' in warning for warning in warnings), warnings)
+        self.assertEqual(outside.read_text(encoding='utf-8'), '{"schema": "wait-state-v1"}')
 
     def test_a_symlinked_log_directory_is_refused_and_never_raises(self):
         outside = Path(tempfile.mkdtemp(prefix='empty-outside-'))
@@ -172,14 +324,29 @@ class EmptyWakeRecordTests(unittest.TestCase):
             with self.subTest(change=change):
                 after = wake_log.normalize_row(a_row(**change))
                 changed = wake_log.changed_wakes([before], [a_row(**change)], waiting.worker_view([]))
-                self.assertEqual(changed, [{'task': 't1', 'trigger': expected,
-                                            'whose_move': after['whose_move']}])
+                self.assertEqual([(item['task'], item['trigger'], item['whose_move'])
+                                  for item in changed],
+                                 [('t1', expected, after['whose_move'])])
 
     def test_added_and_removed_rows_are_changes(self):
         changed = wake_log.changed_wakes([wake_log.normalize_row(a_row('gone'))],
                                          [a_row('new')], waiting.worker_view([]))
         self.assertEqual([row['task'] for row in changed], ['gone', 'new'])
         self.assertEqual([row['trigger'] for row in changed], ['edit', 'assignment'])
+        # A removed row left the caller (own release/close), an added one is an
+        # assignment: only the latter can be an empty wake (review b2).
+        self.assertEqual([row['own'] for row in changed], [True, False])
+
+    def test_own_detection_uses_the_activity_counts_and_the_wait_marker(self):
+        before = wake_log.normalize_row(a_row())
+        own = wake_log.normalize_row(a_row(contribution_id='c2', newer_activity_own=1))
+        other = wake_log.normalize_row(a_row(contribution_id='c2',
+                                             newer_activity_by_others=1))
+        edit = wake_log.normalize_row(a_row(contribution_id='c2',
+                                            wait_newer_activity_marker='m2'))
+        self.assertTrue(wake_log._own_change(before, own))
+        self.assertFalse(wake_log._own_change(before, other))
+        self.assertFalse(wake_log._own_change(before, edit))
 
 
 class LaneBoardTests(unittest.TestCase):
@@ -252,6 +419,8 @@ class WorkWaitRecordingTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.project = self.root / 'projects' / 'p'
         self.project.mkdir(parents=True)
+        wake_log._reset_warnings()
+        self.addCleanup(wake_log._reset_warnings)
 
     def row(self, status='open'):
         return {'id': 't1', 'title': 'Task t1', 'issue_type': 'task', 'status': status,
@@ -267,15 +436,15 @@ class WorkWaitRecordingTests(unittest.TestCase):
             return lines
         return work.execute(self.project, A, 'wait', args, {}, runner, operators=[A])
 
-    def test_an_empty_wake_from_the_wait_is_recorded(self):
+    def test_the_callers_own_close_from_the_wait_is_not_recorded(self):
+        # Review b2: after the worker itself closes the task the next wait returns it
+        # with no items, but that is the caller's own write, not a bad wake.
         first = self.run_wait([self.row()], [])
         self.assertIn('t1', [item['task'] for item in first['items']])
         self.assertEqual(wake_log.read(self.project, A)['empty_wakes_24h'], 0)
         second = self.run_wait([self.row('closed')], ['--since', first['fingerprint']])
         self.assertEqual(second['items'], [])
-        summary = wake_log.read(self.project, A)
-        self.assertEqual(summary['empty_wakes_24h'], 1)
-        self.assertEqual(summary['empty_wake_task'], 't1')
+        self.assertEqual(wake_log.read(self.project, A)['empty_wakes_24h'], 0)
 
     def test_a_real_wake_stays_a_real_wake_and_is_not_recorded(self):
         first = self.run_wait([self.row()], [])
@@ -365,7 +534,7 @@ class HttpWorkerWaitRecordingTests(test_http_agents.AgentHarness):
     def log_dir(self):
         return self.backend.wake_root / self.project
 
-    def test_an_empty_wake_is_recorded_once_and_matches_the_endpoint_rule(self):
+    def test_the_callers_own_close_is_not_recorded_and_matches_the_endpoint_rule(self):
         created = self.create_task(self.alex, self.project, 'first')
         task_id = created.data['id']
         claimed = self.request('POST', '/v1/projects/%s/tasks/%s/claim'
@@ -375,6 +544,9 @@ class HttpWorkerWaitRecordingTests(test_http_agents.AgentHarness):
         self.assertEqual(200, first.status, first.data)
         self.assertIn(task_id, [row['task'] for row in first.data['items']])
         self.assertEqual(wake_log.read(self.log_dir(), self.actor())['empty_wakes_24h'], 0)
+        # Review b2: the agent closes its OWN task.  The next wait still returns the
+        # change with no items (the wake set is untouched), but it is the caller's own
+        # write and must NOT be recorded as an empty wake on either transport.
         current = self.request('GET', '/v1/projects/%s/tasks/%s' % (self.project, task_id),
                                token=self.secret)
         self.assertEqual(200, current.status, current.data)
@@ -389,22 +561,29 @@ class HttpWorkerWaitRecordingTests(test_http_agents.AgentHarness):
         self.assertIs(True, woke.data['changed'])
         self.assertEqual(woke.data['items'], [])
         summary = wake_log.read(self.log_dir(), self.actor())
-        self.assertEqual(summary['empty_wakes_24h'], 1)
-        self.assertEqual(summary['empty_wake_task'], task_id)
+        self.assertEqual(summary['empty_wakes_24h'], 0, summary)
         # The same rows and ``since`` classify identically through the shared rule.
         endpoint_dir = self.tmp_path / 'endpoint-wakes'
         previous_view = waiting.worker_view([a_row(task_id)])
         wake_log.observe(endpoint_dir, self.actor(), None, previous_view, [a_row(task_id)])
         view = waiting.worker_view([])
+        changed = [a_row(task_id, status='closed', whose_move='coordinator',
+                         review_state='awaiting-review', newer_activity_by_others=0,
+                         newer_activity_own=1)]
         wake_log.observe(endpoint_dir, self.actor(), previous_view['fingerprint'],
-                         dict(view, fingerprint=woke.data['fingerprint']), [])
+                         dict(view, fingerprint=woke.data['fingerprint']), changed)
         endpoint = wake_log.read(endpoint_dir, self.actor())
-        self.assertEqual(endpoint['empty_wake_task'], summary['empty_wake_task'])
-        self.assertEqual(endpoint['empty_wake_trigger'], summary['empty_wake_trigger'])
-        # A second poll of the same wake records nothing new.
+        self.assertEqual(endpoint['empty_wakes_24h'], summary['empty_wakes_24h'])
+        # A second poll of the same wake still records nothing.
         self.request('GET', '/v1/agents/me/wait?since=' + first.data['fingerprint'],
                      token=self.secret)
-        self.assertEqual(wake_log.read(self.log_dir(), self.actor())['empty_wakes_24h'], 1)
+        self.assertEqual(wake_log.read(self.log_dir(), self.actor())['empty_wakes_24h'], 0)
+
+    def test_a_malformed_since_on_the_worker_form_is_ignored(self):
+        # Review n4: the worker form always ignored an unusable since; the record-only
+        # feature must not start answering 400 there (the coordinator form still does).
+        answered = self.request('GET', '/v1/agents/me/wait?since=nonsense', token=self.secret)
+        self.assertEqual(200, answered.status, answered.data)
 
 
 if __name__ == '__main__':
