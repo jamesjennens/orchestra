@@ -119,6 +119,33 @@ class LanesRouteCase(ServerHarness):
                     return row, entry
         raise AssertionError('task %s is on no lane: %r' % (task_id, payload['items']))
 
+    def plant_fault(self, task_id, actor, reason='the merge slot is stuck', age_seconds=600):
+        """Plant a checkpoint and a needs-investigation record, as the checkpoint writer would."""
+        stamp = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat()
+        comments = self.backend.state['tasks'][task_id].setdefault('comments', [])
+        comments.append({'id': 'comment_fault_checkpoint', 'issue_id': task_id, 'author': actor,
+                         'text': 'a checkpoint', 'created_at': stamp})
+        payload = {'schema_version': 1, 'task': task_id, 'checkpoint': 'comment_fault_checkpoint',
+                   'state': 'needs-investigation', 'reason': reason}
+        comments.append({'id': 'comment_fault_planted', 'issue_id': task_id, 'author': actor,
+                         'text': lane_state.PREFIX + canonical_bytes(payload).decode(), 'created_at': stamp})
+
+    def test_a_raised_fault_is_on_the_lane_board_row_for_the_owner_and_the_lane_only(self):
+        self.plant_coordination(operators=[self.ids['olive']])
+        self.plant_fault(self.carl_task, self.ids['carl'])
+        every = self.lanes(self.olive).data
+        fault = self.lane_row(every, self.ids['carl'])['needs_investigation']
+        self.assertEqual(('comment_fault_planted', 'the merge slot is stuck', self.carl_task),
+                         (fault['record'], fault['reason'], fault['task']))
+        self.assertGreaterEqual(fault['age_seconds'], 600)
+        self.assertIsNone(self.lane_row(every, self.ids['dana'])['needs_investigation'])
+        self.assertEqual(1, every['flags']['needs_investigation'])
+        own = self.lanes(self.dana).data
+        self.assertNotIn('the merge slot is stuck', json.dumps(own))
+        mine = self.lane_row(self.lanes(self.carl).data, self.ids['carl'])['needs_investigation']
+        self.assertEqual({k: v for k, v in fault.items() if k != 'age_seconds'},
+                         {k: v for k, v in mine.items() if k != 'age_seconds'})
+
     # -- the threshold is the page's argument ----------------------------------
     def test_the_threshold_reaches_the_one_read_and_the_flags_change_with_it(self):
         self.plant_coordination(operators=[self.ids['olive']])
@@ -396,6 +423,13 @@ class LanesPageTests(unittest.TestCase):
         self.assertTrue(seen['countsLine'], seen['text'])
         self.assertIn('15 idle minutes', seen['countsLine'][0])
         self.assertIn('1 waiting too long', seen['countsLine'][0])
+        # A raised fault shows its reason as text (never markup), where and how long, and the
+        # older open reasons, beside the lane that raised it (kittrial-5bb.398).
+        self.assertEqual(1, len(seen['fault']), seen['fault'])
+        for wanted in ('Needs investigation', 'the <b>merge</b> slot is stuck', '1 h ago', 'alpha-4', 'alpha-5'):
+            self.assertIn(wanted, seen['fault'][0], wanted)
+        self.assertEqual(['Earlier open: credentials leaked'], seen['faultEarlier'])
+        self.assertEqual(['+3 more earlier open not shown'], seen['faultOmitted'])
         # The panel is composed into the project overview.
         self.assertEqual(1, seen['overviewHasPanel'])
         # Next reads the read's own next page, with the SAME threshold.

@@ -316,7 +316,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # completeness record already at the operator's destination: text this kit did
             # not just write itself, so a deeply nested one is described rather than
             # crashing the copy out of the guard.
-            'admin.py': 10,
+            'admin.py': 11,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
             # message line through the guard: a room post is text a person wrote, and a
             # nested or lookalike file must be a refusal, never a RecursionError.
@@ -398,6 +398,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # actor's comment, its host journal entry files and the bd comments-add
             # receipts of both writes through the guard (four).
             'followon.py': 4,
+            # kittrial-5bb.398: fault_clear.py parses the reserved clear body, its journal entry
+            # files and the bd comments-add receipt through the guard (three).
+            'fault_clear.py': 3,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

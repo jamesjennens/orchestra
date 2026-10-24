@@ -220,9 +220,9 @@ class CoordinatorFormTests(unittest.TestCase):
         view = self.coordinator(queue=[{'task': 't1', 'review_state': 'none'}],
                                 lanes=lanes_page(lane('lane-a', A, held=[
                                     {'task': 't1', 'state': 'working', 'flags': []}])))
-        # kittrial-5bb.397: an empty `empty-wake` group is deliberately kept OUT of the
-        # fingerprint, so a quiet answer keeps the fingerprint it had before the trigger.
-        stable = {name: [] for name in waiting.COORDINATOR_TRIGGERS if name != 'empty-wake'}
+        # kittrial-5bb.397/.398: empty `needs-investigation` and `empty-wake` groups are kept OUT
+        # of the fingerprint, so a quiet answer keeps the fingerprint it had before those triggers.
+        stable = {name: [] for name in waiting.COORDINATOR_TRIGGERS if name not in ('needs-investigation', 'empty-wake')}
         self.assertEqual(view['fingerprint'], waiting.digest(stable))
         self.assertEqual(view['items'], [])
 

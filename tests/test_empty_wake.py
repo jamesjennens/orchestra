@@ -410,7 +410,7 @@ class LaneBoardTests(unittest.TestCase):
         # A quiet answer keeps the fingerprint it had before the new trigger existed.
         self.assertEqual(view['fingerprint'],
                          waiting.digest({name: [] for name in waiting.COORDINATOR_TRIGGERS
-                                         if name != 'empty-wake'}))
+                                         if name not in waiting.OPTIONAL_TRIGGERS}))
         self.record(['d'])
         page = lanes.read([self.row()], A, {'schema_version': 1, 'records': {}},
                           ['--limit', '20'], journal=self.root)

@@ -347,6 +347,28 @@ act instead of leaving it to be discovered.
 waiting agent, so that work adds the push and does not redefine the state. The record lives beside
 the checkpoint precisely so that the push work can extend it without reopening the checkpoint schema.
 
+## 9a. Needs investigation (kittrial-5bb.398)
+
+A lane may raise a fault flag that is its own channel (`lane_state.newest()` and so the held task's
+declared state skip needs-investigation records, so a raise never replaces `waiting_on`, `expect_by` or the
+`checkpoint-to-coordinator` trigger, and a clear gives nothing back because nothing was taken). It is independent of its working/waiting state: a `lane-state-v1`
+record with `state: needs-investigation`, a required `reason` (at most 300 characters, one printable
+line) and an optional `about_task`. The reason is untrusted everywhere: escaped, clipped to 300 and
+folded onto one line in text views. The board's lane row carries `needs_investigation` (reason, task,
+record, since, age) on every lane, faulted lanes sort first, and the flags summary counts them. The
+flag is the lane's newest raise across all its tasks, closed ones included; a later state record never
+clears it. Only `coordinator fault-clear` (or the host `admin.py fault-clear`) clears it, writing a
+`lane-fault-clear-v1` comment plus a journal entry that records who and when. A newer raise does not hide an older open one: the
+row's `needs_investigation.earlier` lists up to five older open raises and `earlier_omitted` counts the rest (a clear
+of the newest ends them all), and the wait row carries `task` (the `about_task`, else the raised-on task),
+`raised_on`, the older reasons and `earlier_omitted`. The web Lanes panel renders the reason as text, with the
+omitted count. The coordinator wait gains a `needs-investigation` trigger, ordered before any empty-wake trigger.
+An EMPTY group never enters the coordinator fingerprint, so every fingerprint is unchanged while nothing is
+flagged; a non-empty group is fingerprinted by stable fields only (lane, actor, task, raised-on task, raise
+record and time), never by the reason text or the age. An older kit drops the unknown state and so does not
+show the flag; the clear reads there as an ordinary comment. Use it for process faults, not task
+blockers, which stay open items.
+
 ## 10. Decisions taken (the two former owner questions are closed)
 
 1. **Threshold** — 15 minutes by default, given as an argument of the read and of the page, **not** a

@@ -130,11 +130,15 @@ WORKER_MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor', 'owner
                       'contribution_id', 'pending_review_items', 'redelivered',
                       'guidance_version', 'wait_newer_activity_marker')
 
-#: The things a coordinator wakes for, in the order the task names them. ``empty-wake``
+#: The things a coordinator wakes for, in the order the task names them. ``needs-investigation``
+#: (kittrial-5bb.398) is a lane-raised fault that stays until a coordinator clears it. ``empty-wake``
 #: (kittrial-5bb.397) is the lane board's count of worker wakes that changed nothing the
 #: caller could act on: three DIFFERENT fingerprints in 24 hours on one lane.
 COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
-                        'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake')
+                        'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake', 'needs-investigation')
+#: Triggers whose EMPTY group stays out of the fingerprint, so a quiet answer keeps the
+#: fingerprint it had before they were added (coordinator rule for .397 and .398).
+OPTIONAL_TRIGGERS = ('empty-wake', 'needs-investigation')
 EMPTY_WAKE_TRIGGER = 3
 
 #: The lane board flags a coordinator acts on: a lane quiet on its own move, or past a
@@ -617,6 +621,27 @@ def _empty_wake_row(lane):
             'at': _scalar(lane.get('empty_wake_at'))}
 
 
+def _fault_row(lane, fault):
+    """One raised fault, reduced to stable fields: no age, and the reason as already escaped."""
+    return {'lane': _scalar(lane.get('lane')), 'actor': _scalar(lane.get('actor')),
+            'task': _scalar(fault.get('about_task') or fault.get('task')),
+            'raised_on': _scalar(fault.get('task')),
+            'state': 'needs-investigation', 'reason': _scalar(fault.get('reason')),
+            'record': _scalar(fault.get('record')), 'since': _scalar(fault.get('since')),
+            'earlier': [_scalar(item.get('reason')) for item in fault.get('earlier') or []
+                        if isinstance(item, dict)],
+            'earlier_omitted': _count(fault.get('earlier_omitted'))}
+
+
+def _count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _fault_fingerprinted(row):
+    """The stable identity of one raise: who, where, which record and when; never the prose."""
+    return {name: row.get(name) for name in ('lane', 'actor', 'task', 'raised_on', 'record', 'since')}
+
+
 def coordinator_view(queue_items, lanes_payload):
     """The coordinator form's answer: the four trigger groups plus a fingerprint.
 
@@ -658,17 +683,20 @@ def coordinator_view(queue_items, lanes_payload):
                          or entry.get('next_actor') == 'coordinator')
             if addressed:
                 triggers['checkpoint-to-coordinator'].append(_lane_row(lane, entry))
+        fault = lane.get('needs_investigation')
+        if isinstance(fault, dict):
+            triggers['needs-investigation'].append(_fault_row(lane, fault))
         count = lane.get('empty_wakes_24h')
         if isinstance(count, int) and count >= EMPTY_WAKE_TRIGGER:
             triggers['empty-wake'].append(_empty_wake_row(lane))
     grouped = {name: _sorted_rows(rows) for name, rows in triggers.items()}
     flat = [dict(row, trigger=name) for name in COORDINATOR_TRIGGERS for row in grouped[name]]
-    # An empty group is part of the fingerprint only for the trigger this module just
-    # added, so a coordinator answer that has no empty wake keeps its OLD fingerprint;
-    # adding ``empty-wake: []`` to every answer would change all of them at once.
-    fingerprinted = {name: _sorted_rows([_fingerprinted(row) for row in rows])
-                     for name, rows in triggers.items()
-                     if rows or name != 'empty-wake'}
+    # An empty group of a trigger added after the fingerprint existed (OPTIONAL_TRIGGERS) never
+    # enters the fingerprint, so a quiet answer keeps its OLD fingerprint; a raised fault is
+    # fingerprinted by its stable identity, never its prose.
+    fingerprinted = {name: _sorted_rows([_fault_fingerprinted(row) if name == 'needs-investigation'
+                                         else _fingerprinted(row) for row in rows])
+                     for name, rows in triggers.items() if rows or name not in OPTIONAL_TRIGGERS}
     return {'schema': WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
             'items': flat, 'fingerprint': digest(fingerprinted)}
 

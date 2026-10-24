@@ -229,7 +229,7 @@ class FlagTests(unittest.TestCase):
         result = board([waiting, owing])
         # Both holders owe their OWN move (no contribution has been delivered on either),
         # so your_move_idle counts both; the waiting and expect_by flags name lane A only.
-        self.assertEqual(result['flags'], {'waiting_too_long': 1, 'expect_by_passed': 1, 'your_move_idle': 2})
+        self.assertEqual(result['flags'], {'waiting_too_long': 1, 'expect_by_passed': 1, 'your_move_idle': 2, 'needs_investigation': 0})
         row_a = next(item for item in result['items'] if item['actor'] == A)
         self.assertEqual(row_a['flag_tasks']['expect_by_passed'], ['t1'])
         row_b = next(item for item in result['items'] if item['actor'] == B)

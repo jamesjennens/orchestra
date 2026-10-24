@@ -347,7 +347,8 @@ class _InlineWait:
                           'contribution_id', 'pending_review_items', 'redelivered',
                           'guidance_version', 'wait_newer_activity_marker')
     COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
-                            'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake')
+                            'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake', 'needs-investigation')
+    OPTIONAL_TRIGGERS = ('empty-wake', 'needs-investigation')
     EMPTY_WAKE_TRIGGER = 3
     LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')
     AWAITING_REVIEW_STATES = ('awaiting-review', 'legacy-review-ready')
@@ -729,6 +730,27 @@ class _InlineWait:
                 'at': _InlineWait._scalar(lane.get('empty_wake_at'))}
 
     @staticmethod
+    def _fault_row(lane, fault):
+        return {'lane': _InlineWait._scalar(lane.get('lane')),
+                'actor': _InlineWait._scalar(lane.get('actor')),
+                'task': _InlineWait._scalar(fault.get('about_task') or fault.get('task')),
+                'raised_on': _InlineWait._scalar(fault.get('task')),
+                'state': 'needs-investigation', 'reason': _InlineWait._scalar(fault.get('reason')),
+                'record': _InlineWait._scalar(fault.get('record')),
+                'since': _InlineWait._scalar(fault.get('since')),
+                'earlier': [_InlineWait._scalar(item.get('reason')) for item in fault.get('earlier') or []
+                            if isinstance(item, dict)],
+                'earlier_omitted': _InlineWait._count(fault.get('earlier_omitted'))}
+
+    @staticmethod
+    def _count(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    @staticmethod
+    def _fault_fingerprinted(row):
+        return {name: row.get(name) for name in ('lane', 'actor', 'task', 'raised_on', 'record', 'since')}
+
+    @staticmethod
     def coordinator_view(queue_items, lanes_payload):
         lanes = lanes_payload if isinstance(lanes_payload, dict) else {}
         triggers = {name: [] for name in _InlineWait.COORDINATOR_TRIGGERS}
@@ -761,6 +783,9 @@ class _InlineWait:
                              or entry.get('next_actor') == 'coordinator')
                 if addressed:
                     triggers['checkpoint-to-coordinator'].append(_InlineWait._lane_row(lane, entry))
+            fault = lane.get('needs_investigation')
+            if isinstance(fault, dict):
+                triggers['needs-investigation'].append(_InlineWait._fault_row(lane, fault))
             count = lane.get('empty_wakes_24h')
             if isinstance(count, int) and count >= _InlineWait.EMPTY_WAKE_TRIGGER:
                 triggers['empty-wake'].append(_InlineWait._empty_wake_row(lane))
@@ -768,9 +793,9 @@ class _InlineWait:
         flat = [dict(row, trigger=name) for name in _InlineWait.COORDINATOR_TRIGGERS
                 for row in grouped[name]]
         fingerprinted = {name: _InlineWait._sorted_rows(
-            [_InlineWait._fingerprinted(row) for row in rows])
-            for name, rows in triggers.items()
-            if rows or name != 'empty-wake'}
+            [_InlineWait._fault_fingerprinted(row) if name == 'needs-investigation'
+             else _InlineWait._fingerprinted(row) for row in rows])
+            for name, rows in triggers.items() if rows or name not in _InlineWait.OPTIONAL_TRIGGERS}
         return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
                 'items': flat, 'fingerprint': _InlineWait.digest(fingerprinted)}
 
