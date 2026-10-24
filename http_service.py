@@ -11686,6 +11686,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         task=None,
         contribution=None,
     ):
+        capped_contribution = str(contribution)[:200] if contribution else None
         with self.service.store.lock:
             event = self.service.audit(
                 ctx.request_id,
@@ -11697,22 +11698,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             )
             if isinstance(record, dict):
                 event['task'] = record.get('task') or task
-                event['contribution'] = record.get('contribution') or contribution
+                raw_contribution = record.get('contribution') or capped_contribution
+                event['contribution'] = str(raw_contribution)[:200] if raw_contribution else None
                 event['commit'] = record.get('commit')
                 if sha256 is None and isinstance(record.get('delivery'), dict):
                     sha256 = record['delivery'].get('sha256')
             else:
                 if task is not None:
                     event['task'] = task
-                if contribution is not None:
-                    event['contribution'] = contribution
+                if capped_contribution is not None:
+                    event['contribution'] = capped_contribution
             if sha256 is not None:
                 event['sha256'] = sha256
             if size_bytes is not None:
                 event['bytes'] = size_bytes
             self.service.store.save_soon('the audit entry of a bundle read')
 
-    def _send_bundle_stream(self, handle_fd, record, verified):
+    def _send_bundle_stream(self, handle_fd, record, verified, ctx=None, pid=None):
         from review_workflow import BUNDLE_BLOCK_BYTES
         headers_sent = False
         try:
@@ -11787,6 +11789,23 @@ class ApiHandler(BaseHTTPRequestHandler):
         except Exception:
             self.close_connection = True
             if not headers_sent:
+                audit_ctx = ctx
+                if audit_ctx is None and getattr(self, 'service', None) is not None:
+                    from types import SimpleNamespace
+                    audit_ctx = SimpleNamespace(
+                        request_id=getattr(self, '_current_request_id', None) or '',
+                        principal=getattr(self, '_principal', None) or '',
+                    )
+                if audit_ctx is not None:
+                    self._audit_bundle_read(
+                        audit_ctx,
+                        pid if pid is not None else (record.get('project') if isinstance(record, dict) else None),
+                        record,
+                        'interrupted',
+                        reason='stream_error',
+                        sha256=verified.get('sha256') if isinstance(verified, dict) else None,
+                        size_bytes=verified.get('bytes') if isinstance(verified, dict) else None,
+                    )
                 raise
             try:
                 self.wfile.flush()
@@ -11959,7 +11978,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 contribution=contribution_id,
             )
             raise
-        outcome, interrupt_reason = self._send_bundle_stream(handle_fd, record, verified)
+        outcome, interrupt_reason = self._send_bundle_stream(handle_fd, record, verified, ctx=ctx, pid=pid)
         self._audit_bundle_read(
             ctx,
             pid,
