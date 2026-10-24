@@ -594,6 +594,26 @@ class HttpAgentWaitTests(test_http_agents.AgentHarness):
         response = self.request('GET', '/v1/agents/me/wait', token=self.alex)
         self.assertEqual(403, response.status, response.data)
 
+    def test_a_blank_or_repeated_query_value_is_refused_not_repaired(self):
+        fingerprint = waiting.fingerprint([])
+        for path, name in (
+                ('/v1/agents/me/wait?form=', 'form'),
+                ('/v1/agents/me/wait?form=worker&form=coordinator', 'form'),
+                ('/v1/agents/me/wait?since=%s&since=%s' % (fingerprint, fingerprint), 'since'),
+                ('/v1/agents/me/wait?idle_minutes=', 'idle_minutes'),
+                ('/v1/agents/me/wait?idle_minutes=1_5', 'idle_minutes'),
+                ('/v1/agents/me/wait?idle_minutes=+15', 'idle_minutes'),
+                ('/v1/agents/me/wait?idle_minutes=%2015', 'idle_minutes')):
+            with self.subTest(path=path):
+                refused = self.request('GET', path, token=self.secret)
+                self.assertEqual(400, refused.status, refused.data)
+                self.assertIn(name, refused.data['error']['message'])
+        bare = self.request('GET', '/v1/agents/me/wait', token=self.secret)
+        worker = self.request('GET', '/v1/agents/me/wait?form=worker', token=self.secret)
+        self.assertEqual(200, bare.status, bare.data)
+        self.assertEqual(200, worker.status, worker.data)
+        self.assertEqual(bare.data['fingerprint'], worker.data['fingerprint'])
+
 
 if __name__ == '__main__':
     unittest.main()

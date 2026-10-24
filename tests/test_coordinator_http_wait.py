@@ -74,9 +74,21 @@ class CoordinatorWaitTests(grants.Grants):
 
     def test_query_validation(self):
         self.assertEqual(200, self.grant().status)
-        for query in ('&since=bad', '&idle_minutes=0', '&idle_minutes=10081', '&idle_minutes=x'):
+        fingerprint = waiting.fingerprint([])
+        for query in ('&since=bad', '&idle_minutes=0', '&idle_minutes=10081', '&idle_minutes=x',
+                      '&since=' + fingerprint + '&since=' + fingerprint,
+                      '&idle_minutes=', '&idle_minutes=1_5', '&idle_minutes=+15',
+                      '&idle_minutes=%2015'):
             with self.subTest(query=query):
-                self.assertEqual(400, self.wait(query=query).status)
+                refused = self.wait(query=query)
+                self.assertEqual(400, refused.status, refused.data)
+                self.assertIn('since' if 'since' in query else 'idle_minutes',
+                              refused.data['error']['message'])
+        for query in ('?form=', '?form=coordinator&form=worker'):
+            with self.subTest(query=query):
+                refused = self.request('GET', '/v1/agents/me/wait' + query, token=self.agent)
+                self.assertEqual(400, refused.status, refused.data)
+                self.assertIn('form', refused.data['error']['message'])
         self.assertEqual(400, self.request('GET', '/v1/agents/me/wait?form=other', token=self.agent).status)
 
     def test_canonical_authority_names_only_the_coordinator_wait_form(self):

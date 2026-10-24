@@ -206,13 +206,14 @@ class NoUnguardedParseTests(unittest.TestCase):
                            'a damaged, unreadable or nested file is caught and read as the restrictive '
                            '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
                            'permissive default'),
-        'client.py': (12, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
+        'client.py': (15, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
                          'kittrial-5bb.285 added the wait read\'s answer from the endpoint (and wait\'s --config read, '
                          'which kittrial-5bb.373 merged with main()\'s --config read into one parse after delivery; '
                          "neither is a record comment or a caller's payload). The twelfth (kittrial-5bb.327 "
                          "review 2) is the wait's own small state file: text this client wrote beside its config, "
                          'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
-                         'treated as absent'),
+                         'treated as absent. The last three (kittrial-5bb.384) are the `files` command\'s reads of the endpoint\'s own answer line '
+                         'and of the file record inside it, on the caller\'s machine'),
         'coordination.py': (7, 'bd output'),
         'endpoint.py': (6, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
                            'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own); the sixth '
@@ -349,8 +350,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # kittrial-5bb.378: the thirteenth guards the web release body (a query scope or one
             # deploy group the route transports); web_release has already validated its field
             # set, and the guard bounds its nesting before it is parsed.
+            # endpoint.py (kittrial-5bb.384): the framed task-file header line, and the request text read
+            # whole (the same guarded parse the old reader made, now in two places: a pipe and a text stream).
             'task_files.py': 9,
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 13, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 15, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through

@@ -82,6 +82,14 @@ class MarkdownTests(unittest.TestCase):
         self.assertIn('b' * 64, document)
         self.assertIn('Acceptance decision: demo', document)
 
+    def test_multiline_terminal_reason_quotes_every_line_including_setext(self):
+        terminal = item(record(), state='withdrawn')
+        terminal['reason'] = {'reason': 'Heading\n===\n\n<script>\n# title\n> quote'}
+        document = render(view(terminal)).decode()
+        self.assertIn('Reason:\n\n> Heading\n> ===\n> \n> &lt;script&gt;', document)
+        self.assertNotIn('\n===\n', document)
+        self.assertIn(r'> \# title', document)
+
     def test_wrong_item_kind_or_cross_id_revision_is_never_silently_omitted(self):
         wrong = item(record())
         wrong['kind'] = 'unknown-new-kind'

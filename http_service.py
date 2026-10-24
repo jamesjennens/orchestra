@@ -1941,6 +1941,27 @@ def unsupported_fields_text(keys):
     return ', '.join(shown)
 
 
+def refuse_ambiguous_query(raw_query, names):
+    """Refuse a blank or repeated query value instead of quietly taking the first.
+
+    ``_dispatch`` builds ``ctx.query`` with ``keep_blank_values=False`` and keeps only
+    ``v[0]``, so a handler cannot tell ``?form=`` from no form at all, or the first
+    ``?idle_minutes=15`` from two of them. The routes that read these names re-parse the
+    raw query with ``keep_blank_values=True`` and refuse a malformed value here, before
+    reading it (kittrial-5bb.389; the same reading as ``project_guidance_status``).
+    A parameter that is absent is left alone: the route's own default still applies.
+    """
+    pairs = parse_qs(raw_query, keep_blank_values=True)
+    for name in names:
+        values = pairs.get(name)
+        if values is None:
+            continue
+        if len(values) != 1:
+            raise HttpError(400, 'invalid_request', 'Use %s only once' % name)
+        if values[0] == '':
+            raise HttpError(400, 'invalid_request', '%s must not be blank' % name)
+
+
 def refuse_unknown_fields(payload, allowed, where, takes=None):
     """Refuse a body field the route does not take, in the task-change shape (kittrial-5bb.183).
 
@@ -5740,13 +5761,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         row = self._files_row(ctx)
         may = self._files_coordinates(ctx) or task_files.is_assignee(row, actor)
         try:
-            items = []
-            for entry in task_files.live(project, ctx.params['tid']):
-                item = task_files.view(entry, may_download=may)
-                # kittrial-5bb.380: a purged file is said as purged (view carries the sentence), not as missing.
-                if not entry.get('purged') and task_files.blob_size(project, entry['sha256']) != entry['bytes']:
-                    item['missing'] = True
-                items.append(item)
+            items = task_files.listing(project, ctx.params['tid'], may)
         except task_files.Refusal as refusal:
             raise files_error(refusal) from None
         return 200, {'task': ctx.params['tid'], 'items': items, 'total': len(items), 'may_download': may}
@@ -5863,25 +5878,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if isinstance(record, dict) and record.get('archived') and not coordinates:
                 # r2 (review s4d): an archived project is read-only; its files stay downloadable by its coordinators.
                 raise forbidden('The project is archived: only its coordinators download its files.')
-            entry = task_files.read_entry(project, ctx.params['tid'], sha256)
-            if entry is None or entry.get('withdrawn') is not None:
-                raise not_found('No such file on this task.')
-            if entry.get('purged'):
-                # kittrial-5bb.380 (coordinator's Q2): the bytes were removed by an operator's purge.
-                raise HttpError(410, 'gone', task_files.purged_sentence(entry))
             limit = self._files_limits()
-            handle = task_files.open_blob(project, sha256)
+            entry, handle = task_files.download_target(project, ctx.params['tid'], sha256)
         except (HttpError, task_files.Refusal) as error:
             raise self._files_refused(ctx, action, error, sha256) from None
         gate = self.transfers or DEFAULT_TRANSFERS
         key = self._files_key(ctx)
         try:
             with handle:
-                size = os.fstat(handle.fileno()).st_size
-                if size != entry['bytes']:
-                    raise self._files_refused(ctx, action, task_files.Refusal(
-                        409, 'conflict', 'The stored file does not match its record (its size changed); it is not '
-                        'served. An operator must look at it.'), sha256)
+                size = entry['bytes']
                 try:
                     gate.take(key, limit, ctx.params['pid'])
                 except HttpError as error:
@@ -8567,6 +8572,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         from work import move_decision
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
+        refuse_ambiguous_query(urlsplit(self.path).query, ('form', 'since', 'idle_minutes'))
+        # Both forms share this query, so a malformed threshold is refused even on the
+        # worker form, where the value is otherwise unused (kittrial-5bb.389).
+        self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
         form = ctx.query.get('form', 'worker')
         if form not in ('worker', 'coordinator'):
             raise HttpError(400, 'invalid_request', 'form must be worker or coordinator')
@@ -10945,7 +10954,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/baselines/(?P<baseline>[A-Za-z0-9_-]{1,64})')
     def requirements_baseline(self, ctx):
         self._requirements_baseline_member(ctx)
-        return 200, self.backend.requirements_read(ctx.params['pid'], ['baseline', ctx.params['baseline']])
+        result = self.backend.requirements_read(ctx.params['pid'], ['baseline', ctx.params['baseline']])
+        if self._requirement_editor_here(ctx, ctx.params['pid']) is None:
+            receipt = result.get('receipt')
+            if isinstance(receipt, dict):
+                names = self.service.actor_names([receipt.get('account_id')])
+                account = receipt.get('account_id')
+                name = names.get(account)
+                result['author_name'] = name if name and name != account else 'Former project owner'
+                result['receipt'] = {key: value for key, value in receipt.items()
+                                     if key not in ('account_id', 'operation_id')}
+        return 200, result
 
     def _requirements_document_args(self, ctx, action):
         if set(ctx.query) - {'baseline'}:
@@ -10968,8 +10987,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/brd/changes')
     def requirements_baseline_changes(self, ctx):
         self._requirements_baseline_member(ctx)
-        return 200, self.backend.requirements_read(ctx.params['pid'],
+        result = self.backend.requirements_read(ctx.params['pid'],
             self._requirements_document_args(ctx, 'changes'))
+        for change in result.get('changes', []):
+            for side in ('before', 'after'):
+                projected = {'state': change.get(side + '_state')}
+                self._requirements_state_only(ctx, projected)
+                self._requirements_names(projected)
+                change[side + '_state'] = projected['state']
+                if 'state_author_name' in projected:
+                    change[side + '_state_author_name'] = projected['state_author_name']
+        return 200, result
 
     @route('GET', r'/v1/projects/(?P<pid>'+ID+r')/requirements/governance')
     def requirements_governance_read(self,ctx):
@@ -12391,6 +12419,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         so the cursor the answer carries is minted from that, never from a second cut here.
         """
         self._project(ctx, CAP_READ)
+        refuse_ambiguous_query(urlsplit(self.path).query, ('idle_minutes',))
         limit, state = self._page(ctx, ctx.query)
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
         scope = self._lanes_scope(ctx.principal, ctx.params['pid'])
@@ -12412,14 +12441,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         the ONE read's own range, so the page cannot ask for a value the read would refuse.
         """
         from lanes import DEFAULT_IDLE_MINUTES, IDLE_MINUTES_MIN, IDLE_MINUTES_MAX
-        if raw is None or raw == '':
+        if raw is None:
             return DEFAULT_IDLE_MINUTES
-        try:
-            minutes = int(raw)
-        except (TypeError, ValueError):
+        # Plain ASCII digits only (kittrial-5bb.389): ``int()`` would also take ``1_5``,
+        # ``+15`` and surrounding whitespace and quietly repair the caller's value.
+        if not re.fullmatch(r'[0-9]+', raw):
             raise HttpError(400, 'invalid_request',
                             'idle_minutes must be a whole number of minutes, %d to %d'
                             % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
+        minutes = int(raw)
         if not IDLE_MINUTES_MIN <= minutes <= IDLE_MINUTES_MAX:
             raise HttpError(400, 'invalid_request',
                             'idle_minutes must be %d to %d (one minute to seven days)'

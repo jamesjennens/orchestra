@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb382-requirement-baseline-read-recovery-1",
+  "key": "requirements.baseline-read-recovery",
+  "name": "Member-safe baseline reads and staged-cut backup diagnostics",
+  "aliases": [
+    "baseline receipt redaction",
+    "pending baseline backup"
+  ],
+  "summary": "Changes reads project before/after states through the existing member policy and neutral author names; non-editors read baseline receipts without account or operation handles. New cuts isolate damaged unrelated receipts only with readable matching names; readable matching project/account/operation identity still refuses cross-name replay before validation, and current-pointer validation stays strict. Pending-cut backup reports, status and host setup-status name the project, stage and original-owner exact HTTP retry. Multiline Reasons are quoted in new exports while existing frozen bytes and receipt hashes remain readable and recoverable.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#requirements-baseline-backup-and-restore-boundary"
+  ],
+  "code": [
+    "http_service.py::ApiHandler.requirements_baseline",
+    "http_service.py::ApiHandler.requirements_baseline_changes",
+    "requirement_baselines.py::cut",
+    "requirement_baselines.py::pending_backup_message",
+    "requirement_baseline_records.py::validate_receipt",
+    "requirement_brd.py::render",
+    "admin.py::project_setup_status"
+  ],
+  "tests": [
+    "tests/test_http_requirement_baselines.py",
+    "tests/test_requirement_baselines.py",
+    "tests/test_requirement_brd.py",
+    "tests/test_backup_multi.py",
+    "tests/test_project_setup.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "requirements",
+    "baselines",
+    "backup",
+    "recovery",
+    "http"
+  ]
+}
