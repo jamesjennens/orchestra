@@ -1,0 +1,43 @@
+...ss..................s
+----------------------------------------------------------------------
+Ran 24 tests in 274.154s
+
+OK (skipped=3)
+
+R10 first accept 500 Internal error | rows after first [('pp-7cd', 'decision', 'Use CSV', 'open')]
+R10 amend 409 | retry accept 200  {'decision_id': 'pp-7cd', 'evidence': 'orchestra:room/r-9b3ed8423c08#1', 'id': 'pp-7cd', 'kind': 'decision', 'revision': None, 'sha256': None}
+R10 rows after retry [('pp-7cd', 'decision', 'Use CSV', 'open')] | item now accepted Use CSV {'decision_id': 'pp-7cd', 'evidence': 'orchestra:room/r-9b3ed8423c08#1', 'id': 'pp-7cd', 'kind': 'decision', 'revision': None, 'sha256': None}
+
+R11 first 500 | rows [('pp-d3s', 'decision', 'Accept requirement pp-76m.1', 'open'), ('pp-76m.1', 'task', 'Add export', 'open')] | retry (fresh key) 200 {'decision_id': 'pp-d3s', 'evidence': 'orchestra:room/r-005c918ab67b#1', 'id': 'pp-76m.1', 'kind': 'requirement', 'revision': 2, 'sha256': '96af0087c55a5e56e125665c3d77685cdb1e2240fb72da2c6643f2f4919b7401'} | rows after [('pp-d3s', 'decision', 'Accept requirement pp-76m.1', 'open'), ('pp-76m.1', 'task', 'Add export', 'open')]
+
+R12 first accept 500 Internal error | rows after first [('pp-i0d', 'decision', 'Accept requirement pp-q1p.1', 'open'), ('pp-q1p.1', 'task', 'Add export', 'open')]
+R12 amend 409 | second accept 200  pp-q1p.1
+R12 rows after [('pp-i0d', 'decision', 'Accept requirement pp-q1p.1', 'open'), ('pp-q1p.1', 'task', 'Add export', 'open')] | item accepted Add export pp-q1p.1
+
+R13 first 500 | second (editor picks job2 pp-t5c) 409 This acceptance was started under parent pp-whi; retry without a parent, or a project owner or coordinator can None | rows [('pp-tf4', 'decision', 'Accept requirement pp-whi.1', 'open'), ('pp-whi.1', 'task', 'Add export', 'open')] | parents [('pp-whi.1', 'pp-whi', [None])] | item proposed
+
+R14 statuses acc/amend/acc/amend/acc [500, 409, 500, 409, 200]  | rows [('pp-p52', 'decision', 'Accept requirement pp-hwy.1', 'open'), ('pp-hwy.1', 'task', 'Add export', 'open')] | item accepted Add export pp-hwy.1
+  [proposals GET 200 total 1 items 1 None ]
+  [proposals GET 200 total 2 items 2 None ]
+
+R15 contributor first 500 | amend 409 | second 200  {'decision_id': None, 'evidence': 'orchestra:room/r-d6c6727874d9#1', 'id': 'p-ac0ebd287ab9', 'kind': 'proposal', 'revision': 1, 'sha256': '4b0b1d0d66137c23c450b24977176aff09c0ab85c23bccbe9af467aef1830691'} | new proposals [('p-ac0ebd287ab9', 'We need CSV export.', 'submitted')]
+R16 ('decision-row', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('decision-row accept', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('other-project', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('other-project accept', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('missing', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('missing accept', 422, 'That parent is not a job of this project; a requirement hang')
+R16 ('plain-task', 200, '')
+R16 ('plain-task accept', 200, '')
+R16 ('rows', [('pp-64j', 'decision', 'Accept requirement pp-58e.1', 'open'), ('pp-58e.1', 'task', 'Add export', 'open')])
+  [proposals GET 200 total 2 items 2 None ]
+  [proposals GET 200 total 3 items 3 None ]
+
+R8bc contributor+owner [('casey', 200, None), ('alex', 409, 'final')] rows [] new proposals [('p-b9db359a16d5', 'We need CSV export.', 'submitted')] events 1
+
+R9 room state during write open | archive 200 11.7s | accept 200 None | rows [('pp-gwo', 'decision', 'Accept requirement pp-u5i.1', 'open'), ('pp-u5i.1', 'task', 'Add export', 'open')] | events 1 | room now archived
+  [proposals GET 200 total 3 items 3 None ]
+  [proposals GET 200 total 4 items 4 None ]
+
+R9b room state during proposal open | archive 200 | accept 200 None | new proposals [('p-2a0453267558', 'We need CSV export.', 'submitted')] | events 1
+exit=0

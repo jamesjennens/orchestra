@@ -1,0 +1,176 @@
+test_v5_archive_cancels (tests.test_rev388r5_bd.Rev388r5Bd) ... ERROR
+test_v5_cancel_rights (tests.test_rev388r5_bd.Rev388r5Bd) ... ERROR
+test_v5_committed_adopt_counts (tests.test_rev388r5_bd.Rev388r5Bd) ... ERROR
+test_v5_concurrent_first_accepts_two_callers (tests.test_rev388r5_bd.Rev388r5Bd) ... ERROR
+test_v5_concurrent_retries_two_callers (tests.test_rev388r5_bd.Rev388r5Bd) ... ERROR
+test_v5_created_not_accepted_then_third_editor (tests.test_rev388r5_bd.Rev388r5Bd) ... ERROR
+test_v5_missing_row_other_editor_then_cancel (tests.test_rev388r5_bd.Rev388r5Bd) ... ERROR
+test_v5_moderation_cancels_then_retry_refused (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_proposal_intent_editor_cannot_complete_and_no_attempt_line (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_reserved_prefixes_and_request_id (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_same_author_retry_after_missing_row_decision (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_same_author_retry_after_missing_row_requirement (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_same_author_retry_new_login_session_decision (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_same_author_retry_new_login_session_requirement (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_ssh_planted_journal_row_decision (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_ssh_planted_journal_row_requirement (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_uncertain_row_other_editor (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+
+======================================================================
+ERROR: test_v5_archive_cancels (tests.test_rev388r5_bd.Rev388r5Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/./tests/test_rev388r5_bd.py", line 300, in test_v5_archive_cancels
+    arch = self.request('POST', '/v1/projects/pp/rooms/%s/archive' % rid, {}, token=self.tokens['alex'],
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_v5_cancel_rights (tests.test_rev388r5_bd.Rev388r5Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_v5_committed_adopt_counts (tests.test_rev388r5_bd.Rev388r5Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_v5_concurrent_first_accepts_two_callers (tests.test_rev388r5_bd.Rev388r5Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_v5_concurrent_retries_two_callers (tests.test_rev388r5_bd.Rev388r5Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_v5_created_not_accepted_then_third_editor (tests.test_rev388r5_bd.Rev388r5Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_v5_missing_row_other_editor_then_cancel (tests.test_rev388r5_bd.Rev388r5Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+----------------------------------------------------------------------
+Ran 17 tests in 278.970s
+
+FAILED (errors=7)
+
+V10 alex 500 | moderate 422 | cancel lines [] | retry 200 None | module accept of cancelled identity (409, 'operation_reused') | served (200, [(1, 'item', 'Add export', 'We need CSV export.'), (3, 'item-event', None, '')], [(1, 'accepted', 'Add export', 'We need CSV export.')]) | rows ['pp-6bl.1']
+
+V13 casey 500 | alex(editor) retry 409 This acceptance is a proposal by casey; only they can finish it, or a project owner or coordinator cancels it. | drew(other contributor) 409 This acceptance is a proposal by casey; only they can finish it, or a project owner or coordinator cancels it. | lines added by refused retries 0 | casey own retry 200 {'decision_id': None, 'evidence': 'orchestra:room/r-c683dfb4424f#1', 'id': 'p-225ae7653c31', 'kind': 'proposal', 'revision': 1, 'sha256': '81e38f70dbce91123da842e489c0ea7e9bc8a68769e69e07d3b8d58292ce12b6'} | props [] | lines [(2, 'item-intent', 'casey', '42b5b19-accept', None, None), (3, 'item-event', 'casey', '', None, None)]
+V14 ('room-x-12345678', 422)
+V14 ('intent-x-12345678', 422)
+V14 ('X-Request-Id intent- without key', 422, 'An Idempotency-Key may not start with room- or intent-: those names belong to the room itself.')
+V14 ('X-Request-Id room- without key', 422, 'An Idempotency-Key may not start with room- or intent-: those names belong to the room itself.')
+V14 ('lines', [(1, 'item', 'v14-item-key')])
+
+V2 alex 500 | decisions ['pp-oh9'] | deleted 2 | alex retry 200 None  | decisions after ['pp-ye8', 'pp-oh9'] | events 1
+
+V1 alex 500 | rows ['pp-46u.1'] | deleted journal rows 12 | alex retry 200 None  | rows after ['pp-46u.1'] | events 1
+
+V2b alex 500 | decisions ['pp-2gp'] | alex NEW SESSION retry 422 invalid_payload Operation identity belongs to a different principal | decisions after ['pp-2gp'] | pending (2, 'alex', '299a-1-f7896a5ed4d8c9c4-accept') | cancel 200 ['pp-2gp'] False | accept afresh 200 | decisions now ['pp-5rq', 'pp-2gp']
+
+V1b alex 500 | rows ['pp-x5u.1'] | alex NEW SESSION retry 200 None  | rows after ['pp-x5u.1']
+
+V9 plant rc 0 None warning: beads.role not configured (GH#2950).
+  Fix: git config beads.role maintainer
+  Or:  git con | alex accept 422 Operation identity belongs to a different principal | drew retry 409 An earlier acceptance of this item by alex has an unknown outcome; a project owner or coordinator cancels it,  | pending (2, 'alex', 'e494-1-f7896a5ed4d8c9c4-accept') | decisions []
+
+V8 plant rc 0 None warning: beads.role not configured (GH#2950).
+  Fix: git config beads.role maintainer
+  Or:  git config beads.role contr planted id pp-dbe | journal row [{'operation_id': '005b8bf49a93c7c44f4eeee38f2d721ba87cca36e9d5a3b18e6fc2bd56ef3ad8', 'state': 'committed', 'route': None, 'principal': 'actor:casey'}] | alex accept 422 Canonical command rejected the request | drew retry 404 Requirement not found None | cancel 200 ['pp-dbe'] True | req rows []
+
+V3 alex 500 | rows ['pp-cp2.1'] | set unknown 3 | drew retry 409 An earlier acceptance of this item by alex has an unknown outcome; a project owner or coordinator cancels it,  | cancel 200 5a028b42b5b19-accept [] True | lines [(2, 'item-intent', 'alex', '42b5b19-accept', None, None), (3, 'item-intent-cancel', 'alex', '42b5b19-accept', [], True)]
+exit=1

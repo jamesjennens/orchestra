@@ -1,0 +1,16 @@
+test_w1_jsonl_intent_parent_cleared_and_replays (tests.test_rev388r5.Rev388r5) ... ok
+test_w2_agent_and_outsider_cancel (tests.test_rev388r5.Rev388r5) ... ok
+test_w3_author_demoted_own_proposal_cancel (tests.test_rev388r5.Rev388r5) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 5.120s
+
+OK
+
+W1 intent parent recorded job_0002 requirement
+W1 moderate 201 | same key again 201 False | other key 409 | cancel lines 1 [(['task_requirement_1'], False)] | job_0002 in JSONL False | title in JSONL False
+
+W2 agent with coordinator grant 403 | outsider 404 | coord 200 | coord same key 200 None | cancel lines 1
+
+W3 demoted-to-viewer author cancels own proposal intent 200 -> 200 None
+exit=0

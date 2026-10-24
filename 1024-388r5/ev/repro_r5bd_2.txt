@@ -1,0 +1,37 @@
+test_v5_archive_cancels (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_cancel_rights (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_committed_adopt_counts (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_concurrent_first_accepts_two_callers (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_concurrent_retries_two_callers (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_created_not_accepted_then_third_editor (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_missing_row_other_editor_then_cancel (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+test_v5_moderation_cancels_then_retry_refused (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 421.019s
+
+OK
+
+V11 accepts 500 500 | archive 200 | pending after None None | cancels [(5, 'item-intent-cancel', 'alex', '42b5b19-accept', [], True), (6, 'item-intent-cancel', 'alex', '7c60815-accept', ['pp-vbm'], False)] | moderate item in archived room 201 None | retry 409 archived | served (200, [(1, 'tombstone', None, 'removed by alex at 2026-10-24T'), (2, 'item', 'D', 'Dtext')], [(1, 'proposed', None, 'removed by alex at 2026-10-24T'), (2, 'proposed', 'D', 'Dtext')])
+V12 ('intents', 500, 500, (3, 'alex', 'dd6a-1-aa25a028b42b5b19-accept'), (4, 'casey', 'dd6a-2-dd0d67f69d11ab7d-accept'))
+V12 ('agent cancel 1', 403)
+V12 ('vic viewer cancel 1', 403)
+V12 ('casey contributor cancel 1 (not author)', 403)
+V12 ('casey author cancel own proposal 2', 200)
+V12 ('drew (contributor) accept 2 after cancel', 200)
+V12 ('drew contributor cancel 1', 403)
+V12 ('drew coordinator cancel 1', 200)
+V12 ('owner cancel 1 again', 409)
+
+V5 alex 500 | drew retry 200 {'decision_id': 'pp-5im', 'evidence': 'orchestra:room/r-b6825e372106#1', 'id': 'pp-qqo.1', 'kind': 'requirement', 'revision': 2, 'sha256': '4c748f8d1d59c86f23103145bc25593429a55393aacb6f431b98da8ebed4fc6a'} | req rows ['pp-qqo.1'] | decisions ['pp-5im'] | events 1 | with_pointer [('pp-5im', 'decision', 'Accept requirement pp-qqo.1', 'open'), ('pp-qqo.1', 'task', 'Add export', 'open')] | lines [(2, 'item-intent', 'alex', '42b5b19-accept', None, None), (3, 'item-event', 'drew', '', None, None)]
+
+V7b concurrent first {'alex': (200, None), 'drew': (409, 'final')} | req rows ['pp-8em.1'] | events 1
+
+V7 alex 500 | concurrent {'alex': (200, None), 'drew': (409, 'final')} | req rows ['pp-gm5.1'] | decisions ['pp-9rb'] | events 1
+
+V6 alex(create only) 500 | drew adopt, append fails 500 | alex retry 409 An earlier acceptance of this item by drew has an unknown outcome; a project owner or coordinator cancels it,  None | req rows ['pp-12p.1'] | decisions ['pp-sc4'] | events 0 | lines [(2, 'item-intent', 'alex', '42b5b19-accept', None, None), (3, 'item-intent-attempt', 'drew', '42b5b19-accept', None, None)]
+
+V4 alex 500 | rows ['pp-kg5.1'] | deleted 19 | drew retry 409 An earlier acceptance of this item by alex has an unknown outcome; a project owner or coordinator cancels it,  | cancel 200 identity==intent True [] True | rows ['pp-kg5.1']
+
+V10 alex 500 | moderate 201 | cancel lines [(True, [], True, 'moderated')] | retry 409 moderated | module accept of cancelled identity (409, 'cancelled') | served (200, [(1, 'tombstone', None, 'removed by alex at 2026-10-24T')], [(1, 'proposed', None, 'removed by alex at 2026-10-24T')]) | rows ['pp-g1i.1']
+exit=0

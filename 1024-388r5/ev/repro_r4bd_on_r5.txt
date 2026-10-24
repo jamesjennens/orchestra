@@ -1,0 +1,159 @@
+test_n1_retry_by_different_editor (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n2_retry_after_room_archived (tests.test_rev388r4_bd.Rev388r4Bd) ... ERROR
+test_n3_retry_after_decider_lost_role (tests.test_rev388r4_bd.Rev388r4Bd) ... ERROR
+test_n4_editor_fails_then_contributor_accepts (tests.test_rev388r4_bd.Rev388r4Bd) ... ERROR
+test_n5_contributor_fails_then_editor_accepts (tests.test_rev388r4_bd.Rev388r4Bd) ... ERROR
+test_n6_native_write_fails_then_moderation (tests.test_rev388r4_bd.Rev388r4Bd) ... ERROR
+test_n7_contributor_intent_blocks_owner_moderation (tests.test_rev388r4_bd.Rev388r4Bd) ... ERROR
+test_n8_squat_intent_key (tests.test_rev388r4_bd.Rev388r4Bd) ... ERROR
+test_n8b_squat_identity_after_failed_append (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+test_n9_editor_parent_choice_then_retry (tests.test_rev388r4_bd.Rev388r4Bd) ... ok
+
+======================================================================
+ERROR: test_n2_retry_after_room_archived (tests.test_rev388r4_bd.Rev388r4Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/./tests/test_rev388r4_bd.py", line 105, in test_n2_retry_after_room_archived
+    arch = self.request('POST', '/v1/projects/pp/rooms/%s/archive' % rid, {}, token=self.tokens['alex'], key='n2-archive')
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_n3_retry_after_decider_lost_role (tests.test_rev388r4_bd.Rev388r4Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_n4_editor_fails_then_contributor_accepts (tests.test_rev388r4_bd.Rev388r4Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_n5_contributor_fails_then_editor_accepts (tests.test_rev388r4_bd.Rev388r4Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_n6_native_write_fails_then_moderation (tests.test_rev388r4_bd.Rev388r4Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_n7_contributor_intent_blocks_owner_moderation (tests.test_rev388r4_bd.Rev388r4Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+======================================================================
+ERROR: test_n8_squat_intent_key (tests.test_rev388r4_bd.Rev388r4Bd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_rooms_items_real_bd.py", line 35, in setUp
+    registered = self.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'PP'},
+  File "/home/james/orchestra-review-evidence/1024-388r5/rev/w/tests/test_http_review_fixes.py", line 225, in request
+    response = client.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+TimeoutError: timed out
+
+----------------------------------------------------------------------
+Ran 10 tests in 216.520s
+
+FAILED (errors=7)
+
+N1 alex 500 | pending (2, 'alex', 'cf55-1-aa25a028b42b5b19-accept') | drew retry 200  | rows [('pp-rhf', 'decision', 'Accept requirement pp-d6r.1', 'open'), ('pp-d6r.1', 'task', 'Add export', 'open')] | events 1 | pending after None
+N8b ('accept', 500)
+N8b ('drew message keyed with identity', 422, 'room-r-277f084bb4b6-1-aa25a028b42b5b19-accept')
+N8b ('pending', (2, 'alex', 'b4b6-1-aa25a028b42b5b19-accept'))
+N8b ('retry accept', 200, None, '')
+N8b ('moderate', 201, None, '')
+N8b ('reject', 409, 'moderated', 'A moderated item cannot be decided.')
+N8b ('amend', 409, 'moderated', 'A moderated item cannot be decided.')
+N8b ('supersede', 409, 'moderated', 'A moderated item cannot be superseded.')
+N8b ('item', 'accepted')
+N8b ('rows', [('pp-qpz', 'decision', 'Accept requirement pp-nbq.1', 'open'), ('pp-nbq.1', 'task', 'Add export', 'open')])
+N8b ('lines', [(1, 'item', '', ''), (2, 'item-intent', 'accept', 1), (3, 'item-event', 'accept', 1), (4, 'tombstone', '', 1)])
+N8b ('served to casey', (200, [(1, 'tombstone', None, 'removed by alex at 2026-10-24T'), (3, 'item-event', None, 'removed by alex at 2026-10-24T')], [(1, 'accepted', None, 'removed by alex at 2026-10-24T')]))
+
+N9 accept(job2) 500 | retry default parent 200  | moderate 201 None | close job2 rc 1 cannot close epic pp-avp: 1 open child issue(s); close children first or use --force to override
+ | retry job2 after close 409 That item is already decided. | pending None | rows [('pp-4e3', 'decision', 'Accept requirement pp-avp.1', 'open'), ('pp-avp.1', 'task', 'Add export', 'open')]
+exit=1

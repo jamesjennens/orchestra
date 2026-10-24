@@ -1,0 +1,44 @@
+test_n2_retry_after_room_archived (tests.test_rev388r4_bd_t.Rev388r4BdT) ... ok
+test_n3_retry_after_decider_lost_role (tests.test_rev388r4_bd_t.Rev388r4BdT) ... ok
+test_n4_editor_fails_then_contributor_accepts (tests.test_rev388r4_bd_t.Rev388r4BdT) ... ok
+test_n5_contributor_fails_then_editor_accepts (tests.test_rev388r4_bd_t.Rev388r4BdT) ... ok
+test_n6_native_write_fails_then_moderation (tests.test_rev388r4_bd_t.Rev388r4BdT) ... ok
+test_n7_contributor_intent_blocks_owner_moderation (tests.test_rev388r4_bd_t.Rev388r4BdT) ... ok
+test_n8_squat_intent_key (tests.test_rev388r4_bd_t.Rev388r4BdT) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 234.403s
+
+OK
+
+N2 accept 500 | archive 200 | retry 409 archived | moderate item 201 None | moderate message (control) 201 | reject 409 archived
+N2 item proposed True None removed by alex at 2026-10-24T10:26:44Z: abusive | pending None | rows [('pp-1em', 'decision', 'Accept requirement pp-4g5.1', 'open'), ('pp-4g5.1', 'task', 'Add export', 'open')] | served (200, [(1, 'tombstone', None, 'removed by alex at 2026-10-24T'), (2, 'tombstone', None, 'removed by alex at 2026-10-24T')], [(1, 'proposed', None, 'removed by alex at 2026-10-24T')])
+  [proposals GET 200 total 0 items 0 None ]
+  [proposals GET 200 total 0 items 0 None ]
+
+N3 drew(coord) accept 500 | rows [('pp-wco', 'decision', 'Accept requirement pp-6pe.1', 'open'), ('pp-6pe.1', 'task', 'Add export', 'open')] | drew demoted retry 403 forbidden None | rows after [('pp-wco', 'decision', 'Accept requirement pp-6pe.1', 'open'), ('pp-6pe.1', 'task', 'Add export', 'open')] | new proposals [] | events 0 | pending (2, 'drew', 'a644-1-aa25a028b42b5b19-accept') | item proposed
+N3 drew viewer retry 403 forbidden
+  [proposals GET 200 total 0 items 0 None ]
+  [proposals GET 200 total 0 items 0 None ]
+
+N4 alex 500 | rows [('pp-68a', 'decision', 'Accept requirement pp-rui.1', 'open'), ('pp-rui.1', 'task', 'Add export', 'open')] | casey 403 forbidden None | rows after [('pp-68a', 'decision', 'Accept requirement pp-rui.1', 'open'), ('pp-rui.1', 'task', 'Add export', 'open')] | new proposals [] | events 0
+  [proposals GET 200 total 0 items 0 None ]
+  [proposals GET 200 total 1 items 1 None ]
+  [proposals GET 200 total 1 items 1 None ]
+
+N5 casey 500 | props [('p-3f8b3ba05dd3', 'We need CSV export.', 'submitted')] | alex 409 conflict None | rows after [] | new proposals [('p-3f8b3ba05dd3', 'We need CSV export.', 'submitted')] | events 0
+N6 ('accept', 500, 'internal_error')
+N6 ('pending', (2, 'alex', 'b95e-1-e1c2be5e9ad0f4ca-accept'))
+N6 ('moderate', 201, None, '')
+N6 ('reject', 409, 'moderated', 'A moderated item cannot be decided.')
+N6 ('amend', 409, 'moderated', 'A moderated item cannot be decided.')
+N6 ('supersede', 409, 'moderated', 'A moderated item cannot be superseded.')
+N6 ('served to casey', (200, [(1, 'tombstone', None, 'removed by alex at 2026-10-24T')], [(1, 'proposed', None, 'removed by alex at 2026-10-24T')]))
+N6 ('rows', [])
+N6 ('moderate again later', 409, 'already_moderated')
+
+N7 casey accept 500 | pending None | owner moderate 201 None | owner reject 409 moderated | served to drew (200, [(1, 'tombstone', None, 'removed by alex at 2026-10-24T')], [(1, 'proposed', None, 'removed by alex at 2026-10-24T')])
+
+N8 drew posts message keyed intent-room-r-1a78ba896b64-1-aa25a028b42b5b19-accept 422 | alex accept 200 None  | pending None | rows [('pp-2wf', 'decision', 'Accept requirement pp-xxh.1', 'open'), ('pp-xxh.1', 'task', 'Add export', 'open')]
+N8 amend 409 | accept after amend 409 final
+exit=0

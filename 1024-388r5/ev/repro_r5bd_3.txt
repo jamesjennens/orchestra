@@ -1,0 +1,8 @@
+test_v5_moderation_timing_requirement (tests.test_rev388r5_bd.Rev388r5Bd) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 171.524s
+
+OK
+V15 alex 500 | rows ['pp-kfa.1'] | moderate 201 took 150.1 s | requirements_read calls [('raised', 'HttpError', 'Canonical endpoint timed out; outcome may be unknown', 150.1), ('read', ['get', 'pp-kfa.1'], 150.1)] | cancel line [([], True)]
+exit=0
