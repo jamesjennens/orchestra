@@ -2559,6 +2559,7 @@ def descriptor_actor_denial(request, authority_config, reserved):
 #: are not judged there at all: they carry their own exact check
 #: (``project_creation.SERVICE_ACTIONS``).
 BLOCK_CAPABILITIES = {
+    'work': {'lanes': CAP_READ},
     # The HTTP coordinator read uses exactly this canonical wait form. Other
     # wait forms have no web authority entry and cannot inherit its wider view.
     'wait': {'--coordinator': CAP_COORDINATE},

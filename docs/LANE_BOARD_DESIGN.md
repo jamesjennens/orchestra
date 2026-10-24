@@ -182,7 +182,10 @@ office surface.
 scope: owners and coordinators — the same `review_workflow.listed_operator_actor` definition the
 endpoint itself uses — read every lane, and everybody else is scoped to their own agents' lanes,
 exactly the contributor route's rule. The transport default is a property of the route, not an
-authority the page may inherit.
+authority the page may inherit. The backend sends the authenticated caller's principal with a
+`read` authority descriptor and requires live authority on the endpoint; only `work lanes` has
+that table entry. The descriptor authorizes the member read, while `lanes_scope` still only
+narrows the route-selected scope.
 
 ## 5. What an older checkpoint, an older kit and a rollback mean
 
