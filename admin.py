@@ -3486,8 +3486,16 @@ def project_setup_status(root,name,path=None):
             if item['name']==name:
                 backup['last_run']={'status':item['status'],'completed_at':item.get('completed_at'),
                                     'degraded':bool(item.get('degraded')),'scope':record.get('scope')}
+                if item.get('reason'):
+                    backup['last_run']['reason']=item['reason']
     except (ValueError,OSError):
         pass
+    from requirement_baselines import pending_backup_message
+    try:
+        pending=pending_backup_message(path,name)
+    except (ValueError,OSError):
+        pending=None
+    if pending:backup['baseline_stage']=pending
     result['backup']=backup
     # The project's merge slot, so the setup page can name a missing or damaged one as a
     # step (kittrial-5bb.202 item 2). Unknown when bd cannot say; never a write.
@@ -6503,7 +6511,9 @@ def backup_projects(root,names,all_projects=False,named_http_state=None):
         try:
             native=backup_project(root,name)
         except Exception as error:
-            results.append({'name':name,'status':'failed','reason':failure_reason(error)})
+            reason=failure_reason(error)
+            results.append({'name':name,'status':'failed','reason':reason})
+            print('Backup of %s failed: %s'%(name,reason),file=sys.stderr)
             incomplete.append(name);continue
         complete,reason=backup_pair_state(root,name)
         if complete:
@@ -11574,7 +11584,16 @@ def main():
         # Retired projects are not part of the gate; they are listed so an operator can
         # see them (the key appears only when there are any, the record is unchanged).
         retired=[entry for _,entry in retired_entries(root)]
-        print(json.dumps(dict(record,retired=retired) if retired else record,sort_keys=True))
+        from requirement_baselines import pending_backup_message
+        stages=[]
+        for name in initialized_projects(root):
+            try:message=pending_backup_message(project_dir(root,name),name)
+            except (ValueError,OSError):continue
+            if message:stages.append({'project':name,'message':message})
+        output=dict(record)
+        if retired:output['retired']=retired
+        if stages:output['baseline_stages']=stages
+        print(json.dumps(output,sort_keys=True))
         degraded=degraded_projects(root,record)
         if degraded:
             # stdout stays one JSON document; the plain sentence goes to stderr.
