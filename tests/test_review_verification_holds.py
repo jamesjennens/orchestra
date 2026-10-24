@@ -485,8 +485,10 @@ class IntegrationHoldTests(Harness):
         self.assertEqual(briefing.brief(self.rows, PROJECT, TASK)['review']['review_state'], 'held')
         item = work.queue(self.rows, AUTHOR, ['--mine'])['items'][0]
         self.assertEqual(item['review_state'], 'held')
-        self.assertEqual(item['whose_move'], 'coordinator')
-        self.assertEqual(item['next_actor'], 'coordinator')
+        self.assertTrue(item['assignee_comment_pending'])
+        self.assertEqual(item['whose_move'], 'you')
+        self.assertEqual(item['next_actor'], 'assignee')
+        self.assertIn('Integration hold', item['next'])
         self.assertEqual(item['holds'], [state['holds'][0]['comment_id']])
         self.assertNotEqual(item['review_state'], 'awaiting-integration')
 

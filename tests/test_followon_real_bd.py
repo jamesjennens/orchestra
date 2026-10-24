@@ -115,7 +115,8 @@ class FollowonCase(RulesHelpers, unittest.TestCase):
     def acknowledge_comments(self, task):
         provenance = json.loads(self.endpoint('checkpoint', WORKER,
                                               [task, '--provenance'])['stdout'])
-        body = dict(schema_version=1, task=task, previous=None,
+        previous = getattr(self, '_comment_acknowledgements', {}).get(task)
+        body = dict(schema_version=1, task=task, previous=previous,
                     activity_cursor=provenance['activity_cursor'], provenance=provenance['provenance'],
                     source_commit=COMMIT, branch='work/followon', intent='Read task comments',
                     acceptance='Attention consumed without authorizing a hand-back',
@@ -124,6 +125,8 @@ class FollowonCase(RulesHelpers, unittest.TestCase):
         written = self.endpoint('checkpoint', WORKER, [task, '@attachment:0'],
                                 {'0': {'flag': '--file', 'text': json.dumps(body)}})
         self.assertEqual(written['returncode'], 0, written)
+        self._comment_acknowledgements = dict(getattr(self, '_comment_acknowledgements', {}),
+                                              **{task: json.loads(written['stdout'])['comment_id']})
 
     def comment_ids(self, task):
         return [comment['id'] for comment in

@@ -36,8 +36,8 @@ import test_followon_real_bd as real
 COORD = real.COORD
 WORKER = real.WORKER
 PREFIX = 'followon --project PROJECT --actor OPERATOR --file payload.json'
-NO_MOVE_SENTENCE = ('A comment does not change whose move an integrated-but-open task is: '
-                    'record a hand-back or close the task.')
+NO_MOVE_SENTENCE = ('A newer coordinator comment on an open assigned task requires the assignee to read and acknowledge it; '
+                    'a recorded hand-back separately holds the implementation move until resolved.')
 
 
 class FollowonAdminDocsTests(unittest.TestCase):
@@ -56,10 +56,9 @@ class FollowonAdminDocsTests(unittest.TestCase):
                 self.assertIn('operator allowlist', text)
                 self.assertIn('followon.apply', text)
 
-    def test_the_coordinator_documents_say_a_comment_changes_no_move(self):
-        # The worker in kittrial-5bb.228/.252 waited five days on an integrated-but-open
-        # task after reading a coordinator COMMENT as a change of move. The sentence is
-        # pinned in both places a coordinator reads about this rule.
+    def test_the_coordinator_documents_distinguish_attention_from_a_handback(self):
+        # Comment attention requires a read/acknowledgement; it creates no journalled
+        # hand-back. Both coordinator documents explain the independent rules.
         for name in ('OPERATIONS.md', 'REVIEWS.md'):
             with self.subTest(document=name):
                 self.assertIn(NO_MOVE_SENTENCE, self.text(name))
@@ -129,6 +128,7 @@ class FollowonAdminCommandTests(real.FollowonCase):
     # -- tests ------------------------------------------------------------------
     def test_an_operator_records_and_withdraws_and_the_move_changes(self):
         task = self.integrated_task()
+        self.acknowledge_comments(task)
         text = 'Remaining scope: finish the release notes and the run book.'
         # Baseline: integrated-but-open is the coordinator's move, so wait sleeps.
         self.assertNotIn(task, [item['task'] for item in self.wait_items()])
@@ -165,6 +165,7 @@ class FollowonAdminCommandTests(real.FollowonCase):
         self.assertEqual((withdrawn['operation'], withdrawn['target']),
                          ('withdraw', recorded['comment_id']))
         self.assertEqual(self.journal_entry(withdrawn['comment_id'])['actor'], COORD)
+        self.acknowledge_comments(task)
         row = self.row(task)
         self.assertEqual((row['whose_move'], row['next_actor']), ('coordinator', 'coordinator'))
         self.assertEqual(row['followon']['state'], 'withdrawn')
@@ -177,6 +178,7 @@ class FollowonAdminCommandTests(real.FollowonCase):
 
     def test_a_non_operator_actor_is_refused_and_writes_nothing(self):
         task = self.integrated_task()
+        self.acknowledge_comments(task)
         before_ids = self.comment_ids(task)
         before_journal = self.journal_names()
         lock = self.project / '.coordination.lock'

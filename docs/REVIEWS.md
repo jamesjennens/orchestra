@@ -826,4 +826,4 @@ followon` or `admin.py followon`), which makes it the assignee's move and shows 
 text there. Deployment or verification may still be the coordinator's move;
 integration alone does not require the assignee to invent more implementation work.
 A closed task remains history, and an unassigned integrated task does not invent a
-holder. A comment does not change whose move an integrated-but-open task is: record a hand-back or close the task.
+holder. A newer coordinator comment on an open assigned task requires the assignee to read and acknowledge it; a recorded hand-back separately holds the implementation move until resolved.

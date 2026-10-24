@@ -50,6 +50,8 @@ ITEM_FIELDS = {
     # Additive: the checkpoint-independent marker a worker's wait fingerprints
     # (kittrial-5bb.369).
     'wait_newer_activity_marker',
+    # Additive assignee comment attention across review states (kittrial-5bb.390).
+    'assignee_comment_pending',
     # Additive: one sentence for a contribution that waits for somebody else's approval
     # (kittrial-5bb.197 review request 01a12894, item 3b).
     'waiting_for_approval', 'approval_requires_other_party',

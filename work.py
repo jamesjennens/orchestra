@@ -918,6 +918,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     evidence={r['id']:r['scopes'] for r in integration_evidence(rows,events=page_events)}
     items=[]
     checkpoint_states={}
+    attention_snapshots={}
     from review_state import is_integration_warning, reverts_by_task
     if reverts is None:
         revert_map,revert_problems=reverts_by_task(rows,operators,journal)
@@ -1163,9 +1164,17 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # this row already shows; no further read. `owned` is the SUBJECT's (kittrial-
         # 5bb.288): an open task assigned to the subject with no contribution and no
         # checkpoint by them reads `you` and counts in `your_move`.
-        from briefing import assignee_comment_pending
-        comment_pending = assignee_comment_pending(row, checkpoint_states.get(row['id']),
-                                                   review.get('last_response')) if state != 'error' else False
+        from briefing import assignee_comment_pending, checkpoint_snapshot
+        checkpoint_data = checkpoint_states.get(row['id'])
+        full = None
+        if state != 'error' and row.get('status') != 'closed' and row.get('assignee'):
+            try:
+                full = checkpoint_snapshot(rows, row, checkpoint_data)
+                attention_snapshots[row['id']] = full
+            except (ValueError, TypeError, KeyError, StopIteration):
+                pass
+        comment_pending = assignee_comment_pending(row, checkpoint_data,
+                                                   review.get('last_response'), full=full) if state != 'error' else False
         move,move_text,role=move_decision(state,row['id'],bool(subject) and actor_holds(row.get('assignee'), subject),
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
@@ -1177,7 +1186,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # the reviewers' queue, and an author with open requested changes is told the
         # changes are owed AND that the contribution is held, rather than "nothing is for
         # you to do". The `held` state's own sentence already says it.
-        if state != 'held' and (review.get('holds') or review.get('verification') == 'failed'):
+        if (state != 'held' or comment_pending) and (review.get('holds') or review.get('verification') == 'failed'):
             from review_workflow import integration_hold_sentence
             hold_sentence=integration_hold_sentence(review)
             if hold_sentence and hold_sentence not in move_text:
@@ -1246,7 +1255,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       'integration_disagreements':disagreements,'integration_warnings':integration_warnings,
                       'approval_requires_other_party':bool(independent_approval),
                       'waiting_for_approval':approval_wait(state,row['id'],actor,row.get('assignee'),
-                          contribution.get('author'),independent_approval,owners,review_request,move_text)})
+                          contribution.get('author'),independent_approval,owners,review_request,
+                          review_move(state,row['id'],bool(subject) and actor_holds(row.get('assignee'),subject),
+                              named_reviewer=review_request,pending_items=pending_items,
+                              redelivered=redelivered)[1] if comment_pending else move_text)})
         # Additive (kittrial-5bb.210 F0): the void snapshot's per-dimension reason is carried
         # on the row so a reader can say WHY a lifecycle dimension reads the way it does. Kept
         # BESIDE this lane's held state, not instead of it: a voided dimension and a hold are
@@ -1328,7 +1340,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     for item in result['items']:
         if item['task'] in task_rows:
             item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task']),
-                                                provenance_writes=provenance_writes))
+                                                provenance_writes=provenance_writes,
+                                                full=attention_snapshots.get(item['task'])))
     # The count of the QUEUE's items where the next move is the caller's, from the same
     # reconciled rows the sort used, so every page reports the same number
     # (kittrial-5bb.249 review, item 2a).

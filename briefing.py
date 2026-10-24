@@ -607,7 +607,14 @@ def pending_other_comments(entries, owner, selected=None, acknowledged=None):
                for entry in remaining)
 
 
-def assignee_comment_pending(row, state=None, response=None):
+def checkpoint_snapshot(rows, row, state):
+    """One full activity snapshot for both queue selection and displayed fields."""
+    has_checkpoint = state['current'] is not None and not state['invalid']
+    project = untoken(state['current'][0]['activity_cursor']).get('project', 'work-queue') if has_checkpoint else 'work-queue'
+    return snapshot(rows, project, row['id'])
+
+
+def assignee_comment_pending(row, state=None, response=None, full=None):
     """Unconsumed comments for an open assignee, reusing checkpoint provenance.
 
     Review state does not decide whether a person has written to the assignee.
@@ -626,7 +633,7 @@ def assignee_comment_pending(row, state=None, response=None):
         comments = {str(c['id']): c for c in row.get('comments') or []}
         own = [(i, cid, payload) for i, (cid, payload) in enumerate(state['history'])
                if same_activity_actor(comments[str(cid)].get('author'), owner)]
-        full = snapshot([row], 'comment-attention', row['id'])
+        full = full if full is not None else checkpoint_snapshot([row], row, state)
         selected = None
         if own:
             index, cid, payload = own[-1]
@@ -1275,6 +1282,8 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                       reverts_more='review '+task if len(reverts)>REVERT_BRIEF_LIMIT else None,
                       integration=compact_integration(review.get('integration')))
     brief_review.pop('reconciliation_needed',None)
+    # Internal attention acknowledgement metadata belongs in the full projection.
+    brief_review.pop('last_response',None)
     # The coordinator's recorded hand-back (kittrial-5bb.343): the same additive
     # block a work row carries. An APPLYING one is the assignee's move, so `next`
     # quotes the recorded text once and the shared review block names the role.
@@ -1674,7 +1683,7 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
             'fields':list(fields or []),'fields_note':None if current else fields_note,
             'history':history,'note':note}
 
-def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
+def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None):
     """Bounded queue fields; share the brief's linked state and full-row snapshot.
 
     This is the ONE computation of the newer-activity fields (kittrial-5bb.354,
@@ -1700,8 +1709,7 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True):
         # task's full snapshot for every row. The project name only seeds the snapshot's
         # task key; the marker reads entries and task fields, never the project.
         has_checkpoint=state['current'] is not None and not state['invalid']
-        project=untoken(state['current'][0]['activity_cursor']).get('project','work-queue') if has_checkpoint else 'work-queue'
-        full=snapshot(rows,project,row['id'])
+        full=full if full is not None else checkpoint_snapshot(rows,row,state)
         wait_marker=wait_activity_marker(full,row)
         if not has_checkpoint:
             return dict(empty,wait_newer_activity_marker=wait_marker)
