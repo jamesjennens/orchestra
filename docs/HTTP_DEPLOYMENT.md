@@ -12,7 +12,8 @@ coordinator view.
 
 Each authorized project costs one canonical wait read: queue and lane triggers
 come from the same snapshot. `triggers` groups `checkpoint-to-coordinator`,
-`awaiting-review`, `awaiting-integration` and `lane-quiet`, and `items` carries
+`awaiting-review`, `awaiting-integration`, `lane-quiet` and `empty-wake` (a lane with
+three different empty worker wakes in 24 hours, kittrial-5bb.397), and `items` carries
 those rows with their trigger. `idle_minutes` has the lane board's range
 1–10080 (default 15). For one project, `fingerprint` is byte-identical to the CLI
 coordinator fingerprint for the same actor, threshold and state. For multiple

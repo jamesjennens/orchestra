@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "operation_id": "cap397-wait-empty-wake-0002",
+  "key": "wait.empty-wake",
+  "revision": 2,
+  "expected_sha256": "4bbce1ca3130818a32fbbfb356fc99e407cac0c86dfdc2fda63b1310b5704c45",
+  "name": "An empty worker wake is recorded and shown",
+  "aliases": [
+    "empty wake",
+    "wake with nothing to do",
+    "empty_wakes_24h",
+    "worker woke with nothing to do"
+  ],
+  "summary": "A worker wait wakes when the fingerprint of its move rows changes. An EMPTY wake is that change with no row that is the caller's move (an integrated-but-open task whose review state moved is the .390 case). One shared rule compares the caller's full work --mine rows with the rows it last saw and names the changed field class (new-comment, review-state, assignment, delivery, review-items, status, guidance, edit); a wake is empty only when no changed row is the caller's move. The read already made by the CLI endpoint action and by GET /v1/agents/me/wait records it once per (actor, task, fingerprint) in <project>/.wait-wakes/: a bounded append-only per-lane JSONL (4096 bytes / 64 entries / 24 h, oldest dropped, atomic rewrite under a lock, symlinks refused). It is best effort: an error is an answer warning and never fails or changes a wait, and nothing is written to the tracker. work lanes adds empty_wakes_24h and the newest task, trigger and time; the coordinator wait gains an empty-wake trigger at three different fingerprints in 24 hours. Worker move sets and fingerprints are unchanged; the new trigger group is only in the coordinator fingerprint when it has a row.",
+  "requirements": [],
+  "anchors": [
+    "docs/FINDING_WORK.md#waking-your-agent",
+    "docs/LANE_BOARD_DESIGN.md#31-empty-wakes-kittrial-5bb397"
+  ],
+  "code": [
+    "wake_log.py::observe",
+    "wake_log.py::changed_wakes",
+    "wake_log.py::read",
+    "waiting.py::coordinator_view",
+    "lanes.py::read",
+    "work.py::execute",
+    "http_service.py::ApiHandler.agents_me_wait"
+  ],
+  "tests": [
+    "tests/test_empty_wake.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "wait",
+    "lanes",
+    "coordinator"
+  ]
+}

@@ -1467,8 +1467,16 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
             guidance_item=(queue_payload.get('guidance') or {}).get('item')
             if isinstance(guidance_item,dict):
                 move_rows.append(guidance_item)
-            return worker_view(move_rows,claiming=queue_payload.get('claiming'),
-                               empty_message=queue_payload.get('empty_message'))
+            view=worker_view(move_rows,claiming=queue_payload.get('claiming'),
+                             empty_message=queue_payload.get('empty_message'))
+            # kittrial-5bb.397: the SAME read also records an empty wake (a fingerprint
+            # change with no row of the caller's move) in the project's bounded host log.
+            # It is best effort: observe never raises, and its warnings are additive.
+            from wake_log import observe as wake_observe
+            warnings=wake_observe(path,actor,parsed.since,view,queue_payload.get('items') or [])
+            if warnings:
+                view['warnings']=warnings
+            return view
         if args[:1]==['lanes']:
             # The lanes board (kittrial-5bb.263) reads the SAME export this action already
             # loaded, plus the project's session registry: one pass, no per-task comment
