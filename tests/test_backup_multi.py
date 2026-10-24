@@ -100,6 +100,48 @@ class BackupCommandCase(unittest.TestCase):
         # Deterministic JSON: the file is exactly the sorted-key dump of its record.
         self.assertEqual(self.status_text(), json.dumps(record, ensure_ascii=False, sort_keys=True))
 
+    def test_pending_baseline_is_named_with_retry_command_in_report_and_status(self):
+        import requirement_baselines as baselines
+        stage = '.pending-' + 'a' * 64
+        directory = self.root / 'projects' / 'alpha' / baselines.DIRECTORY / stage
+        directory.mkdir(parents=True)
+        def backup(root, name):
+            baselines.backup_files(root / 'projects' / name, name)
+        message = baselines.pending_backup_message(directory.parent.parent, 'alpha')
+        self.assertLessEqual(len(message), 400)
+        with patch.object(admin, 'backup_project', side_effect=backup):
+            _, stderr, code = self.run_admin('backup', 'alpha')
+        self.assertEqual(code, 1)
+        self.assertIn(message, stderr)
+        stdout, _, code = self.run_admin('backup-status')
+        self.assertEqual(code, 0)
+        result = json.loads(stdout)
+        self.assertEqual(result['projects'][0]['reason'], message)
+        self.assertEqual(result['baseline_stages'], [{'project': 'alpha', 'message': message}])
+        self.assertIn('http_client.py', message)
+        self.assertIn('--idempotency-key "$ORIGINAL_KEY"', message)
+        self.assertIn('--body "$ORIGINAL_BODY"', message)
+        self.assertIn(stage, message)
+        self.assertTrue(directory.is_dir())
+        directory.rmdir()
+        stdout, _, code = self.run_admin('backup-status')
+        self.assertNotIn('baseline_stages', json.loads(stdout))
+        # Saved history remains unchanged when the live stage is resolved.
+        self.assertEqual(admin.read_backup_status(self.root)['projects'][0]['reason'], message)
+
+    def test_live_pending_baseline_is_visible_even_before_next_backup_run(self):
+        with patch.object(admin, 'backup_project', side_effect=self.fake_backup()):
+            self.run_admin('backup', '--all')
+        import requirement_baselines as baselines
+        stage = self.root / 'projects' / 'alpha' / baselines.DIRECTORY / ('.pending-' + 'b' * 64)
+        stage.mkdir(parents=True)
+        stdout, _, code = self.run_admin('backup-status')
+        result = json.loads(stdout)
+        self.assertEqual(code, 0)
+        self.assertEqual(result['status'], 'complete')  # historical run, not a new generation
+        self.assertEqual(result['baseline_stages'][0]['project'], 'alpha')
+        self.assertIn(stage.name, result['baseline_stages'][0]['message'])
+
     def test_several_named_projects_run_in_one_invocation(self):
         with patch.object(admin, 'backup_project', side_effect=self.fake_backup()):
             stdout, stderr, code = self.run_admin('backup', 'beta', 'alpha')

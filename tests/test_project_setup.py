@@ -438,6 +438,16 @@ class HostStatusTests(unittest.TestCase):
     def status(self):
         return admin.project_setup_status(self.root, 'alpha')
 
+    def test_pending_baseline_stage_has_same_actionable_backup_diagnostic(self):
+        import requirement_baselines as baselines
+        stage = self.project / baselines.DIRECTORY / ('.pending-' + 'a' * 64)
+        stage.mkdir(parents=True)
+        expected = baselines.pending_backup_message(self.project, 'alpha')
+        self.assertEqual(self.status()['backup']['baseline_stage'], expected)
+        self.assertTrue(stage.exists())
+        stage.rmdir()
+        self.assertNotIn('baseline_stage', self.status()['backup'])
+
     def unit(self, line, name='beads-backup.service'):
         (self.units / name).write_text('[Service]\nType=oneshot\n%s\n' % line, encoding='utf-8')
 
