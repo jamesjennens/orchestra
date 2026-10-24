@@ -3332,7 +3332,7 @@ class EndpointBackend:
         return self._checked(reply)
 
     def prior_room_write(self, project_id, user_id, route=None, key=None, target=None,
-                         operation_id=None):
+                         operation_id=None, journal_route=None, session_bound=False):
         """What one earlier room-item attempt by ``user_id`` wrote (kittrial-5bb.388 round 5, b1).
 
         Read from the endpoint's operation journal only: that row is written by the endpoint
@@ -3344,6 +3344,13 @@ class EndpointBackend:
         * ``('uncertain', None)`` - in flight, unknown, expired, recorded by digest only, or
           MISSING. Committed rows are kept for about a day, so a missing row never proves
           that nothing was written (the coordinator's condition on the plan).
+
+        Round 6 (s2): a row counts only when the endpoint wrote it for THIS person on THIS
+        route - its principal is that person's account (``owner-account:<user>``; a proposal
+        row is bound to one of that person's sessions, ``user:<user>|...``) and its route is
+        the room path's route. Any other row under the same id was written by someone else
+        (the SSH path accepts a caller-chosen operation id): ``('foreign', None)``, which the
+        caller treats as "this attempt wrote nothing under that id".
 
         One indexed point read per call; it does not grow with the project.
         """
@@ -3357,6 +3364,13 @@ class EndpointBackend:
         if path is None or not path.is_file():
             return ('uncertain', None)
         entry = OperationJournal(path).lookup(operation_id)
+        if isinstance(entry, dict):
+            principal = entry.get('principal')
+            expected_route = journal_route or route
+            mine = (isinstance(principal, str) and principal.startswith('user:%s|' % user_id)
+                    if session_bound else principal == 'owner-account:%s' % user_id)
+            if not mine or (expected_route is not None and entry.get('route') != expected_route):
+                return ('foreign', None)
         if (not isinstance(entry, dict) or entry.get('state') != 'committed'
                 or entry.get('envelope_omitted') or not isinstance(entry.get('envelope'), dict)):
             return ('uncertain', None)
@@ -6679,14 +6693,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         requirement created but not yet accepted, ``('none', None)`` when that attempt is
         recorded as having written nothing, or ``('uncertain', None)``. Only the endpoint's
         operation journal is read (EndpointBackend.prior_room_write), never tracker text.
+        A row someone else wrote under the same id (``'foreign'``, round 6 s2) means this
+        attempt wrote nothing there, so it counts as ``'none'``.
         """
-        lookup = getattr(self.backend, 'prior_room_write', None)
-        if lookup is None:
+        read_row = getattr(self.backend, 'prior_room_write', None)
+        if read_row is None:
             return ('uncertain', None)
+        def lookup(*args, **kwargs):
+            state, payload = read_row(*args, **kwargs)
+            return ('none', None) if state == 'foreign' else (state, payload)
         kind = intent.get('record_kind')
         if kind == 'decision':
             state, payload = lookup(pid, author_id, operation_id=self._room_decision_operation(
-                base, author_id))
+                base, author_id), journal_route='rooms.item.accept')
             if state != 'committed':
                 return (state, None)
             decision_id = payload.get('decision_id')
@@ -6696,7 +6715,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                                'sha256': None, 'decision_id': decision_id, 'evidence': evidence})
         if kind == 'proposal':
             state, payload = lookup(pid, author_id, 'proposals.submit', base + '-proposal',
-                                    evidence)
+                                    evidence, session_bound=True)
             if state != 'committed':
                 return (state, None)
             identity = payload.get('key') or payload.get('id') or payload.get('native_id')
@@ -6722,21 +6741,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                                'decision_id': decision_id, 'evidence': evidence})
         return ('created', created)
 
-    def _room_attempt_outcomes(self, pid, project, room_id, pending):
+    def _room_attempt_outcomes(self, pid, project, room_id, pending, lines=None):
         """The records an intent's attempts wrote, and whether any outcome is unknown.
 
         Used when an intent is cancelled (moderation, archive, a coordinator), so the cancel
         line names the records known from the journal and marks ``record_may_exist`` when an
-        attempt's outcome is not known (the coordinator's answer to Q1 on the plan).
+        attempt's outcome is not known (the coordinator's answer to Q1 on the plan). Round 6
+        (s1): callers run it with NO room lock held, because it may read through the endpoint,
+        which takes the project's .coordination.lock (the room lock); the room's lines are read
+        under that lock only for the moment it takes.
         """
         evidence = rooms._item_evidence(room_id, pending['target_sequence'])
         records = []
         unknown = False
-        lines = rooms.load_lines(project, room_id)
+        if lines is None:
+            with self._rooms_lock(project):
+                lines = rooms.load_lines(project, room_id)
         for author in rooms.intent_authors(lines, pending['identity']):
             try:
                 state, value = self._room_prior_record(pid, pending, author['id'],
-                                                       pending['identity'], evidence)
+                                                       rooms.intent_base(pending), evidence)
             except (HttpError, ValueError, OSError):
                 state, value = 'uncertain', None
             if state == 'record':
@@ -6746,6 +6770,28 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif state != 'none':
                 unknown = True
         return records, unknown
+
+    def _room_outcomes_before_locks(self, pid, project, room_id, sequences=None):
+        """Every pending intent's outcome in a room, worked out before the locks (round 6, s1).
+
+        The room's lines are read under the room lock for that moment only; each outcome is
+        then resolved with no lock held. Keyed by the intent's identity: if an intent changed
+        before the caller takes its locks, its cancel line falls back to "a record may exist".
+        """
+        try:
+            with self._rooms_lock(project):
+                lines = rooms.load_lines(project, room_id)
+        except (rooms.Refusal, ValueError, OSError):
+            return {}
+        wanted = sequences if sequences is not None else sorted(
+            {line['sequence'] for line in lines if line['kind'] == 'item'})
+        outcomes = {}
+        for sequence in wanted:
+            pending = rooms.pending_accept_intent(lines, sequence)
+            if pending is not None:
+                outcomes[pending['identity']] = self._room_attempt_outcomes(
+                    pid, project, room_id, pending, lines)
+        return outcomes
 
     def _room_item_record(self, ctx, pid, item, evidence, parent=None, base=None,
                           record_kind=None, earlier=(), intent=None, log_attempt=None):
@@ -6779,9 +6825,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 adopt = value
                 continue
             if state != 'none':
-                raise conflict('An earlier acceptance of this item by %s has an unknown outcome; '
+                who = ('your' if author['id'] == ctx.principal.user_id
+                       else "%s's" % author.get('name', 'someone'))
+                raise conflict('An earlier acceptance of this item (%s) has an unknown outcome; '
                                'a project owner or coordinator cancels it, and the item then '
-                               'names what may have been written.' % author.get('name', 'someone'))
+                               'names what may have been written.' % who)
         if log_attempt is not None:
             log_attempt()
         if record_kind == 'proposal':
@@ -6935,6 +6983,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         raise conflict('The project is archived: its rooms can be read and exported, '
                                        'and no room is written.')
                     current = rooms.decidable_item(project, rid, current['sequence'], 'accept')
+                    fresh = pending is None
                     if pending is None:
                         if current['item_kind'] == 'decision':
                             record_kind = 'decision'
@@ -6993,16 +7042,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                         raise conflict('This acceptance is a proposal by %s; only they can finish '
                                        'it, or a project owner or coordinator cancels it.'
                                        % intent['author']['name'])
+                    # Round 6 (b1): the caller's OWN earlier attempt is checked too. Only the
+                    # request that wrote the intent just now has no earlier attempt of its
+                    # own; a retry by the same person reconciles through the journal like
+                    # anyone's, and a missing own row is unknown (409), never a second write.
                     with self._rooms_lock(project):
                         earlier = [author for author in rooms.intent_authors(
                             rooms.load_lines(project, rid), identity)
-                            if author['id'] != actor['id']]
+                            if not (fresh and author['id'] == actor['id'])]
                     def log_attempt():
                         with self._rooms_lock(project):
                             rooms.record_attempt(project, rid, current['sequence'], identity,
                                                  actor, limits_values)
                     record = self._room_item_record(ctx, ctx.params['pid'], current,
-                                                    current['evidence'], chosen, base=identity,
+                                                    current['evidence'], chosen,
+                                                    base=rooms.intent_base(intent),
                                                     record_kind=record_kind, earlier=earlier,
                                                     intent=intent, log_attempt=log_attempt)
                     with self._rooms_lock(project):
@@ -7046,8 +7100,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                     if pending is None:
                         raise rooms.Refusal(409, 'not_accepting', 'That item has no acceptance in progress.')
                     if role not in ('owner', 'coordinator', 'superuser'):
+                        # Round 6 (n4): the author still needs the proposal authority NOW,
+                        # so an author demoted to viewer cannot cancel either.
                         if not (pending.get('record_kind') == 'proposal'
-                                and pending['author']['id'] == ctx.principal.user_id):
+                                and pending['author']['id'] == ctx.principal.user_id
+                                and CAP_PROPOSALS in self.service.capabilities_for(
+                                    ctx.principal, ctx.params['pid'])):
                             raise forbidden('Only a project owner or coordinator can cancel this '
                                             'acceptance; its author can cancel only their own proposal.')
                     records, unknown = self._room_attempt_outcomes(ctx.params['pid'], project, rid,
@@ -7195,19 +7253,20 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/rooms/(?P<rid>' + ID + r')/archive')
     def rooms_archive(self, ctx):
-        self._rooms_project(ctx)
+        place = self._rooms_project(ctx)
         _record, role = self._project(ctx, CAP_COORDINATE)
         payload = ctx.payload if isinstance(ctx.payload, dict) else {}
         if set(payload) - {'reason'}:
             raise invalid('A room archive takes only an optional reason')
         actor = self._rooms_actor(ctx, role)
         operation_id = ctx.idempotency_key or ctx.request_id
+        # Round 6 (s1): every pending intent's outcome is worked out before the locks.
+        outcomes = self._room_outcomes_before_locks(ctx.params['pid'], place, ctx.params['rid'])
         def write(project):
             # Round 5 (b2): archive cancels every pending accept intent in the room first.
             return rooms.archive(project, ctx.params['rid'], actor, operation_id,
                                  payload.get('reason'), self._rooms_limits(),
-                                 outcome=lambda pending: self._room_attempt_outcomes(
-                                     ctx.params['pid'], project, ctx.params['rid'], pending))
+                                 outcome=lambda pending: outcomes.get(pending['identity'], ((), True)))
         return self._rooms_write(ctx, 'rooms.archive', CAP_COORDINATE, write,
                                  reason='room %s' % ctx.params['rid'], item_first=True)
 
@@ -7229,6 +7288,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         # room lock, so it cannot slip between an acceptance's state check and its append.
         def write():
             try:
+                # Round 6 (s1): what a pending intent's attempts wrote is worked out BEFORE
+                # any lock: it may need an endpoint read, and the endpoint takes the project's
+                # .coordination.lock, which is the room lock.
+                outcomes = self._room_outcomes_before_locks(ctx.params['pid'], project,
+                                                            ctx.params['rid'], [sequence])
                 with self._rooms_item_lock(project):
                     with self._rooms_lock(project):
                         # Round 5 (b2): moderation always wins. A pending accept intent on
@@ -7237,8 +7301,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         result = rooms.moderate(
                             project, ctx.params['rid'], sequence, payload['reason'],
                             operation_id, actor, self._rooms_limits(),
-                            outcome=lambda pending: self._room_attempt_outcomes(
-                                ctx.params['pid'], project, ctx.params['rid'], pending))
+                            outcome=lambda pending: outcomes.get(pending['identity'], ((), True)))
             except rooms.Refusal as refusal:
                 raise self._rooms_refusal(refusal) from None
             return result, result

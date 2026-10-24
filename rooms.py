@@ -117,6 +117,7 @@ RESERVED_KEY_PREFIXES = ('room-', 'intent-')
 #: coordinator cancels it.
 MAX_ATTEMPT_AUTHORS = 5
 CONTENT_DIGEST = re.compile(r'[0-9a-f]{16}\Z')
+NONCE = re.compile(r'[0-9a-f]{16}\Z')
 INTENT_KINDS = ('item-intent', 'item-intent-attempt', 'item-intent-cancel')
 RECORD_FIELDS = {'kind', 'id', 'revision', 'sha256', 'decision_id', 'evidence'}
 RECORD_KINDS = ('requirement', 'proposal', 'decision')
@@ -372,6 +373,18 @@ def item_intent_operation(identity):
     return 'intent-' + identity
 
 
+def intent_base(intent):
+    """The base of an intent's native operation ids (round 6, s2).
+
+    The identity names the item, its content and its cancels, so anyone can compute it; the
+    intent's random nonce is not served by any read or export, so the operation ids the
+    endpoint journal records for this intent's writes cannot be computed in advance by a
+    member who wants to occupy them. An intent written before round 6 has no nonce.
+    """
+    nonce = intent.get('nonce') if isinstance(intent, dict) else None
+    return '%s-%s' % (intent['identity'], nonce) if nonce else intent['identity']
+
+
 def item_intent_attempt_operation(identity, author_id):
     """The room-line operation id of one further person's attempt on an intent (b1/r5)."""
     digest = hashlib.sha256(('%s\x1f%s' % (identity, author_id)).encode('utf-8')).hexdigest()[:24]
@@ -485,6 +498,7 @@ def intend_accept(project, room_id, sequence, identity, author, limits_values,
     if record_kind is not None:
         line['record_kind'] = record_kind
         line['content'] = content
+        line['nonce'] = secrets.token_hex(8)
         if parent is not None:
             line['parent'] = parent
     _append(project, room_id, line, limits_values)
@@ -658,6 +672,10 @@ def _validate_line(line, expected=None):
         else:
             required = (ITEM_INTENT_FIELDS_RECORD_PARENT if 'parent' in line
                         else ITEM_INTENT_FIELDS_RECORD)
+            # Round 6 (s2): an intent carries a random nonce that its native operation ids
+            # include, so no member can compute those ids before the intent exists.
+            if 'nonce' in line:
+                required = required | {'nonce'}
     elif kind == 'item-intent-attempt':
         required = ITEM_INTENT_ATTEMPT_FIELDS
     elif kind == 'item-intent-cancel':
@@ -699,6 +717,9 @@ def _validate_line(line, expected=None):
             if 'parent' in line and (not isinstance(line['parent'], str)
                                      or not OPERATION_ID.fullmatch(line['parent'])):
                 raise ValueError('Invalid room item-intent parent')
+            if 'nonce' in line and (not isinstance(line['nonce'], str)
+                                    or not NONCE.fullmatch(line['nonce'])):
+                raise ValueError('Invalid room item-intent nonce')
     if kind in ('item-intent-attempt', 'item-intent-cancel'):
         if type(line['target_sequence']) is not int or line['target_sequence'] < 1:
             raise ValueError('Invalid room %s target' % kind)
@@ -1758,11 +1779,14 @@ def export_jsonl(project, room_id):
             # clears it with the title when the item was moderated.
             safe.pop('title', None)
             safe.pop('parent', None)
-        elif line['kind'] == 'item-intent' and line['target_sequence'] in tombstones:
+        elif line['kind'] == 'item-intent':
             # Round 5: the intent records the parent job an editor chose; that is the item's
-            # data too, so a moderated item's intent loses it like its amendments do.
+            # data too, so a moderated item's intent loses it like its amendments do. Round 6
+            # (s2): the nonce never leaves the room file (only a backup carries it).
             safe = dict(line)
-            safe.pop('parent', None)
+            safe.pop('nonce', None)
+            if line['target_sequence'] in tombstones:
+                safe.pop('parent', None)
         else:
             safe = dict(line)
         out.append(json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(',', ':')))

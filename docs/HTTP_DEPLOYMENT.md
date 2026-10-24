@@ -4325,21 +4325,34 @@ owner or coordinator; a person demoted since is refused (403), never turned into
 proposal intent is submitted as its author, so only its author finishes it.
 
 **How a retry reconciles.** Each person writes under their own operation id, because the
-endpoint journal binds an id to the principal that first used it. A retry by someone else
-first reads every earlier attempt on the intent from the endpoint's operation journal. That
-row is written only by the endpoint, so a planted record or label is never matched.
+endpoint journal binds an id to the principal that first used it. Requirement and room-decision
+rows are bound to the person's account, not the login session, so the same person's retry after
+signing in again replays its own row.
+
+A retry reads every earlier attempt on the intent from the endpoint's operation journal, the
+caller's own included. Only the request that writes the intent has no earlier attempt of its
+own. A row counts only if the endpoint wrote it for that person on the room path's route:
+- its principal is the person's account (a proposal's is one of their sessions);
+- its route is the room route.
+
+A row someone else wrote under the same id counts as "that attempt wrote nothing there". The SSH
+path accepts caller-chosen ids, but each intent's native ids also include a random nonce that no
+read or export serves, so no member can compute them in advance. The outcomes:
 - An attempt that finished: its record is adopted.
-- A requirement that was created but not yet accepted: the retrying editor accepts it.
+- A requirement that was created but not yet accepted: the retrying editor accepts it, or adopts
+  it when it is already accepted.
 - An attempt recorded as refused: it wrote nothing.
-- An attempt whose row is in flight, unknown or missing (committed rows are kept about a day):
-  uncertain. The retry is refused (409) until a coordinator cancels the intent.
+- An attempt whose row is in flight, unknown or missing (committed rows are kept about a day),
+  the caller's own included: uncertain. The retry is refused (409) until a coordinator cancels
+  the intent.
 
 A person's attempt is logged as an `item-intent-attempt` line immediately before their own
 native write, and only then, so a refused or adopting retry logs nothing. At most five people
 try one intent.
 
-So one item becomes one native record, unless an intent whose outcome is unknown is cancelled.
-That is the one way two can exist, and the cancel line says so.
+So one item becomes one native record. Two can exist only when an intent whose outcome is
+unknown is cancelled and the item is then accepted afresh, and the cancel line says so
+(`record_may_exist`).
 
 **Moderation always wins, and nothing stays stuck.** While an intent is pending, an
 amendment, a supersede or another decision is refused (409 `accepting`). Three things cancel
@@ -4347,7 +4360,12 @@ it with an `item-intent-cancel` line:
 - moderation, in the same room-lock section as its tombstone;
 - archiving a room, which cancels every pending intent in it first;
 - an owner or coordinator, through `POST .../rooms/{rid}/items/{seq}/intent/cancel {reason}`.
-  An intent's author may cancel only their own proposal-kind intent.
+  An intent's author may cancel only their own proposal-kind intent, and only while they still
+  hold the proposal authority (an author demoted to viewer cannot).
+
+Moderation and archive work out the attempts' outcomes before taking any lock. The room lock is
+the project's `.coordination.lock`, which the endpoint's reads need, so they never wait on the
+endpoint while holding it.
 
 The cancel line names the identity, the records the attempts are known to have written (from
 the journal), and `record_may_exist` when an outcome is unknown, so a coordinator can find and

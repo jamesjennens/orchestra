@@ -404,9 +404,97 @@ class RoomsItemsRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTest
         self.assertEqual(500, failed.status, failed.data)
         refused = self.decide(rid, 'drew', key='r5p-accept-drew')
         self.assertEqual(409, refused.status, refused.data)
-        accepted = self.decide(rid, 'alex', key='r5p-accept-alex-2')
+        own = self.decide(rid, 'alex', key='r5p-accept-alex-2')
+        self.assertEqual(409, own.status, own.data)
+        cancelled = self.request('POST', '/v1/projects/pp/rooms/%s/items/1/intent/cancel' % rid,
+                                 {'reason': 'outcome unknown'}, token=self.tokens['alex'],
+                                 key='r5p-cancel-key')
+        self.assertEqual(200, cancelled.status, cancelled.data)
+        accepted = self.decide(rid, 'alex', key='r5p-accept-alex-3')
         self.assertEqual(200, accepted.status, accepted.data)
         self.assertNotEqual(planted_id, accepted.data['record']['id'])
+
+    # -- round 6 (request 01a16e15): the same person's retry, journal rows, lock-free outcomes --
+    def test_r6_a_decision_retry_after_signing_in_again_adopts_the_decision(self):
+        # V2b: room-decision's journal row is bound to the account, not the session, and the
+        # caller's own attempt is reconciled: one decision, no 422, no cancel needed.
+        rid = self.room('R6 relogin')
+        self.assertEqual(201, self.item(rid, kind='decision', title='Use CSV', text='CSV first.',
+                                        key='r6a-item-key').status)
+        self.fail_first_append()
+        self.assertEqual(500, self.decide(rid, 'alex', key='r6a-accept-1').status)
+        self.tokens['alex'] = self.login('alex', 'alex-password-1')[0]
+        retried = self.decide(rid, 'alex', key='r6a-accept-2')
+        self.assertEqual(200, retried.status, retried.data)
+        decisions = [row for row in self.rows_with_pointer(rid)
+                     if (row.get('issue_type') or row.get('type')) == 'decision']
+        self.assertEqual(1, len(decisions), decisions)
+
+    def test_r6_a_missing_own_journal_row_is_unknown_not_a_second_decision(self):
+        # V2: alex's own rows are gone between the attempts: 409, never a second decision.
+        import sqlite3
+        from http_authority import journal_path
+        rid = self.room('R6 own gone')
+        self.assertEqual(201, self.item(rid, kind='decision', title='Use CSV', text='CSV first.',
+                                        key='r6b-item-key').status)
+        self.fail_first_append()
+        self.assertEqual(500, self.decide(rid, 'alex', key='r6b-accept-1').status)
+        with sqlite3.connect(str(journal_path(self.project))) as connection:
+            deleted = connection.execute(
+                "DELETE FROM operations WHERE route = 'rooms.item.accept'").rowcount
+        self.assertGreaterEqual(deleted, 1)
+        refused = self.decide(rid, 'alex', key='r6b-accept-2')
+        self.assertEqual(409, refused.status, refused.data)
+        decisions = [row for row in self.rows_with_pointer(rid)
+                     if (row.get('issue_type') or row.get('type')) == 'decision']
+        self.assertEqual(1, len(decisions), decisions)
+
+    def test_r6_only_a_journal_row_of_that_person_and_route_counts(self):
+        # S2: prior_room_write checks the row's principal and route; a row another principal
+        # wrote under the same id (the SSH path accepts caller-chosen ids) is foreign.
+        from types import SimpleNamespace
+        from http_authority import OperationJournal, journal_path
+        self.room('R6 journal')  # any write, so the project's journal exists
+        journal = OperationJournal(journal_path(self.project))
+        alex = self.ids['alex']
+        envelope = {'returncode': 0, 'stdout': json.dumps({'id': 'pp-x', 'revision': 1,
+                                                           'sha256': 'a' * 64}) + '\n', 'stderr': ''}
+        cases = [('planted-by-casey', 'actor:casey', 'requirements.create', 'foreign'),
+                 ('wrong-route', 'owner-account:' + alex, 'requirements.revise', 'foreign'),
+                 ('alex-create', 'owner-account:' + alex, 'requirements.create', 'committed')]
+        for key, principal, route, expected in cases:
+            operation = self.backend._result_key(
+                SimpleNamespace(user_id=alex, credential_id=None), 'pp', 'requirements.create',
+                key, None)
+            journal._actor, journal._route = None, route
+            journal.reserve(operation, 'hash-' + key, principal)
+            journal.complete(operation, envelope, 'hash-' + key, principal)
+            state, _payload = self.backend.prior_room_write('pp', alex, 'requirements.create', key, None)
+            self.assertEqual(expected, state, (key, principal, route))
+
+    def test_r6_moderating_a_requirement_intent_does_not_wait_on_the_endpoint(self):
+        # V15 / S1: the outcome is resolved before the room lock (the project's
+        # .coordination.lock), so moderation does not stall until the endpoint times out, and
+        # the cancel line names the requirement the attempt wrote.
+        import time
+        import rooms
+        rid = self.room('R6 moderate')
+        self.assertEqual(201, self.item(rid, parent=self.job, key='r6m-item-key').status)
+        self.fail_first_append()
+        self.assertEqual(500, self.decide(rid, 'alex', key='r6m-accept').status)
+        started = time.monotonic()
+        moderated = self.request('POST', '/v1/projects/pp/rooms/%s/messages/1/moderate' % rid,
+                                 {'reason': 'abusive'}, token=self.tokens['alex'], key='r6m-moderate')
+        elapsed = time.monotonic() - started
+        self.assertEqual(201, moderated.status, moderated.data)
+        self.assertLess(elapsed, 30, 'moderation waited on the coordination lock')
+        cancel = [line for line in rooms.load_lines(self.project, rid)
+                  if line['kind'] == 'item-intent-cancel']
+        requirement = [row['id'] for row in self.rows_with_pointer(rid)
+                       if 'requirement' in (row.get('labels') or [])]
+        self.assertEqual(1, len(cancel))
+        self.assertEqual(requirement, cancel[0]['records'])
+        self.assertFalse(cancel[0]['record_may_exist'])
 
 
 if __name__ == '__main__':

@@ -84,10 +84,16 @@ class ItemsBackend(http_service.InProcessBackend):
             raise http_service.HttpError(503, 'unavailable', 'injected native failure: nothing written')
 
     def prior_room_write(self, project_id, user_id, route=None, key=None, target=None,
-                         operation_id=None):
+                         operation_id=None, journal_route=None, session_bound=False):
         entry = self.journal.get(operation_id if operation_id is not None
                                  else (user_id, route, key, target))
-        return entry if entry is not None else ('uncertain', None)
+        if entry is None:
+            return ('uncertain', None)
+        # A three-part entry names who wrote the row (round 6, s2): a row written by someone
+        # else under this person's id is foreign, as EndpointBackend.prior_room_write says.
+        if len(entry) == 3 and entry[2] != user_id:
+            return ('foreign', None)
+        return entry[:2]
 
     def owner_requirements(self, principal, project_id, action, fields, key, task=None):
         self.calls.append(('owner_requirements', action, key, task))
@@ -353,7 +359,12 @@ class RoomsItemsHttpTests(agents.AgentHarness):
         self.assertEqual(503, failed.status, failed.data)
         refused = self.accept(self.tokens['coord'], key='plant-coord')
         self.assertEqual(409, refused.status, refused.data)
-        accepted = self.accept(self.tokens['owner'], key='plant-owner-retry')
+        # Round 6 (b1): the author's own attempt has no journal row either, so its retry is
+        # unknown too; the way out is a cancel, never adopting the planted record.
+        own = self.accept(self.tokens['owner'], key='plant-owner-retry')
+        self.assertEqual(409, own.status, own.data)
+        self.assertEqual(200, self.cancel(self.tokens['owner'], key='plant-cancel').status)
+        accepted = self.accept(self.tokens['owner'], key='plant-owner-after')
         self.assertEqual(200, accepted.status, accepted.data)
         self.assertNotEqual('planted', accepted.data['record']['id'])
 
@@ -525,9 +536,9 @@ class RoomsItemsHttpTests(agents.AgentHarness):
         self.post_item(self.tokens['worker'])
         self.backend.fail_native = 'requirements.create'
         self.assertEqual(503, self.accept(self.tokens['owner'], key='m59-owner').status)
-        identity = self.kinds('item-intent')[0]['identity']
+        base = rooms.intent_base(self.kinds('item-intent')[0])
         self.backend.journal[(self.ids['owner'], 'requirements.create',
-                              identity + '-requirement-create', None)] = ('none', None)
+                              base + '-requirement-create', None)] = ('none', None)
         self.fail_after_native(self.tokens['coord'], 'm59-coord')
         attempts = self.kinds('item-intent-attempt')
         self.assertEqual([self.ids['coord']], [line['author']['id'] for line in attempts])
@@ -635,6 +646,151 @@ class RoomsItemsHttpTests(agents.AgentHarness):
                 self.assertEqual(422, answer.status, (path, answer.data))
         self.assertEqual(1, len(self.lines()), 'nothing was written')
         self.assertEqual('open', self.read().data['room']['state'])
+
+    # -- round 6 (request 01a16e15) --------------------------------------------------------------
+    def test_r6_the_same_persons_retry_adopts_its_own_record(self):
+        # B1: the caller's own earlier attempt is reconciled through the journal too, so a
+        # retry by the same person after a failed append adopts that record.
+        self.post_item(self.tokens['worker'], kind='decision', title='Use CSV', text='CSV first.')
+        self.fail_after_native(self.tokens['owner'], 'own-first')
+        retried = self.accept(self.tokens['owner'], key='own-retry')
+        self.assertEqual(200, retried.status, retried.data)
+        self.assertEqual(1, len(self.backend.decisions))
+        self.assertEqual(1, len([call for call in self.backend.calls if call[0] == 'room_decision']),
+                         'the retry adopted the record instead of writing again')
+
+    def test_r6_a_missing_own_row_is_unknown_never_a_second_write(self):
+        # V2: the same person's journal rows are gone between the attempts: 409, one record.
+        self.post_item(self.tokens['worker'], kind='decision', title='Use CSV', text='CSV first.')
+        self.fail_after_native(self.tokens['owner'], 'own-gone-first')
+        self.backend.journal.clear()
+        refused = self.accept(self.tokens['owner'], key='own-gone-retry')
+        self.assertEqual(409, refused.status, refused.data)
+        self.assertIn('your', refused.data['error']['message'])
+        self.assertEqual(1, len(self.backend.decisions))
+
+    def test_r6_a_journal_row_written_by_someone_else_is_not_adopted(self):
+        # S2: a row under an earlier attempt's id that another person wrote is not that
+        # attempt's record; it counts as "wrote nothing there", so it is never adopted.
+        self.post_item(self.tokens['worker'])
+        self.backend.fail_native = 'requirements.create'
+        self.assertEqual(503, self.accept(self.tokens['owner'], key='foreign-owner').status)
+        intent = self.kinds('item-intent')[0]
+        key = rooms.intent_base(intent) + '-requirement-create'
+        self.backend.requirements['casey'] = {'id': 'casey', 'revision': 1, 'sha256': 'a' * 64,
+                                             'title': 'x', 'description': 'x', 'decision_id': None}
+        self.backend.journal[(self.ids['owner'], 'requirements.create', key, None)] = (
+            'committed', dict(self.backend.requirements['casey']), self.ids['worker'])
+        retried = self.accept(self.tokens['coord'], key='foreign-coord')
+        self.assertEqual(200, retried.status, retried.data)
+        self.assertNotEqual('casey', retried.data['record']['id'])
+
+    def test_r6_intent_operation_ids_carry_a_nonce_no_export_serves(self):
+        # S2: the native operation ids of an intent include a random nonce; no read or export
+        # serves it, so a member cannot compute them before the write.
+        self.post_item(self.tokens['worker'])
+        accepted = self.accept(self.tokens['owner'], key='nonce-accept')
+        self.assertEqual(200, accepted.status, accepted.data)
+        intent = self.kinds('item-intent')[0]
+        self.assertRegex(intent['nonce'], r'\A[0-9a-f]{16}\Z')
+        keys = [call[2] for call in self.backend.calls if call[0] == 'owner_requirements']
+        self.assertTrue(keys and all(intent['nonce'] in key for key in keys), keys)
+        for fmt in ('jsonl', 'markdown'):
+            exported = self.request('GET', self.path('/export?format=' + fmt), token=self.tokens['owner'])
+            text = exported.data if isinstance(exported.data, str) else json.dumps(exported.data)
+            self.assertNotIn(intent['nonce'], text)
+        self.assertNotIn(intent['nonce'], json.dumps(self.read(self.tokens['owner']).data))
+
+    def held_room_lock(self):
+        """Patch the room lock so a test can tell whether a call runs while it is held."""
+        state = {'held': 0}
+        original = http_service.ApiHandler._rooms_lock
+        import contextlib
+        @contextlib.contextmanager
+        def counted(handler, project):
+            with original(handler, project):
+                state['held'] += 1
+                try:
+                    yield
+                finally:
+                    state['held'] -= 1
+        return state, mock.patch.object(http_service.ApiHandler, '_rooms_lock', counted)
+
+    def test_r6_moderation_and_archive_resolve_outcomes_outside_the_room_lock(self):
+        # S1: the room lock is the project's .coordination.lock, which the endpoint takes for
+        # its reads; resolving an outcome under it stalled moderation until the endpoint
+        # timed out. No attempt's outcome is resolved while the room lock is held.
+        self.post_item(self.tokens['worker'])
+        self.fail_after_native(self.tokens['owner'], 's1-owner')
+        self.post_item(self.tokens['worker'], title='Second', text='Second text.', key='item-key-2')
+        second = self.items()[-1]['sequence']
+        self.fail_after_native(self.tokens['owner'], 's1-owner-2', sequence=second)
+        state, patch = self.held_room_lock()
+        original = http_service.ApiHandler._room_prior_record
+        seen = []
+        def watched(handler, *args, **kwargs):
+            seen.append(state['held'])
+            return original(handler, *args, **kwargs)
+        with patch, mock.patch.object(http_service.ApiHandler, '_room_prior_record', watched):
+            self.assertEqual(201, self.moderate(self.tokens['coord'], key='s1-moderate').status)
+            archived = self.request('POST', self.path('/archive'), {}, token=self.tokens['owner'],
+                                    key='s1-archive')
+            self.assertEqual(200, archived.status, archived.data)
+        self.assertTrue(seen)
+        self.assertEqual([0] * len(seen), seen, 'an outcome was resolved under the room lock')
+        cancels = self.kinds('item-intent-cancel')
+        self.assertEqual(2, len(cancels))
+        self.assertTrue(all(line['records'] for line in cancels), cancels)
+
+    def test_r6_the_accept_append_holds_the_room_lock(self):
+        # N1 (M12): message posts take only the room lock, so the accept's append must hold
+        # it too, or the two appends race on the same segment.
+        self.post_item(self.tokens['worker'])
+        state, patch = self.held_room_lock()
+        original = rooms.accept_item
+        seen = []
+        def watched(*args, **kwargs):
+            seen.append(state['held'])
+            return original(*args, **kwargs)
+        with patch, mock.patch.object(rooms, 'accept_item', watched):
+            self.assertEqual(200, self.accept(self.tokens['owner'], key='lock-accept').status)
+        self.assertEqual([1], seen)
+
+    def test_r6_a_demoted_author_of_a_requirement_intent_cannot_cancel_it(self):
+        # N3 (V8): an author cancels only its own PROPOSAL intent; a former editor who wrote a
+        # requirement intent and has been demoted is refused.
+        self.post_item(self.tokens['worker'])
+        self.fail_after_native(self.tokens['coord'], 'n3-coord')
+        put = self.request('PUT', '/v1/projects/%s/members/%s' % (self.pid, self.ids['coord']),
+                           {'role': 'contributor'}, token=self.admin)
+        self.assertIn(put.status, (200, 201), put.data)
+        self.assertEqual(403, self.cancel(self.tokens['coord'], key='n3-cancel').status)
+
+    def test_r6_an_author_demoted_to_viewer_cannot_cancel_its_proposal(self):
+        # N4: the author still needs the proposal authority when it cancels.
+        self.post_item(self.tokens['worker'], title='Candidate', text='Some text.')
+        self.fail_after_native(self.tokens['worker'], 'n4-worker')
+        put = self.request('PUT', '/v1/projects/%s/members/%s' % (self.pid, self.ids['worker']),
+                           {'role': 'viewer'}, token=self.admin)
+        self.assertIn(put.status, (200, 201), put.data)
+        self.assertEqual(403, self.cancel(self.tokens['worker'], key='n4-cancel').status)
+
+    def test_r6_an_already_accepted_requirement_is_adopted_without_accepting_again(self):
+        # N3 (V18): the earlier attempt created the requirement and its acceptance landed,
+        # but the acceptance's journal row is gone: the retry reads the requirement, sees it
+        # accepted and adopts it without a second accept.
+        self.post_item(self.tokens['worker'])
+        self.fail_after_native(self.tokens['owner'], 'v18-owner')
+        intent = self.kinds('item-intent')[0]
+        accept_key = rooms.intent_base(intent) + '-requirement-accept'
+        for entry in [entry for entry in self.backend.journal if isinstance(entry, tuple)
+                      and entry[1] == 'requirements.accept' and entry[2] == accept_key]:
+            del self.backend.journal[entry]
+        before = len([call for call in self.backend.calls if call[1] == 'accept'])
+        retried = self.accept(self.tokens['coord'], key='v18-coord')
+        self.assertEqual(200, retried.status, retried.data)
+        self.assertEqual(before, len([call for call in self.backend.calls if call[1] == 'accept']))
+        self.assertEqual(1, len(self.backend.requirements))
 
     # -- routes and authority ----------------------------------------------------------------------
     def test_item_post_and_read_are_members_only(self):

@@ -881,9 +881,13 @@ def room_decision(root, project_path, project, request, authority_config, runner
                                       'evidence': body['evidence']}) + '\n',
                 'stderr': ''}
 
+    # Round 6 of kittrial-5bb.388 (b1): the journal row is bound to the ACCOUNT, as the owner
+    # requirement writes are, not to the login session, so the same person's retry after
+    # signing in again replays the recorded decision instead of being refused as a
+    # different principal (and then cancelled into a second decision).
     return guarded_write(root, request, journal_path(project_path), effect,
                          authority_config=authority_config, require_authority=True,
-                         runner=runner, identity_check=identity_check)
+                         runner=runner, identity_check=identity_check, account_identity=True)
 
 
 def read(project_path, project, args, run, operators=None):
