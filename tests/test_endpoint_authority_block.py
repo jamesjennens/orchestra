@@ -301,6 +301,7 @@ class BlockMatchesRequestTests(EndpointHarness):
             ('review recommend', review('recommend'), 'reviews.write', 'work'),
             ('checkpoint', lambda: self.payload_request('checkpoint', [TASK], {'schema_version': 1, 'task': TASK}),
              'checkpoints.write', 'briefing'),
+            ('lanes', lambda: self.payload_request('work', ['lanes']), 'read', 'work'),
             ('claim', lambda: self.payload_request('bd', ['update', TASK, '--claim', '--json']), 'tasks.write', None),
             ('task create', lambda: self.payload_request('bd', ['create', 'A title', '--json']), 'tasks.write', None),
             ('task comment', lambda: self.payload_request('bd', ['comments', 'add', TASK, 'Literal contributor remark']), 'tasks.write', None),
@@ -315,7 +316,8 @@ class BlockMatchesRequestTests(EndpointHarness):
             with self.subTest(request=label):
                 self.assertEqual(needed, http_authority.required_capability(build()))
         # Not in the table: reads, and actions the web service sends no block for.
-        for action, args in (('review', [TASK]), ('proposal', ['get', 'k']), ('proposal', ['list']), ('work', []),
+        for action, args in (('review', [TASK]), ('proposal', ['get', 'k']), ('proposal', ['list']),
+                             ('work', []), ('work', ['--mine']),
                              ('handoff', [TASK, '@attachment:0']), ('bd', ['dep', 'add', TASK, 'pp-other']),
                              ('bd', ['close', TASK]), ('lifecycle', ['{}']), ('coordinate', ['{}']), ('ref', ['propose']),
                              ('capability', ['propose']), ('feedback', ['add']), ('session', ['show']),
