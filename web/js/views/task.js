@@ -12,6 +12,16 @@ const ACTIONS = {
   'checkpoint-added': ['Recorded a checkpoint', ''], 'checkpoint': ['Recorded a checkpoint', ''], 'comment': ['Commented', ''],
 };
 
+export function contextPointers(item) {
+  const pointers = Array.isArray(item.pointers) ? item.pointers : [];
+  if (!pointers.length) return null;
+  return h('ul', { class: 'small', 'data-context-pointers': 'true' },
+    pointers.map(p => h('li', null, h('code', null, p.pointer), ' — ', p.state,
+      ' (untrusted data)', p.label ? [' ', p.label.text] : null,
+      p.follow ? h('div', null, 'Follow: ', h('code', null, p.follow)) : null)),
+    item.pointers_omitted ? h('li', null, String(item.pointers_omitted), ' pointers unresolved by bounds.') : null);
+}
+
 export async function create(ctx, { pid }) {
   const project = await ctx.api.project(pid);
   if (!canWrite(project) || project.archived || project.usable === false) {
@@ -76,7 +86,9 @@ export async function detail(ctx, { pid, tid }) {
   // could not read all of them: show what it has and offer a reload rather than let
   // the first page read as the whole list.
   const carry = Array.isArray(brief.carry_open_items) ? brief.carry_open_items : null;
-  const openItems = carry || (cp && Array.isArray(cp.open_items) ? cp.open_items : []);
+  const shownItems = cp && Array.isArray(cp.open_items) ? cp.open_items : [];
+  const shownById = new Map([...shownItems, ...(cp && Array.isArray(cp.pointer_items) ? cp.pointer_items : [])].map(item => [item.id, item]));
+  const openItems = (carry || shownItems).map(item => shownById.get(item.id) || item);
   const openTotal = cp && Number.isInteger(cp.open_items_total) ? cp.open_items_total : openItems.length;
   const incomplete = brief.carry_open_items === null;
   const briefPanel = h('section', { class: 'panel', 'aria-labelledby': 'brief-h' },
@@ -86,7 +98,12 @@ export async function detail(ctx, { pid, tid }) {
       cp ? [h('h3', { class: 'small' }, 'Where it stands'), h('p', { class: 'prose' }, cp.summary), cp.next_action ? h('p', null, h('strong', null, 'Next step: '), cp.next_action) : null] : null,
       cp ? changesSinceCheckpoint(brief.changes_since_checkpoint) : null,
       cp && openItems.length ? [h('h3', { class: 'small' }, 'Unresolved items ', h('span', { class: 'nav-count' }, String(openTotal))),
-        h('ul', { class: 'open-items' }, openItems.map((o) => h('li', null, h('span', { class: 'chip plain' }, o.kind), ' ', o.text)))] : null,
+        h('ul', { class: 'open-items' }, openItems.map((o) => h('li', null, h('span', { class: 'chip plain' }, o.kind), ' ', o.text,
+          h('div', { class: 'small muted' }, 'Source: ', o.source), contextPointers(o))))] : null,
+      cp && Array.isArray(cp.resolved) && cp.resolved.length ? [h('h3', { class: 'small' }, 'Resolved items'),
+        h('ul', null, cp.resolved.map(o => h('li', null, o.id, ': ', o.reason,
+          h('div', { class: 'small muted' }, 'Evidence: ', o.evidence), contextPointers(o)))),
+        cp.resolved_omitted ? h('p', { class: 'small muted' }, String(cp.resolved_omitted), ' more resolved items are not shown.') : null] : null,
       incomplete ? h('div', { class: 'banner', role: 'note' }, 'The complete list of unresolved items could not all be read. ',
         h('button', { type: 'button', class: 'link', onclick: () => reload() }, 'Reload the task'), ' to try again.') : null));
 

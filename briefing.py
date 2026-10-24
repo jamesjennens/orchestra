@@ -517,6 +517,117 @@ def plain_text(value):
     separator that ends the reader's line, or a bidi override that reorders it."""
     return CONTROL_TEXT_RE.sub(lambda match:'\\u%04x'%ord(match.group()),str(value or ''))
 
+
+CONTEXT_POINTER_RE = re.compile(r'(task|comment|ref|cap|item|file|room|commit|doc|archive):([A-Za-z0-9._/#:-]{1,200})\Z')
+CONTEXT_POINTER_ITEM_MAX = 10
+CONTEXT_POINTER_BRIEF_MAX = 50
+
+
+def parse_context_pointers(text):
+    """Read tokens, never rewrite or validate the checkpoint's prose."""
+    if not isinstance(text,str):
+        return []
+    result=[]
+    for token in text.split():
+        match=CONTEXT_POINTER_RE.fullmatch(token)
+        if match:
+            result.append({'pointer':token,'kind':match[1],'value':match[2]})
+    return result
+
+
+class ContextPointers:
+    """Read-only resolution over a caller-authorized, project-scoped snapshot.
+
+    No runner, path or journal is accepted: resolution cannot perform I/O. A caller
+    with narrower visibility supplies its predicate before any target is indexed.
+    Unloaded kinds are uniformly unchecked; absent/hidden loaded kinds unavailable.
+    """
+    def __init__(self,rows,project,operators=None,can_read=None):
+        self.project=project
+        self.operators=operators
+        self.remaining=CONTEXT_POINTER_BRIEF_MAX
+        self.rows=[row for row in rows if isinstance(row,dict) and
+                   row.get('project_id',project)==project and
+                   not row.get('malformed') and (can_read is None or can_read(row))]
+        self.tasks={}
+        self.comments={}
+        self.catalogs={}
+        self.reviews={}
+        from reserved_comments import is_record_anchor
+        from coordination import is_merge_slot
+        for row in self.rows:
+            if is_record_anchor(row) or is_merge_slot(row):
+                continue
+            self.tasks.setdefault(str(row.get('id')),[]).append(row)
+            for comment in row.get('comments') or []:
+                if isinstance(comment,dict) and comment.get('id') is not None:
+                    self.comments.setdefault(str(comment['id']),[]).append((row,comment))
+
+    def resolve(self,pointer):
+        kind,value=pointer['kind'],pointer['value']
+        entry={'pointer':pointer['pointer'],'kind':kind,'state':'unchecked','trust':'data'}
+        if kind not in ('task','comment','ref','cap'):
+            return entry
+        entry['state']='unavailable'
+        label=follow=None
+        if kind=='task':
+            matches=self.tasks.get(value,[])
+            if len(matches)==1:
+                row=matches[0]
+                entry['state']='superseded' if row.get('status')=='closed' and row.get('close_reason')=='superseded' else 'live'
+                label=row.get('title')
+                follow='brief '+value
+        elif kind=='comment':
+            matches=self.comments.get(value,[])
+            if len(matches)==1:
+                row,comment=matches[0]
+                text=comment.get('text',comment.get('body'))
+                if isinstance(text,str):
+                    entry['state']='live'
+                    label='%s / %s: %s'%(row['id'],comment.get('author') or 'unknown',text)
+                    follow='history '+str(row['id'])+' --recent 10'
+                    # Reuse the same workflow projection as brief; no comment read.
+                    if row['id'] not in self.reviews:
+                        from work import workflow
+                        self.reviews[row['id']]=workflow(row,operators=self.operators)
+                    prior=self.reviews[row['id']].get('prior_contributions') or []
+                    if any(str(item.get('comment_id'))==value for item in prior):
+                        entry['state']='superseded'
+        else:
+            if kind not in self.catalogs:
+                import reference_records,capability_records
+                module=reference_records if kind=='ref' else capability_records
+                entries,_=module.catalog(self.rows,self.operators)
+                indexed={}
+                for item in entries:
+                    indexed.setdefault(item.get('key'),[]).append(item)
+                self.catalogs[kind]=indexed
+            matches=self.catalogs[kind].get(value,[])
+            if len(matches)==1:
+                view=matches[0]
+                record=view.get('record') or view.get('proposed')
+                if record is not None and view.get('state') not in ('malformed','unsupported','conflicted','incomplete'):
+                    entry['state']='superseded' if record.get('acceptance_state')=='superseded' else 'live'
+                    label=record.get('name') or record.get('title') or value
+                    follow=('ref get ' if kind=='ref' else 'capability get ')+value
+        if entry['state'] in ('live','superseded'):
+            entry['label']=clip(plain_text(label),120)
+            entry['follow']=follow
+        return entry
+
+    def items(self,items,field):
+        """Enrich display copies only; carry/template payloads keep their old schema."""
+        shown=[]
+        for item in items:
+            pointers=parse_context_pointers(item.get(field))
+            count=min(len(pointers),CONTEXT_POINTER_ITEM_MAX,self.remaining)
+            self.remaining-=count
+            resolved=[self.resolve(pointer) for pointer in pointers[:count]]
+            resolved += [{'pointer':p['pointer'],'kind':p['kind'],'state':'unresolved','trust':'data'}
+                         for p in pointers[count:]]
+            shown.append(dict(item,pointers=resolved,pointers_omitted=len(pointers)-count))
+        return shown
+
 def encoded_size(text):
     """Encoded JSON string bytes: the unit history budgets an answer in (control
     characters and Unicode must not make a bounded answer silently much larger)."""
@@ -1274,6 +1385,11 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                        +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.']
                        +[w for w in integration_warnings if w.startswith(RECONCILIATION_WARNING_PREFIX)]),
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
+    if p is not None:
+        pointers=ContextPointers(rows,project,operators)
+        result['unresolved']['items']=pointers.items(result['unresolved']['items'],'source')
+        result['resolved']={'items':pointers.items(p['resolved'][:limit],'evidence'),
+                            'total':len(p['resolved']),'omitted':max(0,len(p['resolved'])-limit)}
     if p is not None and not counted:
         # The brief states plainly WHY no direction is outstanding (kittrial-5bb.284):
         # a reader must not infer an unacknowledged instruction from a count that the
@@ -2013,6 +2129,36 @@ def format_changes(section,activity):
     lines.append('  '+section['note'])
     return lines
 
+def bound_context_pointer_display(groups):
+    """Keep a composed web brief within the same budget across existing page reads."""
+    remaining=CONTEXT_POINTER_BRIEF_MAX
+    result=[]
+    for group in groups:
+        shown=[]
+        for item in group:
+            pointers=[]
+            for pointer in item.get('pointers') or []:
+                if pointer.get('state')=='unresolved':
+                    pointers.append(dict(pointer))
+                elif remaining:
+                    pointers.append(dict(pointer));remaining-=1
+                else:
+                    pointers.append({k:pointer[k] for k in ('pointer','kind','trust')} | {'state':'unresolved'})
+            shown.append(dict(item,pointers=pointers,pointers_omitted=sum(p['state']=='unresolved' for p in pointers)))
+        result.append(shown)
+    return result
+
+
+def format_context_pointers(item):
+    lines=[]
+    for pointer in item.get('pointers') or []:
+        label=(pointer.get('label') or {}).get('text')
+        lines.append('  '+pointer['pointer']+' ['+pointer['state']+'; trust=data]'+(' '+label if label else ''))
+    if item.get('pointers_omitted'):
+        lines.append('  Pointers unresolved by bounds: '+str(item['pointers_omitted']))
+    return lines
+
+
 def format_brief(result):
     def excerpt(value):return value['text']+(f' [excerpt; {value["omitted_chars"]} characters omitted — use show/history]' if value['omitted_chars'] else '')
     lines=[f'{result["task"]}: {excerpt(result["title"])}',f'Owner: {excerpt(result["owner"])} | Status: {result["status"]}',
@@ -2065,7 +2211,14 @@ def format_brief(result):
         lines += [f'Outstanding directions: {dirs["total"]} [{", ".join(k+"="+str(v) for k,v in sorted(states.items()))}] '+ids,
                   '  Resolve or supersede each with note+evidence (digest-checked); acknowledgement alone does not clear a direction.']
     unresolved=result['unresolved'];lines += [f'Unresolved items: {unresolved["total"] if unresolved["total"] is not None else "unknown"}']
-    lines += [f'- {item["id"]} [{item["kind"]}]: {item["text"]} (source: {item["source"]})' for item in unresolved['items']]
+    for item in unresolved['items']:
+        lines += [f'- {item["id"]} [{item["kind"]}]: {item["text"]} (source: {item["source"]})']
+        lines += format_context_pointers(item)
+    for item in (result.get('resolved') or {}).get('items',[]):
+        lines += ['Resolved '+str(item['id'])+': '+plain_text(item['reason'])+' (evidence: '+plain_text(item['evidence'])+')']
+        lines += format_context_pointers(item)
+    if (result.get('resolved') or {}).get('omitted'):
+        lines += ['Resolved items omitted: '+str(result['resolved']['omitted'])]
     if unresolved['next_offset'] is not None:lines += [f'More unresolved items: brief {result["task"]} --items-offset {unresolved["next_offset"]}']
     lines += ['Native dependencies: '+json.dumps(result['dependencies'],ensure_ascii=False), 'Lifecycle: '+', '.join(k+'='+v['value'] for k,v in result['lifecycle'].items()),
               'Lifecycle scope: '+json.dumps(result['lifecycle_scope'],ensure_ascii=False),'Current activity cursor: '+result['activity_cursor'],

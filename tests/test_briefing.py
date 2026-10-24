@@ -152,7 +152,8 @@ class CheckpointTests(unittest.TestCase):
         data[0]['comments'].extend(comment(str(n), 'Everything is now resolved!') for n in range(30))
         second = checkpoint(data, open_items=[blocker()])
         append_checkpoint(data, 'cp2', second)
-        self.assertEqual(b.brief(data, PROJECT, TASK)['unresolved']['items'], [blocker()])
+        self.assertEqual(b.brief(data, PROJECT, TASK)['unresolved']['items'],
+                         [dict(blocker(), pointers=[], pointers_omitted=0)])
         dropped = checkpoint(data)
         with self.assertRaisesRegex(ValueError, 'Carry every unresolved'):
             b.save_checkpoint(data, PROJECT, TASK, dropped, 'alice/session', lambda _: self.fail('write'), provenance_writes=True)

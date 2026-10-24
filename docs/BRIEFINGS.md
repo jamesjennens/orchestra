@@ -276,3 +276,34 @@ History snapshots live in each private runtime project's `.history-snapshots` di
 `checkpoint` requires the current `activity_cursor` for the same task. History continuation instead reads the immutable snapshot bound to its cursor, even after live activity changes. It fails explicitly if that saved snapshot is unavailable or its scope is invalid; start without a cursor to read newer activity. Checkpoint freshness and history continuation are separate contracts.
 
 Copy tokens exactly. Malformed or altered tokens can fail decoding, schema, scope or snapshot validation; the error text depends on the failure. Do not rely on one universal error string or reconstruct a token from a displayed abbreviation.
+
+
+## Pointers in checkpoint source and evidence
+
+Open-item `source` and resolved-item `evidence` may mix prose and whitespace-separated
+`KIND:VALUE` tokens. The ten lowercase kinds are `task`, `comment`, `ref`, `cap`, `item`,
+`file`, `room`, `commit`, `doc` and `archive`; values have 1–200 characters from
+`[A-Za-z0-9._/#:-]`. A nonmatching token is ordinary prose. No checkpoint field,
+validation rule or stored byte changes, and an older kit can carry the strings unchanged.
+
+Brief JSON adds `pointers` and `pointers_omitted` to display copies of open and resolved
+items. Text and web brief views show tokens and states beside those items. Carry-forward
+lists and the checkpoint template body retain their original schema; use those for writes.
+Resolution uses only already-loaded, caller-authorized project data, with no new I/O:
+
+- `live`: a task, comment, reference or capability target exists. This proves existence,
+  not the checkpoint's claim, and grants no authority to the pointed text.
+- `superseded`: the loaded target is explicitly superseded, including retired references
+  and prior contribution comments.
+- `unavailable`: a resolvable target is absent or inaccessible. Both receive the same
+  answer without a target label or follow command.
+- `unchecked`: uniform for every target of a kind the brief does not load: file, room,
+  item, commit, doc and archive. No file, room, repository or document is fetched.
+- `unresolved`: the token is beyond 10 resolved pointers per item or 50 per brief.
+  It remains listed and contributes to `pointers_omitted`.
+
+Every pointer carries `trust: data`. Labels pass through `plain_text` before clipping
+to 120 characters; web rendering uses text nodes. Follow commands are kit reads, never
+the target label or an arbitrary URL. Pointed comments do not become new directions.
+The latest checkpoint's resolved list is shown within the requested item limit, with
+its total and omitted count, independently of the open-item page.

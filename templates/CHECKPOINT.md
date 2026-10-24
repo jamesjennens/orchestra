@@ -48,6 +48,26 @@ holds every one of them (the template's `carried_open_items` is that count). Cop
 template's list (or `carry_open_items`), never the first ten. When `carry_open_items` is
 null the items could not all be read: read the brief again before writing the checkpoint.
 
+## Pointers in source and evidence
+
+An open item's `source` and a resolved item's `evidence` may contain whitespace-separated
+`KIND:VALUE` tokens among ordinary prose. The kinds are `task`, `comment`, `ref`, `cap`,
+`item`, `file`, `room`, `commit`, `doc` and `archive`. Values contain 1–200 characters
+from `A–Z a–z 0–9 . _ / # : -`; the whole field still has its existing 240-character limit.
+For example: `task:example-task ref:host.build.rule (the original decision)`.
+Prose and malformed tokens remain legal, and the stored text is never rewritten.
+
+Brief shows pointers beside open and resolved items as untrusted data. `live` means
+the target exists in the loaded authorized data, not that it proves the claim.
+`unavailable` means absent or inaccessible, with identical answers and no target label.
+`unchecked` is uniform for kinds the brief does not load, including file, room, item,
+commit, doc and archive; resolution performs no new I/O. A superseded record is marked
+`superseded`. At most 10 pointers per item and 50 per brief are resolved; remaining
+tokens are `unresolved`, counted in `pointers_omitted`. Labels are escaped before being
+clipped to 120 characters and carry `trust: data`. Copy the original carry/template
+items into a checkpoint, not the display-only pointer metadata. Older kits can read
+and carry these same string fields unchanged.
+
 ## lane_state (a sibling, not a checkpoint field)
 
 `lane_state` travels in the same payload FILE beside the checkpoint object and is popped

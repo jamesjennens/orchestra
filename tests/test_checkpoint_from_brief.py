@@ -279,7 +279,8 @@ class OpenItemTests(AgentTask, fixes.EndpointCase):
         self.assertEqual(201, self.save(open_items=[item('key'), item('choice', 'decision')]).status)
         brief = self.brief()
         # The brief shows where each item came from, and the template holds them as recorded.
-        self.assertEqual(brief['checkpoint']['open_items'], [item('key'), item('choice', 'decision')])
+        self.assertEqual(brief['checkpoint']['open_items'],
+                         [dict(i,pointers=[],pointers_omitted=0) for i in [item('key'),item('choice','decision')]])
         template = brief['checkpoint_template']
         self.assertEqual(template['body']['open_items'], [item('key'), item('choice', 'decision')])
         self.assertEqual(template['carried_open_items'], 2)
@@ -351,7 +352,7 @@ class OpenItemTests(AgentTask, fixes.EndpointCase):
         brief = self.brief()
         point = brief['checkpoint']
         self.assertEqual((point['open_items_shown'], point['open_items_total']), (3, 3))
-        self.assertEqual(point['open_items'], three)
+        self.assertEqual(point['open_items'], [dict(i,pointers=[],pointers_omitted=0) for i in three])
         self.assertNotIn('open_items_note', point)
         self.assertEqual(brief['carry_open_items'], three)
 
@@ -546,7 +547,7 @@ class InProcessCarryTests(test_http_agents.AgentHarness):
         self.assertEqual(201, saved.status, saved.data)
         brief = self.request('GET', base + '/brief', token=admin).data
         self.assertEqual(brief['checkpoint_template']['body']['open_items'], [item('key')])
-        self.assertEqual(brief['checkpoint']['open_items'], [item('key')])
+        self.assertEqual(brief['checkpoint']['open_items'], [dict(item('key'),pointers=[],pointers_omitted=0)])
         # The page needs the complete list: it travels beside the template (kittrial-5bb.356).
         self.assertEqual(brief['carry_open_items'], [item('key')])
         self.assertEqual((brief['checkpoint']['open_items_shown'],
