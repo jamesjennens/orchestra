@@ -1011,10 +1011,23 @@ def _wait_command(args,config,project,actor,out,config_path=None):
     remembered = None if options.fresh or state is None else state.get('fingerprint')
     resumed = options.since if options.since is not None else remembered
     endpoint_args = wait.read_args(options, resumed)
+    # An endpoint older than this kit refuses the unknown ``--since`` on the READ. The
+    # empty-wake log is additive, so the wait must still work there: fall back to exactly
+    # the old request once, and keep that answer for the rest of this wait.
+    plain_endpoint_args = wait.read_args(options, None)
+    carries_since = endpoint_args != plain_endpoint_args
+    accepts_since = {'value': carries_since}
 
     def read():
         try:
-            result = request(config,project,actor,endpoint_args,'wait')
+            result = request(config,project,actor,
+                             endpoint_args if accepts_since['value'] else plain_endpoint_args,
+                             'wait')
+            if (carries_since and accepts_since['value'] and isinstance(result,dict)
+                    and result.get('returncode')
+                    and '--since' in (result.get('stderr') or '')):
+                accepts_since['value'] = False
+                result = request(config,project,actor,plain_endpoint_args,'wait')
         except (RuntimeError,ValueError,OSError) as error:
             # The transport said the service could not be reached: not a usage error.
             raise wait.WaitUnreachable(str(error)[:300]) from None

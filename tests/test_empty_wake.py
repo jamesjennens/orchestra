@@ -17,6 +17,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
+import client
 import lanes
 import test_http_agents
 import wake_log
@@ -286,6 +287,62 @@ class WorkWaitRecordingTests(unittest.TestCase):
     def test_an_invalid_since_is_refused_by_the_read(self):
         with self.assertRaises(ValueError):
             self.run_wait([self.row()], ['--since', 'nonsense'])
+
+
+class OldEndpointFallbackTests(unittest.TestCase):
+    """A client with the new read works against an endpoint that refuses --since."""
+
+    def test_one_refused_read_falls_back_to_the_old_request(self):
+        import io
+        import tempfile
+        from unittest import mock
+        calls = []
+
+        def request(_config, _project, _actor, args, action='bd', path=None):
+            calls.append((action, list(args)))
+            if len(calls) == 1:
+                return {'returncode': 2,
+                        'stdout': '',
+                        'stderr': 'ValueError: unrecognized arguments: --since wait1:%s' % ('0' * 64)}
+            return {'returncode': 0, 'stdout': json.dumps(waiting.worker_view([])), 'stderr': ''}
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text('{}', encoding='utf-8')
+            with mock.patch.object(client, 'request', request), \
+                    mock.patch('sys.stdout', new_callable=io.StringIO), \
+                    mock.patch('sys.stderr', new_callable=io.StringIO):
+                code = client._wait_command(
+                    ['--timeout', '0', '--since', waiting.fingerprint([])],
+                    str(config), 'example', A, None, config_path=str(config))
+        self.assertEqual(code, waiting.EXIT_TIMEOUT)
+        self.assertEqual(calls[0][0], 'wait')
+        self.assertIn('--since', calls[0][1])
+        self.assertEqual(calls[1], ('wait', []))
+        self.assertEqual(len(calls), 2)
+
+    def test_a_new_endpoint_gets_one_read_with_since(self):
+        import io
+        import tempfile
+        from unittest import mock
+        calls = []
+
+        def request(_config, _project, _actor, args, action='bd', path=None):
+            calls.append((action, list(args)))
+            return {'returncode': 0, 'stdout': json.dumps(waiting.worker_view([])), 'stderr': ''}
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text('{}', encoding='utf-8')
+            with mock.patch.object(client, 'request', request), \
+                    mock.patch('sys.stdout', new_callable=io.StringIO), \
+                    mock.patch('sys.stderr', new_callable=io.StringIO):
+                code = client._wait_command(
+                    ['--timeout', '0', '--since', waiting.fingerprint([])],
+                    str(config), 'example', A, None, config_path=str(config))
+        self.assertEqual(code, waiting.EXIT_TIMEOUT)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('--since', calls[0][1])
 
 
 @unittest.skipIf(test_http_agents is None, 'the http service needs a POSIX host')
