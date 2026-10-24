@@ -15,6 +15,18 @@ Plan checkpoint `01a16f7a`, verified by the coordinator on 2026-10-24, with thes
 - **Also:** say what trace shows for a project with no design documents. Orchestra's own system
   design stays a slice.
 
+**Round 2** answers review `01a16fbd`:
+- **Trace is answered by the server from records alone,** for web-only coordinators. The proposer
+  uploads the design document with `design.<scope>`; the server derives and stores its index
+  (`design-index-v1`: the document's sha256, front block, heading anchors, plan phases with their
+  tokens), checks it at acceptance, and serves every trace view. A Coverage panel and a Designs
+  list on the web show it. The client only adds `trace --verify`, the repository check (§5,
+  gap G4).
+- **G1's fix gets the full adversarial review,** and the agent's `decision_id` must be a decision
+  issue in the same project that grants record acceptance, checked by the server (§2.3, §8
+  slice 1).
+- §7 and slices 1 to 4 are updated to match.
+
 The repository is public. The private project that prompted this task is described only in the
 brief's general terms: a server redesign treated as a sub-project, two independent proposals, a
 cross-review that converged, owner choices left in task comments, requirements not revised to
@@ -166,9 +178,11 @@ It requires:
 
   **Gap G1:** the web route a coordinator agent would use to accept a record refuses it. A
   web-only project whose coordinator is an agent cannot accept `design.<scope>`, or any record,
-  except through an owner. Slice 1 verifies this with a test first, then fixes it: an effective
-  coordinator grant counts as the coordinator role for `coordinator=True` record writes, and the
-  acceptance must name the delegation decision (`decision_id`) when the acceptor is an agent.
+  except through an owner. Slice 1 verifies this with a test first, then fixes it under the kit's
+  full adversarial review. An effective coordinator grant counts as the coordinator role for
+  `coordinator=True` record writes **only** when the agent's acceptance names a `decision_id` that
+  the server checks live: a decision issue in the same project, not superseded, whose body grants
+  record acceptance to that agent or to the coordinator-grant holder (§8, slice 1).
 - **An operator on the host** (`ref accept` over the endpoint with the operator allowlist) passes,
   but that is not a web-only route.
 
@@ -180,7 +194,7 @@ rules: a whitespace-separated `KIND:VALUE` token; prose otherwise; never a refus
 | kind | value | resolves to | flags |
 | --- | --- | --- | --- |
 | `req` | `KEY@REV`, e.g. `req:srv.backup@2`; `KEY` alone means "current" | the requirement record's revision `REV` (an exact reference once resolved: id, revision, sha256) | `unknown-key`; `unknown-revision`; `superseded` (a newer accepted revision exists); `draft` (the revision is not accepted) |
-| `design` | `SCOPE#section`, e.g. `design:server-redesign#plan-phase-2`; `SCOPE` alone means the whole design | the selected design (`design.<scope>`'s pinned file and commit) and a heading in it | `unknown-scope` (no `design.<scope>` entry); `unknown-section` (no such heading at the pinned commit); `not-selected` (the entry exists but its revision is not accepted) |
+| `design` | `SCOPE#section`, e.g. `design:server-redesign#plan-phase-2`; `SCOPE` alone means the whole design | the selected design (`design.<scope>`'s pinned file and commit) and a heading in it | `unknown-scope` (no `design.<scope>` entry); `unknown-section` (no such heading in the design's server-held index, §5.1); `not-selected` (the entry exists but its revision is not accepted) |
 
 **Where tokens go:**
 - a task's **description** (the stable place), and a checkpoint's open-item `source` and resolved
@@ -228,9 +242,11 @@ requirements. The plan is versioned with the design: a new plan is a new design 
 | **G1** | a coordinator agent cannot accept a record over the web (§2.3) | it is an authorization rule, not a convention | 1 |
 | **G2** | pointer kinds `req:` and `design:` | the grammar is closed by design; new kinds are a code change, small, in the context index's parser | 2 |
 | **G3** | a decision's link set (which tasks and requirements a decision decides) | a decision issue's text can name tasks, but no reader can project it onto them. OPEN_ITEMS_DECISIONS_DESIGN's `coordinator-decision-v1` is exactly this; its slices are designed and not built. **Reuse it; do not add a second kind.** | after this note's slices (a dependency, not a slice here) |
+| **G4** (round 2) | the server cannot read the repository, so it cannot resolve `design:` sections or plan coverage for a web-only coordinator | the design's bytes and a server-derived index must be on the server; one reserved record, `design-index-v1`, written only by the server (§5.1) | 3 |
 
 There is **no new record kind** for designs, plans, cross-reviews or disagreements: those are
-documents, reference entries, epics and comments.
+documents, reference entries, epics and comments. The only new record is the server-written index
+of a design (G4), because a web-only coordinator has no checkout.
 
 ## 3. Sub-projects
 
@@ -360,62 +376,118 @@ The kit's own context-index note was designed this way:
   - a `design.context-index` reference entry;
   - the Disagreements table: here none survived, and the table would say so.
 
-## 5. The trace read
+## 5. The trace read: answered by the server, from records alone
 
-### 5.1 The command
+Round 2 (review 01a16fbd). Project coordinators now work only on the web site, with no checkout and
+no shell, and they are trace's main users. So the server answers every trace view from records
+alone. A client command over a checkout is a convenience and the place where the repository is
+checked against the records; it is never required.
 
-```
-trace [--scope SCOPE] [--kind requirements|tasks|decisions|designs|tokens|round] [--limit N] [--cursor C]
-```
+### 5.1 What the server needs, and who supplies it: the design document and its index
 
-- It runs in the **client**, against a checkout of the project's repository, like
-  `capability lookup`. The server holds the records; the designs are files in the repository,
-  which the server does not have.
-- It reads:
-  - one export through the existing endpoint read (the read cache serves it warm: work and wait
-    already use it);
-  - the reference catalog (`design.*` entries);
-  - the requirement manifest of each job;
-  - the design documents at their pinned commits, with `git show <commit>:<path>` in the checkout.
-- **Read-only:** no record changes, no acknowledgement.
+The server has no repository, so a design document reaches it the way a file does: **with the
+proposal**.
 
-### 5.2 What it reports
+1. **The proposer uploads the document.** `ref propose` or `ref revise` of a `design.<scope>`
+   entry carries the document's bytes **exactly as they are at the pinned commit**. The web form
+   takes a file; the client reads `git show <commit>:<path>`.
+   - The bytes go into the content-addressed blob store task files already use
+     (`<project>/.task-files/`, named by sha256), so no new storage is needed.
+   - The entry's authority keeps `{type: repo-path, path, commit, anchor}` and gains the
+     document's `sha256`. This is a new version of the repo-path authority, under the catalog's
+     forward-compatibility rule; slice 3.
+2. **The server derives the index itself.** It never takes an index from the proposer: it parses
+   the uploaded bytes and writes one reserved record, `Kind: design-index-v1`, on the entry's
+   anchor, holding:
+   - `doc_sha256`, `path` and `commit`;
+   - the front block's fields (§2.1);
+   - the headings, as `{anchor, level, title}`, with anchors computed the way the web's Markdown
+     renders them;
+   - per heading, the `req:` and `design:` tokens found in that section;
+   - the plan phases: every `#plan-phase-n` heading, with its contract, test-oracle and
+     requirement lines and the epic id once named.
 
-| kind | rows |
+   The prefix is reserved, so only the server writes it, as with every record family (no raw
+   comment can plant one). It is bounded: at most 400 headings, 2,000 tokens and a 1 MiB document.
+3. **Acceptance checks it.** When the coordinator accepts `design.<scope>`, the server checks
+   three things, or refuses the acceptance:
+   - the stored bytes' sha256 equals the authority's `sha256`;
+   - the index was derived from those bytes;
+   - the front block's `scope` equals the key's scope.
+
+   The acceptor sees the rendered document, as text, beside the accept button, so "what am I
+   accepting" is answerable on the web.
+4. **What the server cannot check, and who does.** Whether the uploaded bytes really are the file
+   at that commit needs the repository.
+   - That check runs **where the code is**, as the capability drift check does
+     (CAPABILITY_INDEX_DESIGN §5): a client or CI step `trace --verify` reads
+     `git show <commit>:<path>` and compares sha256.
+   - A match from a trusted verifier (the deployment's `verifiers` list, as for capabilities)
+     marks the entry `verified`.
+   - A mismatch writes a report, and the entry shows **`design-drift`**: the record says one thing
+     and the repository another.
+   - Until verified, the entry reads `unverified`. It still counts for trace, labelled as such.
+5. **When the index and the file disagree.** The record wins for every read (it is what was
+   accepted), and the drift flag tells everyone. The way out is a revision: upload the file as it
+   now is at a new commit, and accept again. Nothing is silently re-derived from the repository.
+
+### 5.2 The read, and its web surface
+
+- **On the server:**
+  - `GET /v1/projects/{pid}/trace?view=...&scope=...` (CAP_READ, the existing visibility rules),
+    and the endpoint action `trace` for the client.
+  - Inputs: one export (warm from the read cache), the reference catalog's `design.*` entries,
+    the `design-index-v1` records, and the requirement records and manifests.
+  - **No repository, no blob read** except when a reader opens a document.
+- **The web surface:**
+  - **A Coverage panel on the project page**, one line per view with counts ("3 requirements
+    have no task; 2 tokens do not resolve; 1 design section has no plan"). Each line opens its
+    view.
+  - **A Designs list under Records**, one row per `design.<scope>` with its state (selected,
+    unverified, drift), its requirement coverage and its plan coverage. A row opens the design
+    page: the stored document rendered as text (md.js), with each section's tokens resolved and
+    each plan phase linked to its epic.
+  - **On the task page**, the task's own tokens resolved in the summary, so a reader sees "cites
+    req:srv.backup@2 (superseded by @3)" where they work.
+- **In the client:** `trace` prints the same views from the same endpoint action. `trace --verify`
+  is the one part that needs a checkout.
+
+### 5.3 What it reports
+
+| view | rows |
 | --- | --- |
-| `requirements` | each accepted requirement with: designs citing it (`design.<scope>` front blocks), tasks citing it, and capability records linking it. **Flags:** `no-design` (when the project has designs), `no-task`, `no-capability` (after delivery) |
-| `tasks` | each open or recently closed task with the requirements and design sections it cites. **Flags:** `cites-superseded-revision` (computed by `requirement_impact.analyze` over the work graph trace builds from the tokens: the first user of that module for tasks), `cites-nothing` (a task under a scoped epic with no token) |
-| `tokens` | every `req:` and `design:` token that does not resolve, with where it is: `unknown-key`, `unknown-revision`, `superseded`, `draft`, `unknown-scope`, `unknown-section`, `not-selected`. **The Q2 condition:** a typo is a row here |
-| `decisions` | decision issues with what they supersede and the designs citing them. **Flag:** `possible-decision-in-comment`: a comment by a project owner on a task or a design round that contains decision words ("I decide", "we will", "go with", "choose") and is not cited by any decision issue. A heuristic, labelled as one: it lists, it never acts |
-| `designs` | each `design.<scope>`: its pinned document, the sections with no plan phase, plan phases with no epic, epics with no task. **Flags:** front-block `status` disagrees with the entry, and review-by past |
+| `requirements` | each accepted requirement with: designs whose index cites it, tasks citing it, capability records linking it. **Flags:** `no-design` (when the project has designs), `no-task`, `no-capability` (after delivery) |
+| `tasks` | each open or recently closed task with the requirements and design sections it cites. **Flags:** `cites-superseded-revision` (computed by `requirement_impact.analyze` over the work graph the server builds from the tokens: the first user of that module for tasks), `cites-nothing` (a task under a scoped epic with no token) |
+| `tokens` | every `req:` and `design:` token that does not resolve, with where it is: `unknown-key`, `unknown-revision`, `superseded`, `draft`, `unknown-scope`, `unknown-section` (checked against the **index**, not a file), `not-selected`. **The Q2 condition:** a typo is a row here |
+| `decisions` | decision issues with what they supersede and the designs citing them. **Flag:** `possible-decision-in-comment`: an owner's comment on a task or a round with decision words and no decision issue citing it. A heuristic, labelled as one: it lists, it never acts |
+| `designs` | each `design.<scope>`: selected or not, `verified`, `unverified` or `design-drift`, its sections with no plan phase, plan phases with no epic, epics with no task, front-block status disagreeing with the entry, review-by past |
 | `round` | for a design round epic: each lane task's plan time, delivery time, the publication time of each twin draft, cross-reviews posted, and the converged design and decision. **Flag:** `delivered-after-publication` (independence, §4.1 step 3) |
 
 **Bounds and safety:**
 - Every row is an excerpt object, with untrusted text escaped (the context index's rule).
-- Pages of at most 50 rows, with a cursor bound to the scope and the export generation (the
-  context index's §4.4 rule).
-- Every answer carries a coverage block saying what was read and what was not, for example
-  "3 design documents read at their pinned commits; 1 not found in this checkout".
+- Pages of at most 50 rows, with a cursor bound to the caller's scope and the export generation.
+- Permission filtering happens before counts (the context index's §4.4).
+- A coverage block says what was read: for example "4 designs indexed, 1 unverified; 3,402 rows".
 
-### 5.3 A project with no design documents (the coordinator's ask)
+### 5.4 A project with no design documents (the coordinator's ask)
 
 It stays useful and cheap:
 - **The design columns** say once, at the top, "No designs in this project (no `design.*`
-  entries)". They are not repeated on every row, and `no-design` is not flagged on every
-  requirement: a project that never writes designs is not shamed for it.
-- **What still works:**
-  - requirements with no task, and no capability once delivered;
-  - tasks citing superseded requirement revisions;
-  - every unresolved `req:` token;
-  - possible decisions left in comments.
-- **The cost** is the one export (cached), plus the requirement manifests. No `git show` happens,
-  because there are no pinned documents.
+  entries)", and `no-design` is not flagged on every requirement.
+- **What still works:** requirements with no task, and no capability once delivered; tasks citing
+  superseded revisions; every unresolved `req:` token; possible decisions left in comments.
+- **The cost** is one cached export plus the requirement manifests; there are no index records and
+  no blobs. **The Coverage panel** shows its requirement and token lines only.
 
 **Cost at kittrial's size** (about 3,400 issues, 7,400 comments, a few dozen requirements and
-designs): one warm export read (the read cache), one pass over the rows and comments to find tokens
-and decision issues, one `analyze` call over a graph of at most a few thousand nodes, and a few
-dozen `git show` calls. The few seconds this should take is an estimate, not a measurement. Slice 3
-measures it on a copy of a kittrial-sized export, as the context index did for find.
+designs):
+- one warm export read;
+- one pass over the rows and comments for tokens, decision issues and index records;
+- one `analyze` call over a graph of at most a few thousand nodes;
+- **no repository read.**
+
+The few seconds this should take is an estimate, not a measurement. Slice 4 measures it on a copy
+of a kittrial-sized export, as the context index did for find.
 
 ## 6. A system design for Orchestra itself
 
@@ -438,34 +510,71 @@ measures it on a copy of a kittrial-sized export, as the context index did for f
 
 | risk | mitigation | test |
 | --- | --- | --- |
-| a token typo silently uncounted | trace's `tokens` view lists every unresolved token | fixtures with each flag (`unknown-key`, `unknown-revision`, `superseded`, `draft`, `unknown-scope`, `unknown-section`, `not-selected`) each appear exactly once |
-| a selected design changes under its selection | the commit pin; trace reads the pinned commit, never the working tree | edit the file after selection: trace still reads the pinned text and flags `newer-unselected-text` |
-| an agent accepts what only the owner may decide | G1's fix requires the delegation decision on an agent's acceptance; §4.3 lists owner-only choices | an agent's accept without `decision_id` is refused; with it, accepted and attributed |
+| a token typo silently uncounted | the `tokens` view lists every unresolved token | fixtures with each flag (`unknown-key`, `unknown-revision`, `superseded`, `draft`, `unknown-scope`, `unknown-section`, `not-selected`) each appear exactly once |
+| **the uploaded document is not the file at the commit** (a mistaken or dishonest upload) | the server stores its sha256 and derives the index from the stored bytes; `trace --verify` where the code is compares with `git show`; only a trusted verifier's match marks `verified`; a mismatch shows `design-drift` | upload bytes that differ from the commit: the entry reads `unverified`, then `design-drift` after a verifier run; a verifier outside the list cannot mark it `verified` |
+| **a planted index** | `design-index-v1` is a reserved prefix written only by the server from stored bytes; a raw comment cannot write one; acceptance re-checks bytes, sha256 and index | a raw `comments add` with the prefix is refused; an index whose `doc_sha256` does not match the stored bytes blocks acceptance |
+| a selected design changes under its selection | the commit pin plus the stored sha256; reads use the stored index, never a working tree | change the file after acceptance: trace still answers from the record, and `--verify` at the new commit reports drift only if the pinned commit's file changed (it cannot) |
+| the stored document leaks or injects | it is project data under the existing read rule, rendered as text (md.js, no HTML), never put into prompts (pointers only, as the context index rules) | a document with HTML, script and bidi controls renders as escaped text on the design page; an agent prompt for a task citing it carries `design:SCOPE#s`, not the text |
+| an agent accepts what only the owner may decide | G1's fix (slice 1) requires a server-checked delegation decision; §4.3 lists owner-only choices | slice 1's adversarial tests (below) |
 | a heuristic "decision in a comment" is taken as fact | labelled `possible-`; never acts; lists only | the fixture comment "we will go with B" by an owner is listed; the same words by a contributor are not |
 | independence claimed but broken | times side by side, `delivered-after-publication`, the fixed statement | a fixture round where one lane delivers after publication is flagged |
-| trace leaks private text | the context index's visibility and escaping rules; it reads only what the caller may read | a caller without access to a task gets no row for it, and counts exclude it |
+| trace leaks private text | permission before counts; the context index's escaping; a caller without access to a task gets no row and no count | a contributor and an outsider each see only what their own reads show |
 
 ## 8. Slices (five, each deliverable alone)
 
-1. **Records acceptance for a coordinator agent, and the design convention (G1).**
-   - A test showing whether a coordinator-grant agent can accept a record through
-     `POST …/references/{key}/accept`. If it is refused, as the code reads, the fix: an effective
-     coordinator grant satisfies the coordinator role for `coordinator=True` record writes, and an
-     agent's acceptance requires `decision_id`.
-   - Docs: the design front block, `design.<scope>`, plan phases as epics, cross-review lines.
-   - The web Records tab names who accepts (the .400 finding).
-2. **Pointer kinds `req:` and `design:` (G2).** Parsed and resolved in the context index's grammar,
-   with the flags of §2.4. This lands with or after the context index's slice 1; until then trace
-   (slice 3) resolves them itself.
-3. **The trace read.** The client command, its six views, bounds and coverage, the no-design case,
-   and the cost measured on a kittrial-sized export.
-4. **Design rounds.** The convention written up for coordinators and lanes (WORKER_GUIDE, the
-   coordinator's AGENT.md), and trace's `round` view. A command to open a round (the epic and N
-   tasks) is optional here and can follow.
-5. **Orchestra's system design.** docs/SYSTEM_DESIGN.md rewritten with the front block,
-   `design.orchestra` accepted, IMPLEMENTATION_PLAN retired, and trace's first report on kittrial.
+1. **A coordinator agent accepting records (G1), with a full adversarial review, and the
+   conventions.**
+   - **First, a test** showing whether a coordinator-grant agent is refused by
+     `POST …/references/{key}/accept` (it is, by reading `_require_record_membership`).
+   - **The fix changes authorization**, so it gets the kit's **full adversarial review**: an
+     independent reviewer and the mutant set, with the authority tests below.
+   - **The rule:** an agent may make a `coordinator=True` record write only when all three hold:
+     1. its coordinator grant is effective (`_may_coordinate`);
+     2. its acceptance names `decision_id`;
+     3. the server checks that decision live: it is a **decision issue in the same project**,
+        not closed as superseded, whose text **grants record acceptance** to that agent or to
+        "the holder of the coordinator grant". The grant is one fixed line,
+        `Grants: record-acceptance to <agent-id | coordinator-grant>`, in the decision's body.
 
-Each slice stands alone: slice 1 helps every web-only project today; slice 2 helps `brief` without
-trace; slice 3 works on tokens or none (§5.3); slice 4 is mostly documentation; slice 5 uses only
-conventions if 2 and 3 are not there yet. **G3** (the decision link set) is the OPEN_ITEMS design's
-later slices: a dependency for richer decision rows, not a slice here.
+     Any decision id, a decision of another project, a decision without that line, or one
+     naming another agent is refused, with the reason.
+   - **Tests:** each refusal; the grant line revoked by a superseding decision; the agent
+     demoted (grant removed) between the read and the write; a person coordinator unaffected.
+   - **Docs:**
+     - the design front block, `design.<scope>`, plan phases as epics and cross-review lines;
+     - the design-round convention (§4) for coordinators and lanes (WORKER_GUIDE and the
+       coordinator's AGENT.md);
+     - the web Records tab naming who accepts (the .400 finding).
+2. **Pointer kinds `req:` and `design:` (G2).** Parsed and resolved in the context index's grammar
+   with the flags of §2.4, resolved on the server: `design:` resolves against `design-index-v1`
+   records (slice 3). Until slice 3 lands, a `design:` token resolves to `unknown-scope` unless the
+   entry exists, and its section reads `unchecked`.
+3. **Design documents on the server: upload, index, verify.**
+   - The upload on propose and revise, for the web form and the client.
+   - The repo-path authority with `sha256` (a new authority version).
+   - The blob in the task-files store.
+   - The server-derived `design-index-v1` record and its reserved prefix.
+   - Acceptance re-checking bytes, sha256 and index.
+   - `trace --verify` with the verifiers list, and `design-drift` and `unverified` states.
+   - The design page on the web, rendered as text.
+   - Tests: the §7 rows for upload, index and drift.
+4. **The trace read on the server, and the Coverage panel.**
+   - `GET /trace` and the endpoint action, all six views, bounds, permission before counts, the
+     no-design case.
+   - The Coverage panel on the project page and the Designs list under Records.
+   - The task page showing its own tokens resolved.
+   - The client `trace` as a convenience.
+   - The cost measured on a kittrial-sized export.
+5. **Orchestra's system design.** docs/SYSTEM_DESIGN.md rewritten with the front block, uploaded as
+   `design.orchestra` and accepted, IMPLEMENTATION_PLAN retired, and trace's first report on
+   kittrial attached.
+
+**Each slice stands alone:**
+- Slice 1 helps every web-only project today.
+- Slice 2 helps `brief` before any design is indexed.
+- Slice 3 lets a web-only coordinator read and accept a design.
+- Slice 4 answers the requirement, task, token and decision views even with no designs (§5.4).
+- Slice 5 uses whatever has landed.
+
+**G3** (the decision link set) is the OPEN_ITEMS design's later slices: a dependency for richer
+decision rows, not a slice here.
