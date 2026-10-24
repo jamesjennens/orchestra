@@ -4,7 +4,7 @@ Design note for `kittrial-5bb.392`, written by the Claude lane (orc-coord-capabi
 main `7fe1a469685e7ce4a21589878636e55c2d33eb61` (release 1023e). No code in this delivery.
 
 This task is built twice, independently. **I did not read or open the twin task
-(`kittrial-5bb.393`), its branch or its comments before delivering this note.**
+(`kittrial-5bb.393`), its branch or its comments before delivering round 1.**
 
 Plan checkpoint `01a16b21`, verified by the coordinator on 2026-10-24, with these answers and asks:
 - Q1: the file is named for the Claude lane.
@@ -16,6 +16,25 @@ Plan checkpoint `01a16b21`, verified by the coordinator on 2026-10-24, with thes
   - keep the pointer grammar backward-compatible both ways;
   - treat every resolved pointer as untrusted text on every surface.
 
+**Revision 2** answers review `01a16b5e` (request changes on round 1, contribution `01a16b55`):
+- **Five corrections:**
+  - escaping is `briefing.plain_text`, not `clip` (§2.1.3, R1);
+  - the standing-task label is new, not existing (§2.3, §2.7);
+  - `transition()` matches open items by id (§2.1.1, R7);
+  - the command is `work lanes`;
+  - the rounds view uses the review chain's real operations, fields and item states (§2.4).
+- **One design problem both notes missed:** a held standing task counts against the claim limit
+  and reads as the holder's move. §2.7 designs the exemption, who may grant it, and its tests
+  (R11).
+- **Four ideas taken from the twin note**, read only after round 1 was delivered, from the branch
+  the coordinator published, and only for the items the review named:
+  - permission before ranking, counts and cursors, with cursors bound to the caller's scope
+    (§4.4);
+  - a coverage and staleness envelope on every answer (§4.5);
+  - an `archive:` pointer, a file digest plus a line range, for items migrated from the
+    coordinator's log (§2.1, §6.1);
+  - a memo keyed by the read-cache generation that never becomes a second store (§4.6).
+
 ## 0. What I read before writing (about 1,950 lines)
 
 The task allowed about 2,500 lines of reading. I read, in this order:
@@ -23,7 +42,7 @@ The task allowed about 2,500 lines of reading. I read, in this order:
 | what | lines |
 | --- | --- |
 | `docs/BRIEFINGS.md` 1-120: `brief`, `--full` and its bounds, `history`, `checkpoint_wait`, the selection facts | 120 |
-| `docs/LANE_BOARD_DESIGN.md` 1-172: `lane-state-v1`, why it is not inside the checkpoint, the `lanes` read | 172 |
+| `docs/LANE_BOARD_DESIGN.md` 1-172: `lane-state-v1`, why it is not inside the checkpoint, the lanes read | 172 |
 | `docs/OPEN_ITEMS_DECISIONS_DESIGN.md` 51-235 and 534-656: today's `open_items`, anchors, reuse, the item/question/decision reads, brief attention | 308 |
 | `docs/REFERENCE_CATALOG_DESIGN.md` 51-101 and 708-791: the catalog at a glance, `ref get` and `ref list` | 135 |
 | `docs/CAPABILITY_INDEX_DESIGN.md` 454-525: `capability find`, the hidden-surface list, attention | 72 |
@@ -34,62 +53,51 @@ The task allowed about 2,500 lines of reading. I read, in this order:
 | the first lines of `open_items.py`, `rooms.py`, `task_files.py`, `lanes.py`, `lane_state.py`, `read_cache.py`, plus the function lists of `native.py` and `activity.py` | about 170 |
 | the brief of `kittrial-5bb.391` (title and description) | 3 |
 
+For revision 2 I also read the code the review cited:
+- `briefing.py` 355-380 (`transition`) and 505-522 (`clip`, `plain_text`);
+- `claim_limit.py` 1-190;
+- `review_workflow.py` 85-110 (the operations) and 2290-2330 (how items are recorded and
+  answered);
+- `reserved_comments.py` 785-905 (reserved labels, `gt:slot`);
+- `work.py` 343-373 (`move_decision`);
+- twin note sections 2.3, 3.1, 3.4, 4.3, 5.2-5.3 and 6.1 (about 120 lines).
+
 What I did **not** read, and where the note therefore names something to confirm when it is built:
-- `docs/REVIEWS.md` and `review_state.py`, so the field names of the review-round view (§2.4) are
-  confirmed in slice 3;
+- `docs/REVIEWS.md` and `review_state.py`. The rounds view (§2.4) now uses the operation and field
+  names of `review_workflow.py`, and slice 3 confirms the derived item states against
+  `review_state.py`;
 - `capabilities.py` beyond the code-index hits, so the reuse of its scoring (§4) is confirmed in
   slice 4;
 - any coordinator handover file or lane notes file on any host. Those are private, and §6 is
   written from the brief's description of them.
 
-What is built today and what is not (from the module headers):
-- **Built:** checkpoints with `open_items` and `resolved`, `lane-state-v1`, the `lanes` board, the
-  reference catalog (`ref`), capability records (`capability find`), task files slice 1, rooms
-  slice 1, and the read cache.
-- **Not built:**
-  - open items and decisions as records (`open_items.py` is slice 0, names only);
-  - the rooms scribe and room items;
-  - any search across record kinds.
+**Built today** (from the module headers): checkpoints with `open_items` and `resolved`,
+`lane-state-v1`, `work lanes`, the reference catalog, capability records, task files and rooms
+slice 1, and the read cache. **Not built:** open items and decisions as records (`open_items.py` is
+slice 0), the rooms scribe and room items, and any search across record kinds.
 
 ## 1. The problem, and the one principle
 
-**The problem.** No session should have to hold everything in its context at once. Orchestra already
-does half of this for a single task:
-- the newest checkpoint is the task's summary;
-- `brief` is a bounded read of it;
-- `history` fetches detail when asked.
-
-The brief names five places where that breaks:
-- **(a)** a coordinator's own state lives in a flat file outside Orchestra, a 5,300-line
-  append-only handover log;
+**The problem.** No session should have to hold everything in its context at once. For one task
+Orchestra already manages: the newest checkpoint is its summary, `brief` reads it within bounds, and
+`history` fetches detail when asked. The brief names five places where that breaks:
+- **(a)** a coordinator's own state lives in a 5,300-line append-only handover file outside Orchestra;
 - **(b)** headless lanes keep `notes.md` on their own host, invisible to others and lost when a lane
   moves;
 - **(c)** a task with several review rounds has no compact list of what each round settled;
 - **(d)** there is no query for "what do we know about X" or "which task decided Y";
-- **(e)** lane facts (host, model, identity, how to nudge) live in coordinator files, not in
-  reference records.
+- **(e)** lane facts (host, model, identity, how to nudge) live in coordinator files.
 
 **The principle: store each fact once, where its writer already writes, and make everything else a
-pointer to it.** The design has three parts:
-- A small, fixed set of records holds the live state. They all exist today: checkpoints, reference
-  entries, review records, decision issues.
-- One grammar lets any of them point at any other.
-- Three reads walk the pointers: `brief`, the new `review --rounds` and the new `find`.
+pointer to it.** A small, fixed set of existing records holds the live state (checkpoints,
+reference entries, review records, decision issues). One grammar lets any of them point at any
+other. Three reads walk the pointers: `brief`, the new `review --rounds` and the new `find`.
 
 Nothing in this design is a second log. No record grows without bound, and no status is written on
 a timer.
 
-The rest of the note answers the seven sections the task asks for:
-
-| ask | section |
-| --- | --- |
-| 1. what to store where, for (a) to (e) | 2 |
-| 2. read paths and their size bounds | 3 |
-| 3. a search over decisions, findings and facts | 4 |
-| 4. staying current without a second log | 5 |
-| 5. migration from flat files and lane notes | 6 |
-| 6. risks, and the test that proves each part | 7 |
-| 7. at most five slices | 8 |
+The task's seven asks are answered in sections 2 (store), 3 (read paths), 4 (search), 5 (currency),
+6 (migration), 7 (risks and tests) and 8 (slices).
 
 ## 2. What to store where
 
@@ -98,7 +106,7 @@ The rest of the note answers the seven sections the task asks for:
 | gap | stored in (existing record) | new? |
 | --- | --- | --- |
 | (a) coordinator state | the newest checkpoint of the standing coordinator task (`kittrial-5bb.391`), each open item's `source` holding pointers (§2.1) | the pointer grammar only; no field, no record kind |
-| (b) lane notes | facts become reference drafts; task state goes into that task's checkpoint; the lane's own cross-task list goes into a standing **lane task** (§2.3) | a label convention (`lane-task`) and one field on the `lanes` row |
+| (b) lane notes | facts become reference drafts; task state goes into that task's checkpoint; the lane's own cross-task list goes into a standing **lane task** (§2.3) | a new, guarded `standing-task` label with a host journal (§2.7), and one field on the `work lanes` row |
 | (c) what each round settled | the review records that already exist, projected by `review TASK --rounds` (§2.4) | a read only |
 | (d) "what do we know about X" | the records above, searched by `find` (§4) | a read only |
 | (e) lane facts | reference entries under `lane.NAME.*` (§2.5) | a key convention |
@@ -128,9 +136,10 @@ most 240) are free text. Coordinators already write pointers into them in prose:
 | `room` | `ROOM-ID#SEQUENCE` | the room read at that sequence |
 | `commit` | a 7 to 40 hex commit id | not resolved by the kit (no repository on the server); shown as `unchecked` |
 | `doc` | `PATH#ANCHOR` of a served document | `docs PATH` |
+| `archive` | `SHA256#LSTART-LEND`: the digest of a frozen private file and a line range in it, e.g. `archive:3f06...c5#L120-L135` | not resolved by the kit (the file is outside Orchestra); shown as `unchecked`, with the range; whoever holds the file checks it by its digest (§6.1) |
 
 Rules:
-- `KIND` is one of the nine above, lowercase.
+- `KIND` is one of the ten above, lowercase.
 - `VALUE` is 1 to 200 characters from `[A-Za-z0-9._/#:-]`. An empty value is not a pointer, so the
   prose "see task: the review" contains no pointer.
 - A field may hold several pointers and prose around them, all within its existing 240 characters.
@@ -141,9 +150,11 @@ Rules:
 #### 2.1.1 Backward compatible both ways (the coordinator's first ask)
 
 - **An older kit reading a new checkpoint.** The pointer lives inside a string field the older kit
-  already validates by length alone. The older kit shows the field as text, carries the item
-  forward byte for byte (as `transition()` requires) and can publish the next checkpoint. Nothing
-  is refused and nothing is lost.
+  already validates by length alone. The older kit shows the field as text and can publish the next
+  checkpoint. `transition()` matches open items by **id**: an item open before and absent now must
+  be resolved, so a carried item keeps its id. Its `source` may be copied unchanged, which is what
+  `carry_open_items` and the checkpoint template do, and that keeps its pointers. Nothing is
+  refused and nothing is lost.
 - **A newer kit reading an older checkpoint, or any prose.**
   - A field with no pointer gets `pointers: []`. There is no warning, because prose is legal
     forever.
@@ -165,13 +176,8 @@ Rules:
  "trust": "data", "follow": "ref get host.build.load-rule"}
 ```
 
-`state` takes one of five values:
-- `live`;
-- `superseded`: a retired reference entry, a superseded contribution, or a task closed as
-  superseded;
-- `missing`;
-- `unavailable`;
-- `unchecked`: `commit` and `doc`.
+`state` is `live`, `superseded` (a retired reference entry, a superseded contribution, or a task
+closed as superseded), `missing`, `unavailable`, or `unchecked` (`commit`, `doc` and `archive`).
 
 **`unavailable` is used for anything the caller may not read, whether or not it exists.** So a
 pointer never reveals that a hidden thing exists (§7, R2).
@@ -192,8 +198,10 @@ pointer never reveals that a hidden thing exists (§7, R2).
 
 A resolved pointer brings back text someone else wrote: a reference title, a task title, a room
 line. On every surface:
-- the label is an excerpt object (`{text, omitted_chars}`), escaped with `briefing.clip`, so
-  control, bidi and line-separator characters cannot reshape a reader's screen or prompt;
+- the label is passed through `briefing.plain_text` first, which turns C0/C1 controls, the
+  Unicode line and paragraph separators and the bidi controls into `\uXXXX` escapes, so they cannot
+  reshape a reader's screen or prompt. Only then is it cut by `briefing.clip` into an excerpt
+  object (`{text, omitted_chars}`). `clip` itself only truncates;
 - every entry carries `trust: "data"`;
 - **prompts carry the pointer token, never the label.** `agent_prompts` and any generated
   AGENT.md show `ref:KEY`, not the reference's title, following the rule the capability index
@@ -213,12 +221,11 @@ resolved item's evidence is not "proved" by resolving: `live` means "this record
 checkpoint is the coordinator's live state. A fresh coordinator reads `brief` of it first. This note
 adds the discipline that makes it an index rather than a second log:
 
-- **One open item per live thing**, with these kinds:
-  - a delivery in review: `dependency`;
-  - a release in flight: `blocker`;
-  - a question to James: `question`;
-  - a lane problem: `blocker`.
+- **It is an exempt standing task** (§2.7, kind `coordinator`), so holding it costs the coordinator
+  no claim slot and never reads as its move.
 
+- **One open item per live thing**: a delivery in review is a `dependency`, a release in flight or
+  a lane problem a `blocker`, a question to James a `question`.
   `text` says what it is in at most 400 characters. `source` holds the pointers to where the detail
   lives: `task:...`, `comment:...` (the review), `ref:...` (the fact), `commit:...` (the release).
 - **`summary`** (1,000 characters) is the release line and the counts.
@@ -249,16 +256,19 @@ A lane's `notes.md` mixes three different things, and each already has a home:
 | a secret, a credential, a private path | key locations, tokens | **nowhere in Orchestra**. It stays on the lane's host. |
 
 **The standing lane task:**
-- One per lane, title `Lane state (NAME)`, the existing label `lane-task`, assigned to the lane's
-  actor, status `in_progress`, never closed while the lane exists.
+- One per lane, title `Lane state (NAME)`, assigned to the lane's actor, status `in_progress`, never
+  closed while the lane exists.
+- It carries the **new** label `standing-task`. No such label exists in the kit today. Only the
+  coordinator route can grant it, and §2.7 says how and why.
 - Its newest checkpoint is the lane's current cross-task list, in the same discipline as §2.2: one
   open item per live thing, pointers in `source`, settled things move to `resolved`.
 - **No new item kind.** A note that fits none of `blocker`, `question`, `decision`, `correction` or
   `dependency` is either a fact (a reference draft) or noise. That is the line that stops the lane
   task becoming `notes.md` again.
-- The `lanes` row gains one field, `lane_task`: the id of the open task labelled `lane-task` and
-  assigned to the row's actor, or `null`. It is derived from the export `lanes` already reads, with
-  no new read. When there are two, the newer is shown with a warning.
+- The `work lanes` row gains one field, `lane_task`: the id of the row actor's exempt standing task
+  (§2.7), or `null`. It is derived from the export and the standing-task journal `work lanes` can
+  read, with no per-task read. When a holder has more than one, only the exempt one is named, with
+  a warning.
 - **The lane writes it** at the points it already checkpoints: when it starts or finishes a task,
   and when it starts waiting. It is not written on every run.
 - **Visibility:** the lane task is an ordinary task, readable by project members. It holds nothing
@@ -270,7 +280,7 @@ A lane's `notes.md` mixes three different things, and each already has a home:
 2. The coordinator closes the lane task with reason `lane retired`. It stays readable in history.
 3. The `lane.NAME.*` reference entries are retired through the catalog's own retirement, naming a
    successor where a new lane takes the work.
-4. The `lanes` board stops listing the lane once it holds nothing and has written nothing for 24
+4. The `work lanes` board stops listing the lane once it holds nothing and has written nothing for 24
    hours (its existing rule), so no flag is raised by retirement itself.
 5. If the lane cannot write the final checkpoint (it is gone), the coordinator writes it. The
    checkpoint's author records who did, and nothing is inferred.
@@ -288,40 +298,73 @@ A lane's `notes.md` mixes three different things, and each already has a home:
 
 ### 2.4 (c) What each review round settled: `review TASK --rounds`
 
-A task with several rounds already holds every fact in its review records: each contribution, each
-review with its items, each response. What it lacks is one bounded page of them. **`review TASK
---rounds`** is a read-only projection of those records, newest round first:
+A task with several rounds already holds every fact in its review chain (`Kind:
+contribution-review-v1`, `review_workflow.py`). It lacks one bounded page of those facts.
+
+**The operations the view reads.** The chain's operations and their fields
+(`review_workflow.EXTRA`):
+
+| operation | fields |
+| --- | --- |
+| `contribute` | `repository`, `commit`, `base_commit`, `delivery`, `summary`, `supersedes` |
+| `request-changes` | `contribution` and `items` of `{id, text, severity}`; `severity` is `blocking` or `note` |
+| `respond` | `contribution` and `resolutions` of `{request, item, reason, evidence}` |
+| `resolve-item` | the requester's own `{request, item, reason}` |
+| `withdraw` | `contribution`, `reason` (the disposition `withdrawn` or `superseded`) |
+| `approve` | `contribution`, `summary` |
+| `request-review`, `decline-review` | as today |
+
+**The view.** **`review TASK --rounds`** is a read-only projection of those records, newest round
+first. A **round** is one contribution and every review operation that names it.
 
 ```json
 {"task": "example-12", "rounds_total": 3, "rounds_omitted": 0,
  "rounds": [
-  {"round": 3, "contribution": "01a1...", "commit": "abc1234...", "base": "def5678...",
-   "delivered_at": "2026-10-20T10:00:00Z", "supersedes": "01a0...",
-   "review": {"id": "01a2...", "outcome": "approve", "at": "2026-10-21T09:00:00Z"},
-   "settled": [], "still_open": []},
-  {"round": 2, "contribution": "01a0...", "commit": "...",
-   "review": {"id": "01a1...", "outcome": "changes-requested"},
-   "settled": [{"item": "B1", "title": {"text": "...", "omitted_chars": 0},
-                "response": "fixed", "in_round": 3, "pointer": "comment:01a1..."}],
-   "still_open": []}],
- "coverage": "review records of this task; text clipped to 200 characters"}
+  {"round": 3, "contribution": "01a1...", "commit": "abc1234...", "base_commit": "def5678...",
+   "delivery": {"kind": "remote", "branch": "contrib/example-12"}, "supersedes": "01a0...",
+   "at": "2026-10-20T10:00:00Z", "disposition": null,
+   "outcome": {"operation": "approve", "record": "01a2...", "at": "2026-10-21T09:00:00Z"},
+   "items": [], "next_contribution": null},
+  {"round": 2, "contribution": "01a0...", "commit": "...", "disposition": "superseded",
+   "outcome": {"operation": "request-changes", "record": "01a1..."},
+   "summary": {"text": "...", "omitted_chars": 0},
+   "items": [{"request": "01a1...", "id": "B1", "severity": "blocking",
+              "text": {"text": "...", "omitted_chars": 0}, "state": "answered",
+              "reason": {"text": "...", "omitted_chars": 0}, "evidence": "comment:01a1...",
+              "by": "respond", "record": "01a1..."}],
+   "next_contribution": "01a1..."}],
+ "coverage": {"records": 9, "malformed": 0, "proved": true}}
 ```
 
-**Bounds:** at most 20 rounds (the rest counted in `rounds_omitted`), at most 50 items per round,
-and every text an excerpt object clipped to 200 characters.
+**Each item's `state`** is derived from the chain, never stored:
+- `open`: requested, with no resolution yet;
+- `answered`: the task's side resolved it with `respond`, giving a `reason` and `evidence`;
+- `settled`: the requester closed it with `resolve-item`;
+- `withdrawn` or `superseded`: the round's contribution carries that disposition before the item
+  was answered.
 
-**Source:** the same review-state projection that `review TASK`, `work` and `brief` share, so the
-rounds view cannot disagree with them about what is approved or integrated. I did not read that
-module for this note. Slice 3 confirms the names `outcome`, `response` and `in_round` against it, and
-uses its words where they differ.
+`settled` means the chain proves the item no longer blocks that round. It does **not** mean
+integrated or deployed. A new contribution alone settles nothing. A `note` item is shown with its
+`severity` and never counted as blocking.
+
+**`coverage.proved`** is false when an old or malformed chain cannot prove a state. Those items read
+`unknown`, with a warning, rather than being guessed.
+
+**Bounds:** at most 20 rounds (the rest counted in `rounds_omitted`), at most 50 items per round,
+and every text escaped (`plain_text`) and clipped to 200 characters. `evidence` is kept whole up to
+its existing 240-character limit, because it is a pointer field (§2.1).
+
+**Source.** The view uses the same chain walk that `review TASK`, `work` and `brief` share, so it
+cannot disagree with them about what is approved. Slice 3 confirms the derived states against
+`review_state.py`, which I have not read.
 
 **What it answers.** A new lane taking over a task reads one page and sees:
 - what was asked in each round;
-- what the answer was;
+- how each item was answered or settled;
 - what is still open.
 
-It then follows a `comment:` pointer only for the item it needs. Nothing is written: no summary
-record, no "round digest", because those would be a second copy that could drift from the records.
+It then follows a pointer only for the item it needs. Nothing is written: no summary record, no
+"round digest", because those would be a second copy that could drift from the records.
 
 ### 2.5 (e) Lane facts: `lane.NAME.*` reference entries
 
@@ -349,26 +392,84 @@ reference entries is a real need, but it is outside this design (§9).
 
 ### 2.6 What this reuses, and what it deliberately does not
 
-- **Reused unchanged:**
-  - the checkpoint and its `transition()` rule;
-  - `lane-state-v1` and `lanes`;
-  - the reference catalog;
-  - capability records;
-  - the review records and their shared projection;
-  - task files and rooms, as pointer targets only;
-  - `briefing.clip`, and the hidden-surface filter list.
+- **Reused unchanged:** the checkpoint and `transition()`, `lane-state-v1` and `work lanes`, the
+  reference catalog, capability records, the review chain and its shared projection,
+  `briefing.plain_text` and `clip`, and the hidden-surface filter list. Task files and rooms are
+  pointer targets only.
 - **Not used:**
-  - the open-item records of OPEN_ITEMS_DECISIONS_DESIGN. They are not built (slice 0). This design
-    does not depend on them, and is ready for them through the `item:` pointer: when they land, a
-    checkpoint item can point at its record.
+  - the open-item records of OPEN_ITEMS_DECISIONS_DESIGN, which are not built (slice 0). The
+    `item:` pointer is ready for them;
   - room items and the scribe (not built);
-  - `lane-state-v1` as a note carrier. It holds a wait state, not notes, and stays so.
-- **Not invented:**
-  - a "context" record kind;
-  - a notes record;
-  - a digest;
-  - a summary written by a timer;
-  - a field on the session registry.
+  - `lane-state-v1` as a note carrier: it holds a wait state and stays so.
+- **Not invented:** a "context" record kind, a notes record, a digest, a summary written by a timer,
+  or a field on the session registry. The one new piece of state is the standing-task journal
+  (§2.7), and it is an authority for an exemption, not a store of context.
+
+### 2.7 Standing tasks: exempt from the claim limit and from "your move"
+
+**The problem** (found by the review; both notes missed it). A standing task is `in_progress` and
+assigned, with review state `none`, so today it is held work twice over:
+- **Claim limit.** `claim_limit.counted` counts it, and the default limit is 1. A lane holding its
+  lane task is refused every real claim.
+  - If its checkpoint leaves a `dependency`, `claim_limit.blocked` moves it out of the active slot.
+    It still counts toward `hard_cap`.
+  - That relief depends on what the lane last wrote, so it is no exemption.
+- **Whose move.** `work.move_decision` reads a claimed, undelivered task as the holder's move. So
+  the task:
+  - wakes `wait` for ever;
+  - counts in `your_move`;
+  - raises `your_move_idle` on the lane board as soon as the lane is quiet for the threshold.
+
+**The exemption.** A row is an **exempt standing task** when all four of these hold:
+1. it carries the label `standing-task`;
+2. a host journal entry exists for it, `.standing-tasks/<sha256 of the task id>.json`, holding
+   `{task, holder, kind: "coordinator"|"lane", granted_by, granted_at, operation_id}`;
+3. its assignee equals the entry's `holder`;
+4. it is the holder's only exempt row. If the journal names two tasks for one holder in one
+   project, the older grant is exempt, the newer counts normally, and `work lanes` warns.
+
+**Why a journal and not only the label.** A label is a raw tracker field. `bd history` shows
+previous values but no author, and an older kit does not reserve the label. So the label alone
+cannot say who granted the exemption. That would make it a way round the claim limit that any
+contributor could take. The host journal is the authority, as it is for task files
+(`task_files.py`: "the reserved comment is the history record, not its authority"). The label is
+the visible mirror that every reader, an older kit included, can see.
+
+**Who may grant it.** Only the coordinator, through two new endpoint operations: `standing grant
+TASK --holder ACTOR --kind lane|coordinator` and `standing revoke TASK`.
+- They run on the host route and on the bound-key `coordinator` route, under the project's
+  coordination lock, after `keyed_records.require_configured_operator` or the coordinator-grant
+  check.
+- They write the journal entry and set or remove the label in one operation, retried by
+  `operation_id`.
+- **Guard.** `standing-task` joins `reserved_comments.RESERVED_EXACT_LABELS`, the way `gt:slot` is
+  protected: no contributor adds, removes or replaces it on any row, on any route. Before the slice
+  ships, an `admin.py standing-label-check` lists any project already using the label.
+
+**What the exemption changes, and nothing else:**
+- **Claim limit.** `claim_limit.counted` returns false for an exempt row, so it is neither active
+  held work nor counted toward `hard_cap`. Every other rule is unchanged.
+- **Moves.**
+  - `work.move_decision` returns `whose_move: "none"` and `next_actor: "none"`, with the sentence
+    "Standing task: its checkpoint is the holder's live list, not a move."
+  - Exempt rows are left out of `your_move`, of `wait` items and of the `work lanes` held set.
+  - The lane board's `your_move_idle` never fires on them. Their own freshness is
+    `lane_task_stale` (§5.2), a different flag with its own threshold.
+- **No delivery.** `review TASK --file` with `contribute` on an exempt row is refused ("a standing
+  task is never delivered; deliver on the task it points at"), so it never enters a review state.
+  It is never `claimable`: the claimability rule gains the exempt predicate.
+- **Revoke and close.**
+  - `standing revoke` removes the journal entry and the label, and the row becomes ordinary held
+    work at once.
+  - Closing the task, as when a lane is retired (§2.3), ends the exemption with it.
+  - Reassigning the task to an actor other than the entry's `holder` ends it until the coordinator
+    grants again for the new holder. That is the new-actor move of §2.3.
+
+**Rollback.** An older kit knows neither the journal nor the label. There the standing task counts
+again, which is today's behaviour: no leak, but the lane's claims may be refused. The coordinator
+can either unassign standing tasks before rolling back or raise those lanes' limits, and the
+release notes of slice 2 say so. A label added through an older kit during a rollback grants
+nothing after the upgrade, because it has no journal entry.
 
 ## 3. Read paths, and their size bounds
 
@@ -380,7 +481,7 @@ reference entries is a real need, but it is outside this design (§9).
 | --- | --- | --- |
 | 1 | `guidance get` | the guidance text (a few KB) |
 | 2 | `brief kittrial-5bb.391` | a compact brief (about 6 KB in practice), first 10 open items plus `carry_open_items`, pointers resolved within §2.1.2's bounds |
-| 3 | `lanes` | a row cap with `next_offset` (LANE_BOARD_DESIGN §3) |
+| 3 | `work lanes` | a row cap with `next_offset` (LANE_BOARD_DESIGN §3) |
 | 4 | `work` | the existing queue, paged |
 
 **A fresh worker session:**
@@ -414,16 +515,11 @@ A session follows only the pointers it needs for the move it is about to make.
 
 ### 3.3 What is never loaded unless asked
 
-The following are never loaded unless the session asks for them:
-- `history` beyond a page, and `show`, which can exceed a tool's output limit (BRIEFINGS.md);
-- superseded checkpoints;
-- review rounds older than the newest (until `review --rounds` is asked);
-- room messages;
-- task-file bytes;
-- comment bodies other than the record a pointer names;
-- the coordinator's and lanes' archived flat files.
-
-No read in this design returns any of them by default.
+Never loaded unless the session asks, and returned by default by no read in this design:
+- `history` beyond a page, and `show` (which can exceed a tool's output limit);
+- superseded checkpoints, and review rounds before the newest;
+- room messages, task-file bytes, and comment bodies other than the record a pointer names;
+- the archived flat files.
 
 ## 4. Search: `find`
 
@@ -431,7 +527,7 @@ No read in this design returns any of them by default.
 
 ```
 find PHRASE [--kind ref|cap|decision|checkpoint|review|task]... [--task TASK] [--state open|all]
-            [--limit N] [--offset N]
+            [--limit N] [--cursor C]
 ```
 
 It is an endpoint action, read-only, safe on the contributor route. It is also exposed later at
@@ -442,7 +538,7 @@ It is an endpoint action, read-only, safe on the contributor route. It is also e
 - `--task` restricts results to one task's checkpoint, review records and the records that point at
   it.
 - `--state open` (the default) leaves out documents from closed tasks. `all` includes them.
-- `--limit` 1..20 (default 10), and `--offset` of at least 0.
+- `--limit` 1..20 (default 10), and `--cursor` from the previous page.
 
 ### 4.2 The corpus: what is searched, and what is not
 
@@ -508,10 +604,26 @@ in the caller's corpus only if the kind's own read would show it to that caller:
 Indexing either would mean re-implementing that rule inside search, and a second implementation of
 an access rule is the classic leak. A later slice may add them only by calling their own predicate.
 
+**Permission comes first** (from the twin note). The caller's corpus is filtered *before* anything
+is scored, excerpted, counted or paged:
+- a filtered-out document never reaches ranking, `total`, `coverage.documents`, a warning or an
+  error sentence;
+- so neither a count nor a page boundary can reveal that a hidden document matched.
+
+**Cursors are bound to the caller.** The page position is returned only inside an opaque `cursor` binding:
+- the project, the phrase and the filters;
+- the read-cache generation;
+- a digest of the caller's **visibility scope**: the route, the key's principal and its scopes.
+
+A cursor presented under another scope, or after the generation changed, is refused with "start
+the search again", so a cursor cannot be handed to a caller with less access.
+
 ### 4.5 The answer, and its bounds
 
 ```json
-{"schema": "find-v1", "phrase": "load rule", "total": 4, "next_offset": null,
+{"schema": "find-v1", "phrase": "load rule", "total": 4, "cursor": null,
+ "watermark": {"generation": "<read-cache key>", "computed_at": "2026-10-24T01:00:00Z"},
+ "stale": "current", "warnings": [],
  "items": [
   {"kind": "ref", "pointer": "ref:host.build.load-rule", "trust": "accepted",
    "title": {"text": "Build host load rule", "omitted_chars": 0},
@@ -519,18 +631,30 @@ an access rule is the classic leak. A later slice may add them only by calling t
    "at": "2026-10-10T08:00:00Z", "rank": 1}],
  "coverage": {"kinds": ["ref", "cap", "decision", "checkpoint", "review", "task"],
               "documents": 5321, "skipped_malformed": 2, "truncated": false,
-              "not_searched": ["superseded checkpoints", "comments", "rooms", "task files"],
-              "generation": "<read-cache key>"}}
+              "not_searched": ["superseded checkpoints", "comments", "rooms", "task files"]}}
 ```
 
 Every text in the answer is untrusted data, carried the way §2.1.3 says.
+
+**The envelope** (from the twin note) is the same on every new read: `find`, `review --rounds` and
+the `pointers` block of `brief`:
+- `coverage`: what was searched and what was not, malformed records skipped, and whether a cap
+  truncated the answer;
+- `watermark`: the read-cache generation the answer was computed from, and when;
+- `stale`, one of:
+  - `current`: computed from the generation that is current now;
+  - `lagging`: a write landed while the answer was being built;
+  - `partial`: some records could not be read;
+  - `unknown`.
+
+A reader can therefore always tell "nothing matched" from "not everything was looked at".
 
 **Bounds:**
 - the phrase is at most 200 characters;
 - at most 20 items a page;
 - every text is an excerpt object of at most 200 characters, escaped;
 - the whole answer is at most 16 KB, and `truncated` says when the cap cut it;
-- `next_offset` pages the rest.
+- the opaque `cursor` pages the rest (bound to the caller, §4.4).
 
 The answer carries **pointers**, so the session follows one with one read (§3.2) rather than
 receiving the record.
@@ -541,7 +665,7 @@ receiving the record.
 and nothing to keep in step.
 
 **Input.** The input is the project's native export, which carries rows and their comments (the
-activity feed and `lanes` are built from it). Since kittrial-5bb.339, `read_cache.py` serves that
+activity feed and `work lanes` are built from it). Since kittrial-5bb.339, `read_cache.py` serves that
 export from one cache file keyed by the tracker's Dolt HEAD:
 - a `find` after any other read with no write in between pays no `bd` export;
 - a `find` after a write pays the one re-export that the next `work` or `brief` would pay anyway.
@@ -571,9 +695,18 @@ the bound below is what the slice must prove.
 - **acceptance:** on a copy of a kittrial-sized export with a warm read cache, `find` answers within
   3 seconds at the 95th percentile, measured on the build host the suite already uses.
 
-**If that bound fails,** the next step is a per-process memo of the built corpus, keyed by the same
-read-cache generation. It is still derived, and still rebuilt on any write. Only after that is a
-cache file beside the project considered, which reopens Q3 with the measurement in hand.
+**If that bound fails,** the next step is a **memo** of the built corpus, and it must not become a
+second store:
+- **Keyed** by the read-cache generation plus the caller's scope digest, so a write (a new
+  generation) or another scope never reuses it.
+- **In memory only**, in the endpoint process. It is never written to disk, never backed up, never
+  restored and never read by another process. Losing it costs one rebuild and loses no fact.
+- **Bounded** to the newest two generations and a fixed byte budget, evicted least-recently-used.
+- **Never a source of truth.** An answer served from it carries the same watermark it was built
+  under, and a record it holds is never newer than the export it was built from.
+
+Only if the memo also fails the bound is a rebuildable cache file beside the project considered,
+which reopens Q3 with the measurement in hand.
 
 ## 5. Staying current without becoming a second log
 
@@ -602,7 +735,7 @@ So what a reader reads first is the state now, not the sum of everything.
 | a reference entry is past `review_by` | `ref list --due expired`, `work` attention (existing) | existing |
 | a pointer no longer resolves, or names a superseded record | `brief`, beside the item (`state: missing` or `superseded`) | §2.1.2 |
 | a standing task (coordinator or lane) has newer activity than its newest checkpoint | `brief` (`newer_activity`, existing) | existing |
-| a lane task's newest checkpoint is older than the `lanes` threshold while the lane holds work | the `lanes` row: one new flag, `lane_task_stale`, computed like `waiting_too_long` | slice 2 |
+| a lane task's newest checkpoint is older than the `work lanes` threshold while the lane holds work | the `work lanes` row: one new flag, `lane_task_stale`, computed like `waiting_too_long` | slice 2 |
 | an open item in a standing task points only at closed or integrated things | `brief`: a warning "every pointer of item X is settled" | slice 5 |
 | a lane fact's actor no longer matches the registry | `ref check` (the catalog's own check) | slice 5 |
 
@@ -619,10 +752,15 @@ The handover log is about 5,300 lines, append-only, and private. It is migrated 
 checklist. **There is no importer in v1.** An importer would have to parse prose and would turn
 guesses into records with authority. The checklist:
 
-1. **Live state first.** Write .391's checkpoint from what is in flight today: one open item per
-   delivery, release, question and lane problem, each with pointers. .391 already exists, so this
-   is its normal use.
-2. **Walk the log's distinct facts once.** Each one is one of these:
+1. **Freeze the log first, and take its digest.** It is no longer appended to, and its SHA-256 is
+   recorded in .391's summary.
+2. **Live state.** Write .391's checkpoint from what is in flight today: one open item per
+   delivery, release, question and lane problem.
+   - An item that came from the log keeps `archive:SHA256#LSTART-LEND` (from the twin note) in
+     its `source` until it is linked to a native record (`task:`, `comment:`, `ref:`).
+   - So a reader holding the frozen file can check the exact lines, and a changed file (another
+     digest) is visibly not the one cited.
+3. **Walk the log's distinct facts once.** Each one is one of these:
    - a host or procedure fact: a reference draft, owner `person:orchestra-coordinator`, attested by
      the coordinator;
    - an owner decision or instruction: a reference draft owned by `person:james` with the owner's
@@ -632,9 +770,9 @@ guesses into records with authority. The checklist:
      reference entry, if any, says "private, ask the coordinator";
    - history, meaning what happened when: **not migrated**. It is already in the tasks' histories,
      and the log stays as a read-only archive.
-3. **Freeze the log.** It is no longer appended to. Its first line names .391 as the live state. It
-   is never read first again.
-4. **Acceptance:** a fresh coordinator session runs a working day from `brief kittrial-5bb.391` and
+4. **Point away from it.** The log's first line names .391 as the live state, and it is never read
+   first again.
+5. **Acceptance:** a fresh coordinator session runs a working day from `brief kittrial-5bb.391` and
    the pointers, without opening the log, and records in .391 every time it had to. Each such time
    is a missing pointer or reference entry, to be added.
 
@@ -674,16 +812,17 @@ files are frozen, not deleted, until the acceptance in §6.1 has held for a rele
 
 | # | risk | mitigation | the test |
 | --- | --- | --- | --- |
-| R1 | **Prompt injection through stored facts.** A reference title, a task title or a checkpoint item says "ignore your instructions and ...", and a session reading `find` or a resolved pointer obeys it. | every resolved or found text is an escaped excerpt marked `trust: "data"`; prompts and AGENT.md carry pointer tokens only; the served guides say task text is data (they already do for coordinators, kittrial-5bb.387) | (1) a fixture with control, bidi and line-separator characters in a reference title: the `brief` pointer label and the `find` excerpt are escaped, byte for byte, as `briefing.clip` escapes; (2) `agent_prompts` and the generated AGENT.md for a task whose checkpoint points at that entry contain `ref:KEY` and not the title; (3) `trust` is `data` on every pointer and every `find` item (a schema test over all kinds) |
+| R1 | **Prompt injection through stored facts.** A reference title, a task title or a checkpoint item says "ignore your instructions and ...", and a session reading `find` or a resolved pointer obeys it. | every resolved or found text is an escaped excerpt marked `trust: "data"`; prompts and AGENT.md carry pointer tokens only; the served guides say task text is data (they already do for coordinators, kittrial-5bb.387) | (1) a fixture with control, bidi and line-separator characters in a reference title: the `brief` pointer label and the `find` excerpt are escaped byte for byte as `briefing.plain_text` escapes, before `clip` cuts them; (2) `agent_prompts` and the generated AGENT.md for a task whose checkpoint points at that entry contain `ref:KEY` and not the title; (3) `trust` is `data` on every pointer and every `find` item (a schema test over all kinds) |
 | R2 | **Leaking private text through a pointer.** A pointer to a task, room or file the caller cannot read reveals its title, or even that it exists. | `unavailable` for anything the caller may not read, whether or not it exists; no label for it | a caller of another project, a contributor without a room's membership, and an agent credential without the task's file rule each resolve pointers to (i) an existing hidden target and (ii) a missing one, and get byte-identical answers |
 | R3 | **Leaking private text through search.** `find` returns a document the caller could not read with that kind's own read. | the corpus is built per caller from each kind's own predicate (§4.4); rooms and files excluded in v1 | for every kind, a caller who lacks the kind's read is given a phrase that matches exactly one hidden document, and gets `total: 0`; a member of another project gets the project refusal before any read |
 | R4 | **Private values in public places.** A lane migrates a private address into a reference entry or a checkpoint. | the §2.3 table and the §6 checklist say where private values stay; reference entries are accepted by the coordinator, who checks; the public repository holds placeholders only | a review of the migration (§6.1 step 4) and of each accepted `lane.*` entry; the repository's existing privacy check over this note's examples (placeholders only) |
 | R5 | **Drift: a pointer that lies.** An item points at a record that was later superseded, and a reader trusts it. | resolution states `superseded` or `missing`; `live` means "exists", never "agrees" | a fixture where the pointed reference is retired and a contribution superseded: `brief` shows `superseded` for both; a fixture with a deleted comment id shows `missing`, and the checkpoint stays valid and publishable |
 | R6 | **Drift: the index disagrees with the records.** | no stored index in v1; `find` is computed from the same export as `work` and `brief` | after a write, the next `find` sees it (the read-cache key changes): write a reference draft, then `find` its key, in the same test |
-| R7 | **Breaking an older kit.** A newer checkpoint, or a lane task, cannot be read or re-published by an older kit. | the grammar lives in existing string fields; the lane task is an ordinary task with an existing label; no record kind or field is added | run the older release's `checkpoint_problems` and `transition` on a checkpoint whose items carry pointers: valid, and carried byte for byte; publish the next checkpoint with the older kit |
+| R7 | **Breaking an older kit.** A newer checkpoint, or a lane task, cannot be read or re-published by an older kit. | the grammar lives in existing string fields; to an older kit a standing task is an ordinary task with an unknown label (it then counts as held work again, §2.7); no record kind or checkpoint field is added | run the older release's `checkpoint_problems` and `transition` on a checkpoint whose items carry pointers: valid, every item matched by id and its source kept; publish the next checkpoint with the older kit |
 | R8 | **Second log by the back door.** Standing tasks grow without bound, or are written every run. | the existing caps (100 items, 80 KB); the "one item per live thing, settled things leave" rule; no timer writes | the existing checkpoint limit tests; slice 5's warning "every pointer of item X is settled" has a fixture |
 | R9 | **Cost.** `find` is too slow on a large project and becomes a timeout. | the bounds of §4.6, the read cache, the document and size caps | the 95th-percentile bound of §4.6 on a kittrial-sized fixture, plus a test that a corpus over 10,000 documents reports `truncated` |
 | R10 | **Pointer misparse.** Prose such as "commit:abc" in a sentence is read as a pointer and shown as missing, confusing a reader. | missing is information only; prose is never refused | a table test of the grammar: matching tokens, near-misses (`task:` with no value, upper-case kinds, characters outside the set) and long fields, each with its expected `pointers` output |
+| R11 | **The standing exemption as a way round the claim limit.** A lane labels ordinary work `standing-task` to hold more than its limit, or to hide a stalled task from the board. | the label is reserved (no contributor writes it on any route); the exemption needs the coordinator-written host journal and a matching holder; one exempt row per holder; an exempt row can never be delivered or claimed | (1) a contributor's raw label add or remove is refused on the SSH and HTTP routes; (2) a row with the label and no journal entry counts against the limit and reads as the holder's move; (3) with an entry, a lane at limit 1 holding its lane task can claim one real task, and the claim is refused at the second; (4) a second grant for the same holder leaves the newer row counted, with the `work lanes` warning; (5) reassigning the row ends the exemption; (6) `wait` and `your_move` leave out exactly the exempt row; (7) `contribute` on it is refused |
 
 ## 8. Slices (five, each deliverable alone)
 
@@ -697,13 +836,21 @@ rolled back by redeploying the previous release with nothing to undo.
 - Tests: R1 (1) and (3) for the brief surface, R2, R5, R7, R10.
 - Depends on nothing.
 
-**Slice 2: standing lane tasks.**
-- Docs: the lane task convention (label `lane-task`, title, discipline) and the retire and move
-  procedures of §2.3, in WORKER_GUIDE and OPERATIONS.
-- `lanes` gains `lane_task` and `lane_task_stale`.
-- The `lane.NAME.*` key convention is documented in the reference catalog page.
-- Tests: the `lanes` row with zero, one and two lane tasks; reassignment moves the row; the stale
-  flag; the contributor route sees only its own row's `lane_task` (the lanes rule).
+**Slice 2: standing tasks and lane tasks.**
+- The exemption of §2.7:
+  - the `standing grant` and `standing revoke` operations on the coordinator and host routes;
+  - the `.standing-tasks/` journal, carried in the coordination backup;
+  - `standing-task` in `RESERVED_EXACT_LABELS`, after `admin.py standing-label-check`;
+  - the exempt predicate in `claim_limit.counted`, `work.move_decision`, `wait`, the claimability
+    rule and `contribute`.
+- `work lanes` gains `lane_task` and `lane_task_stale`.
+- Docs: the lane-task discipline and the retire and move procedures of §2.3 (WORKER_GUIDE,
+  OPERATIONS), and the `lane.NAME.*` key convention (reference catalog page).
+- Tests:
+  - R11 (1) to (7);
+  - the `work lanes` row with zero, one and two standing tasks;
+  - the contributor route sees only its own row's `lane_task`;
+  - an older kit's restore of a backup carrying the journal.
 - Depends on nothing. It uses slice 1's pointers when present, but does not need them.
 
 **Slice 3: `review TASK --rounds`.**
@@ -717,7 +864,8 @@ rolled back by redeploying the previous release with nothing to undo.
 **Slice 4: `find`.**
 - The endpoint action and client command; the corpus, ranking and bounds of §4; HTTP afterwards, in
   the same slice or the next release.
-- Tests: R1 (find surface), R3, R6, R9, and ranking (exact key first, then score, then trust).
+- Tests: R1 (find surface), R3 (with counts and a cursor replayed under a narrower scope), R6, R9,
+  the envelope's `stale` values, and ranking (exact key first, then score, then trust).
 - Depends on nothing. It returns pointers whether or not slice 1 is deployed.
 
 **Slice 5: stale flags, and the migration.**
@@ -740,13 +888,11 @@ Slice 4 is the largest and benefits from the others' records being in place.
   §6.1) rather than inventing a visibility rule inside it. A per-entry visibility class belongs to
   the reference catalog's own design.
 - **Cross-project search.** Not designed. `find` is project-scoped, like every read here.
-- **Open-item and decision records.** When OPEN_ITEMS_DECISIONS_DESIGN's later slices ship:
-  - `item:` pointers resolve to them;
-  - `find` gains the `item` kind;
-  - a standing task's question items may move to owner-question records.
-
-  Nothing here needs to change for that.
+- **Open-item and decision records.** When OPEN_ITEMS_DECISIONS_DESIGN's later slices ship, `item:`
+  pointers resolve to them, `find` gains the `item` kind, and a standing task's question items may
+  move to owner-question records. Nothing here needs to change for that.
 - **Rooms and task files in search.** Excluded from v1 (§4.4). They come only by calling their own
   access predicates.
-- **An importer for flat files.** Not in v1 (§6.1). If the checklist proves too slow, an importer
+- **An importer for flat files.** Not in v1 (§6.1). The twin note proposes a one-shot importer
+  with a dry run and a mapping file. If the checklist proves too slow, an importer
   that writes **drafts only** is the next step, as `ref import` already proposes.
