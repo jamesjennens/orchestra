@@ -98,7 +98,7 @@ class ReviewRoundTests(fixture.ChainHarness):
         self.assertEqual(note['disposition'], 'note')
         self.assertEqual(note['by'], 'resolve-item')
 
-    def test_attestations_and_holds_stay_on_their_round_and_link_releases(self):
+    def test_attestations_stay_on_their_round_and_holds_link_releases(self):
         contribution = self.send(self.contribution())['comment_id']
         attestation = self.send(self.attest(contribution, sha256=fixture.SHA_1, bytes=4096))['comment_id']
         hold = self.send(self.hold(contribution))['comment_id']
@@ -108,6 +108,96 @@ class ReviewRoundTests(fixture.ChainHarness):
         self.assertEqual(round_['attestations'][0]['verdict'], 'verified')
         self.assertEqual(round_['holds'][0]['record'], hold)
         self.assertEqual(round_['holds'][0]['released_by'], release)
+
+    def test_scoped_integration_is_shared_for_matching_and_other_commits(self):
+        def scope(commit):
+            return [{
+                'scope': {'source_commit': commit, 'integration_commit': 'd' * 40,
+                          'release_id': '', 'environment': 'development'},
+                'scope_token': 'scope-' + commit[0], 'order': 1,
+                'integrated': {'value': 'passed', 'event_id': 'integration-1', 'order': 1},
+            }]
+
+        first = self.approved()
+        for commit, expected in ((fixture.COMMIT_1, 'integrated'),
+                                 ('e' * 40, 'awaiting-integration')):
+            with self.subTest(commit=commit):
+                round_ = review_rounds.read(
+                    self.issue, scope(commit), operators=[fixture.OPERATOR])['rounds'][0]
+                self.assertEqual(round_['review_state'], expected)
+                self.assertEqual(round_['workflow_state'], 'awaiting-integration')
+                self.assertEqual(round_['integration']['matches_contribution'],
+                                 commit == fixture.COMMIT_1)
+
+        second = self.approved(commit=fixture.COMMIT_2)
+        rounds = review_rounds.read(
+            self.issue, scope(fixture.COMMIT_1), operators=[fixture.OPERATOR])['rounds']
+        self.assertEqual([round_['contribution'] for round_ in rounds], [second, first])
+        self.assertEqual([round_['review_state'] for round_ in rounds],
+                         ['awaiting-integration', 'integrated'])
+        self.assertEqual(rounds[0]['integration']['fact'], 'unknown')
+        self.assertEqual(rounds[1]['integration']['fact'], 'passed')
+
+    def test_open_holds_are_carried_into_each_later_round(self):
+        first = self.send(self.contribution())['comment_id']
+        self.send(self.attest(first, sha256=fixture.SHA_1, bytes=4096))
+        hold = self.send(self.hold(first))['comment_id']
+        self.send(self.payload('approve', contribution=first, summary='Approved'), fixture.REVIEWER)
+        second = self.send(self.contribution(commit=fixture.COMMIT_2))['comment_id']
+        self.send(self.payload('approve', contribution=second, summary='Approved again'),
+                  fixture.REVIEWER)
+
+        result = self.read()
+        self.assertEqual([round_['review_state'] for round_ in result['rounds']], ['held', 'held'])
+        self.assertEqual([[item['record'] for item in round_['holds']]
+                          for round_ in result['rounds']], [[hold], [hold]])
+        self.assertTrue(all(round_['holds'][0]['released_by'] is None
+                            for round_ in result['rounds']))
+        self.assertEqual(result['rounds'][0]['review_state'], self.shared()['review_state'])
+
+    def test_releasing_a_carried_hold_does_not_rewrite_the_earlier_round(self):
+        first = self.send(self.contribution())['comment_id']
+        hold = self.send(self.hold(first))['comment_id']
+        second = self.send(self.contribution(commit=fixture.COMMIT_2))['comment_id']
+        release = self.send(self.release_hold(second, hold))['comment_id']
+
+        rounds = self.read()['rounds']
+        self.assertEqual(rounds[0]['holds'][0]['released_by'], release)
+        self.assertEqual(rounds[0]['holds'][0]['release_reason']['text'],
+                         'Hold cleared after re-verification')
+        self.assertIsNone(rounds[1]['holds'][0]['released_by'])
+        self.assertEqual(rounds[0]['review_state'], 'awaiting-review')
+        self.assertEqual(rounds[1]['review_state'], 'awaiting-review')
+
+    def test_follow_on_relation_marks_the_prior_round_followed(self):
+        first = self.stored(self.contribution())
+        self.stored(self.payload('approve', contribution=first, summary='Approved'),
+                    fixture.REVIEWER)
+        second = self.stored(self.contribution(
+            commit=fixture.COMMIT_2, supersedes=None, follows=first))
+        rounds = self.read()['rounds']
+        self.assertEqual(rounds[1]['disposition'], 'followed')
+        self.assertEqual(rounds[1]['next_contribution'], second)
+        self.assertEqual(rounds[0]['follows'], first)
+
+    def test_clipping_does_not_split_an_escape(self):
+        hostile = ('x' * 199) + '\x1b' + 'tail'
+        contribution = self.stored(self.contribution(summary=hostile))
+        request = self.stored(self.payload('request-changes', contribution=contribution,
+                                          items=[{'id': 'escape', 'text': hostile}]), fixture.REVIEWER)
+        evidence = ('x' * 239) + '\x1b' + 'tail'
+        self.stored(self.payload('respond', contribution=contribution, resolutions=[
+            {'request': request, 'item': 'escape', 'reason': 'Checked', 'evidence': evidence},
+        ]))
+        round_ = self.read()['rounds'][0]
+        self.assertEqual(round_['summary'], {'text': 'x' * 199, 'omitted_chars': 10})
+        self.assertEqual(round_['items'][0]['text'],
+                         {'text': 'x' * 199, 'omitted_chars': 10})
+        self.assertEqual(round_['items'][0]['evidence'], 'x' * 239)
+        self.assertEqual(round_['items'][0]['evidence_omitted_chars'], 10)
+        self.assertNotIn('\\u001', round_['summary']['text'])
+        exact = review_rounds._text('x' * 199 + '\\')
+        self.assertEqual(exact, {'text': 'x' * 199 + '\\', 'omitted_chars': 0})
 
     def test_twenty_one_rounds_returns_the_newest_twenty(self):
         for number in range(21):

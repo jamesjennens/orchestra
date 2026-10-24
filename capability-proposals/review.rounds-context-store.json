@@ -8,24 +8,25 @@
     "review TASK --rounds",
     "what each review round settled"
   ],
-  "summary": "review_rounds.read projects the validated contribution-review chain into newest-first rounds and calls review_state.effective for the same outcomes as review TASK. It bounds rounds, items, attestations, holds and terminal-safe text, preserves item dispositions and evidence, reports malformed coverage without guessing, and writes no records. work.execute routes only review TASK --rounds to this read; client.py carries standalone usage only.",
+  "summary": "review_rounds.read projects the validated contribution-review chain into newest-first rounds and calls review_state.effective with scoped integration evidence for the same outcomes as review TASK. It bounds rounds, items, attestations, holds and terminal-safe text, carries open holds across revisions, preserves item dispositions and evidence, reports malformed coverage without guessing, and writes no records. work.execute routes only review TASK --rounds to this read; endpoint.py gives only that route a shared project lock, and client.py carries standalone usage only.",
   "requirements": [],
   "anchors": [
     "docs/design/CONTEXT_INDEX_DESIGN_CLAUDE.md#24-c-what-each-review-round-settled-review-task---rounds",
-    "docs/design/CONTEXT_INDEX_DESIGN_CLAUDE.md#8-delivery-slices"
+    "docs/design/CONTEXT_INDEX_DESIGN_CLAUDE.md#8-slices-five-each-deliverable-alone"
   ],
   "code": [
     "review_rounds.py::read",
     "review_rounds.py::format_text",
     "review_state.py::effective",
-    "review_state.py::project",
     "review_workflow.py::history",
     "review_workflow.py::projection",
-    "work.py::execute"
+    "work.py::execute",
+    "endpoint.py::coordination_lock_shared"
   ],
   "tests": [
     "tests/test_review_rounds.py",
     "tests/test_review_rounds_real_bd.py",
+    "tests/test_read_lock_concurrency.py",
     "tests/test_cli_contract.py",
     "tests/test_client_command_help.py",
     "tests/test_endpoint_help.py"

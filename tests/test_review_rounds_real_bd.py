@@ -53,6 +53,44 @@ class ReviewRoundRealBdTests(fixture.RulesHelpers, unittest.TestCase):
         self.assertEqual(round_['items'][0]['state'], 'answered')
         self.assertEqual(round_['items'][0]['evidence'], 'test:review-rounds-real-bd')
 
+    def test_open_hold_is_carried_into_the_next_round(self):
+        self.deployment(review_workflow_writes=True)
+        task = self.task('Review rounds carried hold fixture', assignee='worker')
+        first = json.loads(self.contribute(task, 'worker')['stdout'])['comment_id']
+        attested = self.post_review(task, 'ops', {
+            'schema_version': 1, 'operation': 'attest',
+            'operation_id': 'attest-' + secrets.token_hex(8), 'task': task,
+            'previous': first, 'contribution': first, 'verdict': 'verified',
+            'commit': fixture.COMMIT, 'base_commit': fixture.BASE,
+            'method': 'real-bd fixture attestation', 'reason': 'Fixture delivery checked',
+            'sha256': 'f' * 64, 'bytes': 4096,
+        })
+        attestation = json.loads(attested['stdout'])['comment_id']
+        held = self.post_review(task, 'ops', {
+            'schema_version': 1, 'operation': 'hold',
+            'operation_id': 'hold-' + secrets.token_hex(8), 'task': task,
+            'previous': attestation, 'contribution': first, 'reason': 'Keep integration held',
+        })
+        hold = json.loads(held['stdout'])['comment_id']
+        approved = self.post_review(task, 'reviewer', {
+            'schema_version': 1, 'operation': 'approve',
+            'operation_id': 'approve-first-' + secrets.token_hex(8), 'task': task,
+            'previous': hold, 'contribution': first, 'summary': 'Approved under hold',
+        })
+        approval = json.loads(approved['stdout'])['comment_id']
+        second = json.loads(self.contribute(
+            task, 'worker', commit='c' * 40, previous=approval, supersedes=first,
+        )['stdout'])['comment_id']
+        self.approve(task, 'reviewer', second)
+
+        bare = json.loads(self.endpoint('review', 'worker', [task])['stdout'])
+        rounds = json.loads(self.endpoint('review', 'worker', [task, '--rounds'])['stdout'])
+        self.assertEqual(bare['review_state'], 'held')
+        self.assertEqual([round_['review_state'] for round_ in rounds['rounds']], ['held', 'held'])
+        self.assertEqual([[hold['record'] for hold in round_['holds']]
+                          for round_ in rounds['rounds']], [[hold], [hold]])
+        self.assertIsNone(rounds['rounds'][0]['holds'][0]['released_by'])
+
 
 if __name__ == '__main__':
     unittest.main()

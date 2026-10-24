@@ -2,7 +2,7 @@
 
 import re
 
-from briefing import clip, plain_text
+from briefing import plain_text
 from review_state import effective
 
 
@@ -14,16 +14,26 @@ TEXT_LIMIT = 200
 EVIDENCE_LIMIT = 240
 
 
+def _safe_prefix(value, limit):
+    text = plain_text(value)
+    end = min(len(text), limit)
+    escape = text.rfind('\\', 0, end) if len(text) > limit else -1
+    if escape >= 0 and re.match(r'\\(?:u[0-9a-fA-F]{0,4})?$', text[escape:end]):
+        end = escape
+    return text[:end], max(0, len(text) - end)
+
+
 def _text(value, limit=TEXT_LIMIT):
     if value is None:
         return None
-    return clip(plain_text(value), limit)
+    text, omitted = _safe_prefix(value, limit)
+    return {'text': text, 'omitted_chars': omitted}
 
 
 def _pointer(value):
     if value is None:
         return None
-    return plain_text(value)[:EVIDENCE_LIMIT]
+    return _safe_prefix(value, EVIDENCE_LIMIT)[0]
 
 
 def _delivery(delivery):
@@ -53,7 +63,7 @@ def _item(entry):
         'record': entry.get('record'),
     }
     if entry.get('evidence') is not None:
-        answer['evidence_omitted_chars'] = max(0, len(plain_text(entry['evidence'])) - EVIDENCE_LIMIT)
+        answer['evidence_omitted_chars'] = _safe_prefix(entry['evidence'], EVIDENCE_LIMIT)[1]
     if entry.get('disposition') is not None:
         answer['disposition'] = entry['disposition']
     return answer
@@ -79,13 +89,13 @@ def _fold(ordered, voids, invalid, refused, positions, reverts, invalid_reverts,
     prefix = []
     current = None
 
-    def finish(next_contribution=None):
+    def finish(next_contribution=None, next_relation=None):
         if current is None:
             return
         if next_contribution is not None:
             current['next_contribution'] = next_contribution
             if current['disposition'] is None:
-                current['disposition'] = 'superseded'
+                current['disposition'] = 'followed' if next_relation == 'follows' else 'superseded'
         if current['disposition'] in ('withdrawn', 'superseded'):
             for entry in current['_items'].values():
                 if entry.get('state', 'open') == 'open':
@@ -109,7 +119,8 @@ def _fold(ordered, voids, invalid, refused, positions, reverts, invalid_reverts,
         cid = str(comment['id'])
         operation = payload['operation']
         if operation == 'contribute':
-            finish(cid)
+            relation = 'supersedes' if payload.get('supersedes') else 'follows'
+            finish(cid, relation)
             open_items = {key: _carried(entry) for key, entry in open_items.items()}
             prefix.append((payload, comment))
             current = {
@@ -130,7 +141,8 @@ def _fold(ordered, voids, invalid, refused, positions, reverts, invalid_reverts,
                 'next_contribution': None,
                 '_items': {key: _carried(entry) for key, entry in open_items.items()},
                 '_attestations': [],
-                '_holds': [],
+                '_holds': [dict(hold) for hold in hold_index.values()
+                           if hold['released_by'] is None],
             }
             continue
         if current is None:
@@ -192,8 +204,11 @@ def _fold(ordered, voids, invalid, refused, positions, reverts, invalid_reverts,
         elif operation == 'release-hold':
             hold = hold_index.get(payload['hold'])
             if hold is not None and hold['released_by'] is None:
-                hold['released_by'] = cid
-                hold['release_reason'] = _text(payload['reason'])
+                released = dict(hold, released_by=cid, release_reason=_text(payload['reason']))
+                hold_index[cid] = released
+                for shown in current['_holds']:
+                    if shown['record'] == payload['hold']:
+                        shown.update(released_by=cid, release_reason=released['release_reason'])
     finish()
     return rounds
 
