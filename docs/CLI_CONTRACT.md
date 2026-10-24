@@ -1915,7 +1915,8 @@ text: 1105 characters, the limit is 1000`, `resolutions[1] (item second) resolut
 reason: ...`, `open_items[0].text (id blocked-on-keys): ...`. `review --help`,
 `handoff --help` and `checkpoint --help` list every field limit in `limits`, from the
 same numbers the validators enforce, so a caller can read a limit instead of finding
-it by failing.
+it by failing. `review --help` keeps those record-validation limits in `limits` and
+lists the read-only rounds view's display bounds separately in `rounds_limits`.
 
 | Command | Option | Range |
 | --- | --- | --- |

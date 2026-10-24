@@ -335,7 +335,12 @@ class ReviewRoundRouteTests(fixture.ChainHarness):
         self.assertEqual(help_payload['usage'], 'review TASK [--rounds | --file payload.json]')
         self.assertIn('--rounds', [option['flag'] for option in help_payload['options']])
         self.assertIn(help_payload['usage'], client.contributor_command_help('review'))
-        self.assertEqual(help_payload['limits']['rounds / items per round'], '20 / 50')
+        self.assertEqual(help_payload['rounds_limits'], {
+            'rounds / items per round': '20 / 50',
+            'attestations / holds per round': '10 / 10',
+            'rounds text / evidence pointer': '<= 200 / <= 240 characters',
+        })
+        self.assertNotIn('rounds / items per round', help_payload['limits'])
 
 
 if __name__ == '__main__':

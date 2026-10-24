@@ -693,9 +693,11 @@ def help_payload(action='work'):
         ]
         import review_recommendations
         payload['limits'] = dict(review_workflow_limits(), **review_recommendations.help_limits())
-        payload['limits']['rounds / items per round'] = '20 / 50'
-        payload['limits']['attestations / holds per round'] = '10 / 10'
-        payload['limits']['rounds text / evidence pointer'] = '<= 200 / <= 240 characters'
+        payload['rounds_limits'] = {
+            'rounds / items per round': '20 / 50',
+            'attestations / holds per round': '10 / 10',
+            'rounds text / evidence pointer': '<= 200 / <= 240 characters',
+        }
     elif action == 'handoff':
         payload['operations'] = ['transfer (from_actor/to_actor)', 'request', 'disposition']
         payload['notes'] = ['A JSON file attachment is required; payload.task must equal TASK.']
