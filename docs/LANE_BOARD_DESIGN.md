@@ -169,6 +169,26 @@ its own lane's row**, and a **member of another project sees nothing** — the e
 `key_project_refusal` already enforces that before any read, and the board adds no new data path
 around it. **Both are tested.**
 
+### 3.1 Empty wakes (kittrial-5bb.397)
+
+A worker `wait` can wake because the fingerprint of its move rows changed while none of the changed
+rows is its move any more (the integrated-but-open case of kittrial-5bb.390 is the example): the
+worker is woken to find nothing. That is not hidden and not a second wake rule; the same read records
+it. Each lane row carries four additive fields outside the move fields and the three flags:
+
+- `empty_wakes_24h` — how many DIFFERENT wake fingerprints in the last 24 hours changed a row but
+  left no row that was the lane's move;
+- `empty_wake_task`, `empty_wake_trigger`, `empty_wake_at` — the newest one: its task, the field class
+  that changed (`new-comment`, `review-state`, `assignment`, `delivery`, `review-items`, `status`,
+  `guidance` or `edit`) and when.
+
+The record is one append-only JSONL per lane under the project's `.wait-wakes/` (a short hash of the
+actor names the file), capped at 4096 bytes / 64 entries / 24 hours, with the last-seen rows in a
+bounded `.last.json` beside it; it is written by the worker read itself, never by a tracker write,
+and a log error is swallowed into an answer `warnings` entry. The coordinator form gains an
+`empty-wake` trigger: one row per lane whose `empty_wakes_24h` is 3 or more. That group is part of the
+coordinator fingerprint only when it has a row, so an unchanged quiet answer keeps its old fingerprint.
+
 ## 4. The web: the Lanes panel
 
 The panel belongs on the **project page of the web service, for owners and coordinators**

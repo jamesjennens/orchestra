@@ -402,6 +402,25 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
             kept=holder_notices['items'][:20]
             lane['assignment_notices']={'items':kept,'total':holder_notices['total'],
                                         'omitted':max(0,holder_notices['total']-len(kept))}
+    # kittrial-5bb.397: each lane carries the count of its worker waits that woke with
+    # nothing to act on in the last 24 hours, and the newest one's task and trigger.
+    # Additive fields; they are not lane flags and they are not in the coordinator's
+    # stable move fields, so no existing row or fingerprint changes because of them.
+    if journal is not None:
+        import wake_log
+        wakes=wake_log.summaries(journal,[lane.get('actor') for lane in lanes],now=now)
+        for lane in lanes:
+            summary=wakes.get(lane.get('actor')) or wake_log.DEFAULT_SUMMARY
+            lane['empty_wakes_24h']=summary.get('empty_wakes_24h',0)
+            lane['empty_wake_task']=summary.get('empty_wake_task')
+            lane['empty_wake_trigger']=summary.get('empty_wake_trigger')
+            lane['empty_wake_at']=summary.get('empty_wake_at')
+    else:
+        for lane in lanes:
+            lane['empty_wakes_24h']=0
+            lane['empty_wake_task']=None
+            lane['empty_wake_trigger']=None
+            lane['empty_wake_at']=None
     if scope == 'own':
         lanes = [row for row in lanes if row['actor'] == actor]
     lanes.sort(key=lambda row: (0 if row['held'] else 1, 0 if row['flag_tasks'] else 1,
