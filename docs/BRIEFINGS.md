@@ -219,6 +219,53 @@ These eight fields have the same names and the same meaning on every route that 
 - **`wait_newer_activity_marker`** is the checkpoint-INDEPENDENT marker a worker's `wait` fingerprints (kittrial-5bb.369). `newer_activity_marker` is relative to the newest checkpoint, so the agent's own plan checkpoint both resets it and moves `checkpoint_at`; the next wait then returns once with nothing new. This marker is instead the newest entry by anybody other than the task's ASSIGNEE across the whole task history, folded with the current title/description/acceptance digest by the same `activity_marker` rule. It is `<entry_id>:<16 hex>`, or `fields:<16 hex>` when nobody else has written, and it moves for each new or edited other-party entry, for another actor's checkpoint, and for every edit of the three fields. The agent's own checkpoint, lane-state record and comments are its own entries (its actor is the assignee), so they never move it. It is computed even when the task has no checkpoint yet, so writing the FIRST one does not move the marker either; it is `null` only when the snapshot cannot be read. It rides beside the seven checkpoint-relative fields, and a worker's wait compares it INSTEAD OF `checkpoint_at`, `open_items`, `blocking_items`, `newer_activity` and `newer_activity_marker`; `review_state`, `whose_move`, `next_actor`, `owner` (assignment), `status` (claim/release), `pending_review_items`, `contribution_id` and `redelivered` are still compared directly. **The caller's own delivery or review response** takes the row out of its move, so the wait does not need to wake on it: the write's answer prints the post-write fingerprint to pass as `--since`.
 - `checkpoint.newer_activity` in `brief` is a different, older fact with its own name: the checkpoint is stale (its cursor no longer matches), own entries and task-state changes included.
 
+### New comments return an open task to its assignee (kittrial-5bb.390)
+
+A coordinator or owner can reach an assignee by commenting on the task even while
+its contribution awaits review or integration. The queue reports the task as the
+assignee's move until that assignee records a checkpoint or a valid structured
+review response after the comment. This also applies to a partly approved or
+integrated task kept open for its remainder. A closed task gains no comment
+attention. Existing unresolved review requests remain discoverable independently.
+
+`assignee_comment_pending` is the shared attention decision, alongside the review
+and lifecycle evidence. An `awaiting-review` contribution can therefore have
+`whose_move: you` and `next_actor: assignee`: the assignee must read the new comment;
+no approval, integration or other lifecycle fact has changed. A named reviewer
+still sees its own review assignment; assignee attention does not cancel it. An operator error
+still needs its operator. Only plain comments count: review, integration, scope,
+hand-back, receipt, lane-state, checkpoint and every other reserved record kind
+remain evidence and never add comment attention.
+
+The selection uses the existing `newer_selection` and `same_activity_actor` rules,
+including parent/sub-label ownership. The assignee's own comments do not add
+attention. A checkpoint by someone else does not acknowledge for the assignee.
+The author must currently be a project owner or coordinator, an agent with an
+effective coordinator grant, or a configured host operator (including its adopted
+session actor through the existing principal map). This is the current view on
+each read: granting a role makes an earlier unacknowledged plain comment count;
+removing the role makes it stop counting. No historical role is inferred or stamped.
+A response clears attention only when it comes from the validated linked review
+chain and its author is the assignee. Its boundary is its entry in the same ordered
+history; it does not claim new checkpoint digest coverage. Write a checkpoint when
+recording exact incorporation of an edited or backdated history entry is needed.
+Reading or posting an ordinary own progress comment acknowledges nothing.
+
+The `.351/.354` marker, count and coverage meanings remain unchanged. Worker wait
+continues to fingerprint the `.369` checkpoint-independent
+`wait_newer_activity_marker`; no second marker or polling clock is introduced.
+Two successive eligible plain comments each move it, while own comments and an
+unchanged reread keep it identical. Recording a checkpoint can clear the attention
+row; it does not move that wait marker by itself.
+
+`GET /v1/agents/me/next` offers `new-comments` for a delivered task needing this
+attention, with the same activity fields and a link to its brief/history. Its
+attention state is `working` while its persisted review state stays visible.
+`changes-requested` and undelivered work keep their existing action kinds. CLI
+`work --mine`, worker wait and HTTP worker wait use the same move decision. The
+`.379` coordinator wait retains its four trigger groups and shared CLI/HTTP
+fingerprint: a lane acknowledging a comment does not review or integrate a delivery.
+
 ### Changes since your checkpoint (kittrial-5bb.354)
 
 `brief` and the web task read carry `changes_since_checkpoint`, the section an agent reads first after a wake. The worker prompts say so.

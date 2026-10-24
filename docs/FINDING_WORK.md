@@ -329,3 +329,10 @@ the task's remaining scope if any, otherwise checkpoint that nothing remains for
 you. Deployment or verification may still be the coordinator's move; integration
 alone does not require the assignee to invent more implementation work. A closed
 task remains history, and an unassigned integrated task does not invent a holder.
+
+
+A comment from the coordinator or project owner reaches a held open task even
+while its contribution awaits review or integration. Read the linked newer
+comments and record a checkpoint or valid review response to acknowledge the
+next step. The review state remains visible. Own progress comments do not wake
+an unchanged wait. See [comment attention](BRIEFINGS.md#new-comments-return-an-open-task-to-its-assignee-kittrial-5bb390).

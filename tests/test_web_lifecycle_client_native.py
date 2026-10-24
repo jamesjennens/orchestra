@@ -56,7 +56,7 @@ class NativeLifecycleClientTests(RulesHelpers,unittest.TestCase):
             evidence=['synthetic waiting'],provenance='reported',trigger='Awaiting native evidence')))
         output=io.StringIO()
         with contextlib.redirect_stdout(output):
-            code=client_module.main(['--base-url',base,'--token',token,'lifecycle','pp',other,'fact',
+            code=client_module.main(['--base-url',base,'--token='+token,'lifecycle','pp',other,'fact',
                 '--dimension','implemented','--file',str(body),'--idempotency-key','native-client-cli'])
         self.assertEqual(code,0);self.assertEqual(json.loads(output.getvalue())['dimension'],'implemented')
         self.assertEqual(client.lifecycle('pp',other)['facts']['implemented']['trigger'],'Awaiting native evidence')
