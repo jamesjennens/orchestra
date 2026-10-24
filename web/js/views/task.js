@@ -87,8 +87,9 @@ export async function detail(ctx, { pid, tid }) {
   // the first page read as the whole list.
   const carry = Array.isArray(brief.carry_open_items) ? brief.carry_open_items : null;
   const shownItems = cp && Array.isArray(cp.open_items) ? cp.open_items : [];
-  const shownById = new Map([...shownItems, ...(cp && Array.isArray(cp.pointer_items) ? cp.pointer_items : [])].map(item => [item.id, item]));
-  const openItems = (carry || shownItems).map(item => shownById.get(item.id) || item);
+  const pointerItems = new Map(Object.entries((cp && cp.pointer_items) || {}));
+  const resolvedPointers = new Map(Object.entries((cp && cp.resolved_pointer_items) || {}));
+  const openItems = carry || shownItems;
   const openTotal = cp && Number.isInteger(cp.open_items_total) ? cp.open_items_total : openItems.length;
   const incomplete = brief.carry_open_items === null;
   const briefPanel = h('section', { class: 'panel', 'aria-labelledby': 'brief-h' },
@@ -99,10 +100,10 @@ export async function detail(ctx, { pid, tid }) {
       cp ? changesSinceCheckpoint(brief.changes_since_checkpoint) : null,
       cp && openItems.length ? [h('h3', { class: 'small' }, 'Unresolved items ', h('span', { class: 'nav-count' }, String(openTotal))),
         h('ul', { class: 'open-items' }, openItems.map((o) => h('li', null, h('span', { class: 'chip plain' }, o.kind), ' ', o.text,
-          h('div', { class: 'small muted' }, 'Source: ', o.source), contextPointers(o))))] : null,
+          h('div', { class: 'small muted' }, 'Source: ', o.source), contextPointers(pointerItems.get(o.id) || {}))))] : null,
       cp && Array.isArray(cp.resolved) && cp.resolved.length ? [h('h3', { class: 'small' }, 'Resolved items'),
         h('ul', null, cp.resolved.map(o => h('li', null, o.id, ': ', o.reason,
-          h('div', { class: 'small muted' }, 'Evidence: ', o.evidence), contextPointers(o)))),
+          h('div', { class: 'small muted' }, 'Evidence: ', o.evidence), contextPointers(resolvedPointers.get(o.id) || {})))),
         cp.resolved_omitted ? h('p', { class: 'small muted' }, String(cp.resolved_omitted), ' more resolved items are not shown.') : null] : null,
       incomplete ? h('div', { class: 'banner', role: 'note' }, 'The complete list of unresolved items could not all be read. ',
         h('button', { type: 'button', class: 'link', onclick: () => reload() }, 'Reload the task'), ' to try again.') : null));

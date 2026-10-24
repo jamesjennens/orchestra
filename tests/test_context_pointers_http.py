@@ -23,18 +23,20 @@ class PointerHttpTests(TeamHarness):
         self.assertEqual(answer.status,201,answer.data)
         result=self.request('GET',self.path('/tasks/'+self.task+'/brief'),token=self.vera)
         self.assertEqual(result.status,200,result.data)
-        data=result.data;shown=data['checkpoint']['open_items']
-        self.assertEqual([p['state'] for p in shown[0]['pointers']],['live','live'])
-        hidden=dict(shown[1]['pointers'][0]);absent=dict(shown[2]['pointers'][0])
+        data=result.data;shown=data['checkpoint']['pointer_items']
+        self.assertEqual(data['checkpoint']['open_items'],items)
+        self.assertEqual([p['state'] for p in shown['source']['pointers']],['live','live'])
+        hidden=dict(shown['hidden']['pointers'][0]);absent=dict(shown['absent']['pointers'][0])
         hidden.pop('pointer');absent.pop('pointer');self.assertEqual(hidden,absent)
         self.assertEqual(hidden['state'],'unavailable');self.assertNotIn('label',hidden)
-        self.assertEqual([p['state'] for p in shown[3]['pointers']],['unchecked','unchecked'])
+        self.assertEqual([p['state'] for p in shown['file']['pointers']],['unchecked','unchecked'])
         self.assertEqual(data['carry_open_items'],items)
         self.assertNotIn('PRIVATE title',str(data))
         body=data['checkpoint_template']['body']
         self.assertEqual(body['open_items'],items)
         # The actual template publishes through the existing checkpoint route.
         body['summary']='Carried unchanged'
+        body['open_items']=data['checkpoint']['open_items']
         again=self.request('POST',self.path('/tasks/'+self.task+'/checkpoints'),body,token=self.carl)
         self.assertEqual(again.status,201,again.data)
 

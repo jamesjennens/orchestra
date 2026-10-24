@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5bb395-context-pointers-1",
+  "operation_id": "capnew-5bb395-context-pointers-2",
   "key": "checkpoint.context-pointers",
   "name": "Checkpoint context pointers resolved by brief",
   "aliases": [
     "context store pointer open item source resolved evidence brief",
     "KIND VALUE pointer grammar"
   ],
-  "summary": "Parses ten lowercase KIND:VALUE tokens inside existing open-item source and resolved evidence strings without changing checkpoint schema or bytes. Brief resolves loaded authorized project tasks, comments, references and capabilities with no new I/O: live means existence only; superseded marks retired entries or explicitly replaced deliveries; absent and inaccessible both unavailable without label or follow. Every unloaded kind, including file/room/item/commit/doc/archive, is uniformly unchecked. Labels are escaped before clipping120 and every pointer is trust:data. Bounds10/item and50/brief leave remaining tokens unresolved with counts. JSON/text/web display pointer metadata while carry/template writer data stays unchanged; prose remains legal and old writers can carry it.",
+  "summary": "Parses ten lowercase KIND:VALUE tokens inside existing checkpoint source/evidence strings without changing schema or bytes. CLI unresolved.items and HTTP checkpoint.open_items remain verbatim carry-safe; resolution is in separate maps keyed by item id. No new I/O; prose and unloaded kinds build no index. Five states: live means existence only; superseded marks explicit retirement/replacement; unavailable covers absent, inaccessible, malformed, conflicted, ambiguous, and task/comment anchor or hidden-record-comment targets; unloaded kinds uniformly unchecked; excess tokens unresolved (10/item,50/brief). Labels escape controls/direction marks before safe clipping120, with trust:data; text view folds line breaks. Old writers carry the same strings unchanged. Punctuation is literal, not stripped.",
   "requirements": [],
   "anchors": [
     "docs/BRIEFINGS.md#pointers-in-checkpoint-source-and-evidence",
@@ -19,7 +19,11 @@
     "briefing.py::brief",
     "briefing.py::format_context_pointers",
     "http_service.py::EndpointBackend.task_brief",
-    "http_service.py::InProcessBackend.task_brief"
+    "http_service.py::InProcessBackend.task_brief",
+    "briefing.py::clip_context_label",
+    "briefing.py::inline_context_text",
+    "briefing.py::ContextPointers.item_pointers",
+    "briefing.py::bound_context_pointer_display"
   ],
   "tests": [
     "tests/test_context_pointers.py",

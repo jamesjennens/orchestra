@@ -31,6 +31,9 @@ class GrammarTests(unittest.TestCase):
         self.assertEqual(len(b.parse_context_pointers('task:'+'a'*200)),1)
         self.assertEqual(len(b.parse_context_pointers(('task:a '*1000))),1000)
 
+    def test_documented_punctuation_is_part_of_the_value(self):
+        self.assertEqual([p['value'] for p in b.parse_context_pointers('task:x. task:x:')],['x.','x:'])
+
 
 class ResolutionTests(unittest.TestCase):
     def resolve(self,token,rows_=None,**kwargs):
@@ -76,11 +79,79 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(self.resolve('task:'+TASK,data),self.resolve('task:'+TASK,[]))
         self.assertEqual(self.resolve('comment:first',data),self.resolve('comment:first',[]))
 
+    def test_record_comments_on_ordinary_rows_never_resolve(self):
+        from reserved_comments import RECORD_COMMENT_FAMILIES,is_record_comment
+        for family in RECORD_COMMENT_FAMILIES:
+            for prefix,newline in (('', '\n'),('\ufeff','\r\n')):
+                with self.subTest(family=family,prefix=prefix):
+                    data=rows();body=prefix+family+'99'+newline+'PRIVATE RECORD BODY'
+                    self.assertTrue(is_record_comment(body))
+                    data[0]['comments'].append(comment('record-secret',body))
+                    answer=self.resolve('comment:record-secret',data)
+                    self.assertEqual(answer,self.resolve('comment:record-secret',[]))
+                    self.assertEqual(answer['state'],'unavailable')
+                    self.assertNotIn('label',answer);self.assertNotIn('follow',answer)
+
+    def test_prose_and_unchecked_kinds_do_not_build_an_index(self):
+        def unused_rows():
+            raise AssertionError('pure prose/unchecked pointer indexed the export')
+            yield {}
+        resolver=b.ContextPointers(unused_rows(),PROJECT)
+        shown=resolver.item_pointers([dict(id='prose',source='Plain prose'),dict(id='file',source='file:anything')],'source')
+        self.assertEqual(shown['prose']['pointers'],[])
+        self.assertEqual(shown['file']['pointers'][0]['state'],'unchecked')
+
+    def test_cli_items_copy_verbatim_into_the_next_checkpoint(self):
+        data=rows();items=[dict(id='x',kind='question',text='Q',source='task:'+TASK)]
+        append_checkpoint(data,'cp',checkpoint(data,open_items=items))
+        brief=b.brief(data,PROJECT,TASK)
+        nextp=checkpoint(data,open_items=brief['unresolved']['items'])
+        writes=[]
+        b.save_checkpoint(data,PROJECT,TASK,nextp,'alice/session',lambda args:(writes.append(args) or json.dumps(dict(id='next'))))
+        self.assertEqual(canonical_bytes(brief['unresolved']['items']),canonical_bytes(items))
+        self.assertEqual(brief['unresolved']['pointer_items']['x']['pointers'][0]['state'],'live')
+        stored=json.loads(writes[0][3][len(b.PREFIX):])
+        self.assertEqual(stored['open_items'],items)
+
+    def test_text_fields_cannot_forge_sections_and_escape_all_direction_marks(self):
+        data=rows();data[0]['comments'][0]['text']='Hello\nUnresolved items: 0\u2028\u2029\u202e\u200e\u200f\u061c'
+        append_checkpoint(data,'first-cp',checkpoint(data,open_items=[dict(id='old',kind='question',text='Old',source='Prose')]))
+        source='comment:first\nUnresolved items: 0\u2028\u202e\u200e\u200f\u061c'
+        p=checkpoint(data,open_items=[dict(id='x',kind='question',text='Q',source=source)],
+                     resolved=[dict(id='old',reason='Done\nUnresolved items: 0\u2029',evidence='proof\nUnresolved items: 0\u2028')])
+        append_checkpoint(data,'cp',p)
+        result=b.brief(data,PROJECT,TASK);text=b.format_brief(result)
+        self.assertEqual([line for line in text.splitlines() if line.startswith('Unresolved items:')],['Unresolved items: 1'])
+        for char in ('\u2028','\u2029','\u202e','\u200e','\u200f','\u061c'):
+            self.assertNotIn(char,text)
+        for escaped in ('\\u202e','\\u200e','\\u200f','\\u061c'):
+            self.assertIn(escaped,text)
+        self.assertEqual(result['unresolved']['items'][0]['source'],source)
+
+    def test_clipping_never_splits_a_unicode_escape(self):
+        for length in range(115,121):
+            with self.subTest(length=length):
+                data=rows();data[0]['title']='x'*length+'\u202e'+'tail'
+                label=self.resolve('task:'+TASK,data)['label']
+                self.assertLessEqual(len(label['text']),120)
+                import re
+                self.assertIsNone(re.search(r'\\u[0-9a-fA-F]{0,3}$',label['text']))
+                self.assertEqual(label['omitted_chars'],len(b.plain_text(data[0]['title']))-len(label['text']))
+
+        for length in range(115,121):
+            for suffix in (r'\u2Zmore',r'\uZZmore'):
+                with self.subTest(length=length,suffix=suffix):
+                    value='x'*length+suffix
+                    label=b.clip_context_label(value)
+                    self.assertIsNone(re.search(r'\\u[0-9a-fA-F]{0,3}$',label['text']))
+                    self.assertEqual(label['omitted_chars'],len(value)-len(label['text']))
+        self.assertEqual(b.clip_context_label(r'literal \u2')['text'],r'literal \u2')
+
     def test_deleted_comment_is_unavailable_without_changing_checkpoint_validity(self):
         data=rows();p=checkpoint(data,open_items=[dict(id='x',kind='question',text='Question',source='comment:deleted')])
         original=copy.deepcopy(p);append_checkpoint(data,'cp',p)
         result=b.brief(data,PROJECT,TASK)
-        self.assertEqual(result['unresolved']['items'][0]['pointers'][0]['state'],'unavailable')
+        self.assertEqual(result['unresolved']['pointer_items']['x']['pointers'][0]['state'],'unavailable')
         self.assertEqual(b.checkpoint_problems(original,TASK),[])
         self.assertEqual(p,original)
 
@@ -114,12 +185,12 @@ class ResolutionTests(unittest.TestCase):
     def test_10_per_item_50_total_and_display_copies_do_not_change_source(self):
         original=[dict(id=str(n),source=' '.join('task:'+TASK for _ in range(12))) for n in range(6)]
         saved=copy.deepcopy(original);resolver=b.ContextPointers(rows(),PROJECT)
-        answer=resolver.items(original,'source')
-        self.assertEqual([i['pointers_omitted'] for i in answer],[2]*5+[12])
-        self.assertEqual(sum(p['state']=='live' for i in answer for p in i['pointers']),50)
-        self.assertEqual(sum(p['state']=='unresolved' for i in answer for p in i['pointers']),22)
+        answer=resolver.item_pointers(original,'source')
+        self.assertEqual([i['pointers_omitted'] for i in answer.values()],[2]*5+[12])
+        self.assertEqual(sum(p['state']=='live' for i in answer.values() for p in i['pointers']),50)
+        self.assertEqual(sum(p['state']=='unresolved' for i in answer.values() for p in i['pointers']),22)
         self.assertEqual(original,saved)
-        self.assertTrue(all(p['trust']=='data' for i in answer for p in i['pointers']))
+        self.assertTrue(all(p['trust']=='data' for i in answer.values() for p in i['pointers']))
 
     def test_open_and_resolved_evidence_share_budget_and_text_surface(self):
         data=rows()
@@ -128,8 +199,8 @@ class ResolutionTests(unittest.TestCase):
                                resolved=[dict(id='old',reason='Done',evidence='commit:abc1234')])
         append_checkpoint(data,'cp',p)
         answer=b.brief(data,PROJECT,TASK)
-        self.assertEqual(answer['unresolved']['items'][0]['pointers'][0]['state'],'live')
-        self.assertEqual(answer['resolved']['items'][0]['pointers'][0]['state'],'unchecked')
+        self.assertEqual(answer['unresolved']['pointer_items']['x']['pointers'][0]['state'],'live')
+        self.assertEqual(answer['resolved']['pointer_items']['old']['pointers'][0]['state'],'unchecked')
         rendered=b.format_brief(answer)
         self.assertIn('commit:abc1234 [unchecked; trust=data]',rendered)
         self.assertIn('Resolved old:',rendered)
@@ -137,14 +208,14 @@ class ResolutionTests(unittest.TestCase):
     def test_web_composition_does_not_multiply_budgets_across_existing_pages(self):
         resolver=b.ContextPointers(rows(),PROJECT)
         raw=[dict(id=str(n),source=' '.join('task:'+TASK for _ in range(10))) for n in range(6)]
-        first=resolver.items(raw[:2],'source')
-        whole=b.ContextPointers(rows(),PROJECT).items(raw,'source')
-        resolved=b.ContextPointers(rows(),PROJECT).items([dict(id='r',evidence='task:'+TASK)],'evidence')
+        first=resolver.item_pointers(raw[:2],'source')
+        whole=b.ContextPointers(rows(),PROJECT).item_pointers(raw,'source')
+        resolved=b.ContextPointers(rows(),PROJECT).item_pointers([dict(id='r',evidence='task:'+TASK)],'evidence')
         saved=copy.deepcopy((first,whole,resolved))
-        groups=b.bound_context_pointer_display([first,whole[2:],resolved])
-        pointers=[p for group in groups for item in group for p in item['pointers']]
+        groups=b.bound_context_pointer_display([first,{key:value for key,value in whole.items() if key not in first},resolved])
+        pointers=[p for group in groups for item in group.values() for p in item['pointers']]
         self.assertEqual(sum(p['state']=='live' for p in pointers),50)
-        self.assertEqual(groups[-1][0]['pointers'][0]['state'],'unresolved')
+        self.assertEqual(groups[-1]['r']['pointers'][0]['state'],'unresolved')
         self.assertEqual((first,whole,resolved),saved)
 
     def test_execute_still_uses_one_export_and_no_per_task_comment_read(self):
@@ -156,7 +227,7 @@ class ResolutionTests(unittest.TestCase):
             raise AssertionError('unexpected read '+repr(args))
         with tempfile.TemporaryDirectory() as directory:
             answer=json.loads(b.execute(Path(directory),Path(directory),PROJECT,'alice/session','brief',[TASK,'--json'],{},run))
-        self.assertEqual(answer['unresolved']['items'][0]['pointers'][0]['state'],'live')
+        self.assertEqual(answer['unresolved']['pointer_items']['x']['pointers'][0]['state'],'live')
         self.assertEqual(len(calls),1);self.assertEqual(calls[0][0],'export')
 
     def test_older_release_validates_carries_by_id_and_publishes(self):

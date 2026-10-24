@@ -67,7 +67,7 @@ FULL_FIELD_BUDGET=8000
 # ends the line a reader is looking at) and the bidi controls (a right-to-left override
 # can reorder the answer on screen). Each is rendered as the same \uXXXX escape the JSON
 # form already uses, so the fuller-context read cannot emit a raw ESC/BEL/CR or hide text.
-CONTROL_TEXT_RE=re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]')
+CONTROL_TEXT_RE=re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]')
 
 def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().rstrip('=')
 
@@ -518,6 +518,29 @@ def plain_text(value):
     return CONTROL_TEXT_RE.sub(lambda match:'\\u%04x'%ord(match.group()),str(value or ''))
 
 
+def clip_context_label(value,limit=120):
+    """Escape first, then clip without cutting a generated Unicode escape."""
+    text=plain_text(value)
+    end=min(len(text),limit)
+    for match in re.finditer(r'\\u[0-9a-fA-F]{4}',text):
+        if match.start()>=end:
+            break
+        if match.start()<end<match.end():
+            end=match.start()
+            break
+    if end<len(text):
+        partial=re.search(r'\\u[0-9a-fA-F]{0,3}$',text[:end])
+        if partial:
+            end=partial.start()
+    return {'text':text[:end],'omitted_chars':len(text)-end}
+
+
+def inline_context_text(value):
+    """One terminal line, including labels whose separators are already escaped."""
+    text=re.sub(r'(?:[\t\r\n\u2028\u2029]|\\u202[89])+',' ',str(value or ''))
+    return plain_text(text)
+
+
 CONTEXT_POINTER_RE = re.compile(r'(task|comment|ref|cap|item|file|room|commit|doc|archive):([A-Za-z0-9._/#:-]{1,200})\Z')
 CONTEXT_POINTER_ITEM_MAX = 10
 CONTEXT_POINTER_BRIEF_MAX = 50
@@ -538,29 +561,37 @@ def parse_context_pointers(text):
 class ContextPointers:
     """Read-only resolution over a caller-authorized, project-scoped snapshot.
 
-    No runner, path or journal is accepted: resolution cannot perform I/O. A caller
-    with narrower visibility supplies its predicate before any target is indexed.
+    No runner, path or journal is accepted: resolution cannot perform I/O. Production
+    supplies project-scoped, already-authorized rows. ``can_read`` is an optional
+    additional restriction for direct embedders/tests; it never widens that scope.
     Unloaded kinds are uniformly unchecked; absent/hidden loaded kinds unavailable.
     """
     def __init__(self,rows,project,operators=None,can_read=None):
         self.project=project
         self.operators=operators
         self.remaining=CONTEXT_POINTER_BRIEF_MAX
-        self.rows=[row for row in rows if isinstance(row,dict) and
-                   row.get('project_id',project)==project and
-                   not row.get('malformed') and (can_read is None or can_read(row))]
+        self._source_rows=rows
+        self._can_read=can_read
+        self.rows=None
         self.tasks={}
         self.comments={}
         self.catalogs={}
         self.reviews={}
-        from reserved_comments import is_record_anchor
+    def _load(self):
+        # Pure prose and unchecked kinds never build a project-wide index.
+        if self.rows is not None:
+            return
+        self.rows=[row for row in self._source_rows if isinstance(row,dict) and
+                   row.get('project_id',self.project)==self.project and
+                   not row.get('malformed') and (self._can_read is None or self._can_read(row))]
+        from reserved_comments import is_record_anchor,is_record_comment
         from coordination import is_merge_slot
         for row in self.rows:
             if is_record_anchor(row) or is_merge_slot(row):
                 continue
             self.tasks.setdefault(str(row.get('id')),[]).append(row)
             for comment in row.get('comments') or []:
-                if isinstance(comment,dict) and comment.get('id') is not None:
+                if isinstance(comment,dict) and comment.get('id') is not None and not is_record_comment(comment.get('text',comment.get('body'))):
                     self.comments.setdefault(str(comment['id']),[]).append((row,comment))
 
     def resolve(self,pointer):
@@ -568,6 +599,7 @@ class ContextPointers:
         entry={'pointer':pointer['pointer'],'kind':kind,'state':'unchecked','trust':'data'}
         if kind not in ('task','comment','ref','cap'):
             return entry
+        self._load()
         entry['state']='unavailable'
         label=follow=None
         if kind=='task':
@@ -611,13 +643,13 @@ class ContextPointers:
                     label=record.get('name') or record.get('title') or value
                     follow=('ref get ' if kind=='ref' else 'capability get ')+value
         if entry['state'] in ('live','superseded'):
-            entry['label']=clip(plain_text(label),120)
+            entry['label']=clip_context_label(label)
             entry['follow']=follow
         return entry
 
-    def items(self,items,field):
-        """Enrich display copies only; carry/template payloads keep their old schema."""
-        shown=[]
+    def item_pointers(self,items,field):
+        """Resolution by item id; never add fields to a carryable checkpoint item."""
+        shown={}
         for item in items:
             pointers=parse_context_pointers(item.get(field))
             count=min(len(pointers),CONTEXT_POINTER_ITEM_MAX,self.remaining)
@@ -625,7 +657,7 @@ class ContextPointers:
             resolved=[self.resolve(pointer) for pointer in pointers[:count]]
             resolved += [{'pointer':p['pointer'],'kind':p['kind'],'state':'unresolved','trust':'data'}
                          for p in pointers[count:]]
-            shown.append(dict(item,pointers=resolved,pointers_omitted=len(pointers)-count))
+            shown[item['id']]={'pointers':resolved,'pointers_omitted':len(pointers)-count}
         return shown
 
 def encoded_size(text):
@@ -1481,8 +1513,9 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
     if p is not None:
         pointers=ContextPointers(rows,project,operators)
-        result['unresolved']['items']=pointers.items(result['unresolved']['items'],'source')
-        result['resolved']={'items':pointers.items(p['resolved'][:limit],'evidence'),
+        result['unresolved']['pointer_items']=pointers.item_pointers(result['unresolved']['items'],'source')
+        result['resolved']={'items':p['resolved'][:limit],
+                            'pointer_items':pointers.item_pointers(p['resolved'][:limit],'evidence'),
                             'total':len(p['resolved']),'omitted':max(0,len(p['resolved'])-limit)}
     if p is not None and not counted:
         # The brief states plainly WHY no direction is outstanding (kittrial-5bb.284):
@@ -2227,8 +2260,8 @@ def bound_context_pointer_display(groups):
     remaining=CONTEXT_POINTER_BRIEF_MAX
     result=[]
     for group in groups:
-        shown=[]
-        for item in group:
+        shown={}
+        for identity,item in group.items():
             pointers=[]
             for pointer in item.get('pointers') or []:
                 if pointer.get('state')=='unresolved':
@@ -2237,7 +2270,7 @@ def bound_context_pointer_display(groups):
                     pointers.append(dict(pointer));remaining-=1
                 else:
                     pointers.append({k:pointer[k] for k in ('pointer','kind','trust')} | {'state':'unresolved'})
-            shown.append(dict(item,pointers=pointers,pointers_omitted=sum(p['state']=='unresolved' for p in pointers)))
+            shown[identity]={'pointers':pointers,'pointers_omitted':sum(p['state']=='unresolved' for p in pointers)}
         result.append(shown)
     return result
 
@@ -2245,7 +2278,7 @@ def bound_context_pointer_display(groups):
 def format_context_pointers(item):
     lines=[]
     for pointer in item.get('pointers') or []:
-        label=(pointer.get('label') or {}).get('text')
+        label=inline_context_text((pointer.get('label') or {}).get('text'))
         lines.append('  '+pointer['pointer']+' ['+pointer['state']+'; trust=data]'+(' '+label if label else ''))
     if item.get('pointers_omitted'):
         lines.append('  Pointers unresolved by bounds: '+str(item['pointers_omitted']))
@@ -2305,11 +2338,11 @@ def format_brief(result):
                   '  Resolve or supersede each with note+evidence (digest-checked); acknowledgement alone does not clear a direction.']
     unresolved=result['unresolved'];lines += [f'Unresolved items: {unresolved["total"] if unresolved["total"] is not None else "unknown"}']
     for item in unresolved['items']:
-        lines += [f'- {item["id"]} [{item["kind"]}]: {item["text"]} (source: {item["source"]})']
-        lines += format_context_pointers(item)
+        lines += [f'- {item["id"]} [{item["kind"]}]: {inline_context_text(item["text"])} (source: {inline_context_text(item["source"])})']
+        lines += format_context_pointers((unresolved.get('pointer_items') or {}).get(item['id'],{}))
     for item in (result.get('resolved') or {}).get('items',[]):
-        lines += ['Resolved '+str(item['id'])+': '+plain_text(item['reason'])+' (evidence: '+plain_text(item['evidence'])+')']
-        lines += format_context_pointers(item)
+        lines += ['Resolved '+str(item['id'])+': '+inline_context_text(item['reason'])+' (evidence: '+inline_context_text(item['evidence'])+')']
+        lines += format_context_pointers((result['resolved'].get('pointer_items') or {}).get(item['id'],{}))
     if (result.get('resolved') or {}).get('omitted'):
         lines += ['Resolved items omitted: '+str(result['resolved']['omitted'])]
     if unresolved['next_offset'] is not None:lines += [f'More unresolved items: brief {result["task"]} --items-offset {unresolved["next_offset"]}']

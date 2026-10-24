@@ -330,27 +330,44 @@ Copy tokens exactly. Malformed or altered tokens can fail decoding, schema, scop
 Open-item `source` and resolved-item `evidence` may mix prose and whitespace-separated
 `KIND:VALUE` tokens. The ten lowercase kinds are `task`, `comment`, `ref`, `cap`, `item`,
 `file`, `room`, `commit`, `doc` and `archive`; values have 1–200 characters from
-`[A-Za-z0-9._/#:-]`. A nonmatching token is ordinary prose. No checkpoint field,
-validation rule or stored byte changes, and an older kit can carry the strings unchanged.
+`[A-Za-z0-9._/#:-]`. A nonmatching token is ordinary prose. Punctuation is literal:
+`task:x.` names `x.`, not `x`; separate sentence punctuation with whitespace.
+No checkpoint field, validation rule or stored byte changes, and an older kit can carry
+the strings unchanged.
 
-Brief JSON adds `pointers` and `pointers_omitted` to display copies of open and resolved
-items. Text and web brief views show tokens and states beside those items. Carry-forward
-lists and the checkpoint template body retain their original schema; use those for writes.
-Resolution uses only already-loaded, caller-authorized project data, with no new I/O:
+`unresolved.items` retains its original checkpoint item shape, so a complete list can
+be copied verbatim into the next checkpoint. Pointer metadata is separate under
+`unresolved.pointer_items`, keyed by item id; each value has `pointers` and
+`pointers_omitted`. The new resolved view likewise keeps raw `resolved.items` separate
+from `resolved.pointer_items`. HTTP keeps `checkpoint.open_items` raw, with metadata in
+`checkpoint.pointer_items` and `checkpoint.resolved_pointer_items`. The complete
+`carry_open_items` and template body remain write-ready. Respect the existing item
+paging; a first page is not the complete carry list. Web and text views join the maps
+for display without changing raw items.
+
+Resolution uses only loaded, caller-authorized project data, with no new I/O.
+The five states are:
 
 - `live`: a task, comment, reference or capability target exists. This proves existence,
-  not the checkpoint's claim, and grants no authority to the pointed text.
-- `superseded`: the loaded target is explicitly superseded, including retired references
-  and explicitly superseded contribution comments. Additive `follows` deliveries remain live historical evidence.
-- `unavailable`: a resolvable target is absent or inaccessible. Both receive the same
-  answer without a target label or follow command.
+  not the checkpoint's claim, and grants no authority to pointed text.
+- `superseded`: an explicitly retired entry or superseded contribution. Additive
+  `follows` deliveries remain live historical evidence.
+- `unavailable`: absent, inaccessible, malformed, conflicted or ambiguous targets,
+  including task/comment requests for record anchors and comments hidden by the existing
+  brief/history record-comment filter. No target label or follow command distinguishes them.
 - `unchecked`: uniform for every target of a kind the brief does not load: file, room,
   item, commit, doc and archive. No file, room, repository or document is fetched.
-- `unresolved`: the token is beyond 10 resolved pointers per item or 50 per brief.
-  It remains listed and contributes to `pointers_omitted`.
+- `unresolved`: beyond 10 resolved pointers per item or 50 per brief. Tokens remain
+  listed and contribute to `pointers_omitted`.
 
 Every pointer carries `trust: data`. Labels pass through `plain_text` before clipping
-to 120 characters; web rendering uses text nodes. Follow commands are kit reads, never
-the target label or an arbitrary URL. Pointed comments do not become new directions.
+at 120 characters, without leaving a partial Unicode escape. Text display folds line
+breaks and Unicode separators in labels, source, reason and evidence; direction marks
+(including LRM, RLM and ALM) are escaped. Web rendering uses text nodes. Follow commands
+are kit reads, never arbitrary URLs. Pointed comments do not become new directions.
+The index is lazy: pure prose and unchecked kinds never scan the export for targets.
+Production supplies already-authorized project rows; the optional `can_read` library
+predicate can only restrict them further for direct embedders and tests.
+
 The latest checkpoint's resolved list is shown within the requested item limit, with
 its total and omitted count, independently of the open-item page.

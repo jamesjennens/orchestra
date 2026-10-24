@@ -16,15 +16,18 @@ class NativePointerTests(native.RealStackTests):
                 open_items=items,resolved=[])
         answer=self.request('POST',base+'/checkpoints',cp,token=self.agent)
         self.assertEqual(answer.status,201,answer.data)
-        cli=self.backend._run('brief','pp',self.backend.actor_namespace+'/read',[task,'--json'])
-        self.assertEqual([p['state'] for p in cli['unresolved']['items'][0]['pointers']],['live','unchecked','unchecked'])
+        cli=self.backend._run('brief','pp',self.backend.actor_namespace+'/read',[task,'--json','--items-limit','100'])
+        self.assertEqual([p['state'] for p in cli['unresolved']['pointer_items']['point']['pointers']],['live','unchecked','unchecked'])
         web=self.request('GET',base+'/brief',token=self.agent)
         self.assertEqual(web.status,200,web.data)
-        self.assertEqual(web.data['checkpoint']['open_items'][0]['pointers'],cli['unresolved']['items'][0]['pointers'])
+        self.assertEqual(web.data['checkpoint']['pointer_items']['point']['pointers'],cli['unresolved']['pointer_items']['point']['pointers'])
         self.assertEqual(web.data['carry_open_items'],items)
-        self.assertEqual(len(web.data['checkpoint']['pointer_items']),2)
-        self.assertTrue(all(i['pointers'][0]['state']=='live' for i in web.data['checkpoint']['pointer_items']))
+        self.assertEqual(web.data['checkpoint']['open_items'],items[:10])
+        self.assertEqual(cli['unresolved']['items'],items)
+        self.assertEqual(len(web.data['checkpoint']['pointer_items']),12)
+        self.assertTrue(all(i['pointers'][0]['state']=='live' for i in web.data['checkpoint']['pointer_items'].values()))
         body=web.data['checkpoint_template']['body'];body['summary']='Native carry';body['next_action']='Continue native work'
+        body['open_items']=cli['unresolved']['items']
         again=self.request('POST',base+'/checkpoints',body,token=self.agent)
         self.assertEqual(again.status,201,again.data)
         latest=self.request('GET',base+'/brief',token=self.agent).data

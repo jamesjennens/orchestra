@@ -55,18 +55,33 @@ An open item's `source` and a resolved item's `evidence` may contain whitespace-
 `item`, `file`, `room`, `commit`, `doc` and `archive`. Values contain 1–200 characters
 from `A–Z a–z 0–9 . _ / # : -`; the whole field still has its existing 240-character limit.
 For example: `task:example-task ref:host.build.rule (the original decision)`.
-Prose and malformed tokens remain legal, and the stored text is never rewritten.
+Punctuation is not stripped: `task:x.` names `x.`, and `task:x:` names `x:`.
+Separate sentence punctuation with whitespace when you mean `task:x`.
+Prose and malformed tokens remain legal; stored text is never rewritten.
 
-Brief shows pointers beside open and resolved items as untrusted data. `live` means
-the target exists in the loaded authorized data, not that it proves the claim.
-`unavailable` means absent or inaccessible, with identical answers and no target label.
-`unchecked` is uniform for kinds the brief does not load, including file, room, item,
-commit, doc and archive; resolution performs no new I/O. A superseded record is marked
-`superseded`. At most 10 pointers per item and 50 per brief are resolved; remaining
-tokens are `unresolved`, counted in `pointers_omitted`. Labels are escaped before being
-clipped to 120 characters and carry `trust: data`. Copy the original carry/template
-items into a checkpoint, not the display-only pointer metadata. Older kits can read
-and carry these same string fields unchanged.
+The CLI's `unresolved.items` and HTTP's `checkpoint.open_items` keep the original
+checkpoint item shape and can be copied verbatim when the list is complete. Respect
+paging: `carry_open_items` and the checkpoint template body hold the complete list.
+Resolution is separate, keyed by item id: CLI `unresolved.pointer_items` and
+`resolved.pointer_items`; HTTP `checkpoint.pointer_items` and
+`checkpoint.resolved_pointer_items`. Do not copy those metadata maps into a checkpoint.
+Older kits can read and carry the same source/evidence strings unchanged.
+
+There are five read states:
+
+- `live`: the target exists in loaded authorized data; this does not prove the claim.
+- `superseded`: an explicitly retired or replaced record, not an additive `follows` delivery.
+- `unavailable`: absent, inaccessible, malformed, conflicted or ambiguous targets;
+  task/comment requests for record anchors and hidden record comments are unavailable too.
+  Answers have no target label or follow command and do not distinguish these cases.
+- `unchecked`: uniform for every target of an unloaded kind, including file, room,
+  item, commit, doc and archive. Resolution performs no new I/O.
+- `unresolved`: beyond 10 resolved pointers per item or 50 per brief, counted in `pointers_omitted`.
+
+Every pointer carries `trust: data`. Labels are escaped before clipping to 120 characters,
+without cutting a Unicode escape. The text brief folds line breaks in pointer labels,
+source, reason and evidence, and escapes direction marks. Pure prose does not build a
+pointer index.
 
 ## lane_state (a sibling, not a checkpoint field)
 
