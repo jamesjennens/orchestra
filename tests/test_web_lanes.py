@@ -425,13 +425,33 @@ class LanesPageTests(unittest.TestCase):
         self.assertEqual(['alpha-1', 'alpha-3'], seen['taskIds'])
         self.assertEqual(['Ann', 'Cat', 'Bo'], seen['names'])
         text = seen['text']
-        for wanted in ('Ship the lanes panel', 'An older checkpoint',
-                       'changes-requested', 'whose move you', 'next assignee',
-                       'waiting-on-coordinator', 'coordinator', '2026-10-12T00:00:00+00:00'):
+        # r3: rows read as plain words (never bare slugs): state words, the
+        # waited-on name, the shared move sentence, the ages as spans, local
+        # times via time() (no raw ISO in the text), the Late chip plus its
+        # sentence, and the free lane's line.
+        lowered = text.lower()
+        for wanted in ('ship the lanes panel', 'an older checkpoint',
+                       'waiting for the coordinator', 'coordinator',
+                       'deliver a revision', 'read the review'):
+            self.assertIn(wanted, lowered, wanted)
+        # Plain state words per the state map, never a bare slug in a row.
+        for task in seen['tasks']:
+            for slug in ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user',
+                         'waiting_too_long', 'expect_by_passed', 'your_move_idle'):
+                self.assertNotIn(slug, task, task)
+        self.assertNotIn('2026-10-12T00:00:00Z', text)
+        self.assertNotIn('2026-10-12T00:00:00+00:00', text)
+        for wanted in ('In that state 2 days', 'expected', 'since',
+                       'Last wrote', 'Holds nothing'):
             self.assertIn(wanted, text, wanted)
+        for wanted in ('waiting for the coordinator', 'coordinator',
+                       'deliver a revision', 'read the review'):
+            self.assertIn(wanted, lowered, wanted)
+        self.assertTrue(any(cell == 'coordinator' for cell in seen['whoActs']), seen['whoActs'])
         # The ages are the server's, said as spans (2 days for the state, 2 h for the write).
-        self.assertIn('in that state 2 days', text)
-        self.assertIn('last write 2 h', text)
+        self.assertIn('In that state 2 days'.lower(), lowered)
+        self.assertIn('Last wrote', text)
+        self.assertIn('5 min', text)
         # The three flags, each naming the tasks under it, and the free lane said as free.
         flags = seen['flagChips']
         self.assertTrue(any(f == 'waiting_too_long: Waiting too long: alpha-1' for f in flags), flags)
@@ -440,6 +460,11 @@ class LanesPageTests(unittest.TestCase):
         self.assertTrue(seen['freeText'], seen['text'])
         self.assertIn('Holds nothing', seen['freeText'][0])
         self.assertIn('5 min', seen['freeText'][0])
+        # The threshold input keeps its id inside the folded 'How late is late'
+        # section (mock-up lanes.html:77): the r3 fold keeps the hint text too.
+        self.assertEqual('15', seen['threshold'])
+        self.assertIn('How late is late', seen['text'])
+        self.assertIn('idle threshold', seen['text'])
         # The guessed row is marked as guessed; the declared one is not.
         self.assertEqual([None, 'true'], seen['inferredTasks'])
         self.assertEqual(1, len(seen['guessedChips']), seen['guessedChips'])

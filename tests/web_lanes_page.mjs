@@ -21,6 +21,7 @@ const WAITING_LANE = {
     task: 'alpha-1', title: 'Ship the lanes panel', review_state: 'changes-requested',
     work_state: 'changes-requested', whose_move: 'you', next_actor: 'assignee',
     next: 'Deliver a revision', state: 'waiting-on-coordinator', waiting_on: 'coordinator',
+    waiting_on_name: 'coordinator',
     expect_by: '2026-10-12T00:00:00+00:00', declared: true, inferred: false,
     checkpoint: 'cp-1', state_since: '2026-10-12T00:00:00Z', state_age_seconds: 172800,
     no_checkpoint: false, held_age_seconds: 200000, holder_last_write_seconds: 90000,
@@ -35,7 +36,7 @@ const GUESSED_LANE = {
   lane: 'lane-c', actor: 'session-c', display_name: 'Cat', idle: false, held: [{
     task: 'alpha-3', title: 'An older checkpoint', review_state: 'none', work_state: 'none',
     whose_move: 'you', next_actor: 'assignee', next: 'Read the review', state: 'waiting-on-coordinator',
-    waiting_on: 'coordinator', expect_by: null, declared: false, inferred: true,
+    waiting_on: 'coordinator', waiting_on_name: 'coordinator', expect_by: null, declared: false, inferred: true,
     checkpoint: 'cp-3', state_since: '2026-10-16T00:00:00Z', state_age_seconds: 3600,
     no_checkpoint: false, held_age_seconds: 40000, holder_last_write_seconds: 2000,
     flags: ['your_move_idle'], pending_review_items: 0,
@@ -111,12 +112,16 @@ const button = (node, label) => Array.from(node.querySelectorAll('button')).find
 
 // 1. The board on its own page (kittrial-5bb.416): lanesPanel renders the rows, and
 // lanesPage composes it with a crumb and heading. The overview no longer embeds it.
+// r3: rows read as plain words (never a bare slug), the waited-on name, local
+// times, the Late chip with its sentence, and the free lane's line; the
+// threshold fold keeps the input id.
 const panel = view.lanesPanel(ctx, PROJECT);
 document.body.append(panel);
 await settle();
 const out = {
   firstRead: lanesCalls()[0],
   text: panel.textContent,
+  whoActs: panel.all((e) => e.tagName === 'SPAN' && String(e.className || e.attributes['class'] || '').split(' ').includes('who-acts')).map((e) => e.textContent),
   names: panel.all((e) => e.tagName === 'STRONG').map((e) => e.textContent),
   lanes: panel.all((e) => e.attributes && e.attributes['data-lane']).map((e) => e.attributes['data-lane']),
   taskIds: panel.all((e) => e.tagName === 'LI').map((e) => e.attributes['data-task']),
@@ -155,14 +160,14 @@ out.pagedRead = lanesCalls().at(-1);
 const input = panel.querySelector('#lanes-idle-minutes');
 const before = lanesCalls().length;
 input.value = '0';
-await button(panel, 'Read with this threshold').dispatch('click');
+await button(panel, 'Read again').dispatch('click');
 await settle();
 out.refusedText = panel.textContent;
 out.refusedIssuedNoRead = lanesCalls().length === before;
 // 5. A new value re-reads with it, from the first page (no cursor), and the flags the read
 //    answered with are what the panel shows.
 input.value = '45';
-await button(panel, 'Read with this threshold').dispatch('click');
+await button(panel, 'Read again').dispatch('click');
 await settle();
 out.thresholdRead = lanesCalls().at(-1);
 out.afterThreshold = panel.textContent;
@@ -170,7 +175,7 @@ out.thresholdChips = panel.all((e) => e.tagName === 'SPAN' && e.attributes['data
   .map((e) => e.attributes['data-flag'] + ': ' + e.textContent);
 // 6. A refused read says why and offers to read again instead of reading as an empty board.
 input.value = '7';
-await button(panel, 'Read with this threshold').dispatch('click');
+await button(panel, 'Read again').dispatch('click');
 await settle();
 out.refusal = panel.textContent;
 out.refusalHasRetry = Boolean(button(panel, 'Try again'));

@@ -12922,10 +12922,26 @@ class ApiHandler(BaseHTTPRequestHandler):
         # for assignee names (kittrial-5bb.416): display only, never used for any
         # authority or matching decision. A lane with no resolvable name keeps its
         # label; the page shows this server text and never builds a name itself.
+        # Display names for the lane rows, from the same resolver the task list uses
+        # for assignee names (kittrial-5bb.416): display only, never used for any
+        # authority or matching decision. A lane with no resolvable name keeps its
+        # label; the page shows this server text and never builds a name itself.
+        # The waited-on side of a HELD row gets the same treatment (r3): a role
+        # ('coordinator', 'reviewer', 'user') stays the server's role word, an actor
+        # id resolves to its display name, 'you' stays 'you', and unknown stays
+        # absent, so the page never decides a name from an id (assignee_names).
         try:
-            names = self._actor_names(
-                [lane.get('actor') for lane in body.get('items') or []
-                 if isinstance(lane, dict)], ctx.params['pid'])
+            wanted = []
+            for lane in body.get('items') or []:
+                if not isinstance(lane, dict):
+                    continue
+                if isinstance(lane.get('actor'), str):
+                    wanted.append(lane.get('actor'))
+                for entry in lane.get('held') or []:
+                    if (isinstance(entry, dict) and isinstance(entry.get('waiting_on'), str)
+                            and entry.get('waiting_on') != 'you'):
+                        wanted.append(entry.get('waiting_on'))
+            names = self._actor_names(wanted, ctx.params['pid'])
         except Exception:
             names = {}
         for lane in body.get('items') or []:
@@ -12934,6 +12950,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             actor = lane.get('actor')
             lane['display_name'] = (names.get(actor, lane.get('lane'))
                                     if isinstance(actor, str) else lane.get('lane'))
+            for entry in lane.get('held') or []:
+                if not isinstance(entry, dict):
+                    continue
+                waited = entry.get('waiting_on')
+                if isinstance(waited, str) and waited and waited != 'you':
+                    entry['waiting_on_name'] = names.get(waited, waited)
+                else:
+                    entry['waiting_on_name'] = None
         continuation = body.get('next_offset')
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
                                            key=self.service.cursor_key())

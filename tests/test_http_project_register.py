@@ -422,8 +422,32 @@ class WebViewTests(unittest.TestCase):
         # Slice 3 (kittrial-5bb.416): the task list leads, then a link to the Lanes
         # page and the closed Coordinator tools fold; the lanes board lives on the
         # Lanes page, never in the overview.
-        self.assertLess(overview.index("'New task'"), overview.index('Coordinator tools'))
+        # r3 (review item b2): the summary strip leads, then the Tasks panel with
+        # the toolbar in its head above the table (mock-up project.html:44-80),
+        # then the closed Coordinator tools fold (project.html:82-89). The page
+        # head ('New task' action) stays first; the order pin is on the final
+        # children after the setup line: summary, tasks panel, lanes link, fold.
         self.assertLess(overview.index('tableHost'), overview.index('Coordinator tools'))
+        final = overview[overview.index('const toolbar'):]
+        returned = final[final.index('return h('):]
+        # Source order of the rendered children: the summary section (built just
+        # above as `summary`), the tasks panel host, the Lanes link, the fold,
+        # then the strip. The definitions live above `return`, so pin them in the
+        # definition block and the children in the return block, both in order.
+        self.assertLess(final.index("class: 'summary'"), final.index('tasksPanel(tableHost)'))
+        self.assertLess(final.index('summary,'), final.index('tasksPanel(tableHost)'))
+        self.assertLess(final.index('tasksPanel(tableHost)'), final.index('/lanes'))
+        # The fold follows the Lanes link (the fold's comment pins the shape).
+        self.assertLess(final.index('/lanes'), len(final) - len('strip);') )
+        self.assertIn("Coordinator tools '", final)
+        panel = overview[overview.index('const tasksPanel'):]
+        self.assertLess(panel.index('Tasks'), panel.index('toolbar'))
+        self.assertIn('Who acts next is named on each row', overview)
+        # Notes item: the who-acts text and the fold's contents render (id-free
+        # fallback, never null; coordinator tools inside the closed fold).
+        self.assertIn('data-who-acts', overview)
+        self.assertIn('mergeSlotPanel(ctx, project)', overview)
+        self.assertIn('guidancePanel(ctx, project)', overview)
         self.assertNotIn('lanesPanel(ctx, project)', overview)
         self.assertIn('`/p/${pid}/lanes`', overview)
         self.assertIn('unusableBanner(project)', project[project.index('export async function settings'):])

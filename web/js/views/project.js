@@ -111,27 +111,73 @@ export function lanesPanel(ctx, project) {
     state.idle_minutes = chosen; state.cursor = null; state.stack = [];
     draw();
   }
-  const apply = h('button', { type: 'button', onclick: () => readAgain(minutes.value) }, 'Read with this threshold');
+  const apply = h('button', { type: 'button', onclick: () => readAgain(minutes.value) }, 'Read again');
   const head = () => h('div', { class: 'panel-head' },
-    h('h2', { class: 'small' }, 'Lanes'),
+    h('h2', { class: 'small', id: 'lanes-heading' }, 'Lanes'),
     h('span', { class: 'small muted hide-narrow' }, 'Who holds what, who is free, how long each has been that way, and the three flags: all of it from one board read on the server.'));
-  const threshold = () => h('div', { class: 'toolbar' },
-    h('label', { class: 'check', for: 'lanes-idle-minutes' }, 'Idle minutes'), minutes, apply, message);
+  // The threshold lives folded (mock-up lanes.html:77 'How late is late'): the page's
+  // argument, never a setting. The input keeps its id; the fold keeps the hint text.
+  const threshold = () => h('details', { class: 'fold' },
+    h('summary', null, 'How late is late ', h('span', { class: 'fold-hint' }, `idle threshold: ${state.idle_minutes} minutes`)),
+    h('div', { class: 'fold-body' },
+      h('label', { class: 'small', for: 'lanes-idle-minutes' }, 'Idle minutes (1 to 10080)'),
+      h('div', { class: 'toolbar' }, minutes, apply, message),
+      h('p', { class: 'small muted' }, 'A lane is late when its expect-by has passed, when it has waited longer than this, or when it is the holder\u2019s own move and nothing was written for this long.')));
+
+  // A lane row's wait in plain words (kittrial-5bb.416 r3): Who holds it, what the
+  // state means, who is waited on and when, in local time. None of it is coined
+  // here: the state words come from the one UI map below, the times from time(),
+  // the names from the server's display_name/waiting_on_name, the flags from the read.
+  const LANE_STATE_WORDS = {
+    'working': 'Working',
+    'waiting-on-coordinator': 'Waiting for the coordinator',
+    'waiting-on-review': 'Waiting for a review',
+    'waiting-on-user': 'Waiting for you: an answer',
+    'idle': 'Free',
+    'needs-investigation': 'Needs investigation',
+  };
+  function laneStateWords(entry) {
+    return LANE_STATE_WORDS[entry.state] || entry.state || 'Not declared';
+  }
+  function laneWaitingWords(entry) {
+    // The waited-on side in words: the viewer reads as `you`, a role reads as the
+    // role, an actor reads as the server's waiting_on_name; unknown reads as '—'.
+    if (!entry.waiting_on) return null;
+    if (entry.waiting_on === 'you') return 'you';
+    if (entry.waiting_on_name && entry.waiting_on_name !== entry.waiting_on) {
+      return `${entry.waiting_on_name} (${entry.waiting_on})`;
+    }
+    return entry.waiting_on_name || entry.waiting_on;
+  }
 
   function taskLine(entry) {
+    // One HELD task row: the wait's own sentence in words, per the mock-up columns
+    // (docs/design/web-ux/lanes.html: Who / Holds / Waiting for / Last wrote).
+    // Lane rows carry next (the shared move sentence), flags from the read, and any
+    // expect_by; review/work slugs stay in the title for the title attribute only.
     const flags = LANE_FLAGS.filter(([key]) => (entry.flags || []).includes(key));
+    const review = `Review ${entry.review_state || 'none'}, move ${entry.whose_move || 'unknown'} to ${entry.next_actor || 'unknown'}`;
+    const waited = laneWaitingWords(entry);
+    const late = (entry.flags || []).includes('expect_by_passed') || (entry.flags || []).includes('waiting_too_long');
     return h('li', { class: 'lane-task', 'data-task': entry.task, 'data-inferred': entry.inferred ? 'true' : null },
-      h('a', { class: 'title', href: ctx.href(`/p/${project.id}/t/${entry.task}`) }, entry.title || entry.task),
-      h('div', { class: 'sub' }, h('span', { class: 'mono' }, entry.task),
-        ' · review ', h('span', { class: 'mono' }, entry.review_state || 'none'),
-        ' · whose move ', h('span', { class: 'mono' }, entry.whose_move || 'unknown'),
-        ' · next ', h('span', { class: 'mono' }, entry.next_actor || 'unknown')),
-      h('div', { class: 'sub' },
-        'State ', entry.state ? h('span', { class: 'mono' }, entry.state) : h('span', { class: 'muted' }, 'not declared'),
-        entry.waiting_on ? [' · waiting on ', h('span', { class: 'mono' }, entry.waiting_on)] : null,
-        entry.expect_by ? [' · expect by ', h('span', { class: 'mono' }, entry.expect_by)] : null,
-        ' · in that state ', ageText(entry.state_age_seconds),
-        ' · holder last wrote ', ageText(entry.holder_last_write_seconds)),
+      h('a', { class: 'title', href: ctx.href(`/p/${project.id}/t/${entry.task}`), title: review }, entry.title || entry.task),
+      h('div', { class: 'sub mono' }, entry.task),
+      // The wait itself: plain state words, who is waited on (by name), the shared
+      // move sentence, the expect-by in local time, and the server's ages as spans.
+      // Waiting for / Late (kittrial-5bb.416 r3): the mock-up's Late chip plus the
+      // plain sentence it explains (expect-by in local time, how long waited).
+      h('div', { class: 'small' }, laneStateWords(entry),
+        waited ? [' · waiting for ', h('span', { class: 'who-acts' }, waited)] : null,
+        entry.next ? [' — ', entry.next] : null),
+      h('div', { class: 'small muted' },
+        'In that state ', ageText(entry.state_age_seconds),
+        entry.expect_by ? [' · expected ', time(entry.expect_by)] : null,
+        entry.state_since ? [' · since ', time(entry.state_since)] : null),
+      // A late wait says so in words: the Late chip plus the plain sentence it
+      // explains (mock-up lanes.html:60 'Late / expected today 20:00, 2 hours ago').
+      late ? h('div', { class: 'small' }, h('span', { class: 'chip warn', 'data-flag': 'late' }, 'Late'), ' ',
+        'expected ', entry.expect_by ? time(entry.expect_by) : h('span', { class: 'muted' }, 'no date given'),
+        entry.state_age_seconds != null ? [', waited ', ageText(entry.state_age_seconds)] : null) : null,
       // A row the read could not declare is GUESSED from the checkpoint text, and says so.
       entry.inferred ? h('div', { class: 'small', 'data-inferred': 'true' },
         h('span', { class: 'chip plain', title: 'The state is guessed from the checkpoint text, not declared by a lane-state record' }, 'Guessed')) : null,
@@ -167,7 +213,9 @@ function laneBlock(ctx, project, lane) {
         lane.needs_investigation.earlier_omitted > 0 ? h('div', { class: 'muted', 'data-fault-omitted': 'true' },
           '+', lane.needs_investigation.earlier_omitted, ' more earlier open not shown') : null) : null,
       held.length ? h('ul', { class: 'lane-tasks' }, held.map((entry) => taskLine(entry))) : null,
-      lane.idle ? h('p', { class: 'small muted' }, 'Holds nothing; free to take work. Last write ', ageText(lane.last_write_age_seconds), ' ago.') : null);
+      // A free lane says WHAT it holds (nothing) and WHEN it last wrote, in local
+      // time: the mock-up's empty line (lanes.html:74 'Free: portal-agent ...').
+      lane.idle ? h('p', { class: 'small muted' }, 'Holds nothing; free to take work. Last wrote ', lane.last_write ? time(lane.last_write) : h('span', { class: 'muted' }, 'never'), ' (', ageText(lane.last_write_age_seconds), ' ago).') : null);
   }
 
   function pager(data) {
@@ -315,10 +363,14 @@ export async function overview(ctx, { pid }) {
               t.requirement_record ? [' · ', h('a', { href: ctx.href(`/p/${pid}/requirements`) }, 'Edit on Requirements')] : null)),
           // A row the server could not read is listed, and says so (kittrial-5bb.169).
           // WHO ACTS NEXT (kittrial-5bb.416): the server's assignee display name plus
-          // its next_action sentence; an unnamed holder reads as the id-free word the
-          // mock-up uses, never a null. Stays textContent: untrusted text stays text.
+          // its next_action text; an unnamed holder reads as the id-free word the
+          // mock-up uses, never a bare id and never a null. A task id is a tracker
+          // id, not an actor id: assignee_name already resolved it (or left it
+          // absent), so the fallback here is the server id only when a stale row
+          // carries an assignee with no name yet, and otherwise 'anyone'.
+          // Stays textContent: untrusted text stays text.
           h('td', null, t.unreadable ? h('span', { class: 'chip crit' }, 'Cannot be read') : t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
-          h('td', { class: 'who-acts-cell' },
+          h('td', { class: 'who-acts-cell', 'data-who-acts': t.assignee_name || (t.assignee ? t.assignee : 'anyone') },
             h('span', { class: 'who-acts' + (t.assignee ? '' : ' none') },
               (t.assignee_name || (t.assignee ? t.assignee : 'anyone')),
               ' · ',
@@ -343,6 +395,18 @@ export async function overview(ctx, { pid }) {
   const setupLine = h('div');
   setupHint(ctx, project).then((node) => { if (node) setupLine.replaceChildren(node); }).catch(() => {});
 
+  const toolbar = h('div', { class: 'toolbar' }, search, statusSeg, reviewSel, requirementToggle);
+  // Summary strip FIRST, then the Tasks panel with the toolbar in its head, then
+  // the Coordinator tools fold (mock-up project.html:44-89; r3 review item b2).
+  const summary = h('section', { class: 'summary', 'aria-label': 'This project now' },
+    h('div', { class: 'chips' },
+      h('span', { class: 'chip', 'data-summary': 'open' }, 'Tasks'),
+      h('span', { class: 'chip plain', 'data-summary': 'review' }, 'Review states vary by row')),
+    h('div', { class: 'meta' }, 'Who acts next is named on each row.'));
+  const tasksPanel = (host) => h('section', { class: 'panel', 'aria-labelledby': 'tasks-heading' },
+    h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'tasks-heading' }, 'Tasks'), toolbar),
+    host);
+
   return h('div', { class: 'stack' },
     pageHead({ crumbs: crumbs(ctx, project), title: project.name, lede: project.description || null,
       actions: canWrite(project) && !project.archived ? h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/new`) }, 'New task') : null }),
@@ -352,8 +416,11 @@ export async function overview(ctx, { pid }) {
     // Slice 3 (kittrial-5bb.416): the task list first; the merge slot, guidance and
     // onboarding fold into one closed Coordinator tools details; the lanes board
     // moved to its own Lanes page (lanesPage + the menu link) with a link left here.
-    tableHost,
-    h('div', { class: 'toolbar' }, search, statusSeg, reviewSel, requirementToggle),
+    // r3: the summary strip leads, the toolbar heads the Tasks panel (mock-up
+    // project.html:44-80), then the fold (project.html:82-89); the overview text is
+    // the summary, the strip link, the panel, the fold.
+    summary,
+    tasksPanel(tableHost),
     h('p', { class: 'small muted' }, 'The Lanes board has its own page (',
       h('a', { href: ctx.href(`/p/${pid}/lanes`) }, 'Lanes'), '), where a coordinator reads it.'),
     h('details', { class: 'fold' },
