@@ -358,6 +358,75 @@ class OperatorEligibilityTests(unittest.TestCase):
         self.assertEqual(audit.review_void_report(store.rows,[],operator_history=self.history()),{})
         self.assertEqual(before,store.rows)
 
+    def test_verifier_add_and_remove_never_change_operator_eligibility(self):
+        import admin
+        issuer=release.OPERATOR
+        for change,initial,state in [('add',False,'ineligible'),('remove',True,'eligible')]:
+            with self.subTest(change=change),tempfile.TemporaryDirectory(prefix='d2-verifier-history-') as scratch:
+                root=Path(scratch);path=root/admin.AUTHORITY_CHANGES_AUDIT
+                baseline=admin.authority_change_baseline(
+                    dict(operators=[issuer] if initial else [],verifiers=[issuer] if initial else []),
+                    'ops','Synthetic separate lists',at='2026-10-01T00:00:00Z')
+                entries=[dict(at='2026-10-01T00:00:10Z',operator='ops',list='verifiers',
+                              actor=issuer,change=change,reason='Synthetic verifier change')]
+                if initial:
+                    entries.append(dict(at='2026-10-01T00:02:00Z',operator='ops',list='operators',
+                                        actor=issuer,change='remove',reason='Synthetic later operator removal'))
+                path.write_text(json.dumps(dict(schema_version=1,baseline=baseline,entries=entries)))
+                saved=path.read_bytes();history=audit.read_operator_history(root,[])
+                self.assertIsNone(history.reason)
+                eligibility=audit.operator_eligibility(history,issuer,'2026-10-01T00:01:00Z',[])
+                self.assertEqual(eligibility['state'],state,eligibility)
+                store=ReleaseRegressions().held_with_void();before=copy.deepcopy(store.rows)
+                notes=audit.review_void_report(store.rows,[],operator_history=history).get('review_void_diagnostics',[])
+                if initial:
+                    self.assertEqual(len(notes),1,notes)
+                    self.assertEqual(notes[0]['historical_operator_eligibility'],'eligible')
+                    self.assertEqual(notes[0]['reason'],'currently-ineligible-review-void')
+                    self.assertEqual(notes[0]['eligibility_basis'],'retained-authority-trail')
+                else:self.assertEqual(notes,[])
+                self.assertEqual(store.rows,before);self.assertEqual(path.read_bytes(),saved)
+
+    def test_mode_zero_label_uses_existing_stat_without_reading_or_relabeling_damage(self):
+        import admin,stat
+        with tempfile.TemporaryDirectory(prefix='d2-unreadable-label-') as scratch:
+            root=Path(scratch);path=root/admin.AUTHORITY_CHANGES_AUDIT;history=self.history()
+            path.write_text(json.dumps(dict(schema_version=1,entries=history.entries,baseline=history.baseline)))
+            saved=path.read_bytes();fields=list(path.lstat());fields[0]=stat.S_IFREG
+            unreadable_stat=type(path.lstat())(fields)
+            with mock.patch.object(Path,'lstat',return_value=unreadable_stat),mock.patch.object(
+                    admin,'read_authority_changes',wraps=admin.read_authority_changes) as reader:
+                loaded=audit.read_operator_history(root,[])
+                self.assertEqual(loaded.reason,'authority-audit-unreadable')
+                self.assertEqual(audit.operator_eligibility(loaded,release.OPERATOR,
+                    '2026-10-01T00:01:00Z',[])['state'],'unknown')
+                reader.assert_not_called()
+            self.assertEqual(path.read_bytes(),saved)
+            path.write_text('{damaged')
+            self.assertEqual(audit.read_operator_history(root,[]).reason,'authority-audit-damaged')
+
+    def test_real_posix_mode_zero_is_unreadable_and_preserves_bytes(self):
+        import admin,os
+        if os.name!='posix':self.skipTest('POSIX mode-000 permission denial is not available')
+        with tempfile.TemporaryDirectory(prefix='d2-mode-zero-') as scratch:
+            root=Path(scratch);path=root/admin.AUTHORITY_CHANGES_AUDIT;history=self.history()
+            path.write_text(json.dumps(dict(schema_version=1,entries=history.entries,baseline=history.baseline)))
+            saved=path.read_bytes();mode=path.stat().st_mode
+            try:
+                path.chmod(0)
+                try:path.read_bytes()
+                except PermissionError:pass
+                else:self.skipTest('this runner can read mode-000 files; actual permission denial unverified')
+                loaded=audit.read_operator_history(root,[])
+                self.assertEqual(loaded.reason,'authority-audit-unreadable')
+                store=ReleaseRegressions().held_with_void()
+                notes=audit.review_void_report(store.rows,[],operator_history=loaded)['review_void_diagnostics']
+                self.assertEqual(notes[0]['historical_operator_eligibility'],'unknown')
+                self.assertEqual(notes[0]['eligibility_reason'],'authority-audit-unreadable')
+                self.assertEqual(path.stat().st_mode & 0o777,0)
+            finally:path.chmod(mode)
+            self.assertEqual(path.read_bytes(),saved)
+
     def test_missing_or_caller_supplied_history_is_explicitly_unknown(self):
         store=ReleaseRegressions().held_with_void()
         for history in (None,dict(state='eligible'),audit.OperatorHistory(reason='authority-audit-damaged')):
