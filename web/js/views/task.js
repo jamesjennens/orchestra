@@ -1,5 +1,6 @@
 import { h, time, confirmDialog, shortSha, toast } from '../dom.js';
-import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, lifecycleStrip, describe, errorState } from '../ui.js';
+import { markdown } from '../md.js';
+import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, describe, errorState } from '../ui.js';
 import { canWrite, canApprove, isOwner } from './project.js';
 import { lifecyclePanel } from './lifecycle.js';
 import { taskFilesPanel } from './taskFiles.js';
@@ -69,15 +70,27 @@ export async function detail(ctx, { pid, tid }) {
   }
   if (writer) actions.push(h('button', { type: 'button', onclick: () => editPanel.hidden ? openEdit() : null }, 'Edit'));
 
-  // ---- next action -------------------------------------------------------------
+  // ---- next action (summary strip; the sentence a reader needs is first) ------
+  // t.next_action.who says which party acts (owner/assignee/anyone); the strip names
+  // the party (kittrial-5bb.411 slice 2: mock-up web-ux/task.html).
   const next = t.next_action;
-  const nextBanner = next ? h('div', { class: 'banner info' },
-    h('strong', null, 'Next: '), next.text,
-    next.who === 'owner' ? h('span', { class: 'muted' }, owner ? (isOwner(project) ? ' — that’s you (project owner).' : ' — that’s you (coordinator).') : ' — waiting on a project owner or coordinator.') :
-    next.who === 'assignee' ? h('span', { class: 'muted' }, mine ? ' — that’s you.' : ` — waiting on ${t.assignee_name || 'the assignee'}.`) :
-    h('span', { class: 'muted' }, writer ? ' — any contributor can claim it.' : ''),
-    ctx.api.lifecycle && ['approved', 'awaiting-integration'].includes(t.review_state)
-      ? h('a', { href: '#lifecycle-facts' }, ' Record integration evidence') : null) : null;
+  const whoName = t.assignee_name || 'the assignee';
+  const whoActs = next
+    ? next.who === 'owner'
+      ? (owner ? (isOwner(project) ? 'you (project owner)' : 'you (coordinator)') : 'a project owner or coordinator')
+      : next.who === 'assignee' ? (mine ? 'you' : whoName) : 'any contributor'
+    : null;
+  const summaryStrip = h('section', { class: 'summary', 'aria-label': 'Where this task stands' },
+    h('div', { class: 'chips' }, statusChip(t.status), reviewChip(review.state),
+      t.priority !== undefined && t.priority !== null ? h('span', { class: 'chip plain', title: 'Priority' }, 'P' + t.priority) : null),
+    h('div', { class: 'meta' },
+      t.updated_at ? h('span', null, 'Updated ', time(t.updated_at)) : null,
+      h('span', { class: 'mono' }, t.id)),
+    next ? h('p', { class: 'next' }, h('b', null, 'Next: '), next.text, ' ',
+      h('span', { class: 'who-acts' + (whoActs === 'you' || whoActs === 'you (project owner)' || whoActs === 'you (coordinator)' ? ' you' : '') }, whoActs)) : null);
+  // The integration-evidence link stays one banner below the strip for approved work.
+  const nextBanner = (next && ctx.api.lifecycle && ['approved', 'awaiting-integration'].includes(t.review_state))
+    ? h('div', { class: 'banner info' }, h('a', { href: '#lifecycle-facts' }, 'Record integration evidence')) : null;
 
   // ---- brief -------------------------------------------------------------------
   const cp = brief.checkpoint;
@@ -95,7 +108,8 @@ export async function detail(ctx, { pid, tid }) {
   const briefPanel = h('section', { class: 'panel', 'aria-labelledby': 'brief-h' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'brief-h' }, 'Brief'), cp ? h('span', { class: 'small muted' }, 'Checkpoint ', time(cp.at), ' by ', cp.author_name || cp.author) : null),
     h('div', { class: 'panel-body' },
-      t.description ? h('p', { class: 'prose' }, t.description) : h('p', { class: 'muted' }, 'No description yet.'),
+      // Slice 2: the description moves to the "What is wanted" panel above; the
+      // checkpoint keeps its own panel (summary, next step, carried items).
       cp ? [h('h3', { class: 'small' }, 'Where it stands'), h('p', { class: 'prose' }, cp.summary), cp.next_action ? h('p', null, h('strong', null, 'Next step: '), cp.next_action) : null] : null,
       cp ? changesSinceCheckpoint(brief.changes_since_checkpoint) : null,
       cp && openItems.length ? [h('h3', { class: 'small' }, 'Unresolved items ', h('span', { class: 'nav-count' }, String(openTotal))),
@@ -154,16 +168,40 @@ export async function detail(ctx, { pid, tid }) {
   // A long comment is several entries sharing entry_id, each with body_offset and
   // continued (kittrial-5bb.356): join them into one item, fetching the following page
   // while the last fragment still says more of the same body follows.
-  const historyList = h('ul', { class: 'timeline' });
+  const historyList = h('ol', { class: 'timeline' });
   const more = h('button', { type: 'button', hidden: true }, 'Show newer');
   let cursor = null;
   let loading = false;
   const entries = [];
   const byEntry = new Map();
+  const KIND_VERB = {
+    'task-created': 'created the task', 'task-claimed': 'claimed the task',
+    'task-updated': 'edited the task',
+    'contribution': 'delivered a contribution', 'change-requested': 'requested a change',
+    'change-resolved': 'resolved a change',
+    'review-approve': 'approved', 'review-request-changes': 'requested changes',
+    'approve': 'approved', 'request-changes': 'requested changes',
+    'respond': 'responded to review', 'recommend': 'recommended approval',
+    'checkpoint-added': 'recorded a checkpoint', 'checkpoint': 'recorded a checkpoint',
+    'comment': 'commented',
+  };
+  // A history entry's [object Object] author is an author id or object rendered as
+  // text (WEB_UX_REVIEW s2.2): prefer the name the server resolved for it.
+  function entryName(e) {
+    const direct = [e.user_name, e.author_name, e.assignee_name, e.actor_name].find((v) => typeof v === 'string' && v);
+    if (direct) return direct;
+    for (const key of ['author', 'actor', 'user', 'user_id']) {
+      const v = e[key];
+      if (typeof v === 'string' && v) return v;
+      if (v && typeof v === 'object' && typeof v.text === 'string' && v.text) return v.text;
+    }
+    return 'Someone';
+  }
+  const byKindEntry = new Map();
   function addEntry(e) {
     if (typeof e.entry_id === 'string' && e.entry_id && typeof e.body === 'string') {
-      let target = byEntry.get(e.entry_id);
-      if (!target) { target = { ...e, body: '' }; entries.push(target); byEntry.set(e.entry_id, target); }
+      let target = byKindEntry.get(e.entry_id);
+      if (!target) { target = { ...e, body: '' }; entries.push(target); byKindEntry.set(e.entry_id, target); }
       const offset = Number.isInteger(e.body_offset) ? e.body_offset : target.body.length;
       // A page boundary may repeat no text but must never drop any: add only the part
       // of this fragment past what the joined body already holds.
@@ -175,13 +213,25 @@ export async function detail(ctx, { pid, tid }) {
   }
   function drawHistory() {
     historyList.replaceChildren(...entries.map((e) => {
-      // In-process events carry action/user/time; canonical entries carry kind/author/timestamp/body.
-      const action = e.action || e.kind;
-      const [label, tone] = ACTIONS[action] || [action, ''];
-      const detail = typeof e.body === 'string' ? e.body : e.detail;
-      const who = [e.user_name, e.author_name, e.author, e.actor, e.user_id].find((v) => typeof v === 'string' && v) || '';
+      // Activity: comments read as comments; machine records as one-line record
+      // events with the raw JSON folded (WEB_UX_REVIEW s2.2).
+      const who = entryName(e);
+      const when = h('span', { class: 'small muted' }, (e.action ? '' : ' · '), time(e.time || e.timestamp));
+      const kindVerb = e.action ? e.action : (KIND_VERB[e.kind] || e.kind);
+      if (typeof e.body === 'string') {
+        return h('li', null, h('span', { class: 'dot', 'aria-hidden': 'true' }),
+          h('div', null, h('div', { class: 'event-head' }, h('strong', null, who), h('span', null, ' ', kindVerb), ' ', when),
+            h('p', { class: 'event-body prose' }, e.body)));
+      }
+      const tone = (ACTIONS[e.action || ''] || [])[1] || '';
+      const label = e.action || kindVerb || 'Event';
+      const detail = e.detail;
+      let raw = null;
+      try { raw = JSON.stringify(e, null, 2); } catch { raw = String(e.kind || e.action || 'record'); }
       return h('li', null, h('span', { class: 'dot ' + tone, 'aria-hidden': 'true' }),
-        h('div', null, h('div', { class: 'event-head' }, h('strong', null, who), h('span', null, label), time(e.time || e.timestamp)), detail ? h('p', { class: 'event-body prose' }, detail) : null));
+        h('div', { class: 'record-event' }, h('div', { class: 'event-head' }, h('strong', null, who), h('span', null, ' ', label), ' ', when),
+          detail ? h('p', null, String(detail)) : null,
+          h('details', null, h('summary', null, 'Show the raw record'), h('pre', null, raw))));
     }));
     if (!entries.length) historyList.append(h('li', null, h('span'), h('p', { class: 'muted' }, 'No history yet.')));
   }
@@ -205,11 +255,14 @@ export async function detail(ctx, { pid, tid }) {
       more.hidden = !cursor;
     } finally { loading = false; }
   }
+  // Activity first: comments read as comments, machine records as one-line
+  // record events with the raw JSON folded (WEB_UX_REVIEW s2.2).
+  const activityPanel = h('section', { class: 'panel', 'aria-labelledby': 'activity-h' },
+    h('div', { class: 'panel-head' }, h('h2', { id: 'activity-h' }, 'Activity')),
+    h('div', { class: 'panel-body' }, historyList, h('div', null, more)));
   more.addEventListener('click', loadHistory);
   loadHistory();
-  const historyPanel = h('section', { class: 'panel', 'aria-labelledby': 'hist-h' },
-    h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'hist-h' }, 'History')),
-    h('div', { class: 'panel-body' }, historyList, h('div', null, more)));
+  const historyPanel = null;
 
   // ---- edit (version-checked) --------------------------------------------------
   const editPanel = h('section', { class: 'panel', hidden: true, 'aria-labelledby': 'edit-h' });
@@ -245,28 +298,58 @@ export async function detail(ctx, { pid, tid }) {
   }
 
   // ---- side ----------------------------------------------------------------------
-  const side = h('aside', { class: 'side', 'aria-label': 'Task details' },
-    h('section', { class: 'panel' }, h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
-      h('dt', null, 'Status'), h('dd', null, statusChip(t.status)),
-      t.priority !== undefined && t.priority !== null ? [h('dt', null, 'Priority'), h('dd', null, priority(t.priority))] : null,
-      h('dt', null, 'Assignee'), h('dd', null, t.assignee_name || h('span', { class: 'muted' }, 'Unclaimed')),
-      h('dt', null, 'Created'), h('dd', null, time(t.created_at)),
-      t.updated_at ? [h('dt', null, 'Updated'), h('dd', null, time(t.updated_at))] : null,
-      h('dt', null, 'ID'), h('dd', null, h('code', null, t.id)),
-      t.version !== undefined ? [h('dt', null, 'Version'), h('dd', { class: 'num' }, String(t.version))] : null))),
+  // Slice 2 side column (mock-up web-ux/task.html): Details, one-line completion
+  // facts until any is known, Files, then the Owner tools fold.
+  const FACT_PAIRS = [
+    ['implemented', 'Implemented'], ['tested', 'Tested'], ['reviewed', 'Reviewed'],
+    ['integrated', 'Integrated'], ['deployed', 'Deployed'], ['live-verified', 'Live-verified'],
+  ];
+  const knownFacts = brief.lifecycle
+    ? FACT_PAIRS.filter(([key]) => brief.lifecycle[key] && brief.lifecycle[key].value && brief.lifecycle[key].value !== 'unknown')
+    : [];
+  const completionLine = knownFacts.length
+    ? knownFacts.map(([key, label]) => `${label}: ${brief.lifecycle[key].value}`).join(' · ')
+    : 'None recorded yet. They are recorded against a contribution once one is delivered.';
+  const side = h('aside', { class: 'side', 'aria-label': 'Task facts and tools' },
+    h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Details')),
+      h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
+        h('dt', null, 'Status'), h('dd', null, statusChip(t.status)),
+        t.priority !== undefined && t.priority !== null ? [h('dt', null, 'Priority'), h('dd', null, priority(t.priority))] : null,
+        h('dt', null, 'Assignee'), h('dd', null, t.assignee_name || h('span', { class: 'muted' }, 'Unclaimed')),
+        h('dt', null, 'Created'), h('dd', null, time(t.created_at)),
+        t.updated_at ? [h('dt', null, 'Updated'), h('dd', null, time(t.updated_at))] : null,
+        h('dt', null, 'ID'), h('dd', { class: 'mono' }, t.id),
+        t.version !== undefined ? [h('dt', null, 'Version'), h('dd', { class: 'num' }, String(t.version))] : null))),
+    h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Completion facts')),
+      h('div', { class: 'panel-body' }, knownFacts.length
+        ? h('p', { class: knownFacts.length ? 'small' : 'small muted' }, completionLine))),
     brief.depends_on && brief.depends_on.length ? h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Depends on')),
       h('ul', { class: 'panel-body open-items' }, brief.depends_on.map((d) => h('li', null, h('a', { href: ctx.href(`/p/${pid}/t/${d.id}`) }, d.title), ' ', statusChip(d.status))))) : null,
     taskFilesPanel(ctx, { pid, tid, task: t, project }),
+    h('details', { class: 'fold' }, h('summary', null, 'Owner tools'),
+      h('div', { class: 'fold-body' },
+        brief.lifecycle ? h('div', { id: 'lifecycle-facts' }, lifecyclePanel(ctx, project, t)) : null,
+        owner && !project.archived ? assignmentForm(ctx, pid, tid, t) : null,
+        brief.assignment_notices ? h('div', { class: 'banner info' }, brief.assignment_notices.items.map(item => h('p', { class: 'prose' }, item.message))) : null)),
     h('p', { class: 'small muted' }, 'Viewing a task never marks it read, done or acknowledged.'));
 
+  // ---- main column + checkpoint fold + activity --------------------------------
+  // Checkpoint form folded until wanted; the Activity panel shows comments first
+  // and machine records as one-line events with the raw JSON folded.
+  const checkpointFold = writer
+    ? h('details', { class: 'fold' }, h('summary', null, 'Record a checkpoint ', h('span', { class: 'fold-hint' }, t.assignee_name ? `for ${t.assignee_name}, the assignee` : 'for the assignee')),
+      h('div', { class: 'fold-body' }, checkpointForm(ctx, pid, tid, brief))) : null;
+  const wantedPanel = h('section', { class: 'panel', 'aria-labelledby': 'wanted-h' },
+    h('div', { class: 'panel-head' }, h('h2', { id: 'wanted-h' }, 'What is wanted')),
+    h('div', { class: 'panel-body md' }, markdown(t.description || '')));
   return h('div', { class: 'stack' },
     pageHead({ crumbs: [{ label: 'Projects', href: ctx.href('/projects') }, { label: project.name, href: ctx.href('/p/' + pid) }, { label: t.id }], title: t.title, actions }),
-    h('div', { class: 'toolbar' }, statusChip(t.status), reviewChip(review.state), priority(t.priority)),
-    lifecycleStrip(brief.lifecycle),
-    lifecyclePanel(ctx, project, t),
+    summaryStrip,
     nextBanner,
-    h('div', { class: 'detail' }, h('div', { class: 'stack' }, editPanel, owner && !project.archived ? assignmentForm(ctx, pid, tid, t) : null, brief.assignment_notices ? h('div', { class: 'banner info' }, brief.assignment_notices.items.map(item => h('p', { class: 'prose' }, item.message))) : null, briefPanel, reviewPanel, writer ? commentForm(ctx, pid, tid) : null, writer ? checkpointForm(ctx, pid, tid, brief) : null, historyPanel), side));
+    h('div', { class: 'detail' },
+      h('div', { class: 'stack' }, editPanel, wantedPanel, briefPanel, reviewPanel, activityPanel, checkpointFold, writer ? commentForm(ctx, pid, tid) : null, historyPanel),
+      side));
 }
 
 // What happened on the task after its checkpoint (kittrial-5bb.354): the entries newest
