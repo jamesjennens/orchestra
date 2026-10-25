@@ -463,8 +463,12 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
     if operator and not web_coordinator and actor not in trusted:
         raise ValueError('Actor %s is not on the deployment operator allowlist or the verifiers list; only a '
                          'listed actor may record a verified capability check' % actor)
+    decision_id = None
     if web_coordinator and isinstance(payload, dict):
         payload = dict(payload)
+        # The delegation an agent verifies within (kittrial-5bb.407); never part of the
+        # verification record, whose field set is closed.
+        decision_id = payload.pop('decision_id', None)
         payload.setdefault('schema_version', 1)
         payload.setdefault('checked_at', datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
         payload.setdefault('source', 'ast')
@@ -500,10 +504,10 @@ def verify(payload, actor, run, operators=None, verifiers=None, journal=None, op
                 if entry.get('record') is not None
                 else entry.get('proposed_by'))
     if party_check is not None:
-        party_check(proposer)
+        party_check(proposer, decision_id)
         for draft_author in ((entry.get('accepted_draft_authors') if entry.get('record') is not None
                               else entry.get('draft_authors')) or ()):
-            party_check(draft_author)
+            party_check(draft_author, decision_id)
     if web_coordinator:
         validate_payload(payload)
         if not payload['commit'].strip('0'):

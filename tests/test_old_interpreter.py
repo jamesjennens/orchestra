@@ -47,6 +47,7 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'capability_misses.py', 'capability_records.py', 'capability_verification.py', 'credential_store.py',
            'endpoint_process.py', 'feedback.py', 'field_history.py',  # kittrial-5bb.354: library-only; imported by briefing and http_service
            'field_limits.py',
+           'delegations.py',  # kittrial-5bb.407: library-only (no __main__ block); imported by endpoint/admin/http_service
            'fault_clear.py',  # kittrial-5bb.398: library-only (no __main__ block); imported by endpoint/admin
            'followon.py',  # kittrial-5bb.343: library-only (no __main__ block); imported by work/endpoint
            'guidance.py', 'handoff.py', 'host_reads.py', 'http_auth.py', 'http_authority.py',

@@ -154,7 +154,10 @@ class BoundEndpointTests(unittest.TestCase):
         # service stores the bytes and calls it under live authority; no bound key may name it.
         # `room-decision` (kittrial-5bb.388) creates the native decision from a room item; the
         # endpoint re-checks the signed-in owner/coordinator live. No bound key may name it.
-        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignee-followon', 'assignment-roster', 'create-project', 'creation-standing', 'host-coordination',
+        # `delegation` (kittrial-5bb.407) records a person owner's delegation from their own web
+        # session; an operator uses the confined `coordinator delegation-record` instead.
+        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignee-followon', 'assignment-roster', 'create-project', 'creation-standing',
+                                                                 'delegation', 'host-coordination',
                                                                  'host-projects', 'project-creations', 'room-decision', 'task-assign', 'task-file', 'task-release', 'web-guidance',
                                                                  'web-lifecycle', 'web-merge-slot',
                                                                  # kittrial-5bb.378: the release query and one release group; the canonical write is

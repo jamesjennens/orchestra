@@ -2240,6 +2240,8 @@ class EndpointBackend:
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
         'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
+        # Delegated decision rights (kittrial-5bb.407): the canonical `delegation` action.
+        'delegations.grant', 'delegations.narrow', 'delegations.revoke',
     )
     #: Routes with no canonical command yet, and why. Fails closed rather than
     #: pretending the service store is canonical.
@@ -2597,6 +2599,20 @@ class EndpointBackend:
             error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
                                       422: 'invalid', 503: 'unavailable'}.get(status, 'unavailable'),
                               (reply.get('stderr') or 'Release facts cannot be recorded').strip())
+            error.nothing_done = True
+            raise error
+        if action == 'delegation' and isinstance(reply, dict) and reply.get('returncode') == 2 and (
+                reply.get('delegation_status') or reply.get('records_status')):
+            # The delegation action's own refusal or its identity check's (kittrial-5bb.407):
+            # nothing was written, and the status is the one the action gave.
+            status = reply.get('delegation_status') or reply.get('records_status')
+            text = (reply.get('stderr') or 'Delegation refused').strip().split('\n')[-1]
+            for prefix in ('ValueError: ', 'DelegationRefusal: '):
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                    break
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid'}.get(status, 'unavailable'), text)
             error.nothing_done = True
             raise error
         if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
@@ -3066,6 +3082,15 @@ class EndpointBackend:
                     if key in payload:
                         body[key] = payload[key]
             return 'web-release', project_id, [json.dumps(body, ensure_ascii=False)], {}
+        if route.startswith('delegations.'):
+            # A person owner's delegation of a decision right (kittrial-5bb.407). Only the
+            # request travels; the endpoint fills the recorder, the account and the time.
+            operation = route.split('.', 1)[1]
+            import delegations
+            body = {key: payload[key] for key in delegations.REQUEST_FIELDS
+                    if key not in ('schema_version', 'operation_id', 'action')}
+            body.update(schema_version=1, operation_id=operation_id, action=operation)
+            return 'delegation', project_id, [operation, json.dumps(body, ensure_ascii=False)], {}
         if route.startswith('followons.'):
             # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
             # `assignee-followon` action derives every record fact under the project
@@ -3289,6 +3314,21 @@ class EndpointBackend:
 
     def capabilities_find(self, project_id, phrase, limit=5):
         return self._capability_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
+
+    def delegations_read(self, project_id, principal):
+        """The project's delegations and which granted coordinator agents they cover
+        (kittrial-5bb.407), through the endpoint's ``delegation list`` read."""
+        reply = self._endpoint('delegation', project_id, self.service.bind_actor(principal, None), ['list'],
+                               authority=authority_request(principal, project_id, CAP_READ,
+                                                           now=self.service._expiry_now()),
+                               require_authority=True)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and reply.get('delegation_status'):
+            raise HttpError(reply['delegation_status'], 'forbidden' if reply['delegation_status'] == 403 else 'invalid',
+                            (reply.get('stderr') or 'Delegations cannot be read').strip())
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('The canonical delegations read returned an unexpected shape')
+        return payload
 
     def lanes_read(self, project_id, principal, args, actor, scope):
         """One page of the lanes board through the endpoint's ``work lanes`` action.
@@ -10757,7 +10797,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     CAP_VERIFY_FIELDS = ('key', 'revision', 'entry_revision', 'record_sha256', 'expected_sha256',
                          'entry_sha256', 'commit', 'checked_at', 'source', 'graph_built_at_commit',
                          'tool', 'results', 'passed', 'summary', 'method', 'command',
-                         'unverified_pointer_reason')
+                         'unverified_pointer_reason', 'decision_id')
     CAP_ALIAS_PROPOSE_FIELDS = ('key', 'alias', 'evidence')
     CAP_ALIAS_REJECT_FIELDS = ('key', 'alias', 'reason')
 
@@ -10879,6 +10919,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             can_coordinate and verify_authors
             and (self.service.approval_by_another_party or by_agent)
             and not self._independent_all(caller_names, verify_authors, pid, by_agent))
+        if by_agent and can_coordinate:
+            # kittrial-5bb.407: an agent accepts and verifies only within a delegation, which
+            # lifts the agent-only own-party rule but never a draft the agent wrote itself, and
+            # never the project's independence setting (review r1, b1): with that on, the
+            # person rule computed above stands.
+            item['needs_delegation'] = True
+            if not self.service.approval_by_another_party:
+                head = (ctx.principal.actor or '').split('/', 1)[0]
+                own = lambda authors: any(isinstance(a, str) and a.split('/', 1)[0] == head for a in authors)
+                item['self_accept_blocked'] = bool(draft_authors) and own(draft_authors)
+                item['self_verify_blocked'] = bool(verify_authors) and own(verify_authors)
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
@@ -11008,6 +11059,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = dict(fields, schema_version=1, operation_id=operation_id)
         if key_param:
             body['key'] = ctx.params['key']
+        if coordinator and command in ('accept', 'web-verify') and ctx.principal.via == 'credential':
+            # kittrial-5bb.407: an agent accepts or verifies only within a person owner's
+            # delegation, named here; the default operation id would name no decision. The
+            # endpoint checks the delegation itself, live, under the write's lock.
+            named = body.get('decision_id')
+            if named is None and isinstance(body.get('acceptance'), dict):
+                named = body['acceptance'].get('decision_id')
+            if not isinstance(named, str) or not named.strip():
+                raise forbidden('An agent accepts or verifies a record only within a delegation: name the person '
+                              "owner's delegation decision as decision_id")
         body = self._normalize_record_payload(ctx, command, body, operation_id)
 
         def mutate_record():
@@ -11024,6 +11085,68 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, route_name, pid, mutate_record, status=status,
                             capability=needed, serialize=False, canonical=True,
                             reason='%s %s' % (command, body.get('key') or ''))
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/delegations')
+    def delegations_list(self, ctx):
+        """The project's delegations of decision rights (kittrial-5bb.407), at CAP_READ.
+
+        Each item is a decision issue carrying delegation records, in force or not, with the
+        reason when not; ``granted_agents`` says for each agent holding the coordinator grant
+        whether a delegation in force covers it (the check before a release that requires
+        one). Computed by the endpoint with the same live check an acceptance runs.
+        """
+        self._project(ctx, CAP_READ)
+        read = getattr(self.backend, 'delegations_read', None)
+        if read is None:
+            raise not_implemented('Delegations require the canonical endpoint backend')
+        return 200, read(ctx.params['pid'], ctx.principal)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/delegations')
+    def delegations_write(self, ctx):
+        """Grant, narrow or revoke a delegation (kittrial-5bb.407).
+
+        Only a person owner's own web session: an agent or worker credential is refused here,
+        and the endpoint checks the session and the live owner role again under the lock. The
+        body is the closed request (``action`` grant|narrow|revoke, ``decision``, ``right``,
+        ``grantee``, ``scope``, ``escalate``, ``reason``); the recorder, the account and the
+        time are the server's.
+        """
+        import delegations
+        pid = ctx.params['pid']
+        if not hasattr(self.backend, 'ROUTES') or 'delegations.grant' not in self.backend.ROUTES:
+            raise not_implemented('Delegations are unavailable on this server')
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        if ctx.principal.via != 'session':
+            raise forbidden('A delegation is recorded by a person owner signed in to the web; an agent or worker '
+                            'credential cannot record one')
+        with self.service.store.lock:
+            role = ((self.service.state.get('memberships') or {}).get(pid) or {}).get(ctx.principal.user_id)
+        if role != 'owner':
+            raise forbidden('Only a person owner of this project records a delegation; a superuser without the '
+                            'owner role adds themselves as owner first')
+        payload = dict(ctx.payload or {})
+        fields = tuple(sorted(delegations.REQUEST_FIELDS - {'schema_version', 'operation_id'}))
+        refuse_unknown_fields(payload, fields, 'A delegation')
+        if set(payload) != set(fields):
+            raise invalid('Supply exactly ' + ', '.join(fields))
+        if payload.get('action') not in delegations.ACTIONS:
+            raise invalid('action must be one of ' + ', '.join(delegations.ACTIONS))
+        try:
+            delegations.validate_request(dict(payload, schema_version=1, operation_id='http-validation'))
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        route_name = 'delegations.' + payload['action']
+
+        def write():
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request '
+                              'after an uncertain outcome')
+            result = self.backend.invoke(route_name, ctx.principal, pid, payload,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_PROJECT_ADMIN)
+            return result, result
+        return self._mutate(ctx, route_name, pid, write, capability=CAP_PROJECT_ADMIN,
+                            status=201, serialize=False, canonical=True)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):

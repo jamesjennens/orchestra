@@ -4232,7 +4232,7 @@ OWNER_ANSWERS_JOURNAL='.owner-answers'
 #: ``<name>.tmp`` does not match the sweep's shape, so sweeping it is a no-op.
 ATOMIC_SWEEP_DIRECTORIES=('.',)+RESERVATION_JOURNALS+( '.handoffs','.handoff-recoveries',
     '.requirement-backfills','.integration-reverts','.assignee-followons','.lane-fault-clears','.lifecycle-voids',
-    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL)
+    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL,'.delegations')
 
 def sweep_project_temporaries(root,name,*,dry_run=False,min_age_seconds=None):
     """Sweep the project directory and every atomic family in it; never touches a live write.
@@ -4288,7 +4288,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
         baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
         if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
@@ -4340,6 +4340,11 @@ def validate_coordination_files(files):
             # dropped it would show every cleared fault again.
             from fault_clear import validate_entry as validate_fault_clear_entry
             validate_fault_clear_entry(record,name.partition('/')[2])
+        if name.startswith('.delegations/'):
+            # The delegation journal (kittrial-5bb.407): a restore that dropped it would
+            # silently void every delegation, and every agent acceptance would be refused.
+            from delegations import validate_entry as validate_delegation_entry
+            validate_delegation_entry(record,name.partition('/')[2])
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
         if name=='GUIDANCE.md':
             from guidance import validate_text
@@ -4869,6 +4874,13 @@ def backup_project(root,name):
         for record in fault_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Lane fault clear journal entry must not be a symlink')
             files['.lane-fault-clears/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
+        # The delegation journal (kittrial-5bb.407), backed up and restored like the two above:
+        # without it every delegation would be inert after a restore.
+        delegation_journal=path/'.delegations'
+        if delegation_journal.is_symlink():raise ValueError('Delegation journal must not be a symlink')
+        for record in delegation_journal.glob('*.json'):
+            if record.is_symlink():raise ValueError('Delegation journal entry must not be a symlink')
+            files['.delegations/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
         # The per-project claiming setting (kittrial-5bb.352). It lives outside the
         # tracker, so a backup that dropped it would silently open claiming again after
         # a restore. A damaged file is carried byte for byte and reads back restrictive.
@@ -7103,6 +7115,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name.startswith('.lane-fault-clears/'):
             from fault_clear import validate_entry as validate_fault_clear_entry
             validate_fault_clear_entry(record,name.partition('/')[2])
+        elif name.startswith('.delegations/'):
+            from delegations import validate_entry as validate_delegation_entry
+            validate_delegation_entry(record,name.partition('/')[2])
         elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])
@@ -10365,6 +10380,11 @@ def main():
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('fault-clear',help='clear a lane\'s needs-investigation flag (operator allowlist, host journal)')
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('delegation-record',help='grant, narrow or revoke a delegation of a decision right (operator allowlist, host journal)')
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('delegation-check',help='read-only: the delegations of a project and which granted coordinator agents they cover')
+    a.add_argument('--project',required=True)
+    a.add_argument('--state',required=True,help='the existing web service state document (read only)')
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-reconcile');a.add_argument('project');a.add_argument('--operation-id',required=True)
@@ -11020,6 +11040,52 @@ def main():
             authority=operators(root,strict=True)
             require_configured_operator(args.actor,authority,'clear a needs-investigation flag')
             print(json.dumps(fault_clear.apply(payload,args.actor,run,path,operators=authority),ensure_ascii=False))
+    elif args.command=='delegation-record':
+        # The installation operator's host route for a delegation (kittrial-5bb.407); the
+        # SAME delegations.apply the web route and `coordinator delegation-record` call, under
+        # the same project lock, after the same operator check. The record says via operator.
+        import fcntl
+        import delegations
+        from keyed_records import require_configured_operator
+        from http_authority import server_time
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        if not isinstance(payload,dict):
+            raise ValueError('The delegation payload must be a JSON object. Nothing was written.')
+        require_configured_operator(args.actor,operators(root,strict=True),'record a delegation')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            require_configured_operator(args.actor,operators(root,strict=True),'record a delegation')
+            print(json.dumps(delegations.apply(payload,project=args.project,journal=path,run=run,recorded_by=args.actor,
+                                               via='operator',account=None,at=server_time()),ensure_ascii=False))
+    elif args.command=='delegation-check':
+        # Read-only (kittrial-5bb.407): before a release that requires a delegation for every
+        # agent acceptance, list each agent holding this project's coordinator grant and the
+        # delegations in force that cover it. Nothing is written; no lock is taken.
+        import delegations
+        from http_authority import read_state
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        state_path=Path(args.state)
+        if state_path.is_symlink() or not state_path.is_file():raise ValueError('Use the existing web service state document')
+        state=read_state(state_path)
+        def run(argv):return run_bd(root,args.project,argv)
+        listed=record_json.loads_array_rows(run(['list','--label',delegations.LABEL,'--all','--limit','0','--json']) or '[]')
+        ids=[str(row['id']) for row in listed if isinstance(row,dict) and row.get('id')]
+        shown=record_json.loads_array_rows(run(['show',*ids,'--json','--include-comments']) or '[]') if ids else []
+        try:
+            from sessions import owners as session_owners
+            owned=session_owners(path)
+        except (OSError,ValueError):
+            owned=None
+        items=delegations.listing(shown,args.project,state,path,operators(root),owned)
+        agents=delegations.coverage(state,args.project,items)
+        print(json.dumps({'schema_version':1,'project':args.project,'granted_agents':agents,
+                          'uncovered':[a['agent'] for a in agents if not a['covered']],'delegations':items},ensure_ascii=False))
     elif args.command=='requirement-backfill':
         import fcntl
         from requirement_records import backfill

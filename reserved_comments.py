@@ -233,6 +233,12 @@ ASSIGNEE_FOLLOWON_PREFIX = 'Kind: assignee-followon-v1\n'
 # ordinary comments (design 6).
 TASK_FILE_PREFIX = 'Kind: task-file-v1\n'
 TASK_FILE_WITHDRAWN_PREFIX = 'Kind: task-file-withdrawn-v1\n'
+# kittrial-5bb.407. A person owner's (or a listed operator's) delegation of a decision
+# right, written only by the dedicated delegation operation (delegations.py). Reserved so
+# the raw `comments add` path can never plant one; honoured only with its host journal
+# entry (``<project>/.delegations/``), so one planted where the prefix is not reserved (an
+# older kit) grants nothing. Not a record-anchor family: every surface reads it as a comment.
+DELEGATION_PREFIX = 'Kind: delegation-v1\n'
 
 RESERVED = (
     (TASK_ASSIGNMENT_PREFIX, 'task assignment notice', 'the dedicated coordinate assignment operation'),
@@ -273,6 +279,9 @@ RESERVED = (
     (TASK_FILE_PREFIX, 'task file record', 'the task files route (PUT /v1/projects/PID/tasks/TID/files)'),
     (TASK_FILE_WITHDRAWN_PREFIX, 'task file withdrawal record',
      'the task files route (POST /v1/projects/PID/tasks/TID/files/SHA256/withdraw)'),
+    (DELEGATION_PREFIX, 'delegation record',
+     "the delegations route (a person owner's web session) or admin.py delegation-record on the "
+     'coordination host'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
@@ -806,7 +815,9 @@ RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:',
 # and a claim then jammed it (kittrial-5bb.113 review), so no contributor adds,
 # removes or replaces it on any row.
 MERGE_SLOT_LABEL = 'gt:slot'
-RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section', MERGE_SLOT_LABEL})
+# `delegation` marks a decision issue that carries delegation records (kittrial-5bb.407);
+# only the delegation operation adds it, so a contributor cannot fake or hide the listing.
+RESERVED_EXACT_LABELS = frozenset({'requirement', 'brd-section', MERGE_SLOT_LABEL, 'delegation'})
 # Every label-writing spelling accepted by the pinned bd 1.2.2, verified by
 # driving the binary (`bd create --help` / `bd update --help` plus a behaviour
 # probe of each candidate). `create` accepts the UNDOCUMENTED `--label` alias of
