@@ -3649,30 +3649,14 @@ class Service:
         return stored or {}
 
     def _carried(self, record, moment):
-        """Whether a carrier that reaches this record's lane was seen within the window before ``moment``."""
-        try:
-            registry = self._carrier_registry()
-        except HttpError:
-            return False
-        lane, project_id = record.get('lane'), record.get('project')
-        for agent_id, entry in registry.items():
-            agent = self.state['agents'].get(agent_id)
-            if not isinstance(entry, dict) or not isinstance(agent, dict) or not agent.get('enabled'):
-                continue
-            seen = entry.get('seen_ts')
-            if type(seen) not in (int, float) or seen < moment - nudges.CARRIER_WINDOW:
-                continue
-            # The run of heartbeats that ends at ``seen_ts`` began at ``since_ts``: a carrier first heard
-            # long after the moment says nothing about it.
-            since = entry.get('since_ts')
-            since = since if type(since) in (int, float) and since <= seen else seen
-            if moment < since - nudges.CARRIER_WINDOW:
-                continue
-            if lane in (entry.get('lanes') or ()) and project_id in (agent.get('projects') or []) \
-                    and account_in_project(self.state, agent.get('owner'), project_id) \
-                    and full_actor_parties(self.state, lane, project_id) == {agent.get('owner')}:
-                return True
-        return False
+        """Whether a carrier of this record's lane was heard in the window before ``moment`` (its end).
+
+        Judged from the record's own stamp (``nudges.note_carrier``, written by the heartbeat while the
+        request was open), not from the carrier's current entry: a later heartbeat, a cleanup or an
+        eviction of the entry, or the account leaving cannot change what was true at the end.
+        """
+        seen = record.get('carrier_seen_ts')
+        return type(seen) in (int, float) and moment - nudges.CARRIER_WINDOW <= seen <= moment
 
     def _carrier_agent(self, principal):
         """The enabled agent behind a carrier credential, for the caller who holds ``store.lock``."""
@@ -3705,7 +3689,7 @@ class Service:
         raise not_found(self.NUDGE_GONE)
 
     def carrier_heartbeat(self, principal, payload):
-        """Record that this carrier is up and which lanes it reaches; bounded, one entry per agent."""
+        """Record that this carrier is up and which lanes it reaches, and stamp the open requests it can carry."""
         with self.store.lock:
             agent = self._carrier_agent(principal)
             kind = payload.get('kind')
@@ -3717,13 +3701,14 @@ class Service:
                 raise invalid('lanes must be a list of at most %d lane actor labels' % nudges.CARRIER_LANES_MAX)
             now = self._now()
             registry = self._carrier_registry(create=True)
-            before = registry.get(agent['id']) if isinstance(registry.get(agent['id']), dict) else {}
-            last = before.get('seen_ts')
-            # A gap longer than the window ends the run of heartbeats: the carrier was away.
-            run = before.get('since_ts') if type(last) in (int, float) and type(before.get('since_ts')) in (int, float) \
-                and 0 <= now - last <= nudges.CARRIER_WINDOW else now
             registry[agent['id']] = {'kind': kind, 'lanes': sorted(set(lanes)), 'user_id': principal.user_id,
-                                     'since_ts': run, 'seen_ts': now, 'seen_at': now_iso(now)}
+                                     'seen_ts': now, 'seen_at': now_iso(now)}
+            # The heartbeat's real effect: every open request of a lane this carrier reaches is stamped.
+            for project_id in agent.get('projects') or []:
+                for record in self._nudge_records(project_id):
+                    if isinstance(record, dict) and record.get('lane') in lanes \
+                            and self._carrier_sees(principal, agent, record):
+                        nudges.note_carrier(record, now)
             for gone in [key for key, entry in registry.items()
                          if not isinstance(entry, dict) or key not in self.state['agents']
                          or now - (entry.get('seen_ts') if type(entry.get('seen_ts')) in (int, float) else 0) > 86400]:

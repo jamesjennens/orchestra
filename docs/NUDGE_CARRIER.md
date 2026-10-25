@@ -44,10 +44,11 @@ receives them.
 ## When no carrier is there
 
 A request nobody claimed ends after 15 minutes: `not-deliverable` (`no-carrier`) when no carrier that reaches
-the lane was heard within 90 seconds (three polls) of that moment, `expired` (`unclaimed`) when one was. "Heard"
-means the moment lies between 90 seconds before the START of the carrier's current run of heartbeats (a gap
-longer than 90 seconds starts a new run) and 90 seconds after its last heartbeat, and the carrier's account is
-still a member of the project: a carrier first heard long after the moment says nothing about it. One claimed and never answered is `expired` (`unanswered`). The board's `nudge` field shows the state.
+the lane was heard within 90 seconds (three polls) of that moment, `expired` (`unclaimed`) when one was. "Heard" is written on the request itself: each heartbeat
+stamps every open request, before its own end, for a lane that carrier reaches while its account is an enabled
+member of the project, and the request settles by that stamp alone (heard in the last 90 seconds before its
+end). Nothing later can change it: a later heartbeat, the carrier's entry being cleaned up or evicted, or the
+account leaving or being disabled after the end. A carrier first heard after the end says nothing about it. One claimed and never answered is `expired` (`unanswered`). The board's `nudge` field shows the state.
 
 ## The reference supervisor
 

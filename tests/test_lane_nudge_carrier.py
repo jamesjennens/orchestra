@@ -229,16 +229,32 @@ class CarrierReadTests(CarrierCase):
             self.assertEqual(404, self.answer(secret, nudge_id).status)
         self.assertEqual('claimed', self.state(claimed)['state'])
 
-    def test_a_carrier_seen_for_an_account_that_left_does_not_count_as_a_carrier(self):
+    def test_a_carrier_whose_account_already_left_is_not_counted_as_one_at_the_end(self):
         secret, _ = self.carrier('carl')
         nudge_id = self.ask(self.ids['carl'])
-        self.later(nudges.PENDING_TTL - 10)
-        self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
         self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/members/%s' % (self.project, self.ids['carl']),
                                            token=self.tokens['olive']).status)
+        self.later(nudges.PENDING_TTL - 10)
+        self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
         self.later(20)
+        self.assertNotIn('carrier_seen_ts', self.state(nudge_id))
         self.assertEqual('not-deliverable', self.request('GET', '/v1/projects/%s/nudges' % self.project,
                                                          token=self.tokens['olive']).data['items'][0]['state'])
+
+    def test_account_in_project_is_a_live_enabled_member_or_superuser(self):
+        state = self.service.state
+        carl = self.ids['carl']
+        self.assertTrue(http_authority.account_in_project(state, carl, self.project))
+        self.assertFalse(http_authority.account_in_project(state, self.ids['otto'], self.project))
+        self.assertFalse(http_authority.account_in_project(state, carl, 'no-such-project'))
+        self.assertFalse(http_authority.account_in_project(state, 'no-such-user', self.project))
+        state['users'][carl]['disabled'] = True
+        self.assertFalse(http_authority.account_in_project(state, carl, self.project))
+        state['users'][carl]['disabled'] = False
+        state['users'][self.ids['otto']]['superuser'] = True
+        self.assertTrue(http_authority.account_in_project(state, self.ids['otto'], self.project))
+        state['users'][self.ids['otto']]['disabled'] = True
+        self.assertFalse(http_authority.account_in_project(state, self.ids['otto'], self.project))
 
     def test_a_carrier_reaches_only_projects_its_agent_is_granted(self):
         secret, agent_id = self.carrier('carl')
@@ -424,6 +440,54 @@ class NoCarrierTests(CarrierCase):
         self.beat(secret, [self.ids['carl']])          # back after a gap far longer than the window
         self.later(1)
         self.assertEqual(('not-deliverable', 'no-carrier'), tuple(self.lane_state(gap)[k] for k in ('state', 'outcome_detail')))
+
+    def beats_through_the_end(self, secret, extra=0):
+        """A carrier that heartbeats every poll from now past the request's end (plus ``extra`` seconds)."""
+        for _ in range((nudges.PENDING_TTL + extra) // nudges.CARRIER_POLL + 1):
+            self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
+            self.later(nudges.CARRIER_POLL)
+
+    def board(self, nudge_id):
+        return tuple(self.lane_state(nudge_id)[k] for k in ('state', 'outcome_detail'))
+
+    def test_what_was_true_at_the_end_is_not_rewritten_by_a_pause_and_a_later_heartbeat(self):
+        secret, _ = self.carrier('carl')
+        first = self.ask(self.ids['carl'])
+        self.beats_through_the_end(secret)
+        self.assertEqual(('expired', 'unclaimed'), self.board(first))
+        self.later(nudges.CARRIER_WINDOW + 30)
+        self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
+        self.assertEqual(('expired', 'unclaimed'), self.board(first))
+        second = self.ask(self.ids['carl'])         # a new request settles (writes) the first
+        self.assertEqual(('expired', 'unclaimed'), (self.state(first)['state'], self.state(first)['outcome_detail']))
+        self.assertEqual('pending', self.state(second)['state'])
+
+    def test_what_was_true_at_the_end_survives_the_account_leaving_or_being_disabled_afterwards(self):
+        for how in ('leaves', 'disabled'):
+            with self.subTest(how=how):
+                secret, _ = self.carrier('carl', 'Carrier-' + how)
+                nudge_id = self.ask(self.ids['carl'])
+                self.beats_through_the_end(secret)
+                if how == 'leaves':
+                    self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/members/%s' % (self.project, self.ids['carl']),
+                                                       token=self.tokens['olive']).status)
+                else:
+                    self.service.state['users'][self.ids['carl']]['disabled'] = True
+                self.assertEqual(('expired', 'unclaimed'), self.board(nudge_id))
+                self.ask(self.ids['dave'])
+                self.assertEqual('expired', self.state(nudge_id)['state'])
+                self.member('carl', 'contributor')
+                self.service.state['users'][self.ids['carl']]['disabled'] = False
+
+    def test_what_was_true_at_the_end_survives_the_carriers_entry_being_cleaned_up_or_evicted(self):
+        secret, _ = self.carrier('carl')
+        nudge_id = self.ask(self.ids['carl'])
+        self.beats_through_the_end(secret)
+        self.service.state['nudge_carriers'].clear()       # the 24 h cleanup and the 64-entry bound both do this
+        self.assertEqual(('expired', 'unclaimed'), self.board(nudge_id))
+        self.later(2 * 86400)
+        self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
+        self.assertEqual(('expired', 'unclaimed'), self.board(nudge_id))
 
     def test_a_carrier_for_another_lane_or_account_does_not_count(self):
         elsewhere, _ = self.carrier('dave', 'Other')

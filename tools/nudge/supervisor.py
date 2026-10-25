@@ -69,9 +69,9 @@ class TmuxTerminal(Terminal):
         self.target, self.tmux = target, tmux
 
     def _run(self, *args):
-        done = subprocess.run([self.tmux] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              universal_newlines=True, timeout=15)
-        return done.returncode, done.stdout
+        done = subprocess.run([self.tmux] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        # Whatever a pane shows is text to read, never a reason to die: undecodable bytes are replaced.
+        return done.returncode, done.stdout.decode('utf-8', 'replace')
 
     def exists(self):
         try:

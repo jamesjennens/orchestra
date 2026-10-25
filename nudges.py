@@ -139,6 +139,19 @@ def expired(record, now):
     return record.get('state') in OPEN and now - _stamp(record) >= PENDING_TTL
 
 
+def note_carrier(record, now):
+    """Stamp an open request that a carrier of its lane was heard ``now``, while it can still be heard for it.
+
+    The stamp is on the RECORD and is written only before the request's own end, so what a carrier
+    could have done for it is fixed by then: nothing heard later, no entry dropped, and no account
+    removed after the end can change how it settles (kittrial-5bb.415 round 3). True when stamped.
+    """
+    if record.get('state') in OPEN and now < _stamp(record) + PENDING_TTL:
+        record['carrier_seen_ts'] = now
+        return True
+    return False
+
+
 def effective(record, now, iso, carried=None):
     """The record as it stands at ``now``; reading never writes (``settle`` writes it).
 

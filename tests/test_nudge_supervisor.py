@@ -133,6 +133,12 @@ class TypingTests(unittest.TestCase):
                 terminal._run = lambda *args, answer=answer: answer
                 self.assertEqual(blocked, terminal.blocked())
 
+    def test_what_a_pane_shows_is_decoded_with_replacement_never_an_error(self):
+        done = subprocess.CompletedProcess(['tmux'], 0, stdout=b'caf\xc3\xa9 \xff\xfe\n> ', stderr=b'')
+        with mock.patch.object(supervisor.subprocess, 'run', return_value=done):
+            shown = supervisor.TmuxTerminal('%1').screen()
+        self.assertEqual('caf\u00e9 \ufffd\ufffd\n> ', shown)
+
     def test_the_prompt_must_be_the_whole_last_line(self):
         for screen in ('user> rm -rf x', '> and more', 'text\n>> '):
             with self.subTest(screen=screen):
