@@ -382,6 +382,12 @@ class DesignPointerTests(ReferenceCase):
         with patch.object(reference_records, 'catalog', return_value=([good], [])):
             self.assertEqual(self.resolve('design:x', [])['state'], 'live')
 
+    def test_design_names_only_design_entries_never_another_reference(self):
+        self.propose()  # the reference entry calendar.trading, not a design
+        self.assertEqual(self.resolve('ref:calendar.trading')['state'], 'live')
+        answer = self.resolve('design:calendar.trading')
+        self.assertEqual((answer['state'], answer['flags']), ('unavailable', ['unknown-scope']))
+
     def test_hidden_equals_absent_and_another_project_never_resolves(self):
         self.propose(key='design.server-redesign')
         token = 'design:server-redesign#plan'
