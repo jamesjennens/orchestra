@@ -323,9 +323,18 @@ class RoomsItemsRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTest
         self.assertFalse(cancelled.data['record_may_exist'])
 
     def test_r7_room_decision_endpoint_rechecks_signed_authority(self):
-        # M1/M2/M3: role, session and project are live endpoint checks, not route-only ones.
+        # M1 and M2 have equivalent earlier refusals in requirement_editor and
+        # service_descriptor. M3 is killed by a real second-project descriptor.
         # M16: issue requires coordinate even when the signed descriptor asks for less.
         from http_authority import CAP_COORDINATE, CAP_READ, required_capability
+        rb.admin.add_project(self.root, 'qq')
+        admin = self.admin_token()
+        second = self.request('POST', '/v1/projects', {'project_id': 'qq', 'name': 'QQ'},
+                              token=admin)
+        self.assertIn(second.status, (200, 201, 409), second.data)
+        coordinator = self.request('PUT', '/v1/projects/qq/members/%s' % self.ids['alex'],
+                                   {'role': 'coordinator'}, token=admin)
+        self.assertIn(coordinator.status, (200, 201), coordinator.data)
         rid = self.room('R7 signed authority')
         self.assertEqual(201, self.item(rid, who='casey', kind='decision', title='Use CSV',
                                         text='Emit CSV first.', key='r7a-item').status)
@@ -338,7 +347,7 @@ class RoomsItemsRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTest
         cases = (
             ('role', {'who': 'casey'}),
             ('session', {'descriptor': {'via': 'credential'}}),
-            ('project', {'project': 'elsewhere'}),
+            ('project', {'project': 'qq'}),
             ('capability', {'capability': CAP_READ}),
         )
         for label, options in cases:
