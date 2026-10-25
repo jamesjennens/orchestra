@@ -252,7 +252,8 @@ class CoalescingAndLimitTests(NudgeCase):
         self.assertEqual(0, nudges.retry_after(three[1:], 'a', 'agent', 'ag', now))
         ten = [record('lane-%d' % step, now - 3000 + 250 * step, 'ag') for step in range(10)]
         self.assertGreater(nudges.retry_after(ten, 'fresh', 'agent', 'ag', now), 0)
-        self.assertEqual(0, nudges.retry_after(ten, 'fresh', 'agent', 'other', now))
+        self.assertGreater(nudges.retry_after(ten, 'fresh', 'agent', 'other', now), 0)   # the agents' project bound
+        self.assertEqual(0, nudges.retry_after(ten, 'fresh', 'person', None, now))      # ... which a person never meets
 
     def test_the_record_list_is_bounded_and_keeps_every_open_request(self):
         iso = lambda stamp: 'at-%s' % stamp
@@ -345,8 +346,9 @@ class RecordTests(NudgeCase):
         self.assertEqual(201, self.nudge(self.tokens['olive']).status)
         rows = {row['actor']: row for row in self.lanes(self.tokens['olive']).data['items']}
         shown = rows[self.ids['carl']]['nudge']
-        self.assertEqual({'id', 'lane', 'message', 'reason', 'state', 'requested_at', 'requested_by_display',
-                          'outcome_at', 'outcome_detail', 'declared_wait'}, set(shown))
+        # no reason, no lane and no declared-wait detail: slice 2's carrier must never read a reason
+        self.assertEqual({'id', 'message', 'state', 'requested_at', 'requested_by_display',
+                          'outcome_at', 'outcome_detail'}, set(shown))
         self.assertEqual(('resume', 'pending'), (shown['message'], shown['state']))
         self.assertIsNone(rows[self.ids['dave']]['nudge'])
         # The lane itself sees its own row's nudge, and nobody sees another lane's through the page.
@@ -376,7 +378,7 @@ class RecordTests(NudgeCase):
         self.assertEqual(1, len(self.records()))
         third = self.nudge(self.tokens['olive'], self.ids['dave'], operation_id='nudge-op-000002')
         self.assertEqual(201, third.status, third.data)
-        self.assertEqual(422, self.nudge(self.tokens['olive'], key='nudge-retry-0001',
+        self.assertEqual(422, self.nudge(self.tokens['olive'], self.ids['dave'], key='nudge-retry-0007',
                                          operation_id='nudge-op-000009').status)
 
     def test_a_damaged_record_is_refused_and_does_not_break_the_board(self):
@@ -386,6 +388,69 @@ class RecordTests(NudgeCase):
         board = self.lanes(self.tokens['olive'])
         self.assertEqual(200, board.status, board.data)
         self.assertTrue(all(row['nudge'] is None for row in board.data['items']))
+
+
+class FollowUpTests(NudgeCase):
+    """kittrial-5bb.414: the review of .413."""
+
+    def test_every_refusal_before_the_write_is_audited_and_writes_nothing(self):
+        olive = self.tokens['olive']
+        for status, answer in ((404, self.nudge(olive, 'usr_0000000000000000')), (422, self.nudge(olive, message='shout')),
+                               (422, self.nudge(olive, colour='red')), (422, self.nudge(olive, operation_id='x'))):
+            self.assertEqual(status, answer.status, answer.data)
+        self.assertEqual(4, len(self.events(outcome='rejected')))
+        self.assertEqual([], self.events(outcome='committed'))
+        self.assertEqual([], self.records())
+
+    def test_each_refusal_adds_exactly_one_rejected_event(self):
+        for step, body in enumerate(({'lane': 'usr_0000000000000000'}, {'message': 'shout'}, {'colour': 'red'})):
+            answer = self.nudge(self.tokens['olive'], **body)
+            self.assertIn(answer.status, (404, 422))
+            self.assertEqual(step + 1, len(self.events(outcome='rejected')))
+
+    def test_a_retry_after_the_lane_left_the_board_is_the_stored_answer(self):
+        key = 'nudge-left-0001'
+        first = self.nudge(self.tokens['olive'], key=key)
+        self.assertEqual(201, first.status, first.data)
+        planted = self.backend.lanes_read
+        self.backend.lanes_read = lambda *a, **k: dict(planted(*a, **k), items=[])
+        again = self.nudge(self.tokens['olive'], key=key)
+        self.assertEqual((201, first.data['nudge']['id']), (again.status, again.data['nudge']['id']))
+        self.assertEqual(404, self.nudge(self.tokens['olive'], key='nudge-left-0002').status)
+
+    def test_agents_and_persons_have_separate_project_counters(self):
+        now = 10 ** 9
+        person = lambda step: {'lane': 'p-%d' % step, 'requested_ts': now - 3000 + 60 * step,
+                               'requested_by': {'kind': 'person', 'agent_id': None}}
+        agent = lambda step: {'lane': 'a-%d' % step, 'requested_ts': now - 3000 + 60 * step,
+                              'requested_by': {'kind': 'agent', 'agent_id': 'ag-%d' % step}}
+        agents = [agent(step) for step in range(10)]          # ten agents, one request each
+        self.assertEqual(0, nudges.retry_after(agents, 'fresh', 'person', None, now))   # never blocks a person
+        self.assertGreater(nudges.retry_after(agents, 'fresh', 'agent', 'ag-new', now), 0)   # the agents' own bound
+        self.assertEqual(0, nudges.retry_after(agents[1:], 'fresh', 'agent', 'ag-new', now))
+        persons = [person(step) for step in range(30)]
+        self.assertGreater(nudges.retry_after(persons, 'fresh', 'person', None, now), 0)
+        self.assertEqual(0, nudges.retry_after(persons, 'fresh', 'agent', 'ag-new', now))  # never blocks an agent
+        self.assertEqual(0, nudges.retry_after(persons[:20] + agents, 'fresh', 'person', None, now))
+
+    def test_a_record_stamped_in_the_future_blocks_nothing(self):
+        now = 10 ** 9
+        future = {'lane': 'a', 'requested_ts': now + 3000, 'requested_by': {'kind': 'person', 'agent_id': None}}
+        self.assertEqual(0, nudges.retry_after([future] * 6, 'a', 'person', None, now))
+        self.assertGreater(nudges.retry_after([dict(future, requested_ts=now - 10)], 'a', 'person', None, now), 0)
+
+    def test_the_bound_never_evicts_the_newest_hour(self):
+        now = 10 ** 9
+        iso = lambda stamp: 'at-%s' % stamp
+        fresh = [{'id': 'new-%d' % step, 'state': 'delivered', 'requested_ts': now - 60 - step}
+                 for step in range(nudges.KEEP_RECORDS)]
+        older = [{'id': 'old-%d' % step, 'state': 'delivered', 'requested_ts': now - 7200 - step} for step in range(5)]
+        records = older + fresh
+        nudges.settle(records, now, iso)
+        self.assertEqual(sorted(record['id'] for record in fresh), sorted(record['id'] for record in records))
+        records = older + fresh + [{'id': 'newest', 'state': 'delivered', 'requested_ts': now - 5}]
+        nudges.settle(records, now, iso)
+        self.assertEqual(nudges.KEEP_RECORDS + 1, len(records))     # all of the newest hour stays, even past the bound
 
 
 if __name__ == '__main__':

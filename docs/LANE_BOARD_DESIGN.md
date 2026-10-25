@@ -397,3 +397,13 @@ read first, then the project-page panel).
 a `nudge` field (the lane's newest request in this project, never its note). The design is
 `docs/design/LANE_NUDGE_DESIGN.md` (kittrial-5bb.409, commit f84679f; it lands with the next
 release). There is no carrier yet: a request is kept and audited, and ends `not-deliverable`.
+
+Follow-ups (kittrial-5bb.414): every refusal of the request, including a 404 for a lane not on the
+board and a 422 for a bad body, is audited as refused and writes no record; a retry with the same key
+answers the stored result even if the lane has since left the board. Limits: a person's project bound
+(30 per hour) counts only persons' requests; agents have their own project bound (10 per hour across
+all agents) beside the per-agent (10) and per-lane bounds (the per-lane bounds still count every
+request on that lane). A record stamped in the future counts for nothing. The 200-record bound never
+evicts a record younger than an hour, so the list holds at most 200 plus that hour's requests (at most
+30 persons' and 10 agents' per project). The row's `nudge` field carries no reason, lane or
+declared-wait detail.

@@ -12237,26 +12237,31 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         self._project(ctx, CAP_COORDINATE)
         payload = dict(ctx.payload or {})
-        refuse_unknown_fields(payload, self.NUDGE_FIELDS, 'A nudge request')
-        try:
-            fields = nudges.parse_request(payload)
-        except ValueError as error:
-            raise invalid(str(error))
         operation_id = payload.get('operation_id')
-        if operation_id is not None:
-            if not isinstance(operation_id, str) or not IDEMPOTENCY_KEY.fullmatch(operation_id):
-                raise invalid('operation_id must be 8-128 URL-safe characters')
-            if ctx.idempotency_key not in (None, operation_id):
-                raise invalid('operation_id and the Idempotency-Key header must be the same')
+        if isinstance(operation_id, str) and IDEMPOTENCY_KEY.fullmatch(operation_id) \
+                and ctx.idempotency_key in (None, operation_id):
             ctx.idempotency_key = operation_id
-        row = self._nudge_lane_row(ctx, fields['lane'])
+        lane = payload.get('lane')
 
         def request():
+            # Everything that can refuse runs inside the mutation: the key is reserved first (a retry
+            # after the lane left the board is the stored answer) and every refusal is audited.
+            refuse_unknown_fields(payload, self.NUDGE_FIELDS, 'A nudge request')
+            try:
+                fields = nudges.parse_request(payload)
+            except ValueError as error:
+                raise invalid(str(error))
+            if operation_id is not None:
+                if not isinstance(operation_id, str) or not IDEMPOTENCY_KEY.fullmatch(operation_id):
+                    raise invalid('operation_id must be 8-128 URL-safe characters')
+                if ctx.idempotency_key != operation_id:
+                    raise invalid('operation_id and the Idempotency-Key header must be the same')
+            row = self._nudge_lane_row(ctx, fields['lane'])
             return self.service.request_nudge(ctx.principal, ctx.params['pid'], fields, row,
                                               request_id=ctx.request_id)
         status, answer = self._mutate(ctx, 'lanes.nudge.request', ctx.params['pid'], request,
                                       capability=CAP_COORDINATE, status=201, audit_success=False,
-                                      reason='lane %s' % fields['lane'])
+                                      reason='lane %s' % (lane[:80] if isinstance(lane, str) else '?'))
         # An open request for the same lane and message is answered as it is: 200, nothing written.
         return (200 if answer.get('coalesced') else status), answer
 

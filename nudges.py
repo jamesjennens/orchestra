@@ -34,7 +34,7 @@ KEEP_SECONDS = 30 * 86400
 #: ``lane_hour``: per lane per hour; ``project_hour`` and ``agent_hour``: per project, per agent. Every
 #: record counts, whoever wrote it, so an agent cannot nudge a lane a person has just nudged.
 PERSON_LIMITS = {'gap': 5 * 60, 'lane_hour': 6, 'project_hour': 30}
-AGENT_LIMITS = {'gap': 15 * 60, 'lane_hour': 3, 'agent_hour': 10}
+AGENT_LIMITS = {'gap': 15 * 60, 'lane_hour': 3, 'agent_hour': 10, 'agents_project_hour': 10}
 HOUR = 3600
 
 WAIT_STATES = ('waiting-on-coordinator', 'waiting-on-review', 'waiting-on-user')
@@ -140,7 +140,9 @@ def settle(records, now, iso):
     drop = [record for record in finished if now - _stamp(record) > KEEP_SECONDS]
     spare = len(records) - len(drop) - KEEP_RECORDS
     if spare > 0:
-        kept = [record for record in finished if record not in drop]
+        # Only records older than an hour go for the bound: the newest hour still counts toward the
+        # limits. It holds at most 30 persons' and 10 agents' records per project (and a lane's own).
+        kept = [record for record in finished if record not in drop and now - _stamp(record) >= HOUR]
         drop.extend(kept[:spare])
     if drop:
         records[:] = [record for record in records if not any(record is gone for gone in drop)]
@@ -164,7 +166,9 @@ def retry_after(records, lane, kind, agent_id, now):
     section 1.3 rule 3); each counts every record in its window, whoever wrote it.
     """
     limits = AGENT_LIMITS if kind == 'agent' else PERSON_LIMITS
-    stamps = [(record, _stamp(record)) for record in records if isinstance(record, dict)]
+    # A stamp in the future (the clock stepped back) counts for nothing: it must not block a lane.
+    stamps = [(record, stamp) for record, stamp in ((r, _stamp(r)) for r in records if isinstance(r, dict))
+              if stamp <= now]
     lane_stamps = sorted(stamp for record, stamp in stamps if record.get('lane') == lane)
     waits = []
     if lane_stamps and now - lane_stamps[-1] < limits['gap']:
@@ -172,15 +176,19 @@ def retry_after(records, lane, kind, agent_id, now):
     recent = [stamp for stamp in lane_stamps if now - stamp < HOUR]
     if len(recent) >= limits['lane_hour']:
         waits.append(recent[len(recent) - limits['lane_hour']] + HOUR - now)
+
+    def hourly(of_kind, bound, only_agent=None):
+        mine = sorted(stamp for record, stamp in stamps if now - stamp < HOUR
+                      and ((record.get('requested_by') or {}).get('kind') == 'agent') == of_kind
+                      and (only_agent is None or (record.get('requested_by') or {}).get('agent_id') == only_agent))
+        if len(mine) >= bound:
+            waits.append(mine[len(mine) - bound] + HOUR - now)
+    # Agents' records never count against persons: each kind has its own project bound.
     if kind == 'agent':
-        mine = sorted(stamp for record, stamp in stamps
-                      if (record.get('requested_by') or {}).get('agent_id') == agent_id and now - stamp < HOUR)
-        if len(mine) >= limits['agent_hour']:
-            waits.append(mine[len(mine) - limits['agent_hour']] + HOUR - now)
+        hourly(True, limits['agent_hour'], agent_id)
+        hourly(True, limits['agents_project_hour'])
     else:
-        project = sorted(stamp for _record, stamp in stamps if now - stamp < HOUR)
-        if len(project) >= limits['project_hour']:
-            waits.append(project[len(project) - limits['project_hour']] + HOUR - now)
+        hourly(False, limits['project_hour'])
     return int(max(waits) + 1) if waits else 0
 
 
@@ -205,3 +213,11 @@ def view(record, users, agents):
             'requested_by_display': display(record.get('requested_by'), users, agents),
             'outcome_at': record.get('outcome_at'), 'outcome_detail': record.get('outcome_detail'),
             'declared_wait': bool(record.get('declared_wait'))}
+
+
+def row_view(shown):
+    """The lanes row's field: what the board needs, without the reason or the lane (design 1.4)."""
+    if not isinstance(shown, dict):
+        return None
+    return {key: shown.get(key) for key in ('id', 'message', 'state', 'requested_at', 'requested_by_display',
+                                            'outcome_at', 'outcome_detail')}

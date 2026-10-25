@@ -3624,8 +3624,8 @@ class Service:
                 return {}
             for record in reversed(records):
                 if isinstance(record, dict) and record.get('lane') in wanted and record['lane'] not in found:
-                    found[record['lane']] = nudges.view(nudges.effective(record, now, now_iso),
-                                                        self.state['users'], self.state['agents'])
+                    found[record['lane']] = nudges.row_view(nudges.view(
+                        nudges.effective(record, now, now_iso), self.state['users'], self.state['agents']))
         return found
 
     NOT_A_RELEASE_OWNER = ('This agent\'s account is not an owner of this project, so a release grant would '
