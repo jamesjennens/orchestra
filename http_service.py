@@ -3370,6 +3370,9 @@ class EndpointBackend:
         The service-only ``room-decision`` endpoint action re-checks the signed-in
         owner/coordinator authority live and the item's stored title/text before writing.
         """
+        if (principal.via != 'session' or principal.credential_id
+                or getattr(principal, 'agent_id', None)):
+            raise forbidden('Deciding a room item needs a signed-in person; an agent credential cannot decide an item.')
         operation_id = fields['operation_id']
         authority = authority_request(principal, project_id, CAP_COORDINATE,
                                       now=self.service._expiry_now())
@@ -6853,8 +6856,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         """Every pending intent's outcome in a room, worked out before the locks (round 6, s1).
 
         The room's lines are read under the room lock for that moment only; each outcome is
-        then resolved with no lock held. Keyed by the intent's identity: if an intent changed
-        before the caller takes its locks, its cancel line falls back to "a record may exist".
+        then resolved with no lock held. Keyed by the intent's identity and ordered attempt
+        authors: if either changed before the caller takes its locks, its cancel line falls
+        back to "a record may exist".
         """
         try:
             with self._rooms_lock(project):
@@ -6867,9 +6871,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         for sequence in wanted:
             pending = rooms.pending_accept_intent(lines, sequence)
             if pending is not None:
-                outcomes[pending['identity']] = self._room_attempt_outcomes(
+                authors = tuple(author['id'] for author in
+                                rooms.intent_authors(lines, pending['identity']))
+                outcomes[(pending['identity'], authors)] = self._room_attempt_outcomes(
                     pid, project, room_id, pending, lines)
         return outcomes
+
+    def _room_locked_outcome(self, project, room_id, outcomes, pending):
+        lines = rooms.load_lines(project, room_id)
+        authors = tuple(author['id'] for author in
+                        rooms.intent_authors(lines, pending['identity']))
+        return outcomes.get((pending['identity'], authors), ((), True))
 
     def _room_item_record(self, ctx, pid, item, evidence, parent=None, base=None,
                           record_kind=None, earlier=(), intent=None, log_attempt=None):
@@ -7344,7 +7356,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             # Round 5 (b2): archive cancels every pending accept intent in the room first.
             return rooms.archive(project, ctx.params['rid'], actor, operation_id,
                                  payload.get('reason'), self._rooms_limits(),
-                                 outcome=lambda pending: outcomes.get(pending['identity'], ((), True)))
+                                 outcome=lambda pending: self._room_locked_outcome(
+                                     project, ctx.params['rid'], outcomes, pending))
         return self._rooms_write(ctx, 'rooms.archive', CAP_COORDINATE, write,
                                  reason='room %s' % ctx.params['rid'], item_first=True)
 
@@ -7379,7 +7392,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                         result = rooms.moderate(
                             project, ctx.params['rid'], sequence, payload['reason'],
                             operation_id, actor, self._rooms_limits(),
-                            outcome=lambda pending: outcomes.get(pending['identity'], ((), True)))
+                            outcome=lambda pending: self._room_locked_outcome(
+                                     project, ctx.params['rid'], outcomes, pending))
             except rooms.Refusal as refusal:
                 raise self._rooms_refusal(refusal) from None
             return result, result
