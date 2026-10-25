@@ -6,11 +6,13 @@ kind, resolved from caller-authorized rows on the server, never a refusal.
 import copy
 import json
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import briefing as b
 import requirement_governance as governance
 import requirement_http as http
