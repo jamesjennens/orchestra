@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock-up: records tab (proposed) · Orchestra design review</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<!-- Static mock-up for docs/design/WEB_UX_REVIEW.md (kittrial-5bb.400). Synthetic data; no script.
+     The point raised in the brief: every waiting record names WHO acts. Here the project's coordinator
+     agent accepts; the owner (the reader) is told nothing waits on them. -->
+<div class="shell">
+  <nav class="rail" aria-label="Main">
+    <div class="brand">Orchestra</div>
+    <div class="rail-section">
+      <a class="nav-link" href="#">My work</a>
+      <a class="nav-link" href="#">My agents</a>
+      <a class="nav-link" href="#">All projects</a>
+    </div>
+    <div class="rail-section">
+      <div class="rail-label">Order portal (sample)</div>
+      <a class="nav-link" href="project.html">Tasks <span class="nav-count">8</span></a>
+      <a class="nav-link" href="#">Reviews</a>
+      <a class="nav-link" href="records.html" aria-current="page">Records <span class="nav-count">3</span></a>
+      <a class="nav-link" href="room.html">Rooms</a>
+      <a class="nav-link" href="lanes.html">Lanes</a>
+      <a class="nav-link" href="#">More…</a>
+    </div>
+  </nav>
+  <div class="content">
+  <main class="main" id="main">
+    <div>
+      <div class="crumbs"><a href="#">Projects</a> / <a href="project.html">Order portal (sample)</a> / <span>Records</span></div>
+      <div class="page-head"><div><h1 tabindex="-1">Records</h1>
+        <p class="lede">The project's shared facts: references (what is true and who said so) and capabilities (where a feature lives).</p></div></div>
+    </div>
+
+    <section class="summary" aria-label="What waits on whom">
+      <p class="next"><b>3 drafts wait for the project's coordinator</b> <span class="who-acts agent">portal-coord (agent)</span></p>
+      <p class="next small muted">Nothing here waits on you. The coordinator checks each draft and accepts it with evidence; you are asked only when a decision is yours.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="waiting">
+      <div class="panel-head"><h2 id="waiting">Waiting to be accepted <span class="count">3</span></h2></div>
+      <div class="table-wrap">
+        <table class="stack-narrow">
+          <thead><tr><th>Record</th><th>Proposed by</th><th>Who acts</th><th></th></tr></thead>
+          <tbody>
+            <tr><td><span class="title">Search response time</span><div class="sub mono">reference · search.response-time</div></td>
+              <td class="secondary">casey</td><td><span class="who-acts agent">portal-coord</span></td><td><a href="#">View</a></td></tr>
+            <tr><td><span class="title">Invoice CSV format</span><div class="sub mono">reference · invoices.csv-format</div></td>
+              <td class="secondary">casey</td><td><span class="who-acts agent">portal-coord</span></td><td><a href="#">View</a></td></tr>
+            <tr><td><span class="title">Settlement file arrival</span><div class="sub mono">reference · reports.settlement-time</div></td>
+              <td class="secondary">casey</td><td><span class="who-acts agent">portal-coord</span></td><td><a href="#">View</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small muted pager">“Review &amp; accept” appears only for the party who acts: the coordinator. An owner may still accept from a record's own page.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="catalog">
+      <div class="panel-head"><h2 id="catalog">Accepted records</h2>
+        <div class="toolbar"><input type="search" aria-label="Find records" placeholder="Find by key, title or tag">
+          <div class="seg" role="group" aria-label="Kind"><button aria-pressed="true">All</button><button>References</button><button>Capabilities</button></div></div></div>
+      <div class="panel-body"><p class="empty-line">No accepted records yet. Drafts above become records here once accepted.</p></div>
+    </section>
+
+    <details class="fold">
+      <summary>Propose a record <span class="fold-hint">usually done by an agent</span></summary>
+      <div class="fold-body"><p class="small muted">The two propose forms (reference, capability), unchanged, behind one choice.</p></div>
+    </details>
+  </main>
+  </div>
+</div>
+</body>
+</html>

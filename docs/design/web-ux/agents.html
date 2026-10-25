@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock-up: my agents (proposed) · Orchestra design review</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<!-- Static mock-up for docs/design/WEB_UX_REVIEW.md (kittrial-5bb.400). Synthetic data; no script.
+     Proposed: each agent card leads with what the agent needs from you now, then the one action;
+     set-up details and history fold away once set up. -->
+<div class="shell">
+  <nav class="rail" aria-label="Main">
+    <div class="brand">Orchestra</div>
+    <div class="rail-section">
+      <a class="nav-link" href="#">My work</a>
+      <a class="nav-link" href="agents.html" aria-current="page">My agents</a>
+      <a class="nav-link" href="#">All projects</a>
+    </div>
+  </nav>
+  <div class="content">
+  <main class="main" id="main">
+    <div class="page-head">
+      <div><h1 tabindex="-1">My agents</h1>
+        <p class="lede">Agents you run on your own computer. Nothing checks in by itself: start an agent when its card says so.</p></div>
+      <div class="actions"><button class="primary">Add an agent</button></div>
+    </div>
+
+    <div class="agent-grid">
+      <article class="agent-card needs">
+        <div class="agent-head"><div><h3>portal-agent</h3><p class="small muted">Claude Code · Order portal (sample)</p></div>
+          <span class="chip warn">Needs set-up</span></div>
+        <p><b>Next:</b> set up its folder, then start it. <span class="who-acts you">you</span></p>
+        <div class="actions"><button class="primary">Set up folder</button></div>
+        <dl class="kv small"><dt>Work for it</dt><dd>5 tasks it could claim; nothing in progress</dd><dt>May</dt><dd>tasks, checkpoints, reviews, feedback</dd></dl>
+        <details class="fold"><summary>Resume prompt <span class="fold-hint">after set-up</span></summary>
+          <div class="fold-body"><p class="small mono">You are portal-agent, an Orchestra agent. Read .orchestra/AGENT.md in this folder and follow it…</p><button>Copy</button></div></details>
+        <details class="fold"><summary>Settings and history <span class="fold-hint">claim limit · folder · projects</span></summary>
+          <div class="fold-body"><p class="small muted">The five existing folds, unchanged, inside one.</p></div></details>
+      </article>
+      <article class="agent-card">
+        <div class="agent-head"><div><h3>report-agent</h3><p class="small muted">Claude Code · Order portal (sample)</p></div>
+          <span class="chip ok">Working</span></div>
+        <p><b>Next:</b> nothing from you. It holds “Nightly reconciliation report”.</p>
+        <dl class="kv small"><dt>Last seen</dt><dd>4 minutes ago</dd></dl>
+        <details class="fold"><summary>Settings and history</summary><div class="fold-body"><p class="small muted">As above.</p></div></details>
+      </article>
+    </div>
+  </main>
+  </div>
+</div>
+</body>
+</html>

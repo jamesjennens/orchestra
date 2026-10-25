@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock-up: lanes (proposed) · Orchestra design review</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<!-- Static mock-up for docs/design/WEB_UX_REVIEW.md (kittrial-5bb.400). Synthetic data; no script.
+     Proposed: the Lanes board on its own page; one row per person or agent, by name; the declared
+     state in words with who is waited on and when; the flags as the page summary; the threshold folded. -->
+<div class="shell">
+  <nav class="rail" aria-label="Main">
+    <div class="brand">Orchestra</div>
+    <div class="rail-section">
+      <a class="nav-link" href="#">My work</a>
+      <a class="nav-link" href="agents.html">My agents</a>
+      <a class="nav-link" href="#">All projects</a>
+    </div>
+    <div class="rail-section">
+      <div class="rail-label">Order portal (sample)</div>
+      <a class="nav-link" href="project.html">Tasks <span class="nav-count">8</span></a>
+      <a class="nav-link" href="#">Reviews</a>
+      <a class="nav-link" href="records.html">Records <span class="nav-count">3</span></a>
+      <a class="nav-link" href="room.html">Rooms</a>
+      <a class="nav-link" href="lanes.html" aria-current="page">Lanes</a>
+      <a class="nav-link" href="#">More…</a>
+    </div>
+  </nav>
+  <div class="content">
+  <main class="main" id="main">
+    <div>
+      <div class="crumbs"><a href="#">Projects</a> / <a href="project.html">Order portal (sample)</a> / <span>Lanes</span></div>
+      <div class="page-head">
+        <div><h1 tabindex="-1">Lanes</h1>
+          <p class="lede">Who holds what, what each is waiting for, and what is late.</p></div>
+      </div>
+    </div>
+
+    <section class="summary" aria-label="Lanes now">
+      <div class="chips">
+        <span class="chip">2 people · 3 tasks held</span>
+        <span class="chip accent">1 late</span>
+        <span class="chip plain">0 idle on their own move</span>
+      </div>
+      <div class="meta">You see every lane because you own this project.</div>
+      <p class="next"><b>Next:</b> casey has waited on <b>you</b> since 20:00 for an answer on <a href="task.html">Search orders by customer reference</a>.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="lanes">
+      <div class="panel-head"><h2 id="lanes">Lanes <span class="count">3</span></h2></div>
+      <div class="table-wrap">
+        <table class="stack-narrow">
+          <thead><tr><th>Who</th><th>Holds</th><th>Waiting for</th><th class="hide-narrow">Last wrote</th></tr></thead>
+          <tbody>
+            <tr><td><b>casey</b><div class="sub small muted">contributor</div></td>
+              <td><a href="task.html">Search orders by customer reference</a><div class="sub mono small">pp-ghb</div></td>
+              <td class="full-narrow"><span class="who-acts you">you · an answer</span><div class="small"><span class="chip warn">Late</span> expected today 20:00, 2 hours ago</div>
+                <div class="small muted">"Are PO numbers searched as prefixes?"</div></td>
+              <td class="secondary small muted">1 min ago</td></tr>
+            <tr><td><b>casey</b><div class="sub small muted">contributor</div></td>
+              <td><a href="#">Export invoices as CSV</a><div class="sub mono small">pp-edy</div></td>
+              <td class="full-narrow"><span class="who-acts">you · a review</span><div class="small muted">expected Mon 26 Oct, 12:00</div></td>
+              <td class="secondary small muted">1 min ago</td></tr>
+            <tr><td><b>drew</b><div class="sub small muted">contributor</div></td>
+              <td><a href="#">Nightly reconciliation report</a><div class="sub mono small">pp-40s</div></td>
+              <td class="full-narrow"><span class="who-acts">drew · working</span></td>
+              <td class="secondary small muted">1 min ago</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="empty-line">Free: portal-agent (registered, holds nothing, last wrote 3 hours ago).</p>
+    </section>
+
+    <details class="fold">
+      <summary>How late is late <span class="fold-hint">idle threshold: 15 minutes</span></summary>
+      <div class="fold-body">
+        <label class="small" for="idle">Idle minutes (1 to 10080)</label>
+        <div class="actions"><input id="idle" type="number" value="15" min="1" max="10080"><button>Read again</button></div>
+        <p class="small muted">A lane is late when its expect-by has passed, when it has waited longer than this, or when it is the holder's own move and nothing was written for this long.</p>
+      </div>
+    </details>
+  </main>
+  </div>
+</div>
+</body>
+</html>
