@@ -189,9 +189,11 @@ class _RecordsScenarioMixin:
                 'scope': [] if action == 'revoke' else sorted(scope),
                 'escalate': '' if action == 'revoke' else 'requirement changes and anything costing money',
                 'reason': 'The owner delegates record acceptance to the coordinator agents.'}
+        import hashlib
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode('utf-8')).hexdigest()[:24]
         result = harness.request('POST', f'/v1/projects/{self.pid}/delegations', body,
                                  token=token or self.owner_token,
-                                 key=key or 'delegation-%s-%s-%s' % (action, decision or title, ','.join(scope)))
+                                 key=key or 'delegation-' + digest)
         self.assertEqual(result.status, expect, result.data)
         return result.data.get('decision') if expect == 201 else result
 
@@ -1332,6 +1334,32 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_self_acceptance_and_approval_by_another_party(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_self_acceptance_and_party_rules_suite()
+
+
+
+@unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
+class NativeDelegationTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCase):
+    """Delegated record acceptance (kittrial-5bb.407) against the real endpoint.py and native bd,
+    on a project of its own so its drafts never meet the other suites' waiting lists."""
+
+    def setUp(self):
+        super().setUp()
+        self.pid = 'pp'
+        root = self.root
+
+        class Harness(fixes.Harness):
+            def make_backend(h):
+                return http_service.EndpointBackend(
+                    sys.executable, str(KIT / 'endpoint.py'), str(root), service=h.service)
+
+        self.harness = Harness(methodName='runTest')
+        self.harness.setUp()
+        self.addCleanup(self.harness._stop_server)
+        self.owner_token = self.harness.admin_token()
+        reg = self.harness.request('POST', '/v1/projects', {'project_id': self.pid, 'name': 'Native Delegations'},
+                                   token=self.owner_token)
+        self.assertEqual(reg.status, 201, reg.data)
 
     def test_native_delegated_record_acceptance(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
