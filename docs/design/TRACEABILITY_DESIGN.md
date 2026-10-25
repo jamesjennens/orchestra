@@ -24,7 +24,8 @@ Plan checkpoint `01a16f7a`, verified by the coordinator on 2026-10-24, with thes
   gap G4).
 - **G1's fix gets the full adversarial review,** and the agent's `decision_id` must be a decision
   issue in the same project that grants record acceptance, checked by the server (§2.3, §8
-  slice 1).
+  slice 1). Slice 1 as built (kittrial-5bb.407) corrects G1 and makes that grant a server-written
+  delegation record; see §2.3.
 - §7 and slices 1 to 4 are updated to match.
 
 The repository is public. The private project that prompted this task is described only in the
@@ -170,19 +171,25 @@ It requires:
 **Who passes today:**
 - **A person who is the project's coordinator** (signed in on the web): passes both. **This route
   exists and works for a web-only person coordinator.**
-- **A coordinator agent** (a credential): the principal is the agent's own account
-  (http_auth.py:1800, `Principal(user['id'], …, 'credential', …, agent_id=…)`).
-  - Its coordinator grant gives it `CAP_COORDINATE` (http_auth.py:3428, `_may_coordinate`).
-  - An agent is a project member as a **contributor** ("It works as a contributor", the agents
-    page). So `_require_record_membership(coordinator=True)` refuses it, by reading the code.
+- **A coordinator agent** (a credential): the principal's `user_id` is the agent's **owner
+  account** (http_auth.py:1800, `Principal(user['id'], …, 'credential', …, agent_id=…)`).
+  - Its coordinator grant gives it `CAP_COORDINATE` (http_auth.py:3428, `_may_coordinate`), and a
+    grant can only be given while that owner account coordinates.
+  - `_require_record_membership(coordinator=True)` reads the role of that owner account, so a
+    granted agent **passes** it. (Round 1 of this note said it was refused; that was wrong,
+    corrected by slice 1, kittrial-5bb.407.)
+  - What does refuse it is the endpoint's party check (endpoint.py `party_check`): an agent may
+    never accept or verify a draft proposed by its **own party** (its owner account and every
+    other agent or worker credential of that account), whatever `approval_by_another_party` says.
 
-  **Gap G1:** the web route a coordinator agent would use to accept a record refuses it. A
-  web-only project whose coordinator is an agent cannot accept `design.<scope>`, or any record,
-  except through an owner. Slice 1 verifies this with a test first, then fixes it under the kit's
-  full adversarial review. An effective coordinator grant counts as the coordinator role for
-  `coordinator=True` record writes **only** when the agent's acceptance names a `decision_id` that
-  the server checks live: a decision issue in the same project, not superseded, whose body grants
-  record acceptance to that agent or to the coordinator-grant holder (§8, slice 1).
+  **Gap G1, as it really is:** where one person owns every agent, coordinators and lanes alike, a
+  coordinator agent can accept nothing the lanes propose. Slice 1 (kittrial-5bb.407), following
+  the owner's direction of 2026-10-25, makes **every** agent acceptance need a person owner's
+  delegation, and that delegation is what lifts the own-party refusal. A delegation is a
+  server-written `Kind: delegation-v1` record with a host journal entry, recorded only by a person
+  owner's own web session or a listed operator, and checked live at every acceptance; an issue
+  body's lines are not used, because a native issue's author is only an `--actor` label
+  (docs/HTTP_DEPLOYMENT.md, "Delegated record acceptance").
 - **An operator on the host** (`ref accept` over the endpoint with the operator allowlist) passes,
   but that is not a web-only route.
 
@@ -239,7 +246,7 @@ requirements. The plan is versioned with the design: a new plan is a new design 
 
 | gap | what is missing | why the conventions are not enough | slice |
 | --- | --- | --- | --- |
-| **G1** | a coordinator agent cannot accept a record over the web (§2.3) | it is an authorization rule, not a convention | 1 |
+| **G1** | a coordinator agent cannot accept a record its own party proposed (the endpoint's party check, §2.3); built by slice 1 as a person owner's delegation | it is an authorization rule, not a convention | 1 |
 | **G2** | pointer kinds `req:` and `design:` | the grammar is closed by design; new kinds are a code change, small, in the context index's parser | 2 |
 | **G3** | a decision's link set (which tasks and requirements a decision decides) | a decision issue's text can name tasks, but no reader can project it onto them. OPEN_ITEMS_DECISIONS_DESIGN's `coordinator-decision-v1` is exactly this; its slices are designed and not built. **Reuse it; do not add a second kind.** | after this note's slices (a dependency, not a slice here) |
 | **G4** (round 2) | the server cannot read the repository, so it cannot resolve `design:` sections or plan coverage for a web-only coordinator | the design's bytes and a server-derived index must be on the server; one reserved record, `design-index-v1`, written only by the server (§5.1) | 3 |
@@ -524,22 +531,26 @@ of a kittrial-sized export, as the context index did for find.
 
 1. **A coordinator agent accepting records (G1), with a full adversarial review, and the
    conventions.**
-   - **First, a test** showing whether a coordinator-grant agent is refused by
-     `POST …/references/{key}/accept` (it is, by reading `_require_record_membership`).
-   - **The fix changes authorization**, so it gets the kit's **full adversarial review**: an
-     independent reviewer and the mutant set, with the authority tests below.
-   - **The rule:** an agent may make a `coordinator=True` record write only when all three hold:
-     1. its coordinator grant is effective (`_may_coordinate`);
-     2. its acceptance names `decision_id`;
-     3. the server checks that decision live: it is a **decision issue in the same project**,
-        not closed as superseded, whose text **grants record acceptance** to that agent or to
-        "the holder of the coordinator grant". The grant is one fixed line,
-        `Grants: record-acceptance to <agent-id | coordinator-grant>`, in the decision's body.
+   - **As built (kittrial-5bb.407, after the owner's direction of 2026-10-25).** The test-first
+     step found the agent is not refused by membership but by the own-party rule (§2.3). The
+     fix changes authorization, so it had the kit's **full adversarial review** and a mutant set.
+   - **The rule:** every agent acceptance or verification of a reference or capability record
+     needs a **delegation in force**, named as `decision_id`, and that delegation also lifts the
+     own-party refusal. A delegation counts only when, checked live at the write:
+     1. it is a server-written `Kind: delegation-v1` record with its host journal entry, on a
+        decision issue in the same project, recorded by a person owner's own web session or a
+        listed operator (never by an agent; an issue body's lines are not read, since a native
+        author is only an `--actor` label);
+     2. its recorder is still a person owner of the project (or still a listed operator);
+     3. it grants `record-acceptance` to that agent or to every coordinator-grant holder, and the
+        agent's grant is still in effect;
+     4. its scope covers the record kind, and no later narrowing or revocation excludes it.
 
-     Any decision id, a decision of another project, a decision without that line, or one
-     naming another agent is refused, with the reason.
-   - **Tests:** each refusal; the grant line revoked by a superseding decision; the agent
-     demoted (grant removed) between the read and the write; a person coordinator unaffected.
+     Each refusal names its reason.
+   - **Tests:** one per refusal, revocation and narrowing on the next write, the grant removed,
+     the recorder demoted, a planted lookalike without its journal entry, a person coordinator,
+     contributors and viewers unaffected (tests/test_delegations.py and the native delegation
+     suite in tests/test_web_records.py).
    - **Docs:**
      - the design front block, `design.<scope>`, plan phases as epics and cross-review lines;
      - the design-round convention (§4) for coordinators and lanes (WORKER_GUIDE and the
