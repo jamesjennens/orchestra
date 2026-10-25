@@ -56,7 +56,7 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF
                             CAP_ROOMS_POST,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_RECORDS,
                             CAP_REVIEWS, CAP_TASKS,
-                            CAP_COORDINATE, CAP_RELEASE, still_coordinates, coordinator_grant, release_grant, grant_issuer_holds,
+                            CAP_COORDINATE, CAP_RELEASE, still_coordinates, account_in_project, coordinator_grant, release_grant, grant_issuer_holds,
                             GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
@@ -3638,6 +3638,7 @@ class Service:
     NUDGE_CLOSED = 'This nudge request is closed.'
     NUDGE_GONE = 'Nudge request not found'
     NOT_YOUR_CLAIM = 'This nudge request is not claimed by this carrier.'
+    CLAIM_LAPSED = 'The claim has lapsed or the request was taken by another carrier; claim it again.'
 
     def _carrier_registry(self, create=False):
         stored = self.state.get('nudge_carriers')
@@ -3661,7 +3662,14 @@ class Service:
             seen = entry.get('seen_ts')
             if type(seen) not in (int, float) or seen < moment - nudges.CARRIER_WINDOW:
                 continue
+            # The run of heartbeats that ends at ``seen_ts`` began at ``since_ts``: a carrier first heard
+            # long after the moment says nothing about it.
+            since = entry.get('since_ts')
+            since = since if type(since) in (int, float) and since <= seen else seen
+            if moment < since - nudges.CARRIER_WINDOW:
+                continue
             if lane in (entry.get('lanes') or ()) and project_id in (agent.get('projects') or []) \
+                    and account_in_project(self.state, agent.get('owner'), project_id) \
                     and full_actor_parties(self.state, lane, project_id) == {agent.get('owner')}:
                 return True
         return False
@@ -3678,7 +3686,8 @@ class Service:
         """A record this carrier may handle: in a project the agent is granted, for a lane of its own account only."""
         project_id = record.get('project')
         if not isinstance(record, dict) or project_id not in (agent.get('projects') or []) \
-                or project_id not in self.state['projects']:
+                or project_id not in self.state['projects'] \
+                or not account_in_project(self.state, principal.user_id, project_id):
             return False
         lane = record.get('lane')
         return isinstance(lane, str) and record.get('message') in nudges.MESSAGES \
@@ -3708,8 +3717,13 @@ class Service:
                 raise invalid('lanes must be a list of at most %d lane actor labels' % nudges.CARRIER_LANES_MAX)
             now = self._now()
             registry = self._carrier_registry(create=True)
+            before = registry.get(agent['id']) if isinstance(registry.get(agent['id']), dict) else {}
+            last = before.get('seen_ts')
+            # A gap longer than the window ends the run of heartbeats: the carrier was away.
+            run = before.get('since_ts') if type(last) in (int, float) and type(before.get('since_ts')) in (int, float) \
+                and 0 <= now - last <= nudges.CARRIER_WINDOW else now
             registry[agent['id']] = {'kind': kind, 'lanes': sorted(set(lanes)), 'user_id': principal.user_id,
-                                     'seen_ts': now, 'seen_at': now_iso(now)}
+                                     'since_ts': run, 'seen_ts': now, 'seen_at': now_iso(now)}
             for gone in [key for key, entry in registry.items()
                          if not isinstance(entry, dict) or key not in self.state['agents']
                          or now - (entry.get('seen_ts') if type(entry.get('seen_ts')) in (int, float) else 0) > 86400]:
@@ -3765,6 +3779,15 @@ class Service:
                   'nudge': {'id': record['id'], 'project': project_id, 'lane': record['lane'],
                             'message': record['message'], 'message_set': nudge_messages.MESSAGE_SET}}
         return answer, dict(answer)
+
+    def carrier_claim_held(self, principal, nudge_id):
+        """For a replayed claim: it stands only while this carrier still holds the lease."""
+        with self.store.lock:
+            agent = self._carrier_agent(principal)
+            records, record, now = self._carrier_find(principal, agent, nudge_id)
+            if record['state'] != nudges.CLAIMED or record.get('claimed_by') != agent['id']:
+                raise conflict(self.CLAIM_LAPSED)
+            return True
 
     def carrier_outcome(self, principal, nudge_id, payload, request_id=None):
         """Answer a claimed request, once, with a closed outcome. ``(public, stored)`` for ``_mutate``."""

@@ -83,6 +83,30 @@ class ScopeTests(CarrierCase):
         issuer = self.service.state['users'][mixed['user_id']]
         self.assertEqual(frozenset(), http_authority.credential_capabilities(self.service.state, mixed, issuer, self.project))
 
+    def test_decide_takes_exactly_the_nudges_scope_of_an_enabled_agent(self):
+        _secret, agent_id = self.carrier()
+        credential_id, credential = next((key, value) for key, value in self.service.state['credentials'].items()
+                                         if value.get('agent_id') == agent_id)
+        ask = {'via': 'credential', 'user_id': credential['user_id'], 'credential_id': credential_id,
+               'project': None, 'capability': 'nudge.carry'}
+
+        def decided():
+            try:
+                return http_authority.decide(self.service.state, ask)['role']
+            except http_authority.AuthorityDenied as denied:
+                return denied.status
+        self.assertEqual('carrier', decided())
+        for scopes in (['nudges', 'tasks'], ['tasks'], ['nudges', 'nudges'], ['read', 'nudges'], []):
+            with self.subTest(scopes=scopes):
+                credential['scopes'] = scopes
+                self.assertEqual(403, decided())
+        credential['scopes'] = ['nudges']
+        self.service.state['agents'][agent_id]['enabled'] = False
+        self.assertEqual(401, decided())
+        self.service.state['agents'][agent_id]['enabled'] = True
+        credential['agent_id'] = None
+        self.assertEqual(401, decided())
+
     def test_the_scope_grants_one_capability_that_no_role_holds_and_no_baseline_read(self):
         self.assertEqual(frozenset({'nudge.carry'}), http_authority.SCOPE_CAPABILITIES['nudges'])
         for role, held in http_authority.ROLE_CAPABILITIES.items():
@@ -176,6 +200,45 @@ class CarrierReadTests(CarrierCase):
         self.assertEqual(404, self.claim(thief, nudge_id).status)
         self.assertEqual(404, self.answer(thief, nudge_id).status)
         self.assertEqual('pending', self.state(nudge_id)['state'])
+
+    def test_an_ambiguous_worker_namespace_is_nobodys_lane(self):
+        # Two accounts hold worker credentials for one label: the label belongs to both, so neither carrier
+        # may read or answer it (the parties are not the carrier's account alone).
+        carl, _ = self.carrier('carl', 'One')
+        dave, _ = self.carrier('dave', 'Two')
+        shared = self.ask(self.ids['carl'])
+        for number, who in enumerate(('carl', 'dave')):
+            self.service.state['credentials']['shared-%d' % number] = {
+                'user_id': self.ids[who], 'project_id': self.project, 'actor': 'shared-w'}
+        self.state(shared)['lane'] = 'shared-w'
+        for token in (carl, dave):
+            self.assertEqual([], self.mine(token))
+            self.assertEqual(404, self.claim(token, shared).status)
+            self.assertEqual(404, self.answer(token, shared).status)
+
+    def test_a_carrier_whose_account_left_the_project_reads_and_answers_nothing(self):
+        secret, _ = self.carrier('carl')
+        listed = self.ask(self.ids['carl'])
+        claimed = self.ask(self.ids['carl'])
+        self.assertEqual(200, self.claim(secret, claimed).status)
+        self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/members/%s' % (self.project, self.ids['carl']),
+                                           token=self.tokens['olive']).status)
+        self.assertEqual([], self.mine(secret))
+        for nudge_id in (listed, claimed):
+            self.assertEqual(404, self.claim(secret, nudge_id).status)
+            self.assertEqual(404, self.answer(secret, nudge_id).status)
+        self.assertEqual('claimed', self.state(claimed)['state'])
+
+    def test_a_carrier_seen_for_an_account_that_left_does_not_count_as_a_carrier(self):
+        secret, _ = self.carrier('carl')
+        nudge_id = self.ask(self.ids['carl'])
+        self.later(nudges.PENDING_TTL - 10)
+        self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
+        self.assertEqual(200, self.request('DELETE', '/v1/projects/%s/members/%s' % (self.project, self.ids['carl']),
+                                           token=self.tokens['olive']).status)
+        self.later(20)
+        self.assertEqual('not-deliverable', self.request('GET', '/v1/projects/%s/nudges' % self.project,
+                                                         token=self.tokens['olive']).data['items'][0]['state'])
 
     def test_a_carrier_reaches_only_projects_its_agent_is_granted(self):
         secret, agent_id = self.carrier('carl')
@@ -289,6 +352,26 @@ class ClaimAndOutcomeTests(CarrierCase):
         self.assertEqual(1, len(self.events('lanes.nudge.claim')))
 
 
+    def test_a_claim_sent_again_after_the_lease_went_to_another_carrier_is_not_replayed(self):
+        first, _ = self.carrier('carl', 'First')
+        second, second_id = self.carrier('carl', 'Second')
+        nudge_id = self.ask(self.ids['carl'])
+        self.assertTrue(self.claim(first, nudge_id, key='claim-key-0002').data['claimed'])
+        self.later(nudges.CLAIM_TTL + 1)
+        self.assertTrue(self.claim(second, nudge_id).data['claimed'])
+        again = self.claim(first, nudge_id, key='claim-key-0002')
+        self.assertEqual(409, again.status, again.data)
+        self.assertEqual(second_id, self.state(nudge_id)['claimed_by'])
+
+    def test_a_claim_sent_again_while_the_lease_is_held_is_replayed(self):
+        secret, _ = self.carrier('carl')
+        nudge_id = self.ask(self.ids['carl'])
+        first = self.claim(secret, nudge_id, key='claim-key-0003')
+        again = self.claim(secret, nudge_id, key='claim-key-0003')
+        self.assertEqual((200, True), (again.status, again.data['claimed']))
+        self.assertEqual(first.data, again.data)
+
+
 class NoCarrierTests(CarrierCase):
     def lane_state(self, nudge_id):
         self.later(0)
@@ -316,6 +399,31 @@ class NoCarrierTests(CarrierCase):
         self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
         self.later(nudges.PENDING_TTL + 1)
         self.assertEqual('not-deliverable', self.lane_state(nudge_id)['state'])
+
+    def test_a_carrier_heard_only_long_after_the_request_ended_is_no_carrier_for_it(self):
+        secret, _ = self.carrier('carl')
+        nudge_id = self.ask(self.ids['carl'])
+        self.later(nudges.PENDING_TTL + 1)
+        self.assertEqual('not-deliverable', self.lane_state(nudge_id)['state'])
+        self.later(3600)
+        self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
+        shown = self.lane_state(nudge_id)
+        self.assertEqual(('not-deliverable', 'no-carrier'), (shown['state'], shown['outcome_detail']))
+
+    def test_a_carrier_that_beat_all_along_counts_and_one_that_went_away_and_came_back_does_not(self):
+        secret, _ = self.carrier('carl')
+        steady = self.ask(self.ids['carl'])
+        for _ in range(nudges.PENDING_TTL // nudges.CARRIER_POLL + 12):   # well past the request's end
+            self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
+            self.later(nudges.CARRIER_POLL)
+        self.assertEqual(('expired', 'unclaimed'), tuple(self.lane_state(steady)[k] for k in ('state', 'outcome_detail')))
+        gap = self.ask(self.ids['carl'])
+        self.later(nudges.PENDING_TTL // 2)
+        self.beat(secret, [self.ids['carl']])
+        self.later(nudges.PENDING_TTL + 600)
+        self.beat(secret, [self.ids['carl']])          # back after a gap far longer than the window
+        self.later(1)
+        self.assertEqual(('not-deliverable', 'no-carrier'), tuple(self.lane_state(gap)[k] for k in ('state', 'outcome_detail')))
 
     def test_a_carrier_for_another_lane_or_account_does_not_count(self):
         elsewhere, _ = self.carrier('dave', 'Other')

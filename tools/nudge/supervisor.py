@@ -12,6 +12,7 @@ The terminal is behind the ``Terminal`` interface; ``TmuxTerminal`` is the one a
 Nothing here imports a POSIX-only module at module level.
 """
 import argparse
+import errno
 import json
 import os
 import re
@@ -50,6 +51,10 @@ class Terminal:
         """The visible text of the terminal."""
         raise NotImplementedError
 
+    def blocked(self):
+        """True when typed keys would not reach the program (a scroll or copy mode, a dead pane)."""
+        return False
+
     def type_line(self, text):
         """Type ``text`` as the terminal's next input, then Enter."""
         raise NotImplementedError
@@ -82,6 +87,11 @@ class TmuxTerminal(Terminal):
         code, out = self._run('capture-pane', '-p', '-t', self.target)
         return out if code == 0 else ''
 
+    def blocked(self):
+        # In copy or view mode send-keys goes to the mode, not the program; anything unclear counts as blocked.
+        code, out = self._run('display-message', '-p', '-t', self.target, '#{pane_in_mode} #{pane_dead}')
+        return code != 0 or out.split() != ['0', '0']
+
     def type_line(self, text):
         self._run('send-keys', '-t', self.target, '-l', text)
         self._run('send-keys', '-t', self.target, 'Enter')
@@ -93,25 +103,36 @@ class TmuxTerminal(Terminal):
 
 def check_config_file(path):
     """Refuse a config that others could read or that is not the file it names (it holds the token)."""
-    try:
-        info = os.lstat(path)
-    except OSError:
-        raise Refused('the config file cannot be read')
-    if stat.S_ISLNK(info.st_mode):
-        raise Refused('the config file is a symbolic link; give the file itself')
-    if not stat.S_ISREG(info.st_mode):
-        raise Refused('the config file is not a regular file')
+    handle = open_config(path)
+    handle.close()
+
+
+def open_config(path):
+    """The config as a text file opened without following a link, judged by fstat of the SAME open file."""
     if os.name != 'posix':
         raise Refused('the permissions of the config file cannot be checked on this system')
-    if info.st_mode & 0o077:
-        raise Refused('the config file is readable by its group or others; run chmod 600 on it')
-    if hasattr(os, 'getuid') and info.st_uid != os.getuid():
-        raise Refused('the config file belongs to another user')
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise Refused('the config file is a symbolic link; give the file itself')
+        raise Refused('the config file cannot be read')
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Refused('the config file is not a regular file')
+        if info.st_mode & 0o077:
+            raise Refused('the config file is readable by its group or others; run chmod 600 on it')
+        if info.st_uid != os.getuid():
+            raise Refused('the config file belongs to another user')
+        return os.fdopen(fd, encoding='utf-8')
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def load_config(path):
-    check_config_file(path)
-    with open(path, encoding='utf-8') as handle:
+    with open_config(path) as handle:
         config = json.load(handle)
     token = config.get('token')
     if not isinstance(config.get('server'), str) or not isinstance(token, str) or not token \
@@ -121,8 +142,20 @@ def load_config(path):
         if not isinstance(setting, dict) or not isinstance(setting.get('target'), str) \
                 or not isinstance(setting.get('harness'), str) or not isinstance(setting.get('prompt'), str):
             raise Refused('lane %s needs target, harness and prompt' % lane)
+        if not setting['prompt'].strip():
+            raise Refused('lane %s needs a prompt pattern that is not empty' % lane)
         re.compile(setting['prompt'])
     return config
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The Authorization header goes to the configured server and nowhere else: a redirect is an error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, 'redirects are not followed', headers, fp)
+
+
+NUDGE_ID = re.compile(r'nudge-[0-9a-f]{24}')
 
 
 class Api:
@@ -130,7 +163,7 @@ class Api:
 
     def __init__(self, server, token, opener=None):
         self.server, self.token = server.rstrip('/'), token
-        self.opener = opener or urllib.request.urlopen
+        self.opener = opener or urllib.request.build_opener(_NoRedirect).open
 
     def call(self, method, path, body=None):
         data = json.dumps(body).encode('utf-8') if body is not None else None
@@ -163,11 +196,13 @@ class Api:
 
 def at_prompt(terminal, setting):
     """True only when the foreground process is the lane's harness and its last screen line is its prompt."""
+    if terminal.blocked():
+        return False
     foreground = terminal.foreground()
     if not foreground or os.path.basename(foreground) != setting['harness']:
         return False
     lines = [line for line in terminal.screen().splitlines() if line.strip()]
-    return bool(lines) and re.search(setting['prompt'], lines[-1]) is not None
+    return bool(lines) and re.fullmatch(setting['prompt'], lines[-1]) is not None
 
 
 class Supervisor:
@@ -187,16 +222,24 @@ class Supervisor:
         self.api.heartbeat(lanes)
         answered = 0
         for item in self.api.pending():
-            lane = item.get('lane')
+            nudge_id, lane = item.get('id'), item.get('lane')
+            # Nothing the server sent reaches a URL or a log line before it matches the closed pattern.
+            if not isinstance(nudge_id, str) or not NUDGE_ID.fullmatch(nudge_id):
+                self.say('a request with an unexpected id was skipped')
+                continue
             if lane not in lanes:
                 continue
-            claimed = self.api.claim(item['id'])
+            claimed = self.api.claim(nudge_id)
             if not claimed.get('claimed'):
-                self.say('%s: not claimed (%s)' % (item['id'], claimed.get('state')))
+                self.say('%s: not claimed' % nudge_id)
                 continue
-            outcome, detail = self.carry(item, lanes[lane], lane)
-            self.api.outcome(item['id'], outcome, detail)
-            self.say('%s: %s%s' % (item['id'], outcome, ' ' + detail if detail else ''))
+            try:
+                outcome, detail = self.carry(item, lanes[lane], lane)
+            except (OSError, subprocess.SubprocessError):
+                # The terminal failed under us: answer rather than die holding the claim.
+                outcome, detail = 'failed', 'no-session'
+            self.api.outcome(nudge_id, outcome, detail)
+            self.say('%s: %s%s' % (nudge_id, outcome, ' ' + detail if detail else ''))
             answered += 1
         return answered
 

@@ -9,9 +9,13 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -29,9 +33,12 @@ LANE = 'usr_0123456789abcdef'
 
 
 class FakeTerminal(supervisor.Terminal):
-    def __init__(self, foreground='copilot', screen='some output\n> ', present=True):
-        self.running, self.shown, self.present = foreground, screen, present
+    def __init__(self, foreground='copilot', screen='some output\n> ', present=True, blocked=False):
+        self.running, self.shown, self.present, self.stuck = foreground, screen, present, blocked
         self.typed, self.restarted = [], []
+
+    def blocked(self):
+        return self.stuck
 
     def exists(self):
         return self.present
@@ -111,6 +118,49 @@ class TypingTests(unittest.TestCase):
                 run.poll()
                 self.assertEqual([], terminal.typed)
                 self.assertEqual([('nudge-' + '0' * 24, 'failed', 'not-at-prompt')], run.api.answers)
+
+    def test_a_terminal_in_a_scroll_or_copy_mode_or_dead_is_not_typed_to(self):
+        terminal = FakeTerminal(blocked=True)
+        run = Run([item('resume')], terminal)
+        run.poll()
+        self.assertEqual(([], [('nudge-' + '0' * 24, 'failed', 'not-at-prompt')]), (terminal.typed, run.api.answers))
+
+    def test_the_tmux_adapter_calls_a_pane_blocked_unless_tmux_says_it_is_in_no_mode_and_alive(self):
+        for answer, blocked in (((0, '0 0\n'), False), ((0, '1 0\n'), True), ((0, '0 1\n'), True),
+                                ((0, ''), True), ((1, ''), True), ((0, 'x'), True)):
+            with self.subTest(answer=answer):
+                terminal = supervisor.TmuxTerminal('%1')
+                terminal._run = lambda *args, answer=answer: answer
+                self.assertEqual(blocked, terminal.blocked())
+
+    def test_the_prompt_must_be_the_whole_last_line(self):
+        for screen in ('user> rm -rf x', '> and more', 'text\n>> '):
+            with self.subTest(screen=screen):
+                terminal = FakeTerminal(screen=screen)
+                Run([item('resume')], terminal, cfg=config(prompt='> ?')).poll()
+                self.assertEqual([], terminal.typed)
+        terminal = FakeTerminal(screen='work\n> ')
+        Run([item('resume')], terminal, cfg=config(prompt='> ?')).poll()
+        self.assertEqual(1, len(terminal.typed))
+
+    def test_a_server_id_that_is_not_a_nudge_id_is_never_used_in_a_path_or_a_log(self):
+        for bad in ('../../v1/me/carrier', 'nudge-' + '0' * 23, 'nudge-' + 'G' * 24, 'nudge-' + '0' * 24 + '/claim', None, 7):
+            with self.subTest(bad=bad):
+                run = Run([item('resume', nudge_id=bad)])
+                self.assertEqual(0, run.poll())
+                self.assertEqual([('heartbeat', [LANE]), ('pending',)], run.api.calls)
+                self.assertEqual([], run.terminal.typed)
+                self.assertNotIn('..', ' '.join(run.lines))
+
+    def test_a_terminal_that_fails_under_it_is_answered_not_left_holding_the_claim(self):
+        for error in (subprocess.TimeoutExpired('tmux', 15), OSError('tmux is gone')):
+            with self.subTest(error=type(error).__name__):
+                class Broken(FakeTerminal):
+                    def foreground(self):
+                        raise error
+                run = Run([item('resume')], Broken())
+                self.assertEqual(1, run.poll())
+                self.assertEqual([('nudge-' + '0' * 24, 'failed', 'no-session')], run.api.answers)
 
     def test_a_lane_with_no_terminal_is_no_session(self):
         run = Run([item('resume')], FakeTerminal(present=False))
@@ -230,6 +280,21 @@ class ConfigTests(unittest.TestCase):
                 self.assertIn('refused to start', shown)
                 self.assertNotIn(TOKEN, shown)
 
+    def test_an_empty_prompt_pattern_is_refused(self):
+        for prompt in ('', '  '):
+            with self.subTest(prompt=prompt):
+                self.path.write_text(json.dumps(config(prompt=prompt)), encoding='utf-8')
+                code, shown = self.start()
+                self.assertEqual(2, code)
+                self.assertNotIn(TOKEN, shown)
+
+    def test_the_link_check_is_made_on_the_file_that_is_opened_not_on_a_lookup_before_it(self):
+        link = self.dir / 'link.json'
+        link.symlink_to(self.path)
+        with mock.patch.object(supervisor.os, 'lstat', side_effect=lambda path: os.stat(self.path)):
+            with self.assertRaises(supervisor.Refused):
+                supervisor.load_config(str(link))
+
     def test_a_symbolic_link_is_refused_even_to_a_private_file(self):
         link = self.dir / 'link.json'
         link.symlink_to(self.path)
@@ -245,6 +310,41 @@ class ConfigTests(unittest.TestCase):
                 code, shown = self.start()
                 self.assertEqual(2, code)
                 self.assertNotIn(TOKEN, shown)
+
+
+class RedirectTests(unittest.TestCase):
+    def test_the_token_is_never_sent_to_another_host_by_a_redirect(self):
+        seen = []
+
+        class Target(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get('Authorization'))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{}')
+
+            log_message = lambda *args: None
+
+        target = HTTPServer(('127.0.0.1', 0), Target)
+
+        class Bounce(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header('Location', 'http://127.0.0.1:%d/v1/me/nudges' % target.server_port)
+                self.end_headers()
+
+            log_message = lambda *args: None
+
+        bounce = HTTPServer(('127.0.0.1', 0), Bounce)
+        for server in (target, bounce):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+        api = supervisor.Api('http://127.0.0.1:%d' % bounce.server_port, TOKEN)
+        with self.assertRaises(supervisor.Refused) as refused:
+            api.pending()
+        self.assertEqual([], seen)
+        self.assertNotIn(TOKEN, str(refused.exception))
 
 
 class ImportTests(unittest.TestCase):

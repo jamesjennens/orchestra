@@ -12321,7 +12321,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         def claim():
             refuse_unknown_fields(dict(ctx.payload or {}), (), 'A nudge claim')
             return self.service.carrier_claim(ctx.principal, ctx.params['nid'], request_id=ctx.request_id)
-        return self._mutate(ctx, 'lanes.nudge.claim', None, claim, capability=CAP_NUDGE_CARRY, audit_success=False)
+        return self._mutate(ctx, 'lanes.nudge.claim', None, claim, capability=CAP_NUDGE_CARRY, audit_success=False,
+                            replay_check=lambda: self.service.carrier_claim_held(ctx.principal, ctx.params['nid']))
 
     @route('POST', r'/v1/me/nudges/(?P<nid>nudge-[0-9a-f]{24})/outcome', carrier=True)
     def me_nudge_outcome(self, ctx):

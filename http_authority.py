@@ -638,6 +638,23 @@ def coordinator_grant_capabilities(state, credential, project_id, held):
     return frozenset(cap for cap in GRANT_CAPABILITIES if cap in held)
 
 
+def account_in_project(state, user_id, project_id):
+    """Whether this account is NOW an enabled superuser or a member of the project (kittrial-5bb.415 r2).
+
+    A carrier credential carries no role, so its reach is cut off with the account's membership, as
+    ``credential_capabilities`` cuts off every other credential. Anything unreadable is no.
+    """
+    users = state.get('users') if isinstance(state, dict) and isinstance(state.get('users'), dict) else {}
+    user = users.get(user_id)
+    if not isinstance(user, dict) or user.get('disabled'):
+        return False
+    if user.get('superuser'):
+        return True
+    members = state.get('memberships') if isinstance(state.get('memberships'), dict) else {}
+    project = members.get(project_id)
+    return isinstance(project, dict) and project.get(user_id) in ROLE_CAPABILITIES
+
+
 def still_coordinates(state, requested_by, project_id):
     """Whether the requester of a stored nudge may coordinate in this project NOW (kittrial-5bb.415).
 
