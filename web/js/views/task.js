@@ -322,7 +322,7 @@ export async function detail(ctx, { pid, tid }) {
         t.version !== undefined ? [h('dt', null, 'Version'), h('dd', { class: 'num' }, String(t.version))] : null))),
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Completion facts')),
       h('div', { class: 'panel-body' }, knownFacts.length
-        ? h('p', { class: knownFacts.length ? 'small' : 'small muted' }, completionLine))),
+        ? h('p', { class: knownFacts.length ? 'small' : 'small muted' }, completionLine) : null)),
     brief.depends_on && brief.depends_on.length ? h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Depends on')),
       h('ul', { class: 'panel-body open-items' }, brief.depends_on.map((d) => h('li', null, h('a', { href: ctx.href(`/p/${pid}/t/${d.id}`) }, d.title), ' ', statusChip(d.status))))) : null,
