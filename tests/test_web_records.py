@@ -840,7 +840,8 @@ class _RecordsScenarioMixin:
         sibling_draft = propose('deleg.sibling', agent2['token'], 'sibling')
         r = accept('deleg.sibling', sibling_draft, agent1['token'], 'no-decision')
         self.assertEqual(r.status, 403, r.data)
-        self.assertIn('delegation', r.data['error']['message'])
+        # The web service refuses it itself, before the endpoint is asked.
+        self.assertIn("name the person owner's delegation decision", r.data['error']['message'])
         other_draft = propose('deleg.other', coord1['token'], 'other party')
         r = accept('deleg.other', other_draft, agent3['token'], 'other-no-decision')
         self.assertEqual(r.status, 403, r.data)
@@ -921,6 +922,14 @@ class _RecordsScenarioMixin:
                           'operation_id': 'op-direct-verify-no-decision'}},
                 'direct-verify-no-decision', capability=http_service.CAP_COORDINATE)
         self.assertEqual(direct_verify.exception.status, 403)
+        # Within the delegation the same agent verifies its own party's capability.
+        verified = harness.request(
+            'POST', f'/v1/projects/{pid}/capabilities/deleg.cap/verify',
+            {'revision': cap_ok.data['revision'], 'record_sha256': cap_ok.data['sha256'], 'commit': 'e' * 40,
+             'passed': True, 'results': _valid_cap_results(), 'decision_id': current},
+            token=agent2['token'], key='deleg-cap-verify-ok')
+        self.assertEqual(verified.status, 200, verified.data)
+        self.assertEqual(verified.data['verifier'], agent2['actor'])
         with self.assertRaises(http_service.HttpError) as direct_grant:
             harness.backend.invoke(
                 'delegations.grant', harness.service.authenticate(people['nonmember_su']['token']), pid,
