@@ -176,6 +176,8 @@ class _RecordsScenarioMixin:
         self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
             'Content-Type': 'application/json', 'Content-Length': '+12'}), b'{}' * 6), 422)
         self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': '12abc'}), b'{}' * 6), 422)
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
             'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked'}), b'0\r\n\r\n'), 422)
         # A body over the normal limit whose key is not a design entry is refused once read.
         plain = _valid_ref_propose(key='kit.padded', statement='s')
@@ -199,6 +201,10 @@ class _RecordsScenarioMixin:
                                    key='design-web-1')
         self.assertEqual(proposed.status, 201, proposed.data)
         self.assertEqual(proposed.data['document']['bytes'], len(long_text.encode('utf-8')))
+        # The idempotency receipt binds the body read by the route: the same key with another document is refused.
+        again = harness.request('POST', path, self._design_body(long_text + 'more\r\n'),
+                                token=people['contrib']['token'], key='design-web-1')
+        self.assertGreaterEqual(again.status, 400, again.data)
         draft = harness.request('GET', path + '/design.web-design', token=people['coord1']['token'])
         self.assertEqual(draft.status, 200, draft.data)
         accepted = harness.request('POST', path + '/design.web-design/accept',

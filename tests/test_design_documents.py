@@ -138,6 +138,27 @@ class UploadTests(DesignCase):
                     self.propose_design(text, authority=auth)
                 self.nothing_written(writes, blobs)
 
+    def test_text_that_is_not_utf8_is_refused_by_the_bytes_check_itself(self):
+        for text in ('\ud800', 'a\udfffb'):
+            with self.assertRaisesRegex(ValueError, 'valid UTF-8'):
+                dd.document_bytes(text)
+
+    def test_a_forged_repo_document_record_on_another_key_never_parses(self):
+        self.propose_design()
+        body = next(c['text'] for c in self.anchor()['comments'] if c['text'].startswith(rr.ENTRY_V3_PREFIX))
+        record = json.loads(body[len(rr.ENTRY_V3_PREFIX):])
+        record['key'] = 'calendar.trading'
+        record.pop('sha256')
+        record['sha256'] = rr.content_hash(record)
+        forged = rr.ENTRY_V3_PREFIX + rr.canonical_bytes(record).decode('utf-8')
+        self.assertIsNone(rr.parse_entry(forged))
+
+    def test_at_most_one_document_travels_with_a_write(self):
+        attachments = {'0': {'flag': '--file', 'text': json.dumps(entry(key=KEY))},
+                       '1': {'flag': '--document', 'text': 'a'}, '2': {'flag': '--document', 'text': 'b'}}
+        with self.assertRaisesRegex(ValueError, 'at most one --document'):
+            rr.write_payload_and_document(['propose', '@attachment:0', '@attachment:1', '@attachment:2'], attachments)
+
     def test_the_bounds_themselves_are_allowed(self):
         exact = document(body='')
         exact = exact + 'x' * (dd.DOCUMENT_MAX_BYTES - len(exact.encode('utf-8')))
@@ -286,6 +307,14 @@ class AcceptanceTests(DesignCase):
         self.assertEqual(len(self.indexes()), 2)
         with self.assertRaisesRegex(ValueError, 'not the one derived'):
             self.accept_design(1)
+
+    def test_a_malformed_lookalike_index_is_never_counted(self):
+        index = copy.deepcopy(self.indexes()[0])
+        index['headings'][0]['title'] = 'Planted'
+        body = dd.index_body(index).replace('"key"', ' "key"', 1)      # not canonical, stale hash
+        self.native.add_comment(self.anchor()['id'], body, author='mallory')
+        self.assertEqual(len(self.indexes()), 1)
+        self.assertEqual(self.accept_design(1)['state'], 'accepted')
 
     def test_an_identical_second_index_does_not_refuse(self):
         self.native.add_comment(self.anchor()['id'], dd.index_body(self.indexes()[0]))
