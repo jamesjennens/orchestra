@@ -1,6 +1,40 @@
 # Lifecycle fact trust, audit and historical correction
 
-Status: **revised design for structured document review; no new implementation or rollout authorization**.
+Status: **accepted design with a read-only D2 implementation note**.
+
+### Current read-only D2 implementation
+
+The current D2 implementation adds exact kit-intermediate classification and
+historical-assignment evidence to `lifecycle_voids.audit`, bounded native history
+reads solely in `admin.lifecycle_audit_command`, and advisory inactive review-VOID
+release diagnostics through `lifecycle_audit`. It preserves legacy fact reads,
+reader overlays, write gates and protected formats. It authorizes no production
+audit publication, VOID campaign, correction, lifecycle write, E/F provenance
+store or strict reader. Keep actual audit output private on its host.
+
+Historical assignment is a field proved at an exact shared native parent/event
+creation commit, not an interpolated interval or the native committer's identity.
+Every cap, tie, gap, damaged/absent history or head mismatch stays unknown. Current
+operator/mark eligibility remains a separate audit column. A decisive inactive
+review VOID can leave the current chain unreadable; the existing unreadable
+refusal remains operative and a counterfactual is explanatory only. Exact report
+fields and bounded history costs are documented in
+[operations](OPERATIONS.md#d2-audit-and-release-diagnostics) and
+[the CLI contract](CLI_CONTRACT.md#read-only-lifecycle-audit-and-release-diagnostics).
+The diagnostic covers any decisive review-record VOID, including failed
+attestations and repair forks. Host release-query adapters additionally reuse the
+validated runtime authority-change audit, with byte/entry bounds, to distinguish
+prior eligibility from an ineligible issuer or explicitly unknown evidence.
+Neither that optional read context nor its counterfactual changes any operative
+projection or gate. Tasks without a potentially inactive VOID skip the extra
+diagnostic projections; no new public request field or durable store is added.
+
+The accepted design and source inventory below remain pinned to their original
+baseline. Statements about the original docs-only delivery and then-unimplemented
+D2 requirements describe that historical revision; the current note above records
+the limited implementation. The future E/F and correction-campaign gates remain
+separate and unchanged.
+
 This incorporates the seven changes from the accept-with-changes document review.
 The inspected baseline is
 `3a3cf318ce22f450803696acde07e9a6cda6f003` (release `orchestra-3a3cf31-20261015c`, 15 October 2026). Code citations below

@@ -446,13 +446,7 @@ def dispatch(canonical, request, tmp, run=None):
             ids = [str(row['id']) for row in listed if isinstance(row, dict) and row.get('id')][:200]
             shown = json.loads(run(['show', *ids, '--json', '--include-comments']) or '[]') if ids else []
             items = delegations.listing(shown, project, state, canonical.path, operators, None)
-            grants = ((state.get('coordinator_grants') or {}).get(project) or {})
-            in_force = [item['delegation'] for item in items if item['in_force']]
-            agents = [{'agent': agent, 'covered': any(d['right'] == 'record-acceptance' and d['grantee'] in (agent, 'coordinator-grant')
-                                                     for d in in_force),
-                       'by': [d['decision'] for d in in_force
-                              if d['right'] == 'record-acceptance' and d['grantee'] in (agent, 'coordinator-grant')]}
-                      for agent in sorted(grants)]
+            agents = delegations.coverage(state, project, items)
             names = {}
             for ident in {a['agent'] for a in agents} | {x for item in items if item['delegation']
                                                          for x in (item['delegation']['grantee'], item['delegation']['account']) if x}:

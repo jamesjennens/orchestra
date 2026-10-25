@@ -20,6 +20,11 @@ function ctxFor(role, data) {
       postRoomMessage: async () => { throw new Error('not used'); },
       archiveRoom: async () => { throw new Error('not used'); },
       moderateRoomMessage: async () => { throw new Error('not used'); },
+      createRoomItem: async () => { throw new Error('not used'); },
+      acceptRoomItem: async () => { throw new Error('not used'); },
+      rejectRoomItem: async () => { throw new Error('not used'); },
+      amendRoomItem: async () => { throw new Error('not used'); },
+      answerRoomItem: async () => { throw new Error('not used'); },
       exportRoom: async () => ({ text: '# Planning\n' }),
     },
   };
@@ -33,7 +38,7 @@ const data = {
     author: { id: 'usr_2', name: 'Alice', role: 'contributor' },
     created_at: '2026-10-23T04:01:00Z',
     text: '<img src=x onerror=alert(1)> and [x](javascript:alert(1))' }],
-  moderations: [], since: 50, last_sequence: 150, next_since: 150, has_more: false,
+  moderations: [], items: [], since: 50, last_sequence: 150, next_since: 150, has_more: false,
 };
 
 async function detail(role) {

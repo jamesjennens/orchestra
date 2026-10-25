@@ -152,18 +152,20 @@ class BoundEndpointTests(unittest.TestCase):
         # cannot be named directly by a bound key any more than these others can.
         # `task-file` (kittrial-5bb.370) records or withdraws a file attached to a task: the web
         # service stores the bytes and calls it under live authority; no bound key may name it.
+        # `room-decision` (kittrial-5bb.388) creates the native decision from a room item; the
+        # endpoint re-checks the signed-in owner/coordinator live. No bound key may name it.
         # `delegation` (kittrial-5bb.407) records a person owner's delegation from their own web
         # session; an operator uses the confined `coordinator delegation-record` instead.
         self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignee-followon', 'assignment-roster', 'create-project', 'creation-standing',
                                                                  'delegation', 'host-coordination',
-                                                                 'host-projects', 'project-creations', 'task-assign', 'task-file', 'task-release', 'web-guidance',
+                                                                 'host-projects', 'project-creations', 'room-decision', 'task-assign', 'task-file', 'task-release', 'web-guidance',
                                                                  'web-lifecycle', 'web-merge-slot',
                                                                  # kittrial-5bb.378: the release query and one release group; the canonical write is
                                                                  # `web-release`, which a bound key may not name directly.
                                                                  'web-release'])
         for action in ('create-project', 'project-creations', 'creation-standing', 'web-merge-slot',
                        'host-coordination', 'host-projects', 'web-guidance', 'web-lifecycle', 'assignment-roster', 'task-assign', 'task-release',
-                       'assignee-followon', 'task-file', 'web-release'):
+                       'assignee-followon', 'task-file', 'room-decision', 'web-release'):
             for project in ('alpha', 'beta', 'Not A Name', None):
                 with self.subTest(action=action, project=project):
                     self.refused({'project': project, 'actor': 'a', 'action': action},

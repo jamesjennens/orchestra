@@ -190,6 +190,21 @@ class DelegationTests(unittest.TestCase):
         self.refused('holds no coordinator grant', live=state(grants=(SIBLING,)))
         self.refused('only references and capabilities', kind='tasks')
 
+    def test_the_agent_grant_must_be_in_effect_under_the_issuer_rule(self):
+        # kittrial-5bb.410 merged into r3: a coordinator grant counts only while its issuer may
+        # still give it. The delegation's own recorder (OTHER_OWNER) stays an owner throughout.
+        self.write(request(), writer=OTHER_OWNER)
+        live = state()
+        live['memberships'][PROJECT][OWNER] = 'coordinator'          # the grants' issuer demoted
+        self.refused('not in effect', live=live)
+        items = d.listing([self.row()], PROJECT, live, self.project)
+        self.assertEqual({a['agent']: (a['grant_in_effect'], a['covered']) for a in d.coverage(live, PROJECT, items)},
+                         {AGENT: (False, False), SIBLING: (False, False)})
+        live['memberships'][PROJECT][OWNER] = 'owner'                # re-promoted: in effect again
+        self.assertTrue(self.check(live=live))
+        self.assertTrue(all(a['covered'] for a in d.coverage(live, PROJECT, d.listing([self.row()], PROJECT, live,
+                                                                                         self.project))))
+
     def test_the_grant_recorder_must_still_be_a_person_owner_at_use(self):
         self.write(request())
         self.refused('no longer a person owner', live=state(owner_role='coordinator'))

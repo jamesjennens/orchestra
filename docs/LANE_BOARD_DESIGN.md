@@ -199,9 +199,15 @@ office surface.
 
 **How it scopes the read.** The web service calls the endpoint without a bound key, so
 `lanes_scope_for` answers `all` today; the panel must never rely on that default. It passes its own
-scope: owners and coordinators — the same `review_workflow.listed_operator_actor` definition the
-endpoint itself uses — read every lane, and everybody else is scoped to their own agents' lanes,
-exactly the contributor route's rule. The transport default is a property of the route, not an
+scope, from one live decision per read (`_lanes_scope`): an installation operator (the same
+`review_workflow.listed_operator_actor` definition the endpoint uses), a project owner or coordinator
+(`decide()` with `CAP_COORDINATE`, so a superuser reads as owner), or an agent credential holding a
+live coordinator grant (its issuer must still be an owner or a superuser, kittrial-5bb.410) reads every lane; everybody else — contributors, viewers, agents without a
+grant, a failed decision — is scoped to their own agents' lanes. The answer carries `scope_basis`
+(`operator`, `project-role` with `scope_role`, `superuser` for a superuser with no coordinating
+membership here, `coordinator-grant` or `own`) and the panel sentence is
+built from it. The SSH bound-key route (`lanes_scope_for`) stays operator-only: the endpoint knows no
+web membership. The transport default is a property of the route, not an
 authority the page may inherit. The backend sends the authenticated caller's principal with a
 `read` authority descriptor and requires live authority on the endpoint; only `work lanes` has
 that table entry. The descriptor authorizes the member read, while `lanes_scope` still only

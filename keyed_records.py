@@ -408,6 +408,15 @@ def uncertain(message, action, spec):
                       'retrying.' % (message, action, spec.reconcile_command))
 
 
+def current_key_preflight(payload, run, spec, task=None, operator=False):
+    """The current-key read and checks shared by writes and read-only validation."""
+    rows = spec.read_rows(run, payload)
+    if task is None:
+        task = spec.resolve_task(rows, payload, operator)
+    spec.check_key_unique(rows, payload, task)
+    return rows, task
+
+
 # -- the single write entry point ------------------------------------------------------------
 
 def apply_native(payload, actor, run, project, spec, operator=False, operators=None, web_coordinator=False):
@@ -445,14 +454,11 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
         raise ValueError('Operation ID already used for a different record')
     # `read_rows(run, payload)` is the kind's one preflight read for this write: a kind
     # whose records are found by label reads only the rows this payload can touch.
-    rows = spec.read_rows(run, payload)
     created = False
     task = (prior.get('id') if prior and not reusable and prior.get('id') else None) or explicit
-    if task is None:
-        task = spec.resolve_task(rows, payload, operator)
     # Key uniqueness is checked against the pre-write read so a duplicate key is
     # refused with zero native writes.
-    spec.check_key_unique(rows, payload, task)
+    rows, task = current_key_preflight(payload, run, spec, task=task, operator=operator)
     if task is None:
         request_label = 'request:' + identity
         matches = [row for row in rows if request_label in (row.get('labels') or [])]

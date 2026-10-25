@@ -7,9 +7,9 @@ Two surfaces, as the neighbouring web tests are split:
   anything is read; its threshold (``idle_minutes``) reaches the ONE board read unchanged,
   so the rows and the three flags change with it; a threshold outside 1..10080 is refused
   400; and the route scopes the read for its OWN viewer instead of inheriting the
-  transport's answer: an owner or coordinator (``review_workflow.listed_operator_actor``
-  over the host's operator allowlist and actor->principal map) sees every lane, and anyone
-  else is scoped to their own agents' lanes, exactly the contributor route's rule.
+  transport's answer: an installation operator (``review_workflow.listed_operator_actor``),
+  a project owner or coordinator, or an agent holding a live coordinator grant sees every
+  lane (``scope_basis`` says which), and anyone else is scoped to their own agents' lanes, exactly the contributor route's rule.
 * the page's own rendering, in the repository's page-test form: ``tests/web_lanes_page.mjs``
   under Node, driven by the Python test below, over a stubbed transport (no server needed).
 
@@ -241,15 +241,16 @@ class LanesRouteCase(ServerHarness):
         self.assertEqual('all', every.data['scope'])
         self.assertEqual(2, every.data['total'])
 
-    def test_a_host_that_cannot_say_who_is_an_operator_is_scoped_not_widened(self):
-        # No ``host_coordination`` at all (the disposable backend has no host): the answer
-        # is the narrower view, never the wider one -- and olive's project ROLE alone does
-        # not widen it, because the scope is the kit's operator definition, not a new rule.
+    def test_a_host_that_cannot_say_who_is_an_operator_still_reads_by_project_role(self):
+        # No ``host_coordination`` at all (the disposable backend has no host): the operator
+        # basis is lost, never widened; olive's live owner role still reads every lane, and
+        # a contributor stays scoped.
         self.assertFalse(hasattr(self.backend, 'host_coordination'))
-        scoped = self.lanes(self.olive)
-        self.assertEqual(200, scoped.status, scoped.data)
+        wide = self.lanes(self.olive)
+        self.assertEqual(200, wide.status, wide.data)
+        self.assertEqual(('all', 'project-role'), (wide.data['scope'], wide.data['scope_basis']))
+        scoped = self.lanes(self.carl)
         self.assertEqual('own', scoped.data['scope'])
-        self.assertEqual([], scoped.data['items'])
 
     def test_a_non_member_and_a_member_of_another_project_read_nothing(self):
         planted = self.backend.lanes_read
@@ -423,6 +424,18 @@ class LanesPageTests(unittest.TestCase):
         self.assertTrue(seen['countsLine'], seen['text'])
         self.assertIn('15 idle minutes', seen['countsLine'][0])
         self.assertIn('1 waiting too long', seen['countsLine'][0])
+        # The sentence about what this viewer sees comes from the server's scope and basis.
+        said = {name: ' '.join(lines) for name, lines in seen['scopeSentences'].items()}
+        self.assertIn('you are an installation operator', said['operator'])
+        self.assertIn('your role in this project is owner', said['owner'])
+        self.assertIn('your role in this project is coordinator', said['coordinator'])
+        self.assertIn('holds a coordinator grant in this project', said['grant'])
+        self.assertIn('you are a superuser', said['superuser'])
+        self.assertNotIn('role in this project', said['superuser'])
+        self.assertIn('You see your own lanes; installation operators, project owners and coordinators, '
+                      'and agents with a coordinator grant see every lane', said['own'])
+        self.assertTrue(said['unknown'].endswith('You see every lane.'), said['unknown'])
+        self.assertNotIn('owners and coordinators see every lane.', said['owner'])
         # A raised fault shows its reason as text (never markup), where and how long, and the
         # older open reasons, beside the lane that raised it (kittrial-5bb.398).
         self.assertEqual(1, len(seen['fault']), seen['fault'])

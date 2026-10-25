@@ -19,12 +19,14 @@ export const NO_EFFECT = {
   'agent-disabled': ' — the agent is disabled',
   'account-disabled': ' — its account is disabled',
   'account-role': ' — its account is no longer a coordinator or owner here',
+  'issuer-role': ' — the person who gave it is no longer an owner here',
 };
 // The release grant is narrower (kittrial-5bb.378): only an owner's account carries it.
 export const RELEASE_NO_EFFECT = {
   'agent-disabled': ' — the agent is disabled',
   'account-disabled': ' — its account is disabled',
   'account-role': ' — its account is no longer an owner here',
+  'issuer-role': ' — the person who gave it is no longer an owner here',
 };
 export const ROLE_NAMES = [['viewer', 'Viewer'], ['contributor', 'Contributor'], ['coordinator', 'Coordinator'], ['owner', 'Owner']];
 
@@ -59,6 +61,25 @@ export const LANES_PAGE = 10;
 export const LANES_DEFAULT_IDLE_MINUTES = 15;
 export const LANES_IDLE_MINUTES_MIN = 1;
 export const LANES_IDLE_MINUTES_MAX = 10080;
+// The rule in force for this viewer, from the server's own answer (kittrial-5bb.405): the scope and
+// why, never a sentence the page decided for itself. An unknown basis is stated as the scope alone.
+function scopeSentence(data) {
+  if (data.scope === 'own') {
+    return 'You see your own lanes; installation operators, project owners and coordinators, and agents with a coordinator grant see every lane.';
+  }
+  if (data.scope === 'all') {
+    if (data.scope_basis === 'operator') return 'You see every lane: you are an installation operator.';
+    if (data.scope_basis === 'project-role') {
+      if (data.scope_role !== 'coordinator' && data.scope_role !== 'owner') return 'You see every lane.';
+      return 'You see every lane: your role in this project is ' + data.scope_role + '.';
+    }
+    if (data.scope_basis === 'superuser') return 'You see every lane: you are a superuser, who may coordinate every project.';
+    if (data.scope_basis === 'coordinator-grant') return 'You see every lane: this agent holds a coordinator grant in this project.';
+    return 'You see every lane.';
+  }
+  return 'Scope: ' + String(data.scope) + '.';
+}
+
 const LANE_FLAGS = [
   ['waiting_too_long', 'Waiting too long'],
   ['expect_by_passed', 'Expect-by passed'],
@@ -179,7 +200,7 @@ export function lanesPanel(ctx, project) {
       h('p', { class: 'small muted', role: 'note' },
         'Reading with ', String(data.idle_minutes), ' idle minutes: ',
         LANE_FLAGS.map(([key, label]) => `${counts[key] || 0} ${label.toLowerCase()}`).join(' · '),
-        data.scope === 'own' ? '. You see your own lanes; owners and coordinators see every lane.' : '.'),
+        '. ', scopeSentence(data)),
       lanes.length ? h('div', { class: 'stack' }, lanes.map(laneBlock))
         : empty('No lanes to show', 'No session holds work in this project right now.'),
       pager(data));

@@ -183,7 +183,7 @@ class AnchoredKind:
     def __init__(self, **values):
         defaults = {'pre_write': lambda payload, run, operators: None, 'extra_records': {}, 'extra_parsers': {},
                     'supports_retire': False, 'entry_prefixes': None, 'entry_prefix_for': None,
-                    'acceptance_rules': None, 'unsupported_reason': None}
+                    'acceptance_rules': None, 'unsupported_reason': None, 'collecting_content': False}
         defaults.update(values)
         self.__dict__.update(defaults)
         self.entry_prefixes = tuple(self.entry_prefixes or (self.entry_prefix,))
@@ -599,84 +599,135 @@ class AnchoredKind:
 
     # -- payloads ------------------------------------------------------------------------------
 
-    def validate_payload(self, payload, operator=False, web_coordinator=False):
+    def validate_payload(self, payload, operator=False, web_coordinator=False, collect=False):
+        errors = []
+
+        def reject(field, hint, message):
+            if not collect:
+                raise ValueError(message)
+            errors.append({'field': field, 'message': message, 'hint': hint})
+
+        def check(field, hint, call):
+            try:
+                call()
+            except (ValueError, TypeError, KeyError) as error:
+                reject(field, hint, str(error))
+                return False
+            return True
+
         if not isinstance(payload, dict):
             raise ValueError('%s payload must be an object' % self.noun)
-        core.refuse_injected_labels(payload, '%s operation' % self.noun)
+        check('labels', 'Remove labels and add_labels; the operation derives controlled labels.',
+              lambda: core.refuse_injected_labels(payload, '%s operation' % self.noun))
         operation = payload.get('operation')
         if operator:
             allowed_operations = OPERATOR_OPERATIONS + (('retire',) if (self.supports_retire or web_coordinator) else ())
         else:
             allowed_operations = CONTRIBUTOR_OPERATIONS
         if operation not in allowed_operations:
-            raise ValueError('operation must be one of ' + ', '.join(allowed_operations))
+            reject('operation', 'Use the command to choose the operation; do not set it in the payload.',
+                   'operation must be one of ' + ', '.join(allowed_operations))
+            return errors
         if not operator:
             supplied = [name for name in WRITTEN_BY_THE_OPERATION if name in payload]
             if supplied:
-                raise ValueError('%s %s written by the operation, never caller-supplied; acceptance is the '
-                                 'operator route (%s).'
-                                 % (', '.join(supplied), 'is' if len(supplied) == 1 else 'are', self.apply_command))
+                reject('payload', 'Remove operator-only fields; acceptance uses the operator route.',
+                       '%s %s written by the operation, never caller-supplied; acceptance is the '
+                       'operator route (%s).'
+                       % (', '.join(supplied), 'is' if len(supplied) == 1 else 'are', self.apply_command))
         fields = {'propose': self.propose_fields, 'revise': self.propose_fields, 'accept': self.accept_fields,
                   'draft': self.direct_fields, 'retire': self.retire_fields}[operation]
-        core.checked_fields(payload, fields, '%s payload' % self.noun)
+        check('payload', 'Remove unknown fields from the payload.',
+              lambda: core.checked_fields(payload, fields, '%s payload' % self.noun))
         if type(payload.get('schema_version')) is not int or payload['schema_version'] != 1:
-            raise ValueError('schema_version must be the integer 1')
+            reject('schema_version', 'Set schema_version to the integer 1.', 'schema_version must be the integer 1')
         if 'operation_id' not in payload:
-            raise ValueError('%s payload is missing field operation_id' % self.noun)
-        identifier(payload['operation_id'])
+            reject('operation_id', 'Add a unique operation_id for this proposal.',
+                   '%s payload is missing field operation_id' % self.noun)
+        else:
+            check('operation_id', 'Use a short unique operation identifier.',
+                  lambda: identifier(payload['operation_id']))
+        key_valid = True
         if 'key' not in payload:
-            raise ValueError('%s payload is missing field key' % self.noun)
-        self.valid_key(payload['key'])
+            reject('key', 'Add a lowercase dotted capability key.', '%s payload is missing field key' % self.noun)
+            key_valid = False
+        else:
+            key_valid = check('key', 'Use a lowercase dotted key such as review.structured-contribution.',
+                              lambda: self.valid_key(payload['key']))
         if operation == 'retire':
             if 'successor' not in payload:
-                raise ValueError('retire needs successor, the key that replaces this one')
-            self.valid_key(payload['successor'], 'successor')
-            if payload['successor'] == payload['key']:
-                raise ValueError('a key cannot be its own successor')
+                reject('successor', 'Name the key that replaces this one.',
+                       'retire needs successor, the key that replaces this one')
+            else:
+                check('successor', 'Use another valid lowercase dotted key.',
+                      lambda: self.valid_key(payload['successor'], 'successor'))
+                if payload['successor'] == payload['key']:
+                    reject('successor', 'Choose a different successor key.', 'a key cannot be its own successor')
         if operation in ('accept', 'retire'):
             for name in ('revision', 'record_sha256', 'acceptance_state', 'acceptance'):
                 if name not in payload:
-                    raise ValueError('%s needs %s' % (self.apply_command.split()[-1], name))
-            core.positive_int(payload['revision'], 'revision')
+                    reject(name, 'Add the required %s field.' % name,
+                           '%s needs %s' % (self.apply_command.split()[-1], name))
+            check('revision', 'Use a positive integer revision.', lambda: core.positive_int(payload['revision'], 'revision'))
             if not isinstance(payload['record_sha256'], str) or not SHA256_TEXT.match(payload['record_sha256']):
-                raise ValueError('record_sha256 must be the content hash of the revision being accepted')
+                reject('record_sha256', 'Use the 64-character content hash of the reviewed revision.',
+                       'record_sha256 must be the content hash of the revision being accepted')
         else:
-            self.validate_content(payload)
+            if collect and self.collecting_content:
+                errors.extend(self.validate_content(payload, collect=True))
+            else:
+                check('content', 'Correct the capability content fields.', lambda: self.validate_content(payload))
             revision = payload.get('revision', 1 if operation != 'revise' else None)
             if operation == 'revise':
                 if revision is None:
-                    raise ValueError('revise needs the next revision number')
-                core.positive_int(revision, 'revision')
-                if revision < 2:
-                    raise ValueError('revise writes revision 2 or later; use propose for revision 1')
+                    reject('revision', 'Add the next revision number.', 'revise needs the next revision number')
+                else:
+                    check('revision', 'Use revision 2 or later.', lambda: core.positive_int(revision, 'revision'))
+                    if isinstance(revision, int) and not isinstance(revision, bool) and revision < 2:
+                        reject('revision', 'Use propose for revision 1 and revise for later revisions.',
+                               'revise writes revision 2 or later; use propose for revision 1')
                 digest = payload.get('expected_sha256')
                 if not isinstance(digest, str) or not SHA256_TEXT.match(digest):
-                    raise ValueError('revise needs expected_sha256, the content hash of the newest revision '
-                                     'it replaces')
+                    reject('expected_sha256', 'Use the content hash of the newest revision being replaced.',
+                           'revise needs expected_sha256, the content hash of the newest revision it replaces')
             else:
                 if revision != 1:
-                    raise ValueError('%s creates revision 1; use revise for later revisions' % operation)
+                    reject('revision', 'Omit revision or set it to 1; use revise for later revisions.',
+                           '%s creates revision 1; use revise for later revisions' % operation)
                 if payload.get('expected_sha256') is not None:
-                    raise ValueError('%s creates a new entry, so expected_sha256 must be null' % operation)
+                    reject('expected_sha256', 'Omit expected_sha256 or set it to null for a new entry.',
+                           '%s creates a new entry, so expected_sha256 must be null' % operation)
         if operator and operation == 'retire':
             if payload.get('acceptance_state') != 'superseded':
-                raise ValueError('retire writes a superseded revision (acceptance_state must be superseded)')
-            core.validate_acceptance_shape(payload.get('acceptance'))
-            core.bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64))
+                reject('acceptance_state', 'Set acceptance_state to superseded.',
+                       'retire writes a superseded revision (acceptance_state must be superseded)')
+            check('acceptance', 'Supply complete acceptance evidence.',
+                  lambda: core.validate_acceptance_shape(payload.get('acceptance')))
+            if isinstance(payload.get('acceptance'), dict):
+                check('acceptance', 'Supply valid bound acceptance evidence.',
+                      lambda: core.bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64)))
         elif operator:
             if payload.get('acceptance_state') != 'accepted':
-                raise ValueError('%s writes an accepted revision (acceptance_state must be accepted)'
-                                 % self.apply_command.split()[-1])
-            core.validate_acceptance_shape(payload.get('acceptance'))
-            core.bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64))
-        if operation not in ('accept', 'retire'):
+                reject('acceptance_state', 'Set acceptance_state to accepted.',
+                       '%s writes an accepted revision (acceptance_state must be accepted)'
+                       % self.apply_command.split()[-1])
+            check('acceptance', 'Supply complete acceptance evidence.',
+                  lambda: core.validate_acceptance_shape(payload.get('acceptance')))
+            if isinstance(payload.get('acceptance'), dict):
+                check('acceptance', 'Supply valid bound acceptance evidence.',
+                      lambda: core.bound_acceptance(dict(payload['acceptance'], record_sha256='0' * 64)))
+        if collect and operation not in ('accept', 'retire') and revision == 1 and type(revision) is not int:
+            check('revision', 'Use the integer 1, not a boolean or float.',
+                  lambda: core.positive_int(revision, 'revision'))
+        if operation not in ('accept', 'retire') and not errors:
             # Every content rule, including the date rules, is checked here, BEFORE the
             # anchor is created: a refusal after the create would leave an anchor with no
             # record. (An acceptance's content is the reviewed draft's; it is checked
             # before its writes, on an anchor that already exists.)
             state = 'accepted' if operation == 'draft' else 'draft'
-            self.write_time_rules(self.entry_record(payload, payload.get('revision', 1), state))
-        return payload
+            check('payload', 'Correct the payload so it forms a valid entry.',
+                  lambda: self.write_time_rules(self.entry_record(payload, payload.get('revision', 1), state)))
+        return errors if collect else payload
 
     # -- spec hooks ------------------------------------------------------------------------------
 

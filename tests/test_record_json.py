@@ -206,14 +206,15 @@ class NoUnguardedParseTests(unittest.TestCase):
                            'a damaged, unreadable or nested file is caught and read as the restrictive '
                            '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
                            'permissive default'),
-        'client.py': (15, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
+        'client.py': (16, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
                          'kittrial-5bb.285 added the wait read\'s answer from the endpoint (and wait\'s --config read, '
                          'which kittrial-5bb.373 merged with main()\'s --config read into one parse after delivery; '
                          "neither is a record comment or a caller's payload). The twelfth (kittrial-5bb.327 "
                          "review 2) is the wait's own small state file: text this client wrote beside its config, "
                          'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
                          'treated as absent. The last three (kittrial-5bb.384) are the `files` command\'s reads of the endpoint\'s own answer line '
-                         'and of the file record inside it, on the caller\'s machine'),
+                         'and of the file record inside it, on the caller\'s machine; kittrial-5bb.402 adds the '
+                         'validate command\'s read of the endpoint\'s validation result'),
         'coordination.py': (7, 'bd output'),
         'endpoint.py': (6, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
                            'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own); the sixth '
@@ -319,6 +320,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             # The twelfth (kittrial-5bb.407) reads a `.delegations` journal entry for a backup:
             # a host file, but one a damaged or nested copy must refuse, never traceback.
             'admin.py': 12,
+            # D2: bounded native history, review VOID and preserved target payload.
+            'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
             # message line through the guard: a room post is text a person wrote, and a
             # nested or lookalike file must be a refusal, never a RecursionError.
@@ -368,9 +371,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # http_authority reads the operation of an attached review record through the guard,
             # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
             # lifecycle.py also guards exported correction payloads in its offline reader.
-            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
-            # The simple owner adapter guards bd's decision-create receipt too.
-            'requirement_http.py': 2,
+            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 4, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
+            # The simple owner adapter guards bd's decision-create receipt too. The third
+            # (kittrial-5bb.388) guards the service-only room-decision payload the route
+            # transports (room, item number, title, text and pointer) before it is used.
+            'requirement_http.py': 3,
             # Assignment adds closed roster/request payloads at the endpoint and
             # guards both its native task reply and its reserved notice body.
             'task_assignment.py': 2,

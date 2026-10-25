@@ -371,9 +371,15 @@ def check_acceptance(row, *, project, state, journal, agent, kind, operators=Non
     if delegation['right'] != 'record-acceptance':
         raise DelegationRefusal(403, 'Decision %s delegates %s, not record acceptance'
                                 % (row.get('id'), delegation['right']))
-    from http_authority import coordinator_grant
-    if coordinator_grant(state, project, agent) is None:
+    from http_authority import coordinator_grant, grant_issuer_holds
+    grant = coordinator_grant(state, project, agent)
+    if grant is None:
         raise DelegationRefusal(403, 'Agent %s holds no coordinator grant in this project' % agent)
+    if not grant_issuer_holds(state, project, grant):
+        # kittrial-5bb.410: a grant counts only while its issuer may still give it (an enabled
+        # owner of this project, or a superuser), checked at use.
+        raise DelegationRefusal(403, "Agent %s's coordinator grant is not in effect: the person who gave it "
+                                     'is no longer an owner of this project' % agent)
     if delegation['grantee'] != 'coordinator-grant' and delegation['grantee'] != agent:
         raise DelegationRefusal(403, 'The delegation on decision %s is granted to %s, not to %s'
                                 % (row.get('id'), delegation['grantee'], agent))
@@ -456,6 +462,24 @@ def apply(payload, *, project, journal, run, recorded_by, via, account, at):
         run(['update', payload['decision'], '--add-label', LABEL, '--json'])
     return {'schema_version': 1, 'operation_id': payload['operation_id'], 'decision': payload['decision'],
             'record': record, 'comment_id': str(comment['id'])}
+
+
+def coverage(state, project, items):
+    """Each agent with a coordinator grant on record here: whether that grant is in effect (its
+    issuer may still give it, kittrial-5bb.410) and which delegations in force cover it. An agent
+    is ``covered`` only when both hold, since an acceptance needs both."""
+    from http_authority import grant_issuer_holds
+    grants = state.get('coordinator_grants') if isinstance(state, dict) else None
+    grants = grants.get(project) if isinstance(grants, dict) else None
+    grants = grants if isinstance(grants, dict) else {}
+    in_force = [item['delegation'] for item in items if item.get('in_force') and item.get('delegation')]
+    out = []
+    for agent in sorted(grants):
+        effective = isinstance(grants[agent], dict) and grant_issuer_holds(state, project, grants[agent])
+        by = [d['decision'] for d in in_force
+              if d['right'] == 'record-acceptance' and d['grantee'] in (agent, 'coordinator-grant')]
+        out.append({'agent': agent, 'grant_in_effect': bool(effective), 'covered': bool(effective and by), 'by': by})
+    return out
 
 
 def listing(rows, project, state, journal, operators=None, owners=None):

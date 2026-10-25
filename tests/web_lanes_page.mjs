@@ -71,6 +71,7 @@ function board(idleMinutes, extra) {
   }, extra);
 }
 
+let scopeExtra = {};
 const calls = [];
 function transport(method, path) {
   calls.push(method + ' ' + path);
@@ -89,7 +90,7 @@ function transport(method, path) {
     // The first read offers a next page; a read after a threshold change does not.
     const extra = calls.filter((c) => c.startsWith('GET /v1/projects/alpha/lanes')).length === 1
       ? { next_offset: 10, next_cursor: 'cursor-page-2' } : {};
-    return Promise.resolve({ status: 200, data: board(idle, extra) });
+    return Promise.resolve({ status: 200, data: board(idle, Object.assign({}, extra, scopeExtra)) });
   }
   return Promise.resolve({ status: 404,
     data: { error: { code: 'not_found', message: 'No such operation' } } });
@@ -164,5 +165,24 @@ await button(panel, 'Read with this threshold').dispatch('click');
 await settle();
 out.refusal = panel.textContent;
 out.refusalHasRetry = Boolean(button(panel, 'Try again'));
+// 7. The sentence about what this viewer sees is built from the server's scope and its basis.
+out.scopeSentences = {};
+const variants = {
+  operator: { scope: 'all', scope_basis: 'operator', scope_role: null },
+  owner: { scope: 'all', scope_basis: 'project-role', scope_role: 'owner' },
+  coordinator: { scope: 'all', scope_basis: 'project-role', scope_role: 'coordinator' },
+  grant: { scope: 'all', scope_basis: 'coordinator-grant', scope_role: null },
+  superuser: { scope: 'all', scope_basis: 'superuser', scope_role: null },
+  own: { scope: 'own', scope_basis: 'own', scope_role: null },
+  unknown: { scope: 'all', scope_basis: 'something-new', scope_role: null },
+};
+for (const [name, extra] of Object.entries(variants)) {
+  scopeExtra = extra;
+  const fresh = view.lanesPanel(ctx, PROJECT);
+  document.body.append(fresh);
+  await settle();
+  out.scopeSentences[name] = fresh.all((e) => e.tagName === 'P' && e.textContent.includes('idle minutes'))
+    .map((e) => e.textContent);
+}
 out.calls = calls;
 console.log(JSON.stringify(out));

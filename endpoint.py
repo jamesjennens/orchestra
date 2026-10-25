@@ -944,7 +944,7 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: which a bound key is not told.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
-                      'task-file','delegation')
+                      'task-file','room-decision','delegation')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -1257,7 +1257,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','delegation'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision','delegation'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1443,6 +1443,23 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             answer=web_action(root,path,name,request,authority_config,runner,guarded_write)
+        answer['stderr']=answer.get('stderr','')+''.join(run_warnings)
+        return answer
+    if action=='room-decision':
+        # One native decision issue from an accepted room decision item (kittrial-5bb.388).
+        # Service-only; requirement_http.room_decision re-checks the signed-in account's
+        # owner/coordinator membership LIVE under the authority lock and binds the item's
+        # stored title/text/evidence before the guarded write.
+        from requirement_http import room_decision
+        run_warnings=[]
+        def decision_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(decision_run, project=path)
+        with (path/'.coordination.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            answer=room_decision(root,path,name,request,authority_config,runner,guarded_write)
         answer['stderr']=answer.get('stderr','')+''.join(run_warnings)
         return answer
     if action=='set-onboarding':
@@ -1769,9 +1786,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     if action=='capability':
         # The capability index (.60 slices 1a and 1b, kittrial-5bb.67/.69). get, list, find
         # and help are reads (one label-filtered bd list plus bd show; no lock, not
-        # run_guarded); misses is a read of the lookup-miss log (capability_misses, kittrial-
+        # run_guarded); validate is the same read-only preflight as propose, without a lock
+        # or journal; misses is a read of the lookup-miss log (capability_misses, kittrial-
         # 5bb.77), which find feeds; propose, revise, propose-alias and verify are writes,
-        # under the lock and the journal. lookup, resolve, index and check run in the client.
+        # under the lock and the journal. lookup, resolve, index, check and validate's
+        # repository-pointer stage run in the client.
         # A verification written here is always `unverified`; the deployment verifiers list
         # only decides how host-written (`admin.py capability-verify`) records are read.
         import capability_records
@@ -1785,6 +1804,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         by_service=authority_config is not None and require_authority
         writes=capability_records.WRITE_COMMANDS+(capability_records.HTTP_WRITE_COMMANDS if by_service else ())
         if not args or args[0] not in writes:
+            if args[:1]==['validate'] and not any(token in ('--help','-h') for token in args):
+                result=capability_records.validate(args,request.get('attachments',{}),run,configured_operators(root))
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                        'stderr':''.join(run_warnings)}
             if args[:1]==['misses'] and not any(token in ('--help','-h') for token in args):
                 # The lookup-miss log (kittrial-5bb.77): read-only, no lock, not run_guarded.
                 # It reads the telemetry file, and the records once (only when the log holds
@@ -2406,7 +2429,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     raise web_release.ReleaseError(503,'The installation operator list cannot be read, so the '
                                                         'host revert and hold set is unavailable: '+str(error)[:160])
                 if operation=='query':
-                    result=lifecycle.release_query(payload,actor,runner,operators=operators,journal=path)
+                    from lifecycle_audit import read_operator_history
+                    operator_history=read_operator_history(root,operators)
+                    result=lifecycle.release_query(payload,actor,runner,operators=operators,journal=path,
+                                                   operator_history=operator_history)
                 else:
                     rules=configured_coordinator_rules(root,warnings=run_warnings)
                     rows=lifecycle.read_event_rows(runner)
@@ -2561,13 +2587,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             ids=[str(row['id']) for row in listed if isinstance(row,dict) and row.get('id')][:200]
             shown=record_json.loads_array_rows(delegation_run(['show',*ids,'--json','--include-comments']) or '[]') if ids else []
             items=delegations.listing(shown,name,state,path,configured_operators(root),owned())
-            grants=((state.get('coordinator_grants') or {}).get(name) or {}) if isinstance(state.get('coordinator_grants'),dict) else {}
-            in_force=[item['delegation'] for item in items if item['in_force']]
-            agents=[]
-            for agent_id in sorted(grants):
-                covering=[d['decision'] for d in in_force
-                          if d['right']=='record-acceptance' and d['grantee'] in (agent_id,'coordinator-grant')]
-                agents.append({'agent':agent_id,'covered':bool(covering),'by':covering})
+            agents=delegations.coverage(state,name,items)
             # Display names only for the accounts and agents this answer names (members already
             # read them on the coordination panel); never a wider directory.
             named={agent['agent'] for agent in agents}
@@ -2749,11 +2769,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             run_warnings.append('deployment operators unreadable, so operator voids are not applied: '
                                +str(error)[:160])
         def lifecycle_effect():
-            if action=='lifecycle':result=apply_native(payload,actor,runner,
-                                                       operators=configured_operators(root),journal=path,
-                                                       lifecycle_authors=rules['lifecycle_authors'],
-                                                       independent_approval=rules['independent_approval'],
-                                                       owners=owner_loader(path,'lifecycle_authors'))
+            if action=='lifecycle':
+                lifecycle_operators=configured_operators(root)
+                diagnostic_context={}
+                if isinstance(payload,dict) and payload.get('dimension')=='release-query':
+                    from lifecycle_audit import read_operator_history
+                    diagnostic_context['operator_history']=read_operator_history(root,lifecycle_operators)
+                result=apply_native(payload,actor,runner,
+                                    operators=lifecycle_operators,journal=path,
+                                    lifecycle_authors=rules['lifecycle_authors'],
+                                    independent_approval=rules['independent_approval'],
+                                    owners=owner_loader(path,'lifecycle_authors'),**diagnostic_context)
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
                 result=coordinate(payload,actor,runner,path,operators=coordinate_operators,
@@ -3004,7 +3030,7 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
-    ('capability ...', 'capability records: find, get, list, propose, revise, verify'),
+    ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),
     ('refresh', 'refresh the cached export the reads are answered from'),

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "operation_id": "kittrial-5bb-402-capability-validate",
+  "key": "capability.validate-drafts",
+  "name": "Read-only validation of capability draft payloads",
+  "aliases": [
+    "capability validate file",
+    "validate capability proposals",
+    "check draft round file"
+  ],
+  "summary": "capability validate --file entry.json --repo . checks one propose payload or a list before delivery. The endpoint shares propose's schema, content, requirement-link and current-key preflight without a coordination lock or any native/journal write; the client resolves code, test and anchor pointers in the checkout. Per-item results collect independent errors with field and fix hint, preserve propose's first shared error, and leave invalid items as exit-0 validation results.",
+  "requirements": [],
+  "anchors": [
+    "docs/CLI_CONTRACT.md#capability-client-side-code-and-design-lookup",
+    "docs/WORKER_GUIDE.md#register-a-capability-with-your-delivery"
+  ],
+  "code": [
+    "client.py::_capability_validate",
+    "capability_records.py::validate",
+    "capability_records.py::validation_payloads",
+    "keyed_entries.py::AnchoredKind.validate_payload",
+    "keyed_records.py::current_key_preflight"
+  ],
+  "tests": [
+    "tests/test_capability_validate.py",
+    "tests/test_capability_wiring.py::EndpointDispatchTests.test_writes_are_locked_and_guarded_and_reads_are_neither"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "records",
+    "validation",
+    "worker"
+  ]
+}
