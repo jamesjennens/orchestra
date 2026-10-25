@@ -8219,7 +8219,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     # git and sends ONE group, at most 200 targets; the endpoint re-verifies every named
     # target against its own export and skips a target that is not integrated there. The
     # query is the read-only pre-flight: the host-issued reverted set and the recorded
-    # live releases for one environment, writing nothing.
+    # live releases for one environment and read-only review-VOID diagnostics,
+    # writing nothing. Diagnostics include issuer identities and reasons.
     def _release_backend(self, route):
         if not hasattr(self.backend, 'ROUTES') or route not in self.backend.ROUTES:
             raise not_implemented('Release facts are unavailable on this server')
@@ -8227,8 +8228,11 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/releases/query')
     def release_query(self, ctx):
         import web_release
-        # A coordinator read: the query writes nothing and discloses only the reverted
-        # set and the environment's live releases this project already knows.
+        # A coordinator read: CAP_COORDINATE callers (owners/superusers, a project
+        # coordinator, or an agent with the coordinator grant) receive the reverted
+        # set, this environment's live releases and review-VOID diagnostics, including
+        # issuer identities and reasons. Ordinary member/read capability is insufficient.
+        # The query writes nothing; diagnostics cannot authorize a release target.
         self._project(ctx, CAP_COORDINATE)
         try:
             _, fields = web_release.fields(dict(ctx.payload or {}, operation='query'))

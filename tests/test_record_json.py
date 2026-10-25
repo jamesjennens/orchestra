@@ -318,6 +318,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             # not just write itself, so a deeply nested one is described rather than
             # crashing the copy out of the guard.
             'admin.py': 11,
+            # D2: bounded native history, review VOID and preserved target payload.
+            'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
             # message line through the guard: a room post is text a person wrote, and a
             # nested or lookalike file must be a refusal, never a RecursionError.
