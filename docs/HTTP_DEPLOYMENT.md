@@ -2255,8 +2255,9 @@ superuser or an owner of the project. It is read live on every decision by the w
 and again by the endpoint, on every coordinator route and for the requirement editor.
 Demoting, removing or disabling the issuer ends the grant at the next request; making the
 issuer an owner again restores the same record, because nothing is rewritten; an owner who
-gives the grant again replaces a record whose issuer no longer qualifies. A record with no
-readable issuer is no grant.
+gives the grant again replaces a record whose issuer no longer qualifies, but over a record
+whose issuer still qualifies it changes nothing: the old issuer stays on record. A record with
+no readable issuer is no grant.
 
 On upgrade, grants given by someone who is no longer an owner stop having effect. Before
 deploying, list them. The check is read-only (the state file is read as JSON and no store

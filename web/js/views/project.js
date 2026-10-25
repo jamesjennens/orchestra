@@ -69,7 +69,8 @@ function scopeSentence(data) {
   if (data.scope === 'all') {
     if (data.scope_basis === 'operator') return 'You see every lane: you are an installation operator.';
     if (data.scope_basis === 'project-role') {
-      return 'You see every lane: your role in this project is ' + (data.scope_role === 'coordinator' ? 'coordinator' : 'owner') + '.';
+      if (data.scope_role !== 'coordinator' && data.scope_role !== 'owner') return 'You see every lane.';
+      return 'You see every lane: your role in this project is ' + data.scope_role + '.';
     }
     if (data.scope_basis === 'superuser') return 'You see every lane: you are a superuser, who may coordinate every project.';
     if (data.scope_basis === 'coordinator-grant') return 'You see every lane: this agent holds a coordinator grant in this project.';

@@ -142,6 +142,28 @@ class CoordinatorGrantIssuerTests(IssuerCase):
             self.requirement_editor()
         self.assertEqual(403, raised.exception.status)
 
+    def owner_of_another_project(self):
+        # olive stops owning Alpha but owns Beta: owning SOME project is not the right to issue in Alpha.
+        beta = self.create_project(self.admin, 'Beta')
+        self.assertEqual(200, self.member('olive', 'owner', token=self.admin, project=beta).status)
+        self.demote_olive()
+        return beta
+
+    def test_an_owner_of_another_project_is_not_a_valid_issuer_here(self):
+        self.owner_of_another_project()
+        self.assertIn(self.approved(), (401, 403))
+        self.assertEqual((False, 'issuer-role'), (self.view()['effective'], self.view()['no_effect_because']))
+        grant = self.service.state['coordinator_grants'][self.project][self.agent_id]
+        self.assertFalse(http_authority.grant_issuer_holds(self.service.state, self.project, grant))
+
+    def test_the_owner_s_agent_record_reports_the_grant_without_effect_once_the_issuer_is_demoted(self):
+        record = lambda: self.request('GET', '/v1/agents/%s' % self.agent_id, token=self.tokens['cora']).data
+        self.assertEqual([{'project': self.project, 'effective': True}], record()['coordinates'])
+        self.demote_olive()
+        self.assertEqual([{'project': self.project, 'effective': False}], record()['coordinates'])
+        self.assertEqual(200, self.member('olive', 'owner', token=self.admin).status)
+        self.assertEqual([{'project': self.project, 'effective': True}], record()['coordinates'])
+
 
 class ReleaseGrantIssuerTests(IssuerCase):
 
@@ -179,6 +201,12 @@ class ReleaseGrantIssuerTests(IssuerCase):
             token=self.tokens['oscar']).status)
         self.assertEqual(self.ids['oscar'], self.listed(self.tokens['oscar'])[self.agent_id]['release']['granted_by'])
         self.assertIn('release', self.release_caps())
+
+    def test_an_owner_of_another_project_is_not_a_valid_release_issuer_here(self):
+        beta = self.create_project(self.admin, 'Beta')
+        self.assertEqual(200, self.member('olive', 'owner', token=self.admin, project=beta).status)
+        self.demote_olive()
+        self.assertNotIn('release', self.release_caps())
 
     def test_a_record_with_no_readable_issuer_is_no_release_grant(self):
         self.service.state['release_grants'][self.project][self.agent_id]['granted_by'] = 'no-such-user'
