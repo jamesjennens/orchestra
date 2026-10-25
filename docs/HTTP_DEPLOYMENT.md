@@ -2244,9 +2244,37 @@ audit keeps events").
 `GET /v1/projects/{id}/agents` and `.../agents/{agent}` carry `coordinator` for each
 agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective,
 no_effect_because}`; the last is `null` while the grant has effect, else `agent-disabled`,
-`account-disabled` or `account-role`, and the page says which. A record of grants in the
-state file that is not an object answers `503` to a new grant, with a sentence and no
-write. The
+`account-disabled`, `account-role` or `issuer-role` (the person who gave it is no longer an
+owner here), and the page says which. `release` carries the same field and words. A record
+of grants in the state file that is not an object answers `503` to a new grant, with a
+sentence and no write.
+
+**A grant is rooted in the person who gave it (kittrial-5bb.410).** A coordinator grant or a
+release grant counts only while its issuer (`granted_by`) is an enabled account that is a
+superuser or an owner of the project. It is read live on every decision by the web service
+and again by the endpoint, on every coordinator route and for the requirement editor.
+Demoting, removing or disabling the issuer ends the grant at the next request; making the
+issuer an owner again restores the same record, because nothing is rewritten; an owner who
+gives the grant again replaces a record whose issuer no longer qualifies, but over a record
+whose issuer still qualifies it changes nothing: the old issuer stays on record. A record with
+no readable issuer is no grant.
+
+On upgrade, grants given by someone who is no longer an owner stop having effect. Before
+deploying, list them. The check is read-only (the state file is read as JSON and no store
+is opened, so it is safe beside a running service):
+`python3 http_service.py --state <STATE> --list-dormant-grants`
+Each item names the kind (`coordinator` or `release`), the project, the agent, the issuer
+and why (`issuer-missing`, `issuer-disabled` or `issuer-not-owner`). For each one an owner
+either gives the grant again or leaves it ended. An empty list means nothing changes.
+
+A superuser's agent and the requirement editor differ on purpose. `decide()` reads a
+superuser as an owner of every project, so a superuser's agent holding a grant reads every
+lane, and coordinates, in a project the superuser is not a member of. The requirement
+editor needs the project membership (kittrial-5bb.318 item 3) and refuses that agent
+exactly as it refuses the superuser's own session. `tests/test_grant_issuer.py` pins both
+answers; neither rule was widened.
+
+The
 project's settings page lists "Agents in this project" for an owner with a "Make
 coordinator" or "Remove grant" button on each row, and shows the server's sentence when a
 grant is refused. `GET /v1/agents/me/next` tells a granted agent of a contribution by
@@ -4033,8 +4061,10 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
 | `GET /v1/projects/{id}/capabilities`, `GET .../capabilities/find?q=...`, `GET .../capabilities/{key}` | `projects.read` | any member of the project, a superuser, a personal agent granted the project, or a worker credential for the project |
 | `POST /v1/projects/{id}/references`, `PATCH /v1/projects/{id}/references/{key}`, `POST .../references/{key}/revisions` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
 | `POST /v1/projects/{id}/capabilities`, `PATCH /v1/projects/{id}/capabilities/{key}`, `POST .../capabilities/{key}/revisions`, `POST .../capabilities/{key}/aliases` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
-| `POST /v1/projects/{id}/references/{key}/accept`, `POST .../references/{key}/retire` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project; never a contributor, viewer, ungranted agent or worker credential (`403`) |
-| `POST /v1/projects/{id}/capabilities/{key}/accept`, `POST .../capabilities/{key}/retire`, `POST .../capabilities/{key}/verify`, `POST .../capabilities/{key}/aliases/reject` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project; never a contributor, viewer, ungranted agent or worker credential (`403`) |
+| `POST /v1/projects/{id}/references/{key}/accept`, `POST .../references/{key}/retire` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project, and, for an agent's `accept`, only within a person owner's delegation named as `decision_id` (below); never a contributor, viewer, ungranted agent or worker credential (`403`) |
+| `POST /v1/projects/{id}/capabilities/{key}/accept`, `POST .../capabilities/{key}/retire`, `POST .../capabilities/{key}/verify`, `POST .../capabilities/{key}/aliases/reject` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project, and, for an agent's `accept` and `verify`, only within a person owner's delegation named as `decision_id` (below); never a contributor, viewer, ungranted agent or worker credential (`403`) |
+| `GET /v1/projects/{id}/delegations` | `projects.read` | any member: the delegations recorded in the project, in force or not, and which agents holding the coordinator grant they cover |
+| `POST /v1/projects/{id}/delegations` | `project.admin` | only a person `owner` of the project signed in to the web (its own session); never an agent or worker credential, a coordinator, or a superuser without the owner role (`403`) |
 
 - **A superuser without membership in the project is refused (`403`) on every write route.**
   `http_authority.decide()` has no separate superuser path for `coordinate` or `records`, and
@@ -4092,12 +4122,16 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
   `acceptor` on `accept` and `retire`; `proposer` and `verifier` on `verify`; `proposed_by` and
   `accepted_by` on `get` and `list`), along with `draft_authors` and `accepted_draft_authors`
   tracking every author who contributed a draft revision since the prior acceptance.
-- **A granted personal agent never accepts or verifies a draft written by its own party**,
-  whatever the server's `approval_by_another_party` setting says (`403`). Every draft author in
-  the unaccepted revision chain (`draft_authors` for acceptance, `accepted_draft_authors` for
-  verification) is checked against the caller's party. The party of a draft's author includes
-  the owning account (`usr_...`), every personal agent of that account (`agent_...`), and every
-  actor name held by a worker credential of that account in the project.
+- **A granted personal agent accepts or verifies a record only within a person owner's
+  delegation** (kittrial-5bb.407, below). Without one it is refused (`403`), whoever wrote the
+  draft. Within one, the agent-only own-party rule is lifted: the owner's delegation is the act
+  that permits an agent to accept what its owner or that owner's other agents and worker
+  credentials proposed. A delegation never lets an agent accept or verify a draft it wrote
+  itself, and never overrides the project's independence setting: with
+  `approval_by_another_party` or `independent_approval` on, a delegated agent faces exactly the
+  rule below that a person faces. The party of a draft's author still includes the owning
+  account (`usr_...`), every personal agent of that account (`agent_...`), and every actor name
+  held by a worker credential of that account in the project, and is still recorded.
 - **For a signed-in human coordinator or owner:**
   - When `approval_by_another_party` is **off** (the default), a human coordinator or owner may
     accept or verify a draft revision they (or one of their agents or worker credentials) wrote,
@@ -4107,6 +4141,55 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
     author in its unaccepted draft chain belongs to their own party (their account, one of their
     agents, or one of their worker credential actors). Another coordinator or owner of an
     independent party must accept or verify it.
+
+### Delegated record acceptance (kittrial-5bb.407)
+
+A person owner delegates **record acceptance** to the project's coordinator agents, for a stated
+scope and with a stated line of what must be escalated. An agent holding the project's
+`coordinator` grant then accepts (and verifies capabilities) only within a delegation in force,
+and names it as `decision_id` on the request. That same delegation lifts the agent-only
+own-party rule for it (its owner's and sibling agents' drafts), but never a draft the agent wrote
+itself and never the project's independence setting. Nothing changes for a person coordinator or owner, for contributors, viewers,
+ungranted agents or worker credentials, or for the host route.
+
+- **The record.** A delegation is a `Kind: delegation-v1` comment on a decision issue (type
+  `decision`, or labelled `decision`), plus a host journal entry at
+  `<project>/.delegations/<sha256>.json`. The prefix is reserved: a raw comment cannot write
+  one. A record without its journal entry (one planted where the prefix was not reserved, by an
+  older kit or by a lane with native access) grants nothing. The record carries `right`
+  (`record-acceptance`), `grantee` (an exact `agent_<16hex>`, or `coordinator-grant` for every
+  agent holding the grant), `scope` (`references`, `capabilities` or both), `escalate`, `reason`,
+  and the server-filled `recorded_by`, `via` (`session` or `operator`), `account` and `at`.
+- **Who records one.** Only a person `owner` of the project through their own signed-in web
+  session (`POST /v1/projects/{id}/delegations`, the Settings page's *Delegated decisions* panel),
+  or a listed operator on the host (`admin.py delegation-record --project P --actor OPERATOR
+  --file payload.json`, also reachable as the bound-key coordinator command `delegation-record`).
+  Not an agent, not a coordinator, not a superuser without the owner role. A grant may name an
+  existing decision issue (`decision`) or create one (`decision: null` and a `title`; the reason
+  becomes its description).
+- **Why not lines in an issue body.** A native issue's author is only the `--actor` label of
+  whoever wrote it, and over the host route that label is not bound for an unbound key and can
+  be any unused name for a bound one, so "written by the owner" cannot be read off an issue.
+- **Narrowing and revoking.** `action: narrow` names a strict subset of the scope in force;
+  `action: revoke` ends the delegation. Either takes effect on the next acceptance. A second
+  grant on the same decision is refused; record a new decision instead.
+- **Checked live at every acceptance**, under the write's lock, never cached: the decision exists
+  in this project and is a decision issue; its one honoured grant was recorded by someone who is
+  **still** a person owner of the project (or whose exact actor name is still on the operator
+  allowlist; another actor of the same principal does not count); it grants record
+  acceptance to this agent or to `coordinator-grant`; the agent's coordinator grant is still in
+  effect; its scope covers the record kind; it has not been revoked. Each refusal names its
+  reason. An agent's request that names no `decision_id` is refused before the endpoint is asked.
+- **Evidence.** The acceptance record's `decision_id` names the delegation, so every agent
+  acceptance records which person authorized it. (A capability verification record has a closed
+  field set and does not store it; the operation journal keeps the request.)
+- **Before a release with this rule.** An agent that accepted records without a delegation is
+  refused from this release on. Before deploying it, record a delegation for each project whose
+  coordinator agents accept records, and check with the read-only
+  `admin.py delegation-check --project P --state STATE.json`, which lists every agent holding the
+  project's coordinator grant and whether a delegation in force covers it (`uncovered`).
+- **Backups** carry `.delegations/` with the other host journals; a restore that dropped it would
+  void every delegation.
 
 ### `points_to` and `pointers_validation` on capability records
 

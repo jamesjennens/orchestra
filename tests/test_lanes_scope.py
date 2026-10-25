@@ -92,6 +92,14 @@ class PersonRoleTests(ScopeCase):
         # decide() treats a superuser as an owner of every project: one rule, so also here.
         self.assertAll(self.lanes(self.admin), 'project-role', 'owner')
 
+    def test_a_superuser_who_only_contributes_is_told_superuser_not_owner(self):
+        self.service.state['users'][self.ids['carl']]['superuser'] = True
+        self.assertAll(self.lanes(self.tokens['carl']), 'superuser')
+
+    def test_a_superuser_who_really_owns_the_project_is_told_the_role(self):
+        self.service.state['users'][self.ids['olive']]['superuser'] = True
+        self.assertAll(self.lanes(self.tokens['olive']), 'project-role', 'owner')
+
     def test_a_contributor_sees_only_their_own_lane(self):
         self.assertOwn(self.lanes(self.tokens['carl']), self.ids['carl'])
 
@@ -160,10 +168,10 @@ class PersonRoleTests(ScopeCase):
         self.assertTrue(first.data['next_cursor'])
         self.assertEqual(200, self.member('oscar', 'contributor', token=self.admin).status)
         again = self.lanes(self.tokens['oscar'], query='?limit=1&cursor=' + first.data['next_cursor'])
-        if again.status == 200:
-            self.assertEqual('own', again.data['scope'])
-            self.assertNotIn(self.ids['carl'], json.dumps(again.data['items']))
-            self.assertNotIn(self.ids['dave'], json.dumps(again.data['items']))
+        self.assertEqual(200, again.status, again.data)
+        self.assertEqual('own', again.data['scope'])
+        self.assertNotIn(self.ids['carl'], json.dumps(again.data['items']))
+        self.assertNotIn(self.ids['dave'], json.dumps(again.data['items']))
 
 
 class OperatorTests(ScopeCase):
@@ -271,21 +279,24 @@ class ParityTests(ScopeCase):
     def test_the_routes_rows_are_the_canonical_reads_rows_for_the_scope_it_chose(self):
         every = self.lanes(self.tokens['olive']).data
         self.assertEqual('all', every['scope'])
-        # display_name and waiting_on_name are route-only display fields
-        # (kittrial-5bb.416, http_service.py project_lanes): strip them before
-        # comparing, keeping every canonical field in the comparison.
+        # the route adds only display fields to the canonical rows: display_name
+        # and waiting_on_name (kittrial-5bb.416, http_service.py project_lanes) and
+        # the board's nudge field (kittrial-5bb.413). Strip them before comparing,
+        # keeping every canonical field in the comparison.
         route_rows = [{key: value for key, value in row.items()
-                       if key not in ('display_name', 'waiting_on_name')}
+                       if key not in ('display_name', 'waiting_on_name', 'nudge')}
                       for row in every['items']]
         for row in route_rows:
             for entry in row.get('held') or []:
                 entry.pop('waiting_on_name', None)
         self.assertEqual(self.rows('all')['items'], route_rows)
-        # ... and assert it is present on the route's rows: known accounts read
-        # as their display names, never as another name.
+        # ... and assert the 416 one is present on the route's rows: known accounts
+        # read as their display names, never as another name.
         names = {row['actor']: row.get('display_name') for row in every['items']}
         self.assertEqual('carl', names[self.ids['carl']])
         self.assertEqual('dave', names[self.ids['dave']])
+        # ... and the 413 one too: every row carries its nudge view.
+        self.assertTrue(all('nudge' in row for row in every['items']))
         self.assertEqual(self.both(), {row['actor'] for row in self.rows('all')['items']})
 
     def test_the_bound_key_endpoint_rule_stays_operator_only(self):

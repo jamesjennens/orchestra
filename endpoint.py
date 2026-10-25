@@ -944,7 +944,7 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: which a bound key is not told.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
-                      'task-file','room-decision')
+                      'task-file','room-decision','delegation')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -1032,7 +1032,7 @@ def key_principal_refusal(request,path,key_principal):
 #: deliberately absent (James's answer to question 5, 2026-10-07).
 COORDINATOR_COMMANDS=('guidance-set','guidance-clear','guidance-status','reference-apply',
                       'capability-apply','capability-verify','proposal-review','proposal-decide',
-                      'handoff','set-onboarding','followon','fault-clear')
+                      'handoff','set-onboarding','followon','fault-clear','delegation-record')
 #: The coordinator commands that only read (no journal, no server time; the read takes the
 #: project's coordination lock, exactly as the host command does).
 COORDINATOR_READS=('guidance-status',)
@@ -1257,7 +1257,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision','delegation'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -1637,7 +1637,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             def __init__(self,status,message):
                 super().__init__(message)
                 self.status=status
-        def _records_http_context(coordinator,warnings):
+        def _records_http_context(coordinator,warnings,run=None,kind=None):
             if not (authority_config is not None and require_authority):
                 return None,None,None
             from http_authority import actor_parties,CAP_COORDINATE,CAP_RECORDS,read_state
@@ -1658,14 +1658,51 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 elif role not in ('contributor','coordinator','owner'):
                     raise RecordsRefusal(403,'Record mutations require project membership; '
                                              'a superuser without project membership must add themselves to the project first.')
-            def party_check(proposer):
+            checked={}
+            def delegation_check(state,decision_id):
+                # kittrial-5bb.407: every acceptance or verification by an AGENT needs a live,
+                # person-rooted delegation of record acceptance (delegations.check_acceptance);
+                # that same delegation is what lifts the own-party refusal below. It is read
+                # under this write's lock and never cached beyond this one request.
+                if decision_id in checked:
+                    return
+                if not isinstance(decision_id,str) or not decision_id or run is None or kind is None:
+                    raise RecordsRefusal(403,'An agent accepts or verifies a record only within a delegation: name the '
+                                             'delegation decision as decision_id. Nothing was written.')
+                import delegations
+                from sessions import owners as session_owners
+                try:owned=session_owners(path)
+                except (OSError,ValueError):owned=None
+                agent=actor.split('/',1)[0] if isinstance(actor,str) else actor
+                try:
+                    delegations.check_acceptance(delegations.read_issue(run,decision_id),project=name,state=state,
+                                                 journal=path,agent=agent,kind=kind,
+                                                 operators=configured_operators(root),owners=owned)
+                except delegations.DelegationRefusal as error:
+                    raise RecordsRefusal(error.status,'%s. Nothing was written.'%error) from None
+                checked[decision_id]=True
+            def party_check(proposer,decision_id=None):
                 state=read_state(authority_config.store)
                 by_agent=authority.get('via')=='credential'
                 settings_seen=state.get('settings_seen') if isinstance(state.get('settings_seen'),dict) else {}
                 approval_by_another=bool(settings_seen.get('approval_by_another_party')
                                          or authority.get('approval_by_another_party')
                                          or rules.get('independent_approval'))
-                if not by_agent and not approval_by_another:
+                if by_agent:
+                    # kittrial-5bb.407 (review r1, item b1): a delegation lifts ONLY the agent-only
+                    # own-party refusal - an agent accepting a draft its owner or a sibling agent
+                    # proposed. It never lets an agent accept a draft it wrote itself, and where
+                    # the project requires approval by another party (approval_by_another_party or
+                    # independent_approval) the agent faces exactly the rule a person faces below.
+                    delegation_check(state,decision_id)
+                    if not isinstance(proposer,str) or not proposer:
+                        raise RecordsRefusal(403,'This draft has no recorded proposer, so no delegation can admit it.')
+                    if proposer.split('/',1)[0]==(actor.split('/',1)[0] if isinstance(actor,str) else actor):
+                        raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
+                                                 'whatever its delegation says.')
+                    if not approval_by_another:
+                        return
+                elif not approval_by_another:
                     return
                 caller_parties=set(actor_parties(state,actor,name))
                 if user_id:caller_parties.add(user_id)
@@ -1681,7 +1718,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         or bool(caller_parties & proposer_parties) or same_session_owner):
                     if by_agent:
                         raise RecordsRefusal(403,'An agent holding a coordinator grant may not accept or verify a record '
-                                                 'whose draft was proposed by its own party.')
+                                                 'whose draft was proposed by its own party while this project requires '
+                                                 'approval by another party; a delegation does not lift that.')
                     raise RecordsRefusal(403,'A coordinator may not accept or verify a record whose draft was proposed '
                                              'by the same party while approval_by_another_party is enabled.')
             return identity_check,(party_check if coordinator else None),user_id
@@ -1727,7 +1765,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             elif looked_up is not None:counted(looked_up,True)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         coordinator=args[0] in reference_records.HTTP_WRITE_COMMANDS
-        identity_check,party_check,_=_records_http_context(coordinator,run_warnings)
+        identity_check,party_check,_=_records_http_context(coordinator,run_warnings,run,'references')
         payload=reference_records.write_payload(args,request.get('attachments',{}),commands=writes)
         runner=NativeRunner(run, project=path)
         def ref_effect():
@@ -1748,9 +1786,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     if action=='capability':
         # The capability index (.60 slices 1a and 1b, kittrial-5bb.67/.69). get, list, find
         # and help are reads (one label-filtered bd list plus bd show; no lock, not
-        # run_guarded); misses is a read of the lookup-miss log (capability_misses, kittrial-
+        # run_guarded); validate is the same read-only preflight as propose, without a lock
+        # or journal; misses is a read of the lookup-miss log (capability_misses, kittrial-
         # 5bb.77), which find feeds; propose, revise, propose-alias and verify are writes,
-        # under the lock and the journal. lookup, resolve, index and check run in the client.
+        # under the lock and the journal. lookup, resolve, index, check and validate's
+        # repository-pointer stage run in the client.
         # A verification written here is always `unverified`; the deployment verifiers list
         # only decides how host-written (`admin.py capability-verify`) records are read.
         import capability_records
@@ -1764,6 +1804,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         by_service=authority_config is not None and require_authority
         writes=capability_records.WRITE_COMMANDS+(capability_records.HTTP_WRITE_COMMANDS if by_service else ())
         if not args or args[0] not in writes:
+            if args[:1]==['validate'] and not any(token in ('--help','-h') for token in args):
+                result=capability_records.validate(args,request.get('attachments',{}),run,configured_operators(root))
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                        'stderr':''.join(run_warnings)}
             if args[:1]==['misses'] and not any(token in ('--help','-h') for token in args):
                 # The lookup-miss log (kittrial-5bb.77): read-only, no lock, not run_guarded.
                 # It reads the telemetry file, and the records once (only when the log holds
@@ -1786,7 +1830,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 except Exception:pass
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         coordinator=args[0] in capability_records.HTTP_WRITE_COMMANDS
-        identity_check,party_check,user_id=_records_http_context(coordinator,run_warnings)
+        identity_check,party_check,user_id=_records_http_context(coordinator,run_warnings,run,'capabilities')
         operators=configured_operators(root)
         runner=NativeRunner(run, project=path)
         def capability_effect():
@@ -1996,6 +2040,19 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 # record and its host journal entry under this lock.
                 import fault_clear
                 result=fault_clear.apply(payload,actor,runner,path,operators=operators)
+            elif command=='delegation-record':
+                # A listed operator's delegation of a decision right (kittrial-5bb.407).
+                # coordinator_refusal has already required a configured operator behind a
+                # bound key, so the actor is the server's fact; the SAME library call as the
+                # web route and `admin.py delegation-record` writes the record and its host
+                # journal entry under this lock.
+                import delegations
+                from http_authority import server_time as now_stamp
+                try:
+                    result=delegations.apply(payload,project=name,journal=path,run=runner,recorded_by=actor,
+                                             via='operator',account=None,at=now_stamp())
+                except delegations.DelegationRefusal as error:
+                    raise ValueError(str(error)) from None
             elif command=='reference-apply':
                 import reference_records
                 if isinstance(payload,dict) and 'items' in payload:
@@ -2372,7 +2429,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     raise web_release.ReleaseError(503,'The installation operator list cannot be read, so the '
                                                         'host revert and hold set is unavailable: '+str(error)[:160])
                 if operation=='query':
-                    result=lifecycle.release_query(payload,actor,runner,operators=operators,journal=path)
+                    from lifecycle_audit import read_operator_history
+                    operator_history=read_operator_history(root,operators)
+                    result=lifecycle.release_query(payload,actor,runner,operators=operators,journal=path,
+                                                   operator_history=operator_history)
                 else:
                     rules=configured_coordinator_rules(root,warnings=run_warnings)
                     rows=lifecycle.read_event_rows(runner)
@@ -2491,6 +2551,105 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     'merge_slot_status':409,'refused':'coordinator-rule'}
         except SlotError as error:
             return {'returncode':2,'stdout':'','stderr':str(error)+'\n','merge_slot_status':error.status}
+    if action=='delegation':
+        # Delegated decision rights (kittrial-5bb.407). `list` is a read for any member;
+        # `grant`, `narrow` and `revoke` are written ONLY for a person owner's own web session
+        # (never an agent or worker credential, never a superuser without the owner role),
+        # checked live inside the guarded write, and then by the SAME library call as the
+        # operator's `coordinator delegation-record` and `admin.py delegation-record`.
+        import delegations
+        from http_authority import CAP_PROJECT_ADMIN, CAP_READ, read_state, server_time
+        args=request.get('args',[])
+        run_warnings=[]
+        def delegation_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(delegation_run, project=path)
+        def refused(error):
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','delegation_status':error.status}
+        if not isinstance(args,list) or not args or args[0] not in ('list','grant','narrow','revoke'):
+            return refused(delegations.DelegationRefusal(422,'Use delegation list, or grant|narrow|revoke with one JSON '
+                                                              'payload. Nothing was written.'))
+        operation=args[0]
+        from sessions import owners as session_owners
+        def owned():
+            try:return session_owners(path)
+            except (OSError,ValueError):return None
+        if operation=='list':
+            if len(args)!=1:
+                return refused(delegations.DelegationRefusal(422,'delegation list takes no payload'))
+            if not verified_web_authority(request,authority_config,CAP_READ,name):
+                return refused(delegations.DelegationRefusal(403,'Verified read authority required in this project'))
+            state=read_state(authority_config.store)
+            listed=record_json.loads_array_rows(delegation_run(['list','--label',delegations.LABEL,'--all',
+                                                                '--limit','0','--json']) or '[]')
+            ids=[str(row['id']) for row in listed if isinstance(row,dict) and row.get('id')][:200]
+            shown=record_json.loads_array_rows(delegation_run(['show',*ids,'--json','--include-comments']) or '[]') if ids else []
+            items=delegations.listing(shown,name,state,path,configured_operators(root),owned())
+            agents=delegations.coverage(state,name,items)
+            # Display names only for the accounts and agents this answer names (members already
+            # read them on the coordination panel); never a wider directory.
+            named={agent['agent'] for agent in agents}
+            for item in items:
+                if item['delegation']:
+                    named.update(x for x in (item['delegation'].get('grantee'),item['delegation'].get('account')) if x)
+            names={}
+            for ident in sorted(named):
+                record=((state.get('agents') or {}).get(ident) or (state.get('users') or {}).get(ident)) \
+                    if isinstance(ident,str) else None
+                label=(record.get('name') or record.get('display_name')) if isinstance(record,dict) else None
+                if isinstance(label,str) and label:names[ident]=label
+            result={'schema_version':1,'project':name,'items':items,'granted_agents':agents,'names':names,
+                    'listed':len(ids),'omitted':max(0,len(listed)-len(ids))}
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
+        try:
+            if len(args)!=2:
+                raise delegations.DelegationRefusal(422,'delegation %s takes one JSON payload'%operation)
+            try:
+                payload=record_json.loads(args[1])
+                delegations.validate_request(payload)
+            except delegations.DelegationRefusal:
+                raise
+            except ValueError as error:
+                raise delegations.DelegationRefusal(422,'%s. Nothing was written.'%error) from None
+            if payload['action']!=operation:
+                raise delegations.DelegationRefusal(422,'The payload action differs from the operation. Nothing was written.')
+            if not request.get('operation_id') or payload['operation_id']!=request['operation_id']:
+                raise delegations.DelegationRefusal(422,'A delegation needs the same stable operation identity in its '
+                                                        'envelope and body. Nothing was written.')
+        except delegations.DelegationRefusal as error:
+            return refused(error)
+        authority=request.get('authority') if isinstance(request.get('authority'),dict) else {}
+        def delegation_authority():
+            if not verified_web_authority(request,authority_config,CAP_PROJECT_ADMIN,name):
+                raise delegations.DelegationRefusal(403,'Only a person owner of this project records a delegation. '
+                                                        'Nothing was written.')
+            user_id=authority.get('user_id')
+            if authority.get('via')!='session' or not isinstance(user_id,str) or actor!=user_id \
+                    or not delegations.ACCOUNT.fullmatch(user_id):
+                raise delegations.DelegationRefusal(403,'A delegation is recorded by a person owner signed in to the web; '
+                                                        'an agent or worker credential cannot record one. Nothing was written.')
+            state=read_state(authority_config.store)
+            if ((state.get('memberships') or {}).get(name) or {}).get(user_id)!='owner':
+                raise delegations.DelegationRefusal(403,'Only a person owner of this project records a delegation; a '
+                                                        'superuser without the owner role adds themselves as owner first. '
+                                                        'Nothing was written.')
+        def delegation_effect():
+            try:
+                result=delegations.apply(payload,project=name,journal=path,run=runner,recorded_by=actor,
+                                         via='session',account=actor,at=server_time())
+            except delegations.DelegationRefusal as error:
+                return refused(error)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
+                    'stderr':warning_text(run_warnings)}
+        with held_coordination_lock(path):
+            try:
+                return guarded_write(root,request,journal_path(path),delegation_effect,
+                                     authority_config=authority_config,require_authority=True,
+                                     runner=runner,identity_check=delegation_authority)
+            except delegations.DelegationRefusal as error:
+                return refused(error)
     if action=='assignee-followon':
         # The web route's recorded hand-back (kittrial-5bb.343). It runs through the same
         # live-authority boundary every canonical web write uses, and then calls the SAME
@@ -2610,11 +2769,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             run_warnings.append('deployment operators unreadable, so operator voids are not applied: '
                                +str(error)[:160])
         def lifecycle_effect():
-            if action=='lifecycle':result=apply_native(payload,actor,runner,
-                                                       operators=configured_operators(root),journal=path,
-                                                       lifecycle_authors=rules['lifecycle_authors'],
-                                                       independent_approval=rules['independent_approval'],
-                                                       owners=owner_loader(path,'lifecycle_authors'))
+            if action=='lifecycle':
+                lifecycle_operators=configured_operators(root)
+                diagnostic_context={}
+                if isinstance(payload,dict) and payload.get('dimension')=='release-query':
+                    from lifecycle_audit import read_operator_history
+                    diagnostic_context['operator_history']=read_operator_history(root,lifecycle_operators)
+                result=apply_native(payload,actor,runner,
+                                    operators=lifecycle_operators,journal=path,
+                                    lifecycle_authors=rules['lifecycle_authors'],
+                                    independent_approval=rules['independent_approval'],
+                                    owners=owner_loader(path,'lifecycle_authors'),**diagnostic_context)
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
                 result=coordinate(payload,actor,runner,path,operators=coordinate_operators,
@@ -2865,7 +3030,7 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
-    ('capability ...', 'capability records: find, get, list, propose, revise, verify'),
+    ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),
     ('refresh', 'refresh the cached export the reads are answered from'),

@@ -437,6 +437,13 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual(self.execute(['find', 'reserved label guard'])['candidates'][0]['key'],
                          'review.structured-contribution')
         self.assertEqual(self.execute(['find', '--help'])['action'], 'capability')
+        validation_payload = dict(payload, operation_id='validate-1', key='review.validation')
+        receipts_before = {path.name: path.read_bytes() for path in (self.project / '.capability-requests').glob('*.json')}
+        validated = self.execute(['validate', '@attachment:0'], {
+            '0': {'flag': '--file', 'text': json.dumps(validation_payload)}})
+        self.assertTrue(validated['valid'])
+        self.assertEqual(receipts_before, {path.name: path.read_bytes()
+                                          for path in (self.project / '.capability-requests').glob('*.json')})
         # No read takes the coordination lock (a file object here) or writes a journal row.
         # The one flock a find may make is the lookup-miss log's own (kittrial-5bb.77): a
         # descriptor of .capability-misses.lock, never blocking, where the platform has flock.

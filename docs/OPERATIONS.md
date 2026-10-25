@@ -16,6 +16,88 @@ operator relationship is shown separately from approval at recording time;
 historical principal ownership cannot be proved by today's registry. Questionable
 evidence is for operator review, not a finding of fraud. Reads create no store.
 
+### D2 audit and release diagnostics
+
+Keep audit reports and their frozen native/protected evidence on the host, outside
+the source repository. The report is untrusted, advisory data for operator review.
+It records no correction, lifecycle fact, assignment or approval.
+
+A complete kit retry pair appears in `kit_intermediates`: the exact retry reason,
+same task/dimension/author, consecutive unique native child orders and a canonical
+following payload are required. Existing previous-value evidence must agree.
+Second-resolution timestamps may be equal when those native child IDs prove the
+order; missing/duplicate orders and reversed or unusable times stay unknown.
+Only the intermediate leaves revised questionable/unclassifiable totals. The
+following fact retains its own recorder, approval and correction assessment.
+Unpaired retry candidates remain explicit unknown evidence. Ordinary non-lifecycle
+native events have a separate stream. `original_counts` preserves the old audit's
+raw-row counts; revised totals and overlapping reason/cause counts deduplicate
+native event IDs. Raw page items can repeat an ambiguous native ID: reconcile
+revised totals using ID unions, rather than adding overlapping categories or pages.
+
+Only this host audit adapter reads native version history. It uses read-only
+`bd history ID --json --limit N` for parent tasks and their lifecycle event IDs.
+The history enrichment budget is 24 native calls, 128 versions per issue plus one
+truncation sentinel, 1,024 returned versions across the audit, 1 MiB stdout per
+call, 4 MiB charged stdout across the audit, and ten seconds across history reads;
+each call receives at most three seconds or the remaining deadline. The existing
+bounded native runner stops overlarge output and times out the native process;
+its bounded pipe/cleanup overhead is additional. The existing export and audit
+analysis are outside this history-read deadline. `historical_read_coverage`
+reports the limits, calls, returned versions, received/charged bytes, elapsed time,
+unread ID count and stop reason. A failed byte-cap read is charged its byte allowance.
+
+A native version proves the assignee field at that commit. The audit joins the
+parent's exact commit to the lifecycle event's first native creation commit,
+checks both current heads and unchanged event bytes, and reports that commit as
+its basis. It never interpolates a holder between versions. Missing/truncated,
+damaged, tied, mismatched or gapped history remains `unknown`; a backdated/imported
+creation outside native one-second timestamp rounding is unproved. Today's holder
+stays separate. The committer is the service identity, never who assigned.
+`assigned_by` additionally needs a unique validated assignment notice connected
+to the actual native holder and a matching native holder transition with strict
+time ordering. Even that is attributed evidence, not authenticated historical
+principal ownership. An exported JSON field cannot supply host history context.
+
+Every event, correction, pair, unpaired retry, ordinary/unknown native row and
+unreadable-chain stream shares `limit`/`offset`; follow `next_offset` until null.
+Each stream reports totals and omissions. Retain the snapshot and all pages with
+their history coverage. A cap is unknown evidence, not an empty clean category;
+concurrent native edits can cause a head mismatch and require a fresh audit.
+
+Release selection, query and CLI dry-run reports can include bounded
+`review_void_diagnostics` for an individually validated, currently ineligible
+review VOID that changes the hold result, including a failed attestation or repair
+fork as well as a hold/release. They name exact task/target/VOID IDs, the target
+operation, nullable hold/release IDs, issuer,
+current result/reason and an explanatory counterfactual. At most 50 are shown,
+with total/omitted counts. The host release-query adapters reuse the existing
+runtime authority-audit reader, capped at 256 KiB and 200 entries, to supply typed
+optional evidence. Only a retained baseline/ordered trail that agrees with the
+current list and covers the VOID time proves prior eligibility. A proved prior
+operator absent now gets `currently-ineligible-review-void`; a proved ineligible
+issuer at that point is omitted, without claiming lifetime history. Missing,
+unreadable, damaged, symlinked, capped, mismatched or temporally ambiguous evidence
+instead yields `review-void-eligibility-unknown` and explicit unknown eligibility.
+Local reads without that context also stay unknown; payload claims and today's
+list never prove past membership. No audit file is created by the read.
+A canonical review VOID repairs malformed/forked history; it cannot remove a
+protected linked hold. Removing its issuer can therefore make the current chain
+unreadable: that result remains unreadable and the existing release refusal
+still applies. A counterfactual is never used for target selection, reverts,
+attestations, gates or writes. Irrelevant, damaged or protected VOIDs do not gain
+this diagnostic. These paths never load native assignment history.
+The web release-query route returns these issuer identities and reasons only to
+callers with the project's coordinator capability. Diagnostics add review
+projection and counterfactual computation to the existing read; R1 reviewer fixtures
+showed roughly twice the reader cost. Tasks with no potentially inactive VOID
+comment now skip the extra projections; candidate tasks still pay that cost.
+The output cap is not a candidate-processing
+cap. Computing them only on request would require a separately agreed request
+flag; this revision preserves the current additive route response.
+
+### Host corrections
+
 The host-only writer is OFF on a new installation and stays OFF on upgrade unless
 an operator explicitly changes it. First install this reader, backup and restore
 support on **every installation that may hold or restore the project**. Then a
@@ -376,6 +458,45 @@ backup** first and restore that copy — the hand-backs are then absent (inert),
 not silently half-applied. Before rolling back, take and retain a complete
 backup with this kit; after rolling forward, restore that sidecar or re-record
 the hand-backs.
+
+### Delegations: before the release, restore and rollback
+
+From kittrial-5bb.407 an agent holding a project's coordinator grant accepts or verifies
+a reference or capability record **only within a person owner's delegation**
+(docs/HTTP_DEPLOYMENT.md, "Delegated record acceptance"). An agent that accepted records
+without one is refused once this release is deployed.
+
+**Before deploying it**, record a delegation for each project whose coordinator agents
+accept records: the owner on the Settings page (*Delegated decisions*), or an operator
+on the host:
+
+```sh
+python3 admin.py --root /path/to/root delegation-record --project PROJECT --actor OPERATOR --file payload.json
+```
+
+Then check, read-only, that every agent holding the grant is covered:
+
+```sh
+python3 admin.py --root /path/to/root delegation-check --project PROJECT --state /path/to/web-state.json
+```
+
+`uncovered` lists the agents still without one.
+
+**A narrowing or revocation that did not finish is not in force.** Each grant, narrowing and
+revocation is a comment plus its host journal entry, and only the pair counts. If the journal
+write fails after the comment (a full disk, a permission change), the answer is an error or an
+unknown outcome, and that narrowing or revocation does **not** apply: the delegation stays as it
+was. Retry it (the same request on the web, or `delegation-record` again) until it succeeds, and
+confirm with `delegation-check` or the Settings page that the delegation reads as intended.
+
+**Backups.** `admin.py backup` collects `<project>/.delegations/` with the coordination
+sidecar and `restore-new` validates and restores it. A delegation is honoured only with
+its journal entry, so a restore without it voids every delegation (the comments stay,
+inert). **An older kit refuses to restore a backup that holds `.delegations/`**, exactly as
+for `.assignee-followons/` above: restore with this kit or a newer one, or remove
+`.delegations/` from a COPY of the backup. **Rolling back** to a kit before this release
+removes the delegation rule altogether: agents accept as they did before (the own-party
+refusal still holds), and the delegation records read as ordinary comments.
 
 ### The claiming setting: restore and rollback
 
@@ -3234,7 +3355,7 @@ such a file by hand is equally safe: it is a temporary, never a record.
 | --- | --- |
 | `.lifecycle-voids` (`lifecycle_voids.read_journal`) | Enumerates every name and skips both the fixed `.tmp` and anything `is_temporary` recognizes, so a leftover is ignored and the family stays readable. |
 | `.web-lifecycle-marks` (`web_lifecycle_marks.read_journal`) | Enumerates every name and requires `[a-f0-9]{64}\.json`; ANY other name, a temporary included, makes the whole family read `invalid` (fail-closed). Its writer uses the private `mode=` form, so the unique shape this sweep removes is not produced there; the fixed `<name>.tmp` a cut there can leave is not a shape this sweep removes. |
-| `.coordination-requests`, `.handoffs`, `.handoff-requests`, `.handoff-recoveries`, `.requirement-requests`, `.requirement-backfills`, `.integration-reverts`, `.assignee-followons`, `.reference-requests`, `.proposal-requests`, `.capability-requests`, `.open-item-requests`, `.requirement-owner-requests`, `.owner-answers` | Read by one exact path, or listed through `*.json` (a temporary ends in hex, so `*.json` never matches it): a leftover is invisible to every one of them, including `admin.py backup`. |
+| `.coordination-requests`, `.handoffs`, `.handoff-requests`, `.handoff-recoveries`, `.requirement-requests`, `.requirement-backfills`, `.integration-reverts`, `.assignee-followons`, `.reference-requests`, `.proposal-requests`, `.capability-requests`, `.open-item-requests`, `.requirement-owner-requests`, `.owner-answers`, `.delegations` | Read by one exact path, or listed through `*.json` (a temporary ends in hex, so `*.json` never matches it): a leftover is invisible to every one of them, including `admin.py backup`. |
 | `.history-snapshots` (`briefing.py`) | Read by the exact `<digest>.json` a cursor names; never enumerated. |
 
 ## Repeat validation

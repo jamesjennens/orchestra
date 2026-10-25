@@ -49,12 +49,13 @@ import unicodedata
 from pathlib import Path
 
 import claim_limit
+import nudges
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS, CAP_APPROVE,
                             CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
                             CAP_ROOMS_POST,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_RECORDS,
                             CAP_REVIEWS, CAP_TASKS,
-                            CAP_COORDINATE, CAP_RELEASE, coordinator_grant, release_grant,
+                            CAP_COORDINATE, CAP_RELEASE, coordinator_grant, release_grant, grant_issuer_holds,
                             GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
@@ -3311,9 +3312,12 @@ class Service:
         for project_id in sorted(self.state.get('memberships', {})):
             if owner_id not in self.state['memberships'].get(project_id, {}):
                 continue
-            if coordinator_grant(self.state, project_id, agent['id']) is None:
+            grant = coordinator_grant(self.state, project_id, agent['id'])
+            if grant is None:
                 continue
-            found.append({'project': project_id, 'effective': self._may_coordinate(project_id, agent)})
+            found.append({'project': project_id,
+                          'effective': self._may_coordinate(project_id, agent)
+                          and grant_issuer_holds(self.state, project_id, grant)})
         return found
 
     def project_agent_view(self, agent, project_id=None):
@@ -3354,11 +3358,14 @@ class Service:
         grant = coordinator_grant(self.state, project_id, agent['id'])
         if grant is None:
             return None
-        effective = self._may_coordinate(project_id, agent)
+        account = self._may_coordinate(project_id, agent)
+        issuer = grant_issuer_holds(self.state, project_id, grant)
+        effective = account and issuer
         owner = self.state['users'].get(agent.get('owner')) or {}
         # Why a grant on record has no effect now; null when it has. One word, for the page.
         why = None if effective else ('agent-disabled' if not agent.get('enabled') else
-                                      'account-disabled' if owner.get('disabled') else 'account-role')
+                                      'account-disabled' if owner.get('disabled') else
+                                      'account-role' if not account else 'issuer-role')
         return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
                 'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
 
@@ -3372,10 +3379,13 @@ class Service:
         grant = release_grant(self.state, project_id, agent['id'])
         if grant is None:
             return None
-        effective = self._may_release(project_id, agent)
+        account = self._may_release(project_id, agent)
+        issuer = grant_issuer_holds(self.state, project_id, grant)
+        effective = account and issuer
         owner = self.state['users'].get(agent.get('owner')) or {}
         why = None if effective else ('agent-disabled' if not agent.get('enabled') else
-                                      'account-disabled' if owner.get('disabled') else 'account-role')
+                                      'account-disabled' if owner.get('disabled') else
+                                      'account-role' if not account else 'issuer-role')
         return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
                 'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
 
@@ -3418,7 +3428,8 @@ class Service:
                 if project_id not in (agent.get('projects') or []):
                     continue
                 grant = coordinator_grant(self.state, project_id, agent['id'])
-                if grant is None or not self._may_coordinate(project_id, agent):
+                if grant is None or not self._may_coordinate(project_id, agent) \
+                        or not grant_issuer_holds(self.state, project_id, grant):
                     continue
                 agents.append({'name': agent['name'], 'owner_display_name': self._owner_name(agent['owner']),
                                'granted_by_display_name': self._owner_name(grant['granted_by']),
@@ -3465,7 +3476,9 @@ class Service:
                                 'The record of coordinator grants in the service state is damaged (it is not an object), '
                                 'so no grant was written. An operator must repair the state file')
             grants = self.state.setdefault('coordinator_grants', {}).setdefault(project_id, {})
-            if coordinator_grant(self.state, project_id, agent_id) is None:
+            held = coordinator_grant(self.state, project_id, agent_id)
+            # A record whose issuer no longer qualifies is dormant: a current issuer gives it afresh.
+            if held is None or not grant_issuer_holds(self.state, project_id, held):
                 grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
                 self.store.save()
             return self.project_agent_view(agent, project_id)
@@ -3519,6 +3532,102 @@ class Service:
             self.store.save()
             return self.project_agent_view(agent, project_id)
 
+    # -- lane nudges (kittrial-5bb.413; docs/design/LANE_NUDGE_DESIGN.md, kittrial-5bb.409) -------
+    NUDGES_DAMAGED = ('The record of lane nudges in the service state is damaged (it is not an object of lists), '
+                      'so no nudge was written. An operator must repair the state file')
+
+    def _nudge_records(self, project_id, create=False):
+        """The project's ``lane-nudge-v1`` list, newest last. The caller holds ``store.lock``.
+
+        An ABSENT key is every installation before its first nudge; one that is there with anything
+        but an object of lists is damage, refused as the coordinator grants are (kittrial-5bb.261).
+        """
+        stored = self.state.get('nudges')
+        if 'nudges' in self.state and (not isinstance(stored, dict)
+                                       or not isinstance(stored.get(project_id, []), list)):
+            raise HttpError(503, 'unavailable', self.NUDGES_DAMAGED)
+        if create:
+            return self.state.setdefault('nudges', {}).setdefault(project_id, [])
+        return (stored or {}).get(project_id) or []
+
+    def request_nudge(self, principal, project_id, fields, row, request_id=None):
+        """Write one nudge request, or answer the open one; ``(public, stored)`` for ``_mutate``.
+
+        Runs inside the route's mutation, after ``coordinate`` was checked live in this project
+        (a person with the role, or an agent whose coordinator grant is effective and whose issuer
+        still qualifies, kittrial-5bb.410). ``row`` is the lane's row on the board, read by the
+        route from the project's own lanes. Order: an agent never nudges its own account's lane; an
+        open request for the same lane and message is answered as it is (written and audited once);
+        a declared wait needs ``acknowledge_declared_wait``; then the rate limits; then the record
+        and one audit event. A refusal writes no record.
+        """
+        now = self._now()
+        lane = fields['lane']
+        kind = 'agent' if principal.agent_id else 'person'
+        if kind == 'agent':
+            mine = set(full_actor_parties(self.state, principal.actor, project_id)) | {principal.user_id}
+            theirs = set(full_actor_parties(self.state, lane, project_id))
+            if lane == principal.actor or (mine & theirs) - {None}:
+                raise forbidden(nudges.OWN_PARTY)
+        records = self._nudge_records(project_id)
+        nudges.settle(records, now, now_iso)
+        existing = nudges.pending_for(records, lane, fields['message'], now)
+        if existing is not None:
+            return self._nudge_answer(existing, True, now)
+        snapshot = nudges.declared_wait(row)
+        if snapshot is not None and not fields['acknowledge_declared_wait']:
+            raise conflict(nudges.waiting_sentence(snapshot))
+        wait = nudges.retry_after(records, lane, kind, principal.agent_id, now)
+        if wait:
+            error = throttled(nudges.RATE_LIMITED % wait)
+            error.retry_after = wait
+            raise error
+        record = nudges.new_record(project_id, fields,
+                                   {'kind': kind, 'user_id': principal.user_id, 'agent_id': principal.agent_id},
+                                   snapshot, now, now_iso)
+        records = self._nudge_records(project_id, create=True)
+        records.append(record)
+        nudges.settle(records, now, now_iso)
+        # The audit keeps the closed words and the note, cut where every audit reason is (200).
+        self.audit(request_id, principal, 'lanes.nudge.request', 'committed', project_id=project_id,
+                   actor=lane, reason=' '.join(part for part in (fields['message'], fields['reason'], fields['note']) if part))
+        return self._nudge_answer(record, False, now)
+
+    def _nudge_answer(self, record, coalesced, now):
+        answer = {'nudge': nudges.view(nudges.effective(record, now, now_iso), self.state['users'],
+                                       self.state['agents']), 'coalesced': coalesced}
+        return answer, dict(answer)
+
+    def nudge_list(self, project_id, lane=None, limit=20):
+        """The project's newest nudge requests, newest first, as the board shows them (no note)."""
+        now = self._now()
+        with self.store.lock:
+            records = [record for record in self._nudge_records(project_id) if isinstance(record, dict)]
+            if lane is not None:
+                records = [record for record in records if record.get('lane') == lane]
+            shown = [nudges.view(nudges.effective(record, now, now_iso), self.state['users'], self.state['agents'])
+                     for record in reversed(records[-limit:])]
+        return {'items': shown, 'total': len(records), 'truncated': len(records) > limit}
+
+    def nudge_views(self, project_id, lanes):
+        """The newest nudge of each named lane in this project, for the lanes rows; never raises.
+
+        A damaged record reads as no nudge: the board must not fail because of it.
+        """
+        wanted = set(lanes)
+        now = self._now()
+        found = {}
+        with self.store.lock:
+            try:
+                records = self._nudge_records(project_id)
+            except HttpError:
+                return {}
+            for record in reversed(records):
+                if isinstance(record, dict) and record.get('lane') in wanted and record['lane'] not in found:
+                    found[record['lane']] = nudges.row_view(nudges.view(
+                        nudges.effective(record, now, now_iso), self.state['users'], self.state['agents']))
+        return found
+
     NOT_A_RELEASE_OWNER = ('This agent\'s account is not an owner of this project, so a release grant would '
                            'have no effect. Make the account an owner first (Members), then grant the agent.')
 
@@ -3552,7 +3661,8 @@ class Service:
                                 'The record of release grants in the service state is damaged (it is not an object), '
                                 'so no grant was written. An operator must repair the state file')
             grants = self.state.setdefault('release_grants', {}).setdefault(project_id, {})
-            if release_grant(self.state, project_id, agent_id) is None:
+            held = release_grant(self.state, project_id, agent_id)
+            if held is None or not grant_issuer_holds(self.state, project_id, held):
                 grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
                 self.store.save()
             return self.project_agent_view(agent, project_id)

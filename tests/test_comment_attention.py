@@ -212,7 +212,7 @@ class CommentAttentionTests(unittest.TestCase):
     def test_host_operator_principal_and_effective_agent_grant(self):
         self.assertTrue(briefing.comment_author_allowed('ops-session', ['ops'],
                        {'ops': 'person:ops', 'ops-session': 'person:ops'}))
-        state = dict(users={'human': {}}, memberships={'p': {'human': 'coordinator'}},
+        state = dict(users={'human': {}}, memberships={'p': {'human': 'owner'}},
                      agents={'helper': dict(owner='human', enabled=True, projects=['p'])},
                      coordinator_grants={'p': {'helper': {'granted_by': 'human', 'granted_at': 'now'}}})
         allowed = lambda: briefing.comment_author_allowed('helper', operators=(), authority=state, project='p')

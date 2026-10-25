@@ -5,6 +5,7 @@ import { setupHint } from './setup.js';
 import { mergeSlotPanel } from './merge_slot.js';
 import { guidancePanel } from './guidance.js';
 import { coordinationPanel } from './coordination.js';
+import { delegationsPanel } from './delegations.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { historyPanel } from '../agentHistory.js';
 
@@ -18,12 +19,14 @@ export const NO_EFFECT = {
   'agent-disabled': ' — the agent is disabled',
   'account-disabled': ' — its account is disabled',
   'account-role': ' — its account is no longer a coordinator or owner here',
+  'issuer-role': ' — the person who gave it is no longer an owner here',
 };
 // The release grant is narrower (kittrial-5bb.378): only an owner's account carries it.
 export const RELEASE_NO_EFFECT = {
   'agent-disabled': ' — the agent is disabled',
   'account-disabled': ' — its account is disabled',
   'account-role': ' — its account is no longer an owner here',
+  'issuer-role': ' — the person who gave it is no longer an owner here',
 };
 export const ROLE_NAMES = [['viewer', 'Viewer'], ['contributor', 'Contributor'], ['coordinator', 'Coordinator'], ['owner', 'Owner']];
 
@@ -68,8 +71,10 @@ function scopeSentence(data) {
   if (data.scope === 'all') {
     if (data.scope_basis === 'operator') return 'You see every lane: you are an installation operator.';
     if (data.scope_basis === 'project-role') {
-      return 'You see every lane: your role in this project is ' + (data.scope_role === 'coordinator' ? 'coordinator' : 'owner') + '.';
+      if (data.scope_role !== 'coordinator' && data.scope_role !== 'owner') return 'You see every lane.';
+      return 'You see every lane: your role in this project is ' + data.scope_role + '.';
     }
+    if (data.scope_basis === 'superuser') return 'You see every lane: you are a superuser, who may coordinate every project.';
     if (data.scope_basis === 'coordinator-grant') return 'You see every lane: this agent holds a coordinator grant in this project.';
     return 'You see every lane.';
   }
@@ -581,6 +586,8 @@ export async function settings(ctx, { pid }) {
   const auditHost = h('div');
   // Who coordinates (kittrial-5bb.198), read again after an owner changes a role or a grant here.
   const coordination = coordinationPanel(ctx, project);
+  // Delegated decision rights (kittrial-5bb.407): read by every member; recorded only by a person owner.
+  const delegated = delegationsPanel(ctx, project, { owner: project.role === 'owner' });
 
   async function drawMembers() {
     let data;
@@ -740,5 +747,5 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
-    membersHost, claimingPanel(ctx, project), coordination.node, agentsHost, credsHost, auditHost, danger);
+    membersHost, claimingPanel(ctx, project), coordination.node, delegated.node, agentsHost, credsHost, auditHost, danger);
 }

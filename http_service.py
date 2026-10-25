@@ -52,6 +52,7 @@ import bd_refusals
 import claim_limit
 import project_setup
 import project_coordination
+import nudges
 import task_files
 import rooms
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
@@ -2239,6 +2240,8 @@ class EndpointBackend:
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
         'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
+        # Delegated decision rights (kittrial-5bb.407): the canonical `delegation` action.
+        'delegations.grant', 'delegations.narrow', 'delegations.revoke',
     )
     #: Routes with no canonical command yet, and why. Fails closed rather than
     #: pretending the service store is canonical.
@@ -2596,6 +2599,20 @@ class EndpointBackend:
             error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
                                       422: 'invalid', 503: 'unavailable'}.get(status, 'unavailable'),
                               (reply.get('stderr') or 'Release facts cannot be recorded').strip())
+            error.nothing_done = True
+            raise error
+        if action == 'delegation' and isinstance(reply, dict) and reply.get('returncode') == 2 and (
+                reply.get('delegation_status') or reply.get('records_status')):
+            # The delegation action's own refusal or its identity check's (kittrial-5bb.407):
+            # nothing was written, and the status is the one the action gave.
+            status = reply.get('delegation_status') or reply.get('records_status')
+            text = (reply.get('stderr') or 'Delegation refused').strip().split('\n')[-1]
+            for prefix in ('ValueError: ', 'DelegationRefusal: '):
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                    break
+            error = HttpError(status, {403: 'forbidden', 404: 'not_found', 409: 'conflict',
+                                      422: 'invalid'}.get(status, 'unavailable'), text)
             error.nothing_done = True
             raise error
         if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
@@ -3065,6 +3082,15 @@ class EndpointBackend:
                     if key in payload:
                         body[key] = payload[key]
             return 'web-release', project_id, [json.dumps(body, ensure_ascii=False)], {}
+        if route.startswith('delegations.'):
+            # A person owner's delegation of a decision right (kittrial-5bb.407). Only the
+            # request travels; the endpoint fills the recorder, the account and the time.
+            operation = route.split('.', 1)[1]
+            import delegations
+            body = {key: payload[key] for key in delegations.REQUEST_FIELDS
+                    if key not in ('schema_version', 'operation_id', 'action')}
+            body.update(schema_version=1, operation_id=operation_id, action=operation)
+            return 'delegation', project_id, [operation, json.dumps(body, ensure_ascii=False)], {}
         if route.startswith('followons.'):
             # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
             # `assignee-followon` action derives every record fact under the project
@@ -3288,6 +3314,21 @@ class EndpointBackend:
 
     def capabilities_find(self, project_id, phrase, limit=5):
         return self._capability_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
+
+    def delegations_read(self, project_id, principal):
+        """The project's delegations and which granted coordinator agents they cover
+        (kittrial-5bb.407), through the endpoint's ``delegation list`` read."""
+        reply = self._endpoint('delegation', project_id, self.service.bind_actor(principal, None), ['list'],
+                               authority=authority_request(principal, project_id, CAP_READ,
+                                                           now=self.service._expiry_now()),
+                               require_authority=True)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and reply.get('delegation_status'):
+            raise HttpError(reply['delegation_status'], 'forbidden' if reply['delegation_status'] == 403 else 'invalid',
+                            (reply.get('stderr') or 'Delegations cannot be read').strip())
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('The canonical delegations read returned an unexpected shape')
+        return payload
 
     def lanes_read(self, project_id, principal, args, actor, scope):
         """One page of the lanes board through the endpoint's ``work lanes`` action.
@@ -8219,7 +8260,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     # git and sends ONE group, at most 200 targets; the endpoint re-verifies every named
     # target against its own export and skips a target that is not integrated there. The
     # query is the read-only pre-flight: the host-issued reverted set and the recorded
-    # live releases for one environment, writing nothing.
+    # live releases for one environment and read-only review-VOID diagnostics,
+    # writing nothing. Diagnostics include issuer identities and reasons.
     def _release_backend(self, route):
         if not hasattr(self.backend, 'ROUTES') or route not in self.backend.ROUTES:
             raise not_implemented('Release facts are unavailable on this server')
@@ -8227,8 +8269,11 @@ class ApiHandler(BaseHTTPRequestHandler):
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/releases/query')
     def release_query(self, ctx):
         import web_release
-        # A coordinator read: the query writes nothing and discloses only the reverted
-        # set and the environment's live releases this project already knows.
+        # A coordinator read: CAP_COORDINATE callers (owners/superusers, a project
+        # coordinator, or an agent with the coordinator grant) receive the reverted
+        # set, this environment's live releases and review-VOID diagnostics, including
+        # issuer identities and reasons. Ordinary member/read capability is insufficient.
+        # The query writes nothing; diagnostics cannot authorize a release target.
         self._project(ctx, CAP_COORDINATE)
         try:
             _, fields = web_release.fields(dict(ctx.payload or {}, operation='query'))
@@ -10752,7 +10797,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     CAP_VERIFY_FIELDS = ('key', 'revision', 'entry_revision', 'record_sha256', 'expected_sha256',
                          'entry_sha256', 'commit', 'checked_at', 'source', 'graph_built_at_commit',
                          'tool', 'results', 'passed', 'summary', 'method', 'command',
-                         'unverified_pointer_reason')
+                         'unverified_pointer_reason', 'decision_id')
     CAP_ALIAS_PROPOSE_FIELDS = ('key', 'alias', 'evidence')
     CAP_ALIAS_REJECT_FIELDS = ('key', 'alias', 'reason')
 
@@ -10874,6 +10919,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             can_coordinate and verify_authors
             and (self.service.approval_by_another_party or by_agent)
             and not self._independent_all(caller_names, verify_authors, pid, by_agent))
+        if by_agent and can_coordinate:
+            # kittrial-5bb.407: an agent accepts and verifies only within a delegation, which
+            # lifts the agent-only own-party rule but never a draft the agent wrote itself, and
+            # never the project's independence setting (review r1, b1): with that on, the
+            # person rule computed above stands.
+            item['needs_delegation'] = True
+            if not self.service.approval_by_another_party:
+                head = (ctx.principal.actor or '').split('/', 1)[0]
+                own = lambda authors: any(isinstance(a, str) and a.split('/', 1)[0] == head for a in authors)
+                item['self_accept_blocked'] = bool(draft_authors) and own(draft_authors)
+                item['self_verify_blocked'] = bool(verify_authors) and own(verify_authors)
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
@@ -11003,6 +11059,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = dict(fields, schema_version=1, operation_id=operation_id)
         if key_param:
             body['key'] = ctx.params['key']
+        if coordinator and command in ('accept', 'web-verify') and ctx.principal.via == 'credential':
+            # kittrial-5bb.407: an agent accepts or verifies only within a person owner's
+            # delegation, named here; the default operation id would name no decision. The
+            # endpoint checks the delegation itself, live, under the write's lock.
+            named = body.get('decision_id')
+            if named is None and isinstance(body.get('acceptance'), dict):
+                named = body['acceptance'].get('decision_id')
+            if not isinstance(named, str) or not named.strip():
+                raise forbidden('An agent accepts or verifies a record only within a delegation: name the person '
+                              "owner's delegation decision as decision_id")
         body = self._normalize_record_payload(ctx, command, body, operation_id)
 
         def mutate_record():
@@ -11019,6 +11085,68 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, route_name, pid, mutate_record, status=status,
                             capability=needed, serialize=False, canonical=True,
                             reason='%s %s' % (command, body.get('key') or ''))
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/delegations')
+    def delegations_list(self, ctx):
+        """The project's delegations of decision rights (kittrial-5bb.407), at CAP_READ.
+
+        Each item is a decision issue carrying delegation records, in force or not, with the
+        reason when not; ``granted_agents`` says for each agent holding the coordinator grant
+        whether a delegation in force covers it (the check before a release that requires
+        one). Computed by the endpoint with the same live check an acceptance runs.
+        """
+        self._project(ctx, CAP_READ)
+        read = getattr(self.backend, 'delegations_read', None)
+        if read is None:
+            raise not_implemented('Delegations require the canonical endpoint backend')
+        return 200, read(ctx.params['pid'], ctx.principal)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/delegations')
+    def delegations_write(self, ctx):
+        """Grant, narrow or revoke a delegation (kittrial-5bb.407).
+
+        Only a person owner's own web session: an agent or worker credential is refused here,
+        and the endpoint checks the session and the live owner role again under the lock. The
+        body is the closed request (``action`` grant|narrow|revoke, ``decision``, ``right``,
+        ``grantee``, ``scope``, ``escalate``, ``reason``); the recorder, the account and the
+        time are the server's.
+        """
+        import delegations
+        pid = ctx.params['pid']
+        if not hasattr(self.backend, 'ROUTES') or 'delegations.grant' not in self.backend.ROUTES:
+            raise not_implemented('Delegations are unavailable on this server')
+        self._project(ctx, CAP_PROJECT_ADMIN)
+        if ctx.principal.via != 'session':
+            raise forbidden('A delegation is recorded by a person owner signed in to the web; an agent or worker '
+                            'credential cannot record one')
+        with self.service.store.lock:
+            role = ((self.service.state.get('memberships') or {}).get(pid) or {}).get(ctx.principal.user_id)
+        if role != 'owner':
+            raise forbidden('Only a person owner of this project records a delegation; a superuser without the '
+                            'owner role adds themselves as owner first')
+        payload = dict(ctx.payload or {})
+        fields = tuple(sorted(delegations.REQUEST_FIELDS - {'schema_version', 'operation_id'}))
+        refuse_unknown_fields(payload, fields, 'A delegation')
+        if set(payload) != set(fields):
+            raise invalid('Supply exactly ' + ', '.join(fields))
+        if payload.get('action') not in delegations.ACTIONS:
+            raise invalid('action must be one of ' + ', '.join(delegations.ACTIONS))
+        try:
+            delegations.validate_request(dict(payload, schema_version=1, operation_id='http-validation'))
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        route_name = 'delegations.' + payload['action']
+
+        def write():
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request '
+                              'after an uncertain outcome')
+            result = self.backend.invoke(route_name, ctx.principal, pid, payload,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_PROJECT_ADMIN)
+            return result, result
+        return self._mutate(ctx, route_name, pid, write, capability=CAP_PROJECT_ADMIN,
+                            status=201, serialize=False, canonical=True)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):
@@ -12959,7 +13087,95 @@ class ApiHandler(BaseHTTPRequestHandler):
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
                                            key=self.service.cursor_key())
                                if type(continuation) is int and continuation > state['o'] else None)
+        # kittrial-5bb.413: each row also carries the lane's newest nudge request in THIS project
+        # (read-only; never the note). Only rows the viewer's scope already put on the page.
+        items = [row for row in body.get('items') or [] if isinstance(row, dict)]
+        shown = self.service.nudge_views(ctx.params['pid'], [row.get('actor') for row in items])
+        body['items'] = [dict(row, nudge=shown.get(row.get('actor'))) if isinstance(row, dict) else row
+                         for row in body.get('items') or []]
         return 200, body
+
+    #: The one body a nudge request takes (kittrial-5bb.413). ``operation_id`` is the retry key of
+    #: the design when the caller sends no ``Idempotency-Key`` header.
+    NUDGE_FIELDS = ('lane', 'message', 'reason', 'note', 'acknowledge_declared_wait', 'operation_id')
+
+    def _nudge_lane_row(self, ctx, lane):
+        """The lane's row on THIS project's board, read for every lane, or the one 404 of a lane not here.
+
+        The page scope of the viewer does not apply: the caller already holds ``coordinate`` in this
+        project, and the answer for a lane that is absent and for one that exists only in another
+        project is the same sentence.
+        """
+        from lanes import LANES_LIMIT_MAX
+        offset = 0
+        for _page in range(50):
+            read = self.backend.lanes_read(
+                ctx.params['pid'], ctx.principal,
+                ['--idle-minutes', str(self._lanes_idle_minutes(None)), '--limit', str(LANES_LIMIT_MAX),
+                 '--offset', str(offset)],
+                self._lanes_actor(ctx.principal), 'all')
+            for row in read.get('items') or []:
+                if isinstance(row, dict) and row.get('actor') == lane:
+                    return row
+            offset = read.get('next_offset')
+            if type(offset) is not int:
+                break
+        raise not_found(nudges.NOT_HERE)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/nudges')
+    def project_nudge_request(self, ctx):
+        """Ask that a fixed message reach one stalled lane (kittrial-5bb.413; design kittrial-5bb.409).
+
+        ``coordinate`` in THIS project, live: an owner, a coordinator, a superuser, or an agent whose
+        coordinator grant is effective. Nothing is delivered here (no carrier yet): the request is
+        kept, audited and shown on the board, and ends ``not-deliverable``.
+        """
+        self._project(ctx, CAP_COORDINATE)
+        payload = dict(ctx.payload or {})
+        operation_id = payload.get('operation_id')
+        if isinstance(operation_id, str) and IDEMPOTENCY_KEY.fullmatch(operation_id) \
+                and ctx.idempotency_key in (None, operation_id):
+            ctx.idempotency_key = operation_id
+        lane = payload.get('lane')
+
+        def request():
+            # Everything that can refuse runs inside the mutation: the key is reserved first (a retry
+            # after the lane left the board is the stored answer) and every refusal is audited.
+            refuse_unknown_fields(payload, self.NUDGE_FIELDS, 'A nudge request')
+            try:
+                fields = nudges.parse_request(payload)
+            except ValueError as error:
+                raise invalid(str(error))
+            if operation_id is not None:
+                if not isinstance(operation_id, str) or not IDEMPOTENCY_KEY.fullmatch(operation_id):
+                    raise invalid('operation_id must be 8-128 URL-safe characters')
+                if ctx.idempotency_key != operation_id:
+                    raise invalid('operation_id and the Idempotency-Key header must be the same')
+            row = self._nudge_lane_row(ctx, fields['lane'])      # a slow read: never under the service lock
+            with self.service.store.lock:
+                ctx.authorize()
+                return self.service.request_nudge(ctx.principal, ctx.params['pid'], fields, row,
+                                                  request_id=ctx.request_id)
+        status, answer = self._mutate(ctx, 'lanes.nudge.request', ctx.params['pid'], request,
+                                      capability=CAP_COORDINATE, status=201, audit_success=False,
+                                      serialize=False,
+                                      reason='lane %s' % (lane[:80] if isinstance(lane, str) else '?'))
+        # An open request for the same lane and message is answered as it is: 200, nothing written.
+        return (200 if answer.get('coalesced') else status), answer
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/nudges')
+    def project_nudges(self, ctx):
+        """The project's newest nudge requests, newest first; for a coordinator (never the note)."""
+        self._project(ctx, CAP_COORDINATE)
+        refuse_ambiguous_query(urlsplit(self.path).query, ('lane', 'limit'))
+        lane = ctx.query.get('lane')
+        if lane is not None and not nudges.LANE_LABEL.fullmatch(lane):
+            raise HttpError(400, 'invalid_request', 'lane must be a lane actor label')
+        raw = ctx.query.get('limit')
+        if raw is not None and not (re.fullmatch(r'[0-9]+', raw) and 1 <= int(raw) <= 100):
+            raise HttpError(400, 'invalid_request', 'limit must be a whole number, 1 to 100')
+        return 200, dict(self.service.nudge_list(ctx.params['pid'], lane, int(raw) if raw else 20),
+                         generated_at=now_iso(self.service._now()))
 
     def _lanes_idle_minutes(self, raw):
         """The page's threshold argument, or the refusal that names the read's own range.
@@ -12998,7 +13214,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         This service calls the endpoint WITHOUT a bound key, so the endpoint's own
         ``lanes_scope_for`` answers ``'all'`` for it. That is a property of the transport,
         not an authority the page may inherit, so the route decides for its own viewer. The
-        viewer reads every lane (``'all'``) in exactly three cases and everybody else is
+        viewer reads every lane (``'all'``) in exactly the cases below and everybody else is
         scoped to their own agents' lanes (``'own'``, the contributor route's rule):
 
         * ``operator``: an installation operator, the kit's ONE operator definition
@@ -13007,11 +13223,14 @@ class ApiHandler(BaseHTTPRequestHandler):
           host through the read-only ``host-coordination`` action). A host that cannot
           answer is not an operator list, so this case then narrows, never widens;
         * ``project-role``: a person whose role IN THIS PROJECT holds ``CAP_COORDINATE``
-          (coordinator or owner; a superuser is an owner everywhere, as on every other
-          coordinator route);
+          (coordinator or owner);
+        * ``superuser``: a superuser with no coordinating membership here, who is an owner
+          everywhere as on every other coordinator route (kittrial-5bb.410: said as what it
+          is, not as an ``owner`` role they do not hold);
         * ``coordinator-grant``: an agent with an EFFECTIVE coordinator grant in this
-          project (the grant exists, the agent is enabled and in the project, its account is
-          still a coordinator or owner here, and the credential is live).
+          project (the grant exists and its issuer still may give it, the agent is enabled and in
+          the project, its account is still a coordinator or owner here, and the credential
+          is live).
 
         The second and third are ONE live :meth:`Service.check_authority` decision per read,
         the same one every coordinator route takes; nothing is cached, so a demotion, a
@@ -13044,6 +13263,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             return 'own', 'own', None
         if principal.via == 'credential':
             return 'all', 'coordinator-grant', None
+        if principal.superuser:
+            # decide() reads a superuser as owner everywhere, so ``role`` is not their role
+            # here: report the membership if it coordinates, else say it is the superuser.
+            with self.service.store.lock:
+                held = (self.service.state.get('memberships', {}).get(project_id) or {}).get(principal.user_id)
+            if held not in ('owner', 'coordinator'):
+                return 'all', 'superuser', None
+            role = held
         return 'all', 'project-role', role if role in ('owner', 'coordinator') else None
 
     @route('GET', r'/v1/me/work')
@@ -13937,6 +14164,10 @@ def main(argv=None):
     parser.add_argument('--list-unconfirmed-projects', action='store_true',
                         help='print the project records the endpoint backend will not serve (an upgrade '
                              'check: a superuser confirms or archives each one), then exit; read-only')
+    parser.add_argument('--list-dormant-grants', action='store_true',
+                        help='print the coordinator and release grants whose issuer may no longer give '
+                             'them, so they have no effect (an upgrade check, kittrial-5bb.410), then exit; '
+                             'read-only')
     web = parser.add_mutually_exclusive_group()
     web.add_argument('--web-root', default=str(DEFAULT_WEB_ROOT),
                      help='directory holding the browser interface served at / '
@@ -13968,6 +14199,17 @@ def main(argv=None):
             parser.error('--state is not a service state document')
         import types
         items = unusable_projects(types.SimpleNamespace(state=document))
+        print(json.dumps({'items': items, 'total': len(items)}, indent=2))
+        return 0
+    if args.list_dormant_grants:
+        # Read-only, like --list-unconfirmed-projects: the document is read as JSON, no store is opened.
+        if not Path(args.state).is_file():
+            parser.error('--list-dormant-grants needs an existing --state file')
+        document = record_json.loads(Path(args.state).read_text(encoding='utf-8'))
+        if not isinstance(document, dict) or not isinstance(document.get('users'), dict):
+            parser.error('--state is not a service state document')
+        from http_authority import dormant_grants
+        items = dormant_grants(document)
         print(json.dumps({'items': items, 'total': len(items)}, indent=2))
         return 0
     if args.bootstrap_user:

@@ -186,6 +186,7 @@ const variants = {
   owner: { scope: 'all', scope_basis: 'project-role', scope_role: 'owner' },
   coordinator: { scope: 'all', scope_basis: 'project-role', scope_role: 'coordinator' },
   grant: { scope: 'all', scope_basis: 'coordinator-grant', scope_role: null },
+  superuser: { scope: 'all', scope_basis: 'superuser', scope_role: null },
   own: { scope: 'own', scope_basis: 'own', scope_role: null },
   unknown: { scope: 'all', scope_basis: 'something-new', scope_role: null },
 };

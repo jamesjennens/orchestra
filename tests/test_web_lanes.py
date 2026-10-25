@@ -483,6 +483,8 @@ class LanesPageTests(unittest.TestCase):
         self.assertIn('your role in this project is owner', said['owner'])
         self.assertIn('your role in this project is coordinator', said['coordinator'])
         self.assertIn('holds a coordinator grant in this project', said['grant'])
+        self.assertIn('you are a superuser', said['superuser'])
+        self.assertNotIn('role in this project', said['superuser'])
         self.assertIn('You see your own lanes; installation operators, project owners and coordinators, '
                       'and agents with a coordinator grant see every lane', said['own'])
         self.assertTrue(said['unknown'].endswith('You see every lane.'), said['unknown'])
