@@ -389,3 +389,11 @@ No implementation. No change to `briefing.py`, `endpoint.py`, `http_service.py`,
 `worker.py`, `capability_records.py`, `reserved_comments.py` or any test. This is the note the task
 asks for before the work; on acceptance the work follows in two contributions (the record and its
 read first, then the project-page panel).
+
+## 12. The nudge request (kittrial-5bb.413)
+
+`POST /v1/projects/{pid}/nudges` asks that a fixed message (`resume` or `restart`) reach one lane;
+`GET /v1/projects/{pid}/nudges` lists the requests (a coordinator only), and each lanes row carries
+a `nudge` field (the lane's newest request in this project, never its note). The design is
+`docs/design/LANE_NUDGE_DESIGN.md` (kittrial-5bb.409, commit f84679f; it lands with the next
+release). There is no carrier yet: a request is kept and audited, and ends `not-deliverable`.

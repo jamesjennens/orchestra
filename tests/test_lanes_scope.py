@@ -279,7 +279,10 @@ class ParityTests(ScopeCase):
     def test_the_routes_rows_are_the_canonical_reads_rows_for_the_scope_it_chose(self):
         every = self.lanes(self.tokens['olive']).data
         self.assertEqual('all', every['scope'])
-        self.assertEqual(self.rows('all')['items'], every['items'])
+        # the route adds only the board's nudge field (kittrial-5bb.413) to the canonical rows
+        self.assertEqual(self.rows('all')['items'],
+                         [{k: v for k, v in row.items() if k != 'nudge'} for row in every['items']])
+        self.assertTrue(all('nudge' in row for row in every['items']))
         self.assertEqual(self.both(), {row['actor'] for row in self.rows('all')['items']})
 
     def test_the_bound_key_endpoint_rule_stays_operator_only(self):
