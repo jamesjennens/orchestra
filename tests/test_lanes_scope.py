@@ -271,7 +271,17 @@ class ParityTests(ScopeCase):
     def test_the_routes_rows_are_the_canonical_reads_rows_for_the_scope_it_chose(self):
         every = self.lanes(self.tokens['olive']).data
         self.assertEqual('all', every['scope'])
-        self.assertEqual(self.rows('all')['items'], every['items'])
+        # display_name is a route-only display field (kittrial-5bb.416,
+        # http_service.py project_lanes): strip it before comparing, keeping
+        # every canonical field in the comparison.
+        route_rows = [{key: value for key, value in row.items() if key != 'display_name'}
+                      for row in every['items']]
+        self.assertEqual(self.rows('all')['items'], route_rows)
+        # ... and assert it is present on the route's rows: known accounts read
+        # as their display names, never as another name.
+        names = {row['actor']: row.get('display_name') for row in every['items']}
+        self.assertEqual('carl', names[self.ids['carl']])
+        self.assertEqual('dave', names[self.ids['dave']])
         self.assertEqual(self.both(), {row['actor'] for row in self.rows('all')['items']})
 
     def test_the_bound_key_endpoint_rule_stays_operator_only(self):
