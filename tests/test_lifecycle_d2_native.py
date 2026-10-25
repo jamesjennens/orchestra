@@ -61,7 +61,9 @@ class NativeAuditTests(fixture.RealBdLabelAliasTests):
 
     def test_native_version_and_whole_call_caps_answer_unknown(self):
         task,event=self.make_facts();before=canonical_bytes(self.export_rows())
-        with mock.patch.object(audit,'HISTORY_VERSION_CAP',1):
+        # Coordinator fix 2026-10-25: a generous time budget, so on a loaded host the whole-history time
+        # budget cannot stop the audit before the version cap this test is about (it did once in 1024j).
+        with mock.patch.object(audit,'HISTORY_VERSION_CAP',1),mock.patch.object(audit,'HISTORY_SECONDS',600.0):
             report=fixture.admin.lifecycle_audit_command(self.root,'pp',limit=100)
         item=next(i for i in report['items'] if i['event_id']==event)
         self.assertEqual(item['historical_assignment']['state'],'unknown')
