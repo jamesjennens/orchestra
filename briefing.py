@@ -67,7 +67,7 @@ FULL_FIELD_BUDGET=8000
 # ends the line a reader is looking at) and the bidi controls (a right-to-left override
 # can reorder the answer on screen). Each is rendered as the same \uXXXX escape the JSON
 # form already uses, so the fuller-context read cannot emit a raw ESC/BEL/CR or hide text.
-CONTROL_TEXT_RE=re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]')
+CONTROL_TEXT_RE=re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]')
 
 def token(data):return base64.urlsafe_b64encode(canonical_bytes(data)).decode().rstrip('=')
 
@@ -516,6 +516,149 @@ def plain_text(value):
     the JSON form already emits, so no answer carries a raw ESC/BEL, a bare CR, a
     separator that ends the reader's line, or a bidi override that reorders it."""
     return CONTROL_TEXT_RE.sub(lambda match:'\\u%04x'%ord(match.group()),str(value or ''))
+
+
+def clip_context_label(value,limit=120):
+    """Escape first, then clip without cutting a generated Unicode escape."""
+    text=plain_text(value)
+    end=min(len(text),limit)
+    for match in re.finditer(r'\\u[0-9a-fA-F]{4}',text):
+        if match.start()>=end:
+            break
+        if match.start()<end<match.end():
+            end=match.start()
+            break
+    if end<len(text):
+        partial=re.search(r'\\u[0-9a-fA-F]{0,3}$',text[:end])
+        if partial:
+            end=partial.start()
+    return {'text':text[:end],'omitted_chars':len(text)-end}
+
+
+def inline_context_text(value):
+    """One terminal line, including labels whose separators are already escaped."""
+    text=re.sub(r'(?:[\t\r\n\u2028\u2029]|\\u202[89])+',' ',str(value or ''))
+    return plain_text(text)
+
+
+CONTEXT_POINTER_RE = re.compile(r'(task|comment|ref|cap|item|file|room|commit|doc|archive):([A-Za-z0-9._/#:-]{1,200})\Z')
+CONTEXT_POINTER_ITEM_MAX = 10
+CONTEXT_POINTER_BRIEF_MAX = 50
+
+
+def parse_context_pointers(text):
+    """Read tokens, never rewrite or validate the checkpoint's prose."""
+    if not isinstance(text,str):
+        return []
+    result=[]
+    for token in text.split():
+        match=CONTEXT_POINTER_RE.fullmatch(token)
+        if match:
+            result.append({'pointer':token,'kind':match[1],'value':match[2]})
+    return result
+
+
+class ContextPointers:
+    """Read-only resolution over a caller-authorized, project-scoped snapshot.
+
+    No runner, path or journal is accepted: resolution cannot perform I/O. Production
+    supplies project-scoped, already-authorized rows. ``can_read`` is an optional
+    additional restriction for direct embedders/tests; it never widens that scope.
+    Unloaded kinds are uniformly unchecked; absent/hidden loaded kinds unavailable.
+    """
+    def __init__(self,rows,project,operators=None,can_read=None):
+        self.project=project
+        self.operators=operators
+        self.remaining=CONTEXT_POINTER_BRIEF_MAX
+        self._source_rows=rows
+        self._can_read=can_read
+        self.rows=None
+        self.tasks={}
+        self.comments={}
+        self.catalogs={}
+        self.reviews={}
+    def _load(self):
+        # Pure prose and unchecked kinds never build a project-wide index.
+        if self.rows is not None:
+            return
+        self.rows=[row for row in self._source_rows if isinstance(row,dict) and
+                   row.get('project_id',self.project)==self.project and
+                   not row.get('malformed') and (self._can_read is None or self._can_read(row))]
+        from reserved_comments import is_record_anchor,is_record_comment
+        from coordination import is_merge_slot
+        for row in self.rows:
+            if is_record_anchor(row) or is_merge_slot(row):
+                continue
+            self.tasks.setdefault(str(row.get('id')),[]).append(row)
+            for comment in row.get('comments') or []:
+                if isinstance(comment,dict) and comment.get('id') is not None and not is_record_comment(comment.get('text',comment.get('body'))):
+                    self.comments.setdefault(str(comment['id']),[]).append((row,comment))
+
+    def resolve(self,pointer):
+        kind,value=pointer['kind'],pointer['value']
+        entry={'pointer':pointer['pointer'],'kind':kind,'state':'unchecked','trust':'data'}
+        if kind not in ('task','comment','ref','cap'):
+            return entry
+        self._load()
+        entry['state']='unavailable'
+        label=follow=None
+        if kind=='task':
+            matches=self.tasks.get(value,[])
+            if len(matches)==1:
+                row=matches[0]
+                entry['state']='superseded' if row.get('status')=='closed' and row.get('close_reason')=='superseded' else 'live'
+                label=row.get('title')
+                follow='brief '+value
+        elif kind=='comment':
+            matches=self.comments.get(value,[])
+            if len(matches)==1:
+                row,comment=matches[0]
+                text=comment.get('text',comment.get('body'))
+                if isinstance(text,str):
+                    entry['state']='live'
+                    label='%s / %s: %s'%(row['id'],comment.get('author') or 'unknown',text)
+                    follow='history '+str(row['id'])+' --recent 10'
+                    # Reuse the same workflow projection as brief; no comment read.
+                    if row['id'] not in self.reviews:
+                        from work import workflow
+                        self.reviews[row['id']]=workflow(row,operators=self.operators)
+                    prior=self.reviews[row['id']].get('prior_contributions') or []
+                    if any(str(item.get('comment_id'))==value and item.get('relation')=='supersedes' for item in prior):
+                        entry['state']='superseded'
+        else:
+            if kind not in self.catalogs:
+                import reference_records,capability_records
+                module=reference_records if kind=='ref' else capability_records
+                entries,_=module.catalog(self.rows,self.operators)
+                indexed={}
+                for item in entries:
+                    indexed.setdefault(item.get('key'),[]).append(item)
+                self.catalogs[kind]=indexed
+            matches=self.catalogs[kind].get(value,[])
+            if len(matches)==1:
+                view=matches[0]
+                record=view.get('record') or view.get('proposed')
+                if record is not None and view.get('state') not in ('malformed','unsupported','conflicted','incomplete'):
+                    entry['state']='superseded' if record.get('acceptance_state')=='superseded' else 'live'
+                    label=record.get('name') or record.get('title') or value
+                    follow=('ref get ' if kind=='ref' else 'capability get ')+value
+        if entry['state'] in ('live','superseded'):
+            entry['label']=clip_context_label(label)
+            entry['follow']=follow
+        return entry
+
+    def item_pointers(self,items,field):
+        """Resolution by item id; never add fields to a carryable checkpoint item."""
+        shown={}
+        for item in items:
+            pointers=parse_context_pointers(item.get(field))
+            count=min(len(pointers),CONTEXT_POINTER_ITEM_MAX,self.remaining)
+            self.remaining-=count
+            resolved=[self.resolve(pointer) for pointer in pointers[:count]]
+            resolved += [{'pointer':p['pointer'],'kind':p['kind'],'state':'unresolved','trust':'data'}
+                         for p in pointers[count:]]
+            shown[item['id']]={'pointers':resolved,'pointers_omitted':len(pointers)-count}
+        return shown
 
 def encoded_size(text):
     """Encoded JSON string bytes: the unit history budgets an answer in (control
@@ -1368,6 +1511,12 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                        +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.']
                        +[w for w in integration_warnings if w.startswith(RECONCILIATION_WARNING_PREFIX)]),
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
+    if p is not None:
+        pointers=ContextPointers(rows,project,operators)
+        result['unresolved']['pointer_items']=pointers.item_pointers(result['unresolved']['items'],'source')
+        result['resolved']={'items':p['resolved'][:limit],
+                            'pointer_items':pointers.item_pointers(p['resolved'][:limit],'evidence'),
+                            'total':len(p['resolved']),'omitted':max(0,len(p['resolved'])-limit)}
     if p is not None and not counted:
         # The brief states plainly WHY no direction is outstanding (kittrial-5bb.284):
         # a reader must not infer an unacknowledged instruction from a count that the
@@ -2106,6 +2255,36 @@ def format_changes(section,activity):
     lines.append('  '+section['note'])
     return lines
 
+def bound_context_pointer_display(groups):
+    """Keep a composed web brief within the same budget across existing page reads."""
+    remaining=CONTEXT_POINTER_BRIEF_MAX
+    result=[]
+    for group in groups:
+        shown={}
+        for identity,item in group.items():
+            pointers=[]
+            for pointer in item.get('pointers') or []:
+                if pointer.get('state')=='unresolved':
+                    pointers.append(dict(pointer))
+                elif remaining:
+                    pointers.append(dict(pointer));remaining-=1
+                else:
+                    pointers.append({k:pointer[k] for k in ('pointer','kind','trust')} | {'state':'unresolved'})
+            shown[identity]={'pointers':pointers,'pointers_omitted':sum(p['state']=='unresolved' for p in pointers)}
+        result.append(shown)
+    return result
+
+
+def format_context_pointers(item):
+    lines=[]
+    for pointer in item.get('pointers') or []:
+        label=inline_context_text((pointer.get('label') or {}).get('text'))
+        lines.append('  '+pointer['pointer']+' ['+pointer['state']+'; trust=data]'+(' '+label if label else ''))
+    if item.get('pointers_omitted'):
+        lines.append('  Pointers unresolved by bounds: '+str(item['pointers_omitted']))
+    return lines
+
+
 def format_brief(result):
     def excerpt(value):return value['text']+(f' [excerpt; {value["omitted_chars"]} characters omitted — use show/history]' if value['omitted_chars'] else '')
     lines=[f'{result["task"]}: {excerpt(result["title"])}',f'Owner: {excerpt(result["owner"])} | Status: {result["status"]}',
@@ -2158,7 +2337,14 @@ def format_brief(result):
         lines += [f'Outstanding directions: {dirs["total"]} [{", ".join(k+"="+str(v) for k,v in sorted(states.items()))}] '+ids,
                   '  Resolve or supersede each with note+evidence (digest-checked); acknowledgement alone does not clear a direction.']
     unresolved=result['unresolved'];lines += [f'Unresolved items: {unresolved["total"] if unresolved["total"] is not None else "unknown"}']
-    lines += [f'- {item["id"]} [{item["kind"]}]: {item["text"]} (source: {item["source"]})' for item in unresolved['items']]
+    for item in unresolved['items']:
+        lines += [f'- {item["id"]} [{item["kind"]}]: {inline_context_text(item["text"])} (source: {inline_context_text(item["source"])})']
+        lines += format_context_pointers((unresolved.get('pointer_items') or {}).get(item['id'],{}))
+    for item in (result.get('resolved') or {}).get('items',[]):
+        lines += ['Resolved '+str(item['id'])+': '+inline_context_text(item['reason'])+' (evidence: '+inline_context_text(item['evidence'])+')']
+        lines += format_context_pointers((result['resolved'].get('pointer_items') or {}).get(item['id'],{}))
+    if (result.get('resolved') or {}).get('omitted'):
+        lines += ['Resolved items omitted: '+str(result['resolved']['omitted'])]
     if unresolved['next_offset'] is not None:lines += [f'More unresolved items: brief {result["task"]} --items-offset {unresolved["next_offset"]}']
     lines += ['Native dependencies: '+json.dumps(result['dependencies'],ensure_ascii=False), 'Lifecycle: '+', '.join(k+'='+v['value'] for k,v in result['lifecycle'].items()),
               'Lifecycle scope: '+json.dumps(result['lifecycle_scope'],ensure_ascii=False),'Current activity cursor: '+result['activity_cursor'],
@@ -2210,6 +2396,7 @@ def help_limits(action):
             'item source/evidence':'<= %d characters'%CHECKPOINT_SOURCE_LIMIT,
             'payload':'<= %d KB canonical bytes'%(CHECKPOINT_MAX_BYTES//1000),
             'lane_state.waiting_on':'<= 96 characters (a role or an actor id)',
+            'lane_state.reason':'<= 300 characters (needs-investigation only)',
             'error field names':'<= %d names, each <= %d characters'%(FIELD_NAME_COUNT,FIELD_NAME_LIMIT)})
     return limits
 
@@ -2283,13 +2470,17 @@ def help_notes(action):
             'id, reason, evidence).',
             'An optional sibling key lane_state (kittrial-5bb.263) writes one Kind: lane-state-v1 record beside '
             'this checkpoint in the same act. Its fields are schema_version (1), task, state (one of working, '
-            'waiting-on-coordinator, waiting-on-review, waiting-on-user, idle), waiting_on (a role coordinator/'
+            'waiting-on-coordinator, waiting-on-review, waiting-on-user, idle, needs-investigation), waiting_on (a role coordinator/'
             'reviewer/user or an actor id; required with a waiting state and refused without one) and expect_by '
             '(optional ISO-8601 with an offset; a past value is accepted). Do not send checkpoint: the writer '
             'sets it to the comment id this checkpoint just published, which is what makes the record name the '
             'task\'s newest checkpoint at write time. It is NOT a checkpoint field: the checkpoint object '
             'above is unchanged and its field set stays closed, and lane_state is popped out before the checkpoint '
-            'is validated. Nothing is inferred: no person, and no actor turned into a role.',
+            'is validated. Nothing is inferred: no person, and no actor turned into a role. State '
+            'needs-investigation (kittrial-5bb.398) raises an out-of-band fault flag on the lane for the coordinator: '
+            'it requires reason (text, <= 300 characters, one printable line, shown escaped and clipped) and allows '
+            'about_task (a task id); it takes no waiting_on or expect_by, and every other state refuses reason and '
+            'about_task. Only the coordinator can clear it; a later state record never does.',
             'A refusal names every problem with the record at once: the sentence itself for one problem, and for '
             'more a numbered list of the same sentences ("Invalid checkpoint (N problems): [1] ... [2] ..."), at '
             'most %d of them. A stale previous and a changed activity cursor are separate refusals.'

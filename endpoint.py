@@ -1032,7 +1032,7 @@ def key_principal_refusal(request,path,key_principal):
 #: deliberately absent (James's answer to question 5, 2026-10-07).
 COORDINATOR_COMMANDS=('guidance-set','guidance-clear','guidance-status','reference-apply',
                       'capability-apply','capability-verify','proposal-review','proposal-decide',
-                      'handoff','set-onboarding','followon')
+                      'handoff','set-onboarding','followon','fault-clear')
 #: The coordinator commands that only read (no journal, no server time; the read takes the
 #: project's coordination lock, exactly as the host command does).
 COORDINATOR_READS=('guidance-status',)
@@ -1181,11 +1181,15 @@ def _web_guidance_read_only(args,operation):
     from web_guidance import READ_OPERATIONS
     return operation in READ_OPERATIONS
 
+def _review_rounds_read_only(args,operation):
+    return len(args)==2 and args[1]=='--rounds'
+
 READ_ONLY_ACTIONS={
     'brief':_read_only_always,
     'history':_read_only_always,
     'requirements':_read_only_always,
     'work':_read_only_always,
+    'review':_review_rounds_read_only,
     # kittrial-5bb.285: the blocking wait's per-poll read. It is one work read (one export)
     # and nothing is written, so it takes the project lock SHARED like the work read itself.
     'wait':_read_only_always,
@@ -1967,6 +1971,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 # under this lock and writes the native comment plus its host journal entry.
                 import followon
                 result=followon.apply(payload,actor,runner,path,operators=operators)
+            elif command=='fault-clear':
+                # A lane's needs-investigation flag is cleared only here and by the host
+                # command (kittrial-5bb.398). coordinator_refusal has already required a
+                # configured operator behind a bound key, so the lane that raised the fault and
+                # every other member are refused before this call; the library writes the clear
+                # record and its host journal entry under this lock.
+                import fault_clear
+                result=fault_clear.apply(payload,actor,runner,path,operators=operators)
             elif command=='reference-apply':
                 import reference_records
                 if isinstance(payload,dict) and 'items' in payload:

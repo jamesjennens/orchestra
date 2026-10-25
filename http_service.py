@@ -630,6 +630,10 @@ class InProcessBackend:
     #: This backend has no host tracker, so a credential's name is judged by its shape and the
     #: service's namespace only; no row rule is applied or recorded (kittrial-5bb.188 item 4).
     ACTOR_ROWS = False
+    #: Where the disposable backend keeps the empty-wake host log (kittrial-5bb.397):
+    #: one folder per project under it. None (the default) keeps no log, exactly as it
+    #: keeps no project directory today.
+    wake_root = None
 
     def __init__(self, service, actor_namespace=None, *, delivery_roots=(), delivery_serve_max_bytes=None):
         import actor_names
@@ -641,6 +645,12 @@ class InProcessBackend:
         self.delivery_serve_max_bytes = (
             DELIVERY_SERVE_MAX_BYTES if delivery_serve_max_bytes is None else int(delivery_serve_max_bytes)
         )
+
+    def wake_project_dir(self, project_id):
+        """The scratch project folder for the empty-wake log, or ``None``."""
+        if self.wake_root is None:
+            return None
+        return Path(self.wake_root) / str(project_id)
 
     def get_delivery_roots(self):
         return tuple(self.delivery_roots or ())
@@ -1617,6 +1627,9 @@ class InProcessBackend:
     def task_brief(self, project_id, task_id):
         """Everything the task page shows, from one read of the in-process state."""
         task = self._task(project_id, task_id)
+        from briefing import ContextPointers
+        pointer_rows=[row for row in self.state.get('tasks',{}).values() if row.get('project_id')==project_id]
+        pointers=ContextPointers(pointer_rows,project_id,operators=())
         checkpoints = self.state.get('checkpoints', {}).get(task_id) or []
         checkpoint = None
         if checkpoints:
@@ -1628,6 +1641,9 @@ class InProcessBackend:
             checkpoint = {'id': last['id'], 'at': last['created_at'], 'author': last['actor'],
                           'summary': last['summary'], 'next_action': last.get('next_action'),
                           'open_items': items,
+                          'pointer_items': pointers.item_pointers(items,'source'),
+                          'resolved': [dict(item) for item in last.get('resolved') or []],
+                          'resolved_pointer_items': pointers.item_pointers(last.get('resolved') or [],'evidence'),
                           # This backend holds the checkpoint in memory and always reads
                           # every item, so the shown list is the whole list, with no note.
                           'open_items_shown': len(items), 'open_items_total': len(items)}
@@ -1849,7 +1865,7 @@ class InProcessBackend:
                 'omitted': max(0, len(remaining) - NEWER_MAX),
                 'note': 'Event history has no per-entry digests. Reading clears nothing; reconcile with task history.'}
 
-    def lanes_read(self, project_id, args, actor, scope='own'):
+    def lanes_read(self, project_id, principal, args, actor, scope='own'):
         """One page of the lanes board over this backend's own rows (kittrial-5bb.263).
 
         The board's aging and its three flags live in ``lanes.py`` only, so this backend
@@ -1884,7 +1900,7 @@ class InProcessBackend:
                 rows.append(row)
             return waiting.coordinator_view(
                 rows,
-                self.lanes_read(project_id, ['--idle-minutes', str(idle_minutes),
+                self.lanes_read(project_id, principal, ['--idle-minutes', str(idle_minutes),
                                             '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'))
 
     def review_queue(self, project_id):
@@ -3273,7 +3289,7 @@ class EndpointBackend:
     def capabilities_find(self, project_id, phrase, limit=5):
         return self._capability_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
 
-    def lanes_read(self, project_id, args, actor, scope):
+    def lanes_read(self, project_id, principal, args, actor, scope):
         """One page of the lanes board through the endpoint's ``work lanes`` action.
 
         ``args`` are the read's own arguments -- ``--idle-minutes``, ``--limit``,
@@ -3286,11 +3302,27 @@ class EndpointBackend:
         computing their scope themselves.
         """
         reply = self._endpoint('work', project_id, actor, ['lanes'] + list(args),
-                               extra={'lanes_scope': scope})
+                               authority=authority_request(principal, project_id, CAP_READ,
+                                                           now=self.service._expiry_now()),
+                               require_authority=True, extra={'lanes_scope': scope})
         payload = self._checked(reply, reading=True)
         if not isinstance(payload, dict):
             raise uncertain('The canonical lanes read returned an unexpected shape')
         return payload
+
+    def wake_project_dir(self, project_id):
+        """The project directory the empty-wake host log lives under (kittrial-5bb.397).
+
+        It is the SAME project directory claiming, guidance and the lane board already
+        use, and ``admin.project_dir`` refuses a symlinked one. A project without a
+        directory (or an unreadable root) records nothing rather than failing a wait.
+        """
+        import admin
+        try:
+            path = admin.project_dir(Path(self.root), project_id)
+        except ValueError:
+            return None
+        return path if path.is_dir() else None
 
     def coordinator_wait(self, project_id, principal, idle_minutes):
         """One canonical wait read: queue and lanes share the endpoint's export."""
@@ -3668,7 +3700,8 @@ class EndpointBackend:
         if data.get('checkpoint'):
             point = data['checkpoint']
             unresolved = data.get('unresolved') or {}
-            carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved)
+            pointer_items={}
+            carry = self._open_items_in_full(project_id, task_id, point.get('comment_id'), unresolved,pointer_items)
             shown_items = [{'id': item.get('id'), 'kind': item.get('kind'),
                             'text': item.get('text'), 'source': item.get('source')}
                            for item in unresolved.get('items') or []
@@ -3695,9 +3728,18 @@ class EndpointBackend:
                           'acceptance': (data.get('acceptance') or {}).get('text'),
                           'newer_activity': point.get('newer_activity'),
                           'open_items': shown_items,
+                          'pointer_items': pointer_items if carry is not None else
+                                           {item['id']:pointer_items[item['id']] for item in shown_items if item['id'] in pointer_items},
+                          'resolved': (data.get('resolved') or {}).get('items',[]),
+                          'resolved_pointer_items': (data.get('resolved') or {}).get('pointer_items',{}),
+                          'resolved_total': (data.get('resolved') or {}).get('total',0),
+                          'resolved_omitted': (data.get('resolved') or {}).get('omitted',0),
                           'open_items_shown': shown,
                           'open_items_total': total,
                           **({'open_items_note': note} if note else {})}
+            from briefing import bound_context_pointer_display
+            checkpoint['pointer_items'],checkpoint['resolved_pointer_items']=bound_context_pointer_display(
+                [checkpoint['pointer_items'],checkpoint['resolved_pointer_items']])
         review = data.get('review') or {}
         current = review.get('contribution')
         priors = review.get('prior_contributions_total') or 0
@@ -3842,7 +3884,7 @@ class EndpointBackend:
         from briefing import changes_since_checkpoint
         return changes_since_checkpoint({'task': task, 'entries': []}, None, None, None)
 
-    def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved):
+    def _open_items_in_full(self, project_id, task_id, checkpoint_id, unresolved, pointer_items=None):
         """Every open item of the current checkpoint, as recorded, or None when they could not all be read.
 
         The next checkpoint must carry each one forward unchanged, ``source`` included, so
@@ -3853,7 +3895,10 @@ class EndpointBackend:
         reads. A checkpoint written between two reads makes the list unusable, and the
         template then says to read again.
         """
-        items = [dict(item) for item in unresolved.get('items') or [] if isinstance(item, dict)]
+        if pointer_items is not None:
+            pointer_items.clear()
+            pointer_items.update(unresolved.get('pointer_items') or {})
+        items = [{key:value for key,value in item.items() if key not in ('pointers','pointers_omitted')} for item in unresolved.get('items') or [] if isinstance(item, dict)]
         offset = unresolved.get('next_offset')
         if offset is None:
             return items
@@ -3870,7 +3915,10 @@ class EndpointBackend:
             every = whole.get('unresolved') or {}
             if every.get('next_offset') is not None:
                 return None
-            return [dict(item) for item in every.get('items') or [] if isinstance(item, dict)]
+            if pointer_items is not None:
+                pointer_items.clear()
+                pointer_items.update(every.get('pointer_items') or {})
+            return [{key:value for key,value in item.items() if key not in ('pointers','pointers_omitted')} for item in every.get('items') or [] if isinstance(item, dict)]
         for _ in range(self.OPEN_ITEM_PAGES):
             if offset is None:
                 return items
@@ -3880,7 +3928,9 @@ class EndpointBackend:
             if not isinstance(page, dict) or (page.get('checkpoint') or {}).get('comment_id') != checkpoint_id:
                 return None
             more = page.get('unresolved') or {}
-            items += [dict(item) for item in more.get('items') or [] if isinstance(item, dict)]
+            if pointer_items is not None:
+                pointer_items.update(more.get('pointer_items') or {})
+            items += [{key:value for key,value in item.items() if key not in ('pointers','pointers_omitted')} for item in more.get('items') or [] if isinstance(item, dict)]
             offset = more.get('next_offset')
         return items if offset is None else None
 
@@ -8216,7 +8266,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise HttpError(400, 'invalid_request', 'form must be worker or coordinator')
         if form == 'coordinator':
             return self._agent_coordinator_wait(ctx, agent)
+        since = ctx.query.get('since')
+        # Review n4: the worker form always ignored an unusable since; the record-only
+        # feature made it a 400.  Keep the old worker behaviour and ignore it (the
+        # coordinator form still refuses it, as it always did).
+        if since is not None and not waiting.is_fingerprint(since):
+            since = None
         rows = []
+        #: One entry per project this read covered: its full queue rows (the closest
+        #: HTTP fact to the CLI's ``work --mine`` list) and the rows that are its move.
+        #: kittrial-5bb.397 records an empty wake from these without another read.
+        project_reads = []
         #: The claiming setting of every project this read covered (kittrial-5bb.352
         #: review item S1): the same fresh per-project read the endpoints and
         #: /v1/agents/me/next use, so an empty wait under 'assigned' carries the
@@ -8235,6 +8295,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             if item is not None:
                 rows.append(dict(item, project=project_id))
             read = self._agent_project_tasks(project_id)
+            project_rows = []
+            project_move_rows = []
             for task in read.get('tasks') or []:
                 if not isinstance(task, dict):
                     continue
@@ -8244,29 +8306,35 @@ class ApiHandler(BaseHTTPRequestHandler):
                     pending = task.get('open_requests')
                 if not isinstance(pending, int):
                     pending = 0
+                holds = claim_limit.actor_holds(task.get('assignee'), actor)
                 move, _text, next_actor_value = move_decision(
-                    state, task.get('id'), claim_limit.actor_holds(task.get('assignee'), actor),
+                    state, task.get('id'), holds,
                     pending_items=pending, redelivered=bool(task.get('redelivered')),
                     assignee=task.get('assignee'), closed=task.get('status') == 'closed',
                     claimable=task.get('claimable') if isinstance(task.get('claimable'), bool) else None,
                     comment_pending=attention_field(task, 'assignee_comment_pending') is True)
+                if not holds and move != 'you':
+                    continue
+                row = dict(task, task=task.get('id'), project=project_id,
+                           whose_move=move, next_actor=next_actor_value,
+                           # The wait row carries the marker and its counts
+                           # (kittrial-5bb.351): a new other-party entry, or an edit to
+                           # it, moves the fingerprint even while the boolean stays true.
+                           newer_activity_marker=attention_field(task, 'newer_activity_marker'),
+                           newer_activity_fields=attention_field(task, 'newer_activity_fields'),
+                           # The checkpoint-independent marker the worker's wait
+                           # fingerprints (kittrial-5bb.369): the agent's own checkpoint
+                           # does not move it.
+                           wait_newer_activity_marker=attention_field(task, 'wait_newer_activity_marker'),
+                           newer_activity_by_others=attention_field(task, 'newer_activity_by_others'),
+                           newer_activity_own=attention_field(task, 'newer_activity_own'),
+                           newer_activity_coverage=attention_field(task, 'newer_activity_coverage'),
+                           unresolved_directions=attention_field(task, 'unresolved_directions'))
+                project_rows.append(row)
                 if move == 'you':
-                    rows.append(dict(task, task=task.get('id'), project=project_id,
-                                     whose_move=move, next_actor=next_actor_value,
-                                     # The wait row carries the marker and its counts
-                                     # (kittrial-5bb.351): a new other-party entry, or an
-                                     # edit to it, moves the fingerprint even while the
-                                     # boolean stays true.
-                                     newer_activity_marker=attention_field(task, 'newer_activity_marker'),
-                                     newer_activity_fields=attention_field(task, 'newer_activity_fields'),
-                                     # The checkpoint-independent marker the worker's
-                                     # wait fingerprints (kittrial-5bb.369): the agent's
-                                     # own checkpoint does not move it.
-                                     wait_newer_activity_marker=attention_field(task, 'wait_newer_activity_marker'),
-                                     newer_activity_by_others=attention_field(task, 'newer_activity_by_others'),
-                                     newer_activity_own=attention_field(task, 'newer_activity_own'),
-                                     newer_activity_coverage=attention_field(task, 'newer_activity_coverage'),
-                                     unresolved_directions=attention_field(task, 'unresolved_directions')))
+                    project_move_rows.append(row)
+                    rows.append(row)
+            project_reads.append((project_id, project_rows, project_move_rows))
         # The project's claiming setting on the wait read (kittrial-5bb.352 review item
         # S1). The wait can span projects, so report one mode only when they agree;
         # under any 'assigned' project an empty wait carries the empty-list sentence,
@@ -8279,6 +8347,28 @@ class ApiHandler(BaseHTTPRequestHandler):
             from claiming import EMPTY_SENTENCE
             empty_message = EMPTY_SENTENCE
         view = waiting.worker_view(rows, claiming=claiming, empty_message=empty_message)
+        if since is not None:
+            view['changed'] = since != view['fingerprint']
+        # kittrial-5bb.397: one bounded host log per project, written only for the actor
+        # this credential resolves to. Any error is a warning on the answer, never a
+        # failed wait; no tracker record is written.  It runs on every poll, exactly as
+        # the CLI's read does (review n2); the shared observer skips an unchanged write.
+        import wake_log
+        warnings = []
+        for project_id, project_rows, project_move_rows in project_reads:
+            try:
+                project_dir = self.backend.wake_project_dir(project_id)
+            except (OSError, ValueError):
+                project_dir = None
+            if project_dir is None:
+                continue
+            warnings.extend(wake_log.observe(
+                project_dir, actor, since,
+                dict(view, items=waiting.movement(project_move_rows),
+                     fingerprint=view['fingerprint']),
+                project_rows))
+        if warnings:
+            view['warnings'] = warnings
         view['agent'] = agent.get('id')
         view['generated_at'] = now_iso(self.service._now())
         view['manual_cadence'] = ('Read this route again to see a change; it never blocks, '
@@ -11664,6 +11754,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         task=None,
         contribution=None,
     ):
+        capped_contribution = str(contribution)[:200] if contribution else None
         with self.service.store.lock:
             event = self.service.audit(
                 ctx.request_id,
@@ -11675,22 +11766,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             )
             if isinstance(record, dict):
                 event['task'] = record.get('task') or task
-                event['contribution'] = record.get('contribution') or contribution
+                raw_contribution = record.get('contribution') or capped_contribution
+                event['contribution'] = str(raw_contribution)[:200] if raw_contribution else None
                 event['commit'] = record.get('commit')
                 if sha256 is None and isinstance(record.get('delivery'), dict):
                     sha256 = record['delivery'].get('sha256')
             else:
                 if task is not None:
                     event['task'] = task
-                if contribution is not None:
-                    event['contribution'] = contribution
+                if capped_contribution is not None:
+                    event['contribution'] = capped_contribution
             if sha256 is not None:
                 event['sha256'] = sha256
             if size_bytes is not None:
                 event['bytes'] = size_bytes
             self.service.store.save_soon('the audit entry of a bundle read')
 
-    def _send_bundle_stream(self, handle_fd, record, verified):
+    def _send_bundle_stream(self, handle_fd, record, verified, ctx=None, pid=None):
         from review_workflow import BUNDLE_BLOCK_BYTES
         headers_sent = False
         try:
@@ -11765,6 +11857,23 @@ class ApiHandler(BaseHTTPRequestHandler):
         except Exception:
             self.close_connection = True
             if not headers_sent:
+                audit_ctx = ctx
+                if audit_ctx is None and getattr(self, 'service', None) is not None:
+                    from types import SimpleNamespace
+                    audit_ctx = SimpleNamespace(
+                        request_id=getattr(self, '_current_request_id', None) or '',
+                        principal=getattr(self, '_principal', None) or '',
+                    )
+                if audit_ctx is not None:
+                    self._audit_bundle_read(
+                        audit_ctx,
+                        pid if pid is not None else (record.get('project') if isinstance(record, dict) else None),
+                        record,
+                        'interrupted',
+                        reason='stream_error',
+                        sha256=verified.get('sha256') if isinstance(verified, dict) else None,
+                        size_bytes=verified.get('bytes') if isinstance(verified, dict) else None,
+                    )
                 raise
             try:
                 self.wfile.flush()
@@ -11937,7 +12046,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 contribution=contribution_id,
             )
             raise
-        outcome, interrupt_reason = self._send_bundle_stream(handle_fd, record, verified)
+        outcome, interrupt_reason = self._send_bundle_stream(handle_fd, record, verified, ctx=ctx, pid=pid)
         self._audit_bundle_read(
             ctx,
             pid,
@@ -12075,7 +12184,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
         scope = self._lanes_scope(ctx.principal, ctx.params['pid'])
         read = self.backend.lanes_read(
-            ctx.params['pid'],
+            ctx.params['pid'], ctx.principal,
             ['--idle-minutes', str(idle_minutes), '--limit', str(limit), '--offset', str(state['o'])],
             self._lanes_actor(ctx.principal), scope)
         body = dict(read)

@@ -73,11 +73,19 @@ result also carries `changed`: per task the fields that changed old -> new, and 
 added and removed since the last list it printed (additive; ignore it if you do not need
 it). Run `wait`; act on what it returns; run `wait` again. Its exit codes are 0 (something
 is your move), 1 (`--timeout` ran out), 2 (the arguments or the endpoint refused) and 3
-(the service could not be reached). The coordinator has the same thing over the four
-things it wakes for - a delivery awaiting review, approved work awaiting integration, a
-checkpoint addressed to the coordinator, and a lane quiet on its own move or past a
-declared wait - as `wait --coordinator`: run `wait --coordinator`; act on what it returns;
-run `wait --coordinator` again. An agent with a web credential reads the same worker form,
+(the service could not be reached). A wake that changes the fingerprint but carries no
+row that is the caller's move is an EMPTY wake: the wait itself is unchanged, and the
+endpoint records it (once per actor, task and fingerprint) in a small bounded host log
+under the project's `.wait-wakes/`. `work lanes` shows each lane's `empty_wakes_24h` and
+the newest empty wake's task and trigger; the coordinator form also has an `empty-wake`
+trigger for a lane with three different empty wakes in 24 hours, so a worker that keeps
+being woken to find nothing is visible instead of silent. The log is additive, never
+written to the tracker, and a log error only adds a `warnings` entry - it can never fail
+or change a wait. The coordinator has the same thing over the things it wakes for - a
+delivery awaiting review, approved work awaiting integration, a checkpoint addressed to
+the coordinator, a lane quiet on its own move or past a declared wait, and a lane with
+repeated empty wakes - as `wait --coordinator`: run `wait --coordinator`; act on what it
+returns; run `wait --coordinator` again. An agent with a web credential reads the same worker form,
 one read, at `GET /v1/agents/me/wait`, and blocks in the loop of whatever runs it.
 
 An agent should not invent the next wait after an empty timeout. Pass `--idle-since TIME`

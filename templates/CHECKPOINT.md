@@ -48,6 +48,41 @@ holds every one of them (the template's `carried_open_items` is that count). Cop
 template's list (or `carry_open_items`), never the first ten. When `carry_open_items` is
 null the items could not all be read: read the brief again before writing the checkpoint.
 
+## Pointers in source and evidence
+
+An open item's `source` and a resolved item's `evidence` may contain whitespace-separated
+`KIND:VALUE` tokens among ordinary prose. The kinds are `task`, `comment`, `ref`, `cap`,
+`item`, `file`, `room`, `commit`, `doc` and `archive`. Values contain 1–200 characters
+from `A–Z a–z 0–9 . _ / # : -`; the whole field still has its existing 240-character limit.
+For example: `task:example-task ref:host.build.rule (the original decision)`.
+Punctuation is not stripped: `task:x.` names `x.`, and `task:x:` names `x:`.
+Separate sentence punctuation with whitespace when you mean `task:x`.
+Prose and malformed tokens remain legal; stored text is never rewritten.
+
+The CLI's `unresolved.items` and HTTP's `checkpoint.open_items` keep the original
+checkpoint item shape and can be copied verbatim when the list is complete. Respect
+paging: `carry_open_items` and the checkpoint template body hold the complete list.
+Resolution is separate, keyed by item id: CLI `unresolved.pointer_items` and
+`resolved.pointer_items`; HTTP `checkpoint.pointer_items` and
+`checkpoint.resolved_pointer_items`. Do not copy those metadata maps into a checkpoint.
+Older kits can read and carry the same source/evidence strings unchanged.
+
+There are five read states:
+
+- `live`: the target exists in loaded authorized data; this does not prove the claim.
+- `superseded`: an explicitly retired or replaced record, not an additive `follows` delivery.
+- `unavailable`: absent, inaccessible, malformed, conflicted or ambiguous targets;
+  task/comment requests for record anchors and hidden record comments are unavailable too.
+  Answers have no target label or follow command and do not distinguish these cases.
+- `unchecked`: uniform for every target of an unloaded kind, including file, room,
+  item, commit, doc and archive. Resolution performs no new I/O.
+- `unresolved`: beyond 10 resolved pointers per item or 50 per brief, counted in `pointers_omitted`.
+
+Every pointer carries `trust: data`. Labels are escaped before clipping to 120 characters,
+without cutting a Unicode escape. The text brief folds line breaks in pointer labels,
+source, reason and evidence, and escapes direction marks. Pure prose does not build a
+pointer index.
+
 ## lane_state (a sibling, not a checkpoint field)
 
 `lane_state` travels in the same payload FILE beside the checkpoint object and is popped

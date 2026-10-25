@@ -136,6 +136,17 @@ export function lanesPanel(ctx, project) {
       // Raised flags, each naming the tasks the read put under it (`flag_tasks`).
       raised.length ? h('div', { class: 'small' }, raised.map(([key, label]) => h('span', { class: 'chip warn', 'data-flag': key },
         label, (lane.flag_tasks && lane.flag_tasks[key] ? ': ' + lane.flag_tasks[key].join(', ') : '')))) : null,
+      // A lane-raised fault (kittrial-5bb.398): the server's escaped, clipped text, shown until a coordinator clears it.
+      lane.needs_investigation ? h('div', { class: 'small', 'data-fault': 'true' },
+        h('span', { class: 'chip warn' }, 'Needs investigation'), ' ',
+        h('span', null, lane.needs_investigation.reason),
+        h('span', { class: 'muted' }, ' · raised ', ageText(lane.needs_investigation.age_seconds), ' ago on ',
+          h('span', { class: 'mono' }, lane.needs_investigation.task),
+          lane.needs_investigation.about_task ? [' about ', h('span', { class: 'mono' }, lane.needs_investigation.about_task)] : null),
+        (lane.needs_investigation.earlier || []).map((older) => h('div', { class: 'muted', 'data-fault-earlier': 'true' },
+          'Earlier open: ', older.reason)),
+        lane.needs_investigation.earlier_omitted > 0 ? h('div', { class: 'muted', 'data-fault-omitted': 'true' },
+          '+', lane.needs_investigation.earlier_omitted, ' more earlier open not shown') : null) : null,
       held.length ? h('ul', { class: 'lane-tasks' }, held.map((entry) => taskLine(entry))) : null,
       lane.idle ? h('p', { class: 'small muted' }, 'Holds nothing; free to take work. Last write ', ageText(lane.last_write_age_seconds), ' ago.') : null);
   }

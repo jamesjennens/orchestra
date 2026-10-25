@@ -1307,6 +1307,16 @@ class HttpDeliveryTests(unittest.TestCase):
                 'not_found',
                 expected_cid='bad id!',
             )
+            # 5b. 5000-character malformed contribution id -> capped at 200 characters in audit
+            long_malformed = ('m' * 4999) + '!'
+            self.assertEqual(len(long_malformed), 5000)
+            assert_one_refused_line(
+                route_base + '?contribution=' + long_malformed,
+                404,
+                'not_found',
+                expected_cid='m' * 200,
+            )
+            self.assertLessEqual(len(self._bundle_audit_events()[-1]['contribution']), 200)
 
         # 6. Unknown task on both routes -> 404 not_found
         for suffix in ('/delivery', '/delivery/bundle'):
@@ -1337,46 +1347,120 @@ class HttpDeliveryTests(unittest.TestCase):
             assert_one_refused_line(base_bundle, 503, 'deployment_unavailable')
 
     def test_s1_file_rewritten_in_place_after_verification_aborts_stream_and_audits_interrupted(self):
-        """s1-s2-stream-integrity (S1): a file rewritten in place after verify_served_bundle holds back
-        the final block, aborts the connection on digest/fstat mismatch, and audits interrupted.
+        """s1-s2-stream-integrity (S1): a multi-block file (>= 3 blocks + tail) whose LAST block is
+        rewritten in place mid-stream holds back the final block, closes the connection, and audits
+        interrupted / bundle_checksum_mismatch.
         """
-        orig_verify = rw.verify_served_bundle
-        call_count = [0]
+        tail_len = 137
+        multi_len = (3 * rw.BUNDLE_BLOCK_BYTES) + tail_len
+        base_bytes = self.fixture['bundle1_bytes']
+        pad_len = multi_len - len(base_bytes)
+        self.assertGreater(pad_len, tail_len)
+        multi_bytes = base_bytes + (b'A' * (pad_len - tail_len)) + (b'Z' * tail_len)
+        self.assertEqual(len(multi_bytes), multi_len)
+        multi_sha256 = hashlib.sha256(multi_bytes).hexdigest()
 
-        def verify_then_tamper(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs):
-            result = orig_verify(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs)
-            call_count[0] += 1
-            if call_count[0] >= 2:
-                tampered = bytearray(self.fixture['bundle1_bytes'])
-                tampered[-1] ^= 0xFF
-                # Rewrite in place on the same inode so handle_fd reads the mutated bytes during streaming
-                with open(resolved_path, 'r+b') as f:
-                    f.seek(0)
-                    f.write(bytes(tampered))
-                    f.flush()
-            return result
+        self.bundle_path.write_bytes(multi_bytes)
+        orig_contribs = copy.deepcopy(self.backend.state['contributions'][self.task_id])
+        updated_contribs = copy.deepcopy(orig_contribs)
+        updated_contribs[0]['delivery']['sha256'] = multi_sha256
+        self.backend.state['contributions'][self.task_id] = updated_contribs
+        try:
+            orig_verify = rw.verify_served_bundle
+            orig_os_read = os.read
+            stream_target = [None]
+            stream_reads = [0]
 
-        out_dir = self.tmp_path / 's1-out'
-        out_dir.mkdir()
-        out_file = out_dir / 'tampered.bundle'
-        before_events = len(self._bundle_audit_events())
+            def verify_capture_stream(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs):
+                result = orig_verify(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs)
+                stream_target[0] = (resolved_path, handle_fd)
+                stream_reads[0] = 0
+                return result
 
-        with mock.patch('review_workflow.verify_served_bundle', side_effect=verify_then_tamper):
-            hc = http_client.Client(self.base_url).use_credential(self.contrib_token)
-            with self.assertRaisesRegex(ValueError, 'does not match its recorded checksum'):
-                hc.delivery_bundle(self.alpha_id, self.task_id, str(out_file))
+            def read_and_rewrite_last_block_mid_stream(fd, n):
+                chunk = orig_os_read(fd, n)
+                target = stream_target[0]
+                if target is not None and fd == target[1]:
+                    stream_reads[0] += 1
+                    if stream_reads[0] == 2:
+                        # Mid-stream (after 2 blocks read): rewrite the LAST block in place on the same inode.
+                        with open(target[0], 'r+b') as f:
+                            f.seek(3 * rw.BUNDLE_BLOCK_BYTES)
+                            f.write(b'X' * tail_len)
+                            f.flush()
+                return chunk
 
-        self.assertFalse(out_file.exists())
-        self.assertEqual(list(out_dir.iterdir()), [])
-        events = self._bundle_audit_events()
-        self.assertEqual(len(events), before_events + 1, events)
-        self.assertEqual(events[-1]['outcome'], 'interrupted', events[-1])
-        self.assertEqual(events[-1]['reason'], 'bundle_checksum_mismatch', events[-1])
+            # 1. Raw HTTP stream check: first 3 blocks arrive, last block is held back and NOT sent,
+            #    connection is closed by the server, and audit records interrupted / bundle_checksum_mismatch.
+            before_events = len(self._bundle_audit_events())
+            with mock.patch('review_workflow.verify_served_bundle', side_effect=verify_capture_stream), \
+                    mock.patch('os.read', side_effect=read_and_rewrite_last_block_mid_stream):
+                conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
+                try:
+                    conn.request(
+                        'GET',
+                        '/v1/projects/%s/tasks/%s/delivery/bundle' % (self.alpha_id, self.task_id),
+                        headers={'Authorization': 'Bearer ' + self.contrib_token},
+                    )
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    self.assertEqual(int(resp.getheader('Content-Length')), multi_len)
+                    with self.assertRaises(http.client.IncompleteRead) as cm:
+                        resp.read()
+                    partial = cm.exception.partial
+                    sock_closed = (conn.sock is None) or (conn.sock.recv(1) == b'')
+                finally:
+                    conn.close()
+
+            self.assertEqual(len(partial), 3 * rw.BUNDLE_BLOCK_BYTES)
+            self.assertEqual(partial, multi_bytes[:3 * rw.BUNDLE_BLOCK_BYTES])
+            self.assertNotIn(b'Z' * tail_len, partial)
+            self.assertNotIn(b'X' * tail_len, partial)
+            self.assertTrue(sock_closed)
+            events = self._bundle_audit_events()
+            self.assertEqual(len(events), before_events + 1, events)
+            self.assertEqual(events[-1]['outcome'], 'interrupted', events[-1])
+            self.assertEqual(events[-1]['reason'], 'bundle_checksum_mismatch', events[-1])
+
+            # 2. Client helper check on the same multi-block mid-stream rewrite: refuses and leaves no file.
+            self.bundle_path.write_bytes(multi_bytes)
+            stream_target[0] = None
+            verify_calls = [0]
+
+            def verify_capture_second_call(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs):
+                result = orig_verify(resolved_path, handle_fd, size, expected_sha256, expected_commit, **kwargs)
+                verify_calls[0] += 1
+                if verify_calls[0] >= 2:
+                    stream_target[0] = (resolved_path, handle_fd)
+                    stream_reads[0] = 0
+                return result
+
+            out_dir = self.tmp_path / 's1-out'
+            out_dir.mkdir()
+            out_file = out_dir / 'tampered.bundle'
+            before_events = len(self._bundle_audit_events())
+            with mock.patch('review_workflow.verify_served_bundle', side_effect=verify_capture_second_call), \
+                    mock.patch('os.read', side_effect=read_and_rewrite_last_block_mid_stream):
+                hc = http_client.Client(self.base_url).use_credential(self.contrib_token)
+                with self.assertRaisesRegex(ValueError, 'does not match its recorded checksum'):
+                    hc.delivery_bundle(self.alpha_id, self.task_id, str(out_file))
+
+            self.assertFalse(out_file.exists())
+            self.assertEqual(list(out_dir.iterdir()), [])
+            events = self._bundle_audit_events()
+            self.assertEqual(len(events), before_events + 1, events)
+            self.assertEqual(events[-1]['outcome'], 'interrupted', events[-1])
+            self.assertEqual(events[-1]['reason'], 'bundle_checksum_mismatch', events[-1])
+        finally:
+            self.backend.state['contributions'][self.task_id] = orig_contribs
+            self.bundle_path.write_bytes(self.fixture['bundle1_bytes'])
 
     def test_s2_short_read_and_read_error_close_connection_without_hanging_or_json_500(self):
         """s1-s2-stream-integrity (S2): when os.read returns empty with bytes still owed (or raises
         OSError after 200 headers), the server sets close_connection = True, closes without hanging
-        to the client timeout, never writes a JSON 500 after 200 headers, and audits interrupted.
+        to the client timeout, never writes a JSON 500 after 200 headers, and audits interrupted;
+        and when a header write raises before headers_sent, it leaves exactly one interrupted
+        stream_error audit line.
         """
         orig_verify = rw.verify_served_bundle
 
@@ -1429,7 +1513,7 @@ class HttpDeliveryTests(unittest.TestCase):
             return orig_os_read(fd, n)
 
         before_events = len(self._bundle_audit_events())
-        with mock.patch('review_workflow.verify_served_bundle', side_effect=failing_stream_read if False else verify_capture_fd), \
+        with mock.patch('review_workflow.verify_served_bundle', side_effect=verify_capture_fd), \
                 mock.patch('os.read', side_effect=failing_stream_read):
             conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
             try:
@@ -1454,6 +1538,41 @@ class HttpDeliveryTests(unittest.TestCase):
         self.assertEqual(len(events), before_events + 1, events)
         self.assertEqual(events[-1]['outcome'], 'interrupted', events[-1])
         self.assertEqual(events[-1]['reason'], 'stream_error', events[-1])
+
+        # Case C: header write raises before headers_sent -> leaves exactly one interrupted/stream_error audit line
+        handler_cls = self.httpd.RequestHandlerClass
+        orig_send_header = handler_cls.send_header
+
+        def failing_bundle_header(handler_self, keyword, value):
+            if keyword == 'X-Orchestra-Bundle-Sha256':
+                raise ConnectionResetError('simulated header write failure before headers_sent')
+            return orig_send_header(handler_self, keyword, value)
+
+        before_events = len(self._bundle_audit_events())
+        with mock.patch.object(handler_cls, 'send_header', new=failing_bundle_header):
+            conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
+            try:
+                conn.request(
+                    'GET',
+                    '/v1/projects/%s/tasks/%s/delivery/bundle' % (self.alpha_id, self.task_id),
+                    headers={'Authorization': 'Bearer ' + self.contrib_token},
+                )
+                try:
+                    resp = conn.getresponse()
+                    resp.read()
+                except (http.client.HTTPException, OSError):
+                    pass
+            finally:
+                conn.close()
+
+        events = self._bundle_audit_events()
+        self.assertEqual(len(events), before_events + 1, events)
+        self.assertEqual(events[-1]['outcome'], 'interrupted', events[-1])
+        self.assertEqual(events[-1]['reason'], 'stream_error', events[-1])
+        self.assertEqual(events[-1]['task'], self.task_id, events[-1])
+        self.assertEqual(events[-1]['contribution'], self.contribution_id, events[-1])
+        self.assertEqual(events[-1]['sha256'], self.bundle_sha256, events[-1])
+        self.assertEqual(events[-1]['bytes'], len(self.fixture['bundle1_bytes']), events[-1])
 
     def test_s4_approve_only_principal_and_filesystem_and_verification_mutants(self):
         """s4-tests-and-notes: kill remaining mutants across authorization, filesystem resolution,

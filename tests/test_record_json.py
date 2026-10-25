@@ -255,6 +255,11 @@ class NoUnguardedParseTests(unittest.TestCase):
                                      'host-written file itself and refuses a file it cannot read, a deeply nested '
                                      'one included'),
         'version.py': (1, "the kit's own version file"),
+        'wake_log.py': (2, 'the bounded empty-wake host log this kit writes (kittrial-5bb.397): '
+                          'the audit is read one line at a time, at most 32 KiB, and a damaged line '
+                          'is skipped rather than raised into a wait; the .last.json snapshot is the '
+                          'kit\'s own small state, at most 64 KiB, and an unreadable, nested or corrupt '
+                          'value is caught and treated as no remembered rows'),
         'waiting.py': (1, "the wait's own small state file beside the caller's config (kittrial-5bb.327 "
                           'review 2): text this kit wrote, read at most 64 KiB at a time, and any unreadable, '
                           'nested or corrupt value is caught and treated as absent'),
@@ -311,7 +316,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # completeness record already at the operator's destination: text this kit did
             # not just write itself, so a deeply nested one is described rather than
             # crashing the copy out of the guard.
-            'admin.py': 10,
+            'admin.py': 11,
             # D2: bounded native history, review VOID and preserved target payload.
             'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
@@ -395,6 +400,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # actor's comment, its host journal entry files and the bd comments-add
             # receipts of both writes through the guard (four).
             'followon.py': 4,
+            # kittrial-5bb.398: fault_clear.py parses the reserved clear body, its journal entry
+            # files and the bd comments-add receipt through the guard (three).
+            'fault_clear.py': 3,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

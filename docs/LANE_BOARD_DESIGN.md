@@ -169,6 +169,26 @@ its own lane's row**, and a **member of another project sees nothing** — the e
 `key_project_refusal` already enforces that before any read, and the board adds no new data path
 around it. **Both are tested.**
 
+### 3.1 Empty wakes (kittrial-5bb.397)
+
+A worker `wait` can wake because the fingerprint of its move rows changed while none of the changed
+rows is its move any more (the integrated-but-open case of kittrial-5bb.390 is the example): the
+worker is woken to find nothing. That is not hidden and not a second wake rule; the same read records
+it. Each lane row carries four additive fields outside the move fields and the three flags:
+
+- `empty_wakes_24h` — how many DIFFERENT wake fingerprints in the last 24 hours changed a row but
+  left no row that was the lane's move;
+- `empty_wake_task`, `empty_wake_trigger`, `empty_wake_at` — the newest one: its task, the field class
+  that changed (`new-comment`, `review-state`, `assignment`, `delivery`, `review-items`, `status`,
+  `guidance` or `edit`) and when.
+
+The record is one append-only JSONL per lane under the project's `.wait-wakes/` (a short hash of the
+actor names the file), capped at 4096 bytes / 64 entries / 24 hours, with the last-seen rows in a
+bounded `.last.json` beside it; it is written by the worker read itself, never by a tracker write,
+and a log error is swallowed into an answer `warnings` entry. The coordinator form gains an
+`empty-wake` trigger: one row per lane whose `empty_wakes_24h` is 3 or more. That group is part of the
+coordinator fingerprint only when it has a row, so an unchanged quiet answer keeps its old fingerprint.
+
 ## 4. The web: the Lanes panel
 
 The panel belongs on the **project page of the web service, for owners and coordinators**
@@ -182,7 +202,10 @@ office surface.
 scope: owners and coordinators — the same `review_workflow.listed_operator_actor` definition the
 endpoint itself uses — read every lane, and everybody else is scoped to their own agents' lanes,
 exactly the contributor route's rule. The transport default is a property of the route, not an
-authority the page may inherit.
+authority the page may inherit. The backend sends the authenticated caller's principal with a
+`read` authority descriptor and requires live authority on the endpoint; only `work lanes` has
+that table entry. The descriptor authorizes the member read, while `lanes_scope` still only
+narrows the route-selected scope.
 
 ## 5. What an older checkpoint, an older kit and a rollback mean
 
@@ -323,6 +346,28 @@ act instead of leaving it to be discovered.
 `state` is deliberately the same vocabulary `kittrial-5bb.207` needs when it pushes a change to a
 waiting agent, so that work adds the push and does not redefine the state. The record lives beside
 the checkpoint precisely so that the push work can extend it without reopening the checkpoint schema.
+
+## 9a. Needs investigation (kittrial-5bb.398)
+
+A lane may raise a fault flag that is its own channel (`lane_state.newest()` and so the held task's
+declared state skip needs-investigation records, so a raise never replaces `waiting_on`, `expect_by` or the
+`checkpoint-to-coordinator` trigger, and a clear gives nothing back because nothing was taken). It is independent of its working/waiting state: a `lane-state-v1`
+record with `state: needs-investigation`, a required `reason` (at most 300 characters, one printable
+line) and an optional `about_task`. The reason is untrusted everywhere: escaped, clipped to 300 and
+folded onto one line in text views. The board's lane row carries `needs_investigation` (reason, task,
+record, since, age) on every lane, faulted lanes sort first, and the flags summary counts them. The
+flag is the lane's newest raise across all its tasks, closed ones included; a later state record never
+clears it. Only `coordinator fault-clear` (or the host `admin.py fault-clear`) clears it, writing a
+`lane-fault-clear-v1` comment plus a journal entry that records who and when. A newer raise does not hide an older open one: the
+row's `needs_investigation.earlier` lists up to five older open raises and `earlier_omitted` counts the rest (a clear
+of the newest ends them all), and the wait row carries `task` (the `about_task`, else the raised-on task),
+`raised_on`, the older reasons and `earlier_omitted`. The web Lanes panel renders the reason as text, with the
+omitted count. The coordinator wait gains a `needs-investigation` trigger, ordered before any empty-wake trigger.
+An EMPTY group never enters the coordinator fingerprint, so every fingerprint is unchanged while nothing is
+flagged; a non-empty group is fingerprinted by stable fields only (lane, actor, task, raised-on task, raise
+record and time), never by the reason text or the age. An older kit drops the unknown state and so does not
+show the flag; the clear reads there as an ordinary comment. Use it for process faults, not task
+blockers, which stay open items.
 
 ## 10. Decisions taken (the two former owner questions are closed)
 

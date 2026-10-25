@@ -130,9 +130,16 @@ WORKER_MOVE_FIELDS = ('task', 'review_state', 'whose_move', 'next_actor', 'owner
                       'contribution_id', 'pending_review_items', 'redelivered',
                       'guidance_version', 'wait_newer_activity_marker')
 
-#: The four things a coordinator wakes for, in the order the task names them.
+#: The things a coordinator wakes for, in the order the task names them. ``needs-investigation``
+#: (kittrial-5bb.398) is a lane-raised fault that stays until a coordinator clears it. ``empty-wake``
+#: (kittrial-5bb.397) is the lane board's count of worker wakes that changed nothing the
+#: caller could act on: three DIFFERENT fingerprints in 24 hours on one lane.
 COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
-                        'checkpoint-to-coordinator', 'lane-quiet')
+                        'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake', 'needs-investigation')
+#: Triggers whose EMPTY group stays out of the fingerprint, so a quiet answer keeps the
+#: fingerprint it had before they were added (coordinator rule for .397 and .398).
+OPTIONAL_TRIGGERS = ('empty-wake', 'needs-investigation')
+EMPTY_WAKE_TRIGGER = 3
 
 #: The lane board flags a coordinator acts on: a lane quiet on its own move, or past a
 #: declared wait. ``waiting_too_long`` and ``expect_by_passed`` are the declared waits;
@@ -605,6 +612,36 @@ def _lane_row(lane, entry=None):
             'flags': sorted(set(entry.get('flags') or []))}
 
 
+def _empty_wake_row(lane):
+    """One lane's empty-wake count as a trigger row (stable fields only)."""
+    return {'lane': _scalar(lane.get('lane')), 'actor': _scalar(lane.get('actor')),
+            'task': _scalar(lane.get('empty_wake_task')),
+            'trigger': _scalar(lane.get('empty_wake_trigger')),
+            'empty_wakes_24h': lane.get('empty_wakes_24h') if isinstance(lane.get('empty_wakes_24h'), int) else 0,
+            'at': _scalar(lane.get('empty_wake_at'))}
+
+
+def _fault_row(lane, fault):
+    """One raised fault, reduced to stable fields: no age, and the reason as already escaped."""
+    return {'lane': _scalar(lane.get('lane')), 'actor': _scalar(lane.get('actor')),
+            'task': _scalar(fault.get('about_task') or fault.get('task')),
+            'raised_on': _scalar(fault.get('task')),
+            'state': 'needs-investigation', 'reason': _scalar(fault.get('reason')),
+            'record': _scalar(fault.get('record')), 'since': _scalar(fault.get('since')),
+            'earlier': [_scalar(item.get('reason')) for item in fault.get('earlier') or []
+                        if isinstance(item, dict)],
+            'earlier_omitted': _count(fault.get('earlier_omitted'))}
+
+
+def _count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _fault_fingerprinted(row):
+    """The stable identity of one raise: who, where, which record and when; never the prose."""
+    return {name: row.get(name) for name in ('lane', 'actor', 'task', 'raised_on', 'record', 'since')}
+
+
 def coordinator_view(queue_items, lanes_payload):
     """The coordinator form's answer: the four trigger groups plus a fingerprint.
 
@@ -646,10 +683,20 @@ def coordinator_view(queue_items, lanes_payload):
                          or entry.get('next_actor') == 'coordinator')
             if addressed:
                 triggers['checkpoint-to-coordinator'].append(_lane_row(lane, entry))
+        fault = lane.get('needs_investigation')
+        if isinstance(fault, dict):
+            triggers['needs-investigation'].append(_fault_row(lane, fault))
+        count = lane.get('empty_wakes_24h')
+        if isinstance(count, int) and count >= EMPTY_WAKE_TRIGGER:
+            triggers['empty-wake'].append(_empty_wake_row(lane))
     grouped = {name: _sorted_rows(rows) for name, rows in triggers.items()}
     flat = [dict(row, trigger=name) for name in COORDINATOR_TRIGGERS for row in grouped[name]]
-    fingerprinted = {name: _sorted_rows([_fingerprinted(row) for row in rows])
-                     for name, rows in triggers.items()}
+    # An empty group of a trigger added after the fingerprint existed (OPTIONAL_TRIGGERS) never
+    # enters the fingerprint, so a quiet answer keeps its OLD fingerprint; a raised fault is
+    # fingerprinted by its stable identity, never its prose.
+    fingerprinted = {name: _sorted_rows([_fault_fingerprinted(row) if name == 'needs-investigation'
+                                         else _fingerprinted(row) for row in rows])
+                     for name, rows in triggers.items() if rows or name not in OPTIONAL_TRIGGERS}
     return {'schema': WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
             'items': flat, 'fingerprint': digest(fingerprinted)}
 
@@ -660,11 +707,18 @@ def parse_read_args(args):
     parser.add_argument('--coordinator', action='store_true')
     parser.add_argument('--idle-minutes', type=int, default=DEFAULT_IDLE_MINUTES,
                         dest='idle_minutes')
+    # kittrial-5bb.397: the READ accepts the caller's fingerprint as well, so the ONE
+    # read the wait already makes can also record an empty wake. An old endpoint that
+    # does not know the flag is unaffected: the client sends it only to this kit.
+    parser.add_argument('--since')
     parser.add_argument('--json', action='store_true')  # the output is always JSON
     parsed = parser.parse_args(args)
     if not IDLE_MINUTES_MIN <= parsed.idle_minutes <= IDLE_MINUTES_MAX:
         raise ValueError('Invalid wait read: --idle-minutes must be %d..%d'
                          % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
+    if parsed.since is not None and not is_fingerprint(parsed.since):
+        raise ValueError('Invalid wait read: --since takes a fingerprint this kit printed '
+                         '(wait1:<64 hex>)')
     return parsed
 
 
@@ -704,16 +758,21 @@ def parse_client_args(args):
     return parsed
 
 
-def read_args(options):
+def read_args(options, since=None):
     """The endpoint arguments for one poll, from the client's parsed options.
 
-    The client's poll bounds (``--interval``, ``--timeout``, ``--since``) are the
-    CLIENT's: the endpoint is asked for one read, not for a blocking call, so an HTTP
-    route and a bridge extension can use exactly the same read.
+    The client's poll bounds (``--interval``, ``--timeout``) are the CLIENT's: the
+    endpoint is asked for one read, not for a blocking call, so an HTTP route and a
+    bridge extension can use exactly the same read. ``since`` is the fingerprint the
+    caller already saw (kittrial-5bb.397); it is carried on the READ so the endpoint
+    can record an empty wake from the ONE read it already makes. It is omitted when
+    the caller has none, so a first baseline read is exactly the old request.
     """
     args = []
     if options.coordinator:
         args += ['--coordinator', '--idle-minutes', str(options.idle_minutes)]
+    if since is not None:
+        args += ['--since', since]
     return args
 
 

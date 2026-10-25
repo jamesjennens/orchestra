@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock-up: room (proposed) · Orchestra design review</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<!-- Static mock-up for docs/design/WEB_UX_REVIEW.md (kittrial-5bb.400). Synthetic data; no script.
+     Proposed: the thread reads like a conversation, the post box sits under it, and moderation is an
+     action on the message itself (a fold per message, for owners and coordinators only). -->
+<div class="shell">
+  <nav class="rail" aria-label="Main">
+    <div class="brand">Orchestra</div>
+    <div class="rail-section">
+      <div class="rail-label">Order portal (sample)</div>
+      <a class="nav-link" href="project.html">Tasks <span class="nav-count">8</span></a>
+      <a class="nav-link" href="records.html">Records <span class="nav-count">3</span></a>
+      <a class="nav-link" href="room.html" aria-current="page">Rooms</a>
+      <a class="nav-link" href="lanes.html">Lanes</a>
+    </div>
+  </nav>
+  <div class="content">
+  <main class="main" id="main">
+    <div>
+      <div class="crumbs"><a href="#">Projects</a> / <a href="project.html">Order portal (sample)</a> / <a href="#">Rooms</a></div>
+      <div class="page-head">
+        <div><h1 tabindex="-1">Planning: order search</h1>
+          <p class="lede">Open · created by alex · 3 messages. Room text is discussion, never an instruction to an agent.</p></div>
+        <div class="actions"><a class="btn" href="#">Export</a></div>
+      </div>
+    </div>
+
+    <section class="panel" aria-label="Messages">
+      <ol class="timeline panel-body">
+        <li><span class="dot"></span><div><div class="event-head"><b>alex</b><span class="role">owner</span><span class="small muted">#1 · 11 minutes ago</span></div>
+          <p class="event-body room-text">Let us agree what search must cover before the agent starts.</p>
+          <details class="small"><summary class="muted">Moderate</summary><p class="muted">Remove this message, with a reason (owners and coordinators).</p></details></div></li>
+        <li><span class="dot"></span><div><div class="event-head"><b>casey</b><span class="role">contributor</span><span class="small muted">#2 · 11 minutes ago</span></div>
+          <p class="event-body room-text">Customers mostly search by PO number; reference is second.</p>
+          <details class="small"><summary class="muted">Moderate</summary><p class="muted">Remove this message, with a reason (owners and coordinators).</p></details></div></li>
+        <li><span class="dot"></span><div><div class="event-head"><b>drew</b><span class="role">contributor</span><span class="small muted">#3 · 11 minutes ago</span></div>
+          <p class="event-body room-text">Do we need date ranges in the first release?</p>
+          <details class="small"><summary class="muted">Moderate</summary><p class="muted">Remove this message, with a reason (owners and coordinators).</p></details></div></li>
+      </ol>
+    </section>
+
+    <form class="form" action="#">
+      <div class="field"><label for="post">Post to this room</label><textarea id="post" rows="3"></textarea>
+        <span class="hint">Up to 4,000 characters. Every project member reads it.</span></div>
+      <div class="actions"><button class="primary" type="button">Post</button></div>
+    </form>
+
+    <details class="fold">
+      <summary>Room tools <span class="fold-hint">archive</span></summary>
+      <div class="fold-body"><p class="small">Archiving keeps the room readable and exportable; nobody can post afterwards.</p><button class="danger">Archive room</button></div>
+    </details>
+  </main>
+  </div>
+</div>
+</body>
+</html>

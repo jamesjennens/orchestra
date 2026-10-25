@@ -200,7 +200,9 @@ Help recognition is uniform: `-h`/`--help` is honoured wherever it appears as a
 standalone token, except when the token before it is an option that takes a value, so
 `work --owner -h` is still the option error it has always been and not a help request.
 `review TASK --help` and `handoff --json --help` return help, and help never runs a
-native command, takes the coordination lock or needs an attachment.
+native command, takes the coordination lock or needs an attachment. Review usage is
+`review TASK [--rounds | --file payload.json]`: `--rounds` selects the bounded, read-only
+round history; it cannot be combined with an attachment.
 
 `work --help` returns machine-readable usage, options, limits, output shape, identity
 fields and exit codes. The briefing commands return the same envelope with their own
@@ -1791,6 +1793,7 @@ is not sent to `bd`.
 | `proposal-decide --file FILE` | `admin.py proposal-decide` |
 | `handoff --file FILE` | `admin.py handoff` (the operator's transfer) |
 | `followon --file FILE` | the coordinator's recorded hand-back (`followon.py`): `record` with task and text, or `withdraw` with the follow-on and reason |
+| `fault-clear --file FILE` | clears a lane's `needs-investigation` flag (`fault_clear.py`); `admin.py fault-clear` is the host route |
 | `set-onboarding --file FILE` | `admin.py set-onboarding` |
 
 **Authority.** The action is refused unless all of these hold: the request arrives over a key
@@ -1826,7 +1829,7 @@ coordination lock, as the host command does. A `capability-verify` whose every i
 recorded wrote nothing and carries no `server_time`.
 
 **Refusals.** An unknown subcommand, or a host-only command named here, is refused with
-"Unknown coordinator command" and the list of the eleven. A refused operation changes nothing.
+"Unknown coordinator command" and the list of the twelve. A refused operation changes nothing.
 
 **`followon` (kittrial-5bb.343).** Records the coordinator's hand-back of an
 integrated-but-open task to its assignee, or withdraws one. The payload is one JSON
@@ -1862,6 +1865,20 @@ before a lock is taken and nothing is written. The command takes the project's
 `.coordination.lock` and calls `followon.apply`, the same library function the
 `coordinator followon` and web routes call, so its validation, fact derivation and
 journal are identical.
+
+**`fault-clear` (kittrial-5bb.398).** Clears the out-of-band `needs-investigation` flag a
+lane raised with a `lane_state` record (`state: needs-investigation`, `reason`, optional
+`about_task`). The payload is `{"schema_version":1,"task":"TASK","target":"RAISE_COMMENT_ID","reason":"..."}`
+(reason one line, at most 300 characters). The server derives the lane (the author of the
+raise) and requires `target` to be that lane's current, uncleared, newest raise; a stale
+target is refused naming the newer raise. The clear is a `Kind: lane-fault-clear-v1` comment
+paired with a host journal entry in `<project>/.lane-fault-clears/<sha256>.json` recording who
+and when; without the entry the comment is inert, and the board fails closed (the flag stays).
+Only a bound coordinator key whose actor is a configured operator may run it; the lane itself,
+other members and agent credentials are refused. A later `lane_state` record never clears the
+flag. The host route is `python3 admin.py --root ROOT fault-clear --project PROJECT --actor OPERATOR --file payload.json`
+(operator allowlist, coordination lock, the same `fault_clear.apply`). There is no web clear
+route. Every refusal ends "Nothing was written."
 
 ## `files`: a task's files over SSH
 
@@ -1913,7 +1930,8 @@ text: 1105 characters, the limit is 1000`, `resolutions[1] (item second) resolut
 reason: ...`, `open_items[0].text (id blocked-on-keys): ...`. `review --help`,
 `handoff --help` and `checkpoint --help` list every field limit in `limits`, from the
 same numbers the validators enforce, so a caller can read a limit instead of finding
-it by failing.
+it by failing. `review --help` keeps those record-validation limits in `limits` and
+lists the read-only rounds view's display bounds separately in `rounds_limits`.
 
 | Command | Option | Range |
 | --- | --- | --- |
@@ -1945,6 +1963,9 @@ it by failing.
 | `history` | `--since-my-checkpoint` | the same read based on the calling actor's own newest valid checkpoint (no value) |
 | `history` | `--body-budget` | 256..8000 encoded bytes |
 | `review` | `items`/`resolutions` | 1..20 entries |
+| `review TASK --rounds` | rounds / items per round | 20 / 50, newest rounds first; omission counts report the rest |
+| `review TASK --rounds` | attestations / holds per round | 10 / 10 |
+| `review TASK --rounds` | user-written text / evidence pointer | <= 200 / <= 240 characters after terminal escaping |
 | `review` | `summary` (contribute, approve, request-changes, request-review) | <= 1200 characters |
 | `review` | item `severity` | `blocking` or `note` (absent means `blocking`) |
 | `review` | `withdraw` `reason` / `request-review` `reviewer` / `resolve-item` `reason` | <= 1000 characters / an actor identity (may contain `@` or `/`) / <= 1000 characters |

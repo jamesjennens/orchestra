@@ -34,6 +34,8 @@ FLAG_NAMES = ('waiting_too_long', 'expect_by_passed', 'your_move_idle')
 COVERAGE = ('One lane per registered session name; a task with no lane reads as its assignee actor. '
             'The declared state, who it waits on and expect_by come from the newest usable '
             'Kind: lane-state-v1 record; inferred true marks a row whose state is not declared. '
+            'needs_investigation is a lane-raised fault (reason, since, age) shown until a coordinator '
+            'clears it; it changes no move. '
             'Read-only, from one export and the session registry; no per-task comment scan.')
 
 
@@ -299,6 +301,9 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
     else:
         revert_map, revert_problems = {}, {}
     names = registry_names(registry)
+    from fault_clear import host_journal as fault_journal, open_faults
+    faults = open_faults([row for row in rows if isinstance(row, dict)],
+                         fault_journal(journal)[0] if journal is not None else None)
     groups = {}
     notice_groups = {}
     from task_assignment import notices as assignment_notices, parse_comment
@@ -396,15 +401,50 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
                           state=None,waiting_on=None,expect_by=None,inferred=False,state_since=None,
                           state_age_seconds=None,last_write=None,last_write_age_seconds=None,
                           waiting_too_long=False,expect_by_passed=False,your_move_idle=False,flag_tasks={}))
+    # A raised fault is shown even for a lane that holds nothing and wrote long ago: it stays
+    # until a coordinator clears it, so it must not depend on the lane being otherwise listed.
+    existing={lane['actor'] for lane in lanes}
+    for holder in sorted(set(faults)-existing):
+        lanes.append(dict(lane=names.get(holder,holder),actor=holder,idle=False,held=[],
+                          state=None,waiting_on=None,expect_by=None,inferred=False,state_since=None,
+                          state_age_seconds=None,last_write=None,last_write_age_seconds=None,
+                          waiting_too_long=False,expect_by_passed=False,your_move_idle=False,flag_tasks={}))
+    for lane in lanes:
+        fault = faults.get(lane['actor'])
+        if fault is None:
+            lane['needs_investigation'] = None
+        else:
+            raised = moment(fault['since']) if isinstance(fault['since'], str) else None
+            lane['needs_investigation'] = dict(
+                fault, age_seconds=None if raised is None else max(0, int((now - raised).total_seconds())))
     for lane in lanes:
         holder_notices=notice_groups.get(lane['actor'])
         if holder_notices:
             kept=holder_notices['items'][:20]
             lane['assignment_notices']={'items':kept,'total':holder_notices['total'],
                                         'omitted':max(0,holder_notices['total']-len(kept))}
+    # kittrial-5bb.397: each lane carries the count of its worker waits that woke with
+    # nothing to act on in the last 24 hours, and the newest one's task and trigger.
+    # Additive fields; they are not lane flags and they are not in the coordinator's
+    # stable move fields, so no existing row or fingerprint changes because of them.
+    if journal is not None:
+        import wake_log
+        wakes=wake_log.summaries(journal,[lane.get('actor') for lane in lanes],now=now)
+        for lane in lanes:
+            summary=wakes.get(lane.get('actor')) or wake_log.DEFAULT_SUMMARY
+            lane['empty_wakes_24h']=summary.get('empty_wakes_24h',0)
+            lane['empty_wake_task']=summary.get('empty_wake_task')
+            lane['empty_wake_trigger']=summary.get('empty_wake_trigger')
+            lane['empty_wake_at']=summary.get('empty_wake_at')
+    else:
+        for lane in lanes:
+            lane['empty_wakes_24h']=0
+            lane['empty_wake_task']=None
+            lane['empty_wake_trigger']=None
+            lane['empty_wake_at']=None
     if scope == 'own':
         lanes = [row for row in lanes if row['actor'] == actor]
-    lanes.sort(key=lambda row: (0 if row['held'] else 1, 0 if row['flag_tasks'] else 1,
+    lanes.sort(key=lambda row: (0 if row['needs_investigation'] else 1, 0 if row['held'] else 1, 0 if row['flag_tasks'] else 1,
                                 str(row['lane']), str(row['actor'])))
     page = lanes[parsed.offset:parsed.offset + parsed.limit]
     return {
@@ -415,6 +455,7 @@ def read(rows, actor, registry, args, now=None, operators=None, journal=None, sc
         'total': len(lanes),
         'items': page,
         'next_offset': parsed.offset + parsed.limit if parsed.offset + parsed.limit < len(lanes) else None,
-        'flags': {name: sum(1 for row in lanes if row.get(name)) for name in FLAG_NAMES},
+        'flags': dict({name: sum(1 for row in lanes if row.get(name)) for name in FLAG_NAMES},
+                      needs_investigation=sum(1 for row in lanes if row.get('needs_investigation'))),
         'coverage': COVERAGE,
     }

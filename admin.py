@@ -4231,7 +4231,7 @@ OWNER_ANSWERS_JOURNAL='.owner-answers'
 #: private ``mode=`` form (``.web-lifecycle-marks``) is named too; its fixed
 #: ``<name>.tmp`` does not match the sweep's shape, so sweeping it is a no-op.
 ATOMIC_SWEEP_DIRECTORIES=('.',)+RESERVATION_JOURNALS+( '.handoffs','.handoff-recoveries',
-    '.requirement-backfills','.integration-reverts','.assignee-followons','.lifecycle-voids',
+    '.requirement-backfills','.integration-reverts','.assignee-followons','.lane-fault-clears','.lifecycle-voids',
     '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL)
 
 def sweep_project_temporaries(root,name,*,dry_run=False,min_age_seconds=None):
@@ -4288,7 +4288,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
         baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
         if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
@@ -4335,6 +4335,11 @@ def validate_coordination_files(files):
             # silently make every recorded hand-back inert.
             from followon import validate_entry as validate_followon_entry
             validate_followon_entry(record,name.partition('/')[2])
+        if name.startswith('.lane-fault-clears/'):
+            # The host-issued lane fault clear journal (kittrial-5bb.398): a restore that
+            # dropped it would show every cleared fault again.
+            from fault_clear import validate_entry as validate_fault_clear_entry
+            validate_fault_clear_entry(record,name.partition('/')[2])
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
         if name=='GUIDANCE.md':
             from guidance import validate_text
@@ -4857,6 +4862,13 @@ def backup_project(root,name):
         for record in followon_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Assignee follow-on journal entry must not be a symlink')
             files['.assignee-followons/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+        # The host-issued lane fault clear journal (kittrial-5bb.398), backed up and restored
+        # like the follow-on journal: without it every cleared fault would show again.
+        fault_journal=path/'.lane-fault-clears'
+        if fault_journal.is_symlink():raise ValueError('Lane fault clear journal must not be a symlink')
+        for record in fault_journal.glob('*.json'):
+            if record.is_symlink():raise ValueError('Lane fault clear journal entry must not be a symlink')
+            files['.lane-fault-clears/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
         # The per-project claiming setting (kittrial-5bb.352). It lives outside the
         # tracker, so a backup that dropped it would silently open claiming again after
         # a restore. A damaged file is carried byte for byte and reads back restrictive.
@@ -7088,6 +7100,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
             # restore rather than silently making an open hand-back inert.
             from followon import validate_entry as validate_followon_entry
             validate_followon_entry(record,name.partition('/')[2])
+        elif name.startswith('.lane-fault-clears/'):
+            from fault_clear import validate_entry as validate_fault_clear_entry
+            validate_fault_clear_entry(record,name.partition('/')[2])
         elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])
@@ -10348,6 +10363,8 @@ def main():
     a=sub.add_parser('handoff');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('followon',help='record or withdraw a coordinator hand-back of an integrated-but-open task (operator allowlist, host journal)')
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('fault-clear',help='clear a lane\'s needs-investigation flag (operator allowlist, host journal)')
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-reconcile');a.add_argument('project');a.add_argument('--operation-id',required=True)
@@ -10982,6 +10999,27 @@ def main():
             require_configured_operator(args.actor,authority,'record or withdraw a hand-back')
             print(json.dumps(followon_records.apply(request,args.actor,run,path,operators=authority),
                              ensure_ascii=False))
+    elif args.command=='fault-clear':
+        # The installation operator's host route for clearing a lane's needs-investigation
+        # flag (kittrial-5bb.398); the SAME fault_clear.apply the endpoint's `coordinator
+        # fault-clear` calls, under the same project lock, after the same operator check.
+        import fcntl
+        import fault_clear
+        from keyed_records import require_configured_operator
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        if not isinstance(payload,dict):
+            raise ValueError('The fault-clear payload must be a JSON object. Nothing was written.')
+        require_configured_operator(args.actor,operators(root,strict=True),'clear a needs-investigation flag')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            authority=operators(root,strict=True)
+            require_configured_operator(args.actor,authority,'clear a needs-investigation flag')
+            print(json.dumps(fault_clear.apply(payload,args.actor,run,path,operators=authority),ensure_ascii=False))
     elif args.command=='requirement-backfill':
         import fcntl
         from requirement_records import backfill

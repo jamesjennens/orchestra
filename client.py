@@ -347,7 +347,9 @@ class _InlineWait:
                           'contribution_id', 'pending_review_items', 'redelivered',
                           'guidance_version', 'wait_newer_activity_marker')
     COORDINATOR_TRIGGERS = ('awaiting-review', 'awaiting-integration',
-                            'checkpoint-to-coordinator', 'lane-quiet')
+                            'checkpoint-to-coordinator', 'lane-quiet', 'empty-wake', 'needs-investigation')
+    OPTIONAL_TRIGGERS = ('empty-wake', 'needs-investigation')
+    EMPTY_WAKE_TRIGGER = 3
     LANE_FLAGS = ('your_move_idle', 'waiting_too_long', 'expect_by_passed')
     AWAITING_REVIEW_STATES = ('awaiting-review', 'legacy-review-ready')
     AWAITING_INTEGRATION_STATES = ('awaiting-integration', 'approved')
@@ -718,6 +720,37 @@ class _InlineWait:
                 'flags': sorted(set(entry.get('flags') or []))}
 
     @staticmethod
+    def _empty_wake_row(lane):
+        return {'lane': _InlineWait._scalar(lane.get('lane')),
+                'actor': _InlineWait._scalar(lane.get('actor')),
+                'task': _InlineWait._scalar(lane.get('empty_wake_task')),
+                'trigger': _InlineWait._scalar(lane.get('empty_wake_trigger')),
+                'empty_wakes_24h': lane.get('empty_wakes_24h')
+                if isinstance(lane.get('empty_wakes_24h'), int) else 0,
+                'at': _InlineWait._scalar(lane.get('empty_wake_at'))}
+
+    @staticmethod
+    def _fault_row(lane, fault):
+        return {'lane': _InlineWait._scalar(lane.get('lane')),
+                'actor': _InlineWait._scalar(lane.get('actor')),
+                'task': _InlineWait._scalar(fault.get('about_task') or fault.get('task')),
+                'raised_on': _InlineWait._scalar(fault.get('task')),
+                'state': 'needs-investigation', 'reason': _InlineWait._scalar(fault.get('reason')),
+                'record': _InlineWait._scalar(fault.get('record')),
+                'since': _InlineWait._scalar(fault.get('since')),
+                'earlier': [_InlineWait._scalar(item.get('reason')) for item in fault.get('earlier') or []
+                            if isinstance(item, dict)],
+                'earlier_omitted': _InlineWait._count(fault.get('earlier_omitted'))}
+
+    @staticmethod
+    def _count(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    @staticmethod
+    def _fault_fingerprinted(row):
+        return {name: row.get(name) for name in ('lane', 'actor', 'task', 'raised_on', 'record', 'since')}
+
+    @staticmethod
     def coordinator_view(queue_items, lanes_payload):
         lanes = lanes_payload if isinstance(lanes_payload, dict) else {}
         triggers = {name: [] for name in _InlineWait.COORDINATOR_TRIGGERS}
@@ -750,12 +783,19 @@ class _InlineWait:
                              or entry.get('next_actor') == 'coordinator')
                 if addressed:
                     triggers['checkpoint-to-coordinator'].append(_InlineWait._lane_row(lane, entry))
+            fault = lane.get('needs_investigation')
+            if isinstance(fault, dict):
+                triggers['needs-investigation'].append(_InlineWait._fault_row(lane, fault))
+            count = lane.get('empty_wakes_24h')
+            if isinstance(count, int) and count >= _InlineWait.EMPTY_WAKE_TRIGGER:
+                triggers['empty-wake'].append(_InlineWait._empty_wake_row(lane))
         grouped = {name: _InlineWait._sorted_rows(rows) for name, rows in triggers.items()}
         flat = [dict(row, trigger=name) for name in _InlineWait.COORDINATOR_TRIGGERS
                 for row in grouped[name]]
         fingerprinted = {name: _InlineWait._sorted_rows(
-            [_InlineWait._fingerprinted(row) for row in rows])
-            for name, rows in triggers.items()}
+            [_InlineWait._fault_fingerprinted(row) if name == 'needs-investigation'
+             else _InlineWait._fingerprinted(row) for row in rows])
+            for name, rows in triggers.items() if rows or name not in _InlineWait.OPTIONAL_TRIGGERS}
         return {'schema': _InlineWait.WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
                 'items': flat, 'fingerprint': _InlineWait.digest(fingerprinted)}
 
@@ -765,11 +805,15 @@ class _InlineWait:
         parser.add_argument('--coordinator', action='store_true')
         parser.add_argument('--idle-minutes', type=int, default=_InlineWait.DEFAULT_IDLE_MINUTES,
                             dest='idle_minutes')
+        parser.add_argument('--since')
         parser.add_argument('--json', action='store_true')
         parsed = parser.parse_args(args)
         if not _InlineWait.IDLE_MINUTES_MIN <= parsed.idle_minutes <= _InlineWait.IDLE_MINUTES_MAX:
             raise ValueError('Invalid wait read: --idle-minutes must be %d..%d'
                              % (_InlineWait.IDLE_MINUTES_MIN, _InlineWait.IDLE_MINUTES_MAX))
+        if parsed.since is not None and not _InlineWait.is_fingerprint(parsed.since):
+            raise ValueError('Invalid wait read: --since takes a fingerprint this kit printed '
+                             '(wait1:<64 hex>)')
         return parsed
 
     @staticmethod
@@ -795,10 +839,12 @@ class _InlineWait:
         return parsed
 
     @staticmethod
-    def read_args(options):
+    def read_args(options, since=None):
         args = []
         if options.coordinator:
             args += ['--coordinator', '--idle-minutes', str(options.idle_minutes)]
+        if since is not None:
+            args += ['--since', since]
         return args
 
     @staticmethod
@@ -980,11 +1026,33 @@ def _wait_command(args,config,project,actor,out,config_path=None):
     except ValueError as error:
         sys.stderr.write('ValueError: %s\n' % error)
         return wait.EXIT_USAGE
-    endpoint_args = wait.read_args(options)
+    form = 'coordinator' if options.coordinator else 'worker'
+    # The fingerprint the caller ALREADY has (--since, else the state file this client
+    # keeps) is carried on the read itself (kittrial-5bb.397), so the endpoint can tell
+    # a wake from a poll and record an empty one from the ONE read it already makes.
+    # run_wait resolves ``resumed`` the same way; the two must not disagree.
+    state_file = wait.state_path(config_path,project,actor,form)
+    state = wait.read_state(state_file)
+    remembered = None if options.fresh or state is None else state.get('fingerprint')
+    resumed = options.since if options.since is not None else remembered
+    endpoint_args = wait.read_args(options, resumed)
+    # An endpoint older than this kit refuses the unknown ``--since`` on the READ. The
+    # empty-wake log is additive, so the wait must still work there: fall back to exactly
+    # the old request once, and keep that answer for the rest of this wait.
+    plain_endpoint_args = wait.read_args(options, None)
+    carries_since = endpoint_args != plain_endpoint_args
+    accepts_since = {'value': carries_since}
 
     def read():
         try:
-            result = request(config,project,actor,endpoint_args,'wait')
+            result = request(config,project,actor,
+                             endpoint_args if accepts_since['value'] else plain_endpoint_args,
+                             'wait')
+            if (carries_since and accepts_since['value'] and isinstance(result,dict)
+                    and result.get('returncode')
+                    and '--since' in (result.get('stderr') or '')):
+                accepts_since['value'] = False
+                result = request(config,project,actor,plain_endpoint_args,'wait')
         except (RuntimeError,ValueError,OSError) as error:
             # The transport said the service could not be reached: not a usage error.
             raise wait.WaitUnreachable(str(error)[:300]) from None
@@ -998,7 +1066,6 @@ def _wait_command(args,config,project,actor,out,config_path=None):
         except (ValueError,TypeError) as error:
             raise wait.WaitUnreachable('Invalid wait response: %s' % str(error)[:200]) from None
 
-    form = 'coordinator' if options.coordinator else 'worker'
     code,view = wait.run_wait(read,since=options.since,timeout=options.timeout,
                               interval=options.interval,
                               form=form,
@@ -1007,7 +1074,7 @@ def _wait_command(args,config,project,actor,out,config_path=None):
                               give_up_after=options.give_up_after,
                               command_prefix=_wait_client_prefix(config_path,project,actor),
                               idle_minutes=options.idle_minutes,
-                              state_file=wait.state_path(config_path,project,actor,form),
+                              state_file=state_file,
                               fresh=options.fresh)
     text = json.dumps(view,ensure_ascii=True,indent=2)+'\n'
     if out:
@@ -1415,7 +1482,7 @@ _COMMAND_HELP_USAGE = {
     'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
             '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
             ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]',
-    'review': 'review TASK [--file payload.json]',
+    'review': 'review TASK [--rounds | --file payload.json]',
     'handoff': 'handoff TASK --file payload.json',
     'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
     'history': 'history TASK [--limit N | --recent N | --last N] [--since TIME] '

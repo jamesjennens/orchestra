@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock-up: task page (proposed) · Orchestra design review</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<!-- Static mock-up for docs/design/WEB_UX_REVIEW.md (kittrial-5bb.400). Synthetic data; no script.
+     Proposed order: what it is and what happens next first; the task's own text second; tools folded. -->
+<div class="shell">
+  <nav class="rail" aria-label="Main">
+    <div class="brand">Orchestra</div>
+    <div class="rail-section">
+      <a class="nav-link" href="#">My work</a>
+      <a class="nav-link" href="#">My agents</a>
+      <a class="nav-link" href="#">All projects</a>
+    </div>
+    <div class="rail-section">
+      <div class="rail-label">Order portal (sample)</div>
+      <a class="nav-link" href="project.html" aria-current="page">Tasks <span class="nav-count">8</span></a>
+      <a class="nav-link" href="#">Reviews</a>
+      <a class="nav-link" href="records.html">Records <span class="nav-count">3</span></a>
+      <a class="nav-link" href="room.html">Rooms</a>
+      <a class="nav-link" href="lanes.html">Lanes</a>
+      <a class="nav-link" href="#">More…</a>
+    </div>
+  </nav>
+  <div class="content">
+  <main class="main" id="main">
+    <div>
+      <div class="crumbs"><a href="#">Projects</a> / <a href="project.html">Order portal (sample)</a> / <span>pp-ghb</span></div>
+      <div class="page-head">
+        <h1 tabindex="-1">Search orders by customer reference</h1>
+        <div class="actions"><button>Edit</button><button class="primary">Comment</button></div>
+      </div>
+    </div>
+
+    <section class="summary" aria-label="Where this task stands">
+      <div class="chips">
+        <span class="chip accent">In progress</span>
+        <span class="chip plain">No contribution yet</span>
+        <span class="chip plain">P2</span>
+      </div>
+      <div class="meta"><span>Updated 2 minutes ago</span><span class="mono">pp-ghb</span></div>
+      <p class="next"><b>Next:</b> casey delivers a contribution. <span class="who-acts">casey</span></p>
+      <p class="next small muted">Waiting on: a copy of production-sized order data to measure search time (1 open item).</p>
+    </section>
+
+    <div class="detail">
+      <div class="stack">
+        <section class="panel" aria-labelledby="desc">
+          <div class="panel-head"><h2 id="desc">What is wanted</h2></div>
+          <div class="panel-body md">
+            <h3 class="md-h">Goal</h3>
+            <p>A signed-in customer finds any of their orders by reference, PO number or date.</p>
+            <h3 class="md-h">Notes</h3>
+            <p>Search must answer in under 2 seconds for 95% of searches. Partial references match from the start of the reference only. Results show the newest first, 25 to a page.</p>
+            <h3 class="md-h">Out of scope</h3>
+            <p>Full-text search of order lines.</p>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="stands">
+          <div class="panel-head"><h2 id="stands">Where it stands</h2><span class="small muted">casey · 3 minutes ago</span></div>
+          <div class="panel-body">
+            <p>Index on reference and PO number added on a branch; search page wired; tests pass locally.</p>
+            <p class="small"><b>Next step (casey):</b> measure the 95th percentile on a copy of production-sized data, then deliver.</p>
+            <ul class="open-items">
+              <li><span class="chip warn">Waiting</span> A copy of production-sized order data to measure search time. <span class="small muted">· from a task comment</span></li>
+            </ul>
+            <p class="small muted">One newer entry since this checkpoint: alex assigned the task to casey. Read it under Activity.</p>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="activity">
+          <div class="panel-head"><h2 id="activity">Activity</h2><span class="count">4</span></div>
+          <div class="panel-body">
+            <ol class="timeline">
+              <li><span class="dot"></span><div><div class="event-head"><b>alex</b><span class="small muted">commented · 12 minutes ago</span></div>
+                <p class="event-body room-text">I looked at the current search: it scans every order. An index on reference and PO number is needed.</p></div></li>
+              <li><span class="dot"></span><div><div class="event-head"><b>casey</b><span class="small muted">commented · 12 minutes ago</span></div>
+                <p class="event-body room-text">Agreed. Please keep the old search working until the new one is released.</p></div></li>
+              <li><span class="dot accent"></span><div class="record-event"><div class="event-head"><b>casey</b><span class="small muted">recorded a checkpoint · 3 minutes ago</span></div>
+                <p>Index added on a branch; search page wired; 1 open item.</p>
+                <details><summary>Show the recorded checkpoint</summary><pre>{"summary": "Index on reference and PO number added on a branch; …", "open_items": [ … ]}</pre></details></div></li>
+              <li><span class="dot"></span><div class="record-event"><div class="event-head"><b>alex</b><span class="small muted">assigned the task to casey · 2 minutes ago</span></div>
+                <p>“Planned in the sprint review.”</p>
+                <details><summary>Show the assignment record</summary><pre>{"from": null, "to": "casey", "reason": "Planned in the sprint review.", …}</pre></details></div></li>
+            </ol>
+            <form class="form" action="#">
+              <div class="field"><label for="c">Add a comment</label><textarea id="c" rows="3"></textarea>
+                <span class="hint">Stored as written under your name. A comment does not complete or acknowledge work.</span></div>
+              <div class="actions"><button class="primary" type="button">Post comment</button></div>
+            </form>
+          </div>
+        </section>
+
+        <details class="fold">
+          <summary>Record a checkpoint <span class="fold-hint">for casey, the assignee</span></summary>
+          <div class="fold-body"><p class="small muted">The 12-field checkpoint form, unchanged, opened only when wanted. Its unresolved items list starts with the one carried item.</p></div>
+        </details>
+      </div>
+
+      <aside class="side" aria-label="Task facts and tools">
+        <section class="panel">
+          <div class="panel-head"><h2 class="small">Details</h2></div>
+          <div class="panel-body">
+            <dl class="kv">
+              <dt>Status</dt><dd>In progress</dd>
+              <dt>Assignee</dt><dd>casey</dd>
+              <dt>Priority</dt><dd>P2 · normal</dd>
+              <dt>Created</dt><dd>12 minutes ago by alex</dd>
+              <dt>Updated</dt><dd>2 minutes ago</dd>
+              <dt>Task id</dt><dd class="mono">pp-ghb</dd>
+            </dl>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h2 class="small">Completion facts</h2></div>
+          <div class="panel-body"><p class="small muted">None recorded yet. They are recorded against a contribution once one is delivered.</p></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h2 class="small">Files</h2><span class="count">0</span></div>
+          <div class="panel-body"><p class="empty-line">No files.</p><button>Attach for the worker</button></div>
+        </section>
+        <details class="fold">
+          <summary>Owner tools</summary>
+          <div class="fold-body small">
+            <p><b>Assign or reassign</b> (owner, coordinator)</p>
+            <p><b>Record lifecycle evidence</b> (coordinator)</p>
+            <p><b>Integration check</b> (read-only)</p>
+          </div>
+        </details>
+      </aside>
+    </div>
+    <p class="small muted">Viewing a task never marks it read, done or acknowledged.</p>
+  </main>
+  </div>
+</div>
+</body>
+</html>

@@ -17,6 +17,14 @@ Use your existing client prefix for the Beads commands below. This guide is avai
 | `docs finding-work` | to know where a worker looks for work at each run and how a coordinator reaches one; the web interface shows the same text to every member | 6 KB |
 | `docs poll-prompt` (`docs poll-prompt-agent` for an agent with a web credential) | when you set up the prompt that wakes you at every later run; `docs worker-prompt` is the first prompt | under 2.5 KB |
 
+### Raise "needs investigation" for a process fault
+
+If something about your own lane is wrong and a task open item cannot say it (a stuck wait, a broken
+tool, a worker that cannot act), add `lane_state` to the checkpoint with `state: needs-investigation`
+and a one-line `reason` (at most 300 characters; optional `about_task`). The coordinator sees it on the
+lane board and in its wait until the coordinator clears it; your next state record does not clear it.
+Task blockers stay open items. Where you cannot checkpoint, write one line to `~/work/ANOMALY`.
+
 ### What goes where between runs
 
 A worker that runs again and again keeps what it needs to continue in three places, and its prompt is not one of them:

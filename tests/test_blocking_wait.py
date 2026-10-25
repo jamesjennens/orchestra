@@ -220,7 +220,10 @@ class CoordinatorFormTests(unittest.TestCase):
         view = self.coordinator(queue=[{'task': 't1', 'review_state': 'none'}],
                                 lanes=lanes_page(lane('lane-a', A, held=[
                                     {'task': 't1', 'state': 'working', 'flags': []}])))
-        self.assertEqual(view['fingerprint'], waiting.digest({name: [] for name in waiting.COORDINATOR_TRIGGERS}))
+        # kittrial-5bb.397/.398: empty `needs-investigation` and `empty-wake` groups are kept OUT
+        # of the fingerprint, so a quiet answer keeps the fingerprint it had before those triggers.
+        stable = {name: [] for name in waiting.COORDINATOR_TRIGGERS if name not in ('needs-investigation', 'empty-wake')}
+        self.assertEqual(view['fingerprint'], waiting.digest(stable))
         self.assertEqual(view['items'], [])
 
 
@@ -406,6 +409,15 @@ class BoundsTests(unittest.TestCase):
 class OneCheapReadTests(unittest.TestCase):
     """One cheap read per poll: one export, no refresh, no read per task (kittrial-5bb.281)."""
 
+    def setUp(self):
+        # The wait read records an empty wake in the PROJECT directory (kittrial-5bb.397);
+        # a scratch project keeps that write out of the checkout.
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory(prefix='wait-read-')
+        self.addCleanup(self._tmp.cleanup)
+        self.project = Path(self._tmp.name) / 'projects' / 'example'
+        self.project.mkdir(parents=True)
+
     def row(self, task_id, assignee=A, status='open'):
         return dict(id=task_id, title='Task ' + task_id, issue_type='task', status=status,
                     assignee=assignee, description='Intent', acceptance_criteria='Acceptance',
@@ -423,7 +435,7 @@ class OneCheapReadTests(unittest.TestCase):
 
     def test_the_worker_read_is_exactly_one_export(self):
         calls = []
-        result = work.execute(Path('.'), A, 'wait', [], {}, self.runner([self.row('t1')], calls),
+        result = work.execute(self.project, A, 'wait', [], {}, self.runner([self.row('t1')], calls),
                               operators=[A])
         self.assertEqual(calls, [['export', '--all']])
         self.assertEqual(result['schema'], 'wait-v1')
@@ -436,7 +448,7 @@ class OneCheapReadTests(unittest.TestCase):
             'r1': {'request_id': 'r1', 'actor': A, 'name': 'lane-a',
                    'created_at': '2026-09-01T00:00:00+00:00'}}}
         with mock.patch.object(sessions, 'read_registry', return_value=registry):
-            result = work.execute(Path('.'), A, 'wait', ['--coordinator'], {},
+            result = work.execute(self.project, A, 'wait', ['--coordinator'], {},
                                   self.runner([self.row('t1')], calls), operators=[A])
         self.assertEqual(calls, [['export', '--all']])
         self.assertEqual(result['form'], 'coordinator')
