@@ -876,9 +876,13 @@ class AnchoredKind:
             seen['draft_authors'] = draft_authors
             seen['record'] = record
         if party_check is not None and payload.get('operation') == 'accept':
-            party_check(proposer)
+            # The acceptance's decision_id goes with every call: for an agent it must name a
+            # live delegation of record acceptance (kittrial-5bb.407, the endpoint's check).
+            decision_id = (payload.get('acceptance') or {}).get('decision_id') \
+                if isinstance(payload.get('acceptance'), dict) else None
+            party_check(proposer, decision_id)
             for draft_author in draft_authors:
-                party_check(draft_author)
+                party_check(draft_author, decision_id)
         if self.acceptance_rules is not None:
             self.acceptance_rules(record, payload['acceptance'], run)
         return core.bind_acceptance(payload['acceptance'], record)

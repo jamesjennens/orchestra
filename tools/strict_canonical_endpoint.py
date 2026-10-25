@@ -417,6 +417,75 @@ def dispatch(canonical, request, tmp, run=None):
         payload = json.loads(args[0]) if args and isinstance(args[0], str) else None
         result = coordinate(payload, actor, run, canonical.path)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'delegation':
+        # endpoint.py's delegation action (kittrial-5bb.407) over the emulated rows: a read for
+        # any member; grant, narrow and revoke only for a person owner's own web session.
+        import delegations
+        try:
+            import http_authority
+        except ImportError:
+            http_authority = None
+        config_file = canonical.root / 'deployment.private.json'
+        config_data = json.loads(config_file.read_text(encoding='utf-8')) if config_file.is_file() else {}
+        operators = config_data.get('operators') or []
+        authority = request.get('authority') if isinstance(request.get('authority'), dict) else {}
+
+        def refused(status, message):
+            return envelope(2, stderr=message + '\n', delegation_status=status)
+        if http_authority is None or canonical.authority_config is None:
+            return refused(403, 'Verified web authority required in this project')
+        operation = args[0] if args else None
+        if operation == 'list':
+            if not http_authority.verified_web_authority(request, canonical.authority_config,
+                                                         http_authority.CAP_READ, project):
+                return refused(403, 'Verified read authority required in this project')
+            state = http_authority.read_state(canonical.authority_config.store)
+            listed = json.loads(run(['list', '--label', delegations.LABEL, '--all', '--limit', '0', '--json']) or '[]')
+            ids = [str(row['id']) for row in listed if isinstance(row, dict) and row.get('id')][:200]
+            shown = json.loads(run(['show', *ids, '--json', '--include-comments']) or '[]') if ids else []
+            items = delegations.listing(shown, project, state, canonical.path, operators, None)
+            grants = ((state.get('coordinator_grants') or {}).get(project) or {})
+            in_force = [item['delegation'] for item in items if item['in_force']]
+            agents = [{'agent': agent, 'covered': any(d['right'] == 'record-acceptance' and d['grantee'] in (agent, 'coordinator-grant')
+                                                     for d in in_force),
+                       'by': [d['decision'] for d in in_force
+                              if d['right'] == 'record-acceptance' and d['grantee'] in (agent, 'coordinator-grant')]}
+                      for agent in sorted(grants)]
+            names = {}
+            for ident in {a['agent'] for a in agents} | {x for item in items if item['delegation']
+                                                         for x in (item['delegation']['grantee'], item['delegation']['account']) if x}:
+                record = (state.get('agents') or {}).get(ident) or (state.get('users') or {}).get(ident)
+                label = (record.get('name') or record.get('display_name')) if isinstance(record, dict) else None
+                if label:
+                    names[ident] = label
+            return envelope(0, json.dumps({'schema_version': 1, 'project': project, 'items': items,
+                                           'granted_agents': agents, 'names': names, 'listed': len(ids),
+                                           'omitted': max(0, len(listed) - len(ids))}, ensure_ascii=False) + '\n')
+        if operation not in ('grant', 'narrow', 'revoke') or len(args) != 2:
+            return refused(422, 'Use delegation list, or grant|narrow|revoke with one JSON payload. Nothing was written.')
+        try:
+            payload = json.loads(args[1])
+            delegations.validate_request(payload)
+        except ValueError as error:
+            return refused(422, '%s. Nothing was written.' % error)
+        if payload['action'] != operation or payload['operation_id'] != request.get('operation_id'):
+            return refused(422, 'The payload does not match the request. Nothing was written.')
+        if not http_authority.verified_web_authority(request, canonical.authority_config,
+                                                     http_authority.CAP_PROJECT_ADMIN, project):
+            return refused(403, 'Only a person owner of this project records a delegation. Nothing was written.')
+        user_id = authority.get('user_id')
+        if authority.get('via') != 'session' or actor != user_id or not delegations.ACCOUNT.fullmatch(str(user_id)):
+            return refused(403, 'A delegation is recorded by a person owner signed in to the web; an agent or worker '
+                                'credential cannot record one. Nothing was written.')
+        state = http_authority.read_state(canonical.authority_config.store)
+        if ((state.get('memberships') or {}).get(project) or {}).get(user_id) != 'owner':
+            return refused(403, 'Only a person owner of this project records a delegation. Nothing was written.')
+        try:
+            result = delegations.apply(payload, project=project, journal=canonical.path, run=run, recorded_by=actor,
+                                       via='session', account=actor, at=http_authority.server_time())
+        except delegations.DelegationRefusal as error:
+            return refused(error.status, str(error))
+        return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action in ('ref', 'capability'):
         # endpoint.py's reference catalog (kittrial-5bb.66) and capability index
         # (kittrial-5bb.67) reads and writes over the emulated rows.
@@ -499,9 +568,31 @@ def dispatch(canonical, request, tmp, run=None):
                     from admin import coordinator_rules as configured_coordinator_rules
                     rules = configured_coordinator_rules(canonical.root)
 
-                    def _party_check(proposer):
+                    kind = 'references' if action == 'ref' else 'capabilities'
+
+                    def _party_check(proposer, decision_id=None):
                         live = http_authority.read_state(canonical.authority_config.store)
                         by_agent = authority.get('via') == 'credential'
+                        if by_agent:
+                            # endpoint.py's rule (kittrial-5bb.407): an agent accepts or verifies
+                            # only within a live, person-rooted delegation, which also lifts the
+                            # own-party refusal.
+                            import delegations
+                            if not isinstance(decision_id, str) or not decision_id:
+                                raise RecordsRefusal(
+                                    403, 'An agent accepts or verifies a record only within a delegation: name '
+                                         'the delegation decision as decision_id. Nothing was written.')
+                            try:
+                                delegations.check_acceptance(
+                                    delegations.read_issue(run, decision_id), project=project, state=live,
+                                    journal=canonical.path, agent=actor.split('/', 1)[0], kind=kind,
+                                    operators=operators, owners=None)
+                            except delegations.DelegationRefusal as error:
+                                raise RecordsRefusal(error.status, '%s. Nothing was written.' % error) from None
+                            if not isinstance(proposer, str) or not proposer:
+                                raise RecordsRefusal(403, 'This draft has no recorded proposer, so no delegation '
+                                                          'can admit it.')
+                            return
                         settings_seen = live.get('settings_seen') if isinstance(live.get('settings_seen'), dict) else {}
                         approval_by_another = bool(
                             settings_seen.get('approval_by_another_party')

@@ -516,6 +516,9 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     revokeRelease: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/release`),
     // Who coordinates the project and the rules that bind them, for any member; read only (kittrial-5bb.198).
     coordination: (pid) => call('GET', `/v1/projects/${pid}/coordination`),
+    // Delegated decision rights (kittrial-5bb.407): every member reads them; a person owner records one.
+    delegations: (pid) => call('GET', `/v1/projects/${pid}/delegations`),
+    recordDelegation: (pid, body) => mutate('POST', `/v1/projects/${pid}/delegations`, body),
     // Release facts (kittrial-5bb.378). The query writes nothing; a deploy records ONE
     // group of at most 200 already-resolved targets and is idempotent per intent.
     releaseQuery: (pid, scope) => call('POST', `/v1/projects/${pid}/releases/query`, { body: { scope } }),

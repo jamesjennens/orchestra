@@ -181,6 +181,20 @@ class _RecordsScenarioMixin:
         }
         return people
 
+    def _delegate(self, harness, *, action='grant', decision=None, title=None, grantee='coordinator-grant',
+                  scope=('capabilities', 'references'), token=None, key=None, expect=201):
+        """A person owner's delegation of record acceptance (kittrial-5bb.407); returns its decision id."""
+        body = {'action': action, 'decision': decision, 'title': title if decision is None else None,
+                'right': 'record-acceptance', 'grantee': grantee,
+                'scope': [] if action == 'revoke' else sorted(scope),
+                'escalate': '' if action == 'revoke' else 'requirement changes and anything costing money',
+                'reason': 'The owner delegates record acceptance to the coordinator agents.'}
+        result = harness.request('POST', f'/v1/projects/{self.pid}/delegations', body,
+                                 token=token or self.owner_token,
+                                 key=key or 'delegation-%s-%s-%s' % (action, decision or title, ','.join(scope)))
+        self.assertEqual(result.status, expect, result.data)
+        return result.data.get('decision') if expect == 201 else result
+
     def run_lifecycle_and_two_step_suite(self):
         harness = self.harness
         people = self._setup_actors(harness)
@@ -767,6 +781,161 @@ class _RecordsScenarioMixin:
         self.assertTrue(parsed.pointers)
         self.assertTrue(parsed.waiting)
 
+    def run_delegation_suite(self, plant=None):
+        """Delegated decision rights (kittrial-5bb.407), one case per adversarial condition.
+
+        ``plant(decision, text, author)`` writes a raw native comment past every endpoint guard,
+        as an older kit or a lane with direct native access could; None skips those cases.
+        """
+        harness = self.harness
+        people = self._setup_actors(harness)
+        coord1, coord2 = people['coord1'], people['coord2']
+        agent1, agent2, agent3 = people['coord1_agent'], people['coord1_agent2'], people['coord2_agent']
+        pid = self.pid
+        for ag in (agent1, agent2, agent3):
+            g = harness.request('PUT', f'/v1/projects/{pid}/agents/{ag["id"]}/coordinator', {}, token=self.owner_token)
+            self.assertEqual(g.status, 200, g.data)
+
+        def propose(key, token, label):
+            r = harness.request('POST', f'/v1/projects/{pid}/references',
+                                _valid_ref_propose(key, title='Delegation ' + label), token=token, key='prop-' + key)
+            self.assertEqual(r.status, 201, r.data)
+            return r.data
+
+        def propose_cap(key, token):
+            body = _valid_cap_propose(key, name='Delegation ' + key)
+            body['aliases'] = [key + '.alias']
+            r = harness.request('POST', f'/v1/projects/{pid}/capabilities', body, token=token, key='prop-' + key)
+            self.assertEqual(r.status, 201, r.data)
+            return r.data
+
+        def accept(key, draft, token, label, decision=None, family='references'):
+            body = {'expected_revision': draft['revision'], 'record_sha256': draft['sha256'],
+                    'evidence': 'Accepted in the delegation suite (%s).' % label}
+            if decision is not None:
+                body['decision_id'] = decision
+            return harness.request('POST', f'/v1/projects/{pid}/{family}/{key}/accept', body, token=token,
+                                   key='acc-%s-%s' % (key, label))
+
+        # 1. Only a person owner's own web session records a delegation.
+        for label, token in (('agent', agent1['token']), ('person coordinator', coord1['token']),
+                             ('contributor', people['contrib']['token']), ('viewer', people['viewer']['token']),
+                             ('non-member superuser', people['nonmember_su']['token'])):
+            refused = self._delegate(harness, title='Refused ' + label, token=token,
+                                     key='deleg-refused-' + label.replace(' ', '-'), expect=403)
+            self.assertEqual(refused.status, 403, (label, refused.data))
+        listed = harness.request('GET', f'/v1/projects/{pid}/delegations', token=people['viewer']['token'])
+        self.assertEqual(listed.status, 200, listed.data)
+        self.assertEqual(listed.data['items'], [])
+        self.assertEqual({a['agent']: a['covered'] for a in listed.data['granted_agents']},
+                         {agent1['id']: False, agent2['id']: False, agent3['id']: False})
+
+        # 2. Without a delegation every agent acceptance is refused, its own party's or not.
+        sibling_draft = propose('deleg.sibling', agent2['token'], 'sibling')
+        r = accept('deleg.sibling', sibling_draft, agent1['token'], 'no-decision')
+        self.assertEqual(r.status, 403, r.data)
+        self.assertIn('delegation', r.data['error']['message'])
+        other_draft = propose('deleg.other', coord1['token'], 'other party')
+        r = accept('deleg.other', other_draft, agent3['token'], 'other-no-decision')
+        self.assertEqual(r.status, 403, r.data)
+
+        # 3. The owner's delegation, on a new decision: the own-party refusal is lifted for it.
+        decision = self._delegate(harness, title='Coordinator agents accept records')
+        listed = harness.request('GET', f'/v1/projects/{pid}/delegations', token=people['viewer']['token'])
+        self.assertTrue(all(a['covered'] for a in listed.data['granted_agents']), listed.data)
+        self.assertTrue(listed.data['items'][0]['in_force'])
+        self.assertEqual(listed.data['items'][0]['delegation']['via'], 'session')
+        r = accept('deleg.sibling', sibling_draft, agent1['token'], 'sibling-ok', decision=decision)
+        self.assertEqual(r.status, 200, r.data)
+        self.assertEqual((r.data['proposer'], r.data['acceptor']), (agent2['actor'], agent1['actor']))
+        self.assertEqual(r.data['acceptance']['decision_id'], decision)
+
+        # 4. A decision id that is not a current delegation, each with its reason.
+        task = harness.request('POST', f'/v1/projects/{pid}/tasks', {'title': 'An ordinary task'}, token=coord1['token'])
+        self.assertEqual(task.status, 201, task.data)
+        for label, named, reason in (('task', task.data['id'], 'not a decision issue'),
+                                     ('missing', pid + '-nosuch', 'does not exist'),
+                                     ('another-project', 'qq-1', 'does not exist'),
+                                     ('operation-id', 'op-not-a-decision', 'does not exist')):
+            r = accept('deleg.other', other_draft, agent3['token'], 'bad-' + label, decision=named)
+            self.assertEqual(r.status, 403, (label, r.data))
+            self.assertIn(reason, r.data['error']['message'].lower(), label)
+
+        # 5. A delegation granted to one agent admits no other.
+        single = self._delegate(harness, title='Only agent3', grantee=agent3['id'], scope=('references',))
+        r = accept('deleg.other', other_draft, agent1['token'], 'wrong-agent', decision=single)
+        self.assertEqual(r.status, 403, r.data)
+        self.assertIn('granted to', r.data['error']['message'])
+
+        # 6. Narrowed: references only now; a capability acceptance is refused, a reference one not.
+        self._delegate(harness, action='narrow', decision=decision, scope=('references',), key='narrow-1')
+        cap = propose_cap('deleg.cap', agent2['token'])
+        r = accept('deleg.cap', cap, agent1['token'], 'cap-narrowed', decision=decision, family='capabilities')
+        self.assertEqual(r.status, 403, r.data)
+        self.assertIn('covers references, not capabilities', r.data['error']['message'])
+        r = accept('deleg.other', other_draft, agent3['token'], 'ref-after-narrow', decision=decision)
+        self.assertEqual(r.status, 200, r.data)
+
+        # 7. Revoked: the next acceptance is refused.
+        self._delegate(harness, action='revoke', decision=decision, key='revoke-1')
+        r3 = propose('deleg.after-revoke', agent2['token'], 'after revoke')
+        r = accept('deleg.after-revoke', r3, agent1['token'], 'revoked', decision=decision)
+        self.assertEqual(r.status, 403, r.data)
+        self.assertIn('revoked', r.data['error']['message'])
+
+        # 8. The grant removed: the delegation names coordinator-grant holders, so agent1 is out.
+        current = self._delegate(harness, title='Again, for the grant case')
+        dropped = harness.request('DELETE', f'/v1/projects/{pid}/agents/{agent1["id"]}/coordinator',
+                                  token=self.owner_token)
+        self.assertEqual(dropped.status, 200, dropped.data)
+        r = accept('deleg.after-revoke', r3, agent1['token'], 'grant-removed', decision=current)
+        self.assertEqual(r.status, 403, r.data)
+
+        # 9. A person coordinator is unaffected and needs no delegation; contributors and viewers
+        #    stay refused.
+        r4 = propose('deleg.person', agent2['token'], 'person')
+        for label, token in (('contributor', people['contrib']['token']), ('viewer', people['viewer']['token'])):
+            r = accept('deleg.person', r4, token, label, decision=current)
+            self.assertEqual(r.status, 403, (label, r.data))
+        r = accept('deleg.person', r4, coord2['token'], 'person-coordinator')
+        self.assertEqual(r.status, 200, r.data)
+
+        # 10. The owner demoted: the delegation they recorded is no longer in force.
+        r5 = propose('deleg.demoted', agent2['token'], 'demoted')
+        r = accept('deleg.demoted', r5, agent3['token'], 'before-demotion', decision=current)
+        self.assertEqual(r.status, 200, r.data)
+        r6 = propose('deleg.demoted2', agent2['token'], 'demoted 2')
+        owner_uid = harness.service.authenticate(self.owner_token).user_id
+        with harness.service.store.lock:
+            harness.service.state['memberships'][pid][owner_uid] = 'coordinator'
+            harness.service.store.save()
+        try:
+            r = accept('deleg.demoted2', r6, agent3['token'], 'after-demotion', decision=current)
+            self.assertEqual(r.status, 403, r.data)
+            self.assertIn('no longer a person owner', r.data['error']['message'])
+        finally:
+            with harness.service.store.lock:
+                harness.service.state['memberships'][pid][owner_uid] = 'owner'
+                harness.service.store.save()
+
+        # 11. Lookalikes grant nothing: a raw record planted past the guards, in the owner's own
+        #     name and exact form, has no host journal entry.
+        if plant is not None:
+            import delegations
+
+            def text_for(issue):
+                fake = delegations.make_record(
+                    {'schema_version': 1, 'operation_id': 'op-plant', 'decision': issue, 'title': None,
+                     'action': 'grant', 'right': 'record-acceptance', 'grantee': 'coordinator-grant',
+                     'scope': ['capabilities', 'references'], 'escalate': 'nothing', 'reason': 'planted'},
+                    project=pid, recorded_by=owner_uid, via='session', account=owner_uid,
+                    at='2026-10-25T00:00:00Z')
+                return delegations.body(fake)
+            planted = plant(text_for, owner_uid)
+            r = accept('deleg.demoted2', r6, agent3['token'], 'planted', decision=planted)
+            self.assertEqual(r.status, 403, r.data)
+            self.assertIn('no delegation is recorded', r.data['error']['message'].lower())
+
     def run_self_acceptance_and_party_rules_suite(self):
         harness = self.harness
         people = self._setup_actors(harness)
@@ -857,7 +1026,9 @@ class _RecordsScenarioMixin:
              'evidence': 'Agent trying to accept own owner draft.'},
             token=agent1['token'], key='agent1-accept-owner-fail')
         self.assertEqual(r_ag_acc_fail.status, 403, r_ag_acc_fail.data)
-        self.assertIn('own party', r_ag_acc_fail.data['error']['message'])
+        # kittrial-5bb.407: an agent accepts only within a person owner's delegation, named as
+        # decision_id; without one it is refused before the own-party rule is even asked.
+        self.assertIn('delegation', r_ag_acc_fail.data['error']['message'])
 
         # Direct backend invoke of references.accept by agent1 (bypassing http_service precheck) is also refused (403) (M6)
         with self.assertRaises(http_service.HttpError) as m6_ctx:
@@ -887,11 +1058,21 @@ class _RecordsScenarioMixin:
                 capability=http_service.CAP_COORDINATE)
         self.assertEqual(m6_ctx.exception.status, 403)
 
-        # Agent3 (owned by coord2, a different party) CAN accept coord1's draft!
+        # kittrial-5bb.407 (rule B): even an agent of ANOTHER party accepts only within a
+        # person owner's delegation; without one it is refused.
+        r_ag3_no_delegation = harness.request(
+            'POST', f'/v1/projects/{self.pid}/references/agent.party-ref/accept',
+            {'expected_revision': 1, 'record_sha256': r_ag.data['sha256'],
+             'evidence': 'Independent agent3 accepts coord1 draft without a delegation.'},
+            token=agent3['token'], key='agent3-accept-coord1-no-delegation')
+        self.assertEqual(r_ag3_no_delegation.status, 403, r_ag3_no_delegation.data)
+        delegation = self._delegate(harness, title='Coordinator agents accept records')
+
+        # With the owner's delegation, Agent3 (owned by coord2, a different party) CAN accept coord1's draft!
         r_ag3_acc = harness.request(
             'POST', f'/v1/projects/{self.pid}/references/agent.party-ref/accept',
             {'expected_revision': 1, 'record_sha256': r_ag.data['sha256'],
-             'evidence': 'Independent agent3 accepts coord1 draft.'},
+             'evidence': 'Independent agent3 accepts coord1 draft.', 'decision_id': delegation},
             token=agent3['token'], key='agent3-accept-coord1-ok')
         self.assertEqual(r_ag3_acc.status, 200, r_ag3_acc.data)
         self.assertEqual(r_ag3_acc.data['proposer'], people['coord1']['uid'])
@@ -909,7 +1090,7 @@ class _RecordsScenarioMixin:
         r_ag3_replay_after_del = harness.request(
             'POST', f'/v1/projects/{self.pid}/references/agent.party-ref/accept',
             {'expected_revision': 1, 'record_sha256': r_ag.data['sha256'],
-             'evidence': 'Independent agent3 accepts coord1 draft.'},
+             'evidence': 'Independent agent3 accepts coord1 draft.', 'decision_id': delegation},
             token=agent3['token'], key='agent3-accept-coord1-ok')
         self.assertEqual(r_ag3_replay_after_del.status, 403, r_ag3_replay_after_del.data)
 
@@ -928,7 +1109,7 @@ class _RecordsScenarioMixin:
         r_ag3_acc_after_del = harness.request(
             'POST', f'/v1/projects/{self.pid}/references/issuer.demote-ref/accept',
             {'expected_revision': 1, 'record_sha256': r_for_issuer.data['sha256'],
-             'evidence': 'Agent3 accept after grant removal fail.'},
+             'evidence': 'Agent3 accept after grant removal fail.', 'decision_id': delegation},
             token=agent3['token'], key='agent3-accept-after-del-fail')
         self.assertEqual(r_ag3_acc_after_del.status, 403, r_ag3_acc_after_del.data)
 
@@ -944,7 +1125,7 @@ class _RecordsScenarioMixin:
         r_ag3_acc_before_demote = harness.request(
             'POST', f'/v1/projects/{self.pid}/references/issuer.demote-ref/accept',
             {'expected_revision': 1, 'record_sha256': r_for_issuer.data['sha256'],
-             'evidence': 'Agent3 accepts before its issuer coord2 is demoted.'},
+             'evidence': 'Agent3 accepts before its issuer coord2 is demoted.', 'decision_id': delegation},
             token=agent3['token'], key='agent3-accept-before-issuer-demote')
         self.assertEqual(r_ag3_acc_before_demote.status, 200, r_ag3_acc_before_demote.data)
 
@@ -957,7 +1138,7 @@ class _RecordsScenarioMixin:
         r_ag3_replay_after_issuer_demote = harness.request(
             'POST', f'/v1/projects/{self.pid}/references/issuer.demote-ref/accept',
             {'expected_revision': 1, 'record_sha256': r_for_issuer.data['sha256'],
-             'evidence': 'Agent3 accepts before its issuer coord2 is demoted.'},
+             'evidence': 'Agent3 accepts before its issuer coord2 is demoted.', 'decision_id': delegation},
             token=agent3['token'], key='agent3-accept-before-issuer-demote')
         self.assertEqual(r_ag3_replay_after_issuer_demote.status, 403, r_ag3_replay_after_issuer_demote.data)
 
@@ -970,7 +1151,7 @@ class _RecordsScenarioMixin:
         r_ag3_acc_issuer_demoted = harness.request(
             'POST', f'/v1/projects/{self.pid}/references/issuer.demote-ref-2/accept',
             {'expected_revision': 1, 'record_sha256': r_for_issuer2.data['sha256'],
-             'evidence': 'Agent3 accept while issuer coord2 is demoted.'},
+             'evidence': 'Agent3 accept while issuer coord2 is demoted.', 'decision_id': delegation},
             token=agent3['token'], key='agent3-accept-while-issuer-demoted-fail')
         self.assertEqual(r_ag3_acc_issuer_demoted.status, 403, r_ag3_acc_issuer_demoted.data)
 
@@ -1037,7 +1218,11 @@ class _RecordsScenarioMixin:
         for label, tok in (('coord1', coord1), ('coord2', coord2),
                            ('agent1', agent1['token']), ('agent3', agent3['token'])):
             g_view = harness.request('GET', f'/v1/projects/{self.pid}/capabilities/another.party-cap', token=tok)
-            self.assertTrue(g_view.data['self_accept_blocked'], label)
+            if label.startswith('agent'):
+                self.assertFalse(g_view.data['self_accept_blocked'], label)
+                self.assertTrue(g_view.data['needs_delegation'], label)
+            else:
+                self.assertTrue(g_view.data['self_accept_blocked'], label)
             c_acc_fail = harness.request(
                 'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/accept',
                 {'expected_revision': 2, 'record_sha256': c_other_r2.data['sha256'],
@@ -1058,7 +1243,11 @@ class _RecordsScenarioMixin:
         for label, tok in (('coord1', coord1), ('coord2', coord2),
                            ('agent2', agent2['token']), ('agent3', agent3['token'])):
             g_view = harness.request('GET', f'/v1/projects/{self.pid}/capabilities/another.party-cap', token=tok)
-            self.assertTrue(g_view.data['self_verify_blocked'], label)
+            if label.startswith('agent'):
+                self.assertFalse(g_view.data['self_verify_blocked'], label)
+                self.assertTrue(g_view.data['needs_delegation'], label)
+            else:
+                self.assertTrue(g_view.data['self_verify_blocked'], label)
             c_ver_fail = harness.request(
                 'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/verify',
                 {'revision': 3, 'record_sha256': c_owner_acc_ok.data['sha256'], 'commit': 'd' * 40,
@@ -1109,6 +1298,9 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
     def test_self_acceptance_and_approval_by_another_party(self):
         self.run_self_acceptance_and_party_rules_suite()
 
+    def test_delegated_record_acceptance(self):
+        self.run_delegation_suite()
+
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
@@ -1140,6 +1332,21 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_self_acceptance_and_approval_by_another_party(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_self_acceptance_and_party_rules_suite()
+
+    def test_native_delegated_record_acceptance(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+
+        def plant(text_for, author):
+            # Past every endpoint guard, straight into the native tracker, as a lane with native
+            # access or an older kit that did not reserve the prefix could: a decision issue in
+            # the owner's name, and the exact record a person owner's delegation would carry.
+            created = self.r.bd('create', 'Planted decision', '--type', 'decision', '--json', actor=author)
+            self.assertEqual(created.returncode, 0, created.stderr)
+            issue = json.loads(created.stdout)['id']
+            planted = self.r.bd('comments', 'add', issue, text_for(issue), '--json', actor=author)
+            self.assertEqual(planted.returncode, 0, planted.stderr)
+            return issue
+        self.run_delegation_suite(plant=plant)
 
 
 class DeriveAttestedVsTrustedTests(unittest.TestCase):
