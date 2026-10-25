@@ -413,5 +413,55 @@ class HostCommandTests(unittest.TestCase):
             self.admin.validate_coordination_files({'.delegations/' + '0' * 64 + '.json': record})
 
 
+class BackupTests(unittest.TestCase):
+    """The coordination backup carries `.delegations/`, and a restore honours what it carried."""
+
+    def setUp(self):
+        import types
+        from unittest.mock import patch
+        self.patch = patch
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / 'projects' / 'source'
+        self.destination = self.root / 'projects' / 'destination'
+        self.source.mkdir(parents=True)
+        self.destination.mkdir()
+        (self.root / 'backups' / 'source').mkdir(parents=True)
+        self.bundle = self.root / 'backups' / 'source.coordination.json'
+        fake = types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        patcher = patch.dict(sys.modules, {'fcntl': fake})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        import admin
+        self.admin = admin
+        for name, value in (('backup_lifecycle_void_family', {}), ('restore_lifecycle_void_family', False)):
+            patcher = patch.object(admin, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_restored_project_honours_the_delegation_and_a_missing_entry_voids_it(self):
+        record = d.make_record(request(), project='destination', recorded_by=OWNER, via='session',
+                               account=OWNER, at=AT[1])
+        d.publish(self.source, record)
+        with self.patch.object(self.admin, 'run_bd', return_value='synced'):
+            self.admin.backup_project(self.root, 'source')
+        sidecar = json.loads(self.bundle.read_text(encoding='utf-8'))
+        self.assertIn(d.JOURNAL_DIR + '/' + record['sha256'] + '.json', sidecar['files'])
+        self.admin.restore_coordination(self.root, 'source', 'destination')
+        self.assertTrue(d.journaled(self.destination, record))
+        row = {'id': 'pp-dec', 'issue_type': 'decision', 'labels': [],
+               'comments': [{'id': '01a10001', 'author': OWNER, 'text': d.body(record)}]}
+        live = state()
+        live['memberships']['destination'] = live['memberships'][PROJECT]
+        live['coordinator_grants']['destination'] = live['coordinator_grants'][PROJECT]
+        self.assertEqual(d.check_acceptance(row, project='destination', state=live, journal=self.destination,
+                                            agent=AGENT, kind='references')['decision'], 'pp-dec')
+        (self.destination / d.JOURNAL_DIR / (record['sha256'] + '.json')).unlink()
+        with self.assertRaises(d.DelegationRefusal):
+            d.check_acceptance(row, project='destination', state=live, journal=self.destination,
+                               agent=AGENT, kind='references')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1794,6 +1794,7 @@ is not sent to `bd`.
 | `handoff --file FILE` | `admin.py handoff` (the operator's transfer) |
 | `followon --file FILE` | the coordinator's recorded hand-back (`followon.py`): `record` with task and text, or `withdraw` with the follow-on and reason |
 | `fault-clear --file FILE` | clears a lane's `needs-investigation` flag (`fault_clear.py`); `admin.py fault-clear` is the host route |
+| `delegation-record --file FILE` | an operator's delegation of a decision right (`delegations.py`): grant, narrow or revoke; `admin.py delegation-record` is the host route |
 | `set-onboarding --file FILE` | `admin.py set-onboarding` |
 
 **Authority.** The action is refused unless all of these hold: the request arrives over a key
@@ -1879,6 +1880,21 @@ other members and agent credentials are refused. A later `lane_state` record nev
 flag. The host route is `python3 admin.py --root ROOT fault-clear --project PROJECT --actor OPERATOR --file payload.json`
 (operator allowlist, coordination lock, the same `fault_clear.apply`). There is no web clear
 route. Every refusal ends "Nothing was written."
+
+**`delegation-record` (kittrial-5bb.407).** Records a delegation of a decision right on a
+decision issue: the payload is the closed request
+`{"schema_version":1,"operation_id":"...","decision":"ISSUE"|null,"title":null|"...","action":"grant|narrow|revoke","right":"record-acceptance","grantee":"agent_<16hex>|coordinator-grant","scope":["capabilities","references"],"escalate":"...","reason":"..."}`
+(a grant with `decision: null` creates the decision issue from `title`; a revocation carries an
+empty `scope` and `escalate`). The record is a `Kind: delegation-v1` comment on the decision with
+a host journal entry in `<project>/.delegations/<sha256>.json`; without the entry it grants
+nothing. `via: operator` and the recorder are the server's. Only a bound coordinator key whose
+actor is a configured operator may run it; the host route is
+`python3 admin.py --root ROOT delegation-record --project PROJECT --actor OPERATOR --file payload.json`,
+and a person owner records one on the web (`POST /v1/projects/{id}/delegations`). The read-only
+`python3 admin.py --root ROOT delegation-check --project PROJECT --state STATE.json` lists every
+agent holding the project's coordinator grant and whether a delegation in force covers it. An
+agent's web acceptance of a reference or capability record names its delegation as
+`decision_id` (docs/HTTP_DEPLOYMENT.md, "Delegated record acceptance").
 
 ## `files`: a task's files over SSH
 

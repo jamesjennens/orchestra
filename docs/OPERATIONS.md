@@ -377,6 +377,38 @@ not silently half-applied. Before rolling back, take and retain a complete
 backup with this kit; after rolling forward, restore that sidecar or re-record
 the hand-backs.
 
+### Delegations: before the release, restore and rollback
+
+From kittrial-5bb.407 an agent holding a project's coordinator grant accepts or verifies
+a reference or capability record **only within a person owner's delegation**
+(docs/HTTP_DEPLOYMENT.md, "Delegated record acceptance"). An agent that accepted records
+without one is refused once this release is deployed.
+
+**Before deploying it**, record a delegation for each project whose coordinator agents
+accept records: the owner on the Settings page (*Delegated decisions*), or an operator
+on the host:
+
+```sh
+python3 admin.py --root /path/to/root delegation-record --project PROJECT --actor OPERATOR --file payload.json
+```
+
+Then check, read-only, that every agent holding the grant is covered:
+
+```sh
+python3 admin.py --root /path/to/root delegation-check --project PROJECT --state /path/to/web-state.json
+```
+
+`uncovered` lists the agents still without one.
+
+**Backups.** `admin.py backup` collects `<project>/.delegations/` with the coordination
+sidecar and `restore-new` validates and restores it. A delegation is honoured only with
+its journal entry, so a restore without it voids every delegation (the comments stay,
+inert). **An older kit refuses to restore a backup that holds `.delegations/`**, exactly as
+for `.assignee-followons/` above: restore with this kit or a newer one, or remove
+`.delegations/` from a COPY of the backup. **Rolling back** to a kit before this release
+removes the delegation rule altogether: agents accept as they did before (the own-party
+refusal still holds), and the delegation records read as ordinary comments.
+
 ### The claiming setting: restore and rollback
 
 `<project>/.claiming.json` holds whether workers may claim open tasks (`open`, the
@@ -3234,7 +3266,7 @@ such a file by hand is equally safe: it is a temporary, never a record.
 | --- | --- |
 | `.lifecycle-voids` (`lifecycle_voids.read_journal`) | Enumerates every name and skips both the fixed `.tmp` and anything `is_temporary` recognizes, so a leftover is ignored and the family stays readable. |
 | `.web-lifecycle-marks` (`web_lifecycle_marks.read_journal`) | Enumerates every name and requires `[a-f0-9]{64}\.json`; ANY other name, a temporary included, makes the whole family read `invalid` (fail-closed). Its writer uses the private `mode=` form, so the unique shape this sweep removes is not produced there; the fixed `<name>.tmp` a cut there can leave is not a shape this sweep removes. |
-| `.coordination-requests`, `.handoffs`, `.handoff-requests`, `.handoff-recoveries`, `.requirement-requests`, `.requirement-backfills`, `.integration-reverts`, `.assignee-followons`, `.reference-requests`, `.proposal-requests`, `.capability-requests`, `.open-item-requests`, `.requirement-owner-requests`, `.owner-answers` | Read by one exact path, or listed through `*.json` (a temporary ends in hex, so `*.json` never matches it): a leftover is invisible to every one of them, including `admin.py backup`. |
+| `.coordination-requests`, `.handoffs`, `.handoff-requests`, `.handoff-recoveries`, `.requirement-requests`, `.requirement-backfills`, `.integration-reverts`, `.assignee-followons`, `.reference-requests`, `.proposal-requests`, `.capability-requests`, `.open-item-requests`, `.requirement-owner-requests`, `.owner-answers`, `.delegations` | Read by one exact path, or listed through `*.json` (a temporary ends in hex, so `*.json` never matches it): a leftover is invisible to every one of them, including `admin.py backup`. |
 | `.history-snapshots` (`briefing.py`) | Read by the exact `<digest>.json` a cursor names; never enumerated. |
 
 ## Repeat validation
