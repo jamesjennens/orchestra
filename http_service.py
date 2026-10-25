@@ -12178,12 +12178,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         refuse_ambiguous_query(urlsplit(self.path).query, ('idle_minutes',))
         limit, state = self._page(ctx, ctx.query)
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
-        scope = self._lanes_scope(ctx.principal, ctx.params['pid'])
+        scope, basis, role = self._lanes_scope(ctx.principal, ctx.params['pid'])
         read = self.backend.lanes_read(
             ctx.params['pid'], ctx.principal,
             ['--idle-minutes', str(idle_minutes), '--limit', str(limit), '--offset', str(state['o'])],
             self._lanes_actor(ctx.principal), scope)
         body = dict(read)
+        # Why this viewer got this scope, so the page states the rule in force from the answer.
+        body['scope_basis'] = basis
+        body['scope_role'] = role
         continuation = body.get('next_offset')
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
                                            key=self.service.cursor_key())
@@ -12222,20 +12225,31 @@ class ApiHandler(BaseHTTPRequestHandler):
         return principal.actor or principal.user_id
 
     def _lanes_scope(self, principal, project_id):
-        """The lanes panel's own isolation of the read (kittrial-5bb.263, design section 4).
+        """The lanes panel's own isolation of the read: ``(scope, basis, role)``.
 
         This service calls the endpoint WITHOUT a bound key, so the endpoint's own
         ``lanes_scope_for`` answers ``'all'`` for it. That is a property of the transport,
-        not an authority the page may inherit, so the route decides for its own viewer:
-        an owner or coordinator reads every lane, and everybody else is scoped to their
-        own agents' lanes -- the contributor route's rule, ``scope='own'`` in ``lanes.read``.
+        not an authority the page may inherit, so the route decides for its own viewer. The
+        viewer reads every lane (``'all'``) in exactly three cases and everybody else is
+        scoped to their own agents' lanes (``'own'``, the contributor route's rule):
 
-        "Owner or coordinator" is the kit's ONE operator definition,
-        ``review_workflow.listed_operator_actor``, given the same inputs the endpoint itself
-        uses: the installation's operator allowlist and the project's actor -> principal
-        map, both read from the host through the read-only ``host-coordination`` action. A
-        host that cannot answer is not an operator list, so the read is then SCOPED: this
-        falls back to the narrower view, never to the wider one.
+        * ``operator``: an installation operator, the kit's ONE operator definition
+          ``review_workflow.listed_operator_actor`` given the same inputs the endpoint uses
+          (the operator allowlist and the project's actor -> principal map, read from the
+          host through the read-only ``host-coordination`` action). A host that cannot
+          answer is not an operator list, so this case then narrows, never widens;
+        * ``project-role``: a person whose role IN THIS PROJECT holds ``CAP_COORDINATE``
+          (coordinator or owner; a superuser is an owner everywhere, as on every other
+          coordinator route);
+        * ``coordinator-grant``: an agent with an EFFECTIVE coordinator grant in this
+          project (the grant exists, the agent is enabled and in the project, its account is
+          still a coordinator or owner here, and the credential is live).
+
+        The second and third are ONE live :meth:`Service.check_authority` decision per read,
+        the same one every coordinator route takes; nothing is cached, so a demotion, a
+        revoked grant or an expired credential narrows the very next read. Any refusal of
+        that check is ``'own'``: this falls back to the narrower view, never the wider.
+        ``role`` is the decided role for ``project-role`` and ``None`` otherwise.
         """
         from review_workflow import listed_operator_actor
         actor = self._lanes_actor(principal)
@@ -12254,7 +12268,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             allowed = listed_operator_actor(actor, operators, owners)
         except (ValueError, OSError):
             allowed = actor in set(operators)
-        return 'all' if allowed else 'own'
+        if allowed:
+            return 'all', 'operator', None
+        try:
+            _project, role = self.service.check_authority(principal, project_id, CAP_COORDINATE)
+        except HttpError:
+            return 'own', 'own', None
+        if principal.via == 'credential':
+            return 'all', 'coordinator-grant', None
+        return 'all', 'project-role', role if role in ('owner', 'coordinator') else None
 
     @route('GET', r'/v1/me/work')
     def me_work(self, ctx):
