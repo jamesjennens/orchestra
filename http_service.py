@@ -52,6 +52,7 @@ import bd_refusals
 import claim_limit
 import project_setup
 import project_coordination
+import nudges
 import task_files
 import rooms
 from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
@@ -12926,7 +12927,95 @@ class ApiHandler(BaseHTTPRequestHandler):
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
                                            key=self.service.cursor_key())
                                if type(continuation) is int and continuation > state['o'] else None)
+        # kittrial-5bb.413: each row also carries the lane's newest nudge request in THIS project
+        # (read-only; never the note). Only rows the viewer's scope already put on the page.
+        items = [row for row in body.get('items') or [] if isinstance(row, dict)]
+        shown = self.service.nudge_views(ctx.params['pid'], [row.get('actor') for row in items])
+        body['items'] = [dict(row, nudge=shown.get(row.get('actor'))) if isinstance(row, dict) else row
+                         for row in body.get('items') or []]
         return 200, body
+
+    #: The one body a nudge request takes (kittrial-5bb.413). ``operation_id`` is the retry key of
+    #: the design when the caller sends no ``Idempotency-Key`` header.
+    NUDGE_FIELDS = ('lane', 'message', 'reason', 'note', 'acknowledge_declared_wait', 'operation_id')
+
+    def _nudge_lane_row(self, ctx, lane):
+        """The lane's row on THIS project's board, read for every lane, or the one 404 of a lane not here.
+
+        The page scope of the viewer does not apply: the caller already holds ``coordinate`` in this
+        project, and the answer for a lane that is absent and for one that exists only in another
+        project is the same sentence.
+        """
+        from lanes import LANES_LIMIT_MAX
+        offset = 0
+        for _page in range(50):
+            read = self.backend.lanes_read(
+                ctx.params['pid'], ctx.principal,
+                ['--idle-minutes', str(self._lanes_idle_minutes(None)), '--limit', str(LANES_LIMIT_MAX),
+                 '--offset', str(offset)],
+                self._lanes_actor(ctx.principal), 'all')
+            for row in read.get('items') or []:
+                if isinstance(row, dict) and row.get('actor') == lane:
+                    return row
+            offset = read.get('next_offset')
+            if type(offset) is not int:
+                break
+        raise not_found(nudges.NOT_HERE)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/nudges')
+    def project_nudge_request(self, ctx):
+        """Ask that a fixed message reach one stalled lane (kittrial-5bb.413; design kittrial-5bb.409).
+
+        ``coordinate`` in THIS project, live: an owner, a coordinator, a superuser, or an agent whose
+        coordinator grant is effective. Nothing is delivered here (no carrier yet): the request is
+        kept, audited and shown on the board, and ends ``not-deliverable``.
+        """
+        self._project(ctx, CAP_COORDINATE)
+        payload = dict(ctx.payload or {})
+        operation_id = payload.get('operation_id')
+        if isinstance(operation_id, str) and IDEMPOTENCY_KEY.fullmatch(operation_id) \
+                and ctx.idempotency_key in (None, operation_id):
+            ctx.idempotency_key = operation_id
+        lane = payload.get('lane')
+
+        def request():
+            # Everything that can refuse runs inside the mutation: the key is reserved first (a retry
+            # after the lane left the board is the stored answer) and every refusal is audited.
+            refuse_unknown_fields(payload, self.NUDGE_FIELDS, 'A nudge request')
+            try:
+                fields = nudges.parse_request(payload)
+            except ValueError as error:
+                raise invalid(str(error))
+            if operation_id is not None:
+                if not isinstance(operation_id, str) or not IDEMPOTENCY_KEY.fullmatch(operation_id):
+                    raise invalid('operation_id must be 8-128 URL-safe characters')
+                if ctx.idempotency_key != operation_id:
+                    raise invalid('operation_id and the Idempotency-Key header must be the same')
+            row = self._nudge_lane_row(ctx, fields['lane'])      # a slow read: never under the service lock
+            with self.service.store.lock:
+                ctx.authorize()
+                return self.service.request_nudge(ctx.principal, ctx.params['pid'], fields, row,
+                                                  request_id=ctx.request_id)
+        status, answer = self._mutate(ctx, 'lanes.nudge.request', ctx.params['pid'], request,
+                                      capability=CAP_COORDINATE, status=201, audit_success=False,
+                                      serialize=False,
+                                      reason='lane %s' % (lane[:80] if isinstance(lane, str) else '?'))
+        # An open request for the same lane and message is answered as it is: 200, nothing written.
+        return (200 if answer.get('coalesced') else status), answer
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/nudges')
+    def project_nudges(self, ctx):
+        """The project's newest nudge requests, newest first; for a coordinator (never the note)."""
+        self._project(ctx, CAP_COORDINATE)
+        refuse_ambiguous_query(urlsplit(self.path).query, ('lane', 'limit'))
+        lane = ctx.query.get('lane')
+        if lane is not None and not nudges.LANE_LABEL.fullmatch(lane):
+            raise HttpError(400, 'invalid_request', 'lane must be a lane actor label')
+        raw = ctx.query.get('limit')
+        if raw is not None and not (re.fullmatch(r'[0-9]+', raw) and 1 <= int(raw) <= 100):
+            raise HttpError(400, 'invalid_request', 'limit must be a whole number, 1 to 100')
+        return 200, dict(self.service.nudge_list(ctx.params['pid'], lane, int(raw) if raw else 20),
+                         generated_at=now_iso(self.service._now()))
 
     def _lanes_idle_minutes(self, raw):
         """The page's threshold argument, or the refusal that names the read's own range.
