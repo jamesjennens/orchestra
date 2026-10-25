@@ -421,10 +421,12 @@ def dispatch(canonical, request, tmp, run=None):
         # endpoint.py's delegation action (kittrial-5bb.407) over the emulated rows: a read for
         # any member; grant, narrow and revoke only for a person owner's own web session.
         import delegations
+        # A name of its own: an `import http_authority` here would make the name local to
+        # dispatch and unbind the module-level one the records branch below uses.
         try:
-            import http_authority
+            import http_authority as delegation_authority
         except ImportError:
-            http_authority = None
+            delegation_authority = None
         config_file = canonical.root / 'deployment.private.json'
         config_data = json.loads(config_file.read_text(encoding='utf-8')) if config_file.is_file() else {}
         operators = config_data.get('operators') or []
@@ -432,14 +434,14 @@ def dispatch(canonical, request, tmp, run=None):
 
         def refused(status, message):
             return envelope(2, stderr=message + '\n', delegation_status=status)
-        if http_authority is None or canonical.authority_config is None:
+        if delegation_authority is None or canonical.authority_config is None:
             return refused(403, 'Verified web authority required in this project')
         operation = args[0] if args else None
         if operation == 'list':
-            if not http_authority.verified_web_authority(request, canonical.authority_config,
-                                                         http_authority.CAP_READ, project):
+            if not delegation_authority.verified_web_authority(request, canonical.authority_config,
+                                                         delegation_authority.CAP_READ, project):
                 return refused(403, 'Verified read authority required in this project')
-            state = http_authority.read_state(canonical.authority_config.store)
+            state = delegation_authority.read_state(canonical.authority_config.store)
             listed = json.loads(run(['list', '--label', delegations.LABEL, '--all', '--limit', '0', '--json']) or '[]')
             ids = [str(row['id']) for row in listed if isinstance(row, dict) and row.get('id')][:200]
             shown = json.loads(run(['show', *ids, '--json', '--include-comments']) or '[]') if ids else []
@@ -470,19 +472,19 @@ def dispatch(canonical, request, tmp, run=None):
             return refused(422, '%s. Nothing was written.' % error)
         if payload['action'] != operation or payload['operation_id'] != request.get('operation_id'):
             return refused(422, 'The payload does not match the request. Nothing was written.')
-        if not http_authority.verified_web_authority(request, canonical.authority_config,
-                                                     http_authority.CAP_PROJECT_ADMIN, project):
+        if not delegation_authority.verified_web_authority(request, canonical.authority_config,
+                                                     delegation_authority.CAP_PROJECT_ADMIN, project):
             return refused(403, 'Only a person owner of this project records a delegation. Nothing was written.')
         user_id = authority.get('user_id')
         if authority.get('via') != 'session' or actor != user_id or not delegations.ACCOUNT.fullmatch(str(user_id)):
             return refused(403, 'A delegation is recorded by a person owner signed in to the web; an agent or worker '
                                 'credential cannot record one. Nothing was written.')
-        state = http_authority.read_state(canonical.authority_config.store)
+        state = delegation_authority.read_state(canonical.authority_config.store)
         if ((state.get('memberships') or {}).get(project) or {}).get(user_id) != 'owner':
             return refused(403, 'Only a person owner of this project records a delegation. Nothing was written.')
         try:
             result = delegations.apply(payload, project=project, journal=canonical.path, run=run, recorded_by=actor,
-                                       via='session', account=actor, at=http_authority.server_time())
+                                       via='session', account=actor, at=delegation_authority.server_time())
         except delegations.DelegationRefusal as error:
             return refused(error.status, str(error))
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
