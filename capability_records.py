@@ -258,19 +258,42 @@ def entry_record(payload, revision, acceptance_state):
     return record
 
 
-def _validate_content(payload):
-    for name in ('name', 'summary'):
+def _validate_content(payload, collect=False):
+    errors = []
+
+    def reject(field, hint, message):
+        if not collect:
+            raise ValueError(message)
+        errors.append({'field': field, 'message': message, 'hint': hint})
+
+    def check(field, hint, call):
+        try:
+            call()
+        except (ValueError, TypeError, KeyError) as error:
+            reject(field, hint, str(error))
+
+    for name, limit in (('name', NAME_MAX), ('summary', SUMMARY_MAX)):
         if name not in payload:
-            raise ValueError('capability payload is missing field ' + name)
-    _bounded_text(payload['name'], 'name', NAME_MAX)
-    _bounded_text(payload['summary'], 'summary', SUMMARY_MAX)
-    valid_aliases(payload.get('aliases', []))
-    valid_requirements(payload.get('requirements', []))
-    _pointers(payload.get('anchors', []), 'anchors', ANCHORS_MAX, ('#',))
-    _pointers(payload.get('code', []), 'code', CODE_MAX, ('::',))
-    _pointers(payload.get('tests', []), 'tests', TESTS_MAX, ('::', ''))
-    valid_owner(payload.get('owner'), required=payload.get('operation') == 'draft')
-    valid_tags(payload.get('tags', []))
+            reject(name, 'Add a nonempty %s of at most %d characters.' % (name, limit),
+                   'capability payload is missing field ' + name)
+        else:
+            check(name, 'Use a nonempty %s of at most %d characters.' % (name, limit),
+                  lambda name=name, limit=limit: _bounded_text(payload[name], name, limit))
+    check('aliases', 'Use at most %d unique printable search phrases.' % ALIASES_MAX,
+          lambda: valid_aliases(payload.get('aliases', [])))
+    check('requirements', 'Use unique {key, revision?} links to existing requirement records.',
+          lambda: valid_requirements(payload.get('requirements', [])))
+    check('anchors', 'Use at most %d unique file.md#heading pointers.' % ANCHORS_MAX,
+          lambda: _pointers(payload.get('anchors', []), 'anchors', ANCHORS_MAX, ('#',)))
+    check('code', 'Use at most %d unique file.py::Qualified.name pointers.' % CODE_MAX,
+          lambda: _pointers(payload.get('code', []), 'code', CODE_MAX, ('::',)))
+    check('tests', 'Use at most %d unique test file or file.py::Qualified.name pointers.' % TESTS_MAX,
+          lambda: _pointers(payload.get('tests', []), 'tests', TESTS_MAX, ('::', '')))
+    check('owner', 'Use account:<uid> or person:<name>, never a session actor.',
+          lambda: valid_owner(payload.get('owner'), required=payload.get('operation') == 'draft'))
+    check('tags', 'Use at most %d unique lowercase slugs.' % TAGS_MAX,
+          lambda: valid_tags(payload.get('tags', [])))
+    return errors
 
 
 def _pre_write(payload, run, operators=None):
@@ -496,7 +519,7 @@ KIND = keyed_entries.AnchoredKind(
     valid_key=lambda value, where='key': valid_key(value, where), parse_entry=lambda body: parse_entry(body),
     validate_entry=lambda record: validate_entry(record),
     entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
-    validate_content=_validate_content, write_time_rules=lambda record: None,
+    validate_content=_validate_content, collecting_content=True, write_time_rules=lambda record: None,
     content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators: _pre_write(payload, run, operators),
     extra_records={'capability-alias': _read_alias, 'capability-verification': verification.read_record},
     extra_parsers={'capability-alias': parse_alias, 'capability-verification': verification.parse},
@@ -509,6 +532,67 @@ existing_revisions = KIND.existing_revisions
 anchor_for = KIND.anchor_for
 entry_comment = KIND.entry_comment
 write_payload = KIND.write_payload
+
+
+def validation_payloads(args, attachments):
+    """One propose payload or a bare list, each decoded by the ordinary write path."""
+    rest = [token for token in args[1:] if token != '--json'] if args else []
+    if not args or args[0] != 'validate' or len(rest) != 1 or not rest[0].startswith('@attachment:'):
+        raise ValueError('capability validate takes --file entry.json')
+    item = (attachments or {}).get(rest[0].partition(':')[2])
+    if not isinstance(item, dict) or item.get('flag') not in ('--file', '-f') or not isinstance(item.get('text'), str):
+        raise ValueError('capability validate takes --file entry.json')
+    document = parse_json(item['text'])
+    if isinstance(document, dict):
+        return [write_payload(['propose', rest[0]], attachments)]
+    if not isinstance(document, list):
+        raise ValueError('capability validate file must contain one payload object or a list of payloads')
+    if len(document) > 100:
+        raise ValueError('capability validate accepts at most 100 payloads in one file')
+    payloads = []
+    for entry in document:
+        text = json.dumps(entry, ensure_ascii=False)
+        try:
+            payloads.append(write_payload(['propose', '@attachment:item'], {
+                'item': {'flag': '--file', 'text': text}}))
+        except ValueError as error:
+            payloads.append(error)
+    return payloads
+
+
+def validate(args, attachments, run, operators):
+    """Read-only propose preflight; collect field errors without taking a lock or writing."""
+    items = []
+    for index, payload in enumerate(validation_payloads(args, attachments)):
+        if isinstance(payload, ValueError):
+            items.append({'index': index, 'key': None, 'revision': None, 'state': None, 'valid': False,
+                          'errors': [{'field': 'payload', 'message': str(payload),
+                                      'hint': 'Make every list item a propose payload object without an operation field.'}],
+                          'pointer_values': {name: [] for name in ('code', 'tests', 'anchors')}})
+            continue
+        errors = KIND.validate_payload(payload, collect=True)
+        fields = {error['field'] for error in errors}
+        if 'requirements' not in fields:
+            try:
+                KIND.pre_write(payload, run, operators)
+            except ValueError as error:
+                errors.append({'field': 'requirements', 'message': str(error),
+                               'hint': 'Link existing active requirement keys and revisions, or remove the link.'})
+        if not {'key', 'operation_id'} & fields:
+            try:
+                core.current_key_preflight(payload, run, KIND.write_spec(operators, run))
+            except ValueError as error:
+                errors.append({'field': 'key', 'message': str(error),
+                               'hint': 'Choose an unused capability key, or reconcile the existing anchor.'})
+        items.append({'index': index, 'key': payload.get('key') if isinstance(payload.get('key'), str) else None,
+                      'revision': payload.get('revision', 1), 'state': 'draft' if not errors else None,
+                      'valid': not errors, 'errors': errors,
+                      'pointer_values': {name: payload.get(name) for name in ('code', 'tests', 'anchors')}})
+    valid = all(item['valid'] for item in items)
+    return {'schema': 'capability-validate-v1', 'contract': 'cli-contract-v1', 'valid': valid, 'items': items,
+            'summary': {'items': len(items), 'valid': sum(item['valid'] for item in items),
+                        'invalid': sum(not item['valid'] for item in items),
+                        'errors': sum(len(item['errors']) for item in items)}}
 
 
 def pointers_validation_of(record, accepted=False, verification_state=None, attested_by=None):
@@ -1341,6 +1425,7 @@ def help_payload():
                       'capability propose-alias KEY PHRASE [--evidence POINTER]',
                       'capability verify --file verification.json'],
             'local': ['capability lookup PHRASE', 'capability resolve POINTER...', 'capability index',
+                      'capability validate --file entry.json [--repo PATH]',
                       'capability check --repo PATH [--key KEY]... [--record | --payloads FILE]'],
             'telemetry': 'Each find is counted per project, and a find with no exact match also records its '
                          'normalised phrase, a count and first/last seen times; no actor is stored. Read it '
@@ -1462,7 +1547,7 @@ def read(args, run, operators, verifiers=None, journal=None, web_service=False):
         rows, lifecycle = read_catalog(run)
         return find(rows, phrase, operators, limit=limit,
                     trust=Trust(run, operators, verifiers, journal, lifecycle))
-    raise ValueError('capability: unknown command %s; use get, list, find, misses, propose, revise, '
+    raise ValueError('capability: unknown command %s; use get, list, find, misses, validate, propose, revise, '
                      'propose-alias or verify' % command)
 
 

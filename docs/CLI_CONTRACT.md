@@ -966,6 +966,26 @@ If the endpoint cannot answer, the local result is still returned, with
   - `status` and `verified_at` are derived, never stored.
   - The rules on `revision`, `expected_sha256`, retries and interrupted proposes are
     those of `ref`.
+- **`validate --file entry.json [--repo PATH]`** performs the same schema, content,
+  requirement-link and current-key preflight as `propose`, without taking the
+  coordination lock or writing an anchor, revision, receipt or other record. The file
+  contains one propose payload or a bare JSON list of at most 100 payloads. Each result
+  item carries its zero-based `index`, `key`, `valid`, `state`, `revision` and `errors`;
+  every error has a `field`, `message` and fix `hint`. All independent payload errors
+  are collected in the same order in which `propose` checks them, so the first shared
+  error has the same message and the valid/invalid verdict agrees. Later list items
+  are checked even when an earlier one is invalid.
+- The client additionally resolves every syntactically usable `code`, `tests` and
+  `anchors` pointer against `--repo` (default: the current checkout), records the
+  resolution rows under `pointers`, and turns a missing file, symbol or heading into
+  an error for that field. A pointer this kit cannot check remains `resolved: null`,
+  not a failure. Repository resolution follows shared preflight and is not a new
+  server-side `propose` rule.
+- The output is `capability-validate-v1`, with top-level `valid` and a `summary` of
+  item and error counts. A completed report, including one with invalid items, exits
+  0. Arguments, malformed JSON, an unreadable repository or a transport failure exits
+  2 with no stdout. Validation needs `--config`, `--project` and `--actor`; `--help`
+  does not.
 - **`propose-alias KEY "PHRASE" [--evidence POINTER]`** adds a pending alias. It is
   only a candidate until an operator folds it into the next accepted revision's
   `aliases`, or rejects it.

@@ -222,6 +222,14 @@ reads `drifted` at every release cut before its work lands.
   set `operation` (the command supplies it), and do not invent a field: any other field is
   refused. There is no field for "the check that proves it" and none for the commit — the
   check records the commit it was run at.
+- **Validate the round file before delivery.** Run
+  `b capability validate --file capability-proposals/<key>.json --repo .` on every payload
+  file (a round file may instead contain a JSON list of payloads). It reports every item's
+  independent errors with an index, key, field and fix hint, checks requirement links and
+  current keys against the project, and resolves code/test/anchor pointers in your checkout.
+  It takes no coordination lock and creates no anchor, revision, receipt or other record.
+  An invalid payload is a completed result with exit code 0; fix every reported error and
+  run it again before drafting the delivery.
 - **The check proves location, not meaning.** `code`, `tests` and `anchors` are the pointers
   `capability check` resolves, so cite pointers that exist at your delivered commit — never a
   file that only exists in a branch still under review — and make `tests` include a test that
