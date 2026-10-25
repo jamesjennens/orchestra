@@ -2271,13 +2271,39 @@ invoke history enrichment or accept native-row JSON as a history context.
 Release selection, rollback selection, `release-query`, and CLI release/dry-run
 reports optionally carry `review_void_diagnostics` (at most 50),
 `review_void_diagnostics_total` and `review_void_diagnostics_omitted`. Entries name
-`task`, `void_id`, `target_id`, `hold_id`, `release_id`, `issuer`,
+`task`, `void_id`, `target_id`, `target_operation`, `hold_id`, `release_id`, `issuer`,
 `current_result` (`held`, `unheld` or `unreadable`), reasons and a separately named
-counterfactual result/reason, plus `trust: data` and unproved historical operator
-eligibility. Held includes the existing integration hold/failed-attestation
+counterfactual result/reason, plus `trust: data`,
+`historical_operator_eligibility`, `eligibility_basis` and `eligibility_reason`.
+Any review-record operation can be the decisive target, including
+a failed `attest` or a repair `contribute`; `hold_id` and `release_id` are null
+when that target does not name them. Held includes the existing integration hold/failed-attestation
 refusal. Current unreadable chains remain refused; a counterfactual supplies no
 operative result or authority. The CLI labels diagnostic context `host` when its
 read-only endpoint query succeeded, otherwise `local`; a dry run is local.
 Reports with no diagnostic preserve the previous optional-field shape. No
 checkpoint/lifecycle/review payload, writer gate, protected store or write format
 grows a field. JSON output escapes diagnostic text; consumers render it as data.
+Only the host release-query adapters load typed `OperatorHistory` from the
+existing runtime `authority-changes.audit.json`, through the existing validated
+reader with a 256 KiB byte bound and a 200-entry ceiling. They create no file.
+The retained baseline and ordered trail must replay to the current operator
+list and cover the VOID's native creation time. Ties, future times, backward
+order, pre-baseline/fold gaps, missing/null baselines, mismatches, missing,
+unreadable, damaged or symlinked files remain unknown. No native assignment
+history is loaded on these paths; caller/native-row JSON is not this context.
+An issuer proved eligible then but absent now gets
+`reason: currently-ineligible-review-void` and eligibility `eligible`. An issuer
+proved ineligible at that point is omitted; this is not a lifetime claim.
+Without proof, the diagnostic instead has eligibility `unknown` and
+`reason: review-void-eligibility-unknown`, never an inferred revocation. Local
+selection/dry-run without authoritative trail context has that same unknown.
+The web release-query route requires the project's coordinator capability and
+discloses diagnostic issuer identities and reasons to those callers; ordinary
+member/read capability does not grant access. Diagnosing a candidate adds review
+projection and counterfactual work to the existing release read. R1 review
+fixtures roughly doubled reader cost. Tasks with no potentially inactive VOID
+comment now skip these extra projections; candidate tasks still pay that cost.
+The 50-entry output limit does not
+mean only 50 candidates are examined. An opt-in public request flag would need
+a separate protocol change; this additive response retains the current route.

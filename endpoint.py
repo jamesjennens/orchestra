@@ -2343,7 +2343,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     raise web_release.ReleaseError(503,'The installation operator list cannot be read, so the '
                                                         'host revert and hold set is unavailable: '+str(error)[:160])
                 if operation=='query':
-                    result=lifecycle.release_query(payload,actor,runner,operators=operators,journal=path)
+                    from lifecycle_audit import read_operator_history
+                    operator_history=read_operator_history(root,operators)
+                    result=lifecycle.release_query(payload,actor,runner,operators=operators,journal=path,
+                                                   operator_history=operator_history)
                 else:
                     rules=configured_coordinator_rules(root,warnings=run_warnings)
                     rows=lifecycle.read_event_rows(runner)
@@ -2581,11 +2584,17 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             run_warnings.append('deployment operators unreadable, so operator voids are not applied: '
                                +str(error)[:160])
         def lifecycle_effect():
-            if action=='lifecycle':result=apply_native(payload,actor,runner,
-                                                       operators=configured_operators(root),journal=path,
-                                                       lifecycle_authors=rules['lifecycle_authors'],
-                                                       independent_approval=rules['independent_approval'],
-                                                       owners=owner_loader(path,'lifecycle_authors'))
+            if action=='lifecycle':
+                lifecycle_operators=configured_operators(root)
+                diagnostic_context={}
+                if isinstance(payload,dict) and payload.get('dimension')=='release-query':
+                    from lifecycle_audit import read_operator_history
+                    diagnostic_context['operator_history']=read_operator_history(root,lifecycle_operators)
+                result=apply_native(payload,actor,runner,
+                                    operators=lifecycle_operators,journal=path,
+                                    lifecycle_authors=rules['lifecycle_authors'],
+                                    independent_approval=rules['independent_approval'],
+                                    owners=owner_loader(path,'lifecycle_authors'),**diagnostic_context)
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
                 result=coordinate(payload,actor,runner,path,operators=coordinate_operators,

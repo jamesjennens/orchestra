@@ -214,4 +214,111 @@ class NativeAssignmentAuditTests(RulesHelpers,unittest.TestCase):
         self.assertEqual(before,canonical_bytes(self.rows()));self.assertEqual(families,self.inventory())
 
 
+@unittest.skipIf(fixture.endpoint is None,'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(fixture.BD is None,'no pinned native bd (set ORCHESTRA_BD_BIN)')
+class NativeReleaseAuditTests(RulesHelpers,unittest.TestCase):
+    inventory=NativeAuditTests.inventory
+
+    def authority(self,operation):
+        done=subprocess.run([sys.executable,str(Path(lifecycle.__file__).with_name('admin.py')),
+            '--root',str(self.root),'operators',operation,self.operator,'--confirm-revoke'],
+            env=fixture.admin.environment(self.root),capture_output=True,text=True,timeout=30)
+        self.assertEqual(done.returncode,0,done.stdout+done.stderr)
+
+    def prepare(self,case):
+        import test_lifecycle_d2_audit as units
+        import test_lifecycle_release as release
+        import recovery
+        self.operator=release.OPERATOR;self.deployment(operators=[self.operator])
+        task=self.task('Synthetic native R2 '+case,assignee=release.ACTOR)
+        scope=dict(source_commit='a'*40,integration_commit='b'*40,release_id='',environment='test')
+        for actor,dimension in ((release.ACTOR,'lifecycle-scope'),(self.operator,'integrated')):
+            answer=self.lifecycle(actor,dimension,task,scope=scope);self.assertEqual(answer['returncode'],0,answer)
+        if case in ('attest','fork'):
+            template=units.ReleaseDiagnosticsTests().failed_attestation_fork('3' if case=='attest' else '4',task).rows[0]['comments']
+        else:
+            template=units.ReleaseRegressions().held_with_void(task).rows[0]['comments']
+            if case=='release':
+                template=template[:3]
+                payload=dict(schema_version=1,operation='release-hold',operation_id='native-release',task=task,
+                    previous='3',contribution='1',hold='3',reason='Synthetic native release')
+                target=dict(id='4',author=self.operator,text=reviews.PREFIX+canonical_bytes(payload).decode())
+                contribution=json.loads(template[0]['text'][len(reviews.PREFIX):])
+                fork=dict(contribution,operation_id='native-release-fork',previous='3',supersedes='1',commit='9'*40)
+                template += [target,dict(id='repair',author=release.ACTOR,text=reviews.PREFIX+canonical_bytes(fork).decode())]
+                payload=dict(schema_version=1,operation=recovery.OPERATION,operation_id='native-release-void',task=task,
+                    target='4',target_kind='contribution-review',target_sha256=recovery.digest(target['text']),original=target['text'],
+                    reason='Synthetic native repair',disposition='void',operator=self.operator)
+                template.append(dict(id='void-comment',author=self.operator,text=recovery.PREFIX+canonical_bytes(payload).decode()))
+        ids={};texts={};void_id=None
+        for comment in template:
+            prefix=recovery.PREFIX if comment['text'].startswith(recovery.PREFIX) else reviews.PREFIX
+            body=json.loads(comment['text'][len(prefix):])
+            for key in ('previous','supersedes','contribution','hold','target'):
+                if body.get(key) in ids:body[key]=ids[body[key]]
+            author=comment['author']
+            if prefix==recovery.PREFIX:
+                body['original']=texts[body['target']];body['target_sha256']=recovery.digest(body['original'])
+                if case=='forged':body['operator']='never-operator';author='never-operator'
+            text=prefix+canonical_bytes(body).decode()
+            made=self.r.bd('comments','add',task,text,'--json',actor=author);self.assertEqual(made.returncode,0,made.stderr)
+            identity=str(json.loads(made.stdout)['id']);ids[comment['id']]=identity;texts[identity]=text
+            if prefix==recovery.PREFIX:void_id=identity
+        baseline=fixture.admin.authority_change_baseline(dict(operators=[self.operator],verifiers=[]),None,
+            'Synthetic retained baseline',at='2026-10-01T00:00:00Z')
+        audit_path=self.root/fixture.admin.AUTHORITY_CHANGES_AUDIT
+        if audit_path.exists() or audit_path.is_symlink():audit_path.unlink()
+        audit_path.write_text(json.dumps(dict(schema_version=1,entries=[],baseline=baseline)))
+        # Native comments can round upward; the existing authority writer uses
+        # whole seconds. This bounded fixture delay clears both rounding edges.
+        import time
+        time.sleep(2.1)
+        self.authority('remove')
+        return task,void_id,scope
+
+    def query(self):
+        import test_lifecycle_release as release
+        payload=dict(release.release_payload([]),dimension=lifecycle.RELEASE_QUERY,actor='synthetic-reader')
+        answer=self.endpoint('lifecycle','synthetic-reader',[json.dumps(payload)])
+        self.assertEqual(answer['returncode'],0,answer)
+        return json.loads(answer['stdout'])
+
+    def test_host_query_proves_prior_eligibility_for_all_decisive_targets_and_rejects_forgery(self):
+        for case,counter in [('hold','unheld'),('release','held'),('attest','unheld'),('fork','held'),('forged',None)]:
+            with self.subTest(case=case):
+                task,void_id,scope=self.prepare(case);before=canonical_bytes(self.rows());families=self.inventory()
+                audit_path=self.root/fixture.admin.AUTHORITY_CHANGES_AUDIT;trail=audit_path.read_bytes()
+                report=self.query();notes=[n for n in report.get('review_void_diagnostics',[]) if n['task']==task]
+                if counter is None:self.assertEqual(notes,[])
+                else:
+                    self.assertEqual(len(notes),1,report);note=notes[0]
+                    self.assertEqual((note['void_id'],note['historical_operator_eligibility']),(void_id,'eligible'))
+                    self.assertEqual(note['reason'],'currently-ineligible-review-void')
+                    self.assertEqual((note['current_result'],note['counterfactual_result']),('unreadable',counter))
+                with self.assertRaisesRegex(ValueError,'cannot be read'):
+                    self.lifecycle(self.operator,'integrated',task,scope=scope)
+                self.assertEqual(before,canonical_bytes(self.rows()));self.assertEqual(families,self.inventory());self.assertEqual(trail,audit_path.read_bytes())
+                self.authority('add')
+                self.assertFalse([n for n in self.query().get('review_void_diagnostics',[]) if n['task']==task])
+
+    def test_host_query_missing_damaged_and_symlinked_audit_stays_unknown_and_writes_nothing(self):
+        task,void_id,scope=self.prepare('hold');path=self.root/fixture.admin.AUTHORITY_CHANGES_AUDIT
+        valid=path.read_bytes();before=canonical_bytes(self.rows());families=self.inventory()
+        for case in ('missing','damaged','symlink'):
+            with self.subTest(case=case):
+                if path.exists() or path.is_symlink():path.unlink()
+                target=self.root/'synthetic-audit-target.json'
+                if case=='damaged':path.write_text('{damaged')
+                elif case=='symlink':target.write_bytes(valid);path.symlink_to(target)
+                report=self.query();notes=[n for n in report.get('review_void_diagnostics',[]) if n['task']==task]
+                self.assertEqual(len(notes),1,report)
+                self.assertEqual(notes[0]['void_id'],void_id)
+                self.assertEqual(notes[0]['historical_operator_eligibility'],'unknown')
+                self.assertEqual(notes[0]['reason'],'review-void-eligibility-unknown')
+                self.assertEqual(before,canonical_bytes(self.rows()));self.assertEqual(families,self.inventory())
+                if case=='missing':self.assertFalse(path.exists())
+                elif case=='damaged':self.assertEqual(path.read_text(),'{damaged')
+                else:self.assertTrue(path.is_symlink());self.assertEqual(target.read_bytes(),valid)
+
+
 if __name__=='__main__':unittest.main()

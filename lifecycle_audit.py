@@ -241,12 +241,75 @@ def historical_assignment(issue,event,project=None,history=None,native_event=Non
     return result
 
 
-def review_void_diagnostics(rows,operators=None,journal=None,subset=None):
+OPERATOR_AUDIT_BYTES=256*1024
+
+
+class OperatorHistory:
+    """Host-only authority trail context; never accepted from native row JSON."""
+    def __init__(self,entries=(),baseline=None,listed=(),reason=None,observed_at=None):
+        from datetime import datetime,timezone
+        self.entries=entries;self.baseline=baseline;self.listed=listed;self.reason=reason
+        self.observed_at=observed_at or datetime.now(timezone.utc)
+
+
+def read_operator_history(root,operators):
+    """Host release-query adapter only: reuse the existing validated audit reader."""
+    import admin,stat
+    try:
+        path=root/admin.AUTHORITY_CHANGES_AUDIT
+        info=path.lstat()
+        if not stat.S_ISREG(info.st_mode):return OperatorHistory(reason='authority-audit-not-regular')
+        if info.st_size>OPERATOR_AUDIT_BYTES:return OperatorHistory(reason='authority-audit-byte-cap')
+        entries,baseline,damage=admin.read_authority_changes(root,max_bytes=OPERATOR_AUDIT_BYTES)
+        if damage:return OperatorHistory(reason='authority-audit-damaged')
+        if len(entries)>admin.AUTHORITY_CHANGES_MAX:return OperatorHistory(reason='authority-audit-entry-cap')
+        return OperatorHistory(entries,baseline,list(operators or ()))
+    except FileNotFoundError:return OperatorHistory(reason='authority-audit-missing')
+    except (OSError,ValueError,TypeError,UnicodeError,RecursionError):
+        return OperatorHistory(reason='authority-audit-unreadable')
+
+
+def operator_eligibility(history,issuer,at,operators):
+    """Membership within the retained, replayable authority trail only."""
+    import admin,recovery
+    from review_workflow import _recorded_at
+    unknown=lambda reason:dict(state='unknown',reason=reason,basis='none')
+    if not isinstance(history,OperatorHistory):return unknown('authority-history-not-supplied')
+    if history.reason:return unknown(history.reason)
+    try:
+        if set(history.listed)!=recovery.configured_operators(operators):
+            return unknown('authority-current-list-mismatch')
+        baseline=history.baseline
+        if not baseline or baseline['lists']['operators'] is None:
+            return unknown('authority-baseline-unavailable')
+        replay=admin.authority_change_replay(history.entries,{'operators':history.listed},'operators',baseline)
+        if not replay or not replay['agrees'] or replay['listed_more_than_once']:
+            return unknown('authority-trail-current-list-mismatch')
+        stamp=_recorded_at(at);start=_recorded_at(baseline['at'])
+        if stamp is None or start is None or stamp<=start or stamp>history.observed_at:
+            return unknown('authority-time-outside-retained-trail')
+        membership=set(baseline['lists']['operators']);previous=start
+        for entry in history.entries:
+            moment=_recorded_at(entry['at'])
+            if moment is None or moment<previous or moment>history.observed_at:
+                return unknown('authority-trail-time-unclassifiable')
+            previous=moment
+            if moment==stamp:return unknown('authority-trail-time-tie')
+            if moment<stamp and entry['list']=='operators':
+                if entry['change']=='add':membership.add(entry['actor'])
+                else:membership.discard(entry['actor'])
+        return dict(state='eligible' if issuer in membership else 'ineligible',reason=None,
+                    basis='retained-authority-trail',baseline_at=baseline['at'])
+    except (ValueError,TypeError,KeyError,RecursionError):return unknown('authority-history-damaged')
+
+
+def review_void_diagnostics(rows,operators=None,journal=None,subset=None,operator_history=None):
     """Explain decisive currently ineligible review VOIDs without changing a verdict.
 
     The diagnostic compares an otherwise canonical counterfactual, one issuer at
     a time. Only the actual current-list projection governs every release gate.
-    No historical operator membership is inferred from a native record.
+    No historical operator membership is inferred from a native record. A host
+    trail can prove prior eligibility; absent proof is explicitly unknown.
     """
     import lifecycle,recovery,review_workflow as reviews
     try:authority=recovery.configured_operators(operators)
@@ -256,6 +319,12 @@ def review_void_diagnostics(rows,operators=None,journal=None,subset=None):
         if not isinstance(issue,dict) or issue.get('issue_type') in ('event','gate'):continue
         task=issue.get('id')
         if subset is not None and task not in subset:continue
+        # Most release reads have no candidate at all. Do not repeat canonical
+        # projections just to discover an empty optional diagnostic stream.
+        if not any(isinstance(c,dict) and isinstance(c.get('text'),str)
+                   and c['text'].startswith(recovery.PREFIX) and isinstance(c.get('author'),str)
+                   and c['author'] not in authority
+                   for c in issue.get('comments') or []):continue
         current_reason=lifecycle.unreadable_hold_chain(issue,operators,journal)
         try:
             actual_voids,invalid,refused=reviews.applied_review_voids(issue,operators)
@@ -274,6 +343,8 @@ def review_void_diagnostics(rows,operators=None,journal=None,subset=None):
                 recovery.validate(payload,task)
                 if (payload['operator'] in authority or payload['operator']!=comment.get('author')
                         or payload['target_kind'] not in recovery.REVIEW_KIND_PREFIXES):continue
+                eligibility=operator_eligibility(operator_history,payload['operator'],comment.get('created_at'),operators)
+                if eligibility['state']=='ineligible':continue
                 # Reuse canonical validation (native binding, bytes, order, chain).
                 expanded=set(authority)|{payload['operator']}
                 applied,_,_=reviews.applied_review_voids(issue,expanded)
@@ -291,24 +362,27 @@ def review_void_diagnostics(rows,operators=None,journal=None,subset=None):
                 if current==counter:continue
                 target=next(c for c in issue.get('comments') or [] if str(c.get('id'))==payload['target'])
                 original=record_json.loads(target['text'][len(reviews.PREFIX):])
-                if original.get('operation') not in ('hold','release-hold'):continue
-                hold_id=payload['target'] if original['operation']=='hold' else original.get('hold')
+                operation=original.get('operation')
+                hold_id=payload['target'] if operation=='hold' else original.get('hold') if operation=='release-hold' else None
                 candidates[str(comment['id'])]=dict(task=task,void_id=str(comment['id']),
-                    target_id=payload['target'],hold_id=hold_id,
-                    release_id=payload['target'] if original['operation']=='release-hold' else None,
+                    target_id=payload['target'],target_operation=operation,hold_id=hold_id,
+                    release_id=payload['target'] if operation=='release-hold' else None,
                     issuer=payload['operator'],current_result='unreadable' if current is None else 'held' if current else 'unheld',
                     current_reason=current_reason or (reviews.integration_hold_sentence(actual) if actual is not None else None),
                     counterfactual_reason=reviews.integration_hold_sentence(alternative),
                     counterfactual_result='held' if counter else 'unheld',
-                    reason='currently-ineligible-review-void',historical_operator_eligibility='unproved',trust='data')
+                    reason=('currently-ineligible-review-void' if eligibility['state']=='eligible'
+                            else 'review-void-eligibility-unknown'),
+                    historical_operator_eligibility=eligibility['state'],
+                    eligibility_basis=eligibility['basis'],eligibility_reason=eligibility['reason'],trust='data')
             except (ValueError,TypeError,KeyError,StopIteration,RecursionError):continue
         diagnostics.extend(candidates[key] for key in sorted(candidates))
     return diagnostics
 
 
-def review_void_report(rows,operators=None,journal=None,subset=None):
+def review_void_report(rows,operators=None,journal=None,subset=None,operator_history=None):
     """A bounded additive report; never an input to target selection or a gate."""
-    diagnostics=review_void_diagnostics(rows,operators,journal,subset)
+    diagnostics=review_void_diagnostics(rows,operators,journal,subset,operator_history)
     if not diagnostics:return {}
     return dict(review_void_diagnostics=diagnostics[:50],review_void_diagnostics_total=len(diagnostics),
                 review_void_diagnostics_omitted=max(0,len(diagnostics)-50))

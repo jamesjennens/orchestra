@@ -1,15 +1,16 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5988c79e39f1404084b6cc4f73648dcf",
+  "operation_id": "capnew-579e26f8859046dd8325ea815b23c590",
   "key": "lifecycle.audit-read-diagnostics",
   "name": "Read-only lifecycle audit and release diagnostics",
   "aliases": [
     "D2 intermediate historical assignment audit and inactive review VOID",
     "kit intermediate audit pairs",
     "historical assignee at native creation commit",
-    "inactive review void release warning"
+    "inactive review void release warning",
+    "review VOID historical operator eligibility authority evidence"
   ],
-  "summary": "Read-only audit separates exact complete kit retry pairs, preserves baseline counts and reports revised deduplicated reasons and paged evidence. Host admin audit alone loads bounded native histories (versions, calls, bytes and deadline); exact parent/event creation-commit joins prove a field at that commit only. Caps, ties, gaps, damaged/missing history and head mismatches stay unknown; validated anchored notices separately attribute assignment. Release/query/dry-run diagnostics name currently ineligible review VOIDs and the current canonical result, with explanatory counterfactuals that never govern selection or gates. Legacy facts, writer policies and stores are unchanged; audit output is private untrusted data.",
+  "summary": "Read-only audit separates exact complete kit retry pairs, baseline/revised deduplicated counts and paged evidence. Host admin audit alone loads bounded native assignment history; only exact creation-commit fields are known, with unproved evidence unknown. Any decisive review-record VOID can have explanatory release diagnostics; counterfactuals never govern results or gates. Host release-query adapters reuse the validated runtime authority audit with byte/entry bounds: prior eligibility is proved only within a retained replayable time window; ineligible issuers are omitted and missing/damaged/tied evidence is explicitly eligibility unknown. No native assignment history on release paths, no new store/writer/request field. Existing facts and gates remain unchanged.",
   "requirements": [],
   "anchors": [
     "docs/OPERATIONS.md#d2-audit-and-release-diagnostics",
@@ -23,7 +24,10 @@
     "lifecycle_voids.py::audit",
     "admin.py::lifecycle_audit_command",
     "lifecycle.py::release_selection",
-    "lifecycle.py::release_query"
+    "lifecycle.py::release_query",
+    "lifecycle_audit.py::read_operator_history",
+    "lifecycle_audit.py::operator_eligibility",
+    "admin.py::read_authority_changes"
   ],
   "tests": [
     "tests/test_lifecycle_d2_audit.py",
@@ -35,6 +39,7 @@
     "audit",
     "history",
     "release",
-    "read-only"
+    "read-only",
+    "authority"
   ]
 }

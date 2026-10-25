@@ -21,6 +21,13 @@ refusal remains operative and a counterfactual is explanatory only. Exact report
 fields and bounded history costs are documented in
 [operations](OPERATIONS.md#d2-audit-and-release-diagnostics) and
 [the CLI contract](CLI_CONTRACT.md#read-only-lifecycle-audit-and-release-diagnostics).
+The diagnostic covers any decisive review-record VOID, including failed
+attestations and repair forks. Host release-query adapters additionally reuse the
+validated runtime authority-change audit, with byte/entry bounds, to distinguish
+prior eligibility from an ineligible issuer or explicitly unknown evidence.
+Neither that optional read context nor its counterfactual changes any operative
+projection or gate. Tasks without a potentially inactive VOID skip the extra
+diagnostic projections; no new public request field or durable store is added.
 
 The accepted design and source inventory below remain pinned to their original
 baseline. Statements about the original docs-only delivery and then-unimplemented

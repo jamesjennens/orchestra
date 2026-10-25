@@ -67,16 +67,34 @@ concurrent native edits can cause a head mismatch and require a fresh audit.
 
 Release selection, query and CLI dry-run reports can include bounded
 `review_void_diagnostics` for an individually validated, currently ineligible
-review VOID of a hold/release. They name exact task/hold/release/VOID IDs, issuer,
+review VOID that changes the hold result, including a failed attestation or repair
+fork as well as a hold/release. They name exact task/target/VOID IDs, the target
+operation, nullable hold/release IDs, issuer,
 current result/reason and an explanatory counterfactual. At most 50 are shown,
-with total/omitted counts. Historical operator membership stays unproved unless
-separately established; the report says currently ineligible, not proved revoked.
+with total/omitted counts. The host release-query adapters reuse the existing
+runtime authority-audit reader, capped at 256 KiB and 200 entries, to supply typed
+optional evidence. Only a retained baseline/ordered trail that agrees with the
+current list and covers the VOID time proves prior eligibility. A proved prior
+operator absent now gets `currently-ineligible-review-void`; a proved ineligible
+issuer at that point is omitted, without claiming lifetime history. Missing,
+unreadable, damaged, symlinked, capped, mismatched or temporally ambiguous evidence
+instead yields `review-void-eligibility-unknown` and explicit unknown eligibility.
+Local reads without that context also stay unknown; payload claims and today's
+list never prove past membership. No audit file is created by the read.
 A canonical review VOID repairs malformed/forked history; it cannot remove a
 protected linked hold. Removing its issuer can therefore make the current chain
 unreadable: that result remains unreadable and the existing release refusal
 still applies. A counterfactual is never used for target selection, reverts,
 attestations, gates or writes. Irrelevant, damaged or protected VOIDs do not gain
 this diagnostic. These paths never load native assignment history.
+The web release-query route returns these issuer identities and reasons only to
+callers with the project's coordinator capability. Diagnostics add review
+projection and counterfactual computation to the existing read; R1 reviewer fixtures
+showed roughly twice the reader cost. Tasks with no potentially inactive VOID
+comment now skip the extra projections; candidate tasks still pay that cost.
+The output cap is not a candidate-processing
+cap. Computing them only on request would require a separately agreed request
+flag; this revision preserves the current additive route response.
 
 ### Host corrections
 

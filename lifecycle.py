@@ -2048,7 +2048,7 @@ def validate_query_payload(p):
     return p
 
 
-def release_query(payload,actor,run,operators=None,journal=None):
+def release_query(payload,actor,run,operators=None,journal=None,operator_history=None):
     """Read-only endpoint answer for the release pre-flight (rev2 item 5).
 
     Returns the host-issued reverted ``(task, integration_commit)`` set - the same
@@ -2087,7 +2087,7 @@ def release_query(payload,actor,run,operators=None,journal=None):
             'reverted':[{'task':task,'integration_commit':commit} for task,commit in reverted],
             'live_releases':live}
     from lifecycle_audit import review_void_report
-    result.update(review_void_report(rows,operators,journal))
+    result.update(review_void_report(rows,operators,journal,operator_history=operator_history))
     return result
 
 
@@ -2117,7 +2117,7 @@ def require_unheld_fact(issue, dimension, task, operators=None, journal=None):
 
 
 def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_authors=False,
-                 independent_approval=False, owners=None):
+                 independent_approval=False, owners=None, operator_history=None):
     """Caller holds project lock; run(argv) invokes pinned bd and returns stdout.
 
     ``lifecycle_authors`` and ``independent_approval`` are the per-installation
@@ -2132,7 +2132,7 @@ def apply_native(payload, actor, run, operators=None, journal=None, lifecycle_au
     party other than its author and the task's assignee (part b).
     """
     if isinstance(payload,dict) and payload.get('dimension')==RELEASE_QUERY:
-        return release_query(payload,actor,run,operators,journal)
+        return release_query(payload,actor,run,operators,journal,operator_history)
     if isinstance(payload,dict) and payload.get('dimension')==RELEASE:
         return apply_release(payload,actor,run,operators,journal,
                              lifecycle_authors=lifecycle_authors,owners=owners)

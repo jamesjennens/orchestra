@@ -8838,7 +8838,7 @@ def authority_changes_document(record):
         return [],None,('not-this-history','is not the history this kit writes: its baseline is not one this kit writes')
     return entries,baseline,None
 
-def read_authority_changes(root):
+def read_authority_changes(root,*,max_bytes=None):
     """``(entries, baseline, damage)`` for the audit file; ``damage`` is None when it is absent or readable.
 
     ``damage`` is ``(kind, phrase)``. ``not-a-regular-file``: the path is a directory, a fifo or a
@@ -8849,12 +8849,33 @@ def read_authority_changes(root):
     history this kit writes (another schema, an unknown top-level key, an entry or a baseline with
     an unknown or missing field, an ``at`` that is not this kit's stamp). An absent file is an
     empty history with no baseline, never damage.
+    ``max_bytes`` is an optional read-only diagnostic bound. It opens without
+    following a final symlink, checks the descriptor and reads at most the bound
+    plus one detection byte, then uses this same document validator. Ordinary
+    callers retain the existing unbounded reader contract when it is omitted.
     """
     path=root/AUTHORITY_CHANGES_AUDIT
     if path.is_symlink() or (path.exists() and not path.is_file()):
         return [],None,('not-a-regular-file','is not a regular file (a directory, a fifo or a symlink)')
     if not path.exists():return [],None,None
-    try:record=record_json.loads(path.read_text(encoding='utf-8'))
+    try:
+        if max_bytes is None:
+            text=path.read_text(encoding='utf-8')
+        else:
+            # The host's optional read-only diagnostics use this same validator,
+            # with a byte bound that also holds if a file grows after its stat.
+            if type(max_bytes) is not int or max_bytes<1:raise ValueError('Invalid authority audit byte bound')
+            before=path.lstat()
+            flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
+            with os.fdopen(os.open(str(path),flags),'rb') as source:
+                opened=os.fstat(source.fileno())
+                if (not stat.S_ISREG(opened.st_mode) or
+                        (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)):
+                    raise ValueError('Authority audit changed while opening')
+                raw=source.read(max_bytes+1)
+                if len(raw)>max_bytes:raise ValueError('Authority audit exceeds the read byte bound')
+                text=raw.decode('utf-8')
+        record=record_json.loads(text)
     except (OSError,UnicodeError,ValueError) as error:
         return [],None,('unreadable','cannot be read: %s'%error)
     return authority_changes_document(record)

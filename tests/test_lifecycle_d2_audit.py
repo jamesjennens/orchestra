@@ -283,6 +283,19 @@ class HistoryBoundsTests(unittest.TestCase):
 
 
 class AdditionalEvidenceTests(unittest.TestCase):
+    def test_duplicate_id_overrides_otherwise_proved_historical_assignment(self):
+        data,history=history_fixture()
+        before=voids.audit(data,operators=[],owners={},assignment_history=history)
+        original=next(i for i in before['items'] if i['event_id']==TASK+'.3')
+        self.assertEqual(original['historical_assignment']['state'],'known')
+        data.append(copy.deepcopy(data[-1]))
+        result=voids.audit(data,operators=[],owners={},assignment_history=history)
+        repeated=[i for i in result['items'] if i['event_id']==TASK+'.3']
+        self.assertEqual(len(repeated),2)
+        self.assertTrue(all(i['historical_assignment']['state']=='unknown' for i in repeated))
+        self.assertTrue(all(i['historical_assignment']['reason']=='duplicate-native-event-id' for i in repeated))
+        self.assertTrue(all(i['historical_assignment']['assignee'] is None for i in repeated))
+
     def test_duplicate_native_ids_are_unknown_and_deduplicated_in_revised_totals(self):
         data=rows();data.append(copy.deepcopy(data[-1]))
         report=voids.audit(data,operators=[],owners={})
@@ -320,10 +333,184 @@ class AdditionalEvidenceTests(unittest.TestCase):
         self.assertEqual(result['assignee'],'after');self.assertIsNone(result['assigned_by'])
 
 
+class OperatorEligibilityTests(unittest.TestCase):
+    def history(self,issuer=release.OPERATOR):
+        import admin
+        baseline=admin.authority_change_baseline(dict(operators=[issuer],verifiers=[]),'ops','Synthetic baseline',
+            at='2026-10-01T00:00:00Z')
+        entry=dict(at='2026-10-01T00:02:00Z',operator='ops',list='operators',actor=issuer,change='remove',reason='Synthetic removal')
+        return audit.OperatorHistory([entry],baseline,[])
+
+    def test_only_proved_prior_eligibility_is_currently_ineligible(self):
+        store=ReleaseRegressions().held_with_void();before=copy.deepcopy(store.rows)
+        report=audit.review_void_report(store.rows,[],operator_history=self.history())
+        notes=report.get('review_void_diagnostics',[]);self.assertEqual(len(notes),1,report)
+        self.assertEqual(notes[0]['reason'],'currently-ineligible-review-void')
+        self.assertEqual(notes[0]['historical_operator_eligibility'],'eligible')
+        self.assertEqual(notes[0]['eligibility_basis'],'retained-authority-trail')
+        self.assertEqual(before,store.rows)
+
+    def test_never_eligible_commenter_cannot_plant_currently_ineligible_warning(self):
+        store=ReleaseRegressions().held_with_void();comment=store.rows[0]['comments'][-1]
+        payload=json.loads(comment['text'][len(recovery.PREFIX):]);payload['operator']='never-operator'
+        comment.update(author='never-operator',text=recovery.PREFIX+canonical_bytes(payload).decode())
+        before=copy.deepcopy(store.rows)
+        self.assertEqual(audit.review_void_report(store.rows,[],operator_history=self.history()),{})
+        self.assertEqual(before,store.rows)
+
+    def test_missing_or_caller_supplied_history_is_explicitly_unknown(self):
+        store=ReleaseRegressions().held_with_void()
+        for history in (None,dict(state='eligible'),audit.OperatorHistory(reason='authority-audit-damaged')):
+            with self.subTest(history=type(history).__name__):
+                report=audit.review_void_report(store.rows,[],operator_history=history)
+                notes=report.get('review_void_diagnostics',[]);self.assertEqual(len(notes),1,report)
+                self.assertEqual(notes[0]['reason'],'review-void-eligibility-unknown')
+                self.assertEqual(notes[0]['historical_operator_eligibility'],'unknown')
+                self.assertNotEqual(notes[0]['eligibility_reason'],None)
+
+    def test_time_gaps_ties_bad_order_null_baseline_and_mismatch_are_unknown(self):
+        cases=[]
+        for stamp in ('2026-09-30T23:59:59Z','2026-10-01T00:00:00Z','2026-10-01T00:02:00Z','2999-01-01T00:00:00Z','damaged'):
+            cases.append((self.history(),stamp,[]))
+        history=self.history();history.baseline['lists']['operators']=None;cases.append((history,'2026-10-01T00:01:00Z',[]))
+        history=self.history();history.entries += [dict(history.entries[0],at='2026-10-01T00:01:59Z')];cases.append((history,'2026-10-01T00:01:00Z',[]))
+        history=self.history();history.listed=['unexplained'];cases.append((history,'2026-10-01T00:01:00Z',['unexplained']))
+        cases.append((self.history(),'2026-10-01T00:01:00Z',['different']))
+        history=self.history();history.entries[0]['at']='2999-01-01T00:00:00Z';cases.append((history,'2026-10-01T00:01:00Z',[]))
+        history=self.history();history.baseline['at']='2026-10-01T00:03:00Z';cases.append((history,'2026-10-01T00:04:00Z',[]))
+        for history,stamp,operators in cases:
+            with self.subTest(stamp=stamp,operators=operators):
+                self.assertEqual(audit.operator_eligibility(history,release.OPERATOR,stamp,operators)['state'],'unknown')
+
+    def test_repeated_add_remove_membership_is_evaluated_at_the_void_time(self):
+        history=self.history();history.baseline['lists']['operators']=[]
+        history.entries=[dict(history.entries[0],at='2026-10-01T00:'+stamp+'Z',change=change)
+                         for stamp,change in [('00:10','add'),('00:40','remove'),('01:10','add'),('01:40','remove')]]
+        for stamp,state in [('00:05','ineligible'),('00:20','eligible'),('00:50','ineligible'),('01:20','eligible'),('01:50','ineligible')]:
+            with self.subTest(stamp=stamp):
+                self.assertEqual(audit.operator_eligibility(history,release.OPERATOR,'2026-10-01T00:'+stamp+'Z',[])['state'],state)
+
+    def test_existing_audit_reader_missing_damaged_symlink_caps_and_no_effects(self):
+        import admin
+        with tempfile.TemporaryDirectory(prefix='d2-authority-') as scratch:
+            root=Path(scratch)/'runtime';root.mkdir();path=root/admin.AUTHORITY_CHANGES_AUDIT
+            missing=audit.read_operator_history(root,[])
+            self.assertEqual(missing.reason,'authority-audit-missing')
+            history=self.history();record=dict(schema_version=1,entries=history.entries,baseline=history.baseline)
+            text=json.dumps(record);path.write_text(text)
+            loaded=audit.read_operator_history(root,[])
+            self.assertEqual(audit.operator_eligibility(loaded,release.OPERATOR,'2026-10-01T00:01:00Z',[])['state'],'eligible')
+            self.assertEqual(path.read_text(),text)
+            path.write_text('{damaged')
+            self.assertEqual(audit.read_operator_history(root,[]).reason,'authority-audit-damaged')
+            path.unlink();target=Path(scratch)/'outside.json';target.write_text(text)
+            try:path.symlink_to(target)
+            except (OSError,NotImplementedError):pass
+            else:
+                with mock.patch.object(admin,'read_authority_changes') as reader:
+                    self.assertEqual(audit.read_operator_history(root,[]).reason,'authority-audit-not-regular')
+                    reader.assert_not_called()
+                self.assertEqual(target.read_text(),text);path.unlink()
+            path.write_text('x'*(audit.OPERATOR_AUDIT_BYTES+1))
+            with mock.patch.object(admin,'read_authority_changes') as reader:
+                self.assertEqual(audit.read_operator_history(root,[]).reason,'authority-audit-byte-cap');reader.assert_not_called()
+            path.write_text(json.dumps(dict(record,entries=history.entries*201)))
+            self.assertEqual(audit.read_operator_history(root,[]).reason,'authority-audit-entry-cap')
+            path.write_text(text)
+            with mock.patch.object(admin,'read_authority_changes',side_effect=OSError('Synthetic unreadable')):
+                self.assertEqual(audit.read_operator_history(root,[]).reason,'authority-audit-unreadable')
+            self.assertEqual(sorted(p.name for p in root.iterdir()),[admin.AUTHORITY_CHANGES_AUDIT])
+
+    def test_existing_reader_enforces_byte_bound_and_refuses_open_time_symlink_replacement(self):
+        import admin
+        with tempfile.TemporaryDirectory(prefix='d2-authority-race-') as scratch:
+            root=Path(scratch);path=root/admin.AUTHORITY_CHANGES_AUDIT
+            history=self.history();text=json.dumps(dict(schema_version=1,entries=history.entries,baseline=history.baseline))
+            path.write_text(text)
+            self.assertIsNone(admin.read_authority_changes(root)[2])
+            self.assertIsNotNone(admin.read_authority_changes(root,max_bytes=8)[2])
+            self.assertIsNotNone(admin.read_authority_changes(root,max_bytes=len(text.encode())-1)[2])
+            self.assertEqual(path.read_text(),text)
+            target=root/'outside.json';target.write_text(text);real_open=admin.os.open
+            def replaced(name,flags,*args,**kwargs):
+                if str(name)==str(path):
+                    path.unlink();path.symlink_to(target)
+                return real_open(name,flags,*args,**kwargs)
+            try:
+                link=root/'probe-link';link.symlink_to(target);link.unlink()
+            except (OSError,NotImplementedError):return
+            with mock.patch.object(admin.os,'open',side_effect=replaced):
+                self.assertIsNotNone(admin.read_authority_changes(root,max_bytes=65536)[2])
+            self.assertEqual(target.read_text(),text)
+
+
 class ReleaseDiagnosticsTests(unittest.TestCase):
     held_with_void=ReleaseRegressions.held_with_void
     def select(self,store,operators):
         return lifecycle.release_selection(store.rows,release.scope(integration=release.RELEASE_COMMIT),lambda a,b:True,operators=operators)
+    def test_no_candidate_does_not_repeat_canonical_projections(self):
+        store=release.NativeStore(tasks=('trial-a',)).seed('trial-a')
+        release.add_review_chain(store,'trial-a')
+        with mock.patch.object(lifecycle,'unreadable_hold_chain',side_effect=AssertionError('unneeded projection')):
+            self.assertEqual(audit.review_void_report(store.rows,[]),{})
+    def test_malformed_comment_author_is_not_an_eligibility_claim(self):
+        for author in ([],{},None):
+            with self.subTest(author=author):
+                store=self.held_with_void();store.rows[0]['comments'][-1]['author']=author
+                self.assertEqual(audit.review_void_report(store.rows,[]),{})
+    def failed_attestation_fork(self,target,task='trial-a'):
+        store=release.NativeStore(tasks=(task,)).seed(task)
+        release.add_review_chain(store,task)
+        issue=store.rows[0]
+        contribution=json.loads(issue['comments'][0]['text'][len(reviews.PREFIX):])
+        failed=dict(schema_version=1,operation='attest',operation_id='failed-attest',task=task,
+            previous='2',contribution='1',verdict='failed',commit=contribution['commit'],
+            base_commit=contribution['base_commit'],method='Synthetic check',reason='Synthetic failure')
+        fork=dict(contribution,operation_id='failed-repair-fork',previous='2',supersedes='1',commit='9'*40)
+        for identity,author,payload in [('3',release.VERIFIER,failed),('4',release.ACTOR,fork)]:
+            reviews.validate(payload,task)
+            issue['comments'].append(dict(id=identity,author=author,created_at='2026-10-01T00:00:%02dZ'%int(identity),
+                text=reviews.PREFIX+canonical_bytes(payload).decode()))
+        original=next(c['text'] for c in issue['comments'] if c['id']==target)
+        payload=dict(schema_version=1,operation=recovery.OPERATION,operation_id='failed-repair-void',task=task,
+            target=target,target_kind='contribution-review',target_sha256=recovery.digest(original),original=original,
+            reason='Synthetic repair',disposition='void',operator=release.OPERATOR)
+        recovery.validate(payload,task)
+        issue['comments'].append(dict(id='void-failed-repair',author=release.OPERATOR,
+            created_at='2026-10-01T00:00:05Z',text=recovery.PREFIX+canonical_bytes(payload).decode()))
+        return store
+
+    def test_failed_attestation_and_repair_fork_voids_are_decisive(self):
+        for target,operation,counter in [('3','attest','unheld'),('4','contribute','held')]:
+            with self.subTest(target=target):
+                store=self.failed_attestation_fork(target);before=copy.deepcopy(store.rows)
+                live=self.select(store,[])
+                self.assertFalse(live['targets'])
+                self.assertIn('unreadable hold chain',live['skipped'][0]['reason'])
+                notes=live.get('review_void_diagnostics',[])
+                self.assertEqual(len(notes),1,live)
+                note=notes[0]
+                self.assertEqual((note['target_id'],note['target_operation']), (target,operation))
+                self.assertEqual((note['current_result'],note['counterfactual_result']),('unreadable',counter))
+                self.assertIsNone(note['hold_id']);self.assertIsNone(note['release_id'])
+                restored=self.select(store,[release.OPERATOR])
+                self.assertEqual(bool(restored['targets']),counter=='unheld')
+                self.assertFalse(restored.get('review_void_diagnostics'))
+                self.assertEqual(before,store.rows)
+
+    def test_diagnostics_never_change_any_live_release_result(self):
+        stores=[self.held_with_void(),self.failed_attestation_fork('3'),self.failed_attestation_fork('4')]
+        for store in stores:
+            with self.subTest(comments=len(store.rows[0]['comments'])):
+                with mock.patch.object(audit,'review_void_diagnostics',return_value=[]):
+                    live=self.select(store,[])
+                reported=self.select(store,[])
+                operative={k:v for k,v in reported.items() if not k.startswith('review_void_diagnostics')}
+                self.assertEqual(operative,live)
+                self.assertEqual(operative['targets'],[])
+                self.assertEqual(len(operative['skipped']),1)
+                self.assertIn('unreadable hold chain',operative['skipped'][0]['reason'])
+
     def test_operator_removal_readd_recomputes_without_ever_using_a_counterfactual_verdict(self):
         store=self.held_with_void();before=copy.deepcopy(store.rows)
         for operators,warn in (([release.OPERATOR],False),([],True),([release.OPERATOR],False)):
@@ -363,7 +550,7 @@ class ReleaseDiagnosticsTests(unittest.TestCase):
         self.assertIn('held from integration',result['skipped'][0]['reason'])
         store=self.held_with_void();store.rows[0]['comments'][-1]['text']+='damaged'
         self.assertFalse(self.select(store,[]).get('review_void_diagnostics'))
-    def test_irrelevant_approval_void_does_not_get_promoted_to_a_hold_diagnostic(self):
+    def test_decisive_approval_void_names_its_operation_without_inventing_hold_ids(self):
         store=self.held_with_void();issue=store.rows[0];issue['comments']=issue['comments'][:2]
         target=issue['comments'][1];approve=json.loads(target['text'][len(reviews.PREFIX):]);approve.update(operation_id='approval-fork',previous='1')
         issue['comments'].append(dict(id='alternate',author='other-reviewer',created_at='2026-10-01T00:00:30Z',text=reviews.PREFIX+canonical_bytes(approve).decode()))
@@ -371,7 +558,13 @@ class ReleaseDiagnosticsTests(unittest.TestCase):
             target_sha256=recovery.digest(target['text']),original=target['text'],reason='Synthetic irrelevant repair',disposition='void',operator=release.OPERATOR)
         issue['comments'].append(dict(id='irrelevant-void',author=release.OPERATOR,created_at='2026-10-01T00:00:40Z',text=recovery.PREFIX+canonical_bytes(payload).decode()))
         self.assertTrue(reviews.applied_review_voids(issue,[release.OPERATOR])[0])
-        self.assertFalse(self.select(store,[]).get('review_void_diagnostics'))
+        result=self.select(store,[])
+        notes=result.get('review_void_diagnostics',[])
+        self.assertEqual(len(notes),1,result)
+        self.assertEqual(notes[0]['target_operation'],'approve')
+        self.assertEqual(notes[0]['current_result'],'unreadable')
+        self.assertEqual(notes[0]['counterfactual_result'],'unheld')
+        self.assertIsNone(notes[0]['hold_id']);self.assertIsNone(notes[0]['release_id'])
     def test_query_is_bounded_and_writes_no_native_or_host_state(self):
         store=self.held_with_void();before=copy.deepcopy(store.rows);calls=len(store.calls)
         query=dict(release.release_payload([]),dimension=lifecycle.RELEASE_QUERY)
