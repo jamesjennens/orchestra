@@ -41,9 +41,15 @@ class BriefOpenItemsPageTests(unittest.TestCase):
 
         # The long comment is ONE item, both halves in order, even though its second
         # half was on the next page and the first page ended mid-body.
-        self.assertEqual(2, seen['historyItems'], seen['historyText'])
+        self.assertEqual(4, seen['historyItems'], seen['historyText'])
         self.assertIn('First half. Second half.', seen['historyText'])
         self.assertEqual(2, seen['historyCalls'])
+        # b1.1 (kittrial-5bb.411): a non-body history entry reads as the ACTIONS
+        # label for its action, never the raw action id; an unknown action still
+        # reads as its key instead of 'Event'.
+        self.assertTrue(seen['claimedAsLabel'], seen['historyText'])
+        self.assertTrue(seen['noRawActionId'], seen['historyText'])
+        self.assertTrue(seen['unknownActionFallsBackToKey'], seen['historyText'])
         # History is oldest first, so the button loads newer entries and says so.
         self.assertEqual(1, seen['showNewer'])
         self.assertEqual(0, seen['showOlder'])
