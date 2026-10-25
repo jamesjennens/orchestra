@@ -33,6 +33,7 @@ BLOCK = 'import sys\nsys.modules["fcntl"] = None\n'
 #: caller's move.  It prints one JSON result; the test asserts on that result.
 OBSERVE_CASE = BLOCK + '''
 import json
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -54,23 +55,26 @@ def a_row(task='t1', whose_move='you', review_state='changes-requested', **extra
 
 
 root = Path(tempfile.mkdtemp(prefix='no-fcntl-observe-'))
-observe_root = root / 'projects' / 'observe'
-observe_root.mkdir(parents=True)
-changed = [a_row(whose_move='coordinator', review_state='integrated',
-                 newer_activity_by_others=1)]
-view = waiting.worker_view([])
-since = waiting.fingerprint([a_row()])
-if since == view['fingerprint']:
-    raise SystemExit('the case is not a fingerprint change, so it proves nothing')
-warnings = wake_log.observe(observe_root, ACTOR, since, view, changed)
-print(json.dumps({
-    'fcntl_in_sys_modules_is_none': sys.modules['fcntl'] is None,
-    'warnings': warnings,
-    'empty_wakes_24h': wake_log.read(observe_root, ACTOR)['empty_wakes_24h'],
-    'directory_exists': (observe_root / wake_log.DIRECTORY).exists(),
-    'paths_under_project': sorted(str(p.relative_to(observe_root))
-                                  for p in observe_root.rglob('*')),
-}))
+try:
+    observe_root = root / 'projects' / 'observe'
+    observe_root.mkdir(parents=True)
+    changed = [a_row(whose_move='coordinator', review_state='integrated',
+                     newer_activity_by_others=1)]
+    view = waiting.worker_view([])
+    since = waiting.fingerprint([a_row()])
+    if since == view['fingerprint']:
+        raise SystemExit('the case is not a fingerprint change, so it proves nothing')
+    warnings = wake_log.observe(observe_root, ACTOR, since, view, changed)
+    print(json.dumps({
+        'fcntl_in_sys_modules_is_none': sys.modules['fcntl'] is None,
+        'warnings': warnings,
+        'empty_wakes_24h': wake_log.read(observe_root, ACTOR)['empty_wakes_24h'],
+        'directory_exists': (observe_root / wake_log.DIRECTORY).exists(),
+        'paths_under_project': sorted(str(p.relative_to(observe_root))
+                                      for p in observe_root.rglob('*')),
+    }))
+finally:
+    shutil.rmtree(root, ignore_errors=True)
 '''
 
 
@@ -82,6 +86,7 @@ print(json.dumps({
 #: import cases above are the ones that block fcntl before anything is imported.
 PARITY_CASE = '''
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -110,21 +115,24 @@ def run_wait(project):
 
 
 root = Path(tempfile.mkdtemp(prefix='no-fcntl-wait-'))
-present = root / 'projects' / 'present'
-present.mkdir(parents=True)
-expected = run_wait(present)
-blocked = root / 'projects' / 'blocked'
-blocked.mkdir(parents=True)
-with mock.patch.dict(sys.modules, {'fcntl': None}):
-    blocked_arm_saw_none = sys.modules['fcntl'] is None
-    answered = run_wait(blocked)
-print(json.dumps({
-    'blocked_arm_saw_none': blocked_arm_saw_none,
-    'expected': expected,
-    'answered': answered,
-    'blocked_empty_wakes_24h': wake_log.read(blocked, ACTOR)['empty_wakes_24h'],
-    'blocked_directory_exists': (blocked / wake_log.DIRECTORY).exists(),
-}))
+try:
+    present = root / 'projects' / 'present'
+    present.mkdir(parents=True)
+    expected = run_wait(present)
+    blocked = root / 'projects' / 'blocked'
+    blocked.mkdir(parents=True)
+    with mock.patch.dict(sys.modules, {'fcntl': None}):
+        blocked_arm_saw_none = sys.modules['fcntl'] is None
+        answered = run_wait(blocked)
+    print(json.dumps({
+        'blocked_arm_saw_none': blocked_arm_saw_none,
+        'expected': expected,
+        'answered': answered,
+        'blocked_empty_wakes_24h': wake_log.read(blocked, ACTOR)['empty_wakes_24h'],
+        'blocked_directory_exists': (blocked / wake_log.DIRECTORY).exists(),
+    }))
+finally:
+    shutil.rmtree(root, ignore_errors=True)
 '''
 
 
