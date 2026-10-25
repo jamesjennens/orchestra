@@ -18,6 +18,8 @@ export function contextPointers(item) {
   if (!pointers.length) return null;
   return h('ul', { class: 'small', 'data-context-pointers': 'true' },
     pointers.map(p => h('li', null, h('code', null, p.pointer), ' — ', p.state,
+      Array.isArray(p.flags) && p.flags.length ? [' — flags: ', p.flags.join(', ')] : null,
+      p.section && typeof p.section === 'object' ? [' — section ', String(p.section.anchor), ' ', String(p.section.state)] : null,
       ' (untrusted data)', p.label ? [' ', p.label.text] : null,
       p.follow ? h('div', null, 'Follow: ', h('code', null, p.follow)) : null)),
     item.pointers_omitted ? h('li', null, String(item.pointers_omitted), ' pointers unresolved by bounds.') : null);
