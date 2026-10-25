@@ -77,10 +77,33 @@ function formatAuthority(auth) {
   if (auth.type === 'decision') {
     return `decision ${auth.id || '—'}`;
   }
+  if (auth.type === 'repo-document') {
+    return auth.path + (auth.anchor ? '#' + auth.anchor : '') + ' @ ' + String(auth.commit || '').slice(0, 12)
+      + ' (document sha256 ' + String(auth.sha256 || '').slice(0, 12) + ')';
+  }
   return auth.type || '—';
 }
 
-function buildAuthorityFromForm(v) {
+// kittrial-5bb.418: a design.<scope> revision carries its document. The file's exact bytes are hashed and
+// sent as text decoded strictly (no BOM stripped, no replacement), so the server's sha256 of the text it
+// encodes again is the one in the authority. Refused here before anything is sent when it is not UTF-8.
+export async function readDesignDocument(file) {
+  if (!file) throw new Error('Choose the design document (the Markdown file at the pinned commit).');
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length > 1024 * 1024) throw new Error('A design document is at most 1 MiB.');
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (err) {
+    throw new Error('The design document must be UTF-8 text.');
+  }
+  if (!globalThis.crypto || !globalThis.crypto.subtle) throw new Error('This browser cannot hash the document here (a secure connection is needed).');
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes));
+  const sha256 = Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('');
+  return { text, sha256 };
+}
+
+function buildAuthorityFromForm(v, designDoc) {
   const type = (v.authority_type || 'repo-path').trim();
   const target = (v.authority_target || '').trim();
   if (type === 'url') {
@@ -103,6 +126,11 @@ function buildAuthorityFromForm(v) {
   }
   if (type === 'decision') {
     return { type: 'decision', id: target };
+  }
+  if (type === 'repo-document') {
+    const out = { type: 'repo-document', path: target, commit: (v.authority_commit || '').trim(), sha256: designDoc ? designDoc.sha256 : '' };
+    if (v.authority_extra && v.authority_extra.trim()) out.anchor = v.authority_extra.trim();
+    return out;
   }
   const out = { type: 'repo-path', path: target };
   if (v.authority_extra && v.authority_extra.trim()) out.anchor = v.authority_extra.trim();
@@ -385,20 +413,16 @@ export async function page(ctx, { pid }) {
         setFieldError(form, 'authority_target', 'Enter the repository path, URL, observation, or decision ID.');
         return;
       }
-      const authority = buildAuthorityFromForm(v);
       const btn = form.querySelector('button');
       await act(btn, async () => {
         try {
-          await ctx.api.proposeReference(pid, {
-            key,
-            title,
-            statement,
-            authority,
-            owner,
-            review_by,
-            tags,
-            decisions,
-          });
+          const fileInput = form.querySelector('input[name=document_file]');
+          const designDoc = (v.authority_type || '').trim() === 'repo-document'
+            ? await readDesignDocument(fileInput && fileInput.files && fileInput.files[0]) : null;
+          const authority = buildAuthorityFromForm(v, designDoc);
+          const body = { key, title, statement, authority, owner, review_by, tags, decisions };
+          if (designDoc) body.document = designDoc.text;
+          await ctx.api.proposeReference(pid, body);
           toast('Reference draft proposed.', 'ok');
           ctx.go(`/p/${pid}/references/${encodeURIComponent(key)}`);
         } catch (err) {
@@ -419,14 +443,16 @@ export async function page(ctx, { pid }) {
         h('option', { value: 'repo-path' }, 'repo-path (repository file)'),
         h('option', { value: 'url' }, 'url (https URL)'),
         h('option', { value: 'attestation' }, 'attestation (host-check / owner-statement)'),
-        h('option', { value: 'decision' }, 'decision (native decision issue)'))),
+        h('option', { value: 'decision' }, 'decision (native decision issue)'),
+        h('option', { value: 'repo-document' }, 'repo-document (design document, for design.<scope>)'))),
       field('Authority target (path / URL / how / decision id)', h('input', {
         name: 'authority_target',
         placeholder: 'docs/HTTP_DEPLOYMENT.md',
         required: true,
       })),
       field('Pinned commit (40-hex, for repo-path)', h('input', { name: 'authority_commit', class: 'mono', placeholder: '40-char commit sha' })),
-      field('Anchor or source (optional)', h('input', { name: 'authority_extra', placeholder: 'section-anchor' }))),
+      field('Anchor or source (optional)', h('input', { name: 'authority_extra', placeholder: 'section-anchor' })),
+      field('Design document (Markdown, for repo-document)', h('input', { name: 'document_file', type: 'file', accept: '.md,text/markdown,text/plain' }))),
     h('div', { class: 'row wrap' },
       field('Tags (comma-separated)', h('input', { name: 'tags', placeholder: 'ops, web' })),
       field('Decisions (comma-separated issue IDs, optional)', h('input', { name: 'decisions', placeholder: '' }))),
@@ -621,17 +647,22 @@ export async function referencePage(ctx, { pid, key }) {
         const btn = form.querySelector('button');
         await act(btn, async () => {
           try {
-            await ctx.api.reviseReference(pid, key, {
+            const fileInput = form.querySelector('input[name=document_file]');
+            const designDoc = (v.authority_type || '').trim() === 'repo-document'
+              ? await readDesignDocument(fileInput && fileInput.files && fileInput.files[0]) : null;
+            const body = {
               revision: Number(latest.revision || 1) + 1,
               expected_sha256: latest.sha256,
               title: (v.title || '').trim(),
               statement: (v.statement || '').trim(),
-              authority: buildAuthorityFromForm(v),
+              authority: buildAuthorityFromForm(v, designDoc),
               owner: (v.owner || latest.owner || '').trim(),
               review_by: (v.review_by || latest.review_by || '').trim(),
               tags: splitCsv(v.tags),
               decisions: splitCsv(v.decisions),
-            });
+            };
+            if (designDoc) body.document = designDoc.text;
+            await ctx.api.reviseReference(pid, key, body);
             toast('Draft revision recorded.', 'ok');
             await ctx.render();
           } catch (err) {
@@ -647,11 +678,12 @@ export async function referencePage(ctx, { pid, key }) {
         field('Review by (YYYY-MM-DD)', h('input', { name: 'review_by', value: latest.review_by || defaultReviewDate(), required: true }))),
       h('div', { class: 'row wrap' },
         field('Authority type', h('select', { name: 'authority_type' },
-          ['repo-path', 'url', 'attestation', 'decision'].map((t) =>
+          ['repo-path', 'url', 'attestation', 'decision', 'repo-document'].map((t) =>
             h('option', { value: t, selected: (latestAuth.type || 'repo-path') === t }, t)))),
         field('Authority target', h('input', { name: 'authority_target', value: defaultAuthTarget, required: true })),
         field('Pinned commit (40-hex)', h('input', { name: 'authority_commit', class: 'mono', value: defaultAuthCommit })),
-        field('Anchor or source (optional)', h('input', { name: 'authority_extra', value: defaultAuthExtra }))),
+        field('Anchor or source (optional)', h('input', { name: 'authority_extra', value: defaultAuthExtra })),
+        field('Design document (Markdown, for repo-document)', h('input', { name: 'document_file', type: 'file', accept: '.md,text/markdown,text/plain' }))),
       h('div', { class: 'row wrap' },
         field('Tags (comma-separated)', h('input', { name: 'tags', value: (latest.tags || []).join(', ') })),
         field('Decisions (comma-separated)', h('input', { name: 'decisions', value: (latest.decisions || []).join(', ') }))),

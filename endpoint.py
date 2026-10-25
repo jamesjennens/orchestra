@@ -1766,14 +1766,18 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         coordinator=args[0] in reference_records.HTTP_WRITE_COMMANDS
         identity_check,party_check,_=_records_http_context(coordinator,run_warnings,run,'references')
-        payload=reference_records.write_payload(args,request.get('attachments',{}),commands=writes)
+        # kittrial-5bb.418: a design.<scope> propose or revise carries its document as a second
+        # attachment (flag --document), checked, stored and indexed by reference_records.
+        payload,document=reference_records.write_payload_and_document(args,request.get('attachments',{}),commands=writes)
         runner=NativeRunner(run, project=path)
         def ref_effect():
+            import task_files
             try:
                 result=reference_records.apply_native(payload,actor,runner,path,operator=coordinator,
                                                       operators=configured_operators(root),
                                                       web_coordinator=coordinator,party_check=party_check,
-                                                      web_service=by_service)
+                                                      web_service=by_service,document=document,
+                                                      document_limits=task_files.limits(root,run_warnings))
             except RecordsRefusal as error:
                 return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}

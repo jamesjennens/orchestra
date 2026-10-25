@@ -149,7 +149,72 @@ def _attachments(args):
         i += 1
     return converted,attachments
 
-def _wire(project,actor,args,action,path):
+def _document_from_git(entry,repo):
+    """kittrial-5bb.418: (entry with authority.sha256, document text) for --document-from-git.
+
+    The entry's repo-document authority names the path and commit. The document is git's own object at
+    that commit (never the working tree), refused unless it is a regular file (no symlink, submodule or
+    tree), at most 1 MiB and UTF-8; its bytes are kept exactly (line endings, a byte-order mark). The
+    client ships standalone, so http_client.py holds the same few lines."""
+    authority=entry.get('authority') if isinstance(entry,dict) else None
+    if not isinstance(authority,dict) or authority.get('type')!='repo-document' \
+            or not isinstance(authority.get('path'),str) or not isinstance(authority.get('commit'),str):
+        raise ValueError('--document-from-git needs an entry whose authority is a repo-document with a path and commit')
+    path,commit=authority['path'],authority['commit']
+    def git(*args):
+        done=subprocess.run(['git','--no-optional-locks','-C',repo,*args],capture_output=True,timeout=30,
+                            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        if done.returncode:raise ValueError('git cannot read %s at %s' % (path,commit[:12]))
+        return done.stdout
+    found=[]
+    for item in git('ls-tree','-z','--full-tree',commit,'--',path).split(b'\0'):
+        meta,_,name=item.partition(b'\t')
+        if item and name.decode('utf-8','replace')==path and len(meta.split())==3:found.append(meta.split())
+    if len(found)!=1:raise ValueError('commit %s holds no file %s' % (commit[:12],path))
+    mode,kind,obj=(part.decode('ascii','replace') for part in found[0])
+    if kind!='blob' or mode not in ('100644','100755'):
+        raise ValueError('%s at %s is not a regular file (git mode %s, %s)' % (path,commit[:12],mode,kind))
+    data=git('cat-file','blob',obj)
+    if len(data)>1024*1024:raise ValueError('the design document is %d bytes; the limit is 1 MiB' % len(data))
+    try:text=data.decode('utf-8')
+    except UnicodeDecodeError:raise ValueError('%s at %s is not UTF-8 text' % (path,commit[:12])) from None
+    sha256=hashlib.sha256(data).hexdigest()
+    if authority.get('sha256') not in (None,sha256):
+        raise ValueError('authority.sha256 is not the sha256 of %s at %s (%s)' % (path,commit[:12],sha256))
+    return dict(entry,authority=dict(authority,sha256=sha256)),text
+
+def _design_document_args(args):
+    """kittrial-5bb.418: `ref propose|revise --file entry.json --document-from-git [--repo DIR]`.
+
+    Returns (args, document, temporary): the entry file is replaced by the entry with its repo-document
+    `authority.sha256` filled in (a temporary file the caller removes), and the document is the text of
+    the authority's path at its commit, read from git's own object (never the working tree)."""
+    if '--document-from-git' not in args:
+        return args,None,None
+    import tempfile
+    rest=[];repo='.';i=0
+    while i<len(args):
+        token=args[i]
+        if token=='--document-from-git':
+            i+=1;continue
+        if token=='--repo' or token.startswith('--repo='):
+            if '=' in token:repo=token.split('=',1)[1]
+            else:
+                if i+1>=len(args):raise ValueError('--repo needs a directory')
+                repo=args[i+1];i+=1
+            i+=1;continue
+        rest.append(token);i+=1
+    files=[n for n,token in enumerate(rest) if token in ('--file','-f') and n+1<len(rest)]
+    if not rest or rest[0] not in ('propose','revise') or len(files)!=1:
+        raise ValueError('--document-from-git goes with ref propose|revise --file entry.json')
+    entry=json.loads(Path(rest[files[0]+1]).read_text(encoding='utf-8-sig'))
+    entry,document=_document_from_git(entry,repo)
+    handle=tempfile.NamedTemporaryFile('w',encoding='utf-8',suffix='.json',delete=False)
+    with handle:handle.write(json.dumps(entry,ensure_ascii=False))
+    rest[files[0]+1]=handle.name
+    return rest,document,handle.name
+
+def _wire(project,actor,args,action,path,document=None):
     # Same actor rule as the endpoint, enforced here too: a rejected actor must not
     # reach the transport layer, and never reaches the server as a shell word.
     registering=action=='session' and args[:1]==['register']
@@ -164,6 +229,10 @@ def _wire(project,actor,args,action,path):
     if not registering and (not isinstance(actor,str) or not ACTOR.fullmatch(actor)):
         raise ValueError('Supply a short contributor/session actor')
     converted,attachments = _attachments(args)
+    if document is not None:
+        # The design document's exact text (kittrial-5bb.418), never read through a text-mode file.
+        key=str(len(attachments));attachments[key]={'flag':'--document','text':document}
+        converted.append('@attachment:'+key)
     payload = {'project':project,'actor':actor,'action':action,'args':converted,'attachments':attachments}
     if path is not None:payload['path'] = path
     wire = json.dumps(payload,ensure_ascii=False)
@@ -223,9 +292,9 @@ def _interpreter_refusal(returncode,stdout,stderr,config):
         return server_text(found.group(1))+(' '+tail if tail else '')+note
     return server_text(stderr.strip())
 
-def request(config,project,actor,args,action='bd',path=None):
+def request(config,project,actor,args,action='bd',path=None,document=None):
     argv,label = _argv(config)
-    wire = _wire(project,actor,args,action,path)
+    wire = _wire(project,actor,args,action,path,document)
     try:
         # A captured console child can still flash a window when the client is
         # launched by a GUI/agent on Windows. Preserve pipes and exit status.
@@ -1833,7 +1902,15 @@ def main():
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
     elif args[0] in CLIENT_ACTIONS:action=args.pop(0)
-    result=request(config_doc,a.project,a.actor,args,action,path)
+    document=temporary=None
+    if action=='ref':
+        args,document,temporary=_design_document_args(args)
+    try:
+        result=(request(config_doc,a.project,a.actor,args,action,path) if document is None else
+                request(config_doc,a.project,a.actor,args,action,path,document))
+    finally:
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
     output = result['stdout']
     # The server's time of a write that was carried out (kittrial-5bb.97): one line on standard
     # error, so that standard output is exactly what it was. An older endpoint sends none.
