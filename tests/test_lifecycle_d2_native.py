@@ -121,7 +121,7 @@ class NativeAuditTests(fixture.RealBdLabelAliasTests):
         # New read diagnostics create no family or format. Exercise the ACTUAL
         # qualification-base reader and backup/restore, not an imitation validator.
         from test_lifecycle_voids import resolve_kit
-        base='306529ec2bcdd6b8c6e10c5b1c269f282a5df155'
+        base='6be804d4f029cfb3ec2340e2cacaedea7026e0d6'
         old=resolve_kit(base)
         if old is None:self.skipTest('actual D2 qualification-base kit is not available')
         task,event=self.make_facts();rows=self.export_rows();before=canonical_bytes(rows)

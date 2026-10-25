@@ -2310,7 +2310,7 @@ existing runtime `authority-changes.audit.json`, through the existing validated
 reader with a 256 KiB byte bound and a 200-entry ceiling. They create no file.
 The retained baseline and ordered trail must replay to the current operator
 list and cover the VOID's native creation time. Ties, future times, backward
-order, pre-baseline/fold gaps, missing/null baselines, mismatches, missing,
+order, pre-baseline/fold gaps, missing/null operator baselines, mismatches, missing,
 unreadable, damaged or symlinked files remain unknown. No native assignment
 history is loaded on these paths; caller/native-row JSON is not this context.
 An issuer proved eligible then but absent now gets
