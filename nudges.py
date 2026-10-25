@@ -132,6 +132,12 @@ def effective(record, now, iso):
 def settle(records, now, iso):
     """Write the lazy expiry and the bound into ``records``; ``True`` when anything changed."""
     changed = False
+    for record in records:
+        # A stamp in the future (the clock stepped back) is brought back to now, so that a pending
+        # request still expires and a finished one can still be evicted.
+        if isinstance(record, dict) and _stamp(record) > now:
+            record['requested_ts'] = now
+            changed = True
     for position, record in enumerate(records):
         if isinstance(record, dict) and expired(record, now):
             records[position] = effective(record, now, iso)
@@ -169,7 +175,10 @@ def retry_after(records, lane, kind, agent_id, now):
     # A stamp in the future (the clock stepped back) counts for nothing: it must not block a lane.
     stamps = [(record, stamp) for record, stamp in ((r, _stamp(r)) for r in records if isinstance(r, dict))
               if stamp <= now]
-    lane_stamps = sorted(stamp for record, stamp in stamps if record.get('lane') == lane)
+    # A person's per-lane bounds count persons' records only (an agent's request must not make a
+    # person wait); an agent's count every record on the lane.
+    lane_stamps = sorted(stamp for record, stamp in stamps if record.get('lane') == lane
+                         and (kind == 'agent' or (record.get('requested_by') or {}).get('kind') != 'agent'))
     waits = []
     if lane_stamps and now - lane_stamps[-1] < limits['gap']:
         waits.append(lane_stamps[-1] + limits['gap'] - now)

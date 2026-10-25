@@ -402,8 +402,11 @@ Follow-ups (kittrial-5bb.414): every refusal of the request, including a 404 for
 board and a 422 for a bad body, is audited as refused and writes no record; a retry with the same key
 answers the stored result even if the lane has since left the board. Limits: a person's project bound
 (30 per hour) counts only persons' requests; agents have their own project bound (10 per hour across
-all agents) beside the per-agent (10) and per-lane bounds (the per-lane bounds still count every
-request on that lane). A record stamped in the future counts for nothing. The 200-record bound never
+all agents) beside the per-agent bound (10). A person's per-lane bounds count persons' requests only;
+an agent's per-lane bounds count every request on the lane. A record stamped in the future (the clock stepped back) counts for nothing when counting and is brought back to now when the list is settled. The 200-record bound never
 evicts a record younger than an hour, so the list holds at most 200 plus that hour's requests (at most
 30 persons' and 10 agents' per project). The row's `nudge` field carries no reason, lane or
 declared-wait detail.
+The lanes read that finds the lane runs without the service-wide lock; only the authority re-check and
+the write are under it. Two refusals are not audited, as everywhere in the service and older than this
+route: a 422 from the shared body parser before the route runs, and the 409 of a key reused with another body.

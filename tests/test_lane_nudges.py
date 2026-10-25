@@ -8,6 +8,7 @@ carrier yet), so a request that nobody carries out ends ``not-deliverable``.
 """
 import json
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -451,6 +452,47 @@ class FollowUpTests(NudgeCase):
         records = older + fresh + [{'id': 'newest', 'state': 'delivered', 'requested_ts': now - 5}]
         nudges.settle(records, now, iso)
         self.assertEqual(nudges.KEEP_RECORDS + 1, len(records))     # all of the newest hour stays, even past the bound
+
+    def test_the_lanes_read_never_runs_under_the_service_lock(self):
+        held = []
+        planted = self.backend.lanes_read
+
+        def slow(*args, **kwargs):
+            # another thread must be able to take the lock while this (slow) read is under way
+            def other():
+                got = self.service.store.lock.acquire(timeout=3)
+                held.append(got)
+                if got:
+                    self.service.store.lock.release()
+            thread = threading.Thread(target=other)
+            thread.start()
+            thread.join(10)
+            return planted(*args, **kwargs)
+        self.backend.lanes_read = slow
+        self.assertEqual(201, self.nudge(self.tokens['olive']).status)
+        self.assertEqual([True], held[:1])
+
+    def test_a_persons_lane_bounds_count_persons_only_and_an_agents_count_every_record(self):
+        now = 10 ** 9
+        agent = {'lane': 'a', 'requested_ts': now - 10, 'requested_by': {'kind': 'agent', 'agent_id': 'ag'}}
+        person = {'lane': 'a', 'requested_ts': now - 10, 'requested_by': {'kind': 'person', 'agent_id': None}}
+        self.assertEqual(0, nudges.retry_after([agent], 'a', 'person', None, now))
+        self.assertGreater(nudges.retry_after([person], 'a', 'person', None, now), 0)
+        self.assertGreater(nudges.retry_after([person], 'a', 'agent', 'ag', now), 0)
+        self.assertGreater(nudges.retry_after([agent], 'a', 'agent', 'ag', now), 0)
+        three = [dict(agent, requested_ts=now - 3000 + 600 * step) for step in range(6)]
+        self.assertEqual(0, nudges.retry_after(three, 'a', 'person', None, now))
+
+    def test_a_future_stamp_is_brought_back_to_now_when_settled(self):
+        now = 10 ** 9
+        pending = {'id': 'p', 'state': 'pending', 'lane': 'a', 'requested_ts': now + 5000}
+        records = [pending]
+        self.assertTrue(nudges.settle(records, now, lambda stamp: 'at-%s' % stamp))
+        self.assertEqual(now, records[0]['requested_ts'])
+        self.assertEqual('pending', records[0]['state'])
+        later = now + nudges.PENDING_TTL
+        nudges.settle(records, later, lambda stamp: 'at-%s' % stamp)
+        self.assertEqual('not-deliverable', records[0]['state'])        # it expires like any other
 
 
 if __name__ == '__main__':

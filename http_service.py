@@ -12256,11 +12256,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise invalid('operation_id must be 8-128 URL-safe characters')
                 if ctx.idempotency_key != operation_id:
                     raise invalid('operation_id and the Idempotency-Key header must be the same')
-            row = self._nudge_lane_row(ctx, fields['lane'])
-            return self.service.request_nudge(ctx.principal, ctx.params['pid'], fields, row,
-                                              request_id=ctx.request_id)
+            row = self._nudge_lane_row(ctx, fields['lane'])      # a slow read: never under the service lock
+            with self.service.store.lock:
+                ctx.authorize()
+                return self.service.request_nudge(ctx.principal, ctx.params['pid'], fields, row,
+                                                  request_id=ctx.request_id)
         status, answer = self._mutate(ctx, 'lanes.nudge.request', ctx.params['pid'], request,
                                       capability=CAP_COORDINATE, status=201, audit_success=False,
+                                      serialize=False,
                                       reason='lane %s' % (lane[:80] if isinstance(lane, str) else '?'))
         # An open request for the same lane and message is answered as it is: 200, nothing written.
         return (200 if answer.get('coalesced') else status), answer
