@@ -264,6 +264,12 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(d.validate_entry(record, record['sha256'] + '.json'), record)
         with self.assertRaises(ValueError):
             d.validate_entry(record, '0' * 64 + '.json')
+        # A field changed under the same hash is not the record the journal entry names.
+        for changed in (dict(record, scope=['references']), dict(record, grantee=AGENT),
+                        dict(record, account=OTHER_OWNER, recorded_by=OTHER_OWNER)):
+            with self.subTest(changed=sorted(k for k in changed if changed[k] != record[k])):
+                with self.assertRaises(ValueError):
+                    d.validate_entry(changed, record['sha256'] + '.json')
 
     def test_listing_reports_in_force_and_not(self):
         self.write(request())

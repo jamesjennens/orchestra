@@ -826,6 +826,10 @@ class _RecordsScenarioMixin:
             refused = self._delegate(harness, title='Refused ' + label, token=token,
                                      key='deleg-refused-' + label.replace(' ', '-'), expect=403)
             self.assertEqual(refused.status, 403, (label, refused.data))
+            if label in ('agent', 'person coordinator', 'non-member superuser'):
+                # Refused by the web route itself, before the endpoint is asked (the endpoint's
+                # own refusals end "Nothing was written."); the endpoint refuses again below.
+                self.assertNotIn('Nothing was written', refused.data['error']['message'], label)
         listed = harness.request('GET', f'/v1/projects/{pid}/delegations', token=people['viewer']['token'])
         self.assertEqual(listed.status, 200, listed.data)
         self.assertEqual(listed.data['items'], [])
@@ -901,6 +905,30 @@ class _RecordsScenarioMixin:
             self.assertEqual(r.status, 403, (label, r.data))
         r = accept('deleg.person', r4, coord2['token'], 'person-coordinator')
         self.assertEqual(r.status, 200, r.data)
+
+        # 9b. The endpoint's own gates, reached past the web service's (a direct backend call):
+        #     an agent's web-verify that names no delegation, and a superuser who is not an
+        #     owner recording a delegation, are both refused there too.
+        cap_ok = accept('deleg.cap', cap, coord2['token'], 'person-cap', family='capabilities')
+        self.assertEqual(cap_ok.status, 200, cap_ok.data)
+        with self.assertRaises(http_service.HttpError) as direct_verify:
+            harness.backend.invoke(
+                'capabilities.verify', harness.service.authenticate(agent2['token']), pid,
+                {'command': 'web-verify',
+                 'body': {'key': 'deleg.cap', 'revision': cap_ok.data['revision'],
+                          'record_sha256': cap_ok.data['sha256'], 'commit': 'e' * 40, 'passed': True,
+                          'results': _valid_cap_results(), 'schema_version': 1,
+                          'operation_id': 'op-direct-verify-no-decision'}},
+                'direct-verify-no-decision', capability=http_service.CAP_COORDINATE)
+        self.assertEqual(direct_verify.exception.status, 403)
+        with self.assertRaises(http_service.HttpError) as direct_grant:
+            harness.backend.invoke(
+                'delegations.grant', harness.service.authenticate(people['nonmember_su']['token']), pid,
+                {'action': 'grant', 'decision': None, 'title': 'A superuser tries', 'right': 'record-acceptance',
+                 'grantee': 'coordinator-grant', 'scope': ['references'], 'escalate': 'everything',
+                 'reason': 'Not an owner of this project.'},
+                'direct-su-grant', capability=http_service.CAP_PROJECT_ADMIN)
+        self.assertEqual(direct_grant.exception.status, 403)
 
         # 10. The owner demoted: the delegation they recorded is no longer in force.
         r5 = propose('deleg.demoted', agent2['token'], 'demoted')

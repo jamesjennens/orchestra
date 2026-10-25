@@ -152,7 +152,10 @@ class BoundEndpointTests(unittest.TestCase):
         # cannot be named directly by a bound key any more than these others can.
         # `task-file` (kittrial-5bb.370) records or withdraws a file attached to a task: the web
         # service stores the bytes and calls it under live authority; no bound key may name it.
-        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignee-followon', 'assignment-roster', 'create-project', 'creation-standing', 'host-coordination',
+        # `delegation` (kittrial-5bb.407) records a person owner's delegation from their own web
+        # session; an operator uses the confined `coordinator delegation-record` instead.
+        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignee-followon', 'assignment-roster', 'create-project', 'creation-standing',
+                                                                 'delegation', 'host-coordination',
                                                                  'host-projects', 'project-creations', 'task-assign', 'task-file', 'task-release', 'web-guidance',
                                                                  'web-lifecycle', 'web-merge-slot',
                                                                  # kittrial-5bb.378: the release query and one release group; the canonical write is
