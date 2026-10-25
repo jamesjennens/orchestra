@@ -863,6 +863,11 @@ class _RecordsScenarioMixin:
         r = accept('deleg.own', own_draft, agent1['token'], 'own-draft', decision=decision)
         self.assertEqual(r.status, 403, r.data)
         self.assertIn('wrote itself', r.data['error']['message'])
+        own_view = harness.request('GET', f'/v1/projects/{pid}/references/deleg.own', token=agent1['token'])
+        self.assertTrue(own_view.data['self_accept_blocked'], own_view.data)
+        self.assertTrue(own_view.data['needs_delegation'], own_view.data)
+        sibling_view = harness.request('GET', f'/v1/projects/{pid}/references/deleg.own', token=agent3['token'])
+        self.assertFalse(sibling_view.data['self_accept_blocked'], sibling_view.data)
         #     Its owner's draft is the own-party case the delegation lifts (independence off).
         owners_draft = propose('deleg.owners', coord1['token'], 'owners draft')
         r = accept('deleg.owners', owners_draft, agent1['token'], 'owners-draft', decision=decision)
