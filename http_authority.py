@@ -2722,6 +2722,15 @@ BLOCK_CAPABILITIES = {
     # (tasks), which the action then checks on the live row or journal under the lock.
     'task-file': {'coordinator-record': CAP_COORDINATE, 'assignee-record': CAP_TASKS,
                   'coordinator-withdraw': CAP_COORDINATE, 'author-withdraw': CAP_TASKS},
+    # A native decision from a room item (kittrial-5bb.388). Service-only; the action's own
+    # live check (requirement_http.room_decision) narrows it to the signed-in owner or
+    # coordinator, never a credential. The operation is the payload's own name.
+    'room-decision': {'issue': CAP_COORDINATE},
+    # Delegated decision rights (kittrial-5bb.407): a read for any member; every write is
+    # the owner's (project.admin), and the action itself also requires a person's own web
+    # session and the live owner role.
+    'delegation': {'list': CAP_READ, 'grant': CAP_PROJECT_ADMIN, 'narrow': CAP_PROJECT_ADMIN,
+                   'revoke': CAP_PROJECT_ADMIN},
     'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
                None: CAP_REVIEWS},         # reviews.add, every other operation
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
@@ -2755,7 +2764,7 @@ def required_capability(request):
     if not isinstance(args, list) or not args or any(not isinstance(token, str) for token in args):
         return None
     if action in ('coordinate', 'web-merge-slot', 'web-lifecycle', 'web-release', 'web-guidance', 'assignee-followon',
-                  'task-file'):
+                  'task-file', 'room-decision'):
         if len(args) != 1:
             return None
         item = {'text': args[0]}

@@ -417,6 +417,71 @@ def dispatch(canonical, request, tmp, run=None):
         payload = json.loads(args[0]) if args and isinstance(args[0], str) else None
         result = coordinate(payload, actor, run, canonical.path)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'delegation':
+        # endpoint.py's delegation action (kittrial-5bb.407) over the emulated rows: a read for
+        # any member; grant, narrow and revoke only for a person owner's own web session.
+        import delegations
+        # A name of its own: an `import http_authority` here would make the name local to
+        # dispatch and unbind the module-level one the records branch below uses.
+        try:
+            import http_authority as delegation_authority
+        except ImportError:
+            delegation_authority = None
+        config_file = canonical.root / 'deployment.private.json'
+        config_data = json.loads(config_file.read_text(encoding='utf-8')) if config_file.is_file() else {}
+        operators = config_data.get('operators') or []
+        authority = request.get('authority') if isinstance(request.get('authority'), dict) else {}
+
+        def refused(status, message):
+            return envelope(2, stderr=message + '\n', delegation_status=status)
+        if delegation_authority is None or canonical.authority_config is None:
+            return refused(403, 'Verified web authority required in this project')
+        operation = args[0] if args else None
+        if operation == 'list':
+            if not delegation_authority.verified_web_authority(request, canonical.authority_config,
+                                                         delegation_authority.CAP_READ, project):
+                return refused(403, 'Verified read authority required in this project')
+            state = delegation_authority.read_state(canonical.authority_config.store)
+            listed = json.loads(run(['list', '--label', delegations.LABEL, '--all', '--limit', '0', '--json']) or '[]')
+            ids = [str(row['id']) for row in listed if isinstance(row, dict) and row.get('id')][:200]
+            shown = json.loads(run(['show', *ids, '--json', '--include-comments']) or '[]') if ids else []
+            items = delegations.listing(shown, project, state, canonical.path, operators, None)
+            agents = delegations.coverage(state, project, items)
+            names = {}
+            for ident in {a['agent'] for a in agents} | {x for item in items if item['delegation']
+                                                         for x in (item['delegation']['grantee'], item['delegation']['account']) if x}:
+                record = (state.get('agents') or {}).get(ident) or (state.get('users') or {}).get(ident)
+                label = (record.get('name') or record.get('display_name')) if isinstance(record, dict) else None
+                if label:
+                    names[ident] = label
+            return envelope(0, json.dumps({'schema_version': 1, 'project': project, 'items': items,
+                                           'granted_agents': agents, 'names': names, 'listed': len(ids),
+                                           'omitted': max(0, len(listed) - len(ids))}, ensure_ascii=False) + '\n')
+        if operation not in ('grant', 'narrow', 'revoke') or len(args) != 2:
+            return refused(422, 'Use delegation list, or grant|narrow|revoke with one JSON payload. Nothing was written.')
+        try:
+            payload = json.loads(args[1])
+            delegations.validate_request(payload)
+        except ValueError as error:
+            return refused(422, '%s. Nothing was written.' % error)
+        if payload['action'] != operation or payload['operation_id'] != request.get('operation_id'):
+            return refused(422, 'The payload does not match the request. Nothing was written.')
+        if not delegation_authority.verified_web_authority(request, canonical.authority_config,
+                                                     delegation_authority.CAP_PROJECT_ADMIN, project):
+            return refused(403, 'Only a person owner of this project records a delegation. Nothing was written.')
+        user_id = authority.get('user_id')
+        if authority.get('via') != 'session' or actor != user_id or not delegations.ACCOUNT.fullmatch(str(user_id)):
+            return refused(403, 'A delegation is recorded by a person owner signed in to the web; an agent or worker '
+                                'credential cannot record one. Nothing was written.')
+        state = delegation_authority.read_state(canonical.authority_config.store)
+        if ((state.get('memberships') or {}).get(project) or {}).get(user_id) != 'owner':
+            return refused(403, 'Only a person owner of this project records a delegation. Nothing was written.')
+        try:
+            result = delegations.apply(payload, project=project, journal=canonical.path, run=run, recorded_by=actor,
+                                       via='session', account=actor, at=delegation_authority.server_time())
+        except delegations.DelegationRefusal as error:
+            return refused(error.status, str(error))
+        return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action in ('ref', 'capability'):
         # endpoint.py's reference catalog (kittrial-5bb.66) and capability index
         # (kittrial-5bb.67) reads and writes over the emulated rows.
@@ -499,15 +564,41 @@ def dispatch(canonical, request, tmp, run=None):
                     from admin import coordinator_rules as configured_coordinator_rules
                     rules = configured_coordinator_rules(canonical.root)
 
-                    def _party_check(proposer):
+                    kind = 'references' if action == 'ref' else 'capabilities'
+
+                    def _party_check(proposer, decision_id=None):
                         live = http_authority.read_state(canonical.authority_config.store)
                         by_agent = authority.get('via') == 'credential'
+                        if by_agent:
+                            # endpoint.py's rule (kittrial-5bb.407): an agent accepts or verifies
+                            # only within a live, person-rooted delegation, which also lifts the
+                            # own-party refusal.
+                            import delegations
+                            if not isinstance(decision_id, str) or not decision_id:
+                                raise RecordsRefusal(
+                                    403, 'An agent accepts or verifies a record only within a delegation: name '
+                                         'the delegation decision as decision_id. Nothing was written.')
+                            try:
+                                delegations.check_acceptance(
+                                    delegations.read_issue(run, decision_id), project=project, state=live,
+                                    journal=canonical.path, agent=actor.split('/', 1)[0], kind=kind,
+                                    operators=operators, owners=None)
+                            except delegations.DelegationRefusal as error:
+                                raise RecordsRefusal(error.status, '%s. Nothing was written.' % error) from None
+                            if not isinstance(proposer, str) or not proposer:
+                                raise RecordsRefusal(403, 'This draft has no recorded proposer, so no delegation '
+                                                          'can admit it.')
+                            if proposer.split('/', 1)[0] == actor.split('/', 1)[0]:
+                                raise RecordsRefusal(403, 'An agent never accepts or verifies a draft it wrote '
+                                                          'itself, whatever its delegation says.')
                         settings_seen = live.get('settings_seen') if isinstance(live.get('settings_seen'), dict) else {}
                         approval_by_another = bool(
                             settings_seen.get('approval_by_another_party')
                             or authority.get('approval_by_another_party')
                             or rules.get('independent_approval'))
-                        if not by_agent and not approval_by_another:
+                        if not approval_by_another:
+                            # A delegation lifted the agent-only own-party refusal (review r1, b1);
+                            # a project's independence setting is never lifted by one.
                             return
                         caller_parties = set(http_authority.actor_parties(live, actor, project))
                         if user_id:
@@ -520,7 +611,8 @@ def dispatch(canonical, request, tmp, run=None):
                                 raise RecordsRefusal(
                                     403,
                                     'An agent holding a coordinator grant may not accept or verify a record '
-                                    'whose draft was proposed by its own party.')
+                                    'whose draft was proposed by its own party while this project requires '
+                                    'approval by another party; a delegation does not lift that.')
                             raise RecordsRefusal(
                                 403,
                                 'A coordinator may not accept or verify a record whose draft was proposed '

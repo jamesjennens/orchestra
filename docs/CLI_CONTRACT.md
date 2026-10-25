@@ -966,6 +966,26 @@ If the endpoint cannot answer, the local result is still returned, with
   - `status` and `verified_at` are derived, never stored.
   - The rules on `revision`, `expected_sha256`, retries and interrupted proposes are
     those of `ref`.
+- **`validate --file entry.json [--repo PATH]`** performs the same schema, content,
+  requirement-link and current-key preflight as `propose`, without taking the
+  coordination lock or writing an anchor, revision, receipt or other record. The file
+  contains one propose payload or a bare JSON list of at most 100 payloads. Each result
+  item carries its zero-based `index`, `key`, `valid`, `state`, `revision` and `errors`;
+  every error has a `field`, `message` and fix `hint`. All independent payload errors
+  are collected in the same order in which `propose` checks them, so the first shared
+  error has the same message and the valid/invalid verdict agrees. Later list items
+  are checked even when an earlier one is invalid.
+- The client additionally resolves every syntactically usable `code`, `tests` and
+  `anchors` pointer against `--repo` (default: the current checkout), records the
+  resolution rows under `pointers`, and turns a missing file, symbol or heading into
+  an error for that field. A pointer this kit cannot check remains `resolved: null`,
+  not a failure. Repository resolution follows shared preflight and is not a new
+  server-side `propose` rule.
+- The output is `capability-validate-v1`, with top-level `valid` and a `summary` of
+  item and error counts. A completed report, including one with invalid items, exits
+  0. Arguments, malformed JSON, an unreadable repository or a transport failure exits
+  2 with no stdout. Validation needs `--config`, `--project` and `--actor`; `--help`
+  does not.
 - **`propose-alias KEY "PHRASE" [--evidence POINTER]`** adds a pending alias. It is
   only a candidate until an operator folds it into the next accepted revision's
   `aliases`, or rejects it.
@@ -1794,6 +1814,7 @@ is not sent to `bd`.
 | `handoff --file FILE` | `admin.py handoff` (the operator's transfer) |
 | `followon --file FILE` | the coordinator's recorded hand-back (`followon.py`): `record` with task and text, or `withdraw` with the follow-on and reason |
 | `fault-clear --file FILE` | clears a lane's `needs-investigation` flag (`fault_clear.py`); `admin.py fault-clear` is the host route |
+| `delegation-record --file FILE` | an operator's delegation of a decision right (`delegations.py`): grant, narrow or revoke; `admin.py delegation-record` is the host route |
 | `set-onboarding --file FILE` | `admin.py set-onboarding` |
 
 **Authority.** The action is refused unless all of these hold: the request arrives over a key
@@ -1879,6 +1900,21 @@ other members and agent credentials are refused. A later `lane_state` record nev
 flag. The host route is `python3 admin.py --root ROOT fault-clear --project PROJECT --actor OPERATOR --file payload.json`
 (operator allowlist, coordination lock, the same `fault_clear.apply`). There is no web clear
 route. Every refusal ends "Nothing was written."
+
+**`delegation-record` (kittrial-5bb.407).** Records a delegation of a decision right on a
+decision issue: the payload is the closed request
+`{"schema_version":1,"operation_id":"...","decision":"ISSUE"|null,"title":null|"...","action":"grant|narrow|revoke","right":"record-acceptance","grantee":"agent_<16hex>|coordinator-grant","scope":["capabilities","references"],"escalate":"...","reason":"..."}`
+(a grant with `decision: null` creates the decision issue from `title`; a revocation carries an
+empty `scope` and `escalate`). The record is a `Kind: delegation-v1` comment on the decision with
+a host journal entry in `<project>/.delegations/<sha256>.json`; without the entry it grants
+nothing. `via: operator` and the recorder are the server's. Only a bound coordinator key whose
+actor is a configured operator may run it; the host route is
+`python3 admin.py --root ROOT delegation-record --project PROJECT --actor OPERATOR --file payload.json`,
+and a person owner records one on the web (`POST /v1/projects/{id}/delegations`). The read-only
+`python3 admin.py --root ROOT delegation-check --project PROJECT --state STATE.json` lists every
+agent holding the project's coordinator grant and whether a delegation in force covers it. An
+agent's web acceptance of a reference or capability record names its delegation as
+`decision_id` (docs/HTTP_DEPLOYMENT.md, "Delegated record acceptance").
 
 ## `files`: a task's files over SSH
 
@@ -2238,3 +2274,93 @@ work in both simple and governed projects. Missing historical governance and
 restores from backups without governance remain governed; only a new durable
 creation intent opts into the simple provisioning default. See
 [REQUIREMENTS.md](REQUIREMENTS.md) for the trust boundary and export procedure.
+
+
+## Read-only lifecycle audit and release diagnostics
+
+The host `admin.py lifecycle-audit` report has additive D2 fields. Ordinary
+lifecycle facts, reader overlays, raw-write protection and writer switches retain
+their existing contracts. Audit classifications are advisory untrusted data
+(`trust: data`), and the complete audit stays private on the host.
+
+`original_counts` contains the baseline audit's raw-row counts. Root revised
+`questionable_fact_count`, `questionable_native_record_count`,
+`unclassifiable_classification_count` and `unclassifiable_fact_count` count distinct
+native IDs. `questionable_reason_counts` and `unclassifiable_cause_counts` overlap;
+each reason counts a named event once. `deduplicated_event_count` and
+`duplicate_native_event_id_count` disclose repeated raw IDs. The root `total` and
+`items` pagination retain raw event occurrences. Each item adds `classification`,
+`native_occurrences`, `questionable_reasons`, `unclassifiable_causes`,
+`historical_assignment` and `recorder_is_historical_assignee` (null when unknown).
+The existing current-assignee, operator and issued-mark columns remain separate.
+
+`kit_intermediates` binds `event_id`, `following_event_id`, operation ID, dimension
+and native-order basis. Only its intermediate row is excluded from revised counts;
+its following fact is audited normally. `unpaired_intermediates`,
+`ordinary_native_events`, `unknown_native_events` and `unreadable_hold_chains` are
+separate streams. Each has a total/count and before/after omission fields;
+`page_total`/`next_offset` cover all streams, including corrections. Unknown native
+rows also carry source row hashes, occurrence counts and at most ten distinct
+hash variants with an omitted count. Reconcile unique totals by IDs/hashes across
+all pages; raw per-page occurrence counts are not deduplicated global totals.
+
+`historical_assignment.state` is `known` only for an exact shared parent/event
+creation commit, with `basis: same-native-event-creation-commit`, `at_commit`,
+`native_versions` and the assignee field at that commit. It proves no interval.
+Otherwise the state is `unknown`, assignee null, and reason names the cap,
+missing/damaged/tied history, head mismatch, raw gap or other unproved evidence.
+`assigned_by`/`notice_ids` require separately validated, anchored notice/native
+transition evidence; the native committer never supplies them.
+`historical_principal_ownership_verified` remains false. A missing history context
+on a direct library call stays unknown; it never falls back to today's holder.
+
+Only the host audit adapter constructs `AssignmentHistory` and calls native
+history. Its `historical_read_coverage.limits` states 128 versions per issue plus
+one detection version, 24 calls, 1,024 versions and 4 MiB charged stdout per audit,
+1 MiB per call, a ten-second history deadline and at most three seconds per call.
+`received_bytes` counts complete returned responses; `charged_bytes` also charges
+failed byte-cap reads. Unknown/unread coverage and elapsed time are explicit.
+The existing bounded native pipe reader can consume its final detection chunk and
+bounded cleanup beyond these allowances. The export and pure audit analysis have
+no new latency guarantee. Ordinary lifecycle/work/brief/wait/gate readers never
+invoke history enrichment or accept native-row JSON as a history context.
+
+Release selection, rollback selection, `release-query`, and CLI release/dry-run
+reports optionally carry `review_void_diagnostics` (at most 50),
+`review_void_diagnostics_total` and `review_void_diagnostics_omitted`. Entries name
+`task`, `void_id`, `target_id`, `target_operation`, `hold_id`, `release_id`, `issuer`,
+`current_result` (`held`, `unheld` or `unreadable`), reasons and a separately named
+counterfactual result/reason, plus `trust: data`,
+`historical_operator_eligibility`, `eligibility_basis` and `eligibility_reason`.
+Any review-record operation can be the decisive target, including
+a failed `attest` or a repair `contribute`; `hold_id` and `release_id` are null
+when that target does not name them. Held includes the existing integration hold/failed-attestation
+refusal. Current unreadable chains remain refused; a counterfactual supplies no
+operative result or authority. The CLI labels diagnostic context `host` when its
+read-only endpoint query succeeded, otherwise `local`; a dry run is local.
+Reports with no diagnostic preserve the previous optional-field shape. No
+checkpoint/lifecycle/review payload, writer gate, protected store or write format
+grows a field. JSON output escapes diagnostic text; consumers render it as data.
+Only the host release-query adapters load typed `OperatorHistory` from the
+existing runtime `authority-changes.audit.json`, through the existing validated
+reader with a 256 KiB byte bound and a 200-entry ceiling. They create no file.
+The retained baseline and ordered trail must replay to the current operator
+list and cover the VOID's native creation time. Ties, future times, backward
+order, pre-baseline/fold gaps, missing/null operator baselines, mismatches, missing,
+unreadable, damaged or symlinked files remain unknown. No native assignment
+history is loaded on these paths; caller/native-row JSON is not this context.
+An issuer proved eligible then but absent now gets
+`reason: currently-ineligible-review-void` and eligibility `eligible`. An issuer
+proved ineligible at that point is omitted; this is not a lifetime claim.
+Without proof, the diagnostic instead has eligibility `unknown` and
+`reason: review-void-eligibility-unknown`, never an inferred revocation. Local
+selection/dry-run without authoritative trail context has that same unknown.
+The web release-query route requires the project's coordinator capability and
+discloses diagnostic issuer identities and reasons to those callers; ordinary
+member/read capability does not grant access. Diagnosing a candidate adds review
+projection and counterfactual work to the existing release read. R1 review
+fixtures roughly doubled reader cost. Tasks with no potentially inactive VOID
+comment now skip these extra projections; candidate tasks still pay that cost.
+The 50-entry output limit does not
+mean only 50 candidates are examined. An opt-in public request flag would need
+a separate protocol change; this additive response retains the current route.

@@ -206,14 +206,15 @@ class NoUnguardedParseTests(unittest.TestCase):
                            'a damaged, unreadable or nested file is caught and read as the restrictive '
                            '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
                            'permissive default'),
-        'client.py': (15, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
+        'client.py': (16, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
                          'kittrial-5bb.285 added the wait read\'s answer from the endpoint (and wait\'s --config read, '
                          'which kittrial-5bb.373 merged with main()\'s --config read into one parse after delivery; '
                          "neither is a record comment or a caller's payload). The twelfth (kittrial-5bb.327 "
                          "review 2) is the wait's own small state file: text this client wrote beside its config, "
                          'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
                          'treated as absent. The last three (kittrial-5bb.384) are the `files` command\'s reads of the endpoint\'s own answer line '
-                         'and of the file record inside it, on the caller\'s machine'),
+                         'and of the file record inside it, on the caller\'s machine; kittrial-5bb.402 adds the '
+                         'validate command\'s read of the endpoint\'s validation result'),
         'coordination.py': (7, 'bd output'),
         'endpoint.py': (6, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
                            'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own); the sixth '
@@ -268,7 +269,7 @@ class NoUnguardedParseTests(unittest.TestCase):
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'requirement_baseline_records.py', 'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py')
+    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'requirement_baseline_records.py', 'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py', 'delegations.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -316,7 +317,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # completeness record already at the operator's destination: text this kit did
             # not just write itself, so a deeply nested one is described rather than
             # crashing the copy out of the guard.
-            'admin.py': 11,
+            # The twelfth (kittrial-5bb.407) reads a `.delegations` journal entry for a backup:
+            # a host file, but one a damaged or nested copy must refuse, never traceback.
+            'admin.py': 12,
+            # D2: bounded native history, review VOID and preserved target payload.
+            'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
             # message line through the guard: a room post is text a person wrote, and a
             # nested or lookalike file must be a refusal, never a RecursionError.
@@ -358,7 +363,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # endpoint.py (kittrial-5bb.384): the framed task-file header line, and the request text read
             # whole (the same guarded parse the old reader made, now in two places: a pipe and a text stream).
             'task_files.py': 9,
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 15, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 16, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             # Requirements request bodies use the guard and reject duplicate fields.
             # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
             # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
@@ -367,8 +372,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
             # lifecycle.py also guards exported correction payloads in its offline reader.
             'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 4, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
-            # The simple owner adapter guards bd's decision-create receipt too.
-            'requirement_http.py': 2,
+            # The simple owner adapter guards bd's decision-create receipt too. The third
+            # (kittrial-5bb.388) guards the service-only room-decision payload the route
+            # transports (room, item number, title, text and pointer) before it is used.
+            'requirement_http.py': 3,
             # Assignment adds closed roster/request payloads at the endpoint and
             # guards both its native task reply and its reserved notice body.
             'task_assignment.py': 2,
@@ -401,6 +408,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # kittrial-5bb.398: fault_clear.py parses the reserved clear body, its journal entry
             # files and the bd comments-add receipt through the guard (three).
             'fault_clear.py': 3,
+            # kittrial-5bb.407: delegations.py parses the reserved delegation body carried by any
+            # actor's comment, its host journal entry files and the bd create and comments-add
+            # receipts through the guard (four). endpoint.py's sixteenth is the delegation
+            # request the web service sends.
+            'delegations.py': 4,
             'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

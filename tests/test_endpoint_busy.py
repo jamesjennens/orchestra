@@ -218,10 +218,11 @@ class EndpointTests(unittest.TestCase):
         # action (kittrial-5bb.195) - the one under the project lock and the one for a
         # batch, whose items take the lock themselves - and the one of the
         # assignee-followon action (kittrial-5bb.343, endpoint.py's `followon_effect`), and the
-        # task-file action (kittrial-5bb.370, `files_effect`): eleven.
+        # task-file action (kittrial-5bb.370, `files_effect`): eleven. The twelfth is the
+        # delegation action (kittrial-5bb.407, `delegation_effect`).
         # Every one goes through guarded_write, so every one reads the configuration
         # before it reserves.
-        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 11)
+        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 12)
 
     def test_an_action_that_needs_nothing_from_the_file_is_not_stopped_by_its_damage(self):
         """Review of kittrial-5bb.156: the file was read before EVERY action, so the onboarding text could

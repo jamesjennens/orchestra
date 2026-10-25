@@ -51,10 +51,17 @@ def a_row(task='t1', whose_move='you', review_state='changes-requested', **extra
     return row
 
 
+#: kittrial-5bb.397 follow-up (coordinator, 2026-10-25): wake records counted against the real clock
+#: must carry recent stamps; fixed 2026-10-24 stamps fell out of the 24-hour window and broke these tests.
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+def _recent(hours_ago=1):
+    return (_dt.now(_tz.utc) - _td(hours=hours_ago)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
 def append_one(arguments):
     root, index = arguments
     import wake_log as module
-    return module.append(root, A, [{'schema': module.SCHEMA, 'at': '2026-10-24T12:00:00Z',
+    return module.append(root, A, [{'schema': module.SCHEMA, 'at': _recent(2),
                                     'actor': A, 'fingerprint': 'wait1:' + ('%064x' % index),
                                     'task': 't%d' % index, 'trigger': 'edit', 'empty': True}])
 
@@ -63,10 +70,10 @@ def append_in_child(arguments):
     root, index = arguments
     code = ('import sys; sys.path.insert(0, %r); import wake_log; '
             'wake_log.append(%r, %r, [{"schema": wake_log.SCHEMA, '
-            '"at": "2026-10-24T12:00:00Z", "actor": %r, '
+            '"at": %r, "actor": %r, '
             '"fingerprint": "wait1:" + ("%%064x" %% %d), "task": "t%d", '
             '"trigger": "edit", "empty": True}])'
-            % (str(KIT), root, A, A, index, index))
+            % (str(KIT), root, A, _recent(2), A, index, index))
     return subprocess.run([sys.executable, '-c', code], capture_output=True, timeout=30).returncode
 
 
@@ -182,7 +189,7 @@ class EmptyWakeRecordTests(unittest.TestCase):
         try:
             for index in range(wake_log.MAX_ENTRIES + 12):
                 wake_log.append(self.root, A, [
-                    {'schema': wake_log.SCHEMA, 'at': '2026-10-24T12:00:00Z', 'actor': A,
+                    {'schema': wake_log.SCHEMA, 'at': _recent(2), 'actor': A,
                      'fingerprint': 'wait1:%064x' % index, 'task': 't%d' % index,
                      'trigger': 'edit', 'empty': True}])
         finally:
@@ -270,7 +277,7 @@ class EmptyWakeRecordTests(unittest.TestCase):
         with mock.patch.object(wake_log.os, 'replace', side_effect=OSError('crash before rename')):
             with self.assertRaises(OSError):
                 wake_log.append(self.root, A, [
-                    {'schema': wake_log.SCHEMA, 'at': '2026-10-24T13:00:00Z', 'actor': A,
+                    {'schema': wake_log.SCHEMA, 'at': _recent(1), 'actor': A,
                      'fingerprint': 'wait1:' + '2' * 64, 'task': 't2',
                      'trigger': 'edit', 'empty': True}])
         self.assertEqual(lane.read_bytes(), before)
@@ -375,7 +382,7 @@ class LaneBoardTests(unittest.TestCase):
     def record(self, fingerprints):
         for fingerprint in fingerprints:
             wake_log.append(self.root, A, [
-                {'schema': wake_log.SCHEMA, 'at': '2026-10-24T12:00:00Z', 'actor': A,
+                {'schema': wake_log.SCHEMA, 'at': _recent(2), 'actor': A,
                  'fingerprint': 'wait1:' + fingerprint * 64, 'task': 't1',
                  'trigger': 'review-state', 'empty': True}])
 

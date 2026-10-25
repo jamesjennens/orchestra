@@ -1,0 +1,61 @@
+{
+  "operation_id": "cap-388-rooms-items-acceptance-0001",
+  "schema_version": 1,
+  "key": "rooms.items-acceptance",
+  "name": "Room items and acceptance: a person decides a candidate requirement, decision or question",
+  "aliases": [
+    "room items",
+    "accept reject amend a room item",
+    "candidate requirement from a room",
+    "room decision item to native decision",
+    "orchestra:room pointer in existing fields",
+    "cancel a room item acceptance",
+    "stuck room item",
+    "room accept intent"
+  ],
+  "summary": "Slice 2 of project rooms. Item and item-event lines in the append-only room files; states proposed, accepted, rejected, amended, superseded; accept/reject/amend/answer by a signed-in person only (R7). A requirement-editor accept creates and accepts a requirement through the B1 routes; a contributor accept submits a proposal as that person; a decision accept creates a native decision through the service-only room-decision action, which re-checks live authority and the item before a guarded write. The pointer orchestra:room/<room-id>#<seq> rides only in existing fields. An accept intent (record kind, parent, content) and the item-decision lock make one record per item: another person's retry adopts earlier attempts' records from the endpoint operation journal (unknown outcomes refused until cancelled); moderation, archive or an owner/coordinator cancel a pending intent. A derived items cache rebuilds identically from the lines; a moderated item's text is served nowhere.",
+  "requirements": [],
+  "anchors": [
+    "docs/HTTP_DEPLOYMENT.md#project-room-items-and-acceptance-over-http-slice-2-kittrial-5bb388",
+    "docs/PROJECT_ROOMS_DESIGN.md#6-getting-the-result-out-items-become-the-kits-existing-records"
+  ],
+  "code": [
+    "rooms.py::post_item",
+    "rooms.py::accept_item",
+    "rooms.py::reject_item",
+    "rooms.py::amend_item",
+    "rooms.py::answer_item",
+    "rooms.py::items_from_lines",
+    "rooms.py::read_item",
+    "http_service.py::ApiHandler.rooms_item_post",
+    "http_service.py::ApiHandler.rooms_item_accept",
+    "http_service.py::ApiHandler._room_item_record",
+    "http_service.py::EndpointBackend.room_decision",
+    "endpoint.py::execute",
+    "requirement_http.py::room_decision",
+    "requirement_http.py::create_decision",
+    "http_authority.py::required_capability",
+    "project_creation.py::service_descriptor",
+    "rooms.py::intend_accept",
+    "rooms.py::record_attempt",
+    "rooms.py::cancel_intent",
+    "rooms.py::accept_identity",
+    "rooms.py::pending_accept_intent",
+    "http_service.py::ApiHandler.rooms_item_intent_cancel",
+    "http_service.py::ApiHandler._room_prior_record",
+    "http_service.py::EndpointBackend.prior_room_write"
+  ],
+  "tests": [
+    "tests/test_rooms.py::RoomsItemsTest",
+    "tests/test_rooms_items_http.py::RoomsItemsHttpTests",
+    "tests/test_rooms_items_http.py::RoomsItemsPageTests",
+    "tests/test_rooms_items_real_bd.py::RoomsItemsRealBdTests"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "rooms",
+    "requirements",
+    "decisions",
+    "web"
+  ]
+}

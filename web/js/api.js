@@ -516,6 +516,9 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     revokeRelease: (pid, aid) => mutate('DELETE', `/v1/projects/${pid}/agents/${aid}/release`),
     // Who coordinates the project and the rules that bind them, for any member; read only (kittrial-5bb.198).
     coordination: (pid) => call('GET', `/v1/projects/${pid}/coordination`),
+    // Delegated decision rights (kittrial-5bb.407): every member reads them; a person owner records one.
+    delegations: (pid) => call('GET', `/v1/projects/${pid}/delegations`),
+    recordDelegation: (pid, body) => mutate('POST', `/v1/projects/${pid}/delegations`, body),
     // Release facts (kittrial-5bb.378). The query writes nothing; a deploy records ONE
     // group of at most 200 already-resolved targets and is idempotent per intent.
     releaseQuery: (pid, scope) => call('POST', `/v1/projects/${pid}/releases/query`, { body: { scope } }),
@@ -574,6 +577,11 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     room: (pid, rid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}`, { params }),
     createRoom: (pid, name) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms`, { name }),
     postRoomMessage: (pid, rid, text) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/messages`, { text }),
+    createRoomItem: (pid, rid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/items`, body),
+    acceptRoomItem: (pid, rid, sequence, note, parent) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/items/${sequence}/accept`, Object.assign({}, note ? { note } : {}, parent ? { parent } : {})),
+    rejectRoomItem: (pid, rid, sequence, reason) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/items/${sequence}/reject`, { reason }),
+    amendRoomItem: (pid, rid, sequence, title, text, parent) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/items/${sequence}/amend`, Object.assign({ title, text }, parent ? { parent } : {})),
+    answerRoomItem: (pid, rid, sequence, text) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/items/${sequence}/answer`, { text }),
     archiveRoom: (pid, rid, reason) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/archive`, reason ? { reason } : {}),
     moderateRoomMessage: (pid, rid, sequence, reason) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/messages/${sequence}/moderate`, { reason }),
     exportRoom: (pid, rid, format) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/rooms/${encodeURIComponent(rid)}/export`, { params: { format } }),

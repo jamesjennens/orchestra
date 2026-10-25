@@ -5,6 +5,7 @@ import { setupHint } from './setup.js';
 import { mergeSlotPanel } from './merge_slot.js';
 import { guidancePanel } from './guidance.js';
 import { coordinationPanel } from './coordination.js';
+import { delegationsPanel } from './delegations.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { historyPanel } from '../agentHistory.js';
 
@@ -483,6 +484,8 @@ export async function settings(ctx, { pid }) {
   const auditHost = h('div');
   // Who coordinates (kittrial-5bb.198), read again after an owner changes a role or a grant here.
   const coordination = coordinationPanel(ctx, project);
+  // Delegated decision rights (kittrial-5bb.407): read by every member; recorded only by a person owner.
+  const delegated = delegationsPanel(ctx, project, { owner: project.role === 'owner' });
 
   async function drawMembers() {
     let data;
@@ -642,5 +645,5 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
-    membersHost, claimingPanel(ctx, project), coordination.node, agentsHost, credsHost, auditHost, danger);
+    membersHost, claimingPanel(ctx, project), coordination.node, delegated.node, agentsHost, credsHost, auditHost, danger);
 }

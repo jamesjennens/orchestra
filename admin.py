@@ -994,8 +994,22 @@ def lifecycle_audit_command(root, project, limit=50, offset=0):
     def run(argv):
         return run_bd(root, project, argv)
     run.lifecycle_project = path
-    report = audit(lifecycle.read_event_rows(run), operators(root), operator_owners(path),
-                   limit=limit, offset=offset)
+    rows=lifecycle.read_event_rows(run)
+    from lifecycle_audit import load_assignment_history,HistoryReadError
+    import native
+    def read_history(identity,version_limit,byte_limit,timeout):
+        command=[str(root/'bin/bd'),'--directory',str(path),'--sandbox','--readonly',
+                 'history',identity,'--json','--limit',str(version_limit)]
+        try:
+            done,over=native.run_bounded(command,environment(root),byte_limit,timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise HistoryReadError('native-history-timeout') from None
+        if over:raise HistoryReadError('native-history-byte-cap',byte_limit)
+        if done.returncode:raise HistoryReadError('native-history-unavailable')
+        return done.stdout
+    history=load_assignment_history(rows,read_history)
+    report = audit(rows, operators(root), operator_owners(path),limit=limit,offset=offset,
+                   assignment_history=history,project=project)
     report['project'] = project
     return report
 
@@ -4218,7 +4232,7 @@ OWNER_ANSWERS_JOURNAL='.owner-answers'
 #: ``<name>.tmp`` does not match the sweep's shape, so sweeping it is a no-op.
 ATOMIC_SWEEP_DIRECTORIES=('.',)+RESERVATION_JOURNALS+( '.handoffs','.handoff-recoveries',
     '.requirement-backfills','.integration-reverts','.assignee-followons','.lane-fault-clears','.lifecycle-voids',
-    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL)
+    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL,'.delegations')
 
 def sweep_project_temporaries(root,name,*,dry_run=False,min_age_seconds=None):
     """Sweep the project directory and every atomic family in it; never touches a live write.
@@ -4274,7 +4288,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
         baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
         if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
@@ -4326,6 +4340,11 @@ def validate_coordination_files(files):
             # dropped it would show every cleared fault again.
             from fault_clear import validate_entry as validate_fault_clear_entry
             validate_fault_clear_entry(record,name.partition('/')[2])
+        if name.startswith('.delegations/'):
+            # The delegation journal (kittrial-5bb.407): a restore that dropped it would
+            # silently void every delegation, and every agent acceptance would be refused.
+            from delegations import validate_entry as validate_delegation_entry
+            validate_delegation_entry(record,name.partition('/')[2])
         if name=='ONBOARDING.md' and (set(record)!={'text'} or not isinstance(record['text'],str) or not record['text'].strip() or len(record['text'].encode('utf-8'))>8000):raise ValueError('Invalid onboarding backup')
         if name=='GUIDANCE.md':
             from guidance import validate_text
@@ -4855,6 +4874,13 @@ def backup_project(root,name):
         for record in fault_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Lane fault clear journal entry must not be a symlink')
             files['.lane-fault-clears/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
+        # The delegation journal (kittrial-5bb.407), backed up and restored like the two above:
+        # without it every delegation would be inert after a restore.
+        delegation_journal=path/'.delegations'
+        if delegation_journal.is_symlink():raise ValueError('Delegation journal must not be a symlink')
+        for record in delegation_journal.glob('*.json'):
+            if record.is_symlink():raise ValueError('Delegation journal entry must not be a symlink')
+            files['.delegations/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
         # The per-project claiming setting (kittrial-5bb.352). It lives outside the
         # tracker, so a backup that dropped it would silently open claiming again after
         # a restore. A damaged file is carried byte for byte and reads back restrictive.
@@ -7089,6 +7115,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name.startswith('.lane-fault-clears/'):
             from fault_clear import validate_entry as validate_fault_clear_entry
             validate_fault_clear_entry(record,name.partition('/')[2])
+        elif name.startswith('.delegations/'):
+            from delegations import validate_entry as validate_delegation_entry
+            validate_delegation_entry(record,name.partition('/')[2])
         elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])
@@ -8839,7 +8868,7 @@ def authority_changes_document(record):
         return [],None,('not-this-history','is not the history this kit writes: its baseline is not one this kit writes')
     return entries,baseline,None
 
-def read_authority_changes(root):
+def read_authority_changes(root,*,max_bytes=None):
     """``(entries, baseline, damage)`` for the audit file; ``damage`` is None when it is absent or readable.
 
     ``damage`` is ``(kind, phrase)``. ``not-a-regular-file``: the path is a directory, a fifo or a
@@ -8850,12 +8879,33 @@ def read_authority_changes(root):
     history this kit writes (another schema, an unknown top-level key, an entry or a baseline with
     an unknown or missing field, an ``at`` that is not this kit's stamp). An absent file is an
     empty history with no baseline, never damage.
+    ``max_bytes`` is an optional read-only diagnostic bound. It opens without
+    following a final symlink, checks the descriptor and reads at most the bound
+    plus one detection byte, then uses this same document validator. Ordinary
+    callers retain the existing unbounded reader contract when it is omitted.
     """
     path=root/AUTHORITY_CHANGES_AUDIT
     if path.is_symlink() or (path.exists() and not path.is_file()):
         return [],None,('not-a-regular-file','is not a regular file (a directory, a fifo or a symlink)')
     if not path.exists():return [],None,None
-    try:record=record_json.loads(path.read_text(encoding='utf-8'))
+    try:
+        if max_bytes is None:
+            text=path.read_text(encoding='utf-8')
+        else:
+            # The host's optional read-only diagnostics use this same validator,
+            # with a byte bound that also holds if a file grows after its stat.
+            if type(max_bytes) is not int or max_bytes<1:raise ValueError('Invalid authority audit byte bound')
+            before=path.lstat()
+            flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
+            with os.fdopen(os.open(str(path),flags),'rb') as source:
+                opened=os.fstat(source.fileno())
+                if (not stat.S_ISREG(opened.st_mode) or
+                        (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)):
+                    raise ValueError('Authority audit changed while opening')
+                raw=source.read(max_bytes+1)
+                if len(raw)>max_bytes:raise ValueError('Authority audit exceeds the read byte bound')
+                text=raw.decode('utf-8')
+        record=record_json.loads(text)
     except (OSError,UnicodeError,ValueError) as error:
         return [],None,('unreadable','cannot be read: %s'%error)
     return authority_changes_document(record)
@@ -10330,6 +10380,11 @@ def main():
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('fault-clear',help='clear a lane\'s needs-investigation flag (operator allowlist, host journal)')
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('delegation-record',help='grant, narrow or revoke a delegation of a decision right (operator allowlist, host journal)')
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('delegation-check',help='read-only: the delegations of a project and which granted coordinator agents they cover')
+    a.add_argument('--project',required=True)
+    a.add_argument('--state',required=True,help='the existing web service state document (read only)')
     a=sub.add_parser('requirement-backfill');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-apply');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('requirement-reconcile');a.add_argument('project');a.add_argument('--operation-id',required=True)
@@ -10985,6 +11040,52 @@ def main():
             authority=operators(root,strict=True)
             require_configured_operator(args.actor,authority,'clear a needs-investigation flag')
             print(json.dumps(fault_clear.apply(payload,args.actor,run,path,operators=authority),ensure_ascii=False))
+    elif args.command=='delegation-record':
+        # The installation operator's host route for a delegation (kittrial-5bb.407); the
+        # SAME delegations.apply the web route and `coordinator delegation-record` call, under
+        # the same project lock, after the same operator check. The record says via operator.
+        import fcntl
+        import delegations
+        from keyed_records import require_configured_operator
+        from http_authority import server_time
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        if not isinstance(payload,dict):
+            raise ValueError('The delegation payload must be a JSON object. Nothing was written.')
+        require_configured_operator(args.actor,operators(root,strict=True),'record a delegation')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            require_configured_operator(args.actor,operators(root,strict=True),'record a delegation')
+            print(json.dumps(delegations.apply(payload,project=args.project,journal=path,run=run,recorded_by=args.actor,
+                                               via='operator',account=None,at=server_time()),ensure_ascii=False))
+    elif args.command=='delegation-check':
+        # Read-only (kittrial-5bb.407): before a release that requires a delegation for every
+        # agent acceptance, list each agent holding this project's coordinator grant and the
+        # delegations in force that cover it. Nothing is written; no lock is taken.
+        import delegations
+        from http_authority import read_state
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        state_path=Path(args.state)
+        if state_path.is_symlink() or not state_path.is_file():raise ValueError('Use the existing web service state document')
+        state=read_state(state_path)
+        def run(argv):return run_bd(root,args.project,argv)
+        listed=record_json.loads_array_rows(run(['list','--label',delegations.LABEL,'--all','--limit','0','--json']) or '[]')
+        ids=[str(row['id']) for row in listed if isinstance(row,dict) and row.get('id')]
+        shown=record_json.loads_array_rows(run(['show',*ids,'--json','--include-comments']) or '[]') if ids else []
+        try:
+            from sessions import owners as session_owners
+            owned=session_owners(path)
+        except (OSError,ValueError):
+            owned=None
+        items=delegations.listing(shown,args.project,state,path,operators(root),owned)
+        agents=delegations.coverage(state,args.project,items)
+        print(json.dumps({'schema_version':1,'project':args.project,'granted_agents':agents,
+                          'uncovered':[a['agent'] for a in agents if not a['covered']],'delegations':items},ensure_ascii=False))
     elif args.command=='requirement-backfill':
         import fcntl
         from requirement_records import backfill

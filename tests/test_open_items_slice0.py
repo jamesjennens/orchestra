@@ -185,8 +185,10 @@ class LabelTests(unittest.TestCase):
             self.assertEqual(rc.reserved_label(label), label)
         for label in ORDINARY_LABELS:
             self.assertIsNone(rc.reserved_label(label), label)
-        # No exact label was added: `open-item` stays an ordinary label everywhere.
-        self.assertEqual(rc.RESERVED_EXACT_LABELS, frozenset({'requirement', 'brd-section', 'gt:slot'}))
+        # No exact label was added: `open-item` stays an ordinary label everywhere. (`delegation`
+        # was added by kittrial-5bb.407: only the delegation operation marks a decision with it.)
+        self.assertEqual(rc.RESERVED_EXACT_LABELS, frozenset({'requirement', 'brd-section', 'gt:slot', 'delegation'}))
+        self.assertIsNone(rc.reserved_label('open-item'))
 
     def test_every_label_writing_spelling_is_refused(self):
         for label in STATE_LABELS:

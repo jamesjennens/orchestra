@@ -1787,7 +1787,8 @@ def help_payload(command):
                          'With --config and --project, capability lookup also returns the recorded '
                          'capabilities (records, records_found, records_hint) with each pointer resolved live '
                          'in this checkout, and capability find|get|list|misses|propose|revise|propose-alias go '
-                         'to the coordination endpoint (see docs cli-contract). The endpoint counts each find '
+                         'to the coordination endpoint (see docs cli-contract). capability validate combines '
+                         'read-only endpoint preflight with local pointer checks. The endpoint counts each find '
                          'and records the normalised phrase of one with no exact record (phrase and count '
                          'only, no actor).',
                          'Pointers are file::Qualified.name for code, file.md#anchor for Markdown '

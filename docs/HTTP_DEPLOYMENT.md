@@ -4061,8 +4061,10 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
 | `GET /v1/projects/{id}/capabilities`, `GET .../capabilities/find?q=...`, `GET .../capabilities/{key}` | `projects.read` | any member of the project, a superuser, a personal agent granted the project, or a worker credential for the project |
 | `POST /v1/projects/{id}/references`, `PATCH /v1/projects/{id}/references/{key}`, `POST .../references/{key}/revisions` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
 | `POST /v1/projects/{id}/capabilities`, `PATCH /v1/projects/{id}/capabilities/{key}`, `POST .../capabilities/{key}/revisions`, `POST .../capabilities/{key}/aliases` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
-| `POST /v1/projects/{id}/references/{key}/accept`, `POST .../references/{key}/retire` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project; never a contributor, viewer, ungranted agent or worker credential (`403`) |
-| `POST /v1/projects/{id}/capabilities/{key}/accept`, `POST .../capabilities/{key}/retire`, `POST .../capabilities/{key}/verify`, `POST .../capabilities/{key}/aliases/reject` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project; never a contributor, viewer, ungranted agent or worker credential (`403`) |
+| `POST /v1/projects/{id}/references/{key}/accept`, `POST .../references/{key}/retire` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project, and, for an agent's `accept`, only within a person owner's delegation named as `decision_id` (below); never a contributor, viewer, ungranted agent or worker credential (`403`) |
+| `POST /v1/projects/{id}/capabilities/{key}/accept`, `POST .../capabilities/{key}/retire`, `POST .../capabilities/{key}/verify`, `POST .../capabilities/{key}/aliases/reject` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project, and, for an agent's `accept` and `verify`, only within a person owner's delegation named as `decision_id` (below); never a contributor, viewer, ungranted agent or worker credential (`403`) |
+| `GET /v1/projects/{id}/delegations` | `projects.read` | any member: the delegations recorded in the project, in force or not, and which agents holding the coordinator grant they cover |
+| `POST /v1/projects/{id}/delegations` | `project.admin` | only a person `owner` of the project signed in to the web (its own session); never an agent or worker credential, a coordinator, or a superuser without the owner role (`403`) |
 
 - **A superuser without membership in the project is refused (`403`) on every write route.**
   `http_authority.decide()` has no separate superuser path for `coordinate` or `records`, and
@@ -4120,12 +4122,16 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
   `acceptor` on `accept` and `retire`; `proposer` and `verifier` on `verify`; `proposed_by` and
   `accepted_by` on `get` and `list`), along with `draft_authors` and `accepted_draft_authors`
   tracking every author who contributed a draft revision since the prior acceptance.
-- **A granted personal agent never accepts or verifies a draft written by its own party**,
-  whatever the server's `approval_by_another_party` setting says (`403`). Every draft author in
-  the unaccepted revision chain (`draft_authors` for acceptance, `accepted_draft_authors` for
-  verification) is checked against the caller's party. The party of a draft's author includes
-  the owning account (`usr_...`), every personal agent of that account (`agent_...`), and every
-  actor name held by a worker credential of that account in the project.
+- **A granted personal agent accepts or verifies a record only within a person owner's
+  delegation** (kittrial-5bb.407, below). Without one it is refused (`403`), whoever wrote the
+  draft. Within one, the agent-only own-party rule is lifted: the owner's delegation is the act
+  that permits an agent to accept what its owner or that owner's other agents and worker
+  credentials proposed. A delegation never lets an agent accept or verify a draft it wrote
+  itself, and never overrides the project's independence setting: with
+  `approval_by_another_party` or `independent_approval` on, a delegated agent faces exactly the
+  rule below that a person faces. The party of a draft's author still includes the owning
+  account (`usr_...`), every personal agent of that account (`agent_...`), and every actor name
+  held by a worker credential of that account in the project, and is still recorded.
 - **For a signed-in human coordinator or owner:**
   - When `approval_by_another_party` is **off** (the default), a human coordinator or owner may
     accept or verify a draft revision they (or one of their agents or worker credentials) wrote,
@@ -4135,6 +4141,55 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
     author in its unaccepted draft chain belongs to their own party (their account, one of their
     agents, or one of their worker credential actors). Another coordinator or owner of an
     independent party must accept or verify it.
+
+### Delegated record acceptance (kittrial-5bb.407)
+
+A person owner delegates **record acceptance** to the project's coordinator agents, for a stated
+scope and with a stated line of what must be escalated. An agent holding the project's
+`coordinator` grant then accepts (and verifies capabilities) only within a delegation in force,
+and names it as `decision_id` on the request. That same delegation lifts the agent-only
+own-party rule for it (its owner's and sibling agents' drafts), but never a draft the agent wrote
+itself and never the project's independence setting. Nothing changes for a person coordinator or owner, for contributors, viewers,
+ungranted agents or worker credentials, or for the host route.
+
+- **The record.** A delegation is a `Kind: delegation-v1` comment on a decision issue (type
+  `decision`, or labelled `decision`), plus a host journal entry at
+  `<project>/.delegations/<sha256>.json`. The prefix is reserved: a raw comment cannot write
+  one. A record without its journal entry (one planted where the prefix was not reserved, by an
+  older kit or by a lane with native access) grants nothing. The record carries `right`
+  (`record-acceptance`), `grantee` (an exact `agent_<16hex>`, or `coordinator-grant` for every
+  agent holding the grant), `scope` (`references`, `capabilities` or both), `escalate`, `reason`,
+  and the server-filled `recorded_by`, `via` (`session` or `operator`), `account` and `at`.
+- **Who records one.** Only a person `owner` of the project through their own signed-in web
+  session (`POST /v1/projects/{id}/delegations`, the Settings page's *Delegated decisions* panel),
+  or a listed operator on the host (`admin.py delegation-record --project P --actor OPERATOR
+  --file payload.json`, also reachable as the bound-key coordinator command `delegation-record`).
+  Not an agent, not a coordinator, not a superuser without the owner role. A grant may name an
+  existing decision issue (`decision`) or create one (`decision: null` and a `title`; the reason
+  becomes its description).
+- **Why not lines in an issue body.** A native issue's author is only the `--actor` label of
+  whoever wrote it, and over the host route that label is not bound for an unbound key and can
+  be any unused name for a bound one, so "written by the owner" cannot be read off an issue.
+- **Narrowing and revoking.** `action: narrow` names a strict subset of the scope in force;
+  `action: revoke` ends the delegation. Either takes effect on the next acceptance. A second
+  grant on the same decision is refused; record a new decision instead.
+- **Checked live at every acceptance**, under the write's lock, never cached: the decision exists
+  in this project and is a decision issue; its one honoured grant was recorded by someone who is
+  **still** a person owner of the project (or whose exact actor name is still on the operator
+  allowlist; another actor of the same principal does not count); it grants record
+  acceptance to this agent or to `coordinator-grant`; the agent's coordinator grant is still in
+  effect; its scope covers the record kind; it has not been revoked. Each refusal names its
+  reason. An agent's request that names no `decision_id` is refused before the endpoint is asked.
+- **Evidence.** The acceptance record's `decision_id` names the delegation, so every agent
+  acceptance records which person authorized it. (A capability verification record has a closed
+  field set and does not store it; the operation journal keeps the request.)
+- **Before a release with this rule.** An agent that accepted records without a delegation is
+  refused from this release on. Before deploying it, record a delegation for each project whose
+  coordinator agents accept records, and check with the read-only
+  `admin.py delegation-check --project P --state STATE.json`, which lists every agent holding the
+  project's coordinator grant and whether a delegation in force covers it (`uncovered`).
+- **Backups** carry `.delegations/` with the other host journals; a restore that dropped it would
+  void every delegation.
 
 ### `points_to` and `pointers_validation` on capability records
 
@@ -4172,8 +4227,8 @@ object:
 
 ## Project rooms over HTTP (slice 1, kittrial-5bb.385)
 
-Slice 1 of `docs/PROJECT_ROOMS_DESIGN.md` (section 10): rooms for people. Items, the
-`rooms` scope, the scribe, the wake and the summary are later slices. Room text is
+Slice 1 of `docs/PROJECT_ROOMS_DESIGN.md` (section 10): rooms for people. Items are slice 2
+below; the `rooms` scope, the scribe, the wake and the summary are later slices. Room text is
 discussion, never an instruction to an agent: an agent credential cannot write in this
 slice at all, and the capability the page uses is on no credential scope.
 
@@ -4263,6 +4318,175 @@ The rooms file is written only after the complete sidecar, so a failed backup ne
 pairs a new rooms file with an older sidecar. `backup-copy` carries the same two rooms
 files (and pins their SHA-256 in the run record), so an off-machine copy does not lose
 rooms silently; `backup-status` names them when the project has them.
+## Project room items and acceptance over HTTP (slice 2, kittrial-5bb.388)
+
+Slice 2 of `docs/PROJECT_ROOMS_DESIGN.md` (sections 6 and 10): an item is a candidate
+requirement, a decision or an open question, and a person decides it. The item lines live in
+the same append-only room files as slice 1; no new file and no new record shape is added.
+
+**Lines.** An `item` line carries `item_kind` (`requirement|decision|question`), `title`
+(1..200), `text` (1..`rooms.max_message_chars`), the author, the time and an optional
+`supersedes` naming an earlier item. A requirement item also carries an optional `parent`:
+the existing job the requirement hangs under, checked against the project's current jobs
+(the tracker refuses a parentless draft; when the project has exactly one job and the item
+names none, that job is used; with two or more jobs an editor's accept must name one). An
+`item-event` line carries `target_sequence`, `event`
+(`accept|reject|amend|answer`), the resulting `state`, the author, the time, the text (the
+reason, the amended body, the answer or an optional accept note) and `record` (the pointer
+below; null otherwise). An `amend` event also carries the new `title`. An `item-intent` line
+carries `target_sequence`, `action` (`accept`), `identity` (the native record identity the
+acceptance is about to write), the author and the time; it is internal bookkeeping that the
+read, the items cache and the Markdown export skip, while the raw JSON-lines export keeps it
+like every stored line. All line kinds use the same sequence, operation-id replay, segment
+rollover, torn-tail quarantine and locking as a message. An amendment's identity names the
+new title, text and parent and the item line it follows, so A, B, then A applies again while
+an unchanged request replays; an acceptance's identity names its title and text.
+
+**States.** An item starts `proposed`. `accept` makes it `accepted`; `reject` makes it
+`rejected`; `amend` makes it `amended` with the new title/text, and it may then be accepted
+or rejected; `supersedes` on a newer item makes the older one `superseded` and refuses its
+acceptance. `accepted`, `rejected` and `superseded` are final. A question is answered
+(`answer` -> `accepted`) and records who answered and when; it can also be rejected. A
+moderated item cannot be accepted, rejected, amended or answered (409), and every field its
+author wrote is served nowhere — the original title and text, an amendment's title and text,
+an answer, an accept note and a reject reason all become the tombstone in the read, the
+`index.json` items cache and both exports. Moderation names a message or an item line; it
+does not name an individual answer, accept note or reject reason inside an item's history
+(moderating the item replaces all of them).
+
+**Rights.** The accept capability above is the right to accept. Rejecting or amending an
+item needs its author or a project owner/coordinator: a viewer never posts an item in slice
+1, so a viewer holding only `read` on a question must not be able to rewrite or reject
+someone else's question. Answering an open question stays an ordinary member action (`read`).
+The page shows Reject/Amend only to the author or an owner/coordinator; the server re-checks
+the rule against a current read before the write.
+
+**Routes.** Every POST is CSRF-protected by the existing route machinery. R7 is checked
+before any role or grant check: the accept, reject, amend and answer routes take a signed-in
+person and refuse every agent credential, even one holding the coordinator grant.
+
+| Route | Body | Authority |
+|---|---|---|
+| `POST /v1/projects/{pid}/rooms/{rid}/items` | `{"item_kind","title","text","supersedes"?,"parent"?}` | the `rooms.post` capability (contributor/coordinator/owner) |
+| `POST .../items/{seq}/accept` | `{}`, `{"note": "..."}` or `{"parent": "..."}` | requirement: `requirement_editor` -> `coordinate`, otherwise `proposals.write`; decision: `coordinate` (owner/coordinator); question: 400 |
+| `POST .../items/{seq}/reject` | `{"reason": "..."}` | the item's author, or a project owner/coordinator |
+| `POST .../items/{seq}/amend` | `{"title": "...", "text": "..."}` or with `"parent": "..."` for a requirement | the item's author, or a project owner/coordinator |
+| `POST .../items/{seq}/answer` | `{"text": "..."}` | `read` (any member) on a question |
+
+**Accepted items become the kit's existing records, in existing fields only.** The pointer
+`orchestra:room/<room-id>#<sequence>` goes in a requirement's description, a proposal's
+`evidence` list or a decision's rationale; there is no requirement `source` field and no new
+record shape. A requirement editor's accept creates and accepts a requirement through the
+released B1 routes and appends the pointer to that acceptance's generated native decision.
+A contributor's accept submits a requirement proposal as that person. A decision item's
+accept creates a native decision through the service-only canonical `room-decision` action,
+which re-checks the signed-in account's live owner/coordinator membership (never a credential)
+inside the endpoint under the authority lock and binds the item's stored title, text and
+pointer before the guarded write; it also refuses an item in an archived room there.
+Reject, amend and answer create no record.
+
+**One record per item, written after the checks.** The HTTP route takes the project's
+item-decision lock, re-reads the item, and checks its state, moderation, room and (for an
+accept) the parent job before any native record is written; the room is locked only for the
+append, so the endpoint's own `.coordination.lock` is never nested inside it. A room archive
+takes the same item-decision lock *before* the room lock, so it cannot slip between an
+accept's check and its append: the accept either finishes and is recorded, or the archive
+came first and nothing is written. The record write and the item-event use an operation
+identity naming the room, the item sequence and the action — never the current event count
+or the client's key — so a retry reconciles on the same record. An acceptance's identity also
+follows the title and text it records, and an amendment's follows the new title, text and
+parent and the line it follows, so a second amendment applies (the page offers Amend on an
+amended item), amending back to an earlier text applies again, and an unchanged request
+replays.
+
+**The accept intent, and who completes it.** Before any native write, the route appends an
+`item-intent` line. It names the identity, what the acceptance becomes (`record_kind`:
+requirement, proposal or decision, decided once from the first person's authority), the
+content digest it binds and the parent job chosen. A retry by anyone completes exactly that
+intent: same kind, same parent (a retry naming another parent is refused, 409).
+
+Who may complete it is checked live. A requirement or decision intent needs a current project
+owner or coordinator; a person demoted since is refused (403), never turned into a proposal. A
+proposal intent is submitted as its author, so only its author finishes it.
+
+**How a retry reconciles.** Each person writes under their own operation id, because the
+endpoint journal binds an id to the principal that first used it. Requirement and room-decision
+rows are bound to the person's account, not the login session, so the same person's retry after
+signing in again replays its own row.
+
+A retry reads every earlier attempt on the intent from the endpoint's operation journal, the
+caller's own included. Only the request that writes the intent has no earlier attempt of its
+own. A row counts only if the endpoint wrote it for that person on the room path's route:
+- its principal is the person's account (a proposal's is one of their sessions);
+- its route is the room route.
+
+A row someone else wrote under the same id counts as "that attempt wrote nothing there". The SSH
+path accepts caller-chosen ids, but each intent's native ids also include a random nonce that no
+read or export serves, so no member can compute them in advance. The outcomes:
+- An attempt that finished: its record is adopted.
+- A requirement that was created but not yet accepted: the retrying editor accepts it, or adopts
+  it when it is already accepted.
+- An attempt recorded as refused: it wrote nothing.
+- An attempt whose row is in flight, unknown or missing (committed rows are kept about a day),
+  the caller's own included: uncertain. The retry is refused (409) until a coordinator cancels
+  the intent.
+
+A person's attempt is logged as an `item-intent-attempt` line immediately before their own
+native write, and only then, so a refused or adopting retry logs nothing. At most five people
+try one intent.
+
+So one item becomes one native record. Two can exist only when an intent whose outcome is
+unknown is cancelled and the item is then accepted afresh, and the cancel line says so
+(`record_may_exist`).
+
+**Moderation always wins, and nothing stays stuck.** While an intent is pending, an
+amendment, a supersede or another decision is refused (409 `accepting`). Three things cancel
+it with an `item-intent-cancel` line:
+- moderation, in the same room-lock section as its tombstone;
+- archiving a room, which cancels every pending intent in it first;
+- an owner or coordinator, through `POST .../rooms/{rid}/items/{seq}/intent/cancel {reason}`.
+  An intent's author may cancel only their own proposal-kind intent, and only while they still
+  hold the proposal authority (an author demoted to viewer cannot).
+
+Moderation and archive work out the attempts' outcomes before taking any lock. The room lock is
+the project's `.coordination.lock`, which the endpoint's reads need, so they never wait on the
+endpoint while holding it.
+
+The cancel line names the identity, the records the attempts are known to have written (from
+the journal), and `record_may_exist` when an outcome is unknown, so a coordinator can find and
+retire a stray record. A cancelled identity is refused for ever. The item's next acceptance
+uses a fresh identity, which counts the cancels.
+
+With no pending intent, moderation is exactly as before.
+
+**Room operation-id namespaces.** Accept intents are found by their kind and identity, never
+by a bare operation id. "Already decided" means only that an accept or reject event of that
+item exists. A client `Idempotency-Key` starting with `room-` or `intent-` is refused (422) on
+every room write route, messages included, so no line can occupy an identity an acceptance
+needs. The web page's keys start with `web-`.
+
+A second accept with a *fresh* client key after the item is decided is refused (409) and
+writes no second record, proposal or decision. A contributor accept and an owner accept
+racing each other produce exactly one record, decided by whichever took the item-decision lock
+first. The client `Idempotency-Key` still guards the HTTP mutation.
+
+**The items cache.** `index.json` gains a per-room `items` list: the current views and their
+decision history. It is a cache only. `rooms.py` builds it with the same function that a
+rebuild uses from the segment lines, so deleting the index or any stale byte check rebuilds
+identical states; the lines stay the truth. A moderated item's title, text, parent job and
+every user-written event field are dropped on moderation and on rebuild.
+
+**Rollback.** An older kit reads the requirements, proposals and decisions created here
+unchanged (the pointer rides in fields it already has). A `.385` reader, and a `.388` reader
+older than this revision, does not know the `item`, `item-event`, `item-intent`,
+`item-intent-attempt` and `item-intent-cancel` line kinds, so it names such a room damaged instead of serving it; a kit without rooms ignores
+`.rooms` entirely. Nothing in the tracker or the coordination sidecar changes shape.
+
+**Export.** The Markdown export adds each item with its state, evidence pointer and record,
+then its item events. The JSON-lines export carries the item, item-event and intent lines,
+with a moderated item's title, text, parent and every user-written event field replaced by
+its tombstone (an intent's recorded parent is dropped too).
+
 ## Serving delivered bundles over HTTP
 
 Web reviewers holding `reviews.write` or `reviews.approve` in a project can read a contribution's

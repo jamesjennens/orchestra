@@ -140,6 +140,27 @@ export async function page(ctx, { pid }) {
   const waitingCaps = waitingCapsResp.items || waitingCapsResp.records || [];
   const totalWaiting = waitingRefs.length + waitingCaps.length;
 
+  // Who accepts the waiting drafts in THIS project (kittrial-5bb.407): the people whose role
+  // coordinates, and the coordinator agents a person owner's delegation covers. Filled after the
+  // page draws; a server without either read leaves the line out.
+  function acceptorsLine() {
+    const line = h('p', { class: 'small', 'data-acceptors': 'pending' });
+    if (!ctx.api || typeof ctx.api.coordination !== 'function' || typeof ctx.api.delegations !== 'function') return line;
+    Promise.all([ctx.api.coordination(pid), ctx.api.delegations(pid)]).then(([who, delegated]) => {
+      const people = (who.people || []).filter((p) => !p.disabled).map((p) => p.display_name);
+      const names = delegated.names || {};
+      const agents = (delegated.granted_agents || []).filter((a) => a.covered).map((a) => names[a.agent] || a.agent);
+      const escalate = (delegated.items || []).filter((i) => i.in_force && i.delegation)
+        .map((i) => i.delegation.escalate).filter(Boolean);
+      line.setAttribute('data-acceptors', 'ready');
+      line.replaceChildren('Who accepts here: ',
+        people.length ? people.join(', ') : 'no person coordinator',
+        agents.length ? '; agents within a delegation: ' + agents.join(', ') : '; no agent (no delegation in force)',
+        '.', escalate.length ? ' Escalated to the owner: ' + escalate.join(' · ') : '');
+    }).catch(() => { line.remove(); });
+    return line;
+  }
+
   function renderWaitingRow(item, family) {
     const rec = item.record || {};
     const draft = item.proposed || rec;
@@ -178,6 +199,7 @@ export async function page(ctx, { pid }) {
       approvalByAnotherParty
         ? ' This project requires approval by another party: a coordinator may not accept or verify a draft proposed by their own account or its agents.'
         : ' In this project a coordinator may accept a draft they proposed themselves; both proposer and acceptor are recorded.'),
+    acceptorsLine(),
     totalWaiting === 0
       ? empty('Nothing waiting to be accepted', 'All reference and capability drafts have been handled.')
       : h('div', { class: 'table-wrap' },
