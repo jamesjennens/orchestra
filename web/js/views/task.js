@@ -89,8 +89,14 @@ export async function detail(ctx, { pid, tid }) {
     next ? h('p', { class: 'next' }, h('b', null, 'Next: '), next.text, ' ',
       h('span', { class: 'who-acts' + (whoActs === 'you' || whoActs === 'you (project owner)' || whoActs === 'you (coordinator)' ? ' you' : '') }, whoActs)) : null);
   // The integration-evidence link stays one banner below the strip for approved work.
+  // The facts panel starts hidden inside the closed Owner-tools fold (and until the
+  // lifecycle read lands), so the link opens the fold first (b1.3): otherwise the
+  // hash jump lands on a hidden node and nothing visibly happens.
+  let ownerToolsFold = null;
+  const evidenceLink = h('a', { href: '#lifecycle-facts' }, 'Record integration evidence');
+  evidenceLink.addEventListener('click', () => { if (ownerToolsFold) ownerToolsFold.open = true; });
   const nextBanner = (next && ctx.api.lifecycle && ['approved', 'awaiting-integration'].includes(t.review_state))
-    ? h('div', { class: 'banner info' }, h('a', { href: '#lifecycle-facts' }, 'Record integration evidence')) : null;
+    ? h('div', { class: 'banner info' }, evidenceLink) : null;
 
   // ---- brief -------------------------------------------------------------------
   const cp = brief.checkpoint;
@@ -173,7 +179,6 @@ export async function detail(ctx, { pid, tid }) {
   let cursor = null;
   let loading = false;
   const entries = [];
-  const byEntry = new Map();
   const KIND_VERB = {
     'task-created': 'created the task', 'task-claimed': 'claimed the task',
     'task-updated': 'edited the task',
@@ -185,6 +190,9 @@ export async function detail(ctx, { pid, tid }) {
     'checkpoint-added': 'recorded a checkpoint', 'checkpoint': 'recorded a checkpoint',
     'comment': 'commented',
   };
+  // A non-body history event reads as the ACTIONS label for its action (the old code
+  // did: kittrial-5bb.411 review item b1.1). Unknown keys fall back to the raw key so
+  // a new server action still reads as something instead of 'Event'.
   // A history entry's [object Object] author is an author id or object rendered as
   // text (WEB_UX_REVIEW s2.2): prefer the name the server resolved for it.
   function entryName(e) {
@@ -215,6 +223,9 @@ export async function detail(ctx, { pid, tid }) {
     historyList.replaceChildren(...entries.map((e) => {
       // Activity: comments read as comments; machine records as one-line record
       // events with the raw JSON folded (WEB_UX_REVIEW s2.2).
+      // A non-body history event reads as the ACTIONS label (b1.1: the old code
+      // did); unknown actions fall back to the raw key so a new server action
+      // still reads as something instead of 'Event'.
       const who = entryName(e);
       const when = h('span', { class: 'small muted' }, (e.action ? '' : ' · '), time(e.time || e.timestamp));
       const kindVerb = e.action ? e.action : (KIND_VERB[e.kind] || e.kind);
@@ -224,7 +235,7 @@ export async function detail(ctx, { pid, tid }) {
             h('p', { class: 'event-body prose' }, e.body)));
       }
       const tone = (ACTIONS[e.action || ''] || [])[1] || '';
-      const label = e.action || kindVerb || 'Event';
+      const label = e.action ? ((ACTIONS[e.action] || [])[0] || e.action) : (kindVerb || 'Event');
       const detail = e.detail;
       let raw = null;
       try { raw = JSON.stringify(e, null, 2); } catch { raw = String(e.kind || e.action || 'record'); }
@@ -262,7 +273,6 @@ export async function detail(ctx, { pid, tid }) {
     h('div', { class: 'panel-body' }, historyList, h('div', null, more)));
   more.addEventListener('click', loadHistory);
   loadHistory();
-  const historyPanel = null;
 
   // ---- edit (version-checked) --------------------------------------------------
   const editPanel = h('section', { class: 'panel', hidden: true, 'aria-labelledby': 'edit-h' });
@@ -321,17 +331,16 @@ export async function detail(ctx, { pid, tid }) {
         h('dt', null, 'ID'), h('dd', { class: 'mono' }, t.id),
         t.version !== undefined ? [h('dt', null, 'Version'), h('dd', { class: 'num' }, String(t.version))] : null))),
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Completion facts')),
-      h('div', { class: 'panel-body' }, knownFacts.length
-        ? h('p', { class: knownFacts.length ? 'small' : 'small muted' }, completionLine) : null)),
+      h('div', { class: 'panel-body' }, h('p', { class: knownFacts.length ? 'small' : 'small muted' }, completionLine))),
     brief.depends_on && brief.depends_on.length ? h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Depends on')),
       h('ul', { class: 'panel-body open-items' }, brief.depends_on.map((d) => h('li', null, h('a', { href: ctx.href(`/p/${pid}/t/${d.id}`) }, d.title), ' ', statusChip(d.status))))) : null,
     taskFilesPanel(ctx, { pid, tid, task: t, project }),
-    h('details', { class: 'fold' }, h('summary', null, 'Owner tools'),
+    (ownerToolsFold = h('details', { class: 'fold' }, h('summary', null, 'Owner tools'),
       h('div', { class: 'fold-body' },
         brief.lifecycle ? h('div', { id: 'lifecycle-facts' }, lifecyclePanel(ctx, project, t)) : null,
         owner && !project.archived ? assignmentForm(ctx, pid, tid, t) : null,
-        brief.assignment_notices ? h('div', { class: 'banner info' }, brief.assignment_notices.items.map(item => h('p', { class: 'prose' }, item.message))) : null)),
+        brief.assignment_notices ? h('div', { class: 'banner info' }, brief.assignment_notices.items.map(item => h('p', { class: 'prose' }, item.message))) : null))),
     h('p', { class: 'small muted' }, 'Viewing a task never marks it read, done or acknowledged.'));
 
   // ---- main column + checkpoint fold + activity --------------------------------
@@ -348,7 +357,7 @@ export async function detail(ctx, { pid, tid }) {
     summaryStrip,
     nextBanner,
     h('div', { class: 'detail' },
-      h('div', { class: 'stack' }, editPanel, wantedPanel, briefPanel, reviewPanel, activityPanel, checkpointFold, writer ? commentForm(ctx, pid, tid) : null, historyPanel),
+      h('div', { class: 'stack' }, editPanel, wantedPanel, briefPanel, reviewPanel, activityPanel, checkpointFold, writer ? commentForm(ctx, pid, tid) : null),
       side));
 }
 

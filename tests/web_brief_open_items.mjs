@@ -38,6 +38,10 @@ function brief(carry) {
 
 // One long comment split across the page boundary: its first fragment is the last item
 // of page 1 and is still continued, so the page must fetch page 2 itself.
+// A non-body history entry on page 2 (no body key: kittrial-5bb.411 review item b1.1)
+// reads as the ACTIONS label for its action ('Claimed the task'), never the raw
+// action id, and an unknown action falls back to the raw key so it still reads as
+// something.
 const PAGES = {
   null: {
     items: [
@@ -52,6 +56,11 @@ const PAGES = {
         body: 'Second half.', body_offset: 12, body_total_chars: 23, continued: false },
       { kind: 'comment', author: 'b', timestamp: '2026-10-19T11:00:00Z', entry_id: 'e2',
         body: 'A short one.', body_offset: 0, body_total_chars: 12, continued: false },
+      // Non-body history entries (no body key: kittrial-5bb.411 review item b1.1).
+      { kind: 'record', action: 'task-claimed', author: 'c', timestamp: '2026-10-19T12:00:00Z',
+        detail: 'Assigned.', raw: 1 },
+      { kind: 'record', action: 'task-something-new', author: 'd', timestamp: '2026-10-19T12:01:00Z',
+        detail: 'New.', raw: 2 },
     ],
     next_cursor: null,
   },
@@ -86,13 +95,21 @@ const incompleteCalls = [];
 const incomplete = await view.detail(makeCtx(brief(null), incompleteCalls), { pid: 'alpha', tid: 'alpha-1' });
 await settle();
 
-console.log(JSON.stringify({
+  const recordHeads = complete.all((e) => e.className === 'record-event')
+    .map((e) => e.all((h) => h.className === 'event-head')[0])
+    .filter(Boolean)
+    .map((h) => h.textContent);
+  console.log(JSON.stringify({
   openItems: textOf(complete, 'open-items'),
   unresolvedHeading: complete.textContent.indexOf('Unresolved items 5') !== -1,
   completeHasReadAgain: complete.textContent.indexOf('could not all be read') !== -1,
   historyItems: historyText.length,
   historyText: historyText.join(' | '),
   historyCalls: completeCalls.filter((p) => p.indexOf('/history') !== -1).length,
+  claimedAsLabel: historyText.join(' | ').indexOf('Claimed the task') !== -1,
+  recordHeads,
+  noRawActionId: recordHeads.join(' | ').indexOf('task-claimed') === -1,
+  unknownActionFallsBackToKey: recordHeads.join(' | ').indexOf('task-something-new') !== -1,
   showNewer: buttons(complete, 'Show newer'),
   showOlder: buttons(complete, 'Show older'),
   incompleteNotice: incomplete.textContent.indexOf('could not all be read') !== -1,
