@@ -419,6 +419,13 @@ class WebViewTests(unittest.TestCase):
             self.assertIn(text, work)
         overview = project[project.index('export async function overview'):project.index('export async function reviews')]
         self.assertLess(overview.index('project.usable === false'), overview.index("'New task'"))
+        # Slice 3 (kittrial-5bb.416): the task list leads, then a link to the Lanes
+        # page and the closed Coordinator tools fold; the lanes board lives on the
+        # Lanes page, never in the overview.
+        self.assertLess(overview.index("'New task'"), overview.index('Coordinator tools'))
+        self.assertLess(overview.index('tableHost'), overview.index('Coordinator tools'))
+        self.assertNotIn('lanesPanel(ctx, project)', overview)
+        self.assertIn('`/p/${pid}/lanes`', overview)
         self.assertIn('unusableBanner(project)', project[project.index('export async function settings'):])
         self.assertIn('project.usable === false', task)
 

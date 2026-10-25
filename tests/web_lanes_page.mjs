@@ -14,8 +14,10 @@ const PROJECT = { id: 'alpha', name: 'Alpha', role: 'owner', usable: true, archi
 
 // Three lanes as the read answers them: one holding a task it DECLARES a wait on, one
 // holding a task whose state is only GUESSED from the checkpoint's prose, and one free.
+// The read carries display names (kittrial-5bb.416): the page shows the server text,
+// falling back to the lane label only when the server sent none.
 const WAITING_LANE = {
-  lane: 'lane-a', actor: 'session-a', idle: false, held: [{
+  lane: 'lane-a', actor: 'session-a', display_name: 'Ann', idle: false, held: [{
     task: 'alpha-1', title: 'Ship the lanes panel', review_state: 'changes-requested',
     work_state: 'changes-requested', whose_move: 'you', next_actor: 'assignee',
     next: 'Deliver a revision', state: 'waiting-on-coordinator', waiting_on: 'coordinator',
@@ -30,7 +32,7 @@ const WAITING_LANE = {
   flag_tasks: { waiting_too_long: ['alpha-1'], expect_by_passed: ['alpha-1'] },
 };
 const GUESSED_LANE = {
-  lane: 'lane-c', actor: 'session-c', idle: false, held: [{
+  lane: 'lane-c', actor: 'session-c', display_name: 'Cat', idle: false, held: [{
     task: 'alpha-3', title: 'An older checkpoint', review_state: 'none', work_state: 'none',
     whose_move: 'you', next_actor: 'assignee', next: 'Read the review', state: 'waiting-on-coordinator',
     waiting_on: 'coordinator', expect_by: null, declared: false, inferred: true,
@@ -44,7 +46,7 @@ const GUESSED_LANE = {
   flag_tasks: { your_move_idle: ['alpha-3'] },
 };
 const FREE_LANE = {
-  lane: 'lane-b', actor: 'session-b', idle: true, held: [], state: 'idle', waiting_on: null,
+  lane: 'lane-b', actor: 'session-b', display_name: 'Bo', idle: true, held: [], state: 'idle', waiting_on: null,
   expect_by: null, inferred: false, state_since: null, state_age_seconds: null,
   last_write: '2026-10-17T20:00:00Z', last_write_age_seconds: 300,
   waiting_too_long: false, expect_by_passed: false, your_move_idle: false, flag_tasks: {},
@@ -107,13 +109,15 @@ async function settle() {
 const lanesCalls = () => calls.filter((c) => c.startsWith('GET /v1/projects/alpha/lanes'));
 const button = (node, label) => Array.from(node.querySelectorAll('button')).find((b) => b.textContent === label);
 
-// 1. The panel on its own, as the overview composes it.
+// 1. The board on its own page (kittrial-5bb.416): lanesPanel renders the rows, and
+// lanesPage composes it with a crumb and heading. The overview no longer embeds it.
 const panel = view.lanesPanel(ctx, PROJECT);
 document.body.append(panel);
 await settle();
 const out = {
   firstRead: lanesCalls()[0],
   text: panel.textContent,
+  names: panel.all((e) => e.tagName === 'STRONG').map((e) => e.textContent),
   lanes: panel.all((e) => e.attributes && e.attributes['data-lane']).map((e) => e.attributes['data-lane']),
   taskIds: panel.all((e) => e.tagName === 'LI').map((e) => e.attributes['data-task']),
   tasks: panel.all((e) => e.tagName === 'LI').map((e) => e.textContent),
@@ -133,10 +137,15 @@ const out = {
   faultOmitted: panel.all((e) => e.attributes && e.attributes['data-fault-omitted']).map((e) => e.textContent),
   nextEnabled: !button(panel, 'Next').disabled,
 };
-// 2. The overview composes it.
+// 2. The Lanes page composes the board; the overview links to it instead.
+const lanesPage = await view.lanesPage(ctx, { pid: 'alpha' });
+await settle();
+out.lanesPageText = lanesPage.textContent;
+out.lanesPageHasPanel = lanesPage.all((e) => e.attributes && e.attributes['data-panel'] === 'lanes').length;
 const overview = await view.overview(ctx, { pid: 'alpha' });
 await settle();
 out.overviewHasPanel = overview.all((e) => e.attributes && e.attributes['data-panel'] === 'lanes').length;
+out.overviewText = overview.textContent;
 // 3. A paged answer: Next asks for the read's next page, with the SAME threshold.
 await button(panel, 'Next').dispatch('click');
 await settle();

@@ -12918,6 +12918,22 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Why this viewer got this scope, so the page states the rule in force from the answer.
         body['scope_basis'] = basis
         body['scope_role'] = role
+        # Display names for the lane rows, from the same resolver the task list uses
+        # for assignee names (kittrial-5bb.416): display only, never used for any
+        # authority or matching decision. A lane with no resolvable name keeps its
+        # label; the page shows this server text and never builds a name itself.
+        try:
+            names = self._actor_names(
+                [lane.get('actor') for lane in body.get('items') or []
+                 if isinstance(lane, dict)], ctx.params['pid'])
+        except Exception:
+            names = {}
+        for lane in body.get('items') or []:
+            if not isinstance(lane, dict):
+                continue
+            actor = lane.get('actor')
+            lane['display_name'] = (names.get(actor, lane.get('lane'))
+                                    if isinstance(actor, str) else lane.get('lane'))
         continuation = body.get('next_offset')
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
                                            key=self.service.cursor_key())

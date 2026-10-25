@@ -112,6 +112,24 @@ class LanesRouteCase(ServerHarness):
     def lane_row(self, payload, actor):
         return next(row for row in payload['items'] if row['actor'] == actor)
 
+    def test_each_lane_row_carries_the_resolvers_display_name_and_falls_back_to_its_label(self):
+        """Slice 3 (kittrial-5bb.416): display only, from the task list's own resolver.
+
+        A lane whose actor is a known account reads as its display name; a lane
+        whose actor no registry knows keeps its lane label. The name is never
+        used for any authority or matching decision: only the lane and actor
+        fields scope the board.
+        """
+        self.plant_coordination(operators=[self.ids['olive']])
+        every = self.lanes(self.olive).data
+        carl = self.lane_row(every, self.ids['carl'])
+        dana = self.lane_row(every, self.ids['dana'])
+        self.assertEqual('carl', carl['display_name'])
+        self.assertEqual('dana', dana['display_name'])
+        # An actor no name registry knows keeps its lane label, not another name.
+        names = self.service.actor_names(['session-unknown-actor-1'])
+        self.assertEqual({'session-unknown-actor-1': 'session-unknown-actor-1'}, dict(names))
+
     def held_entry(self, payload, task_id):
         for row in payload['items']:
             for entry in row['held']:
@@ -376,7 +394,12 @@ class LanesScopeRequestCase(unittest.TestCase):
 
 
 class LanesPageTests(unittest.TestCase):
-    """The panel under Node: what it renders, and that the threshold is its argument."""
+    """The board on its own Lanes page under Node (kittrial-5bb.416 slice 3).
+
+    The overview no longer embeds the board: it links to the Lanes page, which
+    composes the same lanesPanel. The server's display_name text heads each row;
+    a lane the server could not name would fall back to its lane label.
+    """
 
     def test_the_panel_renders_the_read_and_re_reads_with_a_new_threshold(self):
         node = shutil.which('node')
@@ -396,12 +419,13 @@ class LanesPageTests(unittest.TestCase):
         self.assertIn('/v1/projects/alpha/lanes', seen['firstRead'])
         self.assertIn('idle_minutes=15', seen['firstRead'])
         self.assertEqual('15', seen['threshold'])
-        # Every lane, its actor, and the tasks it holds with their review facts.
+        # Every lane, with the server's display names heading the rows; the raw lane
+        # labels stay beside them as the mono sub, never as the heading.
         self.assertEqual(['lane-a', 'lane-c', 'lane-b'], seen['lanes'])
         self.assertEqual(['alpha-1', 'alpha-3'], seen['taskIds'])
+        self.assertEqual(['Ann', 'Cat', 'Bo'], seen['names'])
         text = seen['text']
-        for wanted in ('session-a', 'session-b', 'session-c',
-                       'Ship the lanes panel', 'An older checkpoint',
+        for wanted in ('Ship the lanes panel', 'An older checkpoint',
                        'changes-requested', 'whose move you', 'next assignee',
                        'waiting-on-coordinator', 'coordinator', '2026-10-12T00:00:00+00:00'):
             self.assertIn(wanted, text, wanted)
@@ -441,8 +465,11 @@ class LanesPageTests(unittest.TestCase):
             self.assertIn(wanted, seen['fault'][0], wanted)
         self.assertEqual(['Earlier open: credentials leaked'], seen['faultEarlier'])
         self.assertEqual(['+3 more earlier open not shown'], seen['faultOmitted'])
-        # The panel is composed into the project overview.
-        self.assertEqual(1, seen['overviewHasPanel'])
+        # The board moved off the overview onto its own Lanes page.
+        self.assertEqual(1, seen['lanesPageHasPanel'])
+        self.assertIn('Lanes', seen['lanesPageText'])
+        self.assertEqual(0, seen['overviewHasPanel'])
+        self.assertIn('Lanes', seen['overviewText'])
         # Next reads the read's own next page, with the SAME threshold.
         self.assertIn('cursor=', seen['pagedRead'])
         self.assertIn('idle_minutes=15', seen['pagedRead'])

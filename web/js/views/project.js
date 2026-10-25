@@ -47,8 +47,9 @@ export function unusableBanner(project) {
     ' Nothing that grants access is accepted on it; removing a member, revoking a credential and archiving still work.') : null;
 }
 
-// -- the lanes board (kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md section 4) -------------
-// ONE read answers this panel: the canonical `work lanes` read, through
+// -- the lanes board on its own page (kittrial-5bb.416, slice 3 of
+// docs/design/WEB_UX_REVIEW.md section 5; kittrial-5bb.263, docs/LANE_BOARD_DESIGN.md section 4).
+// ONE read answers the board: the canonical `work lanes` read, through
 // GET /v1/projects/<pid>/lanes. No age and no flag is computed here -- not the state age,
 // not the last-write age, not waiting_too_long/expect_by_passed/your_move_idle -- because
 // a second implementation of either on this side is exactly what the design forbids. The
@@ -138,13 +139,14 @@ export function lanesPanel(ctx, project) {
         h('span', { class: 'chip warn', 'data-flag': key }, label))) : null);
   }
 
-  function laneBlock(lane) {
+function laneBlock(ctx, project, lane) {
     const held = lane.held || [];
     const raised = LANE_FLAGS.filter(([key]) => lane[key]);
     return h('div', { class: 'lane', 'data-lane': lane.lane, 'data-actor': lane.actor,
       'data-inferred': lane.inferred ? 'true' : null },
       h('div', { class: 'event-head' },
-        h('strong', null, lane.lane), ' ', h('span', { class: 'mono small muted' }, lane.actor),
+        // Display only (kittrial-5bb.416): the server's display_name text, never decided here.
+        h('strong', null, lane.display_name || lane.lane), ' ', h('span', { class: 'mono small muted' }, lane.lane),
         ' ',
         lane.idle ? h('span', { class: 'chip', 'data-idle': 'true', title: 'This lane holds nothing' }, 'Free')
           : h('span', { class: 'chip plain' }, held.length === 1 ? '1 task held' : held.length + ' tasks held'),
@@ -196,12 +198,33 @@ export function lanesPanel(ctx, project) {
         'Reading with ', String(data.idle_minutes), ' idle minutes: ',
         LANE_FLAGS.map(([key, label]) => `${counts[key] || 0} ${label.toLowerCase()}`).join(' · '),
         '. ', scopeSentence(data)),
-      lanes.length ? h('div', { class: 'stack' }, lanes.map(laneBlock))
+      lanes.length ? h('div', { class: 'stack' }, lanes.map((lane) => laneBlock(ctx, project, lane)))
         : empty('No lanes to show', 'No session holds work in this project right now.'),
       pager(data));
   }
   draw();
   return panel;
+}
+
+export async function lanesPage(ctx, { pid }) {
+  // The lanes board on its own page (kittrial-5bb.416 slice 3). The project menu
+  // links here; the board is the same lanesPanel the overview used to embed, now
+  // with a crumb, a heading and the board. The server's own read (not the
+  // transport's answer) scopes the board; session actors of the project
+  // that the name registry cannot name read as anonymized, never as another person.
+  const project = await load(ctx, pid);
+  if (project.usable === false) {
+    return h('div', { class: 'stack' },
+      pageHead({ crumbs: crumbs(ctx, project, 'Lanes'), title: 'Lanes' }),
+      archivedBanner(project),
+      unusableBanner(project));
+  }
+  return h('div', { class: 'stack' },
+    pageHead({ crumbs: crumbs(ctx, project, 'Lanes'), title: 'Lanes',
+      lede: 'Who holds what, what each lane waits on, and what is late.' }),
+    archivedBanner(project),
+    unusableBanner(project),
+    lanesPanel(ctx, project));
 }
 
 export async function overview(ctx, { pid }) {
@@ -276,10 +299,13 @@ export async function overview(ctx, { pid }) {
     tableHost.replaceChildren(
       ...(unreadable ? [unreadable] : []),
       leftOut,
-      rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
+      rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'stack-narrow' },
         h('caption', { class: 'visually-hidden' }, 'Tasks in ' + project.name),
-        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Assignee'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Next action'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Updated'))),
-        h('tbody', null, rows.map((t) => h('tr', { class: 'row-link', 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
+        // Slice 3 (kittrial-5bb.416): the task list leads with STATE and WHO ACTS NEXT,
+        // the assignee display name plus the next_action text, both straight server text.
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'State'),
+          h('th', { scope: 'col' }, 'Who acts next'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Updated'))),
+        h('tbody', null, rows.map((t) => h('tr', { class: 'row-link task-row', 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
           h('td', null,
             // A requirement record is marked plainly and points at the Requirements page,
             // never offered as ordinary work (kittrial-5bb.277).
@@ -288,9 +314,15 @@ export async function overview(ctx, { pid }) {
             h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id),
               t.requirement_record ? [' · ', h('a', { href: ctx.href(`/p/${pid}/requirements`) }, 'Edit on Requirements')] : null)),
           // A row the server could not read is listed, and says so (kittrial-5bb.169).
+          // WHO ACTS NEXT (kittrial-5bb.416): the server's assignee display name plus
+          // its next_action sentence; an unnamed holder reads as the id-free word the
+          // mock-up uses, never a null. Stays textContent: untrusted text stays text.
           h('td', null, t.unreadable ? h('span', { class: 'chip crit' }, 'Cannot be read') : t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
-          h('td', { class: 'hide-narrow' }, t.assignee_name || h('span', { class: 'muted' }, 'Unclaimed')),
-          h('td', { class: 'hide-narrow' }, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—')),
+          h('td', { class: 'who-acts-cell' },
+            h('span', { class: 'who-acts' + (t.assignee ? '' : ' none') },
+              (t.assignee_name || (t.assignee ? t.assignee : 'anyone')),
+              ' · ',
+              (t.next_action ? t.next_action.text : '—'))),
           h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : '')))))) :
         empty(state.q || state.review ? 'No matching tasks' : 'No tasks yet', state.q || state.review ? 'Try a different search or filter.' : canWrite(project) && !project.archived ? 'Define the first task for this project.' : null),
       partial,
@@ -317,15 +349,18 @@ export async function overview(ctx, { pid }) {
     archivedBanner(project),
     unusableBanner(project),
     setupLine,
-    mergeSlotPanel(ctx, project),
-    guidancePanel(ctx, project),
-    // The lane board (kittrial-5bb.263). Every member sees it: the route scopes a viewer
-    // who is not an owner or coordinator to their own agents' lanes, so a lane always sees
-    // its own row here, and the cross-lane view is never inherited from the transport.
-    lanesPanel(ctx, project),
-    strip,
+    // Slice 3 (kittrial-5bb.416): the task list first; the merge slot, guidance and
+    // onboarding fold into one closed Coordinator tools details; the lanes board
+    // moved to its own Lanes page (lanesPage + the menu link) with a link left here.
+    tableHost,
     h('div', { class: 'toolbar' }, search, statusSeg, reviewSel, requirementToggle),
-    tableHost);
+    h('p', { class: 'small muted' }, 'The Lanes board has its own page (',
+      h('a', { href: ctx.href(`/p/${pid}/lanes`) }, 'Lanes'), '), where a coordinator reads it.'),
+    h('details', { class: 'fold' },
+      h('summary', null, 'Coordinator tools ',
+        h('span', { class: 'fold-hint' }, 'merge slot · guidance · onboarding')),
+      h('div', { class: 'fold-body tools' }, mergeSlotPanel(ctx, project), guidancePanel(ctx, project))),
+    strip);
 }
 
 export async function reviews(ctx, { pid }) {
