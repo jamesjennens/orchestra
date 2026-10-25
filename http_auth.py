@@ -54,7 +54,7 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF
                             CAP_ROOMS_POST,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_RECORDS,
                             CAP_REVIEWS, CAP_TASKS,
-                            CAP_COORDINATE, CAP_RELEASE, coordinator_grant, release_grant,
+                            CAP_COORDINATE, CAP_RELEASE, coordinator_grant, release_grant, grant_issuer_holds,
                             GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
@@ -3311,9 +3311,12 @@ class Service:
         for project_id in sorted(self.state.get('memberships', {})):
             if owner_id not in self.state['memberships'].get(project_id, {}):
                 continue
-            if coordinator_grant(self.state, project_id, agent['id']) is None:
+            grant = coordinator_grant(self.state, project_id, agent['id'])
+            if grant is None:
                 continue
-            found.append({'project': project_id, 'effective': self._may_coordinate(project_id, agent)})
+            found.append({'project': project_id,
+                          'effective': self._may_coordinate(project_id, agent)
+                          and grant_issuer_holds(self.state, project_id, grant)})
         return found
 
     def project_agent_view(self, agent, project_id=None):
@@ -3354,11 +3357,14 @@ class Service:
         grant = coordinator_grant(self.state, project_id, agent['id'])
         if grant is None:
             return None
-        effective = self._may_coordinate(project_id, agent)
+        account = self._may_coordinate(project_id, agent)
+        issuer = grant_issuer_holds(self.state, project_id, grant)
+        effective = account and issuer
         owner = self.state['users'].get(agent.get('owner')) or {}
         # Why a grant on record has no effect now; null when it has. One word, for the page.
         why = None if effective else ('agent-disabled' if not agent.get('enabled') else
-                                      'account-disabled' if owner.get('disabled') else 'account-role')
+                                      'account-disabled' if owner.get('disabled') else
+                                      'account-role' if not account else 'issuer-role')
         return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
                 'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
 
@@ -3372,10 +3378,13 @@ class Service:
         grant = release_grant(self.state, project_id, agent['id'])
         if grant is None:
             return None
-        effective = self._may_release(project_id, agent)
+        account = self._may_release(project_id, agent)
+        issuer = grant_issuer_holds(self.state, project_id, grant)
+        effective = account and issuer
         owner = self.state['users'].get(agent.get('owner')) or {}
         why = None if effective else ('agent-disabled' if not agent.get('enabled') else
-                                      'account-disabled' if owner.get('disabled') else 'account-role')
+                                      'account-disabled' if owner.get('disabled') else
+                                      'account-role' if not account else 'issuer-role')
         return {'granted_by': grant['granted_by'], 'granted_by_display_name': self._owner_name(grant['granted_by']),
                 'granted_at': grant.get('granted_at'), 'effective': effective, 'no_effect_because': why}
 
@@ -3418,7 +3427,8 @@ class Service:
                 if project_id not in (agent.get('projects') or []):
                     continue
                 grant = coordinator_grant(self.state, project_id, agent['id'])
-                if grant is None or not self._may_coordinate(project_id, agent):
+                if grant is None or not self._may_coordinate(project_id, agent) \
+                        or not grant_issuer_holds(self.state, project_id, grant):
                     continue
                 agents.append({'name': agent['name'], 'owner_display_name': self._owner_name(agent['owner']),
                                'granted_by_display_name': self._owner_name(grant['granted_by']),
@@ -3465,7 +3475,9 @@ class Service:
                                 'The record of coordinator grants in the service state is damaged (it is not an object), '
                                 'so no grant was written. An operator must repair the state file')
             grants = self.state.setdefault('coordinator_grants', {}).setdefault(project_id, {})
-            if coordinator_grant(self.state, project_id, agent_id) is None:
+            held = coordinator_grant(self.state, project_id, agent_id)
+            # A record whose issuer no longer qualifies is dormant: a current issuer gives it afresh.
+            if held is None or not grant_issuer_holds(self.state, project_id, held):
                 grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
                 self.store.save()
             return self.project_agent_view(agent, project_id)
@@ -3552,7 +3564,8 @@ class Service:
                                 'The record of release grants in the service state is damaged (it is not an object), '
                                 'so no grant was written. An operator must repair the state file')
             grants = self.state.setdefault('release_grants', {}).setdefault(project_id, {})
-            if release_grant(self.state, project_id, agent_id) is None:
+            held = release_grant(self.state, project_id, agent_id)
+            if held is None or not grant_issuer_holds(self.state, project_id, held):
                 grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
                 self.store.save()
             return self.project_agent_view(agent, project_id)

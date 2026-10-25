@@ -617,10 +617,12 @@ def coordinator_grant_capabilities(state, credential, project_id, held):
     the project, or a superuser). It is the one place where "a credential never approves"
     is lifted. Read from the present state on every decision, by the web service and again
     by the endpoint before it writes: removing the grant, lowering the account's role or
-    taking the agent out of the project ends it at the next request.
+    taking the agent out of the project ends it at the next request. So does the ISSUER
+    losing the right to issue it (:func:`grant_issuer_holds`, kittrial-5bb.410).
     """
     agent_id = credential.get('agent_id')
-    if not agent_id or coordinator_grant(state, project_id, agent_id) is None:
+    grant = coordinator_grant(state, project_id, agent_id) if agent_id else None
+    if grant is None or not grant_issuer_holds(state, project_id, grant):
         return frozenset()
     return frozenset(cap for cap in GRANT_CAPABILITIES if cap in held)
 
@@ -641,6 +643,57 @@ def release_grant(state, project_id, agent_id):
     return grant
 
 
+def grant_issuer_holds(state, project_id, grant):
+    """Whether the person who wrote ``grant`` may still write it in this project (kittrial-5bb.410).
+
+    A grant is rooted in a person and checked at use: it counts only while its issuer
+    (``granted_by``) is an enabled account that is a superuser or holds ``project.admin``
+    here (an owner), the people who may write a coordinator or release grant at all. An
+    issuer that is missing, disabled, demoted or removed ends it at the next request, and
+    re-promoting the issuer restores it: the record is never rewritten. Anything this
+    function cannot read fails closed.
+    """
+    issuer_id = grant.get('granted_by') if isinstance(grant, dict) else None
+    users = state.get('users') if isinstance(state, dict) else None
+    issuer = users.get(issuer_id) if isinstance(users, dict) and isinstance(issuer_id, str) else None
+    if not isinstance(issuer, dict) or issuer.get('disabled'):
+        return False
+    if issuer.get('superuser'):
+        return True
+    members = state.get('memberships')
+    members = members.get(project_id) if isinstance(members, dict) else None
+    role = members.get(issuer_id) if isinstance(members, dict) else None
+    return CAP_PROJECT_ADMIN in ROLE_CAPABILITIES.get(role, frozenset())
+
+
+def dormant_grants(state):
+    """Every coordinator or release grant on record whose issuer no longer may give it (kittrial-5bb.410).
+
+    Read-only, for the pre-deploy check (``http_service.py --list-dormant-grants``): such a
+    grant has no effect from this release on, and an owner may give it afresh. Each item is
+    ``{kind, project, agent, granted_by, why}``; ``why`` is ``issuer-missing``,
+    ``issuer-disabled`` or ``issuer-not-owner`` (neither a superuser nor an owner here).
+    """
+    users = state.get('users') if isinstance(state.get('users'), dict) else {}
+    found = []
+    for kind, key in (('coordinator', 'coordinator_grants'), ('release', 'release_grants')):
+        projects = state.get(key)
+        for project_id in sorted(projects) if isinstance(projects, dict) else []:
+            held = projects[project_id]
+            for agent_id in sorted(held) if isinstance(held, dict) else []:
+                grant = held[agent_id]
+                if not isinstance(grant, dict) or not isinstance(grant.get('granted_by'), str):
+                    continue
+                if grant_issuer_holds(state, project_id, grant):
+                    continue
+                issuer = users.get(grant['granted_by'])
+                why = ('issuer-missing' if not isinstance(issuer, dict) else
+                       'issuer-disabled' if issuer.get('disabled') else 'issuer-not-owner')
+                found.append({'kind': kind, 'project': project_id, 'agent': agent_id,
+                              'granted_by': grant['granted_by'], 'why': why})
+    return found
+
+
 def release_grant_capabilities(state, credential, project_id, held):
     """What a project's release grant adds to this agent credential here, or nothing.
 
@@ -652,7 +705,8 @@ def release_grant_capabilities(state, credential, project_id, held):
     kittrial-5bb.378). Read live by the web service and again by the endpoint.
     """
     agent_id = credential.get('agent_id')
-    if not agent_id or release_grant(state, project_id, agent_id) is None:
+    grant = release_grant(state, project_id, agent_id) if agent_id else None
+    if grant is None or not grant_issuer_holds(state, project_id, grant):
         return frozenset()
     if CAP_PROJECT_ADMIN not in held:
         return frozenset()
@@ -692,6 +746,9 @@ def requirement_editor(state, project_id, request):
       a member of this project is refused just as that superuser's own session is
       (kittrial-5bb.318 item 3; slice 10 said "refuse both").
 
+    The grant counts only while its issuer still may give it (:func:`grant_issuer_holds`,
+    kittrial-5bb.410).
+
     Anything else is denied with :data:`REQUIREMENT_EDITOR_REFUSED`. No operator
     allowlist is read here: the host commands keep their own.
 
@@ -724,7 +781,7 @@ def requirement_editor(state, project_id, request):
         raise deny(401, 'unauthenticated', CREDENTIAL_EXPIRED_MESSAGE)
     agent_id = credential.get('agent_id')
     grant = coordinator_grant(state, project_id, agent_id) if agent_id else None
-    if agent_id is None or grant is None:
+    if agent_id is None or grant is None or not grant_issuer_holds(state, project_id, grant):
         raise deny(403, 'forbidden', REQUIREMENT_EDITOR_REFUSED)
     agent = state.get('agents', {}).get(agent_id)
     if not isinstance(agent, dict) or not agent.get('enabled'):

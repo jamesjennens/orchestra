@@ -12961,7 +12961,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         This service calls the endpoint WITHOUT a bound key, so the endpoint's own
         ``lanes_scope_for`` answers ``'all'`` for it. That is a property of the transport,
         not an authority the page may inherit, so the route decides for its own viewer. The
-        viewer reads every lane (``'all'``) in exactly three cases and everybody else is
+        viewer reads every lane (``'all'``) in exactly the cases below and everybody else is
         scoped to their own agents' lanes (``'own'``, the contributor route's rule):
 
         * ``operator``: an installation operator, the kit's ONE operator definition
@@ -12970,11 +12970,14 @@ class ApiHandler(BaseHTTPRequestHandler):
           host through the read-only ``host-coordination`` action). A host that cannot
           answer is not an operator list, so this case then narrows, never widens;
         * ``project-role``: a person whose role IN THIS PROJECT holds ``CAP_COORDINATE``
-          (coordinator or owner; a superuser is an owner everywhere, as on every other
-          coordinator route);
+          (coordinator or owner);
+        * ``superuser``: a superuser with no coordinating membership here, who is an owner
+          everywhere as on every other coordinator route (kittrial-5bb.410: said as what it
+          is, not as an ``owner`` role they do not hold);
         * ``coordinator-grant``: an agent with an EFFECTIVE coordinator grant in this
-          project (the grant exists, the agent is enabled and in the project, its account is
-          still a coordinator or owner here, and the credential is live).
+          project (the grant exists and its issuer still may give it, the agent is enabled and in
+          the project, its account is still a coordinator or owner here, and the credential
+          is live).
 
         The second and third are ONE live :meth:`Service.check_authority` decision per read,
         the same one every coordinator route takes; nothing is cached, so a demotion, a
@@ -13007,6 +13010,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             return 'own', 'own', None
         if principal.via == 'credential':
             return 'all', 'coordinator-grant', None
+        if principal.superuser:
+            # decide() reads a superuser as owner everywhere, so ``role`` is not their role
+            # here: report the membership if it coordinates, else say it is the superuser.
+            with self.service.store.lock:
+                held = (self.service.state.get('memberships', {}).get(project_id) or {}).get(principal.user_id)
+            if held not in ('owner', 'coordinator'):
+                return 'all', 'superuser', None
+            role = held
         return 'all', 'project-role', role if role in ('owner', 'coordinator') else None
 
     @route('GET', r'/v1/me/work')
@@ -13900,6 +13911,10 @@ def main(argv=None):
     parser.add_argument('--list-unconfirmed-projects', action='store_true',
                         help='print the project records the endpoint backend will not serve (an upgrade '
                              'check: a superuser confirms or archives each one), then exit; read-only')
+    parser.add_argument('--list-dormant-grants', action='store_true',
+                        help='print the coordinator and release grants whose issuer may no longer give '
+                             'them, so they have no effect (an upgrade check, kittrial-5bb.410), then exit; '
+                             'read-only')
     web = parser.add_mutually_exclusive_group()
     web.add_argument('--web-root', default=str(DEFAULT_WEB_ROOT),
                      help='directory holding the browser interface served at / '
@@ -13931,6 +13946,17 @@ def main(argv=None):
             parser.error('--state is not a service state document')
         import types
         items = unusable_projects(types.SimpleNamespace(state=document))
+        print(json.dumps({'items': items, 'total': len(items)}, indent=2))
+        return 0
+    if args.list_dormant_grants:
+        # Read-only, like --list-unconfirmed-projects: the document is read as JSON, no store is opened.
+        if not Path(args.state).is_file():
+            parser.error('--list-dormant-grants needs an existing --state file')
+        document = record_json.loads(Path(args.state).read_text(encoding='utf-8'))
+        if not isinstance(document, dict) or not isinstance(document.get('users'), dict):
+            parser.error('--state is not a service state document')
+        from http_authority import dormant_grants
+        items = dormant_grants(document)
         print(json.dumps({'items': items, 'total': len(items)}, indent=2))
         return 0
     if args.bootstrap_user:
