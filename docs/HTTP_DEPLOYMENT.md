@@ -2244,9 +2244,36 @@ audit keeps events").
 `GET /v1/projects/{id}/agents` and `.../agents/{agent}` carry `coordinator` for each
 agent: `null`, or `{granted_by, granted_by_display_name, granted_at, effective,
 no_effect_because}`; the last is `null` while the grant has effect, else `agent-disabled`,
-`account-disabled` or `account-role`, and the page says which. A record of grants in the
-state file that is not an object answers `503` to a new grant, with a sentence and no
-write. The
+`account-disabled`, `account-role` or `issuer-role` (the person who gave it is no longer an
+owner here), and the page says which. `release` carries the same field and words. A record
+of grants in the state file that is not an object answers `503` to a new grant, with a
+sentence and no write.
+
+**A grant is rooted in the person who gave it (kittrial-5bb.410).** A coordinator grant or a
+release grant counts only while its issuer (`granted_by`) is an enabled account that is a
+superuser or an owner of the project. It is read live on every decision by the web service
+and again by the endpoint, on every coordinator route and for the requirement editor.
+Demoting, removing or disabling the issuer ends the grant at the next request; making the
+issuer an owner again restores the same record, because nothing is rewritten; an owner who
+gives the grant again replaces a record whose issuer no longer qualifies. A record with no
+readable issuer is no grant.
+
+On upgrade, grants given by someone who is no longer an owner stop having effect. Before
+deploying, list them. The check is read-only (the state file is read as JSON and no store
+is opened, so it is safe beside a running service):
+`python3 http_service.py --state <STATE> --list-dormant-grants`
+Each item names the kind (`coordinator` or `release`), the project, the agent, the issuer
+and why (`issuer-missing`, `issuer-disabled` or `issuer-not-owner`). For each one an owner
+either gives the grant again or leaves it ended. An empty list means nothing changes.
+
+A superuser's agent and the requirement editor differ on purpose. `decide()` reads a
+superuser as an owner of every project, so a superuser's agent holding a grant reads every
+lane, and coordinates, in a project the superuser is not a member of. The requirement
+editor needs the project membership (kittrial-5bb.318 item 3) and refuses that agent
+exactly as it refuses the superuser's own session. `tests/test_grant_issuer.py` pins both
+answers; neither rule was widened.
+
+The
 project's settings page lists "Agents in this project" for an owner with a "Make
 coordinator" or "Remove grant" button on each row, and shows the server's sentence when a
 grant is refused. `GET /v1/agents/me/next` tells a granted agent of a contribution by

@@ -92,6 +92,14 @@ class PersonRoleTests(ScopeCase):
         # decide() treats a superuser as an owner of every project: one rule, so also here.
         self.assertAll(self.lanes(self.admin), 'project-role', 'owner')
 
+    def test_a_superuser_who_only_contributes_is_told_superuser_not_owner(self):
+        self.service.state['users'][self.ids['carl']]['superuser'] = True
+        self.assertAll(self.lanes(self.tokens['carl']), 'superuser')
+
+    def test_a_superuser_who_really_owns_the_project_is_told_the_role(self):
+        self.service.state['users'][self.ids['olive']]['superuser'] = True
+        self.assertAll(self.lanes(self.tokens['olive']), 'project-role', 'owner')
+
     def test_a_contributor_sees_only_their_own_lane(self):
         self.assertOwn(self.lanes(self.tokens['carl']), self.ids['carl'])
 
@@ -160,10 +168,10 @@ class PersonRoleTests(ScopeCase):
         self.assertTrue(first.data['next_cursor'])
         self.assertEqual(200, self.member('oscar', 'contributor', token=self.admin).status)
         again = self.lanes(self.tokens['oscar'], query='?limit=1&cursor=' + first.data['next_cursor'])
-        if again.status == 200:
-            self.assertEqual('own', again.data['scope'])
-            self.assertNotIn(self.ids['carl'], json.dumps(again.data['items']))
-            self.assertNotIn(self.ids['dave'], json.dumps(again.data['items']))
+        self.assertEqual(200, again.status, again.data)
+        self.assertEqual('own', again.data['scope'])
+        self.assertNotIn(self.ids['carl'], json.dumps(again.data['items']))
+        self.assertNotIn(self.ids['dave'], json.dumps(again.data['items']))
 
 
 class OperatorTests(ScopeCase):
