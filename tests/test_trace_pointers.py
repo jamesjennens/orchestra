@@ -154,6 +154,28 @@ class HostRequirementTests(unittest.TestCase):
         answer = self.resolve('req:R01')
         self.assertEqual((answer['state'], answer['flags']), ('unavailable', []))
 
+    def test_conflicting_type_labels_are_unavailable(self):
+        self.native.row('req-1')['labels'].append('brd-section')
+        answer = self.resolve('req:R01')
+        self.assertEqual((answer['state'], answer['flags']), ('unavailable', []))
+
+    def test_a_row_whose_revisions_disagree_on_the_key_is_unavailable(self):
+        row = self.native.row('req-1')
+        record = dict(self.native.record('req-1', 1), revision=2, key='R02', description='Other key')
+        record['sha256'] = content_hash({k: v for k, v in record.items() if k != 'sha256'})
+        row['comments'].append(dict(id='98', author='alice', created_at='2026-09-25T00:00:00Z',
+                                    text=REVISION_PREFIX + canonical_bytes(record).decode('utf-8')))
+        for token in ('req:R01', 'req:R02'):
+            answer = self.resolve(token)
+            self.assertEqual((answer['state'], answer['flags']), ('unavailable', []), token)
+
+    def test_a_revision_copied_onto_an_unlabelled_row_never_resolves(self):
+        copy_row = copy.deepcopy(self.native.row('req-1'))
+        copy_row['id'] = 'plain-1'
+        copy_row['labels'] = []
+        answer = self.resolve('req:R01', [copy_row])
+        self.assertEqual((answer['state'], answer['flags']), ('unavailable', ['unknown-key']))
+
     def test_two_rows_claiming_one_key_are_unknown(self):
         twin = copy.deepcopy(self.native.row('req-1'))
         twin['id'] = 'req-twin'
@@ -281,6 +303,25 @@ class OwnerRequirementTests(unittest.TestCase):
         self.assertEqual((answer['state'], answer['flags']), ('unavailable', []))
 
 
+    def test_terminal_state_bound_to_another_governance_is_unavailable(self):
+        item = self.accepted('srv.backup')
+        self.terminal(item, 'withdraw', 'withdraw-1')
+        row = self.native.row(item['id'])
+        comment = next(c for c in row['comments'] if c['text'].startswith(owner.STATE_PREFIX))
+        reason = next(c for c in row['comments'] if c['text'].startswith(owner.REASON_PREFIX))
+        state = owner.parse(comment['text'], state=True)
+        changed = dict(state, governance=dict(state['governance'], sha256='0' * 64))
+        changed['sha256'] = content_hash(changed)
+        comment['text'] = owner.body(changed, state=True)
+        why = owner.parse_reason(reason['text'])
+        why = dict(why, state_sha256=changed['sha256'])
+        why['sha256'] = content_hash(why)
+        reason['text'] = owner.reason_body(why)
+        self.assertIsNotNone(owner.state_ledger(row)[0])
+        answer = self.resolve('req:' + self.key(item), governance=self.snapshot())
+        self.assertEqual((answer['state'], answer['flags']), ('unavailable', []))
+
+
 class DesignPointerTests(ReferenceCase):
     """`design:SCOPE#section` against the reference entry `design.<scope>` (§2.2)."""
 
@@ -327,6 +368,17 @@ class DesignPointerTests(ReferenceCase):
             answer = self.resolve(token)
             self.assertEqual(answer['section']['state'], 'unchecked')
             self.assertNotIn('unknown-section', answer['flags'])
+
+    def test_unreadable_or_ambiguous_design_entries_are_unknown_scope(self):
+        import reference_records
+        good = dict(key='design.x', state='accepted', record=dict(name='X', acceptance_state='accepted'))
+        for views in ([dict(good, state=s) for s in ('malformed',)], [dict(good, state='conflicted')],
+                      [dict(good, state='incomplete')], [dict(good, state='unsupported')], [good, good]):
+            with patch.object(reference_records, 'catalog', return_value=(views, [])):
+                answer = self.resolve('design:x', [])
+            self.assertEqual((answer['state'], answer['flags']), ('unavailable', ['unknown-scope']), views)
+        with patch.object(reference_records, 'catalog', return_value=([good], [])):
+            self.assertEqual(self.resolve('design:x', [])['state'], 'live')
 
     def test_hidden_equals_absent_and_another_project_never_resolves(self):
         self.propose(key='design.server-redesign')
