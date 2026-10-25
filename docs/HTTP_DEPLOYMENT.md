@@ -4096,9 +4096,12 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
   tracking every author who contributed a draft revision since the prior acceptance.
 - **A granted personal agent accepts or verifies a record only within a person owner's
   delegation** (kittrial-5bb.407, below). Without one it is refused (`403`), whoever wrote the
-  draft. Within one, the own-party rule does not apply to it: the owner's delegation is the act
-  that permits an agent to accept what its own party (its account, that account's other agents
-  and worker credentials) proposed. The party of a draft's author still includes the owning
+  draft. Within one, the agent-only own-party rule is lifted: the owner's delegation is the act
+  that permits an agent to accept what its owner or that owner's other agents and worker
+  credentials proposed. A delegation never lets an agent accept or verify a draft it wrote
+  itself, and never overrides the project's independence setting: with
+  `approval_by_another_party` or `independent_approval` on, a delegated agent faces exactly the
+  rule below that a person faces. The party of a draft's author still includes the owning
   account (`usr_...`), every personal agent of that account (`agent_...`), and every actor name
   held by a worker credential of that account in the project, and is still recorded.
 - **For a signed-in human coordinator or owner:**
@@ -4116,8 +4119,9 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
 A person owner delegates **record acceptance** to the project's coordinator agents, for a stated
 scope and with a stated line of what must be escalated. An agent holding the project's
 `coordinator` grant then accepts (and verifies capabilities) only within a delegation in force,
-and names it as `decision_id` on the request. That same delegation is what lifts the own-party
-rule for it. Nothing changes for a person coordinator or owner, for contributors, viewers,
+and names it as `decision_id` on the request. That same delegation lifts the agent-only
+own-party rule for it (its owner's and sibling agents' drafts), but never a draft the agent wrote
+itself and never the project's independence setting. Nothing changes for a person coordinator or owner, for contributors, viewers,
 ungranted agents or worker credentials, or for the host route.
 
 - **The record.** A delegation is a `Kind: delegation-v1` comment on a decision issue (type
@@ -4143,7 +4147,8 @@ ungranted agents or worker credentials, or for the host route.
   grant on the same decision is refused; record a new decision instead.
 - **Checked live at every acceptance**, under the write's lock, never cached: the decision exists
   in this project and is a decision issue; its one honoured grant was recorded by someone who is
-  **still** a person owner of the project (or still a listed operator); it grants record
+  **still** a person owner of the project (or whose exact actor name is still on the operator
+  allowlist; another actor of the same principal does not count); it grants record
   acceptance to this agent or to `coordinator-grant`; the agent's coordinator grant is still in
   effect; its scope covers the record kind; it has not been revoked. Each refusal names its
   reason. An agent's request that names no `decision_id` is refused before the endpoint is asked.

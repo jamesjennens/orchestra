@@ -857,6 +857,37 @@ class _RecordsScenarioMixin:
         self.assertEqual((r.data['proposer'], r.data['acceptor']), (agent2['actor'], agent1['actor']))
         self.assertEqual(r.data['acceptance']['decision_id'], decision)
 
+        # 3b. Review r1 (b1): the delegation lifts ONLY the agent-only own-party refusal.
+        #     An agent never accepts its own draft, delegation or not.
+        own_draft = propose('deleg.own', agent1['token'], 'own')
+        r = accept('deleg.own', own_draft, agent1['token'], 'own-draft', decision=decision)
+        self.assertEqual(r.status, 403, r.data)
+        self.assertIn('wrote itself', r.data['error']['message'])
+        #     Its owner's draft is the own-party case the delegation lifts (independence off).
+        owners_draft = propose('deleg.owners', coord1['token'], 'owners draft')
+        r = accept('deleg.owners', owners_draft, agent1['token'], 'owners-draft', decision=decision)
+        self.assertEqual(r.status, 200, r.data)
+        #     With the project's independence setting on, the agent faces the person rule: its
+        #     owner's draft is refused despite the delegation, another party's agent may accept.
+        with harness.service.store.lock:
+            harness.service.approval_by_another_party = True
+            harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = True
+            harness.service.store.save()
+        try:
+            independent_draft = propose('deleg.independent', coord1['token'], 'independent')
+            r = accept('deleg.independent', independent_draft, agent1['token'], 'independence-own-party',
+                       decision=decision)
+            self.assertEqual(r.status, 403, r.data)
+            self.assertIn('approval by another party', r.data['error']['message'])
+            r = accept('deleg.independent', independent_draft, agent3['token'], 'independence-other-party',
+                       decision=decision)
+            self.assertEqual(r.status, 200, r.data)
+        finally:
+            with harness.service.store.lock:
+                harness.service.approval_by_another_party = False
+                harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = False
+                harness.service.store.save()
+
         # 4. A decision id that is not a current delegation, each with its reason.
         task = harness.request('POST', f'/v1/projects/{pid}/tasks', {'title': 'An ordinary task'}, token=coord1['token'])
         self.assertEqual(task.status, 201, task.data)
@@ -914,7 +945,7 @@ class _RecordsScenarioMixin:
         self.assertEqual(cap_ok.status, 200, cap_ok.data)
         with self.assertRaises(http_service.HttpError) as direct_verify:
             harness.backend.invoke(
-                'capabilities.verify', harness.service.authenticate(agent2['token']), pid,
+                'capabilities.verify', harness.service.authenticate(agent3['token']), pid,
                 {'command': 'web-verify',
                  'body': {'key': 'deleg.cap', 'revision': cap_ok.data['revision'],
                           'record_sha256': cap_ok.data['sha256'], 'commit': 'e' * 40, 'passed': True,
@@ -922,14 +953,15 @@ class _RecordsScenarioMixin:
                           'operation_id': 'op-direct-verify-no-decision'}},
                 'direct-verify-no-decision', capability=http_service.CAP_COORDINATE)
         self.assertEqual(direct_verify.exception.status, 403)
-        # Within the delegation the same agent verifies its own party's capability.
+        # Within the delegation the same agent (another party; never the draft's own author)
+        # verifies the capability.
         verified = harness.request(
             'POST', f'/v1/projects/{pid}/capabilities/deleg.cap/verify',
             {'revision': cap_ok.data['revision'], 'record_sha256': cap_ok.data['sha256'], 'commit': 'e' * 40,
              'passed': True, 'results': _valid_cap_results(), 'decision_id': current},
-            token=agent2['token'], key='deleg-cap-verify-ok')
+            token=agent3['token'], key='deleg-cap-verify-ok')
         self.assertEqual(verified.status, 200, verified.data)
-        self.assertEqual(verified.data['verifier'], agent2['actor'])
+        self.assertEqual(verified.data['verifier'], agent3['actor'])
         with self.assertRaises(http_service.HttpError) as direct_grant:
             harness.backend.invoke(
                 'delegations.grant', harness.service.authenticate(people['nonmember_su']['token']), pid,
@@ -1257,17 +1289,20 @@ class _RecordsScenarioMixin:
         for label, tok in (('coord1', coord1), ('coord2', coord2),
                            ('agent1', agent1['token']), ('agent3', agent3['token'])):
             g_view = harness.request('GET', f'/v1/projects/{self.pid}/capabilities/another.party-cap', token=tok)
+            # kittrial-5bb.407 review r1 (b1): an agent with a valid delegation faces the
+            # project's independence rule exactly as a person does.
+            self.assertTrue(g_view.data['self_accept_blocked'], label)
+            body = {'expected_revision': 2, 'record_sha256': c_other_r2.data['sha256'],
+                    'evidence': f'{label} self-accept blocked on multi-author draft chain.'}
             if label.startswith('agent'):
-                self.assertFalse(g_view.data['self_accept_blocked'], label)
                 self.assertTrue(g_view.data['needs_delegation'], label)
-            else:
-                self.assertTrue(g_view.data['self_accept_blocked'], label)
+                body['decision_id'] = delegation
             c_acc_fail = harness.request(
                 'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/accept',
-                {'expected_revision': 2, 'record_sha256': c_other_r2.data['sha256'],
-                 'evidence': f'{label} self-accept blocked on multi-author draft chain.'},
-                token=tok, key=f'{label}-cap-accept-chain-fail')
+                body, token=tok, key=f'{label}-cap-accept-chain-fail')
             self.assertEqual(c_acc_fail.status, 403, c_acc_fail.data)
+            if label.startswith('agent'):
+                self.assertIn('approval by another party', c_acc_fail.data['error']['message'], label)
 
         # Project owner (independent 3rd party) accepts rev 2 -> writes accepted rev 3!
         c_owner_acc_ok = harness.request(
@@ -1282,17 +1317,18 @@ class _RecordsScenarioMixin:
         for label, tok in (('coord1', coord1), ('coord2', coord2),
                            ('agent2', agent2['token']), ('agent3', agent3['token'])):
             g_view = harness.request('GET', f'/v1/projects/{self.pid}/capabilities/another.party-cap', token=tok)
+            self.assertTrue(g_view.data['self_verify_blocked'], label)
+            body = {'revision': 3, 'record_sha256': c_owner_acc_ok.data['sha256'], 'commit': 'd' * 40,
+                    'passed': True, 'results': _valid_cap_results()}
             if label.startswith('agent'):
-                self.assertFalse(g_view.data['self_verify_blocked'], label)
                 self.assertTrue(g_view.data['needs_delegation'], label)
-            else:
-                self.assertTrue(g_view.data['self_verify_blocked'], label)
+                body['decision_id'] = delegation
             c_ver_fail = harness.request(
                 'POST', f'/v1/projects/{self.pid}/capabilities/another.party-cap/verify',
-                {'revision': 3, 'record_sha256': c_owner_acc_ok.data['sha256'], 'commit': 'd' * 40,
-                 'passed': True, 'results': _valid_cap_results()},
-                token=tok, key=f'{label}-cap-verify-chain-fail')
+                body, token=tok, key=f'{label}-cap-verify-chain-fail')
             self.assertEqual(c_ver_fail.status, 403, c_ver_fail.data)
+            if label.startswith('agent'):
+                self.assertIn('approval by another party', c_ver_fail.data['error']['message'], label)
 
         # Project owner CAN verify revision 3!
         c_ver_ok = harness.request(

@@ -1667,16 +1667,25 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             def party_check(proposer,decision_id=None):
                 state=read_state(authority_config.store)
                 by_agent=authority.get('via')=='credential'
-                if by_agent:
-                    delegation_check(state,decision_id)
-                    if not isinstance(proposer,str) or not proposer:
-                        raise RecordsRefusal(403,'This draft has no recorded proposer, so no delegation can admit it.')
-                    return
                 settings_seen=state.get('settings_seen') if isinstance(state.get('settings_seen'),dict) else {}
                 approval_by_another=bool(settings_seen.get('approval_by_another_party')
                                          or authority.get('approval_by_another_party')
                                          or rules.get('independent_approval'))
-                if not by_agent and not approval_by_another:
+                if by_agent:
+                    # kittrial-5bb.407 (review r1, item b1): a delegation lifts ONLY the agent-only
+                    # own-party refusal - an agent accepting a draft its owner or a sibling agent
+                    # proposed. It never lets an agent accept a draft it wrote itself, and where
+                    # the project requires approval by another party (approval_by_another_party or
+                    # independent_approval) the agent faces exactly the rule a person faces below.
+                    delegation_check(state,decision_id)
+                    if not isinstance(proposer,str) or not proposer:
+                        raise RecordsRefusal(403,'This draft has no recorded proposer, so no delegation can admit it.')
+                    if proposer.split('/',1)[0]==(actor.split('/',1)[0] if isinstance(actor,str) else actor):
+                        raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
+                                                 'whatever its delegation says.')
+                    if not approval_by_another:
+                        return
+                elif not approval_by_another:
                     return
                 caller_parties=set(actor_parties(state,actor,name))
                 if user_id:caller_parties.add(user_id)
@@ -1692,7 +1701,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                         or bool(caller_parties & proposer_parties) or same_session_owner):
                     if by_agent:
                         raise RecordsRefusal(403,'An agent holding a coordinator grant may not accept or verify a record '
-                                                 'whose draft was proposed by its own party.')
+                                                 'whose draft was proposed by its own party while this project requires '
+                                                 'approval by another party; a delegation does not lift that.')
                     raise RecordsRefusal(403,'A coordinator may not accept or verify a record whose draft was proposed '
                                              'by the same party while approval_by_another_party is enabled.')
             return identity_check,(party_check if coordinator else None),user_id

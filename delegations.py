@@ -4,8 +4,9 @@ kittrial-5bb.407 (slice 1 of docs/design/TRACEABILITY_DESIGN.md, as changed by t
 direction of 2026-10-25). A person owner may delegate a decision right to a coordinator, a
 person or an agent, for a stated scope and with a stated escalation line. The first right is
 ``record-acceptance``: an agent holding the project's coordinator grant may accept or verify
-a reference or capability record only within a current delegation, and that delegation is
-also what lifts the own-party refusal (the endpoint's ``party_check``).
+a reference or capability record only within a current delegation, and that delegation lifts
+the agent-only own-party refusal (the endpoint's ``party_check``): never a draft the agent wrote
+itself, and never the project's independence setting (review r1, item b1).
 
 Why a reserved record and not lines in an issue body: a native issue's author (``created_by``)
 is only the ``--actor`` label of whoever wrote it, and over the host route that label is not
@@ -91,6 +92,11 @@ def validate_request(payload, recorded=False):
         if payload['action'] != 'grant':
             raise ValueError('A narrowing or a revocation names the decision it changes')
         _line(payload['title'], TITLE_MAX, 'title')
+        if payload['title'].startswith(('-', '@')):
+            # The native create takes it as a value; a leading dash could still read as a flag
+            # to a reader of the command, and a leading @ as the attachment transport (the same
+            # rule as the task-create route; review r1, N3).
+            raise ValueError('title cannot start with "-" or "@"')
     else:
         if not isinstance(payload['decision'], str) or not ISSUE_ID.fullmatch(payload['decision']):
             raise ValueError('decision must be the id of a native decision issue in this project')
@@ -288,11 +294,13 @@ def recorder_live(record, state, project, operators=None, owners=None):
             return False
         memberships = state.get('memberships') if isinstance(state.get('memberships'), dict) else {}
         return (memberships.get(project) or {}).get(record['account']) == 'owner'
-    from review_workflow import listed_operator_actor
+    # The exact actor that wrote it must still be on the installation's operator allowlist
+    # (review r1, N2): another actor of the same principal does not keep it in force.
     try:
-        return bool(listed_operator_actor(record['recorded_by'], operators, owners))
-    except (ValueError, OSError):
+        listed = set(operators) if operators is not None and not isinstance(operators, str) else set()
+    except TypeError:
         return False
+    return record['recorded_by'] in listed
 
 
 def _scope_in_force(records):
@@ -430,7 +438,7 @@ def apply(payload, *, project, journal, run, recorded_by, via, account, at):
     validate_request(payload)
     if payload['decision'] is None:
         # A new decision issue for this grant: the native create is the first write of the act.
-        created = record_json.loads(run(['create', payload['title'], '--type', 'decision',
+        created = record_json.loads(run(['create', '--title', payload['title'], '--type', 'decision',
                                          '--description', payload['reason'], '--json']))
         if not isinstance(created, dict) or not isinstance(created.get('id'), str) \
                 or not ISSUE_ID.fullmatch(created['id']):

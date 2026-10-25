@@ -10184,11 +10184,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             and (self.service.approval_by_another_party or by_agent)
             and not self._independent_all(caller_names, verify_authors, pid, by_agent))
         if by_agent and can_coordinate:
-            # kittrial-5bb.407: an agent's acceptance and verification are decided by its
-            # delegation, which also lifts the own-party rule; the view says so instead.
-            item['self_accept_blocked'] = False
-            item['self_verify_blocked'] = False
+            # kittrial-5bb.407: an agent accepts and verifies only within a delegation, which
+            # lifts the agent-only own-party rule but never a draft the agent wrote itself, and
+            # never the project's independence setting (review r1, b1): with that on, the
+            # person rule computed above stands.
             item['needs_delegation'] = True
+            if not self.service.approval_by_another_party:
+                head = (ctx.principal.actor or '').split('/', 1)[0]
+                own = lambda authors: any(isinstance(a, str) and a.split('/', 1)[0] == head for a in authors)
+                item['self_accept_blocked'] = bool(draft_authors) and own(draft_authors)
+                item['self_verify_blocked'] = bool(verify_authors) and own(verify_authors)
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)

@@ -65,7 +65,9 @@ class Native:
         if argv[0] == 'create':
             self.seq += 1
             new = 'pp-new%d' % self.seq
-            self.rows[new] = {'id': new, 'title': argv[1], 'issue_type': argv[argv.index('--type') + 1],
+            self.created_argv = list(argv)
+            self.rows[new] = {'id': new, 'title': argv[argv.index('--title') + 1],
+                              'issue_type': argv[argv.index('--type') + 1],
                               'labels': [], 'comments': []}
             return json.dumps(self.rows[new])
         if argv[0] == 'update' and '--add-label' in argv:
@@ -211,6 +213,39 @@ class DelegationTests(unittest.TestCase):
         self.refused('was revoked', live=live)
 
     # -- what grants nothing -----------------------------------------------------------------
+    def test_an_operator_delegation_needs_that_exact_actor_listed(self):
+        # Review r1, N2: another actor of the same principal does not keep it in force.
+        self.write(request(), writer='ops', via='operator')
+        self.assertEqual(self.check(operators=('ops',))['recorded_by'], 'ops')
+        self.refused('no longer a listed operator', operators=('ops-session-2',))
+        self.refused('no longer a listed operator', operators=())
+
+    def test_a_title_cannot_read_as_a_flag(self):
+        # Review r1, N3: refused before any native call, and passed as --title's value.
+        for title in ('--type=task', '-x', '@attachment:0'):
+            with self.subTest(title=title), self.assertRaises(ValueError):
+                d.validate_request(request(decision=None, title=title))
+        self.write(request(decision=None, title='Delegate record acceptance'))
+        argv = self.native.created_argv
+        self.assertEqual(argv[argv.index('--title') + 1], 'Delegate record acceptance')
+
+    def test_a_narrowing_never_widens_the_scope(self):
+        # Review r1, N5: even a planted, journaled "narrowing" to a wider scope changes nothing,
+        # and a narrowing that is not a strict subset of the scope in force is ignored.
+        self.write(request(scope=('references',)))
+        wider = d.make_record(request(action='narrow', scope=('capabilities', 'references'), operation_id='op-w'),
+                              project=PROJECT, recorded_by=OWNER, via='session', account=OWNER, at=AT[2])
+        self.native.comment('pp-dec', d.body(wider), author=OWNER)
+        d.publish(self.project, wider)
+        self.assertEqual(self.check()['scope'], ['references'])
+        self.refused('covers references, not capabilities', kind='capabilities')
+        grant = {'scope': ['references']}
+        self.assertEqual(d._scope_in_force([grant, {'action': 'narrow', 'scope': ['capabilities', 'references']}]),
+                         ['references'])
+        self.assertEqual(d._scope_in_force([{'scope': ['capabilities', 'references']},
+                                            {'action': 'narrow', 'scope': ['capabilities']},
+                                            {'action': 'narrow', 'scope': ['references']}]), ['capabilities'])
+
     def test_a_record_without_its_journal_entry_grants_nothing(self):
         result = self.write(request())
         (self.project / d.JOURNAL_DIR / (result['record']['sha256'] + '.json')).unlink()
@@ -323,6 +358,46 @@ class RouteTests(unittest.TestCase):
                                                      Path(root), 'lane:a')
                 with self.assertRaises(ValueError):
                     endpoint.coordinator_refusal({'actor': 'ops', 'args': ['delegation-record']}, Path(root), None)
+
+    def test_the_coordinator_command_writes_through_the_endpoint(self):
+        # Review r1, N1: the bound-key `coordinator delegation-record` write itself, end to end
+        # through endpoint.execute (gate, lock, guarded write, the shared library call), over an
+        # emulated native tracker.
+        import subprocess
+        from unittest import mock
+        endpoint = self.endpoint
+        with tempfile.TemporaryDirectory() as base:
+            root = Path(base) / 'rt'
+            project = root / 'projects' / 'alpha'
+            (project / '.beads').mkdir(parents=True)
+            (project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+            (root / 'deployment.private.json').write_text(
+                json.dumps({'operators': ['ops'], 'verifiers': [], 'password': 'x'}), encoding='utf-8')
+            (project / '.sessions.json').write_text(
+                json.dumps({'schema_version': 1, 'records': {}, 'owners': {'ops': 'person:ops', 'lane-agent': 'lane:a'}}),
+                encoding='utf-8')
+            native = Native()
+
+            def run(argv, env=None, **kwargs):
+                at = argv.index('--actor')
+                native.writer = argv[at + 1]
+                return subprocess.CompletedProcess(argv, 0, native.run(argv[at + 2:]), '')
+            payload = request(decision='pp-dec', operation_id='op-coordinator-1')
+            built = {'project': 'alpha', 'actor': 'ops', 'action': 'coordinator', 'operation_id': 'op-coordinator-1',
+                     'args': ['delegation-record', '@attachment:0'],
+                     'attachments': {'0': {'flag': '--file', 'text': json.dumps(payload)}}}
+            with mock.patch.object(endpoint.native, 'run', side_effect=run):
+                answer = endpoint.execute(root, built, key_principal='person:ops', key_projects=['alpha'])
+            self.assertEqual(answer['returncode'], 0, answer)
+            record = json.loads(answer['stdout'])['record']
+            self.assertEqual((record['via'], record['recorded_by'], record['project']), ('operator', 'ops', 'alpha'))
+            self.assertTrue(d.journaled(project, record))
+            self.assertEqual(native.rows['pp-dec']['comments'][0]['author'], 'ops')
+            # A lane behind its own bound key is refused before anything is written.
+            lane = dict(built, actor='lane-agent', operation_id='op-coordinator-2')
+            with self.assertRaises(ValueError):
+                endpoint.execute(root, lane, key_principal='lane:a', key_projects=['alpha'])
+            self.assertEqual(len(native.rows['pp-dec']['comments']), 1)
 
     def test_the_block_table_binds_each_operation(self):
         import http_authority

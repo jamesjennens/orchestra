@@ -400,6 +400,13 @@ python3 admin.py --root /path/to/root delegation-check --project PROJECT --state
 
 `uncovered` lists the agents still without one.
 
+**A narrowing or revocation that did not finish is not in force.** Each grant, narrowing and
+revocation is a comment plus its host journal entry, and only the pair counts. If the journal
+write fails after the comment (a full disk, a permission change), the answer is an error or an
+unknown outcome, and that narrowing or revocation does **not** apply: the delegation stays as it
+was. Retry it (the same request on the web, or `delegation-record` again) until it succeeds, and
+confirm with `delegation-check` or the Settings page that the delegation reads as intended.
+
 **Backups.** `admin.py backup` collects `<project>/.delegations/` with the coordination
 sidecar and `restore-new` validates and restores it. A delegation is honoured only with
 its journal entry, so a restore without it voids every delegation (the comments stay,

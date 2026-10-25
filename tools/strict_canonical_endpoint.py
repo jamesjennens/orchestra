@@ -594,13 +594,17 @@ def dispatch(canonical, request, tmp, run=None):
                             if not isinstance(proposer, str) or not proposer:
                                 raise RecordsRefusal(403, 'This draft has no recorded proposer, so no delegation '
                                                           'can admit it.')
-                            return
+                            if proposer.split('/', 1)[0] == actor.split('/', 1)[0]:
+                                raise RecordsRefusal(403, 'An agent never accepts or verifies a draft it wrote '
+                                                          'itself, whatever its delegation says.')
                         settings_seen = live.get('settings_seen') if isinstance(live.get('settings_seen'), dict) else {}
                         approval_by_another = bool(
                             settings_seen.get('approval_by_another_party')
                             or authority.get('approval_by_another_party')
                             or rules.get('independent_approval'))
-                        if not by_agent and not approval_by_another:
+                        if not approval_by_another:
+                            # A delegation lifted the agent-only own-party refusal (review r1, b1);
+                            # a project's independence setting is never lifted by one.
                             return
                         caller_parties = set(http_authority.actor_parties(live, actor, project))
                         if user_id:
@@ -613,7 +617,8 @@ def dispatch(canonical, request, tmp, run=None):
                                 raise RecordsRefusal(
                                     403,
                                     'An agent holding a coordinator grant may not accept or verify a record '
-                                    'whose draft was proposed by its own party.')
+                                    'whose draft was proposed by its own party while this project requires '
+                                    'approval by another party; a delegation does not lift that.')
                             raise RecordsRefusal(
                                 403,
                                 'A coordinator may not accept or verify a record whose draft was proposed '

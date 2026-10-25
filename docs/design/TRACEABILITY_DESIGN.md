@@ -185,7 +185,8 @@ It requires:
   **Gap G1, as it really is:** where one person owns every agent, coordinators and lanes alike, a
   coordinator agent can accept nothing the lanes propose. Slice 1 (kittrial-5bb.407), following
   the owner's direction of 2026-10-25, makes **every** agent acceptance need a person owner's
-  delegation, and that delegation is what lifts the own-party refusal. A delegation is a
+  delegation, and that delegation lifts the agent-only own-party refusal (never a draft the
+  agent wrote itself, and never the project's independence setting). A delegation is a
   server-written `Kind: delegation-v1` record with a host journal entry, recorded only by a person
   owner's own web session or a listed operator, and checked live at every acceptance; an issue
   body's lines are not used, because a native issue's author is only an `--actor` label
@@ -535,8 +536,11 @@ of a kittrial-sized export, as the context index did for find.
      step found the agent is not refused by membership but by the own-party rule (§2.3). The
      fix changes authorization, so it had the kit's **full adversarial review** and a mutant set.
    - **The rule:** every agent acceptance or verification of a reference or capability record
-     needs a **delegation in force**, named as `decision_id`, and that delegation also lifts the
-     own-party refusal. A delegation counts only when, checked live at the write:
+     needs a **delegation in force**, named as `decision_id`. That delegation lifts only the
+     agent-only own-party refusal (its owner's and sibling agents' drafts): an agent never
+     accepts a draft it wrote itself, and with `approval_by_another_party` or
+     `independent_approval` on it faces the person rule. A delegation counts only when, checked
+     live at the write:
      1. it is a server-written `Kind: delegation-v1` record with its host journal entry, on a
         decision issue in the same project, recorded by a person owner's own web session or a
         listed operator (never by an agent; an issue body's lines are not read, since a native
