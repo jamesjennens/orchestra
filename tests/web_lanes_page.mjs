@@ -36,7 +36,7 @@ const GUESSED_LANE = {
   lane: 'lane-c', actor: 'session-c', display_name: 'Cat', idle: false, held: [{
     task: 'alpha-3', title: 'An older checkpoint', review_state: 'none', work_state: 'none',
     whose_move: 'you', next_actor: 'assignee', next: 'Read the review', state: 'waiting-on-coordinator',
-    waiting_on: 'coordinator', waiting_on_name: 'coordinator', expect_by: null, declared: false, inferred: true,
+    waiting_on: 'coordinator', waiting_on_name: 'Carl', expect_by: null, declared: false, inferred: true,
     checkpoint: 'cp-3', state_since: '2026-10-16T00:00:00Z', state_age_seconds: 3600,
     no_checkpoint: false, held_age_seconds: 40000, holder_last_write_seconds: 2000,
     flags: ['your_move_idle'], pending_review_items: 0,

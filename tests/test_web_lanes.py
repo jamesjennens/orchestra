@@ -448,6 +448,10 @@ class LanesPageTests(unittest.TestCase):
                        'deliver a revision', 'read the review'):
             self.assertIn(wanted, lowered, wanted)
         self.assertTrue(any(cell == 'coordinator' for cell in seen['whoActs']), seen['whoActs'])
+        # r4 notes item: the 'Name (id)' branch (project.js laneWaitingWords):
+        # an entry whose waiting_on_name differs from waiting_on reads as
+        # 'Name (id)' in the row text.
+        self.assertIn('Carl (coordinator)', text)
         # The ages are the server's, said as spans (2 days for the state, 2 h for the write).
         self.assertIn('In that state 2 days'.lower(), lowered)
         self.assertIn('Last wrote', text)

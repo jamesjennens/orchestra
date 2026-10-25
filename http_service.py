@@ -12918,14 +12918,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Why this viewer got this scope, so the page states the rule in force from the answer.
         body['scope_basis'] = basis
         body['scope_role'] = role
-        # Display names for the lane rows, from the same resolver the task list uses
-        # for assignee names (kittrial-5bb.416): display only, never used for any
-        # authority or matching decision. A lane with no resolvable name keeps its
-        # label; the page shows this server text and never builds a name itself.
-        # Display names for the lane rows, from the same resolver the task list uses
-        # for assignee names (kittrial-5bb.416): display only, never used for any
-        # authority or matching decision. A lane with no resolvable name keeps its
-        # label; the page shows this server text and never builds a name itself.
+        # Display names for the lane rows, from the same resolver the task list
+        # uses for assignee names (kittrial-5bb.416): display only, never used
+        # for any authority or matching decision. A lane with no resolvable
+        # name keeps its label; the page shows this server text and never
+        # builds a name itself.
         # The waited-on side of a HELD row gets the same treatment (r3): a role
         # ('coordinator', 'reviewer', 'user') stays the server's role word, an actor
         # id resolves to its display name, 'you' stays 'you', and unknown stays
