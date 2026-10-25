@@ -367,8 +367,10 @@ class NoUnguardedParseTests(unittest.TestCase):
             # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
             # lifecycle.py also guards exported correction payloads in its offline reader.
             'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 3, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
-            # The simple owner adapter guards bd's decision-create receipt too.
-            'requirement_http.py': 2,
+            # The simple owner adapter guards bd's decision-create receipt too. The third
+            # (kittrial-5bb.388) guards the service-only room-decision payload the route
+            # transports (room, item number, title, text and pointer) before it is used.
+            'requirement_http.py': 3,
             # Assignment adds closed roster/request payloads at the endpoint and
             # guards both its native task reply and its reserved notice body.
             'task_assignment.py': 2,

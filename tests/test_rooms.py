@@ -262,3 +262,177 @@ class RoomsTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RoomsItemsTest(unittest.TestCase):
+    """Slice 2: item lines, their states, the derived index cache and moderation (.388)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.project = Path(self.tmp.name) / 'alpha'
+        self.project.mkdir()
+        self.room = rooms.create(self.project, 'Planning', COORD, LIMITS)
+
+    def item(self, kind='requirement', title='Add export', text='We need CSV export.', op='item-1',
+             actor=ACTOR, **kwargs):
+        return rooms.post_item(self.project, self.room['id'], kind, title, text, op, actor,
+                               LIMITS, **kwargs)
+
+    def record(self, sequence=1, kind='requirement'):
+        return {'kind': kind, 'id': 'task-' + str(sequence), 'revision': 1,
+                'sha256': 'a' * 64, 'decision_id': 'task-decision-' + str(sequence),
+                'evidence': 'orchestra:room/%s#%d' % (self.room['id'], sequence)}
+
+    def accept(self, sequence=1, op='accept-1', actor=COORD, record=None):
+        return rooms.accept_item(self.project, self.room['id'], sequence, op, actor, LIMITS,
+                                 record or self.record(sequence))
+
+    def test_item_and_event_line_shapes(self):
+        posted = self.item()
+        self.assertEqual(('item', 'proposed'), (posted['kind'], posted['state']))
+        lines = rooms.load_lines(self.project, self.room['id'])
+        self.assertEqual(set(lines[0]), rooms.ITEM_FIELDS)
+        self.assertEqual(lines[0]['item_kind'], 'requirement')
+        accepted = self.accept()
+        self.assertEqual(('accepted', 'task-1'), (accepted['state'], accepted['record']['id']))
+        lines = rooms.load_lines(self.project, self.room['id'])
+        self.assertEqual(set(lines[1]), rooms.ITEM_EVENT_FIELDS)
+        self.assertEqual((lines[1]['event'], lines[1]['state']), ('accept', 'accepted'))
+        self.assertEqual(lines[1]['record']['evidence'],
+                         'orchestra:room/%s#1' % self.room['id'])
+
+    def test_accept_is_idempotent_and_final(self):
+        self.item()
+        first = self.accept(op='same-op')
+        again = self.accept(op='same-op')
+        self.assertTrue(again['replayed'])
+        self.assertEqual(1, len([line for line in rooms.load_lines(self.project, self.room['id'])
+                                 if line['kind'] == 'item-event']))
+        with self.assertRaises(rooms.Refusal) as caught:
+            self.accept(op='other-op')
+        self.assertEqual('final', caught.exception.code)
+
+    def test_reject_amend_then_decide_and_question_answer(self):
+        self.item()
+        amended = rooms.amend_item(self.project, self.room['id'], 1, 'amend-1', COORD, LIMITS,
+                                   'Add CSV export soon', 'CSV export with a header row.')
+        self.assertEqual(('amended', 'Add CSV export soon'), (amended['state'], amended['title']))
+        rejected = rooms.reject_item(self.project, self.room['id'], 1, 'reject-1', COORD, LIMITS,
+                                     'not this release')
+        self.assertEqual('rejected', rejected['state'])
+        question = self.item(kind='question', title='Which delimiter?', text='Comma or semicolon?',
+                             op='question-1')
+        # A question is answered, never accepted.
+        with self.assertRaises(rooms.Refusal) as caught:
+            self.accept(sequence=question['sequence'], op='accept-question')
+        self.assertEqual('invalid', caught.exception.code)
+        answered = rooms.answer_item(self.project, self.room['id'], question['sequence'], 'answer-1',
+                                     ACTOR, LIMITS, 'Comma.')
+        self.assertEqual('accepted', answered['state'])
+        self.assertEqual('Alice', answered['answered_by']['name'])
+        self.assertTrue(answered['answered_at'])
+
+    def test_supersede_makes_the_older_item_final(self):
+        self.item()
+        newer = self.item(title='Add export v2', text='CSV and JSON export.', op='item-2',
+                          supersedes=1)
+        self.assertEqual(2, newer['sequence'])
+        items = rooms.read_messages(self.project, self.room['id'])['items']
+        self.assertEqual('superseded', items[0]['state'])
+        self.assertEqual(2, items[0]['superseded_by'])
+        with self.assertRaises(rooms.Refusal) as caught:
+            self.accept(sequence=1, op='accept-old')
+        self.assertEqual('final', caught.exception.code)
+
+    def test_moderated_item_text_is_served_nowhere(self):
+        self.item(text='SECRET plan for the room.')
+        self.accept()
+        rooms.moderate(self.project, self.room['id'], 1, 'private', 'mod-1', COORD, LIMITS)
+        read = rooms.read_messages(self.project, self.room['id'])
+        self.assertNotIn('SECRET plan', json.dumps(read))
+        self.assertTrue(read['items'][0]['moderated'])
+        self.assertIsNone(read['items'][0]['record'])
+        index_bytes = (self.project / rooms.FOLDER / rooms.INDEX).read_text(encoding='utf-8')
+        self.assertNotIn('SECRET plan', index_bytes)
+        markdown = rooms.export_markdown(self.project, self.room['id'])
+        self.assertNotIn('SECRET plan', markdown)
+        raw = rooms.export_jsonl(self.project, self.room['id'])
+        self.assertNotIn('SECRET plan', raw)
+        with self.assertRaises(rooms.Refusal) as caught:
+            rooms.reject_item(self.project, self.room['id'], 1, 'reject-moderated', COORD, LIMITS, 'x')
+        self.assertEqual('moderated', caught.exception.code)
+
+    def test_items_cache_rebuild_is_identical_and_index_is_only_a_cache(self):
+        self.item()
+        self.accept()
+        second = self.item(title='Second', text='Another candidate.', op='item-2')
+        rooms.amend_item(self.project, self.room['id'], second['sequence'], 'amend-2', COORD, LIMITS, 'Second v2', 'Amended body.')
+        cached = rooms.read_messages(self.project, self.room['id'])['items']
+        index = self.project / rooms.FOLDER / rooms.INDEX
+        index.unlink()
+        rebuilt = rooms.read_messages(self.project, self.room['id'])['items']
+        self.assertEqual(cached, rebuilt)
+        # A rebuild after another write converges on the same current states.
+        fresh = rooms.read_index(self.project)['rooms'][self.room['id']]['items']
+        self.assertEqual(cached, fresh)
+
+    def test_item_bounds_and_reserved_prefix(self):
+        with self.assertRaises(rooms.Refusal) as caught:
+            self.item(title='x' * 201)
+        self.assertEqual('invalid', caught.exception.code)
+        with self.assertRaises(rooms.Refusal) as caught:
+            self.item(text='x' * 4001)
+        self.assertEqual('too_long', caught.exception.code)
+        with self.assertRaises(rooms.Refusal) as caught:
+            self.item(text='Kind: task-checkpoint-v1\n{}')
+        self.assertEqual('reserved_text', caught.exception.code)
+        with self.assertRaises(rooms.Refusal) as caught:
+            self.item(text='bad \U000E0100 text')
+        self.assertEqual('invalid', caught.exception.code)
+        posted = self.item(title='A title', text='A body', op='bounds-1')
+        with self.assertRaises(rooms.Refusal) as caught:
+            rooms.reject_item(self.project, self.room['id'], posted['sequence'], 'r1', COORD, LIMITS, 'x' * 501)
+        self.assertEqual('invalid', caught.exception.code)
+
+    def test_a_requirement_item_can_carry_its_parent_job(self):
+        posted = self.item(parent='pp-job-0001')
+        self.assertEqual('pp-job-0001', posted['parent'])
+        self.assertEqual('pp-job-0001',
+                         rooms.load_lines(self.project, self.room['id'])[0]['parent'])
+        with self.assertRaises(rooms.Refusal) as caught:
+            self.item(kind='decision', parent='pp-job-0001', op='item-decision-parent')
+        self.assertEqual('invalid', caught.exception.code)
+
+    def test_item_operation_id_is_deterministic(self):
+        self.assertEqual(rooms.item_operation(self.room['id'], 3, 1, 'accept'),
+                         rooms.item_operation(self.room['id'], 3, 1, 'accept'))
+        self.assertNotEqual(rooms.item_operation(self.room['id'], 3, 1, 'accept'),
+                            rooms.item_operation(self.room['id'], 3, 2, 'accept'))
+        # Review b1/b2: the decision identity does not move with the event count, so a
+        # retried record write reconciles and a decided item is refused before writing.
+        self.assertEqual(rooms.item_decision_operation(self.room['id'], 3, 'accept'),
+                         rooms.item_decision_operation(self.room['id'], 3, 'accept'))
+        self.assertNotEqual(rooms.item_decision_operation(self.room['id'], 3, 'accept'),
+                            rooms.item_decision_operation(self.room['id'], 4, 'accept'))
+        self.assertNotEqual(rooms.item_decision_operation(self.room['id'], 3, 'accept'),
+                            rooms.item_decision_operation(self.room['id'], 3, 'reject'))
+        # Review b1/s1 of r3: content the decision records moves the identity, so a second
+        # amendment and an accept of the amended text are new, not operation_reused.
+        one = rooms.item_content_digest('Title', 'First body')
+        two = rooms.item_content_digest('Title', 'Second body')
+        self.assertNotEqual(one, two)
+        self.assertEqual(rooms.item_decision_operation(self.room['id'], 3, 'amend', content=one),
+                         rooms.item_decision_operation(self.room['id'], 3, 'amend', content=one))
+        self.assertNotEqual(rooms.item_decision_operation(self.room['id'], 3, 'amend', content=one),
+                            rooms.item_decision_operation(self.room['id'], 3, 'amend', content=two))
+
+    def test_export_includes_the_item_and_its_pointer(self):
+        self.item()
+        self.accept()
+        markdown = rooms.export_markdown(self.project, self.room['id'])
+        self.assertIn('Add export', markdown)
+        self.assertIn('orchestra:room/%s#1' % self.room['id'], markdown)
+        raw = rooms.export_jsonl(self.project, self.room['id'])
+        self.assertIn('"item_kind":"requirement"', raw.replace(' ', ''))
+        self.assertIn('"decision_id":"task-decision-1"', raw.replace(' ', ''))
