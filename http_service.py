@@ -59,6 +59,7 @@ from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
+                       CAP_NUDGE_CARRY, NUDGES_SCOPE,
                        CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_COORDINATE,
                        CAP_RELEASE,
@@ -4801,13 +4802,19 @@ ROUTES = []
 #: The routes that read their own body as a stream (kittrial-5bb.370): the task-file upload
 #: only. Every other route's body is read whole, bounded by ``max_body``, before it runs.
 STREAMED = set()
+#: The only routes a nudge carrier's credential (scope ``nudges``) may call (kittrial-5bb.415). The
+#: dispatcher refuses it everywhere else before the route runs, so a route written later is closed to it
+#: by default; ``tests/test_lane_nudge_carrier.py`` sweeps every route to prove it.
+CARRIER_ROUTES = set()
 
 
-def route(method, pattern, *, anonymous=False, csrf=True, stream=False):
+def route(method, pattern, *, anonymous=False, csrf=True, stream=False, carrier=False):
     compiled = re.compile('^' + pattern + '$')
 
     def register(handler):
         ROUTES.append((method, compiled, handler.__name__, anonymous, csrf))
+        if carrier:
+            CARRIER_ROUTES.add(handler.__name__)
         if stream:
             STREAMED.add(handler.__name__)
         return handler
@@ -5101,6 +5108,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                                self._idempotency_key(), self._body_hash, auth_source,
                                self._is_secure(), route_target)
             begun = (name, ctx.idempotency_key is not None)
+            if self._principal is not None and self._principal.via == 'credential' \
+                    and NUDGES_SCOPE in self._principal.scopes and name not in CARRIER_ROUTES:
+                raise forbidden('Credential scope does not permit this operation')
             status, response = getattr(self, name)(ctx)
             if status is not None:              # None: the route sent its own answer (a file download)
                 self._send_json(status, response)
@@ -12232,8 +12242,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         """Ask that a fixed message reach one stalled lane (kittrial-5bb.413; design kittrial-5bb.409).
 
         ``coordinate`` in THIS project, live: an owner, a coordinator, a superuser, or an agent whose
-        coordinator grant is effective. Nothing is delivered here (no carrier yet): the request is
-        kept, audited and shown on the board, and ends ``not-deliverable``.
+        coordinator grant is effective. Nothing is delivered here: the request is kept, audited and
+        shown on the board, and a carrier (kittrial-5bb.415) claims it and answers once.
         """
         self._project(ctx, CAP_COORDINATE)
         payload = dict(ctx.payload or {})
@@ -12281,6 +12291,48 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise HttpError(400, 'invalid_request', 'limit must be a whole number, 1 to 100')
         return 200, dict(self.service.nudge_list(ctx.params['pid'], lane, int(raw) if raw else 20),
                          generated_at=now_iso(self.service._now()))
+
+    # -- the nudge carrier (kittrial-5bb.415; docs/NUDGE_CARRIER.md) --------------------------------
+    CARRIER_FIELDS = ('kind', 'lanes')
+    OUTCOME_FIELDS = ('outcome', 'detail')
+
+    def _carrier_gate(self, ctx):
+        self.service.check_authority(ctx.principal, None, CAP_NUDGE_CARRY)
+
+    @route('GET', r'/v1/me/nudges', carrier=True)
+    def me_nudges(self, ctx):
+        """The carrier's own open requests: id, project, lane, message key and message set (no reason, no note)."""
+        self._carrier_gate(ctx)
+        return 200, dict(self.service.carrier_nudges(ctx.principal), generated_at=now_iso(self.service._now()))
+
+    @route('POST', r'/v1/me/carrier', carrier=True)
+    def me_carrier(self, ctx):
+        """The carrier's heartbeat: its kind and the lanes it reaches. Not audited (one every 30 seconds)."""
+        self._carrier_gate(ctx)
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, self.CARRIER_FIELDS, 'A carrier heartbeat')
+        answer = self.service.carrier_heartbeat(ctx.principal, payload)
+        self.service.store.save_soon()
+        return 200, answer
+
+    @route('POST', r'/v1/me/nudges/(?P<nid>nudge-[0-9a-f]{24})/claim', carrier=True)
+    def me_nudge_claim(self, ctx):
+        """Lease one open request for two minutes (a lapsed lease makes it pending again)."""
+        def claim():
+            refuse_unknown_fields(dict(ctx.payload or {}), (), 'A nudge claim')
+            return self.service.carrier_claim(ctx.principal, ctx.params['nid'], request_id=ctx.request_id)
+        return self._mutate(ctx, 'lanes.nudge.claim', None, claim, capability=CAP_NUDGE_CARRY, audit_success=False)
+
+    @route('POST', r'/v1/me/nudges/(?P<nid>nudge-[0-9a-f]{24})/outcome', carrier=True)
+    def me_nudge_outcome(self, ctx):
+        """Answer a claimed request once with a closed outcome; refused after expiry and to a non-claimer."""
+        payload = dict(ctx.payload or {})
+
+        def answer():
+            refuse_unknown_fields(payload, self.OUTCOME_FIELDS, 'A nudge outcome')
+            return self.service.carrier_outcome(ctx.principal, ctx.params['nid'], payload, request_id=ctx.request_id)
+        return self._mutate(ctx, 'lanes.nudge.outcome', None, answer, capability=CAP_NUDGE_CARRY,
+                            audit_success=False)
 
     def _lanes_idle_minutes(self, raw):
         """The page's threshold argument, or the refusal that names the read's own range.

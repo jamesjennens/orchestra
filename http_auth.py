@@ -49,13 +49,14 @@ import unicodedata
 from pathlib import Path
 
 import claim_limit
+import nudge_messages
 import nudges
 from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS, CAP_APPROVE,
-                            CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROJECT_ADMIN, CAP_PROPOSALS,
+                            CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_NUDGE_CARRY, CAP_PROJECT_ADMIN, CAP_PROPOSALS, NUDGES_SCOPE,
                             CAP_ROOMS_POST,
                             CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ, CAP_RECORDS,
                             CAP_REVIEWS, CAP_TASKS,
-                            CAP_COORDINATE, CAP_RELEASE, coordinator_grant, release_grant, grant_issuer_holds,
+                            CAP_COORDINATE, CAP_RELEASE, still_coordinates, coordinator_grant, release_grant, grant_issuer_holds,
                             GRANT_LIMIT_DEFAULT, GRANT_LIMIT_MAX, created_projects, project_grant,
                             CREDENTIAL_FORBIDDEN_CAPABILITIES, CREDENTIAL_SCOPES, RANK,
                             ROLE_CAPABILITIES, ROLES, SCOPE_CAPABILITIES, SCHEMA_VERSION,
@@ -2330,6 +2331,8 @@ class Service:
             self._refresh_authority(principal)
             project, role = self.require_project(principal, project_id, 'owner')
             requested = self._scope_names(scopes) or ('tasks', 'checkpoints', 'reviews', 'feedback')
+            if NUDGES_SCOPE in requested:
+                raise invalid('The nudges scope belongs to an agent credential, not a project worker credential')
             label = self._credential_label(label)
             if actor is not None and (not isinstance(actor, str) or not re.fullmatch(
                     r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,63}', actor)):
@@ -3036,6 +3039,8 @@ class Service:
                 raise invalid('Unknown credential scope %r' % (scope,))
             if scope not in names:
                 names.append(scope)
+        if NUDGES_SCOPE in names and names != [NUDGES_SCOPE]:
+            raise invalid('The nudges scope is the nudge carrier\'s alone and is never combined with another scope')
         return tuple(names)
 
     def agent_scopes(self, agent):
@@ -3570,7 +3575,7 @@ class Service:
             if lane == principal.actor or (mine & theirs) - {None}:
                 raise forbidden(nudges.OWN_PARTY)
         records = self._nudge_records(project_id)
-        nudges.settle(records, now, now_iso)
+        nudges.settle(records, now, now_iso, self._carried)
         existing = nudges.pending_for(records, lane, fields['message'], now)
         if existing is not None:
             return self._nudge_answer(existing, True, now)
@@ -3587,14 +3592,14 @@ class Service:
                                    snapshot, now, now_iso)
         records = self._nudge_records(project_id, create=True)
         records.append(record)
-        nudges.settle(records, now, now_iso)
+        nudges.settle(records, now, now_iso, self._carried)
         # The audit keeps the closed words and the note, cut where every audit reason is (200).
         self.audit(request_id, principal, 'lanes.nudge.request', 'committed', project_id=project_id,
                    actor=lane, reason=' '.join(part for part in (fields['message'], fields['reason'], fields['note']) if part))
         return self._nudge_answer(record, False, now)
 
     def _nudge_answer(self, record, coalesced, now):
-        answer = {'nudge': nudges.view(nudges.effective(record, now, now_iso), self.state['users'],
+        answer = {'nudge': nudges.view(nudges.effective(record, now, now_iso, self._carried), self.state['users'],
                                        self.state['agents']), 'coalesced': coalesced}
         return answer, dict(answer)
 
@@ -3605,7 +3610,7 @@ class Service:
             records = [record for record in self._nudge_records(project_id) if isinstance(record, dict)]
             if lane is not None:
                 records = [record for record in records if record.get('lane') == lane]
-            shown = [nudges.view(nudges.effective(record, now, now_iso), self.state['users'], self.state['agents'])
+            shown = [nudges.view(nudges.effective(record, now, now_iso, self._carried), self.state['users'], self.state['agents'])
                      for record in reversed(records[-limit:])]
         return {'items': shown, 'total': len(records), 'truncated': len(records) > limit}
 
@@ -3625,8 +3630,161 @@ class Service:
             for record in reversed(records):
                 if isinstance(record, dict) and record.get('lane') in wanted and record['lane'] not in found:
                     found[record['lane']] = nudges.row_view(nudges.view(
-                        nudges.effective(record, now, now_iso), self.state['users'], self.state['agents']))
+                        nudges.effective(record, now, now_iso, self._carried), self.state['users'], self.state['agents']))
         return found
+
+    # -- the nudge carrier (kittrial-5bb.415; docs/NUDGE_CARRIER.md) -----------------------------
+    CARRIERS_DAMAGED = 'The record of nudge carriers in the service state is damaged (it is not an object).'
+    NUDGE_CLOSED = 'This nudge request is closed.'
+    NUDGE_GONE = 'Nudge request not found'
+    NOT_YOUR_CLAIM = 'This nudge request is not claimed by this carrier.'
+
+    def _carrier_registry(self, create=False):
+        stored = self.state.get('nudge_carriers')
+        if 'nudge_carriers' in self.state and not isinstance(stored, dict):
+            raise HttpError(503, 'unavailable', self.CARRIERS_DAMAGED)
+        if create:
+            return self.state.setdefault('nudge_carriers', {})
+        return stored or {}
+
+    def _carried(self, record, moment):
+        """Whether a carrier that reaches this record's lane was seen within the window before ``moment``."""
+        try:
+            registry = self._carrier_registry()
+        except HttpError:
+            return False
+        lane, project_id = record.get('lane'), record.get('project')
+        for agent_id, entry in registry.items():
+            agent = self.state['agents'].get(agent_id)
+            if not isinstance(entry, dict) or not isinstance(agent, dict) or not agent.get('enabled'):
+                continue
+            seen = entry.get('seen_ts')
+            if type(seen) not in (int, float) or seen < moment - nudges.CARRIER_WINDOW:
+                continue
+            if lane in (entry.get('lanes') or ()) and project_id in (agent.get('projects') or []) \
+                    and full_actor_parties(self.state, lane, project_id) == {agent.get('owner')}:
+                return True
+        return False
+
+    def _carrier_agent(self, principal):
+        """The enabled agent behind a carrier credential, for the caller who holds ``store.lock``."""
+        self._refresh_authority(principal)
+        agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
+        if list(principal.scopes) != [NUDGES_SCOPE] or not isinstance(agent, dict) or not agent.get('enabled'):
+            raise forbidden('A carrier credential is required')
+        return agent
+
+    def _carrier_sees(self, principal, agent, record):
+        """A record this carrier may handle: in a project the agent is granted, for a lane of its own account only."""
+        project_id = record.get('project')
+        if not isinstance(record, dict) or project_id not in (agent.get('projects') or []) \
+                or project_id not in self.state['projects']:
+            return False
+        lane = record.get('lane')
+        return isinstance(lane, str) and record.get('message') in nudges.MESSAGES \
+            and full_actor_parties(self.state, lane, project_id) == {principal.user_id}
+
+    def _carrier_find(self, principal, agent, nudge_id):
+        """``(records, record)`` of the carrier's own, settled to now, or a plain 404."""
+        now = self._now()
+        for project_id in agent.get('projects') or []:
+            records = self._nudge_records(project_id)
+            for record in records:
+                if isinstance(record, dict) and record.get('id') == nudge_id and self._carrier_sees(principal, agent, record):
+                    nudges.settle(records, now, now_iso, self._carried)
+                    return records, next(r for r in records if isinstance(r, dict) and r.get('id') == nudge_id), now
+        raise not_found(self.NUDGE_GONE)
+
+    def carrier_heartbeat(self, principal, payload):
+        """Record that this carrier is up and which lanes it reaches; bounded, one entry per agent."""
+        with self.store.lock:
+            agent = self._carrier_agent(principal)
+            kind = payload.get('kind')
+            if kind not in nudges.CARRIER_KINDS:
+                raise invalid('kind must be one of %s' % ', '.join(nudges.CARRIER_KINDS))
+            lanes = payload.get('lanes')
+            if not isinstance(lanes, list) or len(lanes) > nudges.CARRIER_LANES_MAX or \
+                    any(not isinstance(lane, str) or not nudges.LANE_LABEL.fullmatch(lane) for lane in lanes):
+                raise invalid('lanes must be a list of at most %d lane actor labels' % nudges.CARRIER_LANES_MAX)
+            now = self._now()
+            registry = self._carrier_registry(create=True)
+            registry[agent['id']] = {'kind': kind, 'lanes': sorted(set(lanes)), 'user_id': principal.user_id,
+                                     'seen_ts': now, 'seen_at': now_iso(now)}
+            for gone in [key for key, entry in registry.items()
+                         if not isinstance(entry, dict) or key not in self.state['agents']
+                         or now - (entry.get('seen_ts') if type(entry.get('seen_ts')) in (int, float) else 0) > 86400]:
+                del registry[gone]
+            while len(registry) > nudges.CARRIERS_MAX:
+                del registry[min(registry, key=lambda key: registry[key].get('seen_ts') or 0)]
+        return {'seen_at': now_iso(now), 'poll_seconds': nudges.CARRIER_POLL, 'message_set': nudge_messages.MESSAGE_SET}
+
+    def carrier_nudges(self, principal):
+        """The carrier's own open requests: ``{id, project, lane, message, message_set}``, nothing else."""
+        with self.store.lock:
+            agent = self._carrier_agent(principal)
+            now = self._now()
+            items = []
+            for project_id in agent.get('projects') or []:
+                for record in self._nudge_records(project_id):
+                    if not isinstance(record, dict) or not self._carrier_sees(principal, agent, record):
+                        continue
+                    shown = nudges.effective(record, now, now_iso, self._carried)
+                    if shown['state'] == nudges.PENDING or (
+                            shown['state'] == nudges.CLAIMED and shown.get('claimed_by') == agent['id']):
+                        items.append({'id': shown['id'], 'project': project_id, 'lane': shown['lane'],
+                                      'message': shown['message'], 'message_set': nudge_messages.MESSAGE_SET})
+        return {'items': items[:100], 'message_set': nudge_messages.MESSAGE_SET}
+
+    def carrier_claim(self, principal, nudge_id, request_id=None):
+        """Lease one open request for two minutes. ``(public, stored)`` for ``_mutate``.
+
+        The requester is judged NOW (:func:`still_coordinates`): one who lost the authority since asking
+        has the request ``cancelled`` and nothing is typed.
+        """
+        agent = self._carrier_agent(principal)
+        records, record, now = self._carrier_find(principal, agent, nudge_id)
+        project_id = record['project']
+        if record['state'] not in nudges.OPEN:
+            raise conflict(self.NUDGE_CLOSED)
+        if record['state'] == nudges.CLAIMED and record.get('claimed_by') != agent['id']:
+            raise conflict('Another carrier holds this nudge request.')
+        if not still_coordinates(self.state, record.get('requested_by'), project_id):
+            record.update(state=nudges.CANCELLED, outcome_detail=nudges.REQUESTER_LOST, outcome_at=now_iso(now),
+                          claimed_by=None, claim_expires_at=None, claim_expires_ts=None)
+            self.audit(request_id, principal, 'lanes.nudge.claim', 'rejected', project_id=project_id,
+                       actor=record['lane'], reason=nudges.REQUESTER_LOST)
+            answer = {'claimed': False, 'state': nudges.CANCELLED, 'nudge': None}
+            return answer, dict(answer)
+        if record['state'] == nudges.PENDING:
+            ends = now + nudges.CLAIM_TTL
+            record.update(state=nudges.CLAIMED, claimed_by=agent['id'], claim_expires_ts=ends,
+                          claim_expires_at=now_iso(ends))
+            self.audit(request_id, principal, 'lanes.nudge.claim', 'committed', project_id=project_id,
+                       actor=record['lane'], reason=record['message'])
+        answer = {'claimed': True, 'state': record['state'], 'claim_expires_at': record['claim_expires_at'],
+                  'nudge': {'id': record['id'], 'project': project_id, 'lane': record['lane'],
+                            'message': record['message'], 'message_set': nudge_messages.MESSAGE_SET}}
+        return answer, dict(answer)
+
+    def carrier_outcome(self, principal, nudge_id, payload, request_id=None):
+        """Answer a claimed request, once, with a closed outcome. ``(public, stored)`` for ``_mutate``."""
+        outcome, detail = payload.get('outcome'), payload.get('detail')
+        if outcome not in nudges.OUTCOMES:
+            raise invalid('outcome must be one of %s' % ', '.join(nudges.OUTCOMES))
+        if (outcome == 'failed') != (detail is not None) or (detail is not None and detail not in nudges.FAILED_DETAILS):
+            raise invalid('detail is given with failed only, and is one of %s' % ', '.join(nudges.FAILED_DETAILS))
+        agent = self._carrier_agent(principal)
+        records, record, now = self._carrier_find(principal, agent, nudge_id)
+        if record['state'] != nudges.CLAIMED:
+            raise conflict(self.NUDGE_CLOSED if record['state'] != nudges.PENDING
+                           else 'Claim this nudge request before answering it.')
+        if record.get('claimed_by') != agent['id']:
+            raise forbidden(self.NOT_YOUR_CLAIM)
+        record.update(state=outcome, outcome_detail=detail, outcome_at=now_iso(now))
+        self.audit(request_id, principal, 'lanes.nudge.outcome', 'committed', project_id=record['project'],
+                   actor=record['lane'], reason=' '.join(part for part in (outcome, detail) if part))
+        answer = {'state': outcome, 'outcome_detail': detail}
+        return answer, dict(answer)
 
     NOT_A_RELEASE_OWNER = ('This agent\'s account is not an owner of this project, so a release grant would '
                            'have no effect. Make the account an owner first (Members), then grant the agent.')
