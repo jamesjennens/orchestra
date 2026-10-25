@@ -1,0 +1,84 @@
+/* Proposed additions to web/css/app.css for kittrial-5bb.400 (design note docs/design/WEB_UX_REVIEW.md).
+   A delta only: every rule uses app.css's own tokens, adds no external asset and needs no script.
+   Slice 1 would move these into app.css; the mock-ups beside this file load app.css, then this. */
+
+/* The heading takes focus on navigation (for screen readers); show the ring only for keyboard users. */
+h1:focus:not(:focus-visible) { outline: none; }
+h1[tabindex="-1"]:focus-visible { outline-offset: 4px; }
+
+/* ---------- page summary: what this is, where it stands, what happens next ---------- */
+.summary {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 16px; align-items: center;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 16px;
+}
+.summary .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.summary .next { grid-column: 1 / -1; font-size: var(--t-md); color: var(--ink); }
+.summary .next b { font-weight: 650; }
+.summary .meta { font-size: var(--t-sm); color: var(--muted); display: flex; gap: 6px 14px; flex-wrap: wrap; }
+
+/* ---------- "who acts": the party a row or a step waits on, always named ---------- */
+.who-acts {
+  display: inline-flex; align-items: center; gap: 6px; font-size: var(--t-xs); font-weight: 600;
+  color: var(--ink-2); border: 1px solid var(--line-strong); border-radius: 10px; padding: 0 8px; line-height: 20px;
+  white-space: nowrap;
+}
+.who-acts::before { content: "→"; color: var(--muted); font-weight: 400; }
+.who-acts.you { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 40%, transparent); color: var(--ink); }
+.who-acts.agent { background: var(--surface-2); }
+
+/* ---------- on-page navigation for long pages ---------- */
+.on-page { display: flex; gap: 4px 14px; flex-wrap: wrap; font-size: var(--t-sm); padding: 0 2px; }
+.on-page a { color: var(--muted); }
+.on-page a[aria-current="true"] { color: var(--ink); font-weight: 600; }
+
+/* ---------- folds: rare tools and long references closed by default (no script) ---------- */
+details.fold { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+details.fold > summary {
+  cursor: pointer; list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 16px; font-weight: 600;
+}
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::after { content: "Show"; font-size: var(--t-xs); font-weight: 600; color: var(--accent); }
+details.fold[open] > summary::after { content: "Hide"; }
+details.fold[open] > summary { border-bottom: 1px solid var(--line); }
+details.fold > .fold-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+details.fold .fold-hint { font-size: var(--t-sm); font-weight: 400; color: var(--muted); }
+
+/* A group of coordinator/owner tools, out of the reader's way. */
+.tools { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+
+/* ---------- machine records shown as events, raw form folded ---------- */
+.record-event { font-size: var(--t-sm); color: var(--ink-2); }
+.record-event details { margin-top: 4px; }
+.record-event summary { cursor: pointer; color: var(--muted); font-size: var(--t-xs); }
+.record-event pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12px;
+  background: var(--surface-2); border-radius: var(--radius); padding: 8px 10px; margin: 6px 0 0; }
+
+/* Long identifiers never widen the page (the 375 px task page scrolled sideways). */
+.panel, .card, .timeline, .kv dd, td { overflow-wrap: anywhere; }
+
+/* ---------- compact empty state: one line, not a block ---------- */
+.empty-line { font-size: var(--t-sm); color: var(--muted); padding: 6px 0; }
+
+/* ---------- counts in section heads ---------- */
+.count { font-size: var(--t-xs); font-weight: 600; color: var(--muted); background: var(--surface-2); border-radius: 10px;
+  padding: 0 7px; line-height: 18px; font-variant-numeric: tabular-nums; }
+
+/* ---------- task list: one row, the facts a reader scans ---------- */
+.task-row .title { font-weight: 600; }
+.task-row .who-acts { margin-top: 4px; }
+
+/* ---------- side column on the task page (wide screens) ---------- */
+.detail .side .panel-body { gap: 10px; }
+
+/* ---------- phone width ---------- */
+@media (max-width: 760px) {
+  .summary { grid-template-columns: minmax(0, 1fr); }
+  .tools { grid-template-columns: minmax(0, 1fr); }
+  table.stack-narrow thead { display: none; }
+  table.stack-narrow tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px;
+    padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  table.stack-narrow td { padding: 0; border: 0; }
+  table.stack-narrow td.secondary { grid-column: 1 / -1; color: var(--muted); font-size: var(--t-xs); }
+  table.stack-narrow td.full-narrow { grid-column: 1 / -1; }
+}

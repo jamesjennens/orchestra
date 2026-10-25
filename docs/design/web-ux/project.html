@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock-up: project page (proposed) · Orchestra design review</title>
+<link rel="stylesheet" href="../../../web/css/app.css">
+<link rel="stylesheet" href="proposed.css">
+</head>
+<body>
+<!-- Static mock-up for docs/design/WEB_UX_REVIEW.md (kittrial-5bb.400). Synthetic data; no script.
+     Proposed order: the task list first; who acts on each row named; coordinator tools folded below. -->
+<div class="shell">
+  <nav class="rail" aria-label="Main">
+    <div class="brand">Orchestra</div>
+    <div class="rail-section">
+      <a class="nav-link" href="#">My work</a>
+      <a class="nav-link" href="#">My agents</a>
+      <a class="nav-link" href="#">All projects</a>
+    </div>
+    <div class="rail-section">
+      <div class="rail-label">Order portal (sample)</div>
+      <a class="nav-link" href="project.html" aria-current="page">Tasks <span class="nav-count">8</span></a>
+      <a class="nav-link" href="#">Reviews</a>
+      <a class="nav-link" href="records.html">Records <span class="nav-count">3</span></a>
+      <a class="nav-link" href="room.html">Rooms</a>
+      <a class="nav-link" href="lanes.html">Lanes</a>
+      <a class="nav-link" href="#">More…</a>
+    </div>
+  </nav>
+  <div class="content">
+  <main class="main" id="main">
+    <div>
+      <div class="crumbs"><a href="#">Projects</a> / <span>Order portal (sample)</span></div>
+      <div class="page-head">
+        <div><h1 tabindex="-1">Order portal (sample)</h1>
+          <p class="lede">An order portal for customers, with search, invoices and reports.</p></div>
+        <div class="actions"><button class="primary">New task</button></div>
+      </div>
+    </div>
+
+    <div class="banner">4 set-up steps are left. <a href="#">See the set-up steps</a></div>
+
+    <section class="summary" aria-label="This project now">
+      <div class="chips">
+        <span class="chip">8 open</span>
+        <span class="chip accent">3 in progress</span>
+        <span class="chip plain">0 awaiting review</span>
+      </div>
+      <div class="meta"><a href="records.html">3 records wait for the coordinator</a></div>
+    </section>
+
+    <section class="panel" aria-labelledby="tasks">
+      <div class="panel-head">
+        <h2 id="tasks">Tasks</h2>
+        <div class="toolbar">
+          <input type="search" aria-label="Search tasks" placeholder="Search title, description or id">
+          <div class="seg" role="group" aria-label="Status"><button aria-pressed="true">Active</button><button>Closed</button><button>All</button></div>
+          <select aria-label="Review state"><option>Any review state</option></select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="stack-narrow">
+          <thead><tr><th>Task</th><th>State</th><th>Who acts next</th><th class="hide-narrow">Updated</th></tr></thead>
+          <tbody>
+            <tr class="task-row"><td><a class="title" href="task.html">Search orders by customer reference</a><div class="sub mono">pp-ghb · P2</div></td>
+              <td><span class="chip accent">In progress</span></td><td><span class="who-acts">casey · deliver</span></td><td class="secondary small muted">2 min ago</td></tr>
+            <tr class="task-row"><td><a class="title" href="#">Export invoices as CSV</a><div class="sub mono">pp-edy · P2</div></td>
+              <td><span class="chip accent">In progress</span></td><td><span class="who-acts">casey · deliver</span></td><td class="secondary small muted">2 min ago</td></tr>
+            <tr class="task-row"><td><a class="title" href="#">Nightly reconciliation report</a><div class="sub mono">pp-40s · P2</div></td>
+              <td><span class="chip accent">In progress</span></td><td><span class="who-acts">drew · deliver</span></td><td class="secondary small muted">2 min ago</td></tr>
+            <tr class="task-row"><td><a class="title" href="#">Rate limit the public order API</a><div class="sub mono">pp-n8n · P2</div></td>
+              <td><span class="chip">Open</span></td><td><span class="who-acts">anyone · claim</span></td><td class="secondary small muted">12 min ago</td></tr>
+            <tr class="task-row"><td><a class="title" href="#">Archive orders older than seven years</a><div class="sub mono">pp-q08 · P2</div></td>
+              <td><span class="chip">Open</span></td><td><span class="who-acts">anyone · claim</span></td><td class="secondary small muted">12 min ago</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="pager"><span>1–5 of 8</span><span class="actions"><button disabled>Previous</button><button>Next</button></span></div>
+    </section>
+
+    <details class="fold">
+      <summary>Coordinator tools <span class="fold-hint">merge slot · guidance · onboarding</span></summary>
+      <div class="fold-body tools">
+        <div class="card"><h3 class="small">Merge slot</h3><p class="small">Available. Take it to integrate a task.</p><button>Open the merge slot</button></div>
+        <div class="card"><h3 class="small">Guidance</h3><p class="small muted">No guidance is set.</p><button>Set guidance</button></div>
+        <div class="card"><h3 class="small">Onboarding</h3><p class="small muted">No project onboarding is set.</p><button>Edit onboarding</button></div>
+      </div>
+    </details>
+    <p class="small muted">The Lanes board moves to its own page (<a href="lanes.html">Lanes</a>), where a coordinator reads it.</p>
+  </main>
+  </div>
+</div>
+</body>
+</html>
