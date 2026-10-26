@@ -1642,9 +1642,13 @@ sets `operation`.
       a page asked for at another generation is refused ("The project changed since this page was
       read"). One answer is at most 64 KiB, a hard limit: a page is shortened to fit, and a single row
       still too large is replaced by its identifying fields and `oversized: true` with a plain note.
-    - **Cost.** An answer resolves at most 2,000 distinct tokens; the rest read `unchecked`, and the
-      coverage line says how many. A requirement's ledger is validated once per answer, however many of
-      its revisions are cited. The views are built after the project lock is released.
+    - **Cost.** Each source (a task, or a design section) has at most 200 distinct tokens checked; a
+      source over that has one `tokens-not-checked` row with the count it left out, and only its own
+      extra tokens go unchecked. A summary line a bound cut short says `partial: true`, and the coverage
+      line says why. A requirement's ledger is validated once per answer, however many of its revisions
+      are cited. The export, membership and governance are read under the project lock; the views are
+      built after it is released. Every truncated list carries an `_omitted` count, and the 64 KiB cap
+      keeps room for the generation and the route's cursor.
     - **Flags.** `requirements`: each accepted requirement in force, with `no-design` (only when the
       project has designs), `no-task`, `no-capability` (only when a task citing it is closed or its
       contribution approved). `tasks`: open tasks and those closed in the last 14 days, with

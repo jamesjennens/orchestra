@@ -368,7 +368,7 @@ class _RecordsScenarioMixin:
         self.assertEqual(get(viewer, view='tokens', limit='51').data['error']['message'],
                          'limit must be between 1 and 50')
         # Review b2: the reviewer's shape, 10 tasks of 1,000 distinct req: tokens, through the route (it took
-        # 8.4-8.9 s per read before; now one ledger validation per answer and at most 2,000 tokens resolved).
+        # 8.4-8.9 s per read before; now one ledger validation per answer and 200 distinct tokens checked per source).
         import time
         for number in range(10):
             planted = harness.request('POST', f'/v1/projects/{pid}/tasks',
@@ -381,8 +381,11 @@ class _RecordsScenarioMixin:
         heavy = get(viewer, view='tokens')
         elapsed = time.perf_counter() - started
         self.assertEqual(heavy.status, 200, heavy.data)
-        self.assertIn('distinct tokens not checked', heavy.data['coverage']['text'])
+        self.assertIn('sources carry more than 200 distinct tokens', heavy.data['coverage']['text'])
         self.assertLess(elapsed, 5.0)
+        # Review r2 note 7: a full page with its cursor still fits the 64 KiB cap on the wire.
+        self.assertIsNotNone(heavy.data['next_cursor'])
+        self.assertLessEqual(len(json.dumps(heavy.data, ensure_ascii=False).encode('utf-8')), 64 * 1024)
         summary = get(viewer)
         self.assertEqual(summary.status, 200, summary.data)
         self.assertEqual([line['view'] for line in summary.data['rows']],

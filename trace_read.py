@@ -25,8 +25,11 @@ ROUNDS_MAX = 50
 LIST_MAX = 20
 #: Cross-reviews shown per lane: LIST_MAX lanes of these must fit one answer (review b1).
 CROSS_REVIEWS_MAX = 5
-#: The distinct tokens one answer resolves (review b2); the rest read `unchecked` and the coverage line says so.
-TOKENS_RESOLVED_MAX = 2000
+#: The distinct tokens checked per source, a task or a design section (review b3: a bound per source, so a planted
+#: source hides only its own extra tokens; a global first-come bound let one task blind every later one).
+TOKENS_PER_SOURCE_MAX = 200
+#: Room kept inside ANSWER_MAX for what is added after the page is cut: the generation and the route's cursor.
+TAIL_RESERVE = 1024
 SCOPE_RE = re.compile(r'[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*')
 #: A row larger than the whole answer is replaced by this (review b1: the cap is hard even for one row).
 OVERSIZED = 'This row is larger than the answer limit; it is not shown. Narrow the read (a scope) or ask the coordinator.'
@@ -117,7 +120,10 @@ class Snapshot:
             if parent is not None:
                 self.children.setdefault(str(parent), []).append(task)
         self._resolved = {}
-        self.unchecked = set()
+        self.truncated = {}
+        self._sections = {}
+        self.rounds_omitted = 0
+        self.comments_scanned = None
         self._designs = None
         self._citations = None
         self._workflows = {}
@@ -135,14 +141,40 @@ class Snapshot:
 
     # -- pointers ----------------------------------------------------------------------------
     def resolve(self, pointer):
-        """One resolution per distinct token, and at most TOKENS_RESOLVED_MAX of them per answer (review b2)."""
+        """One resolution per distinct token; each requirement ledger is validated once (briefing._ledger)."""
         key = pointer['pointer']
         if key not in self._resolved:
-            if len(self._resolved) >= TOKENS_RESOLVED_MAX:
-                self.unchecked.add(key)
-                return {'pointer': key, 'kind': pointer['kind'], 'state': 'unchecked', 'trust': 'data', 'flags': []}
             self._resolved[key] = self.pointers.resolve(pointer)
         return self._resolved[key]
+
+    def bounded_tokens(self, source, items, name=lambda item: item['pointer']):
+        """`items` keeping only the first TOKENS_PER_SOURCE_MAX distinct tokens of one source (every occurrence of
+        a kept token stays); how many distinct tokens were left out is recorded per source."""
+        allowed, extra, kept = set(), set(), []
+        for item in items:
+            token = name(item)
+            if token not in allowed:
+                if len(allowed) >= TOKENS_PER_SOURCE_MAX:
+                    extra.add(token)
+                    continue
+                allowed.add(token)
+            kept.append(item)
+        if extra:
+            self.truncated[source] = len(extra)
+        return kept
+
+    def section_tokens(self, design, heading):
+        """A design section's index tokens, parsed, bounded per section like a task's (review b3)."""
+        key = (design['scope'], heading['anchor'])
+        if key not in self._sections:
+            from briefing import parse_context_pointers
+            parsed = []
+            for token in heading['tokens']:
+                found = parse_context_pointers(token)
+                if len(found) == 1:
+                    parsed.append(found[0])
+            self._sections[key] = self.bounded_tokens(('design', design['scope'], heading['anchor']), parsed)
+        return self._sections[key]
 
     def requirement(self, key):
         return self.pointers.requirement(key)
@@ -210,7 +242,7 @@ class Snapshot:
                     for pointer in parse_context_pointers(text):
                         if pointer['kind'] in ('req', 'design'):
                             cited.append((where, pointer))
-                self._citations[task] = cited
+                self._citations[task] = self.bounded_tokens(('task', task), cited, lambda item: item[1]['pointer'])
         return self._citations
 
     # -- designs -----------------------------------------------------------------------------
@@ -417,7 +449,9 @@ def tasks_view(snap):
         rows.append({'id': task, 'title': label(row.get('title')), 'status': row.get('status'),
                      'cites': [dict(pointer=p['pointer'], where=where, state=snap.resolve(p)['state'],
                                     flags=snap.resolve(p).get('flags', [])) for where, p in shown],
-                     'cites_omitted': more, 'affected_requirements': affected.get(task, [])[:LIST_MAX],
+                     'cites_omitted': more, 'tokens_not_checked': snap.truncated.get(('task', task), 0),
+                     'affected_requirements': affected.get(task, [])[:LIST_MAX],
+                     'affected_requirements_omitted': max(0, len(affected.get(task, [])) - LIST_MAX),
                      'flags': flags})
     return rows
 
@@ -436,17 +470,17 @@ def tokens_view(snap):
             flags = unresolved(snap.resolve(pointer))
             if flags:
                 rows.append({'pointer': pointer['pointer'], 'where': {'task': task, 'field': where}, 'flags': flags})
-    from briefing import parse_context_pointers
     for design in snap.designs():
         for heading in design['index']['headings'] if design['index'] else []:
-            for token in heading['tokens']:
-                parsed = parse_context_pointers(token)
-                if len(parsed) != 1:
-                    continue
-                flags = unresolved(snap.resolve(parsed[0]))
+            for pointer in snap.section_tokens(design, heading):
+                flags = unresolved(snap.resolve(pointer))
                 if flags:
-                    rows.append({'pointer': token, 'where': {'design': design['scope'], 'section': heading['anchor']},
-                                 'flags': flags})
+                    rows.append({'pointer': pointer['pointer'],
+                                 'where': {'design': design['scope'], 'section': heading['anchor']}, 'flags': flags})
+    # Review b3: a source over the bound says so in one row; only its own extra tokens go unchecked.
+    for source, count in sorted(snap.truncated.items()):
+        where = {'task': source[1]} if source[0] == 'task' else {'design': source[1], 'section': source[2]}
+        rows.append({'pointer': None, 'where': where, 'flags': ['tokens-not-checked'], 'omitted': count})
     return rows
 
 
@@ -547,8 +581,11 @@ def designs_view(snap):
                      'state': verification['state'] if verification else ('not-selected' if record is None else None),
                      'front_status': front_status, 'review_by': shown.get('review_by'),
                      'sections_without_plan_phase': sections[:LIST_MAX],
+                     'sections_without_plan_phase_omitted': max(0, len(sections) - LIST_MAX),
                      'plan_phases_without_epic': phases_without_epic[:LIST_MAX],
+                     'plan_phases_without_epic_omitted': max(0, len(phases_without_epic) - LIST_MAX),
                      'epics_without_task': epics_without_task[:LIST_MAX],
+                     'epics_without_task_omitted': max(0, len(epics_without_task) - LIST_MAX),
                      'requirements': {'cited': len(cited), 'planned': len(covered)}, 'flags': flags})
     return rows
 
@@ -564,6 +601,9 @@ def round_view(snap, scope=None):
             continue
         found = ROUND_TOKEN.search('%s\n%s' % (row.get('title') or '', row.get('description') or ''))
         if not found or (scope is not None and found.group(1) != scope):
+            continue
+        if len(rows) >= ROUNDS_MAX:
+            snap.rounds_omitted += 1   # counted, so the summary can say its round count is partial
             continue
         name = found.group(1)
         published = None
@@ -610,7 +650,8 @@ def round_view(snap, scope=None):
             # The converged design and its decision are read from the catalog entry, never from comments.
             converged = {'key': design['key'], 'selected': design['record'] is not None,
                          'revision': design['shown'].get('revision'),
-                         'decisions': list((design['shown'].get('decisions') or [])[:LIST_MAX])}
+                         'decisions': list((design['shown'].get('decisions') or [])[:LIST_MAX]),
+                         'decisions_omitted': max(0, len(design['shown'].get('decisions') or []) - LIST_MAX)}
         # Review b1: the lanes are bounded like every list; the round's flags still count every lane.
         shown_lanes, more_lanes = bounded(lanes)
         rows.append({'epic': task, 'scope': name, 'title': label(row.get('title')),
@@ -619,8 +660,6 @@ def round_view(snap, scope=None):
                      'lanes': shown_lanes, 'lanes_omitted': more_lanes,
                      'late_lanes': sum(bool(lane['flags']) for lane in lanes), 'converged': converged,
                      'flags': sorted({flag for lane in lanes for flag in lane['flags']})})
-        if len(rows) >= ROUNDS_MAX:
-            break
     return rows
 
 
@@ -629,29 +668,34 @@ BUILDERS = {'requirements': requirements_view, 'tasks': tasks_view, 'tokens': to
 
 
 def summary_view(snap):
-    """The Coverage panel's lines: counts only, from the same snapshot as every view."""
+    """The Coverage panel's lines: counts only, from the same snapshot as every view. A line whose count a bound cut
+    short says `partial: true` (review b3), with the reason in the coverage line."""
     has_designs = bool(snap.designs())
     requirements = requirements_view(snap)
     tokens = tokens_view(snap)
-    lines = [{'view': 'requirements', 'total': len(requirements),
+    cut = bool(snap.truncated)
+    lines = [{'view': 'requirements', 'total': len(requirements), 'partial': cut,
               'counts': {flag: sum(flag in row['flags'] for row in requirements)
                          for flag in ('no-task', 'no-capability') + (('no-design',) if has_designs else ())}},
-             {'view': 'tokens', 'total': len(tokens), 'counts': {}}]
+             {'view': 'tokens', 'total': len(tokens), 'partial': cut,
+              'counts': {'tokens-not-checked': sum(row.get('omitted', 0) for row in tokens)}}]
     if has_designs:
         tasks = tasks_view(snap)
         decisions = decisions_view(snap)
         designs = designs_view(snap)
         rounds = round_view(snap)
-        lines += [{'view': 'tasks', 'total': len(tasks),
+        scanned = snap.comments_scanned or (0, 0)
+        lines += [{'view': 'tasks', 'total': len(tasks), 'partial': cut,
                    'counts': {flag: sum(flag in row['flags'] for row in tasks)
                               for flag in ('cites-superseded-revision', 'cites-nothing')}},
                   {'view': 'decisions', 'total': sum(row['kind'] == 'decision' for row in decisions),
+                   'partial': scanned[0] < scanned[1],
                    'counts': {'possible-decision-in-comment': sum(row['kind'] != 'decision' for row in decisions)}},
-                  {'view': 'designs', 'total': len(designs),
+                  {'view': 'designs', 'total': len(designs), 'partial': False,
                    'counts': {flag: sum(flag in row['flags'] for row in designs)
                               for flag in ('not-selected', 'unverified', 'design-drift', 'section-without-plan-phase',
                                            'plan-phase-without-epic', 'epic-without-task')}},
-                  {'view': 'round', 'total': len(rounds),
+                  {'view': 'round', 'total': len(rounds) + snap.rounds_omitted, 'partial': bool(snap.rounds_omitted),
                    'counts': {'delivered-after-publication': sum(bool(row['flags']) for row in rounds)}}]
     return lines
 
@@ -677,10 +721,14 @@ def coverage(snap):
     text = '%s; %d rows read' % (', '.join(parts), block['rows_read'])
     if scanned is not None:
         text += '; possible decisions: the newest %d of %d owner comments scanned' % scanned
-    if snap.unchecked:
-        block['tokens_unchecked'] = len(snap.unchecked)
-        text += '; %d distinct tokens not checked (the limit is %d per answer)' % (len(snap.unchecked),
-                                                                                    TOKENS_RESOLVED_MAX)
+    if snap.rounds_omitted:
+        block['rounds_omitted'] = snap.rounds_omitted
+        text += '; %d more design rounds not shown (the limit is %d)' % (snap.rounds_omitted, ROUNDS_MAX)
+    if snap.truncated:
+        block['tokens_not_checked'] = {'sources': len(snap.truncated), 'tokens': sum(snap.truncated.values()),
+                                       'limit_per_source': TOKENS_PER_SOURCE_MAX}
+        text += '; %d sources carry more than %d distinct tokens: %d of their tokens are not checked' % (
+            len(snap.truncated), TOKENS_PER_SOURCE_MAX, sum(snap.truncated.values()))
     block['text'] = text
     return block
 
@@ -709,7 +757,8 @@ def trace(snap, view, *, scope=None, offset=0, limit=PAGE_MAX):
     from briefing import encoded_size
     import json
     def fits():
-        return encoded_size(json.dumps(answer, ensure_ascii=False)) <= ANSWER_MAX
+        # Review note 7: the generation and the route's cursor are added after this cut; their room is kept here.
+        return encoded_size(json.dumps(answer, ensure_ascii=False)) + TAIL_RESERVE <= ANSWER_MAX
     while True:
         answer['rows'] = page
         answer['next_offset'] = offset + len(page) if offset + len(page) < len(rows) else None
@@ -779,10 +828,17 @@ def generation(snap):
     return 's:' + hashlib.sha256(json.dumps(visible, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()[:32]
 
 
+def in_project(row, project):
+    """The snapshot's own row rule (briefing.ContextPointers._load): this project's, readable rows. Review note 2:
+    whether the governance file is read is decided from these, never from another project's rows."""
+    return isinstance(row, dict) and row.get('project_id', project) == project and not row.get('malformed')
+
+
 def read_governance(rows, journal, project):
     """The requirements-governance snapshot, read only when the export holds a requirement row (as `brief` reads it
     only for a `req:` token); None when there is none or it cannot be read. The one file read of a trace answer."""
-    if journal is None or not any(isinstance(row, dict) and 'requirement' in (row.get('labels') or []) for row in rows):
+    if journal is None or not any(in_project(row, project) and 'requirement' in (row.get('labels') or [])
+                                  for row in rows):
         return None
     import requirement_governance
     try:

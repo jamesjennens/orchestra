@@ -621,10 +621,11 @@ of a kittrial-sized export, as the context index did for find.
      tests/trace_cost.py, Windows, Python 3.11): `analyze` 114 ms; each view's first answer in a fresh
      interpreter 359-930 ms (`summary`, which builds every view, is the 930), a second answer 64-587 ms;
      the generation (a digest of the filtered snapshot) 46 ms. **Bounds against planted input (review of
-     part 1):** every list in a row is bounded and the 64 KiB cap holds for one row; an answer resolves at
-     most 2,000 distinct tokens and validates each requirement ledger once, so 10 tasks of 1,000 distinct
-     `req:` tokens read in about 0.1 s (8.4-8.9 s before); the views are built after the shared lock is
-     released. Part 2 builds the web.
+     part 1):** every list in a row is bounded and the 64 KiB cap holds for one row; each requirement
+     ledger is validated once per answer, so 10 tasks of 1,000 distinct `req:` tokens read in about 0.1 s
+     (8.4-8.9 s before); at most 200 distinct tokens are checked per source (a task or a design section),
+     so a planted source hides only its own extra tokens and the summary says when a count is partial;
+     the views are built after the shared lock is released. Part 2 builds the web.
 5. **Orchestra's system design.** docs/SYSTEM_DESIGN.md rewritten with the front block, uploaded as
    `design.orchestra` and accepted, IMPLEMENTATION_PLAN retired, and trace's first report on
    kittrial attached.

@@ -313,7 +313,7 @@ class ViewTests(Fixture):
         self.assertEqual(lanes['trial-l2']['flags'], ['delivered-after-publication'])
         self.assertEqual(lanes['trial-l1']['cross_reviews'], [{'of': 'trial-l2', 'commit': 'abcdef1', 'by': {'text': 'lane-a', 'omitted_chars': 0}, 'at': stamp(5)}])
         self.assertEqual(row['converged'], {'key': 'design.server', 'selected': True, 'revision': 2,
-                                            'decisions': ['trial-d1']})
+                                            'decisions': ['trial-d1'], 'decisions_omitted': 0})
 
     def test_a_contributor_cannot_move_the_publication_time(self):
         # Q7: only a person owner or coordinator in current membership, or a listed operator, counts.
@@ -333,12 +333,13 @@ class ViewTests(Fixture):
 
     def test_summary_counts_come_from_the_views(self):
         lines = {line['view']: line for line in self.view('summary')['rows']}
-        self.assertEqual(lines['requirements'], {'view': 'requirements', 'total': 2,
+        self.assertEqual(lines['requirements'], {'view': 'requirements', 'total': 2, 'partial': False,
                                                  'counts': {'no-task': 0, 'no-capability': 1, 'no-design': 0}})
         self.assertEqual(lines['tokens']['total'], 4)
         self.assertEqual(lines['tasks']['counts'], {'cites-superseded-revision': 1, 'cites-nothing': 1})
-        self.assertEqual(lines['decisions'], {'view': 'decisions', 'total': 1,
+        self.assertEqual(lines['decisions'], {'view': 'decisions', 'total': 1, 'partial': False,
                                               'counts': {'possible-decision-in-comment': 1}})
+        self.assertEqual({line['view'] for line in lines.values() if line['partial']}, set())
         self.assertEqual(lines['designs']['counts']['unverified'], 1)
         self.assertEqual(lines['round']['counts'], {'delivered-after-publication': 1})
 
@@ -497,12 +498,29 @@ class HardCapTests(Fixture):
         self.assertLessEqual(len(json.dumps(answer, ensure_ascii=False).encode('utf-8')), t.ANSWER_MAX)
 
     def test_one_row_larger_than_the_answer_is_replaced_by_a_plain_note(self):
-        with patch.object(t, 'ANSWER_MAX', 900):
+        with patch.object(t, 'ANSWER_MAX', t.TAIL_RESERVE + 900):
             answer = t.trace(self.snap(), 'round')
         self.assertLessEqual(len(json.dumps(answer, ensure_ascii=False).encode('utf-8')), 900)
         self.assertEqual(answer['rows'], [{'oversized': True, 'note': t.OVERSIZED, 'scope': 'server',
                                            'epic': 'trial-round'}])
         self.assertIsNone(answer['next_offset'])
+
+    def test_every_list_in_a_row_carries_its_omitted_count(self):
+        # Review r2 note 4: a truncated list always says how much it left out (CLI_CONTRACT `trace`).
+        exempt = {'flags', 'supersedes'}   # flags are a closed set; a decision supersedes at most one
+
+        def lists(value, where):
+            if isinstance(value, dict):
+                for name, item in value.items():
+                    if isinstance(item, list) and name not in exempt:
+                        self.assertIn(name + '_omitted', value, '%s.%s' % (where, name))
+                    lists(item, '%s.%s' % (where, name))
+            elif isinstance(value, list):
+                for item in value:
+                    lists(item, where)
+        for view in t.VIEWS:
+            if view != 'summary':
+                lists(self.view(view)['rows'], view)
 
 
 class TokenCostTests(Fixture):
@@ -525,17 +543,82 @@ class TokenCostTests(Fixture):
             t.trace(self.snap(), 'summary')
         self.assertEqual({row: calls.count(row) for row in set(calls)}, {row: 1 for row in set(calls)})
 
-    def test_distinct_tokens_resolved_are_bounded_and_said(self):
-        self.planted(tasks=3, tokens=1000)
+    def test_a_planted_task_sorting_first_blinds_only_itself(self):
+        # Review b3: the bound is per source, so one task's planted tokens change nobody else's flags or counts.
+        before = {view: t.trace(self.snap(), view) for view in ('tasks', 'tokens', 'summary')}
+        self.work.insert(0, task('trial-0planted', ' '.join('req:R01@%d' % (k + 1) for k in range(2500))))
         snap = self.snap()
-        answer = t.trace(snap, 'tokens')
-        unchecked = [row for row in t.tokens_view(snap) if row['flags'] == ['unchecked']]
-        self.assertEqual(len(snap._resolved), t.TOKENS_RESOLVED_MAX)
-        self.assertEqual(answer['coverage']['tokens_unchecked'], len(snap.unchecked))
-        self.assertGreater(len(unchecked), 0)
-        self.assertEqual(len({row['pointer'] for row in unchecked}), len(snap.unchecked))
-        self.assertIn('distinct tokens not checked (the limit is %d per answer)' % t.TOKENS_RESOLVED_MAX,
-                      answer['coverage']['text'])
+        after = {view: t.trace(snap, view) for view in ('tasks', 'tokens', 'summary')}
+        others = [row for row in after['tasks']['rows'] if row['id'] != 'trial-0planted']
+        self.assertEqual(json.dumps(others), json.dumps(before['tasks']['rows']))
+
+        def mine(row):
+            return row['where'].get('task') == 'trial-0planted'
+        alone = self.snap([r for r in self.rows() if r['id'] != 'trial-0planted'])
+        self.assertEqual(json.dumps([row for row in t.tokens_view(snap) if not mine(row)]),
+                         json.dumps(t.tokens_view(alone)))
+        planted = [row for row in t.tokens_view(snap) if mine(row)]
+        self.assertEqual(planted[-1], {'pointer': None, 'where': {'task': 'trial-0planted'},
+                                       'flags': ['tokens-not-checked'], 'omitted': 2500 - t.TOKENS_PER_SOURCE_MAX})
+        lines = {line['view']: line for line in after['summary']['rows']}
+        old = {line['view']: line for line in before['summary']['rows']}
+        self.assertEqual(lines['tasks']['counts'], old['tasks']['counts'])
+        self.assertEqual(lines['requirements']['counts'], old['requirements']['counts'])
+        self.assertEqual({view for view, line in lines.items() if line['partial']},
+                         {'requirements', 'tokens', 'tasks'})
+        self.assertEqual(lines['tokens']['counts'], {'tokens-not-checked': 2500 - t.TOKENS_PER_SOURCE_MAX})
+        self.assertIn('1 sources carry more than %d distinct tokens: %d of their tokens are not checked'
+                      % (t.TOKENS_PER_SOURCE_MAX, 2500 - t.TOKENS_PER_SOURCE_MAX),
+                      after['summary']['coverage']['text'])
+        row = next(r for r in after['tasks']['rows'] if r['id'] == 'trial-0planted')
+        self.assertEqual(row['tokens_not_checked'], 2500 - t.TOKENS_PER_SOURCE_MAX)
+
+    def test_a_planted_design_section_blinds_only_itself(self):
+        snap = self.snap()
+        design = snap.designs()[0]
+        heading = dict(design['index']['headings'][0], anchor='planted',
+                       tokens=['req:G%04d' % k for k in range(t.TOKENS_PER_SOURCE_MAX + 7)])
+        design['index'] = dict(design['index'], headings=[heading] + design['index']['headings'])
+        rows = t.tokens_view(snap)
+        self.assertIn('req:NOPE', [row['pointer'] for row in rows])   # a later section keeps its real flag
+        self.assertIn({'pointer': None, 'where': {'design': 'server', 'section': 'planted'},
+                       'flags': ['tokens-not-checked'], 'omitted': 7}, rows)
+
+    def test_the_round_count_says_when_it_is_partial(self):
+        self.work += [task('trial-r%02d' % n, 'design-round:server', issue_type='epic')
+                      for n in range(t.ROUNDS_MAX)]
+        answer = self.view('summary')
+        line = next(line for line in answer['rows'] if line['view'] == 'round')
+        self.assertEqual((line['total'], line['partial']), (t.ROUNDS_MAX + 1, True))
+        self.assertIn('1 more design rounds not shown', answer['coverage']['text'])
+
+    def test_the_answer_keeps_room_for_its_cursor(self):
+        # Review note 7: the generation and the route's cursor are added after the cut; they must still fit.
+        long = 'x' * 2000
+        self.work += [task('trial-y%03d' % n, 'req:M%03d' % n, title=long) for n in range(50)]
+        answer = t.answer(self.rows(), PROJECT, t.parse_options(['tasks']), operators=OPERATORS,
+                          members=MEMBERS, now=NOW)
+        answer['next_cursor'] = 'c' * 300   # the route's signed cursor is about 200 characters
+        self.assertLessEqual(len(json.dumps(answer, ensure_ascii=False).encode('utf-8')), t.ANSWER_MAX)
+        self.assertIsNotNone(answer['next_offset'])
+
+    def test_the_governance_read_is_decided_from_this_projects_rows(self):
+        # Review note 2: another project's requirement row never makes this answer read the governance file.
+        foreign = task('other-req', 'x')
+        foreign.update(project_id='other', labels=['requirement'])
+        journal = self.project
+        with patch('requirement_governance.snapshot', side_effect=AssertionError('read')) as read:
+            self.assertIsNone(t.read_governance(self.references.rows + [foreign], journal, PROJECT))
+        read.assert_not_called()
+        with patch('requirement_governance.snapshot', return_value={'g': 1}) as read:
+            self.assertEqual(t.read_governance(self.rows(), journal, PROJECT), {'g': 1})
+        read.assert_called_once()
+        hidden = copy.deepcopy(self.requirements.rows)
+        for row in hidden:
+            row['project_id'] = 'other'
+        with patch('requirement_governance.snapshot', return_value={'g': 1}) as read:
+            self.assertIsNone(t.read_governance(hidden, journal, PROJECT))
+        read.assert_not_called()
 
     def test_ten_thousand_planted_tokens_answer_within_a_fixed_budget(self):
         # The review's repro shape: 10 tasks of 1,000 distinct req:R01@N tokens took 8.4-8.9 s per read.
@@ -574,6 +657,44 @@ class GenerationTests(Fixture):
             with self.subTest(scope=scope):
                 with self.assertRaisesRegex(ValueError, 'trace VIEW'):
                     t.parse_options(['round', '--scope', scope])
+
+
+class EndpointLockTests(unittest.TestCase):
+    """Review r2 note 1: the endpoint reads the export, membership and governance under the shared lock, and builds
+    the views after releasing it (endpoint.trace_answer)."""
+
+    def test_reads_happen_under_the_lock_and_the_views_after_it(self):
+        try:
+            import endpoint
+        except ImportError:
+            self.skipTest('endpoint imports fcntl (POSIX-only)')
+        import contextlib
+        from types import SimpleNamespace
+        held, seen = [False], {}
+
+        @contextlib.contextmanager
+        def lock(path, shared=False):
+            seen['shared'] = shared
+            held[0] = True
+            try:
+                yield
+            finally:
+                held[0] = False
+
+        def mark(name, value):
+            def record(*args, **kwargs):
+                seen[name] = held[0]
+                return value
+            return record
+        with patch.object(endpoint, 'held_coordination_lock', lock), \
+                patch('read_cache.cached_export_rows', mark('rows', [])), \
+                patch('http_authority.read_state', mark('members', {'memberships': {PROJECT: MEMBERS}})), \
+                patch.object(t, 'read_governance', mark('governance', None)), \
+                patch.object(t, 'answer', mark('views', {'schema': 'trace-v1'})), \
+                patch.object(endpoint, 'configured_operators', lambda root: []), \
+                patch.object(endpoint, 'configured_verifiers', lambda root: []):
+            endpoint.trace_answer(Path('.'), Path('.'), PROJECT, ['summary'], 'actor', SimpleNamespace(store='x'))
+        self.assertEqual(seen, {'shared': True, 'rows': True, 'members': True, 'governance': True, 'views': False})
 
 
 if __name__ == '__main__':
