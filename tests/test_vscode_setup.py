@@ -816,6 +816,10 @@ class CredentialFileRewriteCase(unittest.TestCase):
         path = home / '.orchestra-agent-kestrel.curlrc'
         path.write_text(self.HEADER, encoding='utf-8')      # Notepad: no final newline
         self.run_command(command, home)
+        # The rewritten file names the certificate with cacert; newer curl (ubuntu-26.04 runners,
+        # 2026-10-26) refuses a config whose --cacert file is missing even for --version, so put
+        # the certificate where the setup's move step leaves it.
+        (home / '.orchestra-agent-kestrel.crt').write_text('PEM-DATA\n', encoding='utf-8')
         out = subprocess.run([BASH, '-c', 'curl -K "$HOME/.orchestra-agent-kestrel.curlrc" --version'],
                              env=dict(os.environ, HOME=str(home)), capture_output=True, text=True)
         self.assertEqual(0, out.returncode, out.stderr)     # curl parsed the config file
