@@ -188,7 +188,7 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (26, 'bd output and files on the coordination host, in operator commands; the export row reads '
+        'admin.py': (25, 'bd output and files on the coordination host, in operator commands; the export row reads '
                          'of credential-actors (kittrial-5bb.184) and adopt-actor\'s tracker check (kittrial-5bb.194 '
                          'revision 2) go through record_json.loads_rows (kittrial-5bb.221 revision 2): rows nested '
                          'to 750 read normally and any unreadable row fails the read as a whole; two more '
@@ -322,7 +322,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # crashing the copy out of the guard.
             # The twelfth (kittrial-5bb.407) reads a `.delegations` journal entry for a backup:
             # a host file, but one a damaged or nested copy must refuse, never traceback.
-            'admin.py': 12,
+            # The thirteenth (kittrial-5bb.171) is read_sidecar_json: the depth bound, not the
+            # interpreter's recursion limit, decides whether a nested sidecar reads.
+            'admin.py': 13,
             # D2: bounded native history, review VOID and preserved target payload.
             'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored

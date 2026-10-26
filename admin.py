@@ -4652,7 +4652,9 @@ def read_sidecar_json(path):
         return None,'it cannot be read (%s)'%error.__class__.__name__
     finally:
         if fd is not None:os.close(fd)
-    try:return json.loads(raw.decode('utf-8')),None
+    # record_json.loads bounds the nesting (record_json.NESTING_MAX) on every Python; the RecursionError
+    # catch stays as a backstop (kittrial-5bb.171).
+    try:return record_json.loads(raw.decode('utf-8')),None
     except (ValueError,RecursionError):return None,'it is not valid JSON'
 
 def native_backup_manifest(directory):

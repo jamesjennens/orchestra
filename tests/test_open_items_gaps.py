@@ -11,6 +11,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import admin
+import record_json
 import reserved_comments as rc
 import test_bd_label_aliases as rb
 from test_merge_slot_real_bd import without_inherited_tests
@@ -164,13 +165,28 @@ class FamilyLookalikeTests(unittest.TestCase):
 
 
 class NestedSidecarTests(unittest.TestCase):
-    def test_a_deeply_nested_sidecar_is_a_problem_not_a_crash(self):
+    """read_sidecar_json parses with record_json, whose bound (record_json.NESTING_MAX, record_json.py:25)
+    holds on every Python: the outcome never depends on the interpreter's own recursion limit."""
+
+    def read(self, depth):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'sidecar.json'
-            path.write_text('[' * 5000 + ']' * 5000, encoding='utf-8')
-            data, problem = admin.read_sidecar_json(path)
-            self.assertIsNone(data)
-            self.assertTrue(problem)
+            path.write_text('[' * depth + ']' * depth, encoding='utf-8')
+            return admin.read_sidecar_json(path)
+
+    def test_a_sidecar_just_over_the_bound_is_a_problem_and_just_under_reads(self):
+        limit = record_json.NESTING_MAX
+        self.assertEqual(self.read(limit), (self.read(limit)[0], None))
+        self.assertIsNotNone(self.read(limit)[0])
+        data, problem = self.read(limit + 1)
+        self.assertEqual((data, problem), (None, 'it is not valid JSON'))
+
+    def test_a_very_deep_sidecar_is_still_a_problem(self):
+        self.assertEqual(self.read(5000), (None, 'it is not valid JSON'))
+
+    def test_the_recursion_error_backstop_still_answers(self):
+        with mock.patch.object(admin.record_json, 'loads', side_effect=RecursionError):
+            self.assertEqual(self.read(2), (None, 'it is not valid JSON'))
 
 
 if __name__ == '__main__':
