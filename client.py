@@ -211,7 +211,7 @@ def _answer(reply):
     return json.loads(reply.get('stdout') or 'null')
 
 def _trace_command(args,config,project,actor,out):
-    """kittrial-5bb.418: `trace --verify [--repo DIR] [--record | --payloads FILE]`.
+    """kittrial-5bb.418: `trace --verify [--repo DIR] [--record | --payloads FILE]`; kittrial-5bb.425: `trace VIEW ...`.
 
     The one part of trace that needs a checkout (TRACEABILITY_DESIGN §5.1 step 4): for every accepted
     design.<scope> entry with a repo-document authority, read the file at its pinned commit from git's own
@@ -219,7 +219,12 @@ def _trace_command(args,config,project,actor,out):
     report (`ref verify`); `--payloads FILE` writes them for `admin.py design-verify`, the trusted host route."""
     import tempfile
     if '--verify' not in args:
-        raise ValueError('trace runs on the server (part 4 of the design); the client has trace --verify')
+        # kittrial-5bb.425: every view is answered by the server's trace read; this is a convenience over it.
+        answer=_answer(request(config,project,actor,list(args),'trace'))
+        text=json.dumps(answer,indent=2,ensure_ascii=False)+'\n'
+        if out:Path(out).write_text(text,encoding='utf-8')
+        else:sys.stdout.write(text)
+        return 0
     repo='.';record=False;payloads=None;i=0;rest=[token for token in args if token!='--verify']
     while i<len(rest):
         token=rest[i]
@@ -1607,6 +1612,8 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
+    ('trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]',
+     'the trace read, answered by the server: summary, requirements, tasks, tokens, decisions, designs, round'),
     ('trace --verify [--repo DIR] [--record | --payloads FILE]',
      "check each accepted design document against git at its pinned commit (verified, design-drift)"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),

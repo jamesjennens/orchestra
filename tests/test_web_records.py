@@ -251,6 +251,98 @@ class _RecordsScenarioMixin:
                                 token=people['viewer']['token'], key='design-viewer')
         self.assertEqual(small.status, 403, small.data)
 
+    def run_trace_suite(self):
+        """kittrial-5bb.425: GET /v1/projects/{pid}/trace through the endpoint's `trace` action."""
+        from urllib.parse import urlencode
+        harness = self.harness
+        people = self._setup_actors(harness)
+        pid = self.pid
+        refs = f'/v1/projects/{pid}/references'
+        text = '<!-- design-v1\nscope: web-trace\nstatus: candidate\n-->\n# Web trace\n\n## Storage\nSee req:GHOST here.\n'
+        proposed = harness.request('POST', refs, self._design_body(text, key='design.web-trace'),
+                                   token=people['contrib']['token'], key='trace-design-1')
+        self.assertEqual(proposed.status, 201, proposed.data)
+        accepted = harness.request('POST', refs + '/design.web-trace/accept',
+                                   {'expected_revision': 1, 'record_sha256': proposed.data['sha256'],
+                                    'evidence': 'Read the stored design document.'},
+                                   token=people['coord2']['token'], key='trace-design-accept')
+        self.assertEqual(accepted.status, 200, accepted.data)
+        for number in range(3):
+            made = harness.request('POST', f'/v1/projects/{pid}/tasks',
+                                   {'title': 'Trace task %d' % number,
+                                    'description': 'Uses req:MISSING%d and design:web-trace#nowhere' % number},
+                                   token=people['coord1']['token'])
+            self.assertEqual(made.status, 201, made.data)
+
+        def get(token, project=pid, **query):
+            return harness.request('GET', f'/v1/projects/{project}/trace' + ('?' + urlencode(query) if query else ''),
+                                   token=token)
+
+        # Every member reads the same rows and the same counts: no role sees more or less.
+        answers = {name: get(people[name]['token'], view='tokens') for name in ('viewer', 'contrib', 'coord1',
+                                                                                'coord1_agent')}
+        for name, answer in answers.items():
+            self.assertEqual(answer.status, 200, (name, answer.data))
+        bodies = {json.dumps(answer.data, sort_keys=True) for answer in answers.values()}
+        self.assertEqual(len(bodies), 1)
+        tokens = answers['viewer'].data
+        self.assertEqual(sorted(row['pointer'] for row in tokens['rows']),
+                         ['design:web-trace#nowhere'] * 3 + ['req:GHOST', 'req:MISSING0', 'req:MISSING1',
+                                                             'req:MISSING2'])
+        self.assertEqual(tokens['total'], 7)
+        self.assertIsNone(tokens['next_cursor'])
+        # One 404 for a non-member, a superuser outside the project, an agent scoped to another project and an
+        # unknown project: hidden equals absent.
+        harness.create_account(self.owner_token, 'trace-outsider', 'rec-password-1')
+        outsider, _, _ = harness.login('trace-outsider', 'rec-password-1')
+        other = harness.request('POST', '/v1/projects', {'project_id': 'qq', 'name': 'Other'}, token=self.owner_token)
+        self.assertEqual(other.status, 201, other.data)
+        elsewhere = harness.request('POST', '/v1/agents', {'name': 'Elsewhere', 'working_directory': '/tmp/elsewhere',
+                                                           'projects': ['qq'], 'scopes': ['tasks']},
+                                    token=self.owner_token)
+        self.assertEqual(elsewhere.status, 201, elsewhere.data)
+        absent = [get(outsider), get(elsewhere.data['credential']['secret']),
+                  get(people['viewer']['token'], project='no-such-project'), get(outsider, view='tokens')]
+        self.assertEqual({(r.status, r.data['error']['code'], r.data['error']['message']) for r in absent},
+                         {(404, 'not_found', 'Project not found')})
+        self.assertEqual(get(None).status, 401)
+        # The existing read rule decides, never trace: a caller reads the trace exactly when it reads the tasks.
+        for token in (people['nonmember_su']['token'], outsider, people['viewer']['token']):
+            tasks = harness.request('GET', f'/v1/projects/{pid}/tasks', token=token)
+            self.assertEqual(get(token).status, 200 if tasks.status == 200 else 404, tasks.status)
+        # Pages: the cursor is the caller's, for this query, at this generation.
+        viewer = people['viewer']['token']
+        first = get(viewer, view='tokens', limit='3')
+        self.assertEqual((first.status, len(first.data['rows'])), (200, 3), first.data)
+        second = get(viewer, view='tokens', limit='3', cursor=first.data['next_cursor'])
+        self.assertEqual(second.status, 200, second.data)
+        self.assertEqual([row['pointer'] for row in first.data['rows'] + second.data['rows']],
+                         [row['pointer'] for row in tokens['rows']][:6])
+        for token, query in ((people['contrib']['token'], {'view': 'tokens', 'limit': '3'}),
+                             (viewer, {'view': 'tasks', 'limit': '3'})):
+            stolen = get(token, cursor=first.data['next_cursor'], **query)
+            self.assertEqual(stolen.status, 409, stolen.data)
+        made = harness.request('POST', f'/v1/projects/{pid}/tasks', {'title': 'A later task',
+                                                                     'description': 'Cites req:LATER now'},
+                               token=people['coord1']['token'])
+        self.assertEqual(made.status, 201, made.data)
+        # No answer is kept across requests or callers: the next read of anyone sees the write.
+        for name in ('viewer', 'coord1'):
+            self.assertEqual(get(people[name]['token'], view='tokens').data['total'], 8, name)
+        stale = get(viewer, view='tokens', limit='3', cursor=first.data['next_cursor'])
+        self.assertEqual(stale.status, 409, stale.data)
+        self.assertIn('The project changed since this page was read', stale.data['error']['message'])
+        # Bounds and the query's shape.
+        for query in ({'view': 'everything'}, {'view': 'tokens', 'limit': '51'}, {'view': 'tokens', 'sort': 'x'},
+                      {'view': 'round', 'scope': 'Not A Scope'}):
+            refused = get(viewer, **query)
+            self.assertEqual(refused.status, 422, (query, refused.data))
+        summary = get(viewer)
+        self.assertEqual(summary.status, 200, summary.data)
+        self.assertEqual([line['view'] for line in summary.data['rows']],
+                         ['requirements', 'tokens', 'tasks', 'decisions', 'designs', 'round'])
+        self.assertTrue(summary.data['designs'])
+
     def _setup_actors(self, harness):
         owner = self.owner_token
         people = {}
@@ -1526,6 +1618,9 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
     def test_design_document_upload_and_its_body_limits(self):
         self.run_design_document_suite()
 
+    def test_trace_read_over_http(self):
+        self.run_trace_suite()
+
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
@@ -1561,6 +1656,10 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_design_document_upload_and_its_body_limits(self):
         self.deployment(operators=['ops'], coordinator_writes=True)
         self.run_design_document_suite()
+
+    def test_native_trace_read_over_http(self):
+        self.deployment(operators=['ops'], coordinator_writes=True)
+        self.run_trace_suite()
 
 
 

@@ -1627,6 +1627,36 @@ sets `operation`.
     `index_state` (`matches`, `missing` or `differs`), `heading_lines` (the line of each index heading,
     in the index's order, so a reader places anchors without its own heading rule), and the revision's
     state. Anything that is not a readable repo-document revision answers `Design not found`.
+  - `trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]` (kittrial-5bb.425) is the
+    trace read, answered by the server from records alone (no repository, no blob read); the client
+    passes it to the endpoint action `trace` and prints the answer. Views: `summary` (the Coverage
+    panel's counts), `requirements`, `tasks`, `tokens`, `decisions`, `designs` and `round`
+    ([traceability design](design/TRACEABILITY_DESIGN.md) §5.3).
+    - **What counts.** Every view and every count comes from one snapshot of the rows the caller may
+      read: another project's rows, record anchors and record comments, and the merge slot are never
+      work, so a hidden row is absent from every list and every total.
+    - **Rows.** Every row is data, with untrusted text escaped and clipped (`{text, omitted_chars}`).
+      Pages hold at most 50 rows; `next_offset` and `generation` continue a page, and a page asked for
+      at another generation is refused ("The project changed since this page was read"). One answer is
+      at most 64 KiB; a page is shortened to fit.
+    - **Flags.** `requirements`: each accepted requirement in force, with `no-design` (only when the
+      project has designs), `no-task`, `no-capability` (only when a task citing it is closed or its
+      contribution approved). `tasks`: open tasks and those closed in the last 14 days, with
+      `cites-superseded-revision` (from `requirement_impact.analyze`; a draft or unknown citation is the
+      `tokens` view's) and `cites-nothing` (a task under a selected design's plan-phase epic with no
+      token in its description). `tokens`: every `req:` and `design:` token that does not resolve, in a
+      task description, a checkpoint item, a contribution summary or a design's index, with the flags
+      `brief` gives it. `decisions`: decision issues, their `Supersedes: decision:<id>` first line and
+      the designs naming them, plus `possible-decision-in-comment`, a heuristic that lists a person
+      owner's comment with decision words that no decision cites; it scans the newest 2,000 comments and
+      says so. `designs`: selected or not, `verified`, `unverified` or `design-drift`,
+      `front-status-disagrees`, `review-by-past`, sections with no plan phase, plan phases with no epic,
+      epics with no task. `round`: each `design-round:<scope>` epic's lanes with plan and delivery times,
+      cross-reviews and `delivered-after-publication`; the publication time is the first line
+      `Published drafts of <scope> at <time>` written by a person owner or coordinator in current
+      membership or a listed operator, and nobody else's.
+    - A project with no `design.*` entries says so once (`note`), never flags `no-design`, and its
+      `summary` holds the requirement and token lines only.
 - **Caller-written fields are refused.** `acceptance_state`, `successor`, `sha256`,
   `acceptance` and `labels` are written by the operation.
 - **`propose`** creates the entry's native anchor, closes it and posts revision 1 as a

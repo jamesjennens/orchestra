@@ -1037,10 +1037,23 @@ class TraceVerifyClientTests(unittest.TestCase):
         self.assertEqual((code, summary['checked'], summary['failed']), (4, 0, 0))
         self.assertFalse(summary['results'][0]['checked'])
 
-    def test_trace_without_verify_says_where_trace_is(self):
+    def test_trace_without_verify_is_the_servers_read(self):
+        # kittrial-5bb.425: every view is the endpoint's `trace` action; the client only passes it on.
         import client
-        with self.assertRaisesRegex(ValueError, 'trace --verify'):
-            client._trace_command([], {}, 'p', 'alice', None)
+        calls = []
+
+        def fake(config, project, actor, args, action='bd', path=None):
+            calls.append((action, list(args)))
+            return {'returncode': 0, 'stdout': json.dumps({'schema': 'trace-v1', 'rows': []}), 'stderr': ''}
+        out = Path(self.repo) / 'trace.json'
+        with patch.object(client, 'request', fake):
+            self.assertEqual(client._trace_command(['tokens', '--limit', '5'], {}, 'p', 'alice', str(out)), 0)
+        self.assertEqual(calls, [('trace', ['tokens', '--limit', '5'])])
+        self.assertEqual(json.loads(out.read_text(encoding='utf-8'))['schema'], 'trace-v1')
+        refused = lambda *a, **k: {'returncode': 2, 'stdout': '', 'stderr': 'trace VIEW ...; views: summary'}
+        with patch.object(client, 'request', refused):
+            with self.assertRaisesRegex(ValueError, 'views: summary'):
+                client._trace_command([], {}, 'p', 'alice', None)
 
 
 class DesignPageAnchorTests(unittest.TestCase):

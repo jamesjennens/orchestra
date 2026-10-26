@@ -1483,6 +1483,12 @@ class InProcessBackend:
         return {'schema_version': 1, 'total': 0, 'items': [], 'next_offset': None,
                 'coverage': 'the in-process backend holds no native capability records'}
 
+    def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None):
+        """kittrial-5bb.425: the in-process backend holds no native records, so every view is honestly empty."""
+        import trace_read
+        snap = trace_read.Snapshot([], project_id, now=trace_read.snapshot_now())
+        return dict(trace_read.trace(snap, view, scope=scope, offset=offset, limit=limit), generation='in-process')
+
     def capability(self, project_id, key):
         raise not_found('Capability not found')
 
@@ -3346,6 +3352,19 @@ class EndpointBackend:
         payload = self._checked(reply, 'ref', reading=True)
         if not isinstance(payload, dict):
             raise uncertain('Canonical design read returned an unexpected shape')
+        return payload
+
+    def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None):
+        """kittrial-5bb.425: one page of the trace read through the endpoint's read-only `trace` action."""
+        args = [view] + (['--scope', caller_arg(scope, 'scope')] if scope else []) \
+            + ['--offset', str(offset), '--limit', str(limit)] + (['--generation', generation] if generation else [])
+        reply = self._endpoint('trace', project_id, self.actor_namespace + '/read', args)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 \
+                and 'The project changed since this page was read' in (reply.get('stderr') or ''):
+            raise conflict('The project changed since this page was read; start again from the first page.')
+        payload = self._checked(reply, 'trace', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical trace read returned an unexpected shape')
         return payload
 
     def capabilities(self, project_id, options):
@@ -11441,6 +11460,50 @@ class ApiHandler(BaseHTTPRequestHandler):
             if error.status in (400, 404, 422):
                 raise absent from None
             raise
+
+    TRACE_QUERY = ('view', 'scope', 'limit', 'cursor')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/trace')
+    def trace_get(self, ctx):
+        """kittrial-5bb.425: the trace read (TRACEABILITY_DESIGN §5.2): one page of one view, from records alone.
+
+        CAP_READ, and one 404 for every caller who may not read the project and every project that is not
+        there (an agent credential scoped to other projects included: http_authority.decide). The cursor is
+        bound to the caller, project and query (`cursor_binding`) and carries the export generation its page
+        was read at, so a page of a project that changed since is refused, never stitched to another."""
+        absent = not_found('Project not found')
+        try:
+            self._project(ctx, CAP_READ)
+        except HttpError as error:
+            if error.status == 401:
+                raise
+            raise absent from None
+        reader = getattr(self.backend, 'trace', None)
+        if reader is None:
+            raise absent
+        import trace_read
+        unknown = sorted(set(ctx.query) - set(self.TRACE_QUERY))
+        if unknown:
+            raise invalid('trace takes %s; not %s' % (', '.join(self.TRACE_QUERY), ', '.join(unknown)))
+        view = ctx.query.get('view', 'summary')
+        if view not in trace_read.VIEWS:
+            raise invalid('view must be one of %s' % ', '.join(trace_read.VIEWS))
+        scope = ctx.query.get('scope')
+        if scope is not None and not re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,72}', scope):
+            raise invalid('scope must be a design scope')
+        limit, state = self._page(ctx, ctx.query)
+        if limit > trace_read.PAGE_MAX:
+            raise invalid('limit must be between 1 and %d' % trace_read.PAGE_MAX)
+        carried = state.get('x') if isinstance(state.get('x'), dict) else {}
+        generation = carried.get('g') if isinstance(carried.get('g'), str) else None
+        if state['o'] and generation is None:
+            raise conflict('Invalid cursor')
+        result = dict(reader(ctx.params['pid'], view, scope, state['o'], limit, generation))
+        following = result.pop('next_offset', None)
+        result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, following,
+                                             extra={'g': result.get('generation')}, key=self.service.cursor_key())
+                                 if following is not None else None)
+        return 200, result
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/accept')
     def references_accept(self, ctx):

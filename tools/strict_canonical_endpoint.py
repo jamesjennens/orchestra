@@ -482,6 +482,24 @@ def dispatch(canonical, request, tmp, run=None):
         except delegations.DelegationRefusal as error:
             return refused(error.status, str(error))
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'trace':
+        # endpoint.py's trace read (kittrial-5bb.425) over the emulated rows: no read cache, so the
+        # generation is the rows' own digest.
+        try:
+            import trace_read
+        except ImportError:  # a revision that predates the trace read
+            raise ValueError('Unknown action')
+        rows = [json.loads(line) for line in run(['export', '--all']).split('\n') if line.strip()]
+        config_file = canonical.root / 'deployment.private.json'
+        config_data = json.loads(config_file.read_text(encoding='utf-8')) if config_file.is_file() else {}
+        members = None
+        if canonical.authority_config is not None and http_authority is not None:
+            members = (http_authority.read_state(canonical.authority_config.store).get('memberships') or {}).get(project) or {}
+        result = trace_read.answer(rows, project, trace_read.parse_options(args),
+                                   operators=config_data.get('operators') or [],
+                                   verifiers=config_data.get('verifiers') or [], members=members,
+                                   journal=canonical.path)
+        return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action in ('ref', 'capability'):
         # endpoint.py's reference catalog (kittrial-5bb.66) and capability index
         # (kittrial-5bb.67) reads and writes over the emulated rows.

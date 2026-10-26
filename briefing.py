@@ -621,6 +621,26 @@ class ContextPointers:
                 if isinstance(comment,dict) and comment.get('id') is not None and not is_record_comment(comment.get('text',comment.get('body'))):
                     self.comments.setdefault(str(comment['id']),[]).append((row,comment))
 
+    def loaded(self):
+        """The caller-readable, project-scoped rows every resolution reads (kittrial-5bb.425: the trace read
+        counts only these, so hidden equals absent in its totals too)."""
+        self._load()
+        return self.rows
+
+    def requirement_keys(self):
+        """Every requirement key a readable row claims (kittrial-5bb.425, the trace read's requirements view)."""
+        self._load()
+        return sorted(self._requirement_index())
+
+    def requirement(self,key):
+        """`req:KEY` resolved for any key, including one the token grammar cannot spell (kittrial-5bb.425)."""
+        self._load()
+        entry={'pointer':'req:'+key,'kind':'req','state':'unavailable','trust':'data'}
+        label,_=self._requirement(entry,key,None)
+        if entry['state'] in ('live','superseded'):
+            entry['label']=clip_context_label(label)
+        return entry
+
     def _catalog(self,kind):
         if kind not in self.catalogs:
             import reference_records,capability_records

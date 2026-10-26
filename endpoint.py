@@ -1188,6 +1188,7 @@ READ_ONLY_ACTIONS={
     'brief':_read_only_always,
     'history':_read_only_always,
     'requirements':_read_only_always,
+    'trace':_read_only_always,
     'work':_read_only_always,
     'review':_review_rounds_read_only,
     # kittrial-5bb.285: the blocking wait's per-poll read. It is one work read (one export)
@@ -1239,6 +1240,33 @@ def held_coordination_lock(path,shared=False):
     with (path/'.coordination.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         yield
+
+
+def trace_answer(root,path,name,args,actor,authority_config=None):
+    """(answer, warnings) of one trace page (kittrial-5bb.425). One export from the read cache under a shared
+    lock; the generation it was read at goes back with the answer and a page asked for at another generation
+    is refused. The membership that decides whose lines count (the round's publication line, the owner-only
+    decision heuristic) is read live from the service's state."""
+    import trace_read
+    from read_cache import cached_export_rows,project_generation
+    options=trace_read.parse_options(args)
+    run_warnings=[]
+    def run(argv):
+        stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+        if warnings:run_warnings.append(warnings)
+        return stdout
+    with held_coordination_lock(path,shared=True):
+        rows=cached_export_rows(root,path,run,name)
+        head=project_generation(root,name)
+        members=None
+        if authority_config is not None:
+            from http_authority import AuthorityDenied,read_state
+            try:members=((read_state(authority_config.store).get('memberships') or {}).get(name)) or {}
+            except AuthorityDenied:members={}
+        result=trace_read.answer(rows,name,options,operators=configured_operators(root),
+                                 verifiers=configured_verifiers(root),members=members,journal=path,
+                                 generation=None if head is None else 'g:'+head)
+    return result,''.join(run_warnings)
 
 
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None,frame=None):
@@ -1432,6 +1460,12 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         with held_coordination_lock(path,shared=coordination_lock_shared(request,'requirements',request.get('args',[]))):
             result=read_requirements(path,name,request.get('args',[]),run,configured_operators(root))
         return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+    if action=='trace':
+        # kittrial-5bb.425: the trace read (TRACEABILITY_DESIGN §5.2-§5.4), answered from records alone.
+        # Read-only: a shared lock and no guarded write. One export from the read cache; the generation it
+        # was read at goes back with the answer, and a page asked for at another generation is refused.
+        result=trace_answer(root,path,name,request.get('args',[]),actor,authority_config)
+        return {'returncode':0,'stdout':json.dumps(result[0],ensure_ascii=False)+'\n','stderr':result[1]}
     if action=='owner-requirements':
         from requirement_http import web_action
         run_warnings=[]
@@ -3078,6 +3112,8 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
+    ('trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]',
+     'the trace read, answered by the server: summary, requirements, tasks, tokens, decisions, designs, round'),
     ('trace --verify [--repo DIR] [--record | --payloads FILE]',
      "check each accepted design document against git at its pinned commit (verified, design-drift)"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),

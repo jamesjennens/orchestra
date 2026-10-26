@@ -607,6 +607,20 @@ of a kittrial-sized export, as the context index did for find.
    - The task page showing its own tokens resolved.
    - The client `trace` as a convenience.
    - The cost measured on a kittrial-sized export.
+   - **As built, part 1 (kittrial-5bb.425): the server read, the endpoint action, `GET /trace`, the
+     client.** trace_read.py is a library over one snapshot (`Snapshot`): the rows `brief` resolves
+     pointers from (briefing.py `ContextPointers.loaded`), with an `exclude` hook for any per-caller
+     rule. Requirement drafts and owner states are readable by every member today (the requirement
+     reads strip only operation handles, http_service.py `_requirements_state_only`), so no role-based
+     exclusion applies yet. `cites-superseded-revision` is `requirement_impact.analyze`'s first
+     production use, over manifests of the cited and the current accepted revisions. Lines read from
+     comments (the round's publication line, the owner-only decision heuristic) count only from a
+     person owner or coordinator in current membership or a listed operator; the converged design and
+     its decision are read from the `design.<scope>` entry, never from comments. **Measured** on a
+     synthetic kittrial-sized export (3,461 rows, 7,620 comments, 40 requirements, 20 indexed designs;
+     tests/trace_cost.py, Windows, Python 3.11): `analyze` 143 ms; each view's first answer in a fresh
+     interpreter 310-914 ms (`summary`, which builds every view, is the 914), a second answer 61-582 ms;
+     the row digest the endpoint falls back to without a tracker HEAD 38 ms. Part 2 builds the web.
 5. **Orchestra's system design.** docs/SYSTEM_DESIGN.md rewritten with the front block, uploaded as
    `design.orchestra` and accepted, IMPLEMENTATION_PLAN retired, and trace's first report on
    kittrial attached.
