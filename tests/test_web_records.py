@@ -1528,6 +1528,8 @@ class _RecordsScenarioMixin:
             body = _valid_ref_propose(key, title=title)
             body['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
                                  'observed': today, 'how': 'Checked the live board before proposing.'}
+            # An attestation must be reviewed within 6 months of observed; _review_by() is a year out.
+            body['review_by'] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=90)).isoformat()
             return body
 
         # An other-party draft: coord1 proposes, everyone reads the waiting item.
@@ -1718,6 +1720,7 @@ class _RecordsScenarioMixin:
         other_ref = _valid_ref_propose('probe.narrow-ref2', title='Probe Narrow Ref2')
         other_ref['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
                                   'observed': today, 'how': 'Checked the live board before proposing.'}
+        other_ref['review_by'] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=90)).isoformat()
         made = harness.request('POST', f'/v1/projects/{self.pid}/references', other_ref,
                                token=people['coord2']['token'], key='probe-narrow-ref2-propose')
         self.assertEqual(made.status, 201, made.data)
@@ -1785,6 +1788,7 @@ class _RecordsScenarioMixin:
         body = _valid_ref_propose('indep.shared-ref', title='Independent Shared Ref')
         body['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
                              'observed': today, 'how': 'Checked the live board before proposing.'}
+        body['review_by'] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=90)).isoformat()
         shared = harness.request('POST', f'/v1/projects/{pid}/references', body,
                                  token=people['coord2']['token'], key='indep-shared-propose')
         self.assertEqual(shared.status, 201, shared.data)
@@ -1820,6 +1824,7 @@ class _RecordsScenarioMixin:
         body2 = _valid_ref_propose('indep.split-ref', title='Independent Split Ref')
         body2['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
                               'observed': today, 'how': 'Checked the live board before proposing.'}
+        body2['review_by'] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=90)).isoformat()
         split = harness.request('POST', f'/v1/projects/{pid}/references', body2,
                                 token=people['coord2']['token'], key='indep-split-propose')
         self.assertEqual(split.status, 201, split.data)
