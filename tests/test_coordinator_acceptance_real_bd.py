@@ -15,6 +15,7 @@ A real bd is used when one is available: set ``ORCHESTRA_BD_BIN`` to the bd bina
 ``tests/test_bd_label_aliases.py``. POSIX-only because endpoint.py imports fcntl.
 """
 import csv
+import datetime
 import io
 import json
 import os
@@ -27,6 +28,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
@@ -62,6 +64,11 @@ def wire(project, actor, args, path):
     return client._wire(project, actor, args, 'coordinator', path)
 
 
+def _review_by():
+    today = datetime.date(*time.gmtime()[:3])
+    return (today + datetime.timedelta(days=365)).isoformat()
+
+
 def payload(operation_id='coord-direct-1', operation='draft', key=KEY):
     """The direct accepted revision 1: the form the HOST command writes with ``operation: draft``.
 
@@ -73,7 +80,7 @@ def payload(operation_id='coord-direct-1', operation='draft', key=KEY):
             'statement': 'Charts derive holidays from the pinned calendar module.',
             'authority': {'type': 'repo-path', 'path': 'src/example/calendar.py',
                           'commit': '0' * 40, 'anchor': 'HOLIDAYS'},
-            'owner': 'account:u-0001', 'review_by': '2027-01-15', 'tags': ['calendar', 'data'],
+            'owner': 'account:u-0001', 'review_by': _review_by(), 'tags': ['calendar', 'data'],
             'decisions': [], 'revision': 1, 'expected_sha256': None,
             'acceptance_state': 'accepted',
             'acceptance': {'decision_id': 'decision-42', 'owners': ['account:u-0001'],
@@ -165,6 +172,9 @@ class RealBdCoordinatorAcceptanceTests(unittest.TestCase):
         (cls.root / 'bin').mkdir()
         for name in ('home', 'config', 'dolt-home', 'data'):
             (cls.root / name).mkdir()
+        preload = os.environ.get('LD_PRELOAD')
+        if preload and Path(preload).is_file():
+            shutil.copy(preload, cls.root / 'home' / 'future_clock.so')
         cls.bd_path = cls.root / 'bin' / 'bd'
         shutil.copy(str(BD), str(cls.bd_path))
         sibling = BD.with_name('dolt')
@@ -237,11 +247,12 @@ class RealBdCoordinatorAcceptanceTests(unittest.TestCase):
         request = wire(PROJECT, actor, [subcommand, '--file', str(attachment)], None)
         target = str(KIT / 'endpoint.py')
         line = [sys.executable, str(KIT / 'ssh_forced_command.py'), '--root', str(self.root),
-                '--endpoint', target, '--python', sys.executable,
+                '--endpoint', target, '--python', str(KIT / 'tests' / 'endpoint_python.py'),
                 '--project', PROJECT, '--principal', PRINCIPAL]
         completed = subprocess.run(line, input=request, capture_output=True, text=True,
                                    encoding='utf-8',
-                                   env=dict(os.environ, SSH_ORIGINAL_COMMAND=target), timeout=240)
+                                   env=dict(os.environ, HOME=str(self.root / 'home'),
+                                            SSH_ORIGINAL_COMMAND=target), timeout=240)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return json.loads(completed.stdout)
 
@@ -256,7 +267,7 @@ class RealBdCoordinatorAcceptanceTests(unittest.TestCase):
                     'statement': 'Charts derive holidays from the pinned calendar module.',
                     'authority': {'type': 'repo-path', 'path': 'src/example/calendar.py',
                                   'commit': '0' * 40, 'anchor': 'HOLIDAYS'},
-                    'owner': 'account:u-0001', 'review_by': '2027-01-15', 'tags': ['calendar'],
+                    'owner': 'account:u-0001', 'review_by': _review_by(), 'tags': ['calendar'],
                     'decisions': [], 'revision': 1, 'expected_sha256': None}
         return endpoint.execute(self.root, {
             'project': PROJECT, 'actor': 'alice', 'action': 'ref',
@@ -366,6 +377,12 @@ class RealBdCoordinatorAcceptanceTests(unittest.TestCase):
                 payload(operation_id='coord-direct-retire', operation='retire')))
         self.assertIn('carries only accept', str(refusal.exception))
         self.assertIn('retire', str(refusal.exception))
+
+
+class ReviewByFixtureTests(unittest.TestCase):
+    def test_review_by_is_one_year_after_the_utc_date(self):
+        with patch('time.gmtime', return_value=time.struct_time((2028, 10, 25, 12, 0, 0, 3, 299, 0))):
+            self.assertEqual(_review_by(), '2029-10-25')
 
 
 if __name__ == '__main__':

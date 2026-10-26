@@ -212,7 +212,8 @@ class OperatorCommandTests(unittest.TestCase):
         self.native.actor = 'alice'
         rr.apply_native(entry(operation_id='attested', key='office.server.check', authority={
             'type': 'attestation', 'basis': 'host-check', 'by': 'person:james', 'observed': '2026-09-20',
-            'how': 'check script run on the office server'}), 'alice', self.native, self.project)
+            'how': 'check script run on the office server'}, review_by='2027-03-20'),
+                        'alice', self.native, self.project)
         single = self.accept_payload()
         items = [{'key': key, 'revision': 1,
                   'record_sha256': rr.existing_revisions(rr.anchor_for(rr.read_key_rows(self.native, key), key)[0])[1]['sha256']}
