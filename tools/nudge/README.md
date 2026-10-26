@@ -13,7 +13,8 @@ requests (`GET /v1/me/nudges`), and for each request for a lane in its config it
 
 1. `resume`: types the kit's fixed text and Enter, **only if** the terminal's foreground process is the
    lane's configured `harness` and the last non-empty screen line matches its `prompt` **in full** (an empty pattern is refused at start), and
-   the pane is not in tmux copy or scroll mode and not dead. Otherwise it types
+   the pane is not in tmux copy or scroll mode and not dead. The check and the typing are one tmux `if-shell -F`
+   command that prints which branch ran; if the pane turned blocked after the earlier look, nothing is typed. Otherwise it types
    nothing and answers `failed not-at-prompt`; no terminal at all is `failed no-session`.
 2. `restart`: restarts the lane's own `start_command` in the terminal, waits up to a minute for the harness
    at its prompt, then types the fixed `restart` text (`restarted`); no command or no prompt is
@@ -40,5 +41,5 @@ Get the credential from the account that owns the lane: make an agent for that a
 ## Limits of this reference
 
 It is tested with a fake terminal; the tmux adapter is a thin one (`display-message`, `capture-pane`,
-`send-keys`, `respawn-pane`). Check your harness's prompt pattern by hand before you trust it, as the wake
+`if-shell` with `send-keys`, `respawn-pane`). Check your harness's prompt pattern by hand before you trust it, as the wake
 README says of its own command. One instance per lane set: it keeps no lock file.

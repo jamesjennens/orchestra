@@ -41,6 +41,8 @@ CLAIM_TTL = 2 * 60
 #: A carrier polls no faster than every 30 seconds; none seen within three polls is no carrier.
 CARRIER_POLL = 30
 CARRIER_WINDOW = 3 * CARRIER_POLL
+#: The server accepts a carrier's beat no sooner than this after its last accepted one (the 90 s window absorbs it).
+CARRIER_MIN_INTERVAL = 20
 CARRIER_KINDS = ('supervisor', 'bridge')
 CARRIERS_MAX = 64
 CARRIER_LANES_MAX = 50

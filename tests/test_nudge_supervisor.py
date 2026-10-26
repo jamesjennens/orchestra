@@ -8,11 +8,13 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
@@ -36,6 +38,7 @@ class FakeTerminal(supervisor.Terminal):
     def __init__(self, foreground='copilot', screen='some output\n> ', present=True, blocked=False):
         self.running, self.shown, self.present, self.stuck = foreground, screen, present, blocked
         self.typed, self.restarted = [], []
+        self.refuses = False  # turns blocked only at the moment of typing, after blocked() said no
 
     def blocked(self):
         return self.stuck
@@ -50,7 +53,10 @@ class FakeTerminal(supervisor.Terminal):
         return self.shown
 
     def type_line(self, text):
+        if self.refuses:
+            return False
         self.typed.append(text)
+        return True
 
     def restart(self, command):
         self.restarted.append(command)
@@ -124,6 +130,50 @@ class TypingTests(unittest.TestCase):
         run = Run([item('resume')], terminal)
         run.poll()
         self.assertEqual(([], [('nudge-' + '0' * 24, 'failed', 'not-at-prompt')]), (terminal.typed, run.api.answers))
+
+    def test_a_terminal_that_turns_blocked_between_the_check_and_the_typing_is_failed_never_delivered(self):
+        for message in ('resume', 'restart'):
+            with self.subTest(message=message):
+                terminal = FakeTerminal()
+                terminal.refuses = True
+                run = Run([item(message)], terminal)
+                run.poll()
+                self.assertEqual(([], [('nudge-' + '0' * 24, 'failed', 'not-at-prompt')]),
+                                 (terminal.typed, run.api.answers))
+                self.assertEqual({}, run.supervisor.typed)
+
+    def test_the_tmux_adapter_types_in_one_command_and_only_says_typed_when_that_branch_ran(self):
+        for answer, typed in (((0, supervisor.TYPED + '\n'), True), ((0, supervisor.REFUSED + '\n'), False),
+                              ((0, ''), False), ((1, supervisor.TYPED + '\n'), False)):
+            with self.subTest(answer=answer):
+                terminal, calls = supervisor.TmuxTerminal('%1'), []
+                terminal._run = lambda *args, answer=answer: calls.append(args) or answer
+                self.assertEqual(typed, terminal.type_line('it\'s "x" $HOME; #{a}'))
+                self.assertEqual(1, len(calls))
+                self.assertEqual(('if-shell', '-F', '-t', '%1', '#{||:#{pane_in_mode},#{pane_dead}}'), calls[0][:5])
+                self.assertIn('-l "it\'s \\"x\\" \\$HOME\\; \\#{a}"', calls[0][6])
+
+    @unittest.skipUnless(shutil.which('tmux'), 'tmux is not installed')
+    def test_on_a_private_tmux_server_the_text_is_typed_when_free_and_nothing_is_typed_in_copy_mode(self):
+        base = tempfile.mkdtemp(prefix='nudge-tmux-')
+        self.addCleanup(shutil.rmtree, base, True)
+        env = {'TMUX_TMPDIR': base}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop('TMUX', None)
+            self.addCleanup(subprocess.call, ['tmux', 'kill-server'], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, env=dict(os.environ))
+            subprocess.check_call(['tmux', 'new-session', '-d', '-s', 'a', '-x', '120', '-y', '20', 'cat'])
+            terminal = supervisor.TmuxTerminal('a')
+            time.sleep(0.3)
+            self.assertTrue(terminal.type_line('free: it\'s "ok" $X; #{y}'))
+            time.sleep(0.3)
+            self.assertIn('free: it\'s "ok" $X; #{y}', terminal.screen())
+            subprocess.check_call(['tmux', 'copy-mode', '-t', 'a'])
+            self.assertTrue(terminal.blocked())
+            self.assertFalse(terminal.type_line('blocked text'))
+            subprocess.check_call(['tmux', 'send-keys', '-t', 'a', 'q'])
+            time.sleep(0.3)
+            self.assertNotIn('blocked text', terminal.screen())
 
     def test_the_tmux_adapter_calls_a_pane_blocked_unless_tmux_says_it_is_in_no_mode_and_alive(self):
         for answer, blocked in (((0, '0 0\n'), False), ((0, '1 0\n'), True), ((0, '0 1\n'), True),
