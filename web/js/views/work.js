@@ -39,20 +39,27 @@ export async function home(ctx) {
     h('div', { class: 'panel-head' }, h('h2', { id: 'h-' + title.replace(/\W+/g, ''), class: 'small' }, title, ' ', h('span', { class: 'nav-count' }, count)), note ? h('span', { class: 'small muted' }, note) : null),
     body);
   const myAgents = data.agents || [];
-  const needs = myAgents.filter((a) => ['feedback', 'idle'].includes(attentionOf(a))).length;
-  const agentsPanel = myAgents.length ? h('section', { class: 'panel', 'aria-labelledby': 'h-agents' },
-    h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'h-agents' }, 'Your agents ', h('span', { class: 'nav-count' }, needs ? `${needs} need you` : 'all busy')),
+  // Slice 5 (kittrial-5bb.427, design 2.5): My work shows one row per agent that
+  // needs its owner; the full card grid stays on My agents. The row still renders
+  // through agentCard (data-agent with the name as its first H3 is kept); only
+  // the membership here is narrowed, from the server's attention state.
+  const needed = myAgents.filter((a) => ['feedback', 'idle'].includes(attentionOf(a)));
+  const agentsPanel = needed.length ? h('section', { class: 'panel', 'aria-labelledby': 'h-agents' },
+    h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'h-agents' }, 'Your agents ', h('span', { class: 'nav-count' }, `${needed.length} need you`)),
       h('span', { class: 'small muted' }, 'As of ', new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), ' · ', h('button', { type: 'button', class: 'link', onclick: () => ctx.render() }, 'Refresh'))),
-    h('div', { class: 'panel-body agent-grid' }, myAgents.map((a) => agentCard(ctx, a, { compact: false })))) : null;
+    h('div', { class: 'panel-body agent-grid' }, needed.map((a) => agentCard(ctx, a, { compact: false })))) : null;
   return h('div', { class: 'stack' },
     pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.` }),
     incomplete ? h('div', { class: 'banner' }, 'Some projects could not be read just now, or there is more work than one page shows. Open a project to see all of its tasks.') : null,
     agentPromptPanel(ctx, data),
     contributions,
     agentsPanel,
-    panel('Revisions requested', revisions.length, workTable(ctx, revisions, { emptyTitle: 'No revisions requested', emptyBody: 'When a reviewer asks for changes to your work, it appears here first.' })),
-    panel('Waiting for your review', data.to_review.length, workTable(ctx, data.to_review, { emptyTitle: 'Nothing to review', emptyBody: 'Contributions to projects you own appear here until you approve them or request changes.' }), 'Stays here until you act — no reminder needed'),
-    panel('Assigned to you', assigned.length, workTable(ctx, assigned, { emptyTitle: 'Nothing assigned', emptyBody: 'Claim a task from a project to start work on it.' })));
+    // Slice 5 (design 2.5, 2.7): empty groups are one line, not an empty-state
+    // block; groups with items keep their panel. Omitting the sections entirely
+    // would hide where Revisions/Waiting/Assigned live.
+    revisions.length ? panel('Revisions requested', revisions.length, workTable(ctx, revisions, { emptyTitle: 'No revisions requested', emptyBody: 'When a reviewer asks for changes to your work, it appears here first.' })) : h('p', { class: 'empty-line' }, 'No revisions requested.'),
+    data.to_review.length ? panel('Waiting for your review', data.to_review.length, workTable(ctx, data.to_review, { emptyTitle: 'Nothing to review', emptyBody: 'Contributions to projects you own appear here until you approve them or request changes.' }), 'Stays here until you act — no reminder needed') : h('p', { class: 'empty-line' }, 'Nothing to review.'),
+    assigned.length ? panel('Assigned to you', assigned.length, workTable(ctx, assigned, { emptyTitle: 'Nothing assigned', emptyBody: 'Claim a task from a project to start work on it.' })) : h('p', { class: 'empty-line' }, 'Nothing assigned.'));
 }
 
 // "Copy prompt for my agent": one button per agent the person owns. The server builds
