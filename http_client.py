@@ -551,6 +551,11 @@ class Client:
         return self.request('GET', '/v1/projects/%s/tasks%s'
                             % (quote(project, safe=''), _query(limit, cursor)))
 
+    def task_summaries(self, project, tasks):
+        """One bounded read of checkpoints and latest ordinary posts."""
+        return self.request('POST', '/v1/projects/%s/tasks/summary' % quote(project, safe=''),
+                            {'tasks': tasks})
+
     def get_task(self, project, task):
         return self.request('GET', '/v1/projects/%s/tasks/%s'
                             % (quote(project, safe=''), quote(task, safe='')))
@@ -927,6 +932,10 @@ def _build_parser():
                       help='the new limit: a whole number from 1 up to the current one')
     mine.add_argument('--idempotency-key',
                       help='reuse exactly this key and request after an uncertain result')
+    work_read = sub.add_parser('work', help='bounded task checkpoint/post summaries')
+    work_read.add_argument('project')
+    work_read.add_argument('operation', choices=('summary',))
+    work_read.add_argument('tasks', nargs='+')
     slot = sub.add_parser('merge-slot', help='read or coordinate the project merge slot')
     slot.add_argument('project')
     slot.add_argument('operation', choices=('read', 'acquire', 'release', 'force-release', 'create'))
@@ -1054,6 +1063,9 @@ def main(argv=None):
             return 0
         if args.command == 'whoami':
             print(json.dumps(client.whoami(), indent=2))
+            return 0
+        if args.command == 'work':
+            print(json.dumps(client.task_summaries(args.project, args.tasks), indent=2))
             return 0
         if args.command == 'my-claim-limit':
             print(json.dumps(client.set_my_claim_limit(args.claim_limit,

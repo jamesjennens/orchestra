@@ -1399,7 +1399,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             lanes_scope,request.get('lanes_scope') if isinstance(request,dict) else None)
         def work_effect():
             read_context = {}
-            if action in ('work', 'wait'):
+            if action in ('work', 'wait') and args[:1] != ['summary']:
                 read_context['comment_authority'] = comment_contact_authority(root,path,operators,authority_config)
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,

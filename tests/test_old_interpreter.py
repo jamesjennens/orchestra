@@ -64,7 +64,7 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'wake_log.py',  # kittrial-5bb.397: library-only (no __main__ block); imported by work, lanes and http_service
            'sessions.py', 'task_assignment.py', 'version.py', 'waiting.py', 'web_guidance.py', 'web_lifecycle.py', 'web_lifecycle_marks.py', 'web_merge_slot.py',
            'web_release.py',  # kittrial-5bb.378: library-only (no __main__ block); imported by endpoint
-           'work.py')
+           'work.py', 'work_summary.py')
 
 AS_VERSION = """
 import collections, runpy, sys

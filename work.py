@@ -520,7 +520,8 @@ def help_payload(action='work'):
     usage = {
         'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
                 '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
-                ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]',
+                ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]'
+                ' | work summary TASK [TASK ...] [--json]',
         'review': 'review TASK [--rounds | --file payload.json]',
         'handoff': 'handoff TASK --file payload.json',
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
@@ -550,8 +551,12 @@ def help_payload(action='work'):
             'lanes-idle-minutes': '%d..%d (work lanes; the threshold is an argument of the read, not a '
                                   'setting)' % (lanes.IDLE_MINUTES_MIN, lanes.IDLE_MINUTES_MAX),
             'lanes-limit': '%d..%d (work lanes)' % (lanes.LANES_LIMIT_MIN, lanes.LANES_LIMIT_MAX),
+            'summary-tasks': '1..100 distinct task IDs (work summary)',
+            'summary-next-action': '500 characters; omitted characters counted',
+            'summary-author': '96 characters; omitted characters counted',
         }
         payload['output'] = {
+            'task_summary': 'work summary returns schema_version and items in requested order; each item has task, found, status, checkpoint, last_post and coverage. Hidden and unknown task IDs have identical missing items. No checkpoint means unknown open items, never zero. checkpoint.state is a usable declared lane state or unknown; native task status is separate.',
             'top_level': ['owner', 'total', 'your_move', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
             'guidance': 'guidance: the project\'s current standing guidance version (kittrial-5bb.99), '
                         'with present, version (null for unbound text), set_at, set_by (null when the audit record does not bind to '
@@ -929,6 +934,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     items=[]
     checkpoint_states={}
     attention_snapshots={}
+    attention_selections={}
     from review_state import is_integration_warning, reverts_by_task
     if reverts is None:
         revert_map,revert_problems=reverts_by_task(rows,operators,journal)
@@ -1185,6 +1191,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                 pass
         comment_pending = assignee_comment_pending(row, checkpoint_data,
                                                    review.get('last_response'), full=full,
+                                                   selection_cache=attention_selections,
                                                    authority=comment_authority or (lambda author: comment_author_allowed(author,operators,owners))) if state != 'error' else False
         move,move_text,role=move_decision(state,row['id'],bool(subject) and actor_holds(row.get('assignee'), subject),
                                           named_reviewer=review_request,pending_items=pending_items,
@@ -1352,7 +1359,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         if item['task'] in task_rows:
             item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task']),
                                                 provenance_writes=provenance_writes,
-                                                full=attention_snapshots.get(item['task'])))
+                                                full=attention_snapshots.get(item['task']),
+                                                selection_cache=attention_selections))
     # The count of the QUEUE's items where the next move is the caller's, from the same
     # reconciled rows the sort used, so every page reports the same number
     # (kittrial-5bb.249 review, item 2a).
@@ -1425,6 +1433,10 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         # Structured output is already JSON; accept the flag consistently with brief/show/work.
         args=[token for token in args if token!='--json']
     if action in ('work','wait'):
+        summary_ids = None
+        if action == 'work' and args[:1] == ['summary']:
+            from work_summary import parse_args as summary_args
+            summary_ids = summary_args(args[1:])
         # kittrial-5bb.339: the export rows come from the generation-keyed cache when
         # the tracker has not committed since they were parsed (a write IS visible to
         # the next read: every write commits, so the key moves and the cache misses).
@@ -1432,6 +1444,9 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rows=cached_export_rows(path.parent.parent, path, run)
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+        if summary_ids is not None:
+            from work_summary import read as summary_read
+            return summary_read(rows, summary_ids, project=path.name)
         from lifecycle import host_snapshot
         rows=host_snapshot(rows, run=run, project=path)
         if action=='wait':

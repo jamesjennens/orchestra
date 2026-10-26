@@ -396,3 +396,55 @@ predicate can only restrict them further for direct embedders and tests.
 
 The latest checkpoint's resolved list is shown within the requested item limit, with
 its total and omitted count, independently of the open-item page.
+
+
+## Read checkpoint summaries for many tasks
+
+`b work summary TASK [TASK ...] [--json]` reads a batch of 1..100 distinct task IDs
+under the shared project coordination lock. IDs must have the existing task-ID syntax;
+invalid, repeated, empty or oversized requests are refused before the native read.
+The batch shares one export snapshot instead of calling brief/history once per task.
+The existing generation cache can avoid that export on a warm read; generation and
+classification metadata queries are separate from the export.
+
+The HTTP client provides the same read:
+
+```sh
+python http_client.py --base-url https://office.example --token=TOKEN work PROJECT summary TASK TASK2
+```
+
+Its `Client.task_summaries(PROJECT, [TASK, TASK2])` method posts
+`{"tasks":["TASK","TASK2"]}` to `/v1/projects/PROJECT/tasks/summary`. This is a read,
+without an idempotency reservation. Current project read authority is required,
+including current membership and credential scope. Record anchors (including malformed
+anchors), the merge slot and rows of issue type `event` or `gate` are hidden just as
+on the task surface. A hidden task ID and an unknown ID return
+exactly the same missing item; the read never probes again to explain absence.
+
+Both forms return `schema_version: 1` and `items` in requested order. Each item has
+`task`, `found`, native `status`, `checkpoint`, `last_post` and `coverage`.
+The newest valid linked checkpoint contributes only its `comment_id`, `timestamp`,
+`state`, `next_action`, `next_action_omitted_chars` and `open_items_count`.
+Its `state` is the declared lane state only when the existing lane-state reader binds
+that record to the selected checkpoint; otherwise it is `unknown`. No prose or age
+implies a state. A missing checkpoint is null: its open-item count is unknown, never
+an invented zero. Conflicting/unreadable checkpoint history gives unknown coverage;
+invalid skipped checkpoint records give partial coverage. Neither means completion. Coverage describes the
+summary fields, not provenance completeness or incorporation of all history.
+
+`last_post` is the latest ordinary nonblank comment, ordered by timestamp then native
+comment-ID text, with `comment_id`, `timestamp`, `author` and
+`author_omitted_chars`. Record-family comments of any version and reserved record
+comments, including review, integration,
+checkpoint and lane-state records, never become ordinary posts. No checkpoint body,
+provenance map, item text or task description is returned. Next actions are clipped
+to 500 characters and authors to 96, with exact omitted-character counts. Unusable
+comment identities/timestamps are reported with unknown coverage instead of an
+unbounded or fabricated answer. The read changes no native task/comment record.
+
+`work --owner` shares a matching checkpoint's activity selection between attention
+and displayed fields within one request. An owner's earlier checkpoint remains a
+separate selection from another author's current checkpoint. This reuse is neither
+persistent nor shared between callers; current comment authority is still evaluated
+by the read. Performance depends on the project and host; synthetic timings are
+qualification evidence, not a guaranteed latency for another deployment.

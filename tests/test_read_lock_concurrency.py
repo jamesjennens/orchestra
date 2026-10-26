@@ -90,6 +90,13 @@ class EndpointReadLockTests(unittest.TestCase):
         self.assertEqual(self.locked_flags(['list', '--all', '--limit', '0', '--json']),
                          [endpoint.fcntl.LOCK_SH])
 
+    def test_task_summary_dispatch_uses_shared_lock_and_explicit_identity_stays_exclusive(self):
+        self.assertEqual(self.locked_flags(['summary', 'alpha-task'], action='work'),
+                         [endpoint.fcntl.LOCK_SH])
+        self.assertEqual(self.locked_flags(['summary', 'alpha-task'], action='work',
+                                          operation_id='summary-explicit-identity'),
+                         [endpoint.fcntl.LOCK_EX])
+
     def test_a_bd_write_keeps_the_exclusive_lock(self):
         self.assertEqual(self.locked_flags(['create', 'a task']),
                          [endpoint.fcntl.LOCK_EX])
