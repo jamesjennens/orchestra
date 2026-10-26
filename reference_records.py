@@ -873,6 +873,8 @@ def get(rows, key, operators, current=None, web_service=False):
 def _list_item(entry, current=None, web_service=False):
     source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
     waiting = entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')
+    proposed = entry.get('proposed') or {}
+    record = entry.get('record') or {}
     item = {'key': entry['key'], 'title': (source.get('title') or entry.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
             'owner': source.get('owner'), 'review_by': source.get('review_by') if entry['record'] else None,
             'proposed_review_by': (entry['proposed'] or {}).get('review_by'),
@@ -881,6 +883,13 @@ def _list_item(entry, current=None, web_service=False):
             'acceptance_inert': entry.get('acceptance_inert', False),
             # What kind of authority the listed revision carries, and whether that revision
             # is the accepted record: a draft attestation is never shown unmarked.
+            # The authority object itself rides along for the waiting queue, whose
+            # authority cell prints an attested draft (kittrial-5bb.420 2.3: the cell
+            # read only rec.authority/item.authority and showed a dash although the
+            # draft's attestation was there).
+            'authority': source.get('authority'),
+            'proposed_authority': proposed.get('authority'),
+            'record_authority': record.get('authority'),
             'authority_kind': authority_kind(source) if source else None, 'authority_accepted': entry['record'] is not None}
     if web_service:
         item.update(

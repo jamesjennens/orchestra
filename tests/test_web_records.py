@@ -1344,6 +1344,109 @@ class _RecordsScenarioMixin:
         self.assertEqual(c_ver_ok.status, 200, c_ver_ok.data)
         self.assertEqual(c_ver_ok.data['proposer'], people['coord2']['uid'])
 
+    def run_viewer_may_accept_suite(self):
+        """The ONE server field gating 'Review & accept' (kittrial-5bb.420 item 2).
+
+        The page must never combine flags itself: it shows 'Review & accept' only
+        when the waiting item's ``viewer_may_accept`` is true, else 'View'. The
+        field is computed by the same checks the accept route enforces
+        (can_coordinate, self_accept_blocked, approval_by_another_party, the
+        .407 delegation-in-force check for agents), never a copy; the accept route
+        still enforces on its own. An owner, a person coordinator, a contributor,
+        a viewer, an agent with and without a delegation, and an own draft each
+        get the right button, and a forced accept the page did not offer is still
+        refused. Dates are derived from now (no hard-coded clock comparisons).
+        """
+        import datetime
+        harness = self.harness
+        people = self._setup_actors(harness)
+        coord1 = people['coord1']['token']
+        coord2 = people['coord2']['token']
+        contrib = people['contrib']['token']
+        viewer = people['viewer']['token']
+        agent1 = people['coord1_agent']
+        agent3 = people['coord2_agent']
+        pid = self.pid
+        for ag in (agent1, agent3):
+            g = harness.request('PUT', f'/v1/projects/{pid}/agents/{ag["id"]}/coordinator', {}, token=self.owner_token)
+            self.assertEqual(g.status, 200, g.data)
+        today = datetime.date.today().isoformat()
+
+        def attested_body(key, title):
+            body = _valid_ref_propose(key, title=title)
+            body['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
+                                 'observed': today, 'how': 'Checked the live board before proposing.'}
+            return body
+
+        # An other-party draft: coord1 proposes, everyone reads the waiting item.
+        prop = harness.request('POST', f'/v1/projects/{pid}/references',
+                               attested_body('viewer.gate-ref', title='Viewer Gate Ref'),
+                               token=coord1, key='viewer-gate-propose')
+        self.assertEqual(prop.status, 201, prop.data)
+        seen = {}
+        for label, tok in (('owner', self.owner_token), ('person-coordinator', coord1),
+                           ('contributor', contrib), ('viewer', viewer),
+                           ('agent-no-delegation', agent3['token'])):
+            wait = harness.request('GET', f'/v1/projects/{pid}/references?waiting=true', token=tok)
+            self.assertEqual(wait.status, 200, wait.data)
+            (item,) = [i for i in wait.data['items'] if i['key'] == 'viewer.gate-ref']
+            seen[label] = (item.get('viewer_may_accept'), item.get('viewer_may_accept_reason'))
+            # The waiting item carries the draft's authority (kittrial-5bb.420 item 3).
+            self.assertEqual((item.get('proposed_authority') or {}).get('type'), 'attestation', label)
+            self.assertEqual((item.get('authority') or {}).get('type'), 'attestation', label)
+        # Owner and person coordinator may act on an other-party draft; a
+        # contributor and a viewer may not; an agent without a delegation may not.
+        self.assertTrue(seen['owner'][0], seen)
+        self.assertTrue(seen['person-coordinator'][0], seen)
+        self.assertFalse(seen['contributor'][0], seen)
+        self.assertFalse(seen['viewer'][0], seen)
+        self.assertFalse(seen['agent-no-delegation'][0], seen)
+        self.assertIn('delegation', seen['agent-no-delegation'][1], seen)
+        # A forced accept the page did not offer is still refused (viewer, contributor).
+        for label, tok in (('viewer', viewer), ('contributor', contrib)):
+            forced = harness.request(
+                'POST', f'/v1/projects/{pid}/references/viewer.gate-ref/accept',
+                {'expected_revision': 1, 'record_sha256': prop.data['sha256'],
+                 'evidence': 'Forced accept the page did not offer.'},
+                token=tok, key='viewer-gate-forced-' + label)
+            self.assertEqual(forced.status, 403, (label, forced.data))
+        # The owner's agent with a live delegation may act.
+        delegation = self._delegate(harness, title='Viewer gate delegation')
+        wait = harness.request('GET', f'/v1/projects/{pid}/references?waiting=true', token=agent1['token'])
+        (mine,) = [i for i in wait.data['items'] if i['key'] == 'viewer.gate-ref']
+        self.assertTrue(mine.get('viewer_may_accept'), mine)
+        # An own draft is never the reader's to accept, even with a delegation.
+        own = harness.request('POST', f'/v1/projects/{pid}/references',
+                              attested_body('viewer.own-ref', title='Viewer Own Ref'),
+                              token=agent1['token'], key='viewer-gate-own-propose')
+        self.assertEqual(own.status, 201, own.data)
+        own_view = harness.request('GET', f'/v1/projects/{pid}/references/viewer.own-ref', token=agent1['token'])
+        self.assertFalse(own_view.data['viewer_may_accept'], own_view.data)
+        r = harness.request(
+            'POST', f'/v1/projects/{pid}/references/viewer.own-ref/accept',
+            {'expected_revision': 1, 'record_sha256': own.data['sha256'],
+             'evidence': 'An agent never accepts its own draft.', 'decision_id': delegation},
+            token=agent1['token'], key='viewer-gate-own-accept-fail')
+        self.assertEqual(r.status, 403, r.data)
+        # The owner's own person draft is gated the same way (self_accept_blocked).
+        own_person = harness.request('POST', f'/v1/projects/{pid}/references',
+                                     attested_body('viewer.owner-own', title='Viewer Owner Own'),
+                                     token=self.owner_token, key='viewer-gate-owner-own-propose')
+        self.assertEqual(own_person.status, 201, own_person.data)
+        with harness.service.store.lock:
+            harness.service.approval_by_another_party = True
+            harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = True
+            harness.service.store.save()
+        try:
+            blocked = harness.request('GET', f'/v1/projects/{pid}/references/viewer.owner-own',
+                                      token=self.owner_token)
+            self.assertFalse(blocked.data['viewer_may_accept'], blocked.data)
+        finally:
+            with harness.service.store.lock:
+                harness.service.approval_by_another_party = False
+                harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = False
+                harness.service.store.save()
+
 
 @unittest.skipUnless(os.name == 'nt', 'POSIX runs NativeWebRecordsTests against real endpoint.py and real bd')
 class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
@@ -1381,6 +1484,9 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
     def test_delegated_record_acceptance(self):
         self.run_delegation_suite()
 
+    def test_viewer_may_accept_gate(self):
+        self.run_viewer_may_accept_suite()
+
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
@@ -1412,6 +1518,10 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_self_acceptance_and_approval_by_another_party(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_self_acceptance_and_party_rules_suite()
+
+    def test_native_viewer_may_accept_gate(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_viewer_may_accept_suite()
 
 
 

@@ -4897,7 +4897,7 @@ def task_matches(task, filters):
 class RouteContext:
     __slots__ = ('principal', 'payload', 'query', 'params', 'request_id',
                  'idempotency_key', 'body_hash', 'auth_source', 'secure',
-                 'route_target', 'authorize')
+                 'route_target', 'authorize', '_records_delegation_cache')
 
     def __init__(self, principal, payload, query, params, request_id, idempotency_key,
                  body_hash, auth_source, secure, route_target):
@@ -10832,6 +10832,69 @@ class ApiHandler(BaseHTTPRequestHandler):
         can_coordinate = role in ('coordinator', 'owner') and holds(CAP_COORDINATE)
         return can_propose, can_coordinate
 
+    def _viewer_may_accept(self, ctx, pid, item, can_coordinate, self_accept_blocked):
+        """(may_accept, reason): the ONE server field gating 'Review & accept'.
+
+        Never combined in the page: the page shows 'Review & accept' only when
+        ``may_accept`` is true, else 'View'. The same checks the accept route
+        enforces (endpoint.py ``party_check``): a coordinator (owner role) whose
+        own party did not propose the draft, and — for an agent caller — a
+        delegation in force covering that agent. The accept route still enforces
+        on its own. ``reason`` is a short plain sentence for display only.
+        """
+        by_agent = getattr(ctx.principal, 'via', None) == 'credential'
+        if not can_coordinate:
+            return False, 'Only the project coordinator may accept.'
+        if self_accept_blocked:
+            return False, 'A coordinator may not accept a draft their own party proposed.'
+        if by_agent and item.get('needs_delegation'):
+            covered = self._coverage_for(ctx, pid)
+            if covered is True:
+                return True, ''
+            if covered is False:
+                return False, 'An agent accepts only within a delegation in force.'
+            return False, 'Whether a delegation covers this agent could not be read.'
+        return True, ''
+
+    def _coverage_for(self, ctx, pid):
+        """Whether a delegation in force covers the caller's agent (kittrial-5bb.420).
+
+        Read once per request through the same live ``delegation list`` read the
+        accept route enforces under its lock; a caller the read refuses (or an
+        older backend without it) gets no coverage. Person callers never need
+        this; only an agent's acceptance is gated on a delegation.
+
+        A backend without the canonical endpoint's delegation read (the
+        service-local backend the web tests use) has no coverage signal: an
+        agent there is treated as uncovered, the same refusal the accept route
+        (which has no delegation decision id to check) would give.
+        """
+        cache = getattr(ctx, '_records_delegation_cache', None)
+        if cache is None:
+            cache = {}
+            ctx._records_delegation_cache = cache
+        if pid in cache:
+            return cache[pid]
+        covered = None
+        try:
+            read = getattr(self.backend, 'delegations_read', None)
+            if read is not None and getattr(ctx.principal, 'via', None) == 'credential':
+                actor = getattr(ctx.principal, 'actor', '') or ''
+                head = actor.split('/', 1)[0]
+                payload = read(pid, ctx.principal)
+                for entry in (payload.get('granted_agents') or []):
+                    if isinstance(entry, dict) and entry.get('agent') == head:
+                        covered = bool(entry.get('covered'))
+                        break
+                else:
+                    covered = False
+            elif getattr(ctx.principal, 'via', None) == 'credential':
+                covered = False
+        except HttpError:
+            covered = None
+        cache[pid] = covered
+        return covered
+
     def _enrich_record_view(self, ctx, pid, capabilities, item):
         if not isinstance(item, dict):
             return item
@@ -10933,6 +10996,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
+        may_accept, may_reason = self._viewer_may_accept(
+            ctx, pid, item, can_coordinate, item.get('self_accept_blocked'))
+        item['viewer_may_accept'] = bool(may_accept)
+        item['viewer_may_accept_reason'] = may_reason
         return item
 
     def _enrich_records_list(self, ctx, pid, result):
