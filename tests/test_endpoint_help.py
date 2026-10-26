@@ -15,6 +15,7 @@ import io
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -184,6 +185,41 @@ class EndpointRefusalTests(unittest.TestCase):
         self.assertIn("if args[0] not in ALLOWED:", source)
         self.assertEqual(endpoint.ALLOWED, {'list', 'show', 'ready', 'search', 'count', 'create',
                                             'update', 'close', 'reopen', 'comments', 'dep', 'state', 'lint'})
+
+
+class ClientLocalCapabilityTests(unittest.TestCase):
+    """kittrial-5bb.310: the endpoint's list of client-run `capability` subcommands is derived, not hand-kept."""
+
+    @staticmethod
+    def client_runs(module):
+        """The subcommands the client runs itself: its parser's, and one per `_capability_NAME` it defines.
+
+        `validate` also reaches the endpoint (the client only adds a repository stage), so it is not here.
+        """
+        import capabilities
+        parser = capabilities._parser()
+        parsed = set(next(a for a in parser._actions if a.dest == 'command').choices)
+        defined = {n[len('_capability_'):] for n in dir(module) if n.startswith('_capability_')}
+        return (parsed | defined) - {'validate'}
+
+    def test_the_table_the_endpoint_reads_is_what_the_clients_own_parser_and_dispatch_say(self):
+        import capabilities
+        self.assertEqual(set(capabilities.CLIENT_COMMANDS), self.client_runs(client))
+        self.assertFalse(set(capabilities.CLIENT_COMMANDS) & set(client.CAPABILITY_ENDPOINT))
+
+    def test_a_new_client_local_subcommand_that_is_not_in_the_table_fails_the_derivation(self):
+        import capabilities
+        extra = types.SimpleNamespace(_capability_lookup=None, _capability_check=None, _capability_validate=None,
+                                      _capability_zzz=None)
+        self.assertNotEqual(set(capabilities.CLIENT_COMMANDS), self.client_runs(extra))
+        self.assertEqual({'lookup', 'check', 'zzz'} | {'resolve', 'index'}, self.client_runs(extra))
+
+    def test_the_sentence_is_built_from_the_name_alone(self):
+        if endpoint is None:
+            self.skipTest('endpoint imports fcntl (POSIX-only)')
+        self.assertEqual('`capability lookup` runs in the client, not on the server: it reads the checkout on your '
+                         'machine, which the server cannot see. Run it as `python client.py --config CONFIG '
+                         '--project PROJECT capability lookup ...`.', endpoint.client_capability_sentence('lookup'))
 
 
 if __name__ == '__main__':

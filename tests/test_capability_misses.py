@@ -915,6 +915,35 @@ class EndpointTests(MissLogCase):
                                           'merge': {'count': 1, 'first': T0, 'last': T0}})
         self.assertNotIn('alice', self.file.read_text(encoding='ascii'))
 
+    def test_a_subcommand_the_client_runs_is_answered_with_one_sentence_naming_it_and_nothing_of_the_request(self):
+        from capabilities import CLIENT_COMMANDS
+        secret = 'SECRET-ARGUMENT-/etc/passwd'
+        for name in CLIENT_COMMANDS:
+            with self.subTest(name=name):
+                reply = self.reply([name, secret, '--repo', '/home/x'])
+                self.assertEqual(2, reply['returncode'])
+                self.assertEqual('ValueError: ' + self.endpoint.client_capability_sentence(name) + '\n', reply['stderr'])
+                self.assertIn('python client.py', reply['stderr'])
+                self.assertIn('capability %s' % name, reply['stderr'])
+                for leaked in (secret, '/home/x', '--repo', 'unknown command'):
+                    self.assertNotIn(leaked, reply['stderr'])
+
+    def test_what_the_endpoint_handles_still_runs_and_an_unknown_subcommand_keeps_its_old_answer(self):
+        from capabilities import CLIENT_COMMANDS
+        for name in client.CAPABILITY_ENDPOINT + ('validate',):
+            self.assertNotIn(name, CLIENT_COMMANDS)
+        self.assertEqual(0, self.reply(['list'])['returncode'])
+        self.assertIn('found', self.execute(['find', 'nothing here']))
+        for unknown in ('lookupp', 'zzz'):
+            reply = self.reply([unknown, 'phrase'])
+            self.assertEqual((2, 'ValueError: capability: unknown command %s; use get, list, find, misses, validate, '
+                                 'propose, revise, propose-alias or verify\n' % unknown), (reply['returncode'], reply['stderr']))
+
+    def test_help_for_a_client_subcommand_keeps_its_answer(self):
+        reply = self.reply(['lookup', '--help'])
+        self.assertEqual(0, reply['returncode'], reply)
+        self.assertNotIn('runs in the client', reply['stdout'])
+
     def test_a_pending_alias_only_lifts_a_candidate_so_it_still_counts_as_a_miss(self):
         self.accept('merge.slot', 'Merge slot', [], 'a1')
         self.native.actor = 'alice'
