@@ -49,6 +49,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 import actor_names
 import agent_prompts
 import bd_refusals
+from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
 import claim_limit
 import project_setup
 import project_coordination
@@ -1043,8 +1044,8 @@ class InProcessBackend:
         if not isinstance(title, str) or not title.strip() or len(title) > 200:
             raise invalid('Task title must be 1-200 characters')
         description = payload.get('description') or ''
-        if not isinstance(description, str) or len(description) > 20000:
-            raise invalid('Task description is too long')
+        if not isinstance(description, str) or len(description) > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
         # A null priority is absent, not a value (kittrial-5bb.183 review item 4): the route
         # guard and the endpoint backend already read it that way, and every released client
         # sends null where it has no value, so bd's default 2 applies on both backends.
@@ -1078,8 +1079,8 @@ class InProcessBackend:
                 value = payload[field]
                 if field == 'title' and (not isinstance(value, str) or not value.strip() or len(value) > 200):
                     raise invalid('Task title must be 1-200 characters')
-                if field == 'description' and (not isinstance(value, str) or len(value) > 20000):
-                    raise invalid('Task description is too long')
+                if field == 'description' and (not isinstance(value, str) or len(value) > DESCRIPTION_MAX):
+                    raise invalid(DESCRIPTION_TOO_LONG)
                 if field == 'status' and value not in ('open', 'closed'):
                     raise invalid('Task status must be open or closed')
                 if field == 'priority' and (type(value) is not int or not 0 <= value <= 4):
@@ -6404,6 +6405,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._task_title(title)
         if description is not None and not isinstance(description, str):
             raise invalid('Task description must be text')
+        if description is not None and len(description) > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
         if status is not None and status not in ('open', 'closed'):
             raise invalid('Task status must be open or closed')
         if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
@@ -10618,6 +10621,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._task_title(payload.get('title'))
         if payload.get('description') is not None and not isinstance(payload['description'], str):
             raise invalid('Task description must be text')
+        if len(payload.get('description') or '') > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
         self._bind_task_actor(ctx, payload)
 
         def create():

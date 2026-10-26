@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -396,6 +397,78 @@ class LockTests(WakeCase):
         self.assertEqual(self.wake_lines(), ['one'])
         self.assertEqual(len(self.log_lines()), 1)
         self.assertEqual(self.state_text(), self.fingerprint(1))
+
+    # -- the lock step must not depend on which coreutils is installed (kittrial-5bb.422) --
+    def fake_tool(self, name, body):
+        """A directory with one fake coreutil first in PATH; the real one is run by absolute path."""
+        real = shutil.which(name)
+        bin_dir = self.dir / 'fakebin'
+        bin_dir.mkdir(exist_ok=True)
+        tool = bin_dir / name
+        tool.write_text('#!/bin/sh\nREAL=%s\n%s\n' % (shlex.quote(real), body), encoding='utf-8')
+        tool.chmod(0o755)
+        self.env['PATH'] = str(bin_dir) + os.pathsep + self.env['PATH']
+
+    def together(self, delay=0.0):
+        args = self.script_args()
+        first = subprocess.Popen(args, env=dict(self.env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(delay)
+        second = subprocess.Popen(args, env=dict(self.env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _, first_error = first.communicate(timeout=60)
+        _, second_error = second.communicate(timeout=60)
+        self.assertEqual(first.returncode, 0, first_error)
+        self.assertEqual(second.returncode, 0, second_error)
+
+    def test_two_runs_wake_once_when_mkdir_reports_success_for_an_existing_directory(self):
+        # uutils mkdir (Ubuntu 26.04) runs statx then mkdir(2), so two concurrent runs can
+        # both be told they made the directory. This fake does exactly that: it waits, then
+        # reports success whether or not the directory exists (-p calls are untouched).
+        self.fake_tool('mkdir', 'case " $* " in *" -p "*) exec "$REAL" "$@";; esac\n'
+                       'sleep 0.3\n'
+                       'for last; do :; done\n'
+                       'exec "$REAL" -p "$last"')
+        self.scenario_for(1, sleep=1)
+        self.together()
+        self.assertEqual(self.wake_lines(), ['one'])
+        self.assertEqual(len(self.log_lines()), 1)
+
+    def test_two_runs_taking_over_one_stale_lock_wake_once(self):
+        # Both runs see the dead pid. The second starts while the first is inside its
+        # (slowed) removal of the pid file; only the run that wins the takeover marker may
+        # remove it, or the second would remove the pid file the first has just retaken.
+        self.fake_tool('rm', 'case " $* " in *"/pid "*) sleep 0.4;; esac\nexec "$REAL" "$@"')
+        self.scenario_for(1, sleep=1)
+        self.hold(99999999)
+        self.together(delay=0.15)
+        self.assertEqual(self.wake_lines(), ['one'])
+        self.assertEqual(len(self.log_lines()), 1)
+        self.assertFalse(self.lock.exists(), 'the run that took the lock over must release it')
+
+    def test_a_takeover_marker_left_by_a_dead_run_is_named_with_its_removal(self):
+        self.scenario_for(1)
+        self.hold(99999999)
+        marker = self.lock / 'stale.99999999'
+        marker.write_text('99999998\n', encoding='utf-8')
+        done = self.run_wake()
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn(str(marker), done.stderr)
+        self.assertIn("rm -f '%s'" % marker, done.stderr)
+        self.assertEqual(self.calls_made(), [])
+        self.assertTrue(marker.exists(), 'the message names the file; the run does not remove it')
+        marker.unlink()
+        again = self.run_wake()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(self.wake_lines(), ['one'])
+
+    def test_a_takeover_marker_held_by_a_live_run_makes_this_run_exit_quietly(self):
+        self.scenario_for(1)
+        self.hold(99999999)
+        (self.lock / 'stale.99999999').write_text('%s\n' % os.getpid(), encoding='utf-8')
+        done = self.run_wake()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stderr, '')
+        self.assertEqual(self.calls_made(), [])
+        self.assertTrue((self.lock / 'stale.99999999').exists())
 
 
 SETTING_NAMES = (('--state', 'WAKE_STATE'), ('--lock', 'WAKE_LOCK'), ('--log', 'WAKE_LOG'))
