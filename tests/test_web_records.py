@@ -212,6 +212,40 @@ class _RecordsScenarioMixin:
                                     'evidence': 'Read the stored design document.'},
                                    token=people['coord2']['token'], key='design-web-accept')
         self.assertEqual(accepted.status, 200, accepted.data)
+        # Part 2: the design page. A member reads it; every caller who may not and every scope that is not
+        # there get one and the same 404 (hidden equals absent).
+        page = harness.request('GET', f'/v1/projects/{self.pid}/designs/web-design', token=people['viewer']['token'])
+        self.assertEqual(page.status, 200, page.data)
+        self.assertEqual(page.data['document'], long_text)
+        self.assertEqual((page.data['index_state'], page.data['verification']['state']), ('matches', 'unverified'))
+        harness.create_account(self.owner_token, 'rec-outsider', 'rec-password-1')
+        outsider, _, _ = harness.login('rec-outsider', 'rec-password-1')
+        absent = [harness.request('GET', f'/v1/projects/{self.pid}/designs/{scope}', token=token)
+                  for scope, token in (('web-design', outsider), ('no-such-design', outsider),
+                                       ('no-such-design', people['viewer']['token']),
+                                       ('kit', people['viewer']['token']))]
+        self.assertEqual({(r.status, r.data['error']['code'], r.data['error']['message']) for r in absent},
+                         {(404, 'not_found', 'Design not found')})
+        # Without a session every scope gets the authentication answer, the same whether it exists or not.
+        anonymous = [harness.request('GET', f'/v1/projects/{self.pid}/designs/{scope}')
+                     for scope in ('web-design', 'no-such-design')]
+        self.assertEqual({(r.status, r.data['error']['code']) for r in anonymous}, {(401, 'unauthenticated')})
+        # Q4: a member who may propose files a report; it opens design-drift marked untrusted.
+        authority = self._design_body(long_text)['authority']
+        report = {'doc_sha256': authority['sha256'], 'path': authority['path'], 'commit': authority['commit'],
+                  'observed_sha256': '0' * 64, 'result': 'fail', 'reason': 'mismatch'}
+        for name in ('viewer', 'nonmember_su'):
+            refused = harness.request('POST', path + '/design.web-design/verifications', report,
+                                      token=people[name]['token'], key='design-report-' + name)
+            self.assertEqual(refused.status, 403, (name, refused.data))
+        filed = harness.request('POST', path + '/design.web-design/verifications', report,
+                                token=people['contrib']['token'], key='design-report-contrib')
+        self.assertEqual(filed.status, 201, filed.data)
+        self.assertEqual(filed.data['identity'], 'unverified')
+        seen = harness.request('GET', path + '/design.web-design', token=people['viewer']['token'])
+        verification = seen.data['verification']
+        self.assertEqual((verification['state'], verification['trusted'], len(verification['reported_by'])),
+                         ('design-drift', False, 1))
         # A viewer may not propose one even with a small body (the role, as for every reference write).
         small = harness.request('POST', path, self._design_body(text, key='design.other-web'),
                                 token=people['viewer']['token'], key='design-viewer')

@@ -380,10 +380,12 @@ The five states are:
   `unavailable` with no flags.
 - `design:` resolves against the reference entry `design.SCOPE`. Flags: `unknown-scope`
   (no such readable entry) and `not-selected` (only a draft revision). A retired entry
-  reads `superseded`. A `#SECTION` is shown as `section: {anchor, state: "unchecked"}`:
-  headings are checked once designs are indexed on the server.
+  reads `superseded`. A `#SECTION` is shown as `section: {anchor, state}`, checked against the
+  server-derived index of the revision shown (kittrial-5bb.418): `live` when it has a heading with
+  that anchor, else `unknown` with the flag `unknown-section`. A design entry with no single index
+  (one written before design documents were stored, or two differing copies) reads `unchecked`.
 
-Text output appends `flags=...` and `section=ANCHOR unchecked` to these lines.
+Text output appends `flags=...` and `section=ANCHOR STATE` to these lines.
 
 Every pointer carries `trust: data`. Labels pass through `plain_text` before clipping
 at 120 characters, without leaving a partial Unicode escape. Text display folds line

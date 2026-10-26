@@ -10558,6 +10558,8 @@ def main():
     a.add_argument('--operation-id',default=None,help='retain the returned identity for an exact retry after uncertainty')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('design-verify',help='record trusted design-document checks from trace --verify --payloads (operator allowlist or verifiers list)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
     a.add_argument('--key-file',required=True,help='a file holding one plain OpenSSH public key line')
     a.add_argument('--role',choices=['contributor','operator','both'],default='both',
@@ -11210,6 +11212,32 @@ def main():
         print(json.dumps(sweep_project_temporaries(root,args.project,dry_run=args.dry_run,
                                                    min_age_seconds=args.min_age_minutes*60),
                          sort_keys=True,indent=1))
+    elif args.command=='design-verify':
+        # kittrial-5bb.418 (TRACEABILITY_DESIGN §5.1 step 4): the one route that writes a trusted design
+        # verification. Each report names an accepted repo-document revision; the actor must be on the operator
+        # allowlist or the verifiers list, both read strictly.
+        import fcntl
+        import reference_records
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        items=payload.get('items') if isinstance(payload,dict) else payload
+        if not isinstance(items,list) or not 1<=len(items)<=100:raise ValueError('design-verify takes {"items": [1..100 reports]}')
+        authority=operators(root,strict=True);listed=verifiers(root,strict=True)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        results=[]
+        for item in items:
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                try:
+                    results.append(reference_records.write_verification(item,args.actor,run,operators=authority,
+                                                                        verifiers=listed,route='host'))
+                except ValueError as error:
+                    results.append({'key':(item or {}).get('key') if isinstance(item,dict) else None,
+                                    'recorded':False,'refused':str(error)})
+        print(json.dumps({'items':results,'recorded':sum(1 for item in results if item.get('recorded'))}))
+        # Review of part 2 (N5): a run that refused any item does not exit 0.
+        if any('refused' in item for item in results):raise SystemExit(1)
     elif args.command=='capability-verify':
         import contextlib
         import fcntl

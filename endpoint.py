@@ -1738,7 +1738,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if warnings:run_warnings.append(warnings)
             return stdout
         by_service=authority_config is not None and require_authority
-        writes=reference_records.CONTRIBUTOR_OPERATIONS+(reference_records.HTTP_WRITE_COMMANDS if by_service else ())
+        if args[:1]==['design']:
+            # kittrial-5bb.418: the design page read (the stored document as text, its index and state).
+            # Read-only, no lock; it reads one key's rows and that revision's stored bytes.
+            rest=[token for token in args[1:] if token!='--json']
+            revision=None
+            if len(rest)==3 and rest[1]=='--revision' and re.fullmatch(r'[1-9][0-9]{0,8}',rest[2]):
+                revision=int(rest[2]);rest=rest[:1]
+            if len(rest)!=1 or not isinstance(rest[0],str):raise ValueError('ref design takes SCOPE [--revision N]')
+            key='design.'+rest[0]
+            try:reference_records.valid_key(key)
+            except ValueError:raise ValueError('Design not found') from None
+            result=reference_records.design_page(reference_records.read_key_rows(run,key),rest[0],path,
+                                                 configured_operators(root),configured_verifiers(root),revision)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        writes=reference_records.CONTRIBUTOR_OPERATIONS+('verify',)+(reference_records.HTTP_WRITE_COMMANDS if by_service else ())
         if not args or args[0] not in writes:
             import capability_misses
             log=capability_misses.REFERENCE
@@ -1755,7 +1769,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=capability_misses.report(path,lambda:reference_records.NowAnswered(reference_records.read_rows(run),configured_operators(root)),limit,log)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
             looked_up=reference_records.miss_phrase(args)
-            try:result=reference_records.read(args,run,configured_operators(root),web_service=authority_config is not None)
+            try:result=reference_records.read(args,run,configured_operators(root),web_service=authority_config is not None,
+                                              verifiers=configured_verifiers(root))
             except ValueError as error:
                 # `ref get` of a key nobody has recorded is a lookup that missed.
                 if looked_up is not None and str(error).startswith('Unknown reference key'):counted(looked_up,False)
@@ -1768,6 +1783,22 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         identity_check,party_check,_=_records_http_context(coordinator,run_warnings,run,'references')
         # kittrial-5bb.418: a design.<scope> propose or revise carries its document as a second
         # attachment (flag --document), checked, stored and indexed by reference_records.
+        if args[0]=='verify':
+            # kittrial-5bb.418 (Q4): a `trace --verify` report through the endpoint is written unverified;
+            # only admin.py design-verify on the host writes a trusted one. Contributor-level, like propose.
+            payload=reference_records.verification_payload(args,request.get('attachments',{}))
+            runner=NativeRunner(run, project=path)
+            def verify_effect():
+                result=reference_records.write_verification(payload,actor,runner,operators=configured_operators(root),
+                                                            verifiers=configured_verifiers(root),
+                                                            route='web' if by_service else 'endpoint')
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                return guarded_write(root,request,journal_path(path),verify_effect,
+                                     authority_config=authority_config,
+                                     require_authority=require_authority,runner=runner,
+                                     identity_check=identity_check)
         payload,document=reference_records.write_payload_and_document(args,request.get('attachments',{}),commands=writes)
         runner=NativeRunner(run, project=path)
         def ref_effect():
@@ -3047,6 +3078,8 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
+    ('trace --verify [--repo DIR] [--record | --payloads FILE]',
+     "check each accepted design document against git at its pinned commit (verified, design-drift)"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),

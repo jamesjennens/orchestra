@@ -1594,6 +1594,39 @@ sets `operation`.
     `repo-path` design entries written before stay readable. A repo-document revision is stored as
     `Kind: reference-entry-v3`, which a kit from the decision authority's release on reads
     `unsupported` (never malformed).
+  - **Verification.** `ref get` of an entry with an accepted repo-document revision carries
+    `verification`: `unverified` until checked; `verified` (with `verified_by`, `verified_at`) after a
+    trusted pass; `design-drift` after a failing report, with `trusted` (whether a trusted verifier
+    reported it), `reported_by`, `reason` and `observed_sha256`. A later trusted pass clears a drift,
+    including a trusted re-check whose result is the same as an earlier one; a pinned commit's file
+    cannot change, so otherwise the way out is a revision.
+  - Reports belong to a document, not a revision: a check binds the document's sha256, path and
+    commit. A later revision that pins exactly the same bytes, path and commit again (for example a
+    revise that returns to an earlier document) carries that document's reports and state with it; a
+    revision with another path or commit starts unverified.
+  - `trace --verify [--repo DIR] [--record | --payloads FILE]` (client) reads each accepted design
+    document's path at its pinned commit from git's own object and compares its sha256 with the
+    stored document's. It exits 3 when any check fails and 4 when it checked nothing, so a CI step
+    cannot pass without a check. A commit the checkout does not hold is reported "not checked"
+    (fetch it and run again), never as a fail; there is no dirty-checkout refusal because every read is
+    git's object at the pinned commit, never the working tree. `--record` files each result with
+    `ref verify --file report.json`, which writes an **unverified** report: it can open
+    `design-drift` (marked `trusted: false`) and never marks a document verified. `--payloads FILE`
+    writes `{"items": [...]}` for `admin.py design-verify`, the only route that writes a trusted
+    check, for an actor on the operator allowlist or the deployment's verifiers list
+    ([operations](OPERATIONS.md#reference-and-capability-records)); it exits 1 when it refused any
+    item, after printing every item's outcome.
+  - A report is `{schema_version: 1, key, doc_sha256, path, commit, observed_sha256, result, reason}`:
+    `result` is `pass` (reason `match`, and `observed_sha256` equals `doc_sha256`) or `fail` (`mismatch`,
+    `missing`, `not-a-regular-file` or `not-utf8`). It must name the accepted revision's own document.
+    A report is a repeat, and writes nothing, only when the newest report on that document is the
+    same one: the same submitter and route, result and observed sha256. After any newer report it is
+    written again. Untrusted reports are bounded per submitter and document: at most 10 passes and 5
+    fails; the trusted route is not bounded.
+  - `ref design SCOPE [--revision N]` reads the design page: the stored document as text, its index,
+    `index_state` (`matches`, `missing` or `differs`), `heading_lines` (the line of each index heading,
+    in the index's order, so a reader places anchors without its own heading rule), and the revision's
+    state. Anything that is not a readable repo-document revision answers `Design not found`.
 - **Caller-written fields are refused.** `acceptance_state`, `successor`, `sha256`,
   `acceptance` and `labels` are written by the operation.
 - **`propose`** creates the entry's native anchor, closes it and posts revision 1 as a
