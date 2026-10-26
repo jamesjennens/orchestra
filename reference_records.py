@@ -233,6 +233,11 @@ def valid_authority(value):
         if 'commit' not in value or 'sha256' not in value:
             raise ValueError('a repo-document authority needs its pinned commit and the document sha256')
         _repository_location(value)
+        # Review of part 1: a repo-document path is one plain line (no NUL, newline or other C0/C1 control). The
+        # repo-path rule is left as it was: existing entries are validated on every read, so tightening it could
+        # turn a stored entry malformed.
+        if any(ord(character) < 32 or 127 <= ord(character) < 160 for character in value['path']):
+            raise ValueError('authority.path of a repo-document must not contain a control character')
         if not isinstance(value['sha256'], str) or not design_documents.SHA256.fullmatch(value['sha256']):
             raise ValueError('authority.sha256 must be the 64-character lowercase hex sha256 of the document')
     elif kind == 'url':
@@ -769,8 +774,9 @@ def _apply_native(payload, actor, run, project, operator, operators, web_coordin
                                     party_check=party_check, seen=seen, web_service=web_service)
     except ValueError as error:
         # A refusal wrote no revision: the bytes this call stored are removed again (discard keeps a blob
-        # any journal entry names). An uncertain write keeps them: its retry sends the same document.
-        if stored is not None and stored[2] and 'uncertain' not in str(error):
+        # any journal entry names). Only a write whose native outcome is uncertain keeps them, decided by
+        # its type (review b1: a refusal's message can carry caller text); its retry sends the same document.
+        if stored is not None and stored[2] and not isinstance(error, core.UncertainOutcome):
             import task_files
             task_files.discard(project, stored[0])
         raise
