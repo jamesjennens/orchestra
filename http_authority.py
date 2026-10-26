@@ -2699,7 +2699,8 @@ BLOCK_CAPABILITIES = {
     'task-assign': CAP_COORDINATE,         # dedicated assignee-only guarded operation
     'task-release': CAP_TASKS,             # releasing your OWN claim (kittrial-5bb.301)
     'assignment-roster': CAP_COORDINATE,   # project-scoped existing assignment targets
-    'coordinate': {'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
+    'coordinate': {'create-child': CAP_COORDINATE,
+                   'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
                    'merge-release': CAP_COORDINATE, 'merge-create': CAP_PROJECT_ADMIN},
     'web-merge-slot': {'check': CAP_READ, 'acquire': CAP_COORDINATE,
                        'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
