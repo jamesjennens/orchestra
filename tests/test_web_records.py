@@ -304,6 +304,15 @@ class _RecordsScenarioMixin:
         ungranted = harness.request('PATCH', '/v1/agents/' + elsewhere.data['agent']['id'], {'projects': []},
                                     token=self.owner_token)
         self.assertEqual(ungranted.status, 200, ungranted.data)
+        # A carrier agent's credential (scope `nudges`) meets the service-wide carrier gate before any route
+        # (http_service.py CARRIER_ROUTES): the same 403 as the tasks read. A coexisting gate, not trace's.
+        carrier = harness.request('POST', '/v1/agents', {'name': 'Carrier', 'working_directory': '/tmp/carrier',
+                                                         'projects': [pid], 'scopes': ['nudges']},
+                                  token=self.owner_token)
+        self.assertEqual(carrier.status, 201, carrier.data)
+        for route in ('trace', 'tasks'):
+            self.assertEqual(harness.request('GET', f'/v1/projects/{pid}/{route}',
+                                             token=carrier.data['credential']['secret']).status, 403, route)
         absent = [get(outsider), get(elsewhere.data['credential']['secret']),
                   get(people['viewer']['token'], project='no-such-project'), get(outsider, view='tokens')]
         self.assertEqual({(r.status, r.data['error']['code'], r.data['error']['message']) for r in absent},
@@ -335,11 +344,24 @@ class _RecordsScenarioMixin:
         stale = get(viewer, view='tokens', limit='3', cursor=first.data['next_cursor'])
         self.assertEqual(stale.status, 409, stale.data)
         self.assertIn('The project changed since this page was read', stale.data['error']['message'])
+        # A credential whose issuer has left the project: the tasks read says 403 (http_authority.py
+        # credential_capabilities); trace answers the one 404, like every caller who may not read the project.
+        agent_secret = people['coord1_agent']['token']
+        self.assertEqual(get(agent_secret).status, 200)
+        removed = harness.request('DELETE', f'/v1/projects/{pid}/members/' + people['coord1']['uid'],
+                                  token=self.owner_token)
+        self.assertIn(removed.status, (200, 204), removed.data)
+        self.assertEqual(harness.request('GET', f'/v1/projects/{pid}/tasks', token=agent_secret).status, 403)
+        left = get(agent_secret)
+        self.assertEqual((left.status, left.data['error']['message']), (404, 'Project not found'))
         # Bounds and the query's shape.
         for query in ({'view': 'everything'}, {'view': 'tokens', 'limit': '51'}, {'view': 'tokens', 'sort': 'x'},
                       {'view': 'round', 'scope': 'Not A Scope'}):
             refused = get(viewer, **query)
             self.assertEqual(refused.status, 422, (query, refused.data))
+        # The route refuses an over-long page itself, before the endpoint is asked.
+        self.assertEqual(get(viewer, view='tokens', limit='51').data['error']['message'],
+                         'limit must be between 1 and 50')
         summary = get(viewer)
         self.assertEqual(summary.status, 200, summary.data)
         self.assertEqual([line['view'] for line in summary.data['rows']],
