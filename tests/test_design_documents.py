@@ -316,11 +316,37 @@ class UploadTests(DesignCase):
         self.assertEqual(answer['flags'], ['unknown-scope'])
 
     def test_a_repo_document_path_is_one_plain_line(self):
+        # Review r1 (control characters) and r2 b2 (bidi, zero-width, separators, tags): the plain-text rule
+        # task-file names follow, applied to repo-document paths only.
         text = document()
-        for path in ('docs/a\nb.md', 'docs/a\x00b.md', 'docs/a\tb.md', 'docs/a\x85b.md', 'docs/a\x7fb.md'):
-            with self.subTest(path=repr(path)):
-                with self.assertRaisesRegex(ValueError, 'control character|authority.path'):
-                    self.propose_design(text, authority=authority(text, path=path.encode().decode('unicode_escape')))
+        for code in (0x0A, 0x00, 0x09, 0x85, 0x7F, 0x202E, 0x202A, 0x2067, 0x2069, 0x061C, 0x200E, 0x200B,
+                     0x2028, 0xFEFF, 0xE0041):
+            path = 'docs/a' + chr(code) + 'b.md'
+            with self.subTest(code=hex(code)):
+                writes, blobs = self.writes(), self.blobs()
+                with self.assertRaisesRegex(ValueError, 'authority.path'):
+                    self.propose_design(text, authority=authority(text, path=path))
+                self.nothing_written(writes, blobs)
+
+    def test_a_repo_path_authority_keeps_its_earlier_rule(self):
+        # Only repo-document paths are tightened: a repo-path entry is re-validated on every read.
+        rr.valid_authority({'type': 'repo-path', 'path': 'docs/a' + chr(0x202E) + 'b.md', 'commit': 'a' * 40})
+
+    def test_a_second_request_for_the_same_document_never_deletes_a_blob_it_did_not_create(self):
+        # Review r2 (N3, the reviewer's SharedBlobProbe): an uncertain write keeps its unjournaled blob for its
+        # retry; another request that stores the same bytes (created False) and is refused must not remove it.
+        self.native.fail_comment_prefix = rr.ENTRY_V3_PREFIX
+        with self.assertRaises(rr.core.UncertainOutcome):
+            self.propose_design()
+        self.native.fail_comment_prefix = None
+        digest = authority(document())['sha256']
+        self.assertEqual(self.blobs(), [digest])
+        self.assertEqual(task_files.all_entries(self.project), [])
+        with self.assertRaises(ValueError):
+            self.propose_design(operation_id='second', decisions=['no-such-decision'])
+        self.assertEqual(self.blobs(), [digest])
+        self.propose_design()
+        self.assertEqual(len(self.indexes()), 1)
 
     def test_a_refused_revision_removes_the_bytes_it_stored(self):
         self.propose_design()

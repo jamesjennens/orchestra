@@ -6072,7 +6072,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # A retry of a file already attached under this name: answered from the record,
                 # without reading the body again (design 3a: an idempotent 200).
                 known = task_files.read_entry(project, tid, expected)
-                if known is not None and known.get('withdrawn') is None and known['name'] == name and \
+                # kittrial-5bb.418 review r2 (N1): a design document's entry is not an attached file.
+                if known is not None and known.get('withdrawn') is None and known.get('direction') != task_files.DESIGN \
+                        and known['name'] == name and \
                         task_files.blob_size(project, expected) == known['bytes']:
                     return 200, dict(task_files.view(known), replayed=True)
             task_files.check_room(project, tid, length, limit)

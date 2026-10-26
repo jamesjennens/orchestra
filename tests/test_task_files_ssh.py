@@ -97,6 +97,17 @@ class TaskFilesOverSshTests(unittest.TestCase):
     def stored(self, task=None, data=b''):
         return task_files.read_entry(self.project, task or self.task, sha(data))
 
+    def test_a_put_naming_a_design_document_is_never_answered_as_a_replay(self):
+        # kittrial-5bb.418 review r2 (N1): a design document's journal entry is not an attached file.
+        import design_documents
+        data = b'<!-- design-v1\nscope: x\nstatus: candidate\n-->\n# X\n'
+        digest, _ = design_documents.store_blob(self.project, data)
+        design_documents.journal(self.project, self.task, 'design.x', 1, digest, len(data), 'ops', '2026-10-26T00:00:00Z')
+        put = self.put_file('ops', data, name='design.x.md')
+        self.assertNotEqual(0, put.returncode, put.stdout)
+        self.assertNotIn('"replayed"', put.stdout)
+        self.assertEqual(self.stored(data=data)['direction'], task_files.DESIGN)
+
     # -- the round trip ----------------------------------------------------------------------------
     def test_a_coordinator_hands_a_file_to_the_assignee_who_gets_it_and_hands_one_back(self):
         data = b'spreadsheet ' * 30000
