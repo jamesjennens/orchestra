@@ -524,6 +524,11 @@ class HardCapTests(Fixture):
                 lists(self.view(view)['rows'], view)
 
 
+def task_row_cites_fields(snap, task_id):
+    row = next(r for r in t.trace(snap, 'tasks')['rows'] if r['id'] == task_id)
+    return [cite['where'] for cite in row['cites']]
+
+
 class TokenCostTests(Fixture):
     """Review b2: planted tokens cannot make a read expensive."""
 
@@ -596,6 +601,15 @@ class TokenCostTests(Fixture):
         self.assertEqual(cut, {'checkpoint': 100})
         contributed = [r for r in rows if r['where'].get('field') == 'contribution-summary']
         self.assertEqual(len(contributed), 100)   # every contribution token checked, despite the checkpoint
+        # The fields are read in the order CLI_CONTRACT names: the description first, then the checkpoint, then
+        # the contribution, and the rows say so.
+        order = []
+        for r in rows:
+            field = r['where'].get('field')
+            if r['pointer'] is not None and field not in order:
+                order.append(field)
+        self.assertEqual(order, ['description', 'checkpoint-source', 'contribution-summary'])
+        self.assertEqual(task_row_cites_fields(snap, TASK)[0], 'description')
         task_row = next(r for r in t.trace(snap, 'tasks')['rows'] if r['id'] == TASK)
         self.assertEqual(task_row['flags'], ['cites-superseded-revision'])
         self.assertEqual(task_row['tokens_not_checked'], 100)
