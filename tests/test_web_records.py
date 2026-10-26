@@ -1697,6 +1697,15 @@ class _RecordsScenarioMixin:
                     pass
             else:
                 registry.write_text(before, encoding='utf-8')
+        # b1 (review round 5): indep.shared-ref stays waiting (independent_hold
+        # refused its same-party accept); indep.split-ref was accepted, so it
+        # leaves the waiting queue. The suite now runs on its own project (see
+        # NativeIndependentApprovalTests), where nothing else asserts.
+        not_waiting = harness.request(
+            'GET', f'/v1/projects/{pid}/references?waiting=true', token=people['coord1']['token'])
+        self.assertEqual(not_waiting.status, 200, not_waiting.data)
+        self.assertEqual([item['key'] for item in not_waiting.data['items']],
+                         ['indep.shared-ref'], not_waiting.data)
 
     def run_settings_seen_alone_suite(self):
         """Review t2 (r4): settings_seen WITHOUT the service flag (and reverse).
@@ -1857,13 +1866,45 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_settings_seen_alone_suite()
 
-    def test_native_independent_approval_session_owners(self):
-        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=True)
-        self.run_independent_approval_session_owners_suite()
-
     def test_native_nothing_waits_gate(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_nothing_waits_suite()
+
+
+
+@unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
+class NativeIndependentApprovalTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCase):
+    """Independent-approval session-owners suite on a project of its own.
+
+    b1 (review round 5): run_independent_approval_session_owners_suite leaves
+    indep.shared-ref waiting and indep.split-ref accepted; on the shared class
+    project that broke the lifecycle suite's exact waiting list and its
+    find-corpus assertions. Like NativeDelegationTests, this runs on its own
+    project so its drafts meet no other suite's assertions.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pid = 'pp'
+        root = self.root
+
+        class Harness(fixes.Harness):
+            def make_backend(h):
+                return http_service.EndpointBackend(
+                    sys.executable, str(KIT / 'endpoint.py'), str(root), service=h.service)
+
+        self.harness = Harness(methodName='runTest')
+        self.harness.setUp()
+        self.addCleanup(self.harness._stop_server)
+        self.owner_token = self.harness.admin_token()
+        reg = self.harness.request('POST', '/v1/projects', {'project_id': self.pid, 'name': 'Native Independent Approval'},
+                                   token=self.owner_token)
+        self.assertEqual(reg.status, 201, reg.data)
+
+    def test_native_independent_approval_session_owners(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=True)
+        self.run_independent_approval_session_owners_suite()
 
 
 
