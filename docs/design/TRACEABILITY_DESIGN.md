@@ -591,6 +591,15 @@ of a kittrial-sized export, as the context index did for find.
      function of the bytes, key, path and commit, so revisions that pin one document share it and
      an accepted revision keeps its own. Part 2 builds `trace --verify`, the design page and
      `unknown-section`.
+   - **As built, part 2 (kittrial-5bb.418): verify, page, sections.** A report is a reserved
+     `Kind: design-verification-v1` record. Trust mirrors capabilities: only `admin.py design-verify`
+     by an actor on the operator allowlist or the verifiers list writes a trusted record; reports
+     through `ref verify`, `trace --verify --record` or the members-only web route are unverified.
+     Any failing report opens `design-drift`; one opened only by untrusted reports reads
+     `trusted: false` with `reported_by` (the coordinator's Q4). The design page
+     (`GET /v1/projects/{id}/designs/{scope}`, web `/p/{pid}/designs/{scope}`) renders the stored
+     document as text with the server's anchors and gives one 404 for everything a caller may not
+     read. `design:` sections resolve against the selected index: `live`, or `unknown-section`.
 4. **The trace read on the server, and the Coverage panel.**
    - `GET /trace` and the endpoint action, all six views, bounds, permission before counts, the
      no-design case.

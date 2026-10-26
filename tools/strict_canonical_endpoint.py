@@ -496,7 +496,7 @@ def dispatch(canonical, request, tmp, run=None):
         verifiers = config_data.get('verifiers') or []
         launched = canonical.authority_config is not None
         by_service = launched and canonical.require_authority
-        base_writes = reference_records.CONTRIBUTOR_OPERATIONS if action == 'ref' else records.WRITE_COMMANDS
+        base_writes = reference_records.CONTRIBUTOR_OPERATIONS + ('verify',) if action == 'ref' else records.WRITE_COMMANDS
         http_writes = getattr(records, 'HTTP_WRITE_COMMANDS', ()) if by_service else ()
         writes = base_writes + http_writes
         if not args or args[0] not in writes:
@@ -525,8 +525,18 @@ def dispatch(canonical, request, tmp, run=None):
                         raise ValueError('no issues found matching the provided IDs')
                     return json.dumps(found)
                 raise ValueError('unsupported native read')
-            if action == 'ref':
-                result = records.read(args, ref_run, operators, web_service=launched)
+            if action == 'ref' and args[:1] == ['design']:
+                # endpoint.py's design page read (kittrial-5bb.418).
+                rest = [token for token in args[1:] if token != '--json']
+                revision = int(rest[2]) if len(rest) == 3 and rest[1] == '--revision' else None
+                try:
+                    rows_of_key = reference_records.read_key_rows(ref_run, 'design.' + rest[0])
+                    result = reference_records.design_page(rows_of_key, rest[0], canonical.path, operators,
+                                                           verifiers, revision)
+                except ValueError:
+                    raise ValueError('Design not found') from None
+            elif action == 'ref':
+                result = records.read(args, ref_run, operators, web_service=launched, verifiers=verifiers)
             else:
                 result = records.read(args, ref_run, operators, verifiers=verifiers, journal=canonical.path,
                                       web_service=launched)
@@ -618,7 +628,12 @@ def dispatch(canonical, request, tmp, run=None):
                                 'A coordinator may not accept or verify a record whose draft was proposed '
                                 'by the same party while approval_by_another_party is enabled.')
                     party_check = _party_check
-            if action == 'ref':
+            if action == 'ref' and args[0] == 'verify':
+                # endpoint.py's `ref verify` (kittrial-5bb.418): always an unverified report here.
+                result = reference_records.write_verification(
+                    reference_records.verification_payload(args, attachments), actor, run, operators=operators,
+                    verifiers=verifiers, route='web' if by_service else 'endpoint')
+            elif action == 'ref':
                 payload, document = reference_records.write_payload_and_document(args, attachments, commands=writes)
                 result = reference_records.apply_native(
                     payload, actor, run, canonical.path, operator=coordinator,

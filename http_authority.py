@@ -2737,7 +2737,8 @@ BLOCK_CAPABILITIES = {
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
                  'review': CAP_APPROVE,                               # proposals.dispose, triage
                  'decide': CAP_PROJECT_ADMIN},                        # proposals.dispose, the owner decision
-    'ref': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
+    # kittrial-5bb.418: `verify` is a design-document report (unverified), filed by any member who may propose.
+    'ref': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS, 'verify': CAP_RECORDS,
             'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE},
     'capability': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
                    'propose-alias': CAP_RECORDS, 'verify': CAP_RECORDS,

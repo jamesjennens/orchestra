@@ -14,6 +14,8 @@ from requirements import canonical_bytes, content_hash
 
 PREFIX='Kind: task-checkpoint-v1\n'
 KINDS={'blocker','question','decision','correction','dependency'}
+GROUPING_ADVICE=('To fit the limit, group the items: one open item per theme with an id prefix, resolved ones folded into one entry, '
+ 'and a longer text in a repository document that an item source links')
 CHECKPOINT_ITEMS_MAX=100
 CHECKPOINT_TEXT_LIMIT=400
 #: The top-level text fields of a checkpoint and their limits; the validator and the
@@ -279,7 +281,9 @@ def checkpoint_problems(p,task):
         if field not in p:continue
         items=p[field]
         if not isinstance(items,list) or len(items)>CHECKPOINT_ITEMS_MAX:
-            problems.append('%s: expected a list of at most %d items' % (field,CHECKPOINT_ITEMS_MAX));continue
+            problems.append('%s: expected a list of at most %d items' % (field,CHECKPOINT_ITEMS_MAX))
+            if isinstance(items,list):problems.append(GROUPING_ADVICE)
+            continue
         ids=[]
         for index,item in enumerate(items):
             path='%s[%d]' % (field,index)
@@ -708,9 +712,15 @@ class ContextPointers:
         return record.get('title'),'requirements get '+str(row['id'])
 
     def _design(self,entry,scope,section):
-        """§2.4 `design` before slice 3: unknown-scope or not-selected; the section unchecked."""
+        """§2.4 `design`: unknown-scope, not-selected, unknown-section.
+
+        The section is checked against the server-derived index of the revision shown (kittrial-5bb.418), read
+        from the loaded rows like every record: a heading with that anchor is `live`, none is the flag
+        `unknown-section`. A design entry with no single index (one written before documents were stored, or
+        two differing copies) leaves the section `unchecked`."""
         entry['flags']=['unknown-scope']
         label=follow=None
+        shown=None
         matches=self._catalog('ref').get('design.'+scope,[])
         if len(matches)==1 and matches[0].get('state') not in ('malformed','unsupported','conflicted','incomplete'):
             view=matches[0]
@@ -726,9 +736,22 @@ class ContextPointers:
             if record is not None:
                 label=record.get('name') or record.get('title') or 'design.'+scope
                 follow='ref get design.'+scope
+                shown=(view,record)
         if section is not None:
-            # Headings are checked against the server-held design index of slice 3.
             entry['section']={'anchor':section,'state':'unchecked'}
+            if shown is not None:
+                import design_documents
+                view,record=shown
+                authority=record.get('authority') or {}
+                if design_documents.is_document_authority(authority):
+                    row=next((item for item in self.rows if str(item.get('id'))==str(view.get('native_id'))),None)
+                    index=design_documents.selected_index(row,'design.'+scope,authority)
+                    if index is not None:
+                        if any(heading['anchor']==section for heading in index['headings']):
+                            entry['section']['state']='live'
+                        else:
+                            entry['section']['state']='unknown'
+                            entry['flags'].append('unknown-section')
         return label,follow
 
     def resolve(self,pointer):

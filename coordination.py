@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import record_json
+from field_limits import DESCRIPTION_MAX,DESCRIPTION_TOO_LONG
 import re
 import secrets
 import stat
@@ -511,6 +512,7 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         for parent in parents if isinstance(parents,list) else [parents]:
             if is_merge_slot(parent):raise ValueError(merge_slot_sentence(parent.get('id'))+'; it takes no child')
         if not isinstance(p['title'],str) or not p['title'].strip() or not isinstance(p['description'],str):raise ValueError('Child needs title and description')
+        if len(p['description'])>DESCRIPTION_MAX:raise ValueError(DESCRIPTION_TOO_LONG)
         if p['type'] not in ('task','bug','feature','chore','decision'):raise ValueError('Invalid child type')
         if 'assignee' in p and not isinstance(p['assignee'],str):raise ValueError('Child assignee must be text')
         identity=content_hash({'request_id':p['request_id']})
