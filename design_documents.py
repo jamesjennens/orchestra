@@ -335,7 +335,10 @@ VERIFICATION_FIELDS = ('schema_version', 'key', 'doc_sha256', 'path', 'commit', 
 PAYLOAD_FIELDS = ('schema_version', 'key', 'doc_sha256', 'path', 'commit', 'observed_sha256', 'result', 'reason')
 REASONS = {'pass': ('match',), 'fail': ('mismatch', 'missing', 'not-a-regular-file', 'not-utf8')}
 ROUTES = ('host', 'endpoint', 'web')
-UNTRUSTED_REPORTS_MAX = 50
+#: Review of part 2 (N2): untrusted reports are bounded per submitter, passes and fails apart (as capability
+#: verification keeps its pools), so one member cannot fill a document's quota for everybody.
+UNTRUSTED_PASSES_PER_SUBMITTER = 10
+UNTRUSTED_FAILS_PER_SUBMITTER = 5
 
 
 def check_verification_payload(payload):

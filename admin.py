@@ -11236,6 +11236,8 @@ def main():
                     results.append({'key':(item or {}).get('key') if isinstance(item,dict) else None,
                                     'recorded':False,'refused':str(error)})
         print(json.dumps({'items':results,'recorded':sum(1 for item in results if item.get('recorded'))}))
+        # Review of part 2 (N5): a run that refused any item does not exit 0.
+        if any('refused' in item for item in results):raise SystemExit(1)
     elif args.command=='capability-verify':
         import contextlib
         import fcntl

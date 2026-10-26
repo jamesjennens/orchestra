@@ -7,16 +7,22 @@ import { pageHead, errorState } from '../ui.js';
 
 const HEADING = /^ {0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/;
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
+const BOM = /^﻿/;
+const HEADING_LINE_MAX = 1000;
 
-// The document as text blocks. Headings take the server's anchors in order (the index numbers
-// headings outside code fences exactly as `doc#anchor` pointers do), fences are shown verbatim.
-export function renderDocument(text, headings) {
+// The document as text blocks. The server says which line each of its index's headings is on
+// (`heading_lines`, from the same capabilities.markdown_headings that builds the index), so anchors are
+// placed by line and never by a second copy of the heading rule (review of part 2, N4). Lines are split
+// as the server splits them: on LF only, a trailing CR dropped. Fences are shown verbatim.
+export function renderDocument(text, headings, headingLines) {
   const root = h('div', { class: 'md design-document', 'data-design-document': '1' });
-  const lines = String(text || '').replace(/^﻿/, '').replace(/\r\n?/g, '\n').split('\n');
-  const anchors = (headings || []).slice();
-  let para = []; let fence = null; let code = [];
+  const lines = String(text || '').replace(BOM, '').split('\n').map((line) => line.replace(/\r$/, ''));
+  const byLine = new Map();
+  (headingLines || []).forEach((number, n) => { if ((headings || [])[n]) byLine.set(number, headings[n]); });
+  let para = []; let fence = null; let code = []; let lineNumber = 0;
   const flush = () => { if (para.length) { root.append(h('p', null, para.join(' '))); para = []; } };
   for (const raw of lines) {
+    lineNumber += 1;
     const marker = FENCE.exec(raw);
     if (fence !== null) {
       if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length) {
@@ -25,11 +31,11 @@ export function renderDocument(text, headings) {
       continue;
     }
     if (marker) { flush(); fence = marker[1]; continue; }
-    const heading = HEADING.exec(raw);
+    const item = byLine.get(lineNumber) || null;
+    const heading = raw.length <= HEADING_LINE_MAX ? HEADING.exec(raw) : null;
     if (heading) {
       flush();
       const level = Math.min(6, heading[1].length + 1);
-      const item = anchors.length ? anchors.shift() : null;
       const props = { class: 'md-h' };
       if (item && item.anchor) props.id = 'design-' + item.anchor;
       root.append(h('h' + level, props, heading[2]));
@@ -80,5 +86,5 @@ export async function page(ctx, { pid, scope }) {
         h('ul', null, phases.map((phase) => h('li', null, h('code', null, phase.anchor),
           phase.epic ? [' — epic ', h('a', { href: ctx.href ? ctx.href(`/p/${pid}/t/${phase.epic}`) : `#/p/${pid}/t/${phase.epic}` }, phase.epic)] : ' — no epic yet')))) : null,
       h('p', { class: 'small muted' }, 'The stored document, shown as text (untrusted data).')),
-    h('section', { class: 'panel' }, renderDocument(design.document, design.index && design.index.headings)));
+    h('section', { class: 'panel' }, renderDocument(design.document, design.index && design.index.headings, design.heading_lines)));
 }

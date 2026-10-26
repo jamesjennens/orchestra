@@ -189,6 +189,8 @@ def _git_document(repo,path,commit):
         done=subprocess.run(['git','--no-optional-locks','-C',repo,*args],capture_output=True,timeout=30,
                             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         return done.stdout if done.returncode==0 else None
+    # Review of part 2 (N3): a checkout that does not hold the commit cannot check it: not checked, never a fail.
+    if git('cat-file','-e',commit+'^{commit}') is None:return None,'commit-not-in-checkout'
     listing=git('ls-tree','-z','--full-tree',commit,'--',path)
     if listing is None:return None,'missing'
     found=[]
@@ -241,6 +243,11 @@ def _trace_command(args,config,project,actor,out):
             results.append({'key':key,'checked':False,'why':'no accepted repo-document revision'})
             continue
         data,reason=_git_document(repo,authority['path'],authority['commit'])
+        if reason=='commit-not-in-checkout':
+            # Fetch the commit and run again; nothing is reported for it. (There is no dirty-checkout refusal:
+            # every read is git's object at the pinned commit, never the working tree.)
+            results.append({'key':key,'checked':False,'why':'commit %s is not in this checkout' % authority['commit'][:12]})
+            continue
         observed=None
         if data is not None:
             observed=hashlib.sha256(data).hexdigest()

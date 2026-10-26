@@ -1652,14 +1652,23 @@ def write_verification(payload, actor, run, operators=None, verifiers=None, rout
             (authority['sha256'], authority['path'], authority['commit']):
         raise ValueError('the report names a document that is not the accepted revision of %s' % key)
     existing = design_documents.verifications_for(row, key, authority)
-    for _, item, author in existing:
+    if existing:
+        # Review of part 2 (B1): a report is a repeat only when it is the newest one on this document. With a
+        # pinned commit an honest re-check is always identical, so a re-check after a newer report (a fail
+        # filed since) is written and counts.
+        _, item, author = existing[-1]
         if item['submitter'] == {'actor': actor, 'route': route} and item['result'] == payload['result'] \
                 and item['observed_sha256'] == payload['observed_sha256'] and author == actor:
             return {'key': key, 'recorded': False, 'result': item['result'], 'identity': item['identity']}
-    if not trusted and sum(1 for _, item, _ in existing if item['identity'] != 'verified') \
-            >= design_documents.UNTRUSTED_REPORTS_MAX:
-        raise ValueError('%s already holds %d reports for this document; an operator or a listed verifier '
-                         'records the next check' % (key, design_documents.UNTRUSTED_REPORTS_MAX))
+    if not trusted:
+        # N2: bounded per submitter, passes and fails apart.
+        limit = design_documents.UNTRUSTED_PASSES_PER_SUBMITTER if payload['result'] == 'pass' \
+            else design_documents.UNTRUSTED_FAILS_PER_SUBMITTER
+        mine = sum(1 for _, item, author in existing if item['identity'] != 'verified' and author == actor
+                   and item['result'] == payload['result'])
+        if mine >= limit:
+            raise ValueError('%s already holds %d %s reports by %s for this document; an operator or a listed '
+                             'verifier records the next check' % (key, limit, payload['result'], actor))
     at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     entry = design_documents.verification_record(payload, actor, route, 'verified' if trusted else 'unverified', at)
     run(['comments', 'add', row['id'], design_documents.verification_body(entry), '--json'])
@@ -1701,6 +1710,10 @@ def design_page(rows, scope, project, operators, verifiers=None, revision=None):
         raise missing from None
     stored = design_documents.indexes_for(row, key, authority)
     index_state = 'missing' if not stored else 'matches' if all(index == derived for index in stored) else 'differs'
+    # Review of part 2 (N4): the page places the server's anchors by line, so a reader never re-implements the
+    # heading rule (capabilities.markdown_headings: 1-based line numbers, in the index's order).
+    from capabilities import markdown_headings
+    heading_lines = [item[0] for item in markdown_headings(data)][:len(derived['headings'])]
     accepted = entry.get('record') is not None and entry['record'].get('sha256') == record.get('sha256')
     return {'schema_version': 1, 'key': key, 'scope': scope, 'revision': record['revision'],
             'acceptance_state': record['acceptance_state'], 'accepted': accepted,
@@ -1708,5 +1721,6 @@ def design_page(rows, scope, project, operators, verifiers=None, revision=None):
             'verification': design_documents.derive_verification(
                 design_documents.verifications_for(row, key, authority), _trusted(operators, verifiers))
             if record['acceptance_state'] != 'draft' else None,
-            'index': derived, 'index_state': index_state, 'document': text, 'trust': 'data',
+            'index': derived, 'index_state': index_state, 'heading_lines': heading_lines, 'document': text,
+            'trust': 'data',
             'revisions': sorted(number for number, item in revisions.items() if documented(item))}

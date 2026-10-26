@@ -719,16 +719,59 @@ class VerificationTests(DesignCase):
                 with self.assertRaisesRegex(ValueError, why):
                     self.file(payload)
 
-    def test_a_repeated_report_writes_nothing_and_untrusted_reports_are_bounded(self):
+    def test_a_back_to_back_repeat_writes_nothing(self):
         self.assertTrue(self.file(self.report())['recorded'])
         writes = self.writes()
         self.assertFalse(self.file(self.report())['recorded'])
         self.assertEqual(self.writes(), writes)
-        with patch.object(dd, 'UNTRUSTED_REPORTS_MAX', 2):
+
+    def test_a_verifier_recheck_after_a_newer_fail_is_written_and_clears_it(self):
+        # Review of part 2 (B1): pass(V), fail(contributor), pass(V) reads verified.
+        self.file(self.report('pass'), actor=VERIFIER, route='host')
+        self.file(self.report())
+        self.assertEqual(self.state()['state'], 'design-drift')
+        self.assertTrue(self.file(self.report('pass'), actor=VERIFIER, route='host')['recorded'])
+        self.assertEqual(self.state()['state'], 'verified')
+
+    def test_the_same_fail_after_a_trusted_pass_reopens_drift(self):
+        # B1: fail(A), trusted pass, fail(A) reopens drift.
+        self.file(self.report())
+        self.file(self.report('pass'), actor=VERIFIER, route='host')
+        self.assertEqual(self.state()['state'], 'verified')
+        self.assertTrue(self.file(self.report())['recorded'])
+        self.assertEqual(self.state()['state'], 'design-drift')
+
+    def test_untrusted_reports_are_bounded_per_submitter_passes_and_fails_apart(self):
+        # Review of part 2 (N2).
+        with patch.object(dd, 'UNTRUSTED_FAILS_PER_SUBMITTER', 2), patch.object(dd, 'UNTRUSTED_PASSES_PER_SUBMITTER', 1):
             self.file(self.report(observed='1' * 64))
-            with self.assertRaisesRegex(ValueError, 'already holds 2 reports'):
-                self.file(self.report(observed='2' * 64))
+            self.file(self.report(observed='2' * 64))
+            with self.assertRaisesRegex(ValueError, 'already holds 2 fail reports by alice'):
+                self.file(self.report(observed='3' * 64))
+            self.file(self.report(observed='3' * 64), actor='bob')        # another member is not blocked
+            self.file(self.report('pass'))                                  # passes are counted apart
+            self.file(self.report(observed='9' * 64), actor='bob')         # a newer report, so the next is no repeat
+            with self.assertRaisesRegex(ValueError, 'already holds 1 pass reports by alice'):
+                self.file(self.report('pass'))
             self.file(self.report('pass'), actor=VERIFIER, route='host')   # the trusted route is not bounded
+
+    def test_a_trusted_pass_for_another_commit_never_counts(self):
+        # Review of part 2 (G1): the same bytes at another commit or path are another document check.
+        self.file(self.report('pass'), actor=VERIFIER, route='host')
+        self.assertEqual(self.state()['state'], 'verified')
+        moved = dict(self.auth, commit='c' * 40)
+        self.propose_design(self.text, operation='revise', operation_id='moved', revision=3,
+                            expected_sha256=self.sha(2, key=KEY), authority=moved)
+        self.accept(3, self.sha(3, key=KEY), key=KEY, operation_id='accept-moved')
+        self.assertEqual(self.state()['state'], 'unverified')
+
+    def test_a_verification_that_is_not_canonical_never_parses(self):
+        # Review of part 2 (G2).
+        record = dd.verification_record(self.report('pass'), VERIFIER, 'host', 'verified', '2026-01-01T00:00:00Z')
+        body = dd.verification_body(record)
+        self.assertIsNotNone(dd.parse_verification(body))
+        self.assertIsNone(dd.parse_verification(body.replace('"key"', ' "key"', 1)))
+        self.assertIsNone(dd.parse_verification(body.replace('\n', '\r\n', 1)))
 
     def test_the_verification_prefix_is_reserved_and_a_record_comment(self):
         self.file(self.report())
@@ -918,10 +961,82 @@ class TraceVerifyClientTests(unittest.TestCase):
                                     'reason': 'match'})
         dd.check_verification_payload(items[0])
 
+    def test_a_commit_the_checkout_lacks_is_not_checked_never_a_fail(self):
+        # Review of part 2 (N3).
+        import client
+        code, summary, calls = None, None, None
+        entry = {'key': KEY, 'record': {'authority': {'type': 'repo-document', 'path': 'docs/D.md',
+                                                       'commit': 'f' * 40, 'sha256': '1' * 64}}}
+
+        def fake(config, project, actor, args, action='bd', path=None):
+            body = {'items': [{'key': KEY}], 'next_offset': None} if args[0] == 'list' else entry
+            return {'returncode': 0, 'stdout': json.dumps(body), 'stderr': ''}
+        out = self.repo / 'out2.json'
+        with patch.object(client, 'request', side_effect=fake):
+            code = client._trace_command(['--verify', '--repo', str(self.repo), '--record'], {}, 'p', 'alice', str(out))
+        summary = json.loads(out.read_text(encoding='utf-8'))
+        self.assertEqual((code, summary['checked'], summary['failed']), (0, 0, 0))
+        self.assertFalse(summary['results'][0]['checked'])
+
     def test_trace_without_verify_says_where_trace_is(self):
         import client
         with self.assertRaisesRegex(ValueError, 'trace --verify'):
             client._trace_command([], {}, 'p', 'alice', None)
+
+
+class DesignVerifyCommandTests(DesignCase):
+    """`admin.py design-verify` (review of part 2, N5): trusted records, and a non-zero exit when any is refused."""
+
+    def test_the_host_command_records_and_exits_non_zero_on_any_refusal(self):
+        import contextlib
+        import io
+        import types
+        from unittest.mock import Mock
+        import admin
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        project = root / 'projects' / 'trial'
+        (project / '.beads').mkdir(parents=True)
+        (project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        (root / 'deployment.private.json').write_text(json.dumps({'password': 'x', 'unit': 'none',
+                                                                  'operators': [OPERATOR], 'verifiers': [VERIFIER]}),
+                                                      encoding='utf-8')
+        self.project = project
+        text = document()
+        self.propose_design(text)
+        self.accept_design(1)
+        auth = authority(text)
+        good = {'schema_version': 1, 'key': KEY, 'doc_sha256': auth['sha256'], 'path': auth['path'],
+                'commit': auth['commit'], 'observed_sha256': auth['sha256'], 'result': 'pass', 'reason': 'match'}
+
+        def run_native(root_, name, args):
+            if args[:1] == ['--actor']:
+                self.native.actor = args[1]
+                args = args[2:]
+            return self.native(list(args))
+
+        def run(items):
+            path = root / 'checks.json'
+            path.write_text(json.dumps({'items': items}), encoding='utf-8')
+            argv = ['admin.py', '--root', str(root), 'design-verify', 'trial', '--actor', VERIFIER, '--file', str(path)]
+            with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=root), \
+                    patch.object(admin, 'run_bd', side_effect=run_native), \
+                    patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+                    patch.dict(os.environ, {'ORCHESTRA_OPERATORS': '', 'ORCHESTRA_VERIFIERS': ''}), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                try:
+                    admin.main()
+                    code = 0
+                except SystemExit as stop:
+                    code = stop.code
+            return code, json.loads(out.getvalue())
+        code, result = run([good])
+        self.assertEqual((code, result['recorded']), (0, 1))
+        state = rr.get(rr.read_key_rows(self.native, KEY), KEY, [OPERATOR], verifiers=[VERIFIER])['verification']
+        self.assertEqual(state['state'], 'verified')
+        code, result = run([dict(good, key='design.nothing')])
+        self.assertEqual(code, 1)
+        self.assertIn('refused', result['items'][0])
 
 
 class DesignPageWebTests(unittest.TestCase):
@@ -933,7 +1048,7 @@ class DesignPageWebTests(unittest.TestCase):
         code = '''await import(process.argv[1]);
 const view=await import(process.argv[2]);
 const text='# Title <script>evil()</script>\\n\\n[link](javascript:evil) <img src=x onerror=evil()> \\u202e\\n\\n```\\n# not a heading\\n```\\n## Plan phase 1\\n';
-const el=view.renderDocument(text,[{anchor:'title-scriptevilscript',tokens:['req:k@1']},{anchor:'plan-phase-1',tokens:[]}]);
+const el=view.renderDocument(text,[{anchor:'title-scriptevilscript',tokens:['req:k@1']},{anchor:'plan-phase-1',tokens:[]}],[1,8]);
 console.log(JSON.stringify({text:el.textContent,scripts:el.querySelectorAll('script').length,
  images:el.querySelectorAll('img').length,links:el.querySelectorAll('a').length,
  ids:[...el.querySelectorAll('h2'),...el.querySelectorAll('h3')].map(x=>x.getAttribute('id')),pre:el.querySelectorAll('pre').length}));'''
