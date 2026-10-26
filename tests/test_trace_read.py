@@ -8,6 +8,7 @@ import hashlib
 import json
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,7 +24,8 @@ from test_reference_records import RefNative, OPERATOR, TODAY, entry, acceptance
 from test_requirement_records import Native
 
 PROJECT = 'trial'
-NOW = datetime(2026, 10, 20, 12, 0, 0, tzinfo=timezone.utc)
+# Review note 8: a fixture clock far from today, so a rule that read the real clock would fail here.
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 MEMBERS = {'u-owner': 'owner', 'u-coord': 'coordinator', 'u-contrib': 'contributor', 'u-view': 'viewer'}
 OPERATORS = ['operator', OPERATOR]
 DOCUMENT = '''<!-- design-v1
@@ -158,8 +160,8 @@ class Fixture(unittest.TestCase):
             task('trial-4', 'Owner note, already decided.', comments=[
                 note('n-3', 'We decided: keep B.', author='u-owner', days=1)]),
             task('trial-round', 'Round for design-round:server', issue_type='epic', comments=[
-                note('p-1', 'Published drafts of server at 2026-10-10T00:00:00Z', author='u-owner'),
-                note('p-2', 'Published drafts of server at 2026-10-01T00:00:00Z', author='u-contrib')]),
+                note('p-1', 'Published drafts of server at ' + stamp(11), author='u-owner'),
+                note('p-2', 'Published drafts of server at ' + stamp(20), author='u-contrib')]),
             task('trial-l1', 'Lane A', parent='trial-round', assignee='lane-a', comments=[
                 contribution_note('trial-l1', 'k-1', 'lane-a', 12),
                 note('x-1', 'Cross-review of trial-l2 at abcdef1\nAdopt B.', author='lane-a', days=5)]),
@@ -259,13 +261,22 @@ class ViewTests(Fixture):
                 self.assertEqual([r for r in self.view('decisions')['rows'] if r['kind'] != 'decision'], [])
 
     def test_the_comment_scan_is_bounded_and_says_so(self):
-        filler = [note('f-%d' % n, 'filler', days=0) for n in range(30)]
+        filler = [note('f-%d' % n, 'filler', author='u-owner', days=0) for n in range(30)]
         self.work.append(task('trial-filler', 'x', comments=filler))
         with patch.object(t, 'COMMENT_SCAN_MAX', 10):
             answer = self.view('decisions')
         self.assertEqual([r for r in answer['rows'] if r['kind'] != 'decision'], [])
-        self.assertEqual(answer['coverage']['comments_scanned'], {'scanned': 10, 'total': 36, 'limit': 10})
-        self.assertIn('the newest 10 of 36 comments scanned', answer['coverage']['text'])
+        # The owners' comments only: n-1, n-3, p-1 and the 30 above.
+        self.assertEqual(answer['coverage']['comments_scanned'], {'scanned': 10, 'total': 33, 'limit': 10})
+        self.assertIn('the newest 10 of 33 owner comments scanned', answer['coverage']['text'])
+
+    def test_nobody_elses_comments_push_an_owners_out_of_the_scan(self):
+        # Review note 4: the owner filter comes before the bound.
+        filler = [note('f-%d' % n, 'filler', author='u-contrib', days=0) for n in range(30)]
+        self.work.append(task('trial-filler', 'x', comments=filler))
+        with patch.object(t, 'COMMENT_SCAN_MAX', 3):
+            answer = self.view('decisions')
+        self.assertEqual([r['id'] for r in answer['rows'] if r['kind'] != 'decision'], ['n-1'])
 
     def test_designs_view_reports_state_and_plan_coverage(self):
         rows = self.view('designs')['rows']
@@ -295,19 +306,19 @@ class ViewTests(Fixture):
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual((row['epic'], row['scope'], row['published_at'], row['publication']),
-                         ('trial-round', 'server', '2026-10-10T00:00:00Z', 'recorded'))
+                         ('trial-round', 'server', stamp(11), 'recorded'))
         lanes = {lane['task']: lane for lane in row['lanes']}
         self.assertEqual(lanes['trial-l1']['delivered_at'], stamp(12))
         self.assertEqual(lanes['trial-l1']['flags'], [])
         self.assertEqual(lanes['trial-l2']['flags'], ['delivered-after-publication'])
-        self.assertEqual(lanes['trial-l1']['cross_reviews'], [{'of': 'trial-l2', 'commit': 'abcdef1', 'at': stamp(5)}])
+        self.assertEqual(lanes['trial-l1']['cross_reviews'], [{'of': 'trial-l2', 'commit': 'abcdef1', 'by': {'text': 'lane-a', 'omitted_chars': 0}, 'at': stamp(5)}])
         self.assertEqual(row['converged'], {'key': 'design.server', 'selected': True, 'revision': 2,
                                             'decisions': ['trial-d1']})
 
     def test_a_contributor_cannot_move_the_publication_time(self):
         # Q7: only a person owner or coordinator in current membership, or a listed operator, counts.
         round_row = self.work[8]
-        round_row['comments'] = [note('p-2', 'Published drafts of server at 2026-10-01T00:00:00Z', author='u-contrib')]
+        round_row['comments'] = [note('p-2', 'Published drafts of server at ' + stamp(20), author='u-contrib')]
         row = self.view('round')['rows'][0]
         self.assertEqual((row['published_at'], row['publication'], row['flags']),
                          (None, 'publication not recorded', []))
@@ -315,7 +326,7 @@ class ViewTests(Fixture):
             round_row['comments'][0]['author'] = author
             with self.subTest(author=author):
                 row = self.view('round')['rows'][0]
-                self.assertEqual(row['published_at'], '2026-10-01T00:00:00Z')
+                self.assertEqual(row['published_at'], stamp(20))
                 self.assertEqual(row['flags'], ['delivered-after-publication'])
         round_row['comments'][0]['author'] = 'u-owner'
         self.assertEqual(self.view('round', members={})['rows'][0]['published_at'], None)   # no longer a member
@@ -451,6 +462,118 @@ class BoundsTests(Fixture):
         self.assertNotIn('trial-old', names)
         self.work[5]['closed_at'] = stamp(14, hours=1)
         self.assertNotIn('trial-recent', [row['id'] for row in self.view('tasks')['rows']])
+
+
+
+class HardCapTests(Fixture):
+    """Review b1: every list in a row is bounded, and the 64 KiB cap is hard even for one row."""
+
+    def fake_designs(self, count):
+        return [{'scope': 'd%02d' % n, 'key': 'design.d%02d' % n, 'record': {}, 'shown': {'decisions': ['trial-d1']},
+                 'index': {'front': {'requirements': ['R01@3'], 'decisions_open': []}, 'headings': [],
+                           'plan_phases': []}, 'verification': None, 'view': {}} for n in range(count)]
+
+    def test_requirement_and_decision_design_lists_are_bounded(self):
+        snap = self.snap()
+        snap._designs = self.fake_designs(25)
+        row = next(r for r in t.trace(snap, 'requirements')['rows'] if r['key'] == 'R01')
+        self.assertEqual((len(row['designs']), row['designs_omitted']), (t.LIST_MAX, 5))
+        decision = next(r for r in t.trace(snap, 'decisions')['rows'] if r['kind'] == 'decision')
+        self.assertEqual((len(decision['designs']), decision['designs_omitted']), (t.LIST_MAX, 5))
+
+    def test_round_lanes_and_cross_reviews_are_bounded_and_the_row_fits(self):
+        reviews = [note('x-%d' % n, 'Cross-review of trial-l1 at abcdef1\n' + 'y' * 3000, author='m' * 300, days=4)
+                   for n in range(25)]
+        self.work += [task('trial-lx%03d' % n, 'Lane', parent='trial-round', assignee='lane-x',
+                           comments=list(reviews) + [contribution_note('trial-lx%03d' % n, 'k-x%d' % n, 'lane-x', 5)])
+                      for n in range(300)]
+        answer = self.view('round')
+        row = answer['rows'][0]
+        self.assertEqual((len(row['lanes']), row['lanes_omitted']), (t.LIST_MAX, 282))
+        self.assertEqual(row['late_lanes'], 301)   # every lane counts, shown or not
+        lane = next(lane for lane in row['lanes'] if lane['task'].startswith('trial-lx'))
+        self.assertEqual((len(lane['cross_reviews']), lane['cross_reviews_omitted']), (t.CROSS_REVIEWS_MAX, 20))
+        self.assertLessEqual(len(lane['cross_reviews'][0]['by']['text']), t.TITLE_MAX)
+        self.assertLessEqual(len(json.dumps(answer, ensure_ascii=False).encode('utf-8')), t.ANSWER_MAX)
+
+    def test_one_row_larger_than_the_answer_is_replaced_by_a_plain_note(self):
+        with patch.object(t, 'ANSWER_MAX', 900):
+            answer = t.trace(self.snap(), 'round')
+        self.assertLessEqual(len(json.dumps(answer, ensure_ascii=False).encode('utf-8')), 900)
+        self.assertEqual(answer['rows'], [{'oversized': True, 'note': t.OVERSIZED, 'scope': 'server',
+                                           'epic': 'trial-round'}])
+        self.assertIsNone(answer['next_offset'])
+
+
+class TokenCostTests(Fixture):
+    """Review b2: planted tokens cannot make a read expensive."""
+
+    def planted(self, tasks=10, tokens=1000):
+        self.work += [task('trial-p%02d' % n, ' '.join('req:R01@%d' % (n * tokens + k + 1) for k in range(tokens)))
+                      for n in range(tasks)]
+
+    def test_each_requirement_ledger_is_read_once_per_snapshot(self):
+        self.planted(tasks=3, tokens=200)
+        import requirement_records
+        calls = []
+        real = requirement_records.existing_revisions
+
+        def counted(row):
+            calls.append(row['id'])
+            return real(row)
+        with patch.object(requirement_records, 'existing_revisions', counted):
+            t.trace(self.snap(), 'summary')
+        self.assertEqual({row: calls.count(row) for row in set(calls)}, {row: 1 for row in set(calls)})
+
+    def test_distinct_tokens_resolved_are_bounded_and_said(self):
+        self.planted(tasks=3, tokens=1000)
+        snap = self.snap()
+        answer = t.trace(snap, 'tokens')
+        unchecked = [row for row in t.tokens_view(snap) if row['flags'] == ['unchecked']]
+        self.assertEqual(len(snap._resolved), t.TOKENS_RESOLVED_MAX)
+        self.assertEqual(answer['coverage']['tokens_unchecked'], len(snap.unchecked))
+        self.assertGreater(len(unchecked), 0)
+        self.assertEqual(len({row['pointer'] for row in unchecked}), len(snap.unchecked))
+        self.assertIn('distinct tokens not checked (the limit is %d per answer)' % t.TOKENS_RESOLVED_MAX,
+                      answer['coverage']['text'])
+
+    def test_ten_thousand_planted_tokens_answer_within_a_fixed_budget(self):
+        # The review's repro shape: 10 tasks of 1,000 distinct req:R01@N tokens took 8.4-8.9 s per read.
+        self.planted()
+        started = time.perf_counter()
+        for view in ('summary', 'tokens', 'tasks'):
+            t.trace(self.snap(), view)
+        self.assertLess(time.perf_counter() - started, 6.0)
+
+
+class GenerationTests(Fixture):
+    """Review note 2: the generation is the caller's filtered snapshot's."""
+
+    def test_a_hidden_rows_change_never_moves_it_and_a_visible_ones_does(self):
+        foreign = task('other-1', 'x')
+        foreign['project_id'] = 'other'
+        base = t.generation(self.snap(self.rows() + [foreign]))
+        foreign['description'] = 'changed'
+        self.assertEqual(t.generation(self.snap(self.rows() + [foreign])), base)
+        self.assertEqual(t.generation(self.snap(exclude=lambda row: row.get('id') == 'trial-2')),
+                         t.generation(self.snap([row for row in self.rows() if row['id'] != 'trial-2'])))
+        self.work[1]['description'] = 'changed'
+        self.assertNotEqual(t.generation(self.snap(self.rows() + [foreign])), base)
+
+    def test_a_page_at_another_generation_is_refused(self):
+        options = t.parse_options(['tokens', '--limit', '1'])
+        first = t.answer(self.rows(), PROJECT, options, operators=OPERATORS, members=MEMBERS, now=NOW)
+        again = t.parse_options(['tokens', '--offset', '1', '--generation', first['generation']])
+        t.answer(self.rows(), PROJECT, again, operators=OPERATORS, members=MEMBERS, now=NOW)
+        self.work[1]['description'] = 'changed'
+        with self.assertRaisesRegex(ValueError, 'The project changed since this page was read'):
+            t.answer(self.rows(), PROJECT, again, operators=OPERATORS, members=MEMBERS, now=NOW)
+
+    def test_malformed_scopes_are_refused_with_the_usage_sentence(self):
+        for scope in ('a.', 'a..b', '.a', 'A', 'a' * 74):
+            with self.subTest(scope=scope):
+                with self.assertRaisesRegex(ValueError, 'trace VIEW'):
+                    t.parse_options(['round', '--scope', scope])
 
 
 if __name__ == '__main__':

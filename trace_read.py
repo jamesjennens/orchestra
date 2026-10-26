@@ -23,6 +23,13 @@ RECENT_DAYS = 14
 COMMENT_SCAN_MAX = 2000
 ROUNDS_MAX = 50
 LIST_MAX = 20
+#: Cross-reviews shown per lane: LIST_MAX lanes of these must fit one answer (review b1).
+CROSS_REVIEWS_MAX = 5
+#: The distinct tokens one answer resolves (review b2); the rest read `unchecked` and the coverage line says so.
+TOKENS_RESOLVED_MAX = 2000
+SCOPE_RE = re.compile(r'[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*')
+#: A row larger than the whole answer is replaced by this (review b1: the cap is hard even for one row).
+OVERSIZED = 'This row is larger than the answer limit; it is not shown. Narrow the read (a scope) or ask the coordinator.'
 TITLE_MAX = 120
 WORK_TYPES = ('task', 'bug', 'feature', 'chore')
 BAD_STATES = ('malformed', 'unsupported', 'conflicted', 'incomplete')
@@ -110,6 +117,7 @@ class Snapshot:
             if parent is not None:
                 self.children.setdefault(str(parent), []).append(task)
         self._resolved = {}
+        self.unchecked = set()
         self._designs = None
         self._citations = None
         self._workflows = {}
@@ -127,8 +135,12 @@ class Snapshot:
 
     # -- pointers ----------------------------------------------------------------------------
     def resolve(self, pointer):
+        """One resolution per distinct token, and at most TOKENS_RESOLVED_MAX of them per answer (review b2)."""
         key = pointer['pointer']
         if key not in self._resolved:
+            if len(self._resolved) >= TOKENS_RESOLVED_MAX:
+                self.unchecked.add(key)
+                return {'pointer': key, 'kind': pointer['kind'], 'state': 'unchecked', 'trust': 'data', 'flags': []}
             self._resolved[key] = self.pointers.resolve(pointer)
         return self._resolved[key]
 
@@ -251,7 +263,6 @@ class Snapshot:
         if self._impact is not None:
             return self._impact
         from export_requirements import exact_reference
-        import requirement_records as records
         current, cited = {}, {}
         for task, pointers in self.citations().items():
             for _, pointer in pointers:
@@ -272,15 +283,15 @@ class Snapshot:
             if reference is not None and entry['state'] == 'live' and not entry.get('flags'):
                 current[reference['id']] = reference
                 keys[reference['id']] = key
-        records_by = {}
+        # The resolver's own validated ledgers, read once per requirement per snapshot (review b2).
+        ledgers = {}
+        for key in self.requirement_keys():
+            ledger = self.pointers.ledger(key)
+            if isinstance(ledger, tuple):
+                ledgers[ledger[0]['id']] = ledger[1]
 
         def record(reference):
-            token = (reference['id'], reference['revision'])
-            if token not in records_by:
-                rows = self.by_id.get(reference['id']) or []
-                revisions = records.existing_revisions(rows[0]) if len(rows) == 1 else {}
-                records_by[token] = revisions.get(reference['revision'])
-            return records_by[token]
+            return ledgers.get(reference['id'], {}).get(reference['revision'])
 
         layers = []
         for task in sorted(cited):
@@ -373,10 +384,12 @@ def requirements_view(snap):
         if not capabilities.get(key) and any(snap.delivered(task) for task in tasks):
             flags.append('no-capability')
         shown_tasks, more_tasks = bounded(tasks)
+        shown_designs, more_designs = bounded(sorted(citing_designs.get(key, ())))
+        shown_capabilities, more_capabilities = bounded(sorted(capabilities.get(key, ())))
         rows.append({'key': key, 'reference': entry['reference'], 'title': entry.get('label'),
-                     'designs': sorted(citing_designs.get(key, ())), 'tasks': shown_tasks,
-                     'tasks_omitted': more_tasks, 'capabilities': sorted(capabilities.get(key, ()))[:LIST_MAX],
-                     'flags': flags})
+                     'designs': shown_designs, 'designs_omitted': more_designs, 'tasks': shown_tasks,
+                     'tasks_omitted': more_tasks, 'capabilities': shown_capabilities,
+                     'capabilities_omitted': more_capabilities, 'flags': flags})
     return rows
 
 
@@ -457,9 +470,11 @@ def decisions_view(snap):
         cited_by = sorted(d['scope'] for d in designs
                           if task in (((d['shown'] or {}).get('decisions')) or [])
                           or (d['index'] and task in d['index']['front']['decisions_open']))
+        shown_designs, more_designs = bounded(cited_by)
         rows.append({'kind': 'decision', 'id': task, 'title': label(row.get('title')), 'status': row.get('status'),
-                     'supersedes': supersedes, 'designs': cited_by, 'flags': []})
-    # Q5: owners' prose on work items; a structured record ("Kind: ...") is never prose.
+                     'supersedes': supersedes, 'designs': shown_designs, 'designs_omitted': more_designs, 'flags': []})
+    # Q5: owners' prose on work items; a structured record ("Kind: ...") is never prose. The owner filter comes
+    # BEFORE the bound (review note 4), so nobody else's comments can push an owner's out of the scan.
     scan = []
     for task in sorted(snap.items):
         row = snap.items[task]
@@ -467,13 +482,13 @@ def decisions_view(snap):
             continue
         for comment in row.get('comments') or []:
             if isinstance(comment, dict) and isinstance(comment.get('text'), str) \
-                    and not comment['text'].startswith('Kind: '):
+                    and not comment['text'].startswith('Kind: ') and snap.owner(comment.get('author')):
                 scan.append((row, comment))
     total = len(scan)
     scan.sort(key=lambda item: (instant(item[1].get('created_at')) or datetime.min.replace(tzinfo=timezone.utc),
                                 str(item[1].get('id'))), reverse=True)
     for row, comment in scan[:COMMENT_SCAN_MAX]:
-        if not snap.owner(comment.get('author')) or str(comment.get('id')) in cited_comments:
+        if str(comment.get('id')) in cited_comments:
             continue
         lowered = comment['text'].lower()
         if any(phrase in lowered for phrase in DECISION_PHRASES):
@@ -581,10 +596,14 @@ def round_view(snap, scope=None):
             for comment in lane_row.get('comments') or []:
                 match = CROSS_REVIEW.match(first_line((comment or {}).get('text')))
                 if match:
-                    reviews.append({'of': match.group(1), 'commit': match.group(2), 'at': comment.get('created_at')})
+                    # Review note 3: whose line it is, as data (any member may write one).
+                    reviews.append({'of': match.group(1), 'commit': match.group(2), 'by': label(comment.get('author')),
+                                    'at': stamp(instant(comment.get('created_at')))})
             flags = ['delivered-after-publication'] if published and delivery and delivery > published else []
+            shown_reviews, more_reviews = bounded(reviews, CROSS_REVIEWS_MAX)
             lanes.append({'task': lane, 'title': label(lane_row.get('title')), 'plan_at': stamp(plan),
-                          'delivered_at': stamp(delivery), 'cross_reviews': reviews[:LIST_MAX], 'flags': flags})
+                          'delivered_at': stamp(delivery), 'cross_reviews': shown_reviews,
+                          'cross_reviews_omitted': more_reviews, 'flags': flags})
         design = designs.get(name)
         converged = None
         if design is not None:
@@ -592,10 +611,13 @@ def round_view(snap, scope=None):
             converged = {'key': design['key'], 'selected': design['record'] is not None,
                          'revision': design['shown'].get('revision'),
                          'decisions': list((design['shown'].get('decisions') or [])[:LIST_MAX])}
+        # Review b1: the lanes are bounded like every list; the round's flags still count every lane.
+        shown_lanes, more_lanes = bounded(lanes)
         rows.append({'epic': task, 'scope': name, 'title': label(row.get('title')),
                      'published_at': stamp(published),
                      'publication': 'recorded' if published else 'publication not recorded',
-                     'lanes': lanes, 'converged': converged,
+                     'lanes': shown_lanes, 'lanes_omitted': more_lanes,
+                     'late_lanes': sum(bool(lane['flags']) for lane in lanes), 'converged': converged,
                      'flags': sorted({flag for lane in lanes for flag in lane['flags']})})
         if len(rows) >= ROUNDS_MAX:
             break
@@ -654,7 +676,11 @@ def coverage(snap):
         parts.append('%d drifted' % block['design_drift'])
     text = '%s; %d rows read' % (', '.join(parts), block['rows_read'])
     if scanned is not None:
-        text += '; possible decisions: the newest %d of %d comments scanned' % scanned
+        text += '; possible decisions: the newest %d of %d owner comments scanned' % scanned
+    if snap.unchecked:
+        block['tokens_unchecked'] = len(snap.unchecked)
+        text += '; %d distinct tokens not checked (the limit is %d per answer)' % (len(snap.unchecked),
+                                                                                    TOKENS_RESOLVED_MAX)
     block['text'] = text
     return block
 
@@ -682,13 +708,30 @@ def trace(snap, view, *, scope=None, offset=0, limit=PAGE_MAX):
     answer['coverage'] = coverage(snap)
     from briefing import encoded_size
     import json
+    def fits():
+        return encoded_size(json.dumps(answer, ensure_ascii=False)) <= ANSWER_MAX
     while True:
         answer['rows'] = page
         answer['next_offset'] = offset + len(page) if offset + len(page) < len(rows) else None
-        if len(page) <= 1 or encoded_size(json.dumps(answer, ensure_ascii=False)) <= ANSWER_MAX:
+        if len(page) <= 1 or fits():
             break
         page = page[:max(1, len(page) // 2)]
+    if page and not fits():
+        # Review b1: the cap is hard even for one row. The row keeps only what names it, with a plain note.
+        answer['rows'] = [oversized(page[0])]
+        if not fits():
+            answer['rows'] = [{'oversized': True, 'note': OVERSIZED}]
     return answer
+
+
+def oversized(row):
+    """A row too large to send: its identifying fields, clipped, and OVERSIZED."""
+    stub = {'oversized': True, 'note': OVERSIZED}
+    for name in ('view', 'kind', 'id', 'key', 'scope', 'epic', 'task', 'pointer'):
+        value = row.get(name) if isinstance(row, dict) else None
+        if isinstance(value, str):
+            stub[name] = label(value, 200)['text']
+    return stub
 
 
 STALE = 'The project changed since this page was read; start again from the first page.'
@@ -716,7 +759,7 @@ def parse_options(args):
                 raise ValueError(USAGE)
             options[name] = int(value)
         elif name == 'scope':
-            if len(value) > 73 or not re.fullmatch(r'[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*', value):
+            if len(value) > 73 or not SCOPE_RE.fullmatch(value):
                 raise ValueError(USAGE)
             options['scope'] = value
         else:
@@ -726,33 +769,38 @@ def parse_options(args):
     return options
 
 
-def rows_generation(rows):
-    """A generation for an export with no tracker HEAD to name it: a digest of the rows themselves."""
+def generation(snap):
+    """The generation a page was read at: a digest of the caller's FILTERED snapshot (review note 2), so a change
+    to a row the caller cannot read (another project's, an excluded one, the merge slot) never moves it."""
     import hashlib
     import json
-    return 'r:' + hashlib.sha256(json.dumps(rows, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()[:32]
+    from coordination import is_merge_slot
+    visible = [row for row in snap.rows if not is_merge_slot(row)]
+    return 's:' + hashlib.sha256(json.dumps(visible, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()[:32]
 
 
-def answer(rows, project, options, *, operators=None, verifiers=None, members=None, journal=None, generation=None,
-           now=None):
-    """One page for the endpoint action: the snapshot, the stale-page check and the generation it was read at.
+def read_governance(rows, journal, project):
+    """The requirements-governance snapshot, read only when the export holds a requirement row (as `brief` reads it
+    only for a `req:` token); None when there is none or it cannot be read. The one file read of a trace answer."""
+    if journal is None or not any(isinstance(row, dict) and 'requirement' in (row.get('labels') or []) for row in rows):
+        return None
+    import requirement_governance
+    try:
+        return requirement_governance.snapshot(journal, project)
+    except (ValueError, OSError):
+        return None
 
-    The requirements-governance snapshot is read (from `journal`, the project directory) only when the
-    export holds a requirement row, as `brief` reads it only for a `req:` token."""
-    generation = generation or rows_generation(rows)
-    if options['generation'] is not None and options['generation'] != generation:
-        raise ValueError(STALE)
-    governance = None
-    if journal is not None and any(isinstance(row, dict) and 'requirement' in (row.get('labels') or []) for row in rows):
-        import requirement_governance
-        try:
-            governance = requirement_governance.snapshot(journal, project)
-        except (ValueError, OSError):
-            governance = None
+
+def answer(rows, project, options, *, operators=None, verifiers=None, members=None, governance=None, now=None):
+    """One page for the endpoint action, from rows and state already read: no I/O, so the caller builds it after
+    releasing the project lock (review b2). A page asked for at another generation is refused."""
     snap = Snapshot(rows, project, now=snapshot_now(now), operators=operators, verifiers=verifiers,
                     governance=governance, members=members)
+    current = generation(snap)
+    if options['generation'] is not None and options['generation'] != current:
+        raise ValueError(STALE)
     result = trace(snap, options['view'], scope=options['scope'], offset=options['offset'], limit=options['limit'])
-    result['generation'] = generation
+    result['generation'] = current
     return result
 
 

@@ -483,8 +483,7 @@ def dispatch(canonical, request, tmp, run=None):
             return refused(error.status, str(error))
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action == 'trace':
-        # endpoint.py's trace read (kittrial-5bb.425) over the emulated rows: no read cache, so the
-        # generation is the rows' own digest.
+        # endpoint.py's trace read (kittrial-5bb.425) over the emulated rows.
         try:
             import trace_read
         except ImportError:  # a revision that predates the trace read
@@ -498,7 +497,7 @@ def dispatch(canonical, request, tmp, run=None):
         result = trace_read.answer(rows, project, trace_read.parse_options(args),
                                    operators=config_data.get('operators') or [],
                                    verifiers=config_data.get('verifiers') or [], members=members,
-                                   journal=canonical.path)
+                                   governance=trace_read.read_governance(rows, canonical.path, project))
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
     if action in ('ref', 'capability'):
         # endpoint.py's reference catalog (kittrial-5bb.66) and capability index

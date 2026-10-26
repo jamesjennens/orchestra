@@ -7,7 +7,7 @@ Not a test (no test_ prefix): run it by hand from tests/.
 It builds the export with the kit's own writers (requirement and reference records through the test
 natives, so every record is exactly what a real writer leaves), then times, in a fresh interpreter for each
 view, the first answer (imports and the snapshot included) and a second answer over a new snapshot. It also
-times `requirement_impact.analyze` alone and the row digest the endpoint uses when the tracker has no HEAD.
+times `requirement_impact.analyze` alone and the generation (a digest of the filtered snapshot).
 Synthetic data only.
 """
 import argparse
@@ -143,12 +143,12 @@ def main():
     comments = sum(len(row.get('comments') or []) for row in rows)
     print(json.dumps({'rows': len(rows), 'comments': comments, 'export_bytes': export.stat().st_size}))
     import trace_read
-    begin = time.perf_counter()
-    trace_read.rows_generation(rows)
-    print(json.dumps({'rows_generation_ms': round((time.perf_counter() - begin) * 1000)}))
     from datetime import datetime, timezone
     snap = trace_read.Snapshot(rows, 'trial', now=datetime(2026, 10, 20, tzinfo=timezone.utc),
                                operators=['operator', 'ops-james'])
+    begin = time.perf_counter()
+    trace_read.generation(snap)
+    print(json.dumps({'generation_ms': round((time.perf_counter() - begin) * 1000)}))
     snap.citations()
     begin = time.perf_counter()
     affected, note = snap.impact()

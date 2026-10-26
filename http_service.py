@@ -11489,8 +11489,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         if view not in trace_read.VIEWS:
             raise invalid('view must be one of %s' % ', '.join(trace_read.VIEWS))
         scope = ctx.query.get('scope')
-        if scope is not None and not re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,72}', scope):
-            raise invalid('scope must be a design scope')
+        if scope is not None and (len(scope) > 73 or not trace_read.SCOPE_RE.fullmatch(scope)):
+            # Review note 7: the endpoint's own rule and sentence, so `a.` and `a..b` are refused here too.
+            raise invalid(trace_read.USAGE)
         limit, state = self._page(ctx, ctx.query)
         if limit > trace_read.PAGE_MAX:
             raise invalid('limit must be between 1 and %d' % trace_read.PAGE_MAX)

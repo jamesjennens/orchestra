@@ -359,6 +359,11 @@ class _RecordsScenarioMixin:
                       {'view': 'round', 'scope': 'Not A Scope'}):
             refused = get(viewer, **query)
             self.assertEqual(refused.status, 422, (query, refused.data))
+        # Review note 7: the route refuses what the endpoint refuses, with its sentence.
+        for scope in ('a.', 'a..b', '.a'):
+            refused = get(viewer, view='round', scope=scope)
+            self.assertEqual(refused.status, 422, (scope, refused.data))
+            self.assertTrue(refused.data['error']['message'].startswith('trace VIEW'), refused.data)
         # The route refuses an over-long page itself, before the endpoint is asked.
         self.assertEqual(get(viewer, view='tokens', limit='51').data['error']['message'],
                          'limit must be between 1 and 50')

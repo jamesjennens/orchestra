@@ -1243,12 +1243,12 @@ def held_coordination_lock(path,shared=False):
 
 
 def trace_answer(root,path,name,args,actor,authority_config=None):
-    """(answer, warnings) of one trace page (kittrial-5bb.425). One export from the read cache under a shared
-    lock; the generation it was read at goes back with the answer and a page asked for at another generation
-    is refused. The membership that decides whose lines count (the round's publication line, the owner-only
-    decision heuristic) is read live from the service's state."""
+    """(answer, warnings) of one trace page (kittrial-5bb.425). Under a shared lock: the export from the read
+    cache, the live membership (whose lines count: the round's publication line, the owner-only decision
+    heuristic) and the governance snapshot. The views are built after the lock is released (review b2), from
+    what was read; the generation is the caller's filtered snapshot's, and a page at another one is refused."""
     import trace_read
-    from read_cache import cached_export_rows,project_generation
+    from read_cache import cached_export_rows
     options=trace_read.parse_options(args)
     run_warnings=[]
     def run(argv):
@@ -1257,15 +1257,14 @@ def trace_answer(root,path,name,args,actor,authority_config=None):
         return stdout
     with held_coordination_lock(path,shared=True):
         rows=cached_export_rows(root,path,run,name)
-        head=project_generation(root,name)
         members=None
         if authority_config is not None:
             from http_authority import AuthorityDenied,read_state
             try:members=((read_state(authority_config.store).get('memberships') or {}).get(name)) or {}
             except AuthorityDenied:members={}
-        result=trace_read.answer(rows,name,options,operators=configured_operators(root),
-                                 verifiers=configured_verifiers(root),members=members,journal=path,
-                                 generation=None if head is None else 'g:'+head)
+        governance=trace_read.read_governance(rows,path,name)
+    result=trace_read.answer(rows,name,options,operators=configured_operators(root),verifiers=configured_verifiers(root),
+                             members=members,governance=governance)
     return result,''.join(run_warnings)
 
 

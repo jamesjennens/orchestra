@@ -1636,9 +1636,15 @@ sets `operation`.
       read: another project's rows, record anchors and record comments, and the merge slot are never
       work, so a hidden row is absent from every list and every total.
     - **Rows.** Every row is data, with untrusted text escaped and clipped (`{text, omitted_chars}`).
-      Pages hold at most 50 rows; `next_offset` and `generation` continue a page, and a page asked for
-      at another generation is refused ("The project changed since this page was read"). One answer is
-      at most 64 KiB; a page is shortened to fit.
+      Every list in a row holds at most 20 items with an `_omitted` count (5 cross-reviews per lane).
+      Pages hold at most 50 rows; `next_offset` and `generation` continue a page. The generation is a
+      digest of the caller's filtered rows, so a change to a row the caller cannot read never moves it;
+      a page asked for at another generation is refused ("The project changed since this page was
+      read"). One answer is at most 64 KiB, a hard limit: a page is shortened to fit, and a single row
+      still too large is replaced by its identifying fields and `oversized: true` with a plain note.
+    - **Cost.** An answer resolves at most 2,000 distinct tokens; the rest read `unchecked`, and the
+      coverage line says how many. A requirement's ledger is validated once per answer, however many of
+      its revisions are cited. The views are built after the project lock is released.
     - **Flags.** `requirements`: each accepted requirement in force, with `no-design` (only when the
       project has designs), `no-task`, `no-capability` (only when a task citing it is closed or its
       contribution approved). `tasks`: open tasks and those closed in the last 14 days, with
@@ -1648,11 +1654,11 @@ sets `operation`.
       task description, a checkpoint item, a contribution summary or a design's index, with the flags
       `brief` gives it. `decisions`: decision issues, their `Supersedes: decision:<id>` first line and
       the designs naming them, plus `possible-decision-in-comment`, a heuristic that lists a person
-      owner's comment with decision words that no decision cites; it scans the newest 2,000 comments and
-      says so. `designs`: selected or not, `verified`, `unverified` or `design-drift`,
+      owner's comment with decision words that no decision cites; it scans the newest 2,000 of the
+      owners' comments (nobody else's count toward the bound) and says so. `designs`: selected or not, `verified`, `unverified` or `design-drift`,
       `front-status-disagrees`, `review-by-past`, sections with no plan phase, plan phases with no epic,
       epics with no task. `round`: each `design-round:<scope>` epic's lanes with plan and delivery times,
-      cross-reviews and `delivered-after-publication`; the publication time is the first line
+      cross-reviews with their authors and `delivered-after-publication`; the publication time is the first line
       `Published drafts of <scope> at <time>` written by a person owner or coordinator in current
       membership or a listed operator, and nobody else's.
     - A project with no `design.*` entries says so once (`note`), never flags `no-design`, and its

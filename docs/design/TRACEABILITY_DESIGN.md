@@ -618,9 +618,13 @@ of a kittrial-sized export, as the context index did for find.
      person owner or coordinator in current membership or a listed operator; the converged design and
      its decision are read from the `design.<scope>` entry, never from comments. **Measured** on a
      synthetic kittrial-sized export (3,461 rows, 7,620 comments, 40 requirements, 20 indexed designs;
-     tests/trace_cost.py, Windows, Python 3.11): `analyze` 143 ms; each view's first answer in a fresh
-     interpreter 310-914 ms (`summary`, which builds every view, is the 914), a second answer 61-582 ms;
-     the row digest the endpoint falls back to without a tracker HEAD 38 ms. Part 2 builds the web.
+     tests/trace_cost.py, Windows, Python 3.11): `analyze` 114 ms; each view's first answer in a fresh
+     interpreter 359-930 ms (`summary`, which builds every view, is the 930), a second answer 64-587 ms;
+     the generation (a digest of the filtered snapshot) 46 ms. **Bounds against planted input (review of
+     part 1):** every list in a row is bounded and the 64 KiB cap holds for one row; an answer resolves at
+     most 2,000 distinct tokens and validates each requirement ledger once, so 10 tasks of 1,000 distinct
+     `req:` tokens read in about 0.1 s (8.4-8.9 s before); the views are built after the shared lock is
+     released. Part 2 builds the web.
 5. **Orchestra's system design.** docs/SYSTEM_DESIGN.md rewritten with the front block, uploaded as
    `design.orchestra` and accepted, IMPLEMENTATION_PLAN retired, and trace's first report on
    kittrial attached.
