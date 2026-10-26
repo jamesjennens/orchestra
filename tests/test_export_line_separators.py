@@ -139,7 +139,7 @@ class ReaderRouteTests(unittest.TestCase):
         self.project = self.root / 'projects' / 'pp'
         (self.project / '.beads').mkdir(parents=True)
         (self.project / '.beads' / 'metadata.json').write_text(json.dumps({
-            'dolt_server_host': '127.0.0.1', 'dolt_server_port': 12345,
+            'dolt_mode': 'server', 'dolt_server_host': '127.0.0.1', 'dolt_server_port': 12345,
             'dolt_server_user': 'root', 'dolt_database': 'pp'}), encoding='utf-8')
 
     def test_tracker_names_survive_unicode_and_truly_unreadable_rows_still_refuse(self):

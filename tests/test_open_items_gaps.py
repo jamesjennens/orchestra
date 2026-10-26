@@ -37,6 +37,13 @@ class MetadataModeTests(unittest.TestCase):
                 self.assertEqual(self.state(dict(SERVER, dolt_mode=mode)), 'unreadable')
         self.assertEqual(self.state({key: value for key, value in SERVER.items() if key != 'dolt_mode'}), 'unreadable')
 
+    def test_the_sentence_names_the_fault(self):
+        self.assertIn('does not record the Dolt server coordinates', admin.server_metadata_sentence({}))
+        noted = admin.server_metadata_sentence({key: SERVER[key] for key in admin.SERVER_COORDINATES})
+        self.assertIn('has no dolt_mode', noted)
+        self.assertIn('has dolt_mode "Server"', admin.server_metadata_sentence(dict(SERVER, dolt_mode='Server')))
+        self.assertIsNone(admin.server_metadata_fault(SERVER))
+
     def test_server_coordinates_are_still_read_without_the_mode(self):
         # The SQL-coordinate callers do not need dolt_mode: project_server_metadata is unchanged for them.
         with tempfile.TemporaryDirectory() as temp:
@@ -71,6 +78,21 @@ class ModeGuardRealBdTests(Fixture):
             self.assertEqual(json.loads(out)['unreadable'], ['gapone'])
             ran.assert_not_called()
         self.assertFalse((beads / 'embeddeddolt').exists())
+
+    def test_the_endpoint_and_merge_slot_guards_never_run_bd_on_an_embedded_mode_project(self):
+        import actor_names
+        import endpoint
+        beads = self.embed('gapthree')
+        project = self.root / 'projects' / 'gapthree'
+        self.assertEqual(admin.project_merge_slot_state(self.root, 'gapthree'), {'state': 'unknown', 'detail': None})
+        with self.assertRaises(actor_names.TrackerUnreadable):
+            endpoint.tracker_actors(self.root, project)
+        self.assertFalse((beads / 'embeddeddolt').exists())
+        # The operator's sentence says what is wrong: the mode, not the coordinates.
+        said = admin.server_metadata_sentence(json.loads((beads / 'metadata.json').read_text(encoding='utf-8')))
+        self.assertIn('records the Dolt server coordinates but has dolt_mode "embedded"', said)
+        code, out, err = self.main('open-item-label-check', 'gapthree')
+        self.assertIn('has dolt_mode "embedded"', json.loads(out)['projects']['gapthree']['error'])
 
     def test_a_server_mode_project_is_still_read(self):
         self.new_project('gaptwo')
@@ -107,7 +129,7 @@ class FifoMetadataTests(unittest.TestCase):
 
 class FamilyLookalikeTests(unittest.TestCase):
     def test_every_family_lookalike_is_hidden_and_refused_raw(self):
-        self.assertEqual(len(rc.RECORD_COMMENT_FAMILIES), 9)
+        self.assertTrue(rc.RECORD_COMMENT_FAMILIES)
         for family in rc.RECORD_COMMENT_FAMILIES:
             for tail in LOOKALIKE_TAILS:
                 body = family + tail

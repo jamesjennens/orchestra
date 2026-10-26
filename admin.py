@@ -2347,6 +2347,28 @@ def project_metadata_document(root,name):
         return None
     return data if isinstance(data,dict) else None
 
+SERVER_COORDINATES=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
+
+def server_metadata_fault(data):
+    """Why a parsed ``.beads/metadata.json`` is not a server project bd may be run for: ``None``
+    when it is one, ``coordinates`` when the Dolt server coordinates are not all recorded, ``mode``
+    when they are but ``dolt_mode`` is missing or not exactly ``server``. bd runs EMBEDDED for any
+    other mode, CREATES ``.beads/embeddeddolt`` and lists nothing (kittrial-5bb.171). The one rule
+    every bd-running guard shares (admin, endpoint)."""
+    if not isinstance(data,dict) or not all(data.get(key) for key in SERVER_COORDINATES):return 'coordinates'
+    if data.get('dolt_mode')!='server':return 'mode'
+    return None
+
+def server_metadata_sentence(data):
+    """What is wrong with the metadata, in the operator's words, ending with why bd was not run."""
+    if server_metadata_fault(data)=='mode':
+        mode=data.get('dolt_mode')
+        shown='has no dolt_mode' if mode is None else 'has dolt_mode %s'%json.dumps(mode)[:40]
+        problem='.beads/metadata.json records the Dolt server coordinates but %s, not "server"'%shown
+    else:
+        problem='.beads/metadata.json does not record the Dolt server coordinates'
+    return problem+', so bd was not run (it would create an embedded database here and list nothing)'
+
 def project_server_metadata(root,name):
     """(host,port,user,database) from the project's ``.beads/metadata.json``, or None.
 
@@ -2358,7 +2380,7 @@ def project_server_metadata(root,name):
     """
     data=project_metadata_document(root,name)
     if data is None:return None
-    keys=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
+    keys=SERVER_COORDINATES
     if not all(data.get(key) for key in keys):return None
     return tuple(data[key] for key in keys)
 
@@ -2383,7 +2405,7 @@ def project_metadata_state(root,name):
     # bd runs embedded for any other dolt_mode (a missing one too): it CREATES .beads/embeddeddolt
     # and lists nothing, even with the server coordinates present (kittrial-5bb.171 item 1).
     data=project_metadata_document(root,name)
-    return 'server' if data is not None and data.get('dolt_mode')=='server' else 'unreadable'
+    return 'server' if server_metadata_fault(data) is None else 'unreadable'
 
 def server_database_name(root,name):
     """Return the case-insensitively matched server database name, if any."""
@@ -3433,8 +3455,7 @@ def project_merge_slot_state(root,name,path=None):
         metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
     except (OSError,ValueError,UnicodeError):
         metadata=None
-    keys=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
-    if not isinstance(metadata,dict) or not all(metadata.get(key) for key in keys):
+    if server_metadata_fault(metadata) is not None:
         return {'state':'unknown','detail':None}
     try:
         state=json.loads(run_bd(root,name,['merge-slot','check','--json']) or 'null')
@@ -3924,8 +3945,8 @@ def retire_blockers(findings):
     counts=lambda found:', '.join('%d in %s'%(count,journal) for journal,count in sorted(found.items()))
     blockers=[]
     if findings.get('metadata')=='unreadable':
-        blockers.append('its .beads/metadata.json is there but could not be read (or does not record the Dolt '
-                        'server), so the project could not be checked: it may be a healthy tracker')
+        blockers.append('its .beads/metadata.json is there but could not be read, or does not record the Dolt '
+                        'server coordinates with dolt_mode "server", so the project could not be checked: it may be a healthy tracker')
     elif findings['bd']=='unreachable':
         blockers.append('the Dolt server (or bd) could not be reached, so the project could not be checked: it '
                         'may be a healthy tracker')
@@ -5094,8 +5115,7 @@ def open_item_label_check(root,names=None):
             # bd would fall back to an embedded database here: it would CREATE
             # .beads/embeddeddolt inside the project and list nothing, which would read
             # as clean (kittrial-5bb.126 review). Nothing is run for such a project.
-            report[name]={'error':'.beads/metadata.json does not record the Dolt server coordinates, so bd '
-                                   'was not run (it would create an embedded database here and list nothing)'}
+            report[name]={'error':server_metadata_sentence(project_metadata_document(root,name))}
             continue
         try:
             rows=json.loads(run_bd(root,name,['list','--all','--limit','0','--json']) or '[]')
@@ -5184,8 +5204,7 @@ def assignee_name_report(root,names=None,state=None):
         if metadata=='absent':
             report[name]={'error':'unknown or uninitialized project'};continue
         if metadata!='server':
-            report[name]={'error':'.beads/metadata.json does not record the Dolt server coordinates, so bd '
-                                   'was not run (it would create an embedded database here and list nothing)'}
+            report[name]={'error':server_metadata_sentence(project_metadata_document(root,name))}
             continue
         try:
             rows=record_json.loads_rows(run_bd(root,name,['export','--all']))

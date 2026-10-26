@@ -696,9 +696,9 @@ def tracker_actors(root,path,before=None,own=()):
     ``own`` are the lifetimes of earlier credentials of the same name whose rows are not
     held against this one (item 3)."""
     import actor_names
-    from admin import run_bd
+    from admin import run_bd,server_metadata_fault
     # The SAME guard ``admin.project_merge_slot_state`` uses, for the same reason: without the
-    # Dolt server coordinates recorded in ``.beads/metadata.json`` bd falls back to an EMBEDDED
+    # Dolt server coordinates and ``dolt_mode`` server recorded in ``.beads/metadata.json`` bd falls back to an EMBEDDED
     # database, creates ``.beads/embeddeddolt`` and exits 0 having printed nothing. That answer
     # is not this project's tracker at all, so it is the host fault and never the empty-project
     # missing-slot answer: reading it as "no rows at all" answered 503 merge_slot_missing and
@@ -707,8 +707,7 @@ def tracker_actors(root,path,before=None,own=()):
         metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
     except (OSError,ValueError,UnicodeError):
         metadata=None
-    coordinates=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
-    if not isinstance(metadata,dict) or not all(metadata.get(key) for key in coordinates):
+    if server_metadata_fault(metadata) is not None:
         raise actor_names.TrackerUnreadable()
     try:
         text=run_bd(root,path.name,['export','--all'])

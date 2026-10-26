@@ -271,7 +271,9 @@ class RetireCase(unittest.TestCase):
         self.issues['alpha'] = 3
         metadata = self.root / 'projects' / 'alpha' / '.beads' / 'metadata.json'
         for label, text in (('not JSON', '{"dolt_server_host": '), ('not an object', '[]'),
-                            ('no server coordinates', '{}'), ('not text', None)):
+                            ('no server coordinates', '{}'), ('not text', None),
+                            ('embedded mode', json.dumps(dict(SERVER, dolt_mode='embedded', dolt_database='alpha'))),
+                            ('no mode', json.dumps({k: v for k, v in SERVER.items() if k != 'dolt_mode'})), ):
             with self.subTest(label):
                 metadata.write_bytes(b'\xff\xfe') if text is None else metadata.write_text(text, encoding='utf-8')
                 self.bd.clear()
@@ -281,8 +283,8 @@ class RetireCase(unittest.TestCase):
                                  ('unreadable', 'unreachable', None, 'unreadable'))
                 stdout, stderr, code = self.retire('alpha')
                 self.assertNotEqual(code, 0)
-                self.assertIn('its .beads/metadata.json is there but could not be read (or does not record the Dolt '
-                              'server), so the project could not be checked: it may be a healthy tracker', stderr)
+                self.assertIn('its .beads/metadata.json is there but could not be read, or does not record the Dolt '
+                              'server coordinates with dolt_mode "server", so the project could not be checked: it may be a healthy tracker', stderr)
                 self.assertEqual((self.bd, self.probes), ([], []))          # bd is never run without coordinates
                 self.assertTrue(metadata.is_file())
         self.assertEqual(self.journal(), [])
