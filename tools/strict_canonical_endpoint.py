@@ -590,42 +590,42 @@ def dispatch(canonical, request, tmp, run=None):
                             _own = (isinstance(proposer, str) and bool(proposer)
                                       and isinstance(_head, str)
                                       and proposer.split('/', 1)[0] == _head)
-                            try:
-                                import record_acceptance as _shared_accept
-                            except ImportError:
-                                _shared_accept = None
-                            if _shared_accept is not None:
-                                _s_seen = (live.get('settings_seen')
-                                           if isinstance(live.get('settings_seen'), dict) else {})
-                                _s_by_another = bool(
-                                    _s_seen.get('approval_by_another_party')
-                                    or authority.get('approval_by_another_party')
-                                    or rules.get('independent_approval'))
-                                _s_caller = set(http_authority.actor_parties(live, actor, project))
-                                if user_id:
-                                    _s_caller.add(user_id)
-                                _s_draft = (set(http_authority.actor_parties(live, proposer, project))
-                                              if isinstance(proposer, str) and proposer else set())
-                                _may, _reason = _shared_accept.decide(
-                                    can_coordinate=True,
-                                    approval_by_another_party=_s_by_another,
-                                    waiting=True, by_agent=True, agent_head=_head,
-                                    delegation_covers_kind=True,
-                                    delegation_missing=False,
-                                    proposer_known=not _missing,
-                                    caller_parties=_s_caller, draft_parties=_s_draft,
-                                    own_draft=_own,
-                                    own_party=bool(_s_caller & _s_draft),
-                                    independent_hold=False)
-                                if not _may:
-                                    raise RecordsRefusal(403, _reason)
-                                return
+                            # Base order (endpoint.py): no-proposer and own-draft
+                            # refuse before approval_by_another_party is read.
                             if _missing:
                                 raise RecordsRefusal(403, 'This draft has no recorded proposer, so no delegation '
                                                           'can admit it.')
                             if _own:
                                 raise RecordsRefusal(403, 'An agent never accepts or verifies a draft it wrote '
                                                           'itself, whatever its delegation says.')
+                            import record_acceptance as _shared_accept
+                            _s_seen = (live.get('settings_seen')
+                                       if isinstance(live.get('settings_seen'), dict) else {})
+                            _s_by_another = bool(
+                                _s_seen.get('approval_by_another_party')
+                                or authority.get('approval_by_another_party')
+                                or rules.get('independent_approval'))
+                            if not _s_by_another:
+                                return
+                            _s_caller = set(http_authority.actor_parties(live, actor, project))
+                            if user_id:
+                                _s_caller.add(user_id)
+                            _s_draft = (set(http_authority.actor_parties(live, proposer, project))
+                                        if isinstance(proposer, str) and proposer else set())
+                            _may, _reason = _shared_accept.decide(
+                                can_coordinate=True,
+                                approval_by_another_party=_s_by_another,
+                                waiting=True, by_agent=True, agent_head=_head,
+                                delegation_covers_kind=True,
+                                delegation_missing=False,
+                                proposer_known=not _missing,
+                                caller_parties=_s_caller, draft_parties=_s_draft,
+                                own_draft=_own,
+                                own_party=bool(_s_caller & _s_draft),
+                                independent_hold=False)
+                            if not _may:
+                                raise RecordsRefusal(403, _reason)
+                            return
                         settings_seen = live.get('settings_seen') if isinstance(live.get('settings_seen'), dict) else {}
                         approval_by_another = bool(
                             settings_seen.get('approval_by_another_party')

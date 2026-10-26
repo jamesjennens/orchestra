@@ -10841,6 +10841,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         item b1), the SAME rule the accept route enforces through endpoint.py
         ``party_check``/``delegation_check``. The accept route still enforces
         on its own. ``reason`` is a short plain sentence for display only.
+
+        ``record_kind`` is the record family the route handler already knows
+        (``'references'`` or ``'capabilities'``): pass it explicitly. Deriving
+        it from the item alone returns None for references (route_target is
+        'GET /v1/...' and never starts with 'references.'), and None demands
+        both kinds covered, so a references-only delegation would wrongly
+        refuse (review item r2-field-references).
         """
         import record_acceptance
         record_kind = record_kind or self._record_kind(ctx, item)
@@ -10914,10 +10921,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         refused = False
         if by_agent:
             covered = self._coverage_for(ctx, pid, record_kind or 'references')
-            if record_kind is None:
-                other = self._coverage_for(ctx, pid, 'capabilities')
-                if covered is not True or other is not True:
-                    covered = False if (covered is False or other is False) else covered
             if covered is None:
                 unreadable = True
             elif covered is not True:
@@ -11012,7 +11015,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return 'capabilities'
         return None
 
-    def _enrich_record_view(self, ctx, pid, capabilities, item):
+    def _enrich_record_view(self, ctx, pid, capabilities, item, record_kind=None):
         if not isinstance(item, dict):
             return item
         item = dict(item)
@@ -11113,18 +11116,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
-        may_accept, may_reason = self._viewer_may_accept(ctx, pid, item, can_coordinate)
+        may_accept, may_reason = self._viewer_may_accept(ctx, pid, item, can_coordinate,
+                                                        record_kind=record_kind)
         item['viewer_may_accept'] = bool(may_accept)
         item['viewer_may_accept_reason'] = may_reason
         return item
 
-    def _enrich_records_list(self, ctx, pid, result):
+    def _enrich_records_list(self, ctx, pid, result, record_kind=None):
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         can_propose, can_coordinate = self._records_standing(ctx, pid, capabilities)
         result = dict(result)
         for list_key in ('items', 'records', 'candidates'):
             if isinstance(result.get(list_key), list):
-                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item)
+                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item,
+                                                             record_kind=record_kind)
                                     for item in result[list_key]]
         if 'items' not in result and isinstance(result.get('records'), list):
             seen = {r.get('key') for r in result['records'] if isinstance(r, dict)}
@@ -11263,7 +11268,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                          capability=needed)
             capabilities = self.service.capabilities_for(ctx.principal, pid)
             if isinstance(result, dict):
-                result = self._enrich_record_view(ctx, pid, capabilities, result)
+                result = self._enrich_record_view(ctx, pid, capabilities, result,
+                                                  record_kind=route_name.split('.')[0])
             return result, result
         return self._mutate(ctx, route_name, pid, mutate_record, status=status,
                             capability=needed, serialize=False, canonical=True,
@@ -11359,7 +11365,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             options = reference_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('ref list: ', ''))
-        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options))
+        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options),
+                                             record_kind='references')
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
@@ -11384,7 +11391,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             raise invalid(str(error).replace('ref find: ', ''))
         result = self.backend.references_find(pid, phrase, parsed_limit)
-        return 200, self._enrich_records_list(ctx, pid, result)
+        return 200, self._enrich_records_list(ctx, pid, result, record_kind='references')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')')
     def references_get(self, ctx):
@@ -11392,7 +11399,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         return 200, self._enrich_record_view(
-            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']))
+            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']),
+            record_kind='references')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_propose(self, ctx):
@@ -11446,7 +11454,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             options = capability_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('capability list: ', ''))
-        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options))
+        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options),
+                                             record_kind='capabilities')
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
@@ -11471,7 +11480,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             raise invalid(str(error).replace('capability find: ', ''))
         result = self.backend.capabilities_find(pid, phrase, parsed_limit)
-        return 200, self._enrich_records_list(ctx, pid, result)
+        return 200, self._enrich_records_list(ctx, pid, result, record_kind='capabilities')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')')
     def capabilities_get(self, ctx):
@@ -11479,7 +11488,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         return 200, self._enrich_record_view(
-            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']))
+            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']),
+            record_kind='capabilities')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
     def capabilities_propose(self, ctx):

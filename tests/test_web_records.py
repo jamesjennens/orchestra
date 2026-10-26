@@ -1450,16 +1450,7 @@ class _RecordsScenarioMixin:
                 harness.service.store.save()
 
     def run_shared_predicate_rows_suite(self):
-        """Review b1 probe rows as named tests (kittrial-5bb.420 r2): field and route agree.
-
-        The shared ``record_acceptance.decide`` predicate, the enriched waiting
-        item's ``viewer_may_accept`` field, and the accept route's answer MUST
-        agree: a row the page offers ('Review & accept') is one the route
-        accepts, and a row the route refuses offers 'View'. The matrix covers
-        the narrowed-scope delegation (references-only never admits a capability
-        draft) and ``independent_approval`` for a person coordinator on their
-        own draft and an agent on its owner's draft.
-        """
+        """Field/route agreement matrix (kittrial-5bb.420 r3): probe rows below."""
         import record_acceptance
         harness = self.harness
         people = self._setup_actors(harness)
@@ -1494,23 +1485,82 @@ class _RecordsScenarioMixin:
             token=agent1['token'], key='probe-narrow-cap2-accept')
         self.assertEqual(refused.status, 403, refused.data)
         self.assertIn('covers references, not capabilities', refused.data['error']['message'])
-        # installation independent_approval (review b1): the shared predicate
-        # refuses a person coordinator on their own draft and an agent on its
-        # owner's draft, even with a live delegation covering the kind.
-        self.assertEqual(
-            record_acceptance.decide(
-                can_coordinate=True, approval_by_another_party=True, waiting=True,
-                by_agent=False, caller_parties={'coord1'}, draft_parties={'coord1'},
-                own_party=True),
-            (False, 'A coordinator may not accept or verify a record whose draft was proposed '
-                    'by the same party while approval_by_another_party is enabled.'))
-        self.assertEqual(
-            record_acceptance.decide(
-                can_coordinate=True, approval_by_another_party=True, waiting=True,
-                by_agent=True, agent_head='agent1', delegation_covers_kind=True,
-                caller_parties={'owner1'}, draft_parties={'owner1'},
-                own_draft=False, own_party=True)[0],
-            False)
+        ref_row = harness.request('POST', f'/v1/projects/{pid}/references',
+                                  _valid_ref_propose('probe.narrow-ref3', title='Probe Narrow Ref3'),
+                                  token=people['coord2']['token'], key='probe-narrow-ref3-propose')
+        self.assertEqual(ref_row.status, 201, ref_row.data)
+        ref_field = harness.request('GET', f'/v1/projects/{pid}/references/probe.narrow-ref3',
+                                    token=agent1['token'])
+        self.assertEqual(ref_field.status, 200, ref_field.data)
+        cap_field = harness.request('GET', f'/v1/projects/{pid}/capabilities/probe.narrow-cap2',
+                                    token=agent1['token'])
+        self.assertEqual(cap_field.status, 200, cap_field.data)
+        self.assertTrue(ref_field.data['viewer_may_accept'], ref_field.data)
+        self.assertFalse(cap_field.data['viewer_may_accept'], cap_field.data)
+        ref_ok = harness.request(
+            'POST', f'/v1/projects/{pid}/references/probe.narrow-ref3/accept',
+            {'expected_revision': 1, 'record_sha256': ref_row.data['sha256'],
+             'evidence': 'Probe narrowed scope admits reference.', 'decision_id': narrow},
+            token=agent1['token'], key='probe-narrow-ref3-accept')
+        self.assertEqual(ref_ok.status, 200, ref_ok.data)
+        own_ref = harness.request('POST', f'/v1/projects/{pid}/references',
+                                  _valid_ref_propose('probe.own-ref4', title='Probe Own Ref4'),
+                                  token=agent1['token'], key='probe-own-ref4-propose')
+        self.assertEqual(own_ref.status, 201, own_ref.data)
+        with harness.service.store.lock:
+            harness.service.approval_by_another_party = True
+            harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = True
+            harness.service.store.save()
+        try:
+            own_field = harness.request('GET', f'/v1/projects/{pid}/references/probe.own-ref4',
+                                        token=agent1['token'])
+            self.assertEqual(own_field.status, 200, own_field.data)
+            self.assertFalse(own_field.data['viewer_may_accept'], own_field.data)
+            self.assertIn('never accepts or verifies a draft it wrote itself',
+                          own_field.data['viewer_may_accept_reason'], own_field.data)
+            own_route = harness.request(
+                'POST', f'/v1/projects/{pid}/references/probe.own-ref4/accept',
+                {'expected_revision': 1, 'record_sha256': own_ref.data['sha256'],
+                 'evidence': 'Probe own draft stays own-draft.', 'decision_id': narrow},
+                token=agent1['token'], key='probe-own-ref4-accept')
+            self.assertEqual(own_route.status, 403, own_route.data)
+            self.assertIn('never accepts or verifies a draft it wrote itself',
+                          own_route.data['error']['message'])
+            self.assertEqual(
+                record_acceptance.decide(
+                    can_coordinate=True, approval_by_another_party=True, waiting=True,
+                    by_agent=True, agent_head=agent1['actor'].split('/')[0],
+                    delegation_covers_kind=True,
+                    caller_parties={'coord1'}, draft_parties={'coord1'},
+                    own_draft=True, own_party=True),
+                (False, 'An agent never accepts or verifies a draft it wrote itself, '
+                        'whatever its delegation says.'))
+        finally:
+            with harness.service.store.lock:
+                harness.service.approval_by_another_party = False
+                harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = False
+                harness.service.store.save()
+        # A delegation naming one agent admits it and refuses another, named
+        # on the route (the field cannot name a decision).
+        solo = self._delegate(harness, title='Probe single-agent delegation',
+                              grantee=agent3['id'], key='probe-solo-delegation')
+        solo_ref = harness.request('POST', f'/v1/projects/{pid}/references',
+                                   _valid_ref_propose('probe.solo-ref5', title='Probe Solo Ref5'),
+                                   token=people['coord1']['token'], key='probe-solo-ref5-propose')
+        self.assertEqual(solo_ref.status, 201, solo_ref.data)
+        solo_no = harness.request(
+            'POST', f'/v1/projects/{pid}/references/probe.solo-ref5/accept',
+            {'expected_revision': 1, 'record_sha256': solo_ref.data['sha256'],
+             'evidence': 'Probe single-agent grant refuses other agent.', 'decision_id': solo},
+            token=agent1['token'], key='probe-solo-ref5-noaccept')
+        self.assertEqual(solo_no.status, 403, solo_no.data)
+        self.assertIn('granted to', solo_no.data['error']['message'], solo_no.data)
+        solo_yes = harness.request(
+            'POST', f'/v1/projects/{pid}/references/probe.solo-ref5/accept',
+            {'expected_revision': 1, 'record_sha256': solo_ref.data['sha256'],
+             'evidence': 'Probe single-agent grant admits named agent.', 'decision_id': solo},
+            token=agent3['token'], key='probe-solo-ref5-yesaccept')
+        self.assertEqual(solo_yes.status, 200, solo_yes.data)
 
     def _setup_probe_drafts(self, harness, people):
         import datetime
