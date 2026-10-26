@@ -657,6 +657,16 @@ class VerificationTests(DesignCase):
             with self.assertRaises(ValueError):
                 reserved_comments.check_raw_request(['comments', 'add', 'ref-1', text], {}, actor='alice', task='ref-1')
 
+    def test_a_trusted_record_written_by_another_listed_actor_does_not_count(self):
+        record = dd.verification_record(self.report('pass'), VERIFIER, 'host', 'verified', '2026-01-01T00:00:00Z')
+        self.native.add_comment(self.anchor()['id'], dd.verification_body(record), author=OPERATOR)
+        self.assertEqual(self.state()['state'], 'unverified')
+
+    def test_an_untrusted_pass_never_clears_a_drift(self):
+        self.file(self.report())
+        self.file(self.report('pass'), actor='bob')
+        self.assertEqual(self.state()['state'], 'design-drift')
+
     def test_a_verified_identity_counts_only_from_the_host_route(self):
         record = dd.verification_record(self.report('pass'), VERIFIER, 'endpoint', 'verified', '2026-01-01T00:00:00Z')
         self.native.add_comment(self.anchor()['id'], dd.verification_body(record), author=VERIFIER)
@@ -704,6 +714,22 @@ class DesignPageTests(DesignCase):
         index['sha256'] = dd.content_hash(index)
         self.native.add_comment(self.anchor()['id'], dd.index_body(index))
         self.assertEqual(self.page()['index_state'], 'differs')
+
+    def test_a_design_entry_written_before_documents_stays_readable_without_a_page(self):
+        # Q3: a repo-path design entry from an older kit keeps reading; it has no document, so no page,
+        # no verification block, and its sections stay unchecked.
+        with patch.object(dd, 'is_design_key', return_value=False):
+            self.propose(key='design.legacy', operation_id='legacy')
+        self.assertEqual(rr.get(rr.read_key_rows(self.native, 'design.legacy'), 'design.legacy',
+                                [OPERATOR])['state'], 'draft-only')
+        self.assertNotIn('verification', rr.get(rr.read_key_rows(self.native, 'design.legacy'), 'design.legacy',
+                                                [OPERATOR]))
+        with self.assertRaisesRegex(ValueError, '^Design not found$'):
+            self.page(scope='legacy')
+        import briefing
+        pointer = briefing.parse_context_pointers('design:legacy#anything')[0]
+        answer = briefing.ContextPointers(self.native.rows, 'trial', operators=[OPERATOR]).resolve(pointer)
+        self.assertEqual((answer['section']['state'], answer['flags']), ('unchecked', ['not-selected']))
 
     def test_every_absent_or_hidden_design_answers_the_same_refusal(self):
         self.propose_design()
