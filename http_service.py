@@ -10843,14 +10843,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         on its own. ``reason`` is a short plain sentence for display only.
 
         ``record_kind`` is the record family the route handler already knows
-        (``'references'`` or ``'capabilities'``): pass it explicitly. Deriving
-        it from the item alone returns None for references (route_target is
-        'GET /v1/...' and never starts with 'references.'), and None demands
-        both kinds covered, so a references-only delegation would wrongly
-        refuse (review item r2-field-references).
+        (``'references'`` or ``'capabilities'``) and MUST pass explicitly: every
+        caller does (the default is fail-closed, never a guess), so a
+        references-only delegation is never asked about capabilities (review
+        item r2-field-references).
         """
         import record_acceptance
-        record_kind = record_kind or self._record_kind(ctx, item)
+        if record_kind not in ('references', 'capabilities'):
+            return False, 'The record family could not be read.'
         by_agent = getattr(ctx.principal, 'via', None) == 'credential'
         entry_state = item.get('state')
         proposed = item.get('proposed')
@@ -10916,11 +10916,37 @@ class ApiHandler(BaseHTTPRequestHandler):
         head = actor.split('/', 1)[0] if isinstance(actor, str) else ''
         own_draft = bool(head) and any(
             isinstance(a, str) and a.split('/', 1)[0] == head for a in draft_authors)
+        # The route's session-owner sameness (endpoint.py party_check reads the
+        # project's .sessions.json owners map via owner_loader, review t1): the
+        # field reads the same project directory the endpoint backend was
+        # launched with (self.backend.root). sessions/review_workflow import no
+        # POSIX-only module at module level, so this lazy read keeps the
+        # no-fcntl pin green. An unreadable-or-missing registry fails closed:
+        # the field refuses exactly where the route answers 409/403.
+        independent_hold = False
+        if independent and waiting and approval_by_another and can_coordinate:
+            try:
+                from pathlib import Path as _Path
+                import admin as _admin
+                import sessions as _sessions
+                from review_workflow import same_party as _same_party
+                _project_dir = _admin.project_dir(_Path(backend_root), pid)
+                _owners = _sessions.owners(_project_dir)
+                _actor = getattr(ctx.principal, 'actor', '') or ctx.principal.user_id
+                for _prop in draft_authors:
+                    if isinstance(_actor, str) and _actor and _same_party(_actor, _prop, _owners):
+                        independent_hold = True
+                        break
+            except Exception:
+                if by_agent:
+                    return False, 'Whether a delegation covers this agent could not be read.'
+                return False, ('A coordinator may not accept or verify a record whose draft was proposed '
+                               'by the same party while approval_by_another_party is enabled.')
         covered = None
         unreadable = False
         refused = False
         if by_agent:
-            covered = self._coverage_for(ctx, pid, record_kind or 'references')
+            covered = self._coverage_for(ctx, pid, record_kind)
             if covered is None:
                 unreadable = True
             elif covered is not True:
@@ -10940,7 +10966,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             draft_parties=draft_parties,
             own_draft=own_draft,
             own_party=bool(caller_parties & draft_parties),
-            independent_hold=False)
+            independent_hold=independent_hold)
 
     def _coverage_for(self, ctx, pid, kind):
         """Whether a delegation in force covers the caller's agent FOR KIND.
@@ -10995,25 +11021,6 @@ class ApiHandler(BaseHTTPRequestHandler):
             covered = None
         cache[key] = covered
         return covered
-
-    def _record_kind(self, ctx, item):
-        """``'references'`` or ``'capabilities'`` for one enriched item, or None."""
-        for probe in (item.get('item_kind'), item.get('kind')):
-            if probe in ('references', 'capabilities'):
-                return probe
-            if probe == 'reference':
-                return 'references'
-            if probe == 'capability':
-                return 'capabilities'
-        if isinstance(item.get('verification'), dict) or 'verification_state' in item:
-            return 'capabilities'
-        route = getattr(ctx, 'route_target', None)
-        if isinstance(route, str):
-            if route.startswith('references.'):
-                return 'references'
-            if route.startswith('capabilities.'):
-                return 'capabilities'
-        return None
 
     def _enrich_record_view(self, ctx, pid, capabilities, item, record_kind=None):
         if not isinstance(item, dict):

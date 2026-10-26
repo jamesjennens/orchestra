@@ -612,15 +612,16 @@ def dispatch(canonical, request, tmp, run=None):
                                 _s_caller.add(user_id)
                             _s_draft = (set(http_authority.actor_parties(live, proposer, project))
                                         if isinstance(proposer, str) and proposer else set())
+                            # _missing/_own are refused above, so decide's defaults
+                            # (proposer_known True, own_draft False) carry the
+                            # same values (notes tidy-up).
                             _may, _reason = _shared_accept.decide(
                                 can_coordinate=True,
                                 approval_by_another_party=_s_by_another,
                                 waiting=True, by_agent=True, agent_head=_head,
                                 delegation_covers_kind=True,
                                 delegation_missing=False,
-                                proposer_known=not _missing,
                                 caller_parties=_s_caller, draft_parties=_s_draft,
-                                own_draft=_own,
                                 own_party=bool(_s_caller & _s_draft),
                                 independent_hold=False)
                             if not _may:

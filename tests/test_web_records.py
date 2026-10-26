@@ -1608,6 +1608,161 @@ class _RecordsScenarioMixin:
         (item,) = [i for i in listed.data['items'] if i['key'] == 'probe.settled-ref']
         self.assertFalse(item.get('viewer_may_accept'), item)
         self.assertEqual(item.get('viewer_may_accept_reason'), 'Nothing waits to be accepted.')
+    def run_independent_approval_session_owners_suite(self):
+        """Review t1 (r4): deployment independent_approval on, owners map decides.
+
+        No earlier suite ran with deployment independent_approval on, so a
+        mutant dropping independent_hold (record_acceptance.py) survives. The
+        ROUTE enforces it (endpoint.py reads .sessions.json owners and passes
+        same_session_owner): same principal -> 403 + field false; different
+        principals -> 200 + field true. Dates derive from now.
+        """
+        import datetime
+        harness = self.harness
+        people = self._setup_actors(harness)
+        agent1 = people['coord1_agent']
+        pid = self.pid
+        for ag in (agent1, people['coord1_agent2'], people['coord2_agent']):
+            g = harness.request('PUT', f'/v1/projects/{pid}/agents/{ag["id"]}/coordinator', {},
+                                token=self.owner_token)
+            self.assertEqual(g.status, 200, g.data)
+        today = datetime.date.today().isoformat()
+        delegation = self._delegate(harness, title='Independent approval session-owners delegation')
+        # coord2 proposes: a DIFFERENT party from agent1's owner (coord1), so
+        # only the session-owner sameness (independent_hold) can refuse. If
+        # coord1 proposed, own_party would refuse anyway and a mutant dropping
+        # independent_hold would survive.
+        body = _valid_ref_propose('indep.shared-ref', title='Independent Shared Ref')
+        body['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
+                             'observed': today, 'how': 'Checked the live board before proposing.'}
+        shared = harness.request('POST', f'/v1/projects/{pid}/references', body,
+                                 token=people['coord2']['token'], key='indep-shared-propose')
+        self.assertEqual(shared.status, 201, shared.data)
+        import admin as _admin
+        from pathlib import Path as _Path
+        project_dir = _admin.project_dir(_Path(harness.backend.root), pid)
+        registry = project_dir / '.sessions.json'
+        before = registry.read_text(encoding='utf-8') if registry.exists() else None
+        try:
+            registry.write_text(json.dumps({'schema_version': 1, 'records': {},
+                                            'owners': {agent1['actor']: 'person:shared',
+                                                       shared.data['proposer']: 'person:shared'}}),
+                                encoding='utf-8')
+            view = harness.request('GET', f'/v1/projects/{pid}/references/indep.shared-ref',
+                                   token=agent1['token'])
+            self.assertEqual(view.status, 200, view.data)
+            self.assertFalse(view.data['viewer_may_accept'], view.data)
+            refused = harness.request(
+                'POST', f'/v1/projects/{pid}/references/indep.shared-ref/accept',
+                {'expected_revision': 1, 'record_sha256': shared.data['sha256'],
+                 'evidence': 'Same-principal accept refused.', 'decision_id': delegation},
+                token=agent1['token'], key='indep-shared-accept')
+            self.assertEqual(refused.status, 403, refused.data)
+            self.assertIn('approval by another party', refused.data['error']['message'])
+        finally:
+            if before is None:
+                try:
+                    registry.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                registry.write_text(before, encoding='utf-8')
+        body2 = _valid_ref_propose('indep.split-ref', title='Independent Split Ref')
+        body2['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
+                              'observed': today, 'how': 'Checked the live board before proposing.'}
+        split = harness.request('POST', f'/v1/projects/{pid}/references', body2,
+                                token=people['coord2']['token'], key='indep-split-propose')
+        self.assertEqual(split.status, 201, split.data)
+        before = registry.read_text(encoding='utf-8') if registry.exists() else None
+        try:
+            registry.write_text(json.dumps({'schema_version': 1, 'records': {},
+                                            'owners': {agent1['actor']: 'person:agent-side',
+                                                       split.data['proposer']: 'person:draft-side'}}),
+                                encoding='utf-8')
+            view = harness.request('GET', f'/v1/projects/{pid}/references/indep.split-ref',
+                                   token=agent1['token'])
+            self.assertEqual(view.status, 200, view.data)
+            self.assertTrue(view.data['viewer_may_accept'], view.data)
+            admitted = harness.request(
+                'POST', f'/v1/projects/{pid}/references/indep.split-ref/accept',
+                {'expected_revision': 1, 'record_sha256': split.data['sha256'],
+                 'evidence': 'Different-principal accept admitted.', 'decision_id': delegation},
+                token=agent1['token'], key='indep-split-accept')
+            self.assertEqual(admitted.status, 200, admitted.data)
+        finally:
+            if before is None:
+                try:
+                    registry.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                registry.write_text(before, encoding='utf-8')
+
+    def run_settings_seen_alone_suite(self):
+        """Review t2 (r4): settings_seen WITHOUT the service flag (and reverse).
+
+        Every earlier suite sets them together, so a mutant dropping
+        settings_seen from the field survives. Each source rides alone, on a
+        person coordinator's own draft and on an agent's own-party draft (with
+        a delegation): field and route agree in all four corners, quiet when
+        both are off.
+        """
+        harness = self.harness
+        people = self._setup_actors(harness)
+        coord1 = people['coord1']['token']
+        agent1 = people['coord1_agent']
+        pid = self.pid
+        for ag in (agent1, people['coord2_agent']):
+            g = harness.request('PUT', f'/v1/projects/{pid}/agents/{ag["id"]}/coordinator', {},
+                                token=self.owner_token)
+            self.assertEqual(g.status, 200, g.data)
+        delegation = self._delegate(harness, title='Settings-seen alone delegation')
+        own_ref = harness.request('POST', f'/v1/projects/{pid}/references',
+                                  _valid_ref_propose('seen.person-ref', title='Seen Person Ref'),
+                                  token=coord1, key='seen-person-propose')
+        self.assertEqual(own_ref.status, 201, own_ref.data)
+        own_body = _valid_ref_propose('seen.agent-ref', title='Seen Agent Ref')
+        own_ag = harness.request('POST', f'/v1/projects/{pid}/references', own_body,
+                                 token=people['coord1']['token'], key='seen-agent-propose')
+        self.assertEqual(own_ag.status, 201, own_ag.data)
+        cases = [('service-only', True, False), ('seen-only', False, True)]
+        for label, service_flag, seen_flag in cases:
+            with harness.service.store.lock:
+                harness.service.approval_by_another_party = service_flag
+                harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = seen_flag
+                harness.service.store.save()
+            try:
+                person_view = harness.request(
+                    'GET', f'/v1/projects/{pid}/references/seen.person-ref', token=coord1)
+                self.assertEqual(person_view.status, 200, (label, person_view.data))
+                self.assertFalse(person_view.data['viewer_may_accept'], (label, person_view.data))
+                person_refused = harness.request(
+                    'POST', f'/v1/projects/{pid}/references/seen.person-ref/accept',
+                    {'expected_revision': 1, 'record_sha256': own_ref.data['sha256'],
+                     'evidence': 'Own draft refused under %s.' % label},
+                    token=coord1, key='seen-person-refuse-' + label)
+                self.assertEqual(person_refused.status, 403, (label, person_refused.data))
+                agent_view = harness.request(
+                    'GET', f'/v1/projects/{pid}/references/seen.agent-ref', token=agent1['token'])
+                self.assertEqual(agent_view.status, 200, (label, agent_view.data))
+                self.assertFalse(agent_view.data['viewer_may_accept'], (label, agent_view.data))
+                agent_refused = harness.request(
+                    'POST', f'/v1/projects/{pid}/references/seen.agent-ref/accept',
+                    {'expected_revision': 1, 'record_sha256': own_ag.data['sha256'],
+                     'evidence': 'Own-party draft refused under %s.' % label,
+                     'decision_id': delegation},
+                    token=agent1['token'], key='seen-agent-refuse-' + label)
+                self.assertEqual(agent_refused.status, 403, (label, agent_refused.data))
+                self.assertIn('approval by another party', agent_refused.data['error']['message'], label)
+            finally:
+                with harness.service.store.lock:
+                    harness.service.approval_by_another_party = False
+                    harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = False
+                    harness.service.store.save()
+        quiet_view = harness.request('GET', f'/v1/projects/{pid}/references/seen.person-ref', token=coord1)
+        self.assertEqual(quiet_view.status, 200, quiet_view.data)
+        self.assertTrue(quiet_view.data['viewer_may_accept'], quiet_view.data)
+
 
 
 @unittest.skipUnless(os.name == 'nt', 'POSIX runs NativeWebRecordsTests against real endpoint.py and real bd')
@@ -1655,6 +1810,9 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
     def test_nothing_waits_gate(self):
         self.run_nothing_waits_suite()
 
+    def test_settings_seen_alone(self):
+        self.run_settings_seen_alone_suite()
+
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
@@ -1694,6 +1852,14 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_shared_predicate_probe_rows(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_shared_predicate_rows_suite()
+
+    def test_native_settings_seen_alone(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_settings_seen_alone_suite()
+
+    def test_native_independent_approval_session_owners(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=True)
+        self.run_independent_approval_session_owners_suite()
 
     def test_native_nothing_waits_gate(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
