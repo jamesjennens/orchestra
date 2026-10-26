@@ -4450,7 +4450,9 @@ it with an `item-intent-cancel` line:
 
 Moderation and archive work out the attempts' outcomes before taking any lock. The room lock is
 the project's `.coordination.lock`, which the endpoint's reads need, so they never wait on the
-endpoint while holding it.
+endpoint while holding it. Each snapshot is keyed by the intent identity and its ordered attempt
+authors. Under the item and room locks they read those authors again; an exact match uses the
+snapshot, while a new or changed attempt list falls back to `record_may_exist: true`.
 
 The cancel line names the identity, the records the attempts are known to have written (from
 the journal), and `record_may_exist` when an outcome is unknown, so a coordinator can find and

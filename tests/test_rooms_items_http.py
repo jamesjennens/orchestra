@@ -234,7 +234,7 @@ class RoomsItemsHttpTests(agents.AgentHarness):
     def kinds(self, kind):
         return [line for line in self.lines() if line['kind'] == kind]
 
-    def fail_after_native(self, token, key, sequence=1, body=None):
+    def fail_after_native(self, token, key, sequence=1, body=None, rid=None):
         """An accept whose native write lands but whose room append fails (the review's failure)."""
         real_append = rooms._append
         state = {'failed': False}
@@ -244,7 +244,7 @@ class RoomsItemsHttpTests(agents.AgentHarness):
                 raise OSError(5, 'injected append failure after the native write')
             return real_append(project, room_id, line, limits_values)
         with mock.patch.object(rooms, '_append', flaky):
-            failed = self.accept(token, sequence=sequence, key=key, body=body)
+            failed = self.accept(token, sequence=sequence, key=key, body=body, rid=rid)
         self.assertEqual(500, failed.status, failed.data)
         return failed
 
@@ -742,6 +742,46 @@ class RoomsItemsHttpTests(agents.AgentHarness):
         self.assertEqual(2, len(cancels))
         self.assertTrue(all(line['records'] for line in cancels), cancels)
 
+    def test_r7_moderation_and_archive_notice_new_attempt_authors(self):
+        # N1: a second attempt can land after the lock-free outcome snapshot. Its native
+        # write and failed room append happen deterministically before the cancel locks.
+        original = http_service.ApiHandler._room_outcomes_before_locks
+        project = Path(self.rooms_root) / self.pid
+        for action in ('moderate', 'archive'):
+            with self.subTest(action=action):
+                rid = self.room['id'] if action == 'moderate' else self.create_room(
+                    self.tokens['coord'], 'R7 archive')['id']
+                self.post_item(self.tokens['worker'], rid=rid, key='r7-' + action + '-item')
+                self.backend.fail_native = 'requirements.create'
+                failed = self.accept(self.tokens['owner'], rid=rid,
+                                     key='r7-' + action + '-owner')
+                self.assertEqual(503, failed.status, failed.data)
+                lines = rooms.load_lines(project, rid)
+                intent = rooms.pending_accept_intent(lines, 1)
+                base = rooms.intent_base(intent)
+                self.backend.journal[(self.ids['owner'], 'requirements.create',
+                                      base + '-requirement-create', None)] = ('none', None)
+                def snapshot_then_second_attempt(handler, *args, **kwargs):
+                    outcomes = original(handler, *args, **kwargs)
+                    self.fail_after_native(self.tokens['coord'], rid=rid,
+                                           key='r7-' + action + '-coord')
+                    return outcomes
+                with mock.patch.object(http_service.ApiHandler, '_room_outcomes_before_locks',
+                                       snapshot_then_second_attempt):
+                    if action == 'moderate':
+                        answer = self.moderate(self.tokens['coord'], key='r7-moderate')
+                        self.assertEqual(201, answer.status, answer.data)
+                    else:
+                        answer = self.request('POST', self.path('/archive', rid), {},
+                                              token=self.tokens['owner'], key='r7-archive')
+                        self.assertEqual(200, answer.status, answer.data)
+                cancels = [line for line in rooms.load_lines(project, rid)
+                           if line['kind'] == 'item-intent-cancel']
+                self.assertEqual(1, len(cancels), cancels)
+                self.assertTrue(cancels[0]['record_may_exist'], cancels[0])
+                self.assertEqual(2, len(rooms.intent_authors(
+                    rooms.load_lines(project, rid), intent['identity'])))
+
     def test_r6_the_accept_append_holds_the_room_lock(self):
         # N1 (M12): message posts take only the room lock, so the accept's append must hold
         # it too, or the two appends race on the same segment.
@@ -996,6 +1036,19 @@ class RoomsItemsHttpTests(agents.AgentHarness):
             body = {'reason': 'x'} if route == '/reject' else {'title': 't', 'text': 'x'}
             answer = self.request('POST', self.path('/items/1' + route), body, token=secret)
             self.assertEqual(403, answer.status, answer.data)
+
+    def test_r7_room_decision_adapter_still_requires_a_session(self):
+        # M2: the endpoint adapter keeps its own session guard even if the HTTP route's
+        # duplicate guard is removed; a direct credential call never reaches the endpoint.
+        _agent_id, secret, _data = self.agent_secret(self.tokens['owner'], projects=[self.pid])
+        principal = self.service.authenticate(secret)
+        backend = object.__new__(http_service.EndpointBackend)
+        backend.service = self.service
+        backend._endpoint = mock.Mock()
+        with self.assertRaises(http_service.HttpError) as caught:
+            backend.room_decision(principal, self.pid, {'operation_id': 'r7-direct-credential'})
+        self.assertEqual(403, caught.exception.status)
+        backend._endpoint.assert_not_called()
 
     def test_question_answer_is_a_member_action_with_who_and_when(self):
         self.post_item(self.tokens['worker'], kind='question', title='Delimiter?',
