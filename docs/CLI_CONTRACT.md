@@ -2233,7 +2233,14 @@ Incremental `lifecycle.py release --live-verified` selection can add
 deployment. It is valid only with `live_verified=true`, without rollback, in the
 same environment, with the target's exact source/integration commits. The endpoint
 requires that scope to remain live and deployed=passed; otherwise it refuses before
-writing and requests a fresh export. The field is request-only: native scope and
+writing and requests a fresh export; the refusal names the task, the scope it was
+bound to, the live scope (or that nothing is live) and the time of the newest record
+in the view compared (kittrial-5bb.313). `lifecycle.py release` without `--export`
+plans from a live read made through the caller's existing `bd` reads (`list --all
+--limit 0 --json`, then `show IDS --json --include-comments` for rows with comments),
+so a release of many targets after other writes needs no retry; `--export FILE` keeps
+planning from the file as before, and the endpoint re-verifies every target under
+its lock either way. The field is request-only: native scope and
 fact payloads retain their old shape. A target being restored receives live before
 verification on the first command, without a verification-only binding.
 
