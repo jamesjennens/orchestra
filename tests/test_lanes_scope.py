@@ -279,9 +279,23 @@ class ParityTests(ScopeCase):
     def test_the_routes_rows_are_the_canonical_reads_rows_for_the_scope_it_chose(self):
         every = self.lanes(self.tokens['olive']).data
         self.assertEqual('all', every['scope'])
-        # the route adds only the board's nudge field (kittrial-5bb.413) to the canonical rows
-        self.assertEqual(self.rows('all')['items'],
-                         [{k: v for k, v in row.items() if k != 'nudge'} for row in every['items']])
+        # the route adds only display fields to the canonical rows: display_name
+        # and waiting_on_name (kittrial-5bb.416, http_service.py project_lanes) and
+        # the board's nudge field (kittrial-5bb.413). Strip them before comparing,
+        # keeping every canonical field in the comparison.
+        route_rows = [{key: value for key, value in row.items()
+                       if key not in ('display_name', 'waiting_on_name', 'nudge')}
+                      for row in every['items']]
+        for row in route_rows:
+            for entry in row.get('held') or []:
+                entry.pop('waiting_on_name', None)
+        self.assertEqual(self.rows('all')['items'], route_rows)
+        # ... and assert the 416 one is present on the route's rows: known accounts
+        # read as their display names, never as another name.
+        names = {row['actor']: row.get('display_name') for row in every['items']}
+        self.assertEqual('carl', names[self.ids['carl']])
+        self.assertEqual('dave', names[self.ids['dave']])
+        # ... and the 413 one too: every row carries its nudge view.
         self.assertTrue(all('nudge' in row for row in every['items']))
         self.assertEqual(self.both(), {row['actor'] for row in self.rows('all')['items']})
 
