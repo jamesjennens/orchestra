@@ -1540,7 +1540,8 @@ def help_requested(args):
 _COMMAND_HELP_USAGE = {
     'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
             '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
-            ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]',
+            ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]'
+                ' | work summary TASK [TASK ...] [--json]',
     'review': 'review TASK [--rounds | --file payload.json]',
     'handoff': 'handoff TASK --file payload.json',
     'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',

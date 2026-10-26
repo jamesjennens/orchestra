@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "operation_id": "goomba-312-summary-3607d076ea074817835f44a855106005",
+  "key": "work.checkpoint-summary",
+  "name": "Bounded checkpoint and ordinary-post summaries for task ID batches",
+  "summary": "One work summary task-ID batch and HTTP client transport return a bounded latest linked checkpoint, declared lane state, next action and open-item count plus latest ordinary post identity/time/author. Current project visibility and record filters apply; hidden and unknown tasks answer alike. At most 100 distinct IDs, no per-task transport reads or checkpoint bodies/provenance expansion. Existing work-owner attention and display share matching activity selection only within one request; authority remains fresh.",
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "work",
+    "checkpoint",
+    "read",
+    "coordination"
+  ],
+  "aliases": [
+    "bulk latest checkpoint last post coordinator work owner latency",
+    "bulk task checkpoint summaries",
+    "work summary"
+  ],
+  "code": [
+    "work_summary.py::read",
+    "work_summary.py::parse_args",
+    "work_summary.py::item",
+    "briefing.py::checkpoint_selection",
+    "work.py::execute",
+    "http_client.py::Client.task_summaries",
+    "http_service.py::EndpointBackend.task_summaries"
+  ],
+  "tests": [
+    "tests/test_work_summary.py",
+    "tests/test_work_summary_native.py"
+  ],
+  "anchors": [
+    "docs/BRIEFINGS.md#read-checkpoint-summaries-for-many-tasks"
+  ],
+  "requirements": []
+}

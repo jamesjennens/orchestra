@@ -1625,6 +1625,35 @@ class InProcessBackend:
                 'latest_at': records[-1]['created_at'] if records else None,
                 'revisions': len(contributions)}
 
+    def task_summaries(self, principal, project_id, tasks):
+        from work_summary import read, clipped, NEXT_ACTION_MAX, comment_identity
+        from activity import parse_moment, utc_text
+        result = read(self.read_tasks(project_id)['items'], tasks, project=project_id)
+        for item in result['items']:
+            checkpoints = self.state.get('checkpoints', {}).get(item['task']) or []
+            if not item['found'] or not checkpoints:
+                continue
+            latest = checkpoints[-1]
+            try:
+                cid = comment_identity(latest)
+                state = 'unknown'
+                declared = latest.get('lane_state')
+                if declared is not None:
+                    from lane_state import validate
+                    try:
+                        validate(declared, item['task'], cid)
+                        state = declared['state']
+                    except (ValueError, TypeError, KeyError, OverflowError):
+                        pass
+                action, omitted = clipped(latest.get('next_action'), NEXT_ACTION_MAX)
+                item['checkpoint'] = dict(comment_id=cid,
+                    timestamp=utc_text(parse_moment(latest.get('created_at'))), state=state,
+                    next_action=action, next_action_omitted_chars=omitted,
+                    open_items_count=len(latest.get('open_items') or []))
+            except (ValueError, TypeError, KeyError, OverflowError):
+                item.update(checkpoint=None, coverage='unknown')
+        return result
+
     def task_brief(self, project_id, task_id):
         """Everything the task page shows, from one read of the in-process state."""
         task = self._task(project_id, task_id)
@@ -3800,6 +3829,19 @@ class EndpointBackend:
         if isinstance(data.get('followon'), dict):
             detail['followon'] = data['followon']
         return detail
+
+    def task_summaries(self, principal, project_id, tasks):
+        """One host work-summary read, with the caller's live project authority."""
+        from work_summary import task_ids
+        tasks = task_ids(tasks)
+        reply = self._endpoint('work', project_id, principal.actor, ['summary'] + tasks,
+                               authority=authority_request(principal, project_id, CAP_READ,
+                                                           now=self.service._expiry_now()),
+                               require_authority=True)
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict) or payload.get('schema_version') != 1 or not isinstance(payload.get('items'), list):
+            raise uncertain('The canonical task summary returned an unexpected shape')
+        return payload
 
     def task_brief(self, project_id, task_id):
         """Map the canonical ``brief --json`` read onto the task page's shape.
@@ -8244,6 +8286,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                                                 result.get('next') or [])
         result['current_actor'] = self.service.bind_actor(ctx.principal, None)
         return 200, result
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/summary')
+    def task_summary(self, ctx):
+        # A read: no operation identity, reservation, or per-task existence probe.
+        self._project(ctx, CAP_READ)
+        from work_summary import task_ids
+        if not isinstance(ctx.payload, dict) or set(ctx.payload) != {'tasks'}:
+            raise invalid('Task summary requires exactly a tasks list')
+        try:
+            tasks = task_ids(ctx.payload['tasks'])
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        return 200, self.backend.task_summaries(ctx.principal, ctx.params['pid'], tasks)
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle/scope')
     def lifecycle_scope(self, ctx):
