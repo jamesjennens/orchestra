@@ -1399,7 +1399,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             lanes_scope,request.get('lanes_scope') if isinstance(request,dict) else None)
         def work_effect():
             read_context = {}
-            if action in ('work', 'wait'):
+            if action in ('work', 'wait') and args[:1] != ['summary']:
                 read_context['comment_authority'] = comment_contact_authority(root,path,operators,authority_config)
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,
@@ -2820,11 +2820,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                     owners=owner_loader(path,'lifecycle_authors'),**diagnostic_context)
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
+                def create_assignment(args):
+                    import assignee_names
+                    try:
+                        resolved,note=_resolved_bd_assignee(root,path,actor,authority_config,args)
+                    except assignee_names.NameRefusal as error:
+                        raise ValueError('Invalid child assignee: '+str(error)) from None
+                    _guard_claiming_on_assignment(root,path,actor,authority_config,request,resolved)
+                    if note:run_warnings.append(note)
+                    return resolved
                 result=coordinate(payload,actor,runner,path,operators=coordinate_operators,
                                   coordinator_writes=rules['coordinator_writes'],
                                   independent_approval=rules['independent_approval'],
                                   owners=owner_loader(path,'coordinator_writes'),
-                                  review_writes=configured_review_writes(root,warnings=switch_warnings))
+                                  review_writes=configured_review_writes(root,warnings=switch_warnings),
+                                  create_assignment=create_assignment)
             else:
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)

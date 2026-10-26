@@ -490,7 +490,7 @@ def require_unheld_merge_task(issue, task, operators=None, project=None):
 
 
 def apply_native(p, actor, run, project, operators=None, coordinator_writes=False, independent_approval=False,
-                 owners=None, verified_web_authority=False, review_writes=False):
+                 owners=None, verified_web_authority=False, review_writes=False, create_assignment=None):
     """Caller holds canonical project lock. Journals belong to runtime, never Git.
 
     ``coordinator_writes`` and ``independent_approval`` are the per-installation
@@ -503,7 +503,8 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
     if not isinstance(p,dict):raise ValueError('Expected object')
     op=p.get('operation')
     if op=='create-child':
-        if set(p)!={'operation','request_id','parent','title','description','type'}:raise ValueError('Invalid child request fields')
+        fields={'operation','request_id','parent','title','description','type'}
+        if not fields.issubset(p) or not set(p).issubset(fields|{'assignee','priority'}):raise ValueError('Invalid child request fields')
         identifier(p['request_id']);identifier(p['parent'])
         # bd resolves a parent from any substring of an id, so the row is read, not guessed.
         parents=record_json.loads(run(['show',p['parent'],'--json']))
@@ -511,6 +512,7 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
             if is_merge_slot(parent):raise ValueError(merge_slot_sentence(parent.get('id'))+'; it takes no child')
         if not isinstance(p['title'],str) or not p['title'].strip() or not isinstance(p['description'],str):raise ValueError('Child needs title and description')
         if p['type'] not in ('task','bug','feature','chore','decision'):raise ValueError('Invalid child type')
+        if 'assignee' in p and not isinstance(p['assignee'],str):raise ValueError('Child assignee must be text')
         identity=content_hash({'request_id':p['request_id']})
         digest=content_hash({'actor':actor,'payload':p})
         journal=project/'.coordination-requests';journal.mkdir(exist_ok=True)
@@ -536,6 +538,9 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         if prior and not reusable:
             raise ValueError('Reserved request has no visible issue; outcome uncertain. Operator must reconcile before any new request; do not allocate another ID.')
         args=['create','--title',p['title'],'--parent',p['parent'],'--description',p['description'],'--type',p['type'],'--no-inherit-labels','--labels',label+',request-content:'+digest,'--json']
+        if 'assignee' in p:args[-1:-1]=['--assignee',p['assignee']]
+        if 'priority' in p:args[-1:-1]=['--priority',str(p['priority'])]
+        if create_assignment is not None:args=create_assignment(args)
         if p['type']=='decision':args.append('--validate')
         # Preflight the identical create natively BEFORE any reservation exists.
         # `--dry-run` writes nothing: native validation and a missing parent are

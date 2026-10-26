@@ -1661,6 +1661,69 @@ def _apply_fact(payload,actor,rows,run,current_scope,op_index,issues,recorded=No
     return result
 
 
+def _not_integrated_sentence(task,target,scopes,rows):
+    """Why a release target is refused as not integrated, naming what was compared.
+
+    The request's two commits, the integrated scopes the view records for the task
+    (at most three) and the newest record time of the view, so a lagging client
+    file and a really different integration read differently (kittrial-5bb.313).
+    The text is built from the task's own recorded scopes, in the view the writer
+    reads under the lock; nothing here is reachable before the release authority.
+    """
+    recorded=[c['scope'] for c in scopes if (c.get('integrated') or {}).get('value')=='passed']
+    seen=newest_record_time(rows,task)
+    return ('release target is not integrated at that commit: %s; the request names source %s and '
+            'integration %s, the integrated scopes recorded for it are %s, and the newest record in the '
+            'view compared is %s; get a fresh read and retry'
+            %(task,json.dumps(target['source_commit']),json.dumps(target['integration_commit']),
+              '; '.join(scope_fields(scope) for scope in recorded[:3]) if recorded else 'none',
+              seen if seen else 'unknown'))
+
+
+def _not_live_sentence(task,bound,live_scope,live_value,environment,rows):
+    """Why a verification binding is refused: the scope it named against the live one."""
+    live=scope_fields(live_scope['scope']) if live_scope is not None and live_value in ('live','deployed') else None
+    seen=newest_record_time(rows,task)
+    return ('verification target is no longer live: %s was bound to %s, %s, and the newest record in the '
+            'view compared is %s; get a fresh export'
+            %(task,scope_fields(bound),
+              'the live scope in %s is %s'%(json.dumps(environment),live) if live
+              else 'nothing is live in %s'%json.dumps(environment),
+              seen if seen else 'unknown'))
+
+
+LIVE_SHOW_CHUNK=40
+
+
+def read_live_rows(call,chunk=LIVE_SHOW_CHUNK):
+    """The project's rows as the planners take them, from the endpoint's EXISTING bd reads.
+
+    One ``list --all --limit 0 --json`` (every task and lifecycle event, with the
+    labels a task carries), then ``show IDS --json --include-comments`` for the rows
+    that have comments, so a correction, a hold or a revert recorded as a comment is
+    seen exactly as ``export --all`` shows it (kittrial-5bb.313). Both verbs are in
+    the endpoint's ``ALLOWED`` set for every contributor: this reads nothing a caller
+    cannot read today and adds no read action. A row that disappears between the two
+    reads, or a read that fails, raises: a plan is never made from a partial view.
+    """
+    rows=_native_array_rows(call,['list','--all','--limit','0','--json'],'the project task list')
+    index={}
+    for position,row in enumerate(rows):
+        if isinstance(row,dict) and isinstance(row.get('id'),str):index[row['id']]=position
+    wanted=[row['id'] for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str)
+            and (row.get('comment_count') or 0)>0]
+    for start in range(0,len(wanted),max(1,chunk)):
+        names=wanted[start:start+max(1,chunk)]
+        shown=_native_array_rows(call,['show',*names,'--json','--include-comments'],
+                                 'the comments of %s'%', '.join(names[:3]))
+        got={row.get('id'):row for row in shown if isinstance(row,dict)}
+        missing=[name for name in names if name not in got]
+        if missing:
+            raise ValueError('the project changed while it was read (%s is gone); read again'%missing[0])
+        for name in names:rows[index[name]]=got[name]
+    return rows
+
+
 def _release_plan(rows,payload,operators=None,journal=None):
     """Resolve and verify the complete target write plan without writes.
 
@@ -1688,7 +1751,7 @@ def _release_plan(rows,payload,operators=None,journal=None):
                     if (c.get('integrated') or {}).get('value')=='passed'
                     and c['scope']['integration_commit']==target['integration_commit']
                     and c['scope']['source_commit']==target['source_commit']),None)
-        if match is None:raise ValueError('release target is not integrated at that commit: '+task)
+        if match is None:raise ValueError(_not_integrated_sentence(task,target,scopes,rows))
         if (task,target['integration_commit'].lower()) in reverted:
             raise ValueError('release target integration commit was reverted by an operator revert record: '+task)
         release_scope=dict(match['scope'])
@@ -1723,7 +1786,8 @@ def _release_plan(rows,payload,operators=None,journal=None):
         # release contract; it is never silently redirected to a different release.
         if 'verify_scope' in target:
             if live_value not in ('live','deployed') or live_scope['scope']!=target['verify_scope']:
-                raise ValueError('verification target is no longer live; get a fresh export')
+                raise ValueError(_not_live_sentence(task,target['verify_scope'],live_scope,live_value,
+                                                    release_scope['environment'],rows))
             if (live_scope.get('deployed') or {}).get('value')!='passed':
                 raise ValueError('verification target has no passed deployment')
             release_scope=dict(live_scope['scope']);common['scope']=release_scope
@@ -2437,7 +2501,11 @@ def main():
     record=sub.add_parser('record')
     for name in ('config','project','actor','file'):record.add_argument('--'+name,required=True)
     release=sub.add_parser('release')
-    for name in ('config','project','actor','file','export','repo'):release.add_argument('--'+name,required=True)
+    for name in ('config','project','actor','file','repo'):release.add_argument('--'+name,required=True)
+    # Without --export the command reads the project through the endpoint's existing bd
+    # read action (read_live_rows), so a coordinator never plans from an old file; a
+    # given file keeps its old meaning exactly (kittrial-5bb.313).
+    release.add_argument('--export')
     release.add_argument('--live-verified',action='store_true')
     release.add_argument('--dry-run',action='store_true')
     # An explicit rollback (rev2 item 2): move the environment's live release back to
@@ -2488,7 +2556,15 @@ def main():
             validate_release_payload(check,require_targets=False)
             if data['rollback'] and subset:
                 raise ValueError('--target/--rollback cannot be combined: a rollback resolves its own targets')
-            rows=read_export(a.export)
+            if a.export:
+                rows=read_export(a.export)
+            else:
+                config_for_read=load_json(a.config)
+                def read_call(argv):
+                    answer=request(config_for_read,a.project,a.actor,list(argv),action='bd')
+                    if answer['returncode']:raise ValueError(answer['stderr'].strip()[:400] or 'the endpoint refused the read')
+                    return answer['stdout']
+                rows=read_live_rows(read_call)
             journal=a.journal or None
             # Offline selection must consult the same family as host readers.
             # A writing release still has its authoritative endpoint check; its

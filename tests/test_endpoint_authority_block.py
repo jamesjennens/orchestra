@@ -302,6 +302,7 @@ class BlockMatchesRequestTests(EndpointHarness):
             ('checkpoint', lambda: self.payload_request('checkpoint', [TASK], {'schema_version': 1, 'task': TASK}),
              'checkpoints.write', 'briefing'),
             ('lanes', lambda: self.payload_request('work', ['lanes']), 'read', 'work'),
+            ('task summary', lambda: self.payload_request('work', ['summary', TASK]), 'read', 'work'),
             ('claim', lambda: self.payload_request('bd', ['update', TASK, '--claim', '--json']), 'tasks.write', None),
             ('task create', lambda: self.payload_request('bd', ['create', 'A title', '--json']), 'tasks.write', None),
             ('task comment', lambda: self.payload_request('bd', ['comments', 'add', TASK, 'Literal contributor remark']), 'tasks.write', None),
