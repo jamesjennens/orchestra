@@ -42,6 +42,9 @@ class NativeAuditTests(fixture.RealBdLabelAliasTests):
         return {str(p.relative_to(self.project)):p.read_bytes() for p in self.project.rglob('*')
                 if p.is_file() and any(part.startswith(('.lifecycle-','.web-lifecycle-')) for part in p.relative_to(self.project).parts)}
 
+    # Persistence latency must not replace the semantic result under test with
+    # a competing history timeout. The deadline case below still sets zero.
+    @mock.patch.object(audit,'HISTORY_SECONDS',600.0)
     def test_native_pairs_creation_commit_and_read_only_adapter(self):
         task,event=self.make_facts();before=canonical_bytes(self.export_rows());families=self.inventory();calls=[]
         real=native.run_bounded
@@ -76,7 +79,7 @@ class NativeAuditTests(fixture.RealBdLabelAliasTests):
 
     def test_native_byte_budget_and_deadline_stay_read_only(self):
         task,event=self.make_facts();before=canonical_bytes(self.export_rows())
-        with mock.patch.multiple(audit,HISTORY_BYTES_CAP=16,HISTORY_TOTAL_BYTES_CAP=32):
+        with mock.patch.multiple(audit,HISTORY_BYTES_CAP=16,HISTORY_TOTAL_BYTES_CAP=32,HISTORY_SECONDS=600.0):
             report=fixture.admin.lifecycle_audit_command(self.root,'pp',limit=100)
         self.assertLessEqual(report['historical_read_coverage']['read_calls'],2)
         self.assertEqual(report['historical_read_coverage']['stopped_reason'],'whole-audit-history-byte-cap')
@@ -86,6 +89,7 @@ class NativeAuditTests(fixture.RealBdLabelAliasTests):
         self.assertEqual(report['historical_read_coverage']['stopped_reason'],'whole-audit-history-time-budget')
         self.assertEqual(before,canonical_bytes(self.export_rows()))
 
+    @mock.patch.object(audit,'HISTORY_SECONDS',600.0)
     def test_native_unknown_history_cases_never_infer_an_assignment(self):
         task,event=self.make_facts();before=canonical_bytes(self.export_rows())
         selected=[r for r in self.export_rows() if r['id']==task or any(d.get('type')=='parent-child' and d.get('depends_on_id')==task for d in r.get('dependencies') or [])]
@@ -171,6 +175,7 @@ class NativeAssignmentAuditTests(RulesHelpers,unittest.TestCase):
     web=slot_fixture.NativeWebSlotTests.web
     inventory=NativeAuditTests.inventory
 
+    @mock.patch.object(audit,'HISTORY_SECONDS',600.0)
     def test_actual_web_notice_then_raw_assignment_stays_attributed_only_when_proved(self):
         harness,owner=self.web();previous=harness.admin_user['id']
         target=harness.create_account(owner,'d2-assignee','native-assignment-password-1')
@@ -220,6 +225,7 @@ class NativeAssignmentAuditTests(RulesHelpers,unittest.TestCase):
 @unittest.skipIf(fixture.BD is None,'no pinned native bd (set ORCHESTRA_BD_BIN)')
 class NativeReleaseAuditTests(RulesHelpers,unittest.TestCase):
     inventory=NativeAuditTests.inventory
+    web=slot_fixture.NativeWebSlotTests.web
 
     def authority(self,operation):
         done=subprocess.run([sys.executable,str(Path(lifecycle.__file__).with_name('admin.py')),
@@ -284,6 +290,33 @@ class NativeReleaseAuditTests(RulesHelpers,unittest.TestCase):
         answer=self.endpoint('lifecycle','synthetic-reader',[json.dumps(payload)])
         self.assertEqual(answer['returncode'],0,answer)
         return json.loads(answer['stdout'])
+
+    def test_real_web_release_query_supplies_retained_operator_history(self):
+        harness,token=self.web()
+        task,void_id,scope=self.prepare('attest')
+        before=canonical_bytes(self.rows());families=self.inventory()
+        path=self.root/fixture.admin.AUTHORITY_CHANGES_AUDIT;trail=path.read_bytes()
+        # The real HTTP EndpointBackend invokes action=release/operation=query,
+        # not the separate action=lifecycle helper exercised by query() above.
+        reply=harness.request('POST','/v1/projects/pp/releases/query',dict(scope=dict(
+            source_commit='',integration_commit='5'*40,release_id='',environment='production')),
+            token=token,key='synthetic-d2-host-release-query')
+        self.assertEqual(reply.status,200,reply.data)
+        self.assertTrue(reply.data['query']);self.assertEqual(reply.data['environment'],'production')
+        notes=[n for n in reply.data.get('review_void_diagnostics',[]) if n['task']==task]
+        self.assertEqual(len(notes),1,reply.data);note=notes[0]
+        self.assertEqual(note['void_id'],void_id)
+        self.assertEqual(note['target_operation'],'attest')
+        self.assertEqual(note['historical_operator_eligibility'],'eligible')
+        self.assertEqual(note['eligibility_basis'],'retained-authority-trail')
+        self.assertEqual(note['reason'],'currently-ineligible-review-void')
+        self.assertEqual((note['current_result'],note['counterfactual_result']),('unreadable','unheld'))
+        self.assertEqual(before,canonical_bytes(self.rows()));self.assertEqual(families,self.inventory())
+        self.assertEqual(path.read_bytes(),trail)
+        with self.assertRaisesRegex(ValueError,'cannot be read'):
+            self.lifecycle(self.operator,'integrated',task,scope=scope)
+        self.assertEqual(before,canonical_bytes(self.rows()));self.assertEqual(families,self.inventory())
+        self.assertEqual(path.read_bytes(),trail)
 
     def test_host_query_proves_prior_eligibility_for_all_decisive_targets_and_rejects_forgery(self):
         for case,counter in [('hold','unheld'),('release','held'),('attest','unheld'),('fork','held'),('forged',None)]:

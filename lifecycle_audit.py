@@ -260,6 +260,10 @@ def read_operator_history(root,operators):
         info=path.lstat()
         if not stat.S_ISREG(info.st_mode):return OperatorHistory(reason='authority-audit-not-regular')
         if info.st_size>OPERATOR_AUDIT_BYTES:return OperatorHistory(reason='authority-audit-byte-cap')
+        # The shared reader groups permission and parse failures together. The
+        # stat already obtained identifies mode-000 without another file read.
+        if not (info.st_mode & (stat.S_IRUSR|stat.S_IRGRP|stat.S_IROTH)):
+            return OperatorHistory(reason='authority-audit-unreadable')
         entries,baseline,damage=admin.read_authority_changes(root,max_bytes=OPERATOR_AUDIT_BYTES)
         if damage:return OperatorHistory(reason='authority-audit-damaged')
         if len(entries)>admin.AUTHORITY_CHANGES_MAX:return OperatorHistory(reason='authority-audit-entry-cap')
