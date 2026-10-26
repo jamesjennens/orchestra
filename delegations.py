@@ -63,17 +63,17 @@ class DelegationRefusal(ValueError):
         self.status = status
 
 
-def _line(value, limit, what, empty=False):
+def _line(value, limit, what, empty=False, stored=False):
     if not isinstance(value, str) or len(value) > limit or (not empty and not value.strip()):
         raise ValueError('%s must be %s text of at most %d characters'
                          % (what, 'one line of' if not empty else 'one line (or empty)', limit))
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError('%s must be one line of plain text' % what)
     from review_workflow import plain_text
-    plain_text(value, what)
+    plain_text(value, what, stored=stored)
 
 
-def validate_request(payload, recorded=False):
+def validate_request(payload, recorded=False, *, stored=False):
     """The closed request of one delegation event. Attribution is never part of it.
 
     A grant either names an existing decision issue (``decision`` set, ``title`` null) or asks
@@ -91,7 +91,7 @@ def validate_request(payload, recorded=False):
     if payload['decision'] is None and not recorded:
         if payload['action'] != 'grant':
             raise ValueError('A narrowing or a revocation names the decision it changes')
-        _line(payload['title'], TITLE_MAX, 'title')
+        _line(payload['title'], TITLE_MAX, 'title', stored=stored)
         if payload['title'].startswith(('-', '@')):
             # The native create takes it as a value; a leading dash could still read as a flag
             # to a reader of the command, and a leading @ as the attachment transport (the same
@@ -103,7 +103,7 @@ def validate_request(payload, recorded=False):
         if payload['title'] is not None and (not recorded or payload['action'] != 'grant'):
             raise ValueError('title is given only to create a new decision with a grant')
         if payload['title'] is not None:
-            _line(payload['title'], TITLE_MAX, 'title')
+            _line(payload['title'], TITLE_MAX, 'title', stored=stored)
     if payload['action'] not in ACTIONS:
         raise ValueError('action must be one of %s' % ', '.join(ACTIONS))
     if payload['right'] not in RIGHTS:
@@ -120,14 +120,14 @@ def validate_request(payload, recorded=False):
     else:
         if not scope:
             raise ValueError('A grant or a narrowing needs a nonempty scope')
-        _line(payload['escalate'], ESCALATE_MAX, 'escalate')
-    _line(payload['reason'], REASON_MAX, 'reason')
+        _line(payload['escalate'], ESCALATE_MAX, 'escalate', stored=stored)
+    _line(payload['reason'], REASON_MAX, 'reason', stored=stored)
 
 
 def _validate_record(record):
     if not isinstance(record, dict) or set(record) != RECORD_FIELDS:
         raise ValueError('A delegation record has its exact field set')
-    validate_request({key: record[key] for key in REQUEST_FIELDS}, recorded=True)
+    validate_request({key: record[key] for key in REQUEST_FIELDS}, recorded=True, stored=True)
     if not isinstance(record['project'], str) or not PROJECT.fullmatch(record['project']):
         raise ValueError('A delegation record names its project')
     if record['via'] not in VIA:

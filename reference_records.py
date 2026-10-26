@@ -219,8 +219,8 @@ def _repository_location(value):
             raise ValueError('authority.anchor must be one line')
 
 
-def valid_authority(value):
-    """Exactly one closed `repo-path`, `url` or `attestation` object (.41 3.6), time-independent rules."""
+def valid_authority(value, *, stored=True):
+    """Exactly one closed authority object; stored records keep the legacy plain-text set."""
     if not isinstance(value, dict):
         raise ValueError('authority must be an object of type repo-path, url or attestation')
     kind = value.get('type')
@@ -241,7 +241,7 @@ def valid_authority(value):
         # Review r2 (b2): nor a bidi, zero-width, line-separator, tag or other invisible character: the kit's rule
         # for text other people read, as task-file names apply it (task_files.plain).
         from review_workflow import plain_text
-        plain_text(value['path'], 'authority.path of a repo-document')
+        plain_text(value['path'], 'authority.path of a repo-document', stored=stored)
         if not isinstance(value['sha256'], str) or not design_documents.SHA256.fullmatch(value['sha256']):
             raise ValueError('authority.sha256 must be the 64-character lowercase hex sha256 of the document')
     elif kind == 'url':
@@ -433,16 +433,15 @@ def _validate_content(payload):
             raise ValueError('reference payload is missing field ' + name)
     _bounded_text(payload['title'], 'title', TITLE_MAX)
     _bounded_text(payload['statement'], 'statement', STATEMENT_MAX)
-    valid_authority(payload['authority'])
+    valid_authority(payload['authority'], stored=False)
     # kittrial-5bb.418 (Q3): a design.<scope> revision written from this kit on carries its document. The
     # repo-path design entries written before stay readable (their sections unchecked, their state unverified).
     if design_documents.is_document_authority(payload['authority']):
-        # Review r2 (b2): plain_text's fixed lists do not name every invisible character (U+061C, the Arabic letter
-        # mark, passes them), so a written repo-document path also refuses every format, separator, private-use,
-        # surrogate or unassigned character. A WRITE rule only: Unicode categories move between Python versions,
-        # and a rule read back on every read must not turn a stored entry malformed after an upgrade.
+        # A written repo-document path also refuses every separator, private-use, surrogate or unassigned character;
+        # format characters use plain_text's fixed set above. A WRITE rule only: Unicode categories move between
+        # Python versions, and a rule read back on every read must not turn a stored entry malformed after an upgrade.
         import unicodedata
-        if any(unicodedata.category(character) in ('Cf', 'Zl', 'Zp', 'Co', 'Cs', 'Cn')
+        if any(unicodedata.category(character) in ('Zl', 'Zp', 'Co', 'Cs', 'Cn')
                for character in payload['authority']['path']):
             raise ValueError('authority.path of a repo-document must be plain text (no invisible or unassigned '
                              'characters)')
