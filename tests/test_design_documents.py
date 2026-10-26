@@ -769,6 +769,14 @@ class VerificationTests(DesignCase):
         self.assertTrue(self.file(self.report('pass'), actor=VERIFIER, route='host')['recorded'])
         self.assertEqual(self.state()['state'], 'verified')
 
+    def test_the_same_verifier_through_the_host_route_is_no_repeat_of_its_endpoint_report(self):
+        # n2: the route is part of the repeat rule; a listed verifier's untrusted pass, then the same pass
+        # through admin.py design-verify, is written and verifies.
+        self.file(self.report('pass'), actor=VERIFIER, route='endpoint')
+        self.assertEqual(self.state()['state'], 'unverified')
+        self.assertTrue(self.file(self.report('pass'), actor=VERIFIER, route='host')['recorded'])
+        self.assertEqual(self.state()['state'], 'verified')
+
     def test_another_members_identical_fail_is_written_and_named(self):
         # n2: bob's fail identical to alice's is no repeat of alice's.
         self.file(self.report())
