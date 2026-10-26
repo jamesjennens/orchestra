@@ -12,8 +12,10 @@
 #     BEFORE the wake command runs, so a crash, a restart or a second scheduler tick
 #     cannot run the command twice for the same fingerprint;
 #   * one instance at a time: a lock directory beside the state file, with the
-#     process id in it, so a cron line and a systemd timer can overlap safely; only
-#     that directory and its one pid file are ever removed, never a path recursively;
+#     process id in a file created exclusively (O_EXCL, not mkdir, which is not
+#     atomic on every coreutils), so a cron line and a systemd timer can overlap
+#     safely; only that directory, its pid file and a takeover marker are ever
+#     removed, never a path recursively;
 #   * fail closed on a bad setting: an empty, root, home or foreign WAKE_STATE,
 #     WAKE_LOCK or WAKE_LOG is refused before anything is created or removed;
 #   * bounded: client.py wait is given --timeout, so one run ends by itself;
@@ -232,7 +234,7 @@ check_setting_path() {
                 continue
             fi
             case ${entry##*/} in
-                pid) ;;
+                pid|stale.[0-9]*) ;;
                 *) refuse_setting "$setting is $value, an existing directory that is not this waker's lock (it holds $entry): move it away" ;;
             esac
         done
@@ -251,8 +253,12 @@ mkdir -p "$(dirname "$STATE")" "$(dirname "$LOCK")" "$(dirname "$LOG")"
 
 err_file=$(mktemp "${TMPDIR:-/tmp}/orchestra-wake.XXXXXX") || err_file=${TMPDIR:-/tmp}/orchestra-wake.$$.err
 lock_owned=0
+takeover_marker=
 release() {
     rm -f "$err_file"
+    if [ -n "$takeover_marker" ]; then
+        rm -f "$takeover_marker"
+    fi
     if [ "$lock_owned" -eq 1 ]; then
         # The lock is a directory this waker made and holds one pid file in. Remove
         # exactly that file, then the directory with rmdir, which refuses a directory
@@ -266,40 +272,72 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# ONE INSTANCE AT A TIME. mkdir is the atomic step; the pid inside lets a run that
-# died leave a lock that the next run can take. A lock directory with no pid yet is
-# left alone: another run may be between its mkdir and its write, and stealing it
-# there would let two runs poll at once. A stale lock is taken over by removing its
-# one pid file and then the empty directory with rmdir; rmdir refuses a directory
-# that holds anything else, so only this waker's own lock is ever removed. The EXIT
-# trap releases the lock only when this run owns it.
-if [ -d "$LOCK" ]; then
-    held_pid=
-    if [ -f "$LOCK/pid" ]; then
-        held_pid=$(cat "$LOCK/pid" 2>/dev/null || true)
+# ONE INSTANCE AT A TIME. The atomic step is creating LOCK/pid with the shell's own
+# noclobber (set -C opens it with O_EXCL), which the kernel decides: exactly one of
+# any number of runs creates it. mkdir only makes the directory the file lives in and
+# is NOT the lock: some coreutils (uutils 0.10, Ubuntu 26.04) let two concurrent
+# mkdir of one path both report success, so nothing here relies on its answer. A
+# directory with no pid yet is left alone: another run may be between its mkdir and
+# its pid write. A stale lock (its pid is gone) is taken over by one run only: it
+# must first create LOCK/stale.PID exclusively, then remove the one pid file and
+# retake the lock exclusively; every other run that finds the marker exits. Nothing
+# is ever checked and then created non-exclusively, and nothing is removed
+# recursively. The EXIT trap releases the lock only when this run owns it.
+exclusive_write() {
+    ( set -C; printf '%s\n' "$$" > "$1" ) 2>/dev/null
+}
+
+pid_in() {
+    pid_text=
+    if [ -f "$1" ]; then
+        pid_text=$(cat "$1" 2>/dev/null || true)
     fi
-    case $held_pid in
-        ''|*[!0-9]*) held_pid= ;;
+    case $pid_text in
+        ''|*[!0-9]*) pid_text= ;;
     esac
-    if [ -z "$held_pid" ] || kill -0 "$held_pid" 2>/dev/null; then
-        exit 0
+    printf '%s' "$pid_text"
+}
+
+attempt=0
+while [ "$lock_owned" -eq 0 ]; do
+    attempt=$((attempt + 1))
+    if [ -d "$LOCK" ]; then
+        held_pid=$(pid_in "$LOCK/pid")
+        if [ -z "$held_pid" ] || kill -0 "$held_pid" 2>/dev/null; then
+            exit 0
+        fi
+        marker=$LOCK/stale.$held_pid
+        if ! exclusive_write "$marker"; then
+            taker=$(pid_in "$marker")
+            if [ -n "$taker" ] && ! kill -0 "$taker" 2>/dev/null; then
+                printf "wake.sh: the lock %s is stale and the run that was taking it over (pid %s) died; remove the marker and the next run takes it: rm -f '%s'\n" "$LOCK" "$taker" "$marker" >&2
+                exit 1
+            fi
+            exit 0
+        fi
+        takeover_marker=$marker
+        if [ "$(pid_in "$LOCK/pid")" != "$held_pid" ]; then
+            exit 0
+        fi
+        rm -f "$LOCK/pid"
+    else
+        mkdir "$LOCK" 2>/dev/null || [ -d "$LOCK" ] || true
     fi
-    rm -f "$LOCK/pid"
-    if ! rmdir "$LOCK" 2>/dev/null; then
-        printf 'wake.sh: cannot take the lock %s: it holds something other than its own pid file\n' "$LOCK" >&2
+    if exclusive_write "$LOCK/pid"; then
+        lock_owned=1
+    elif [ -f "$LOCK/pid" ] || [ "$attempt" -ge 3 ]; then
+        # Another run holds it; or, after three tries, the directory cannot be used.
+        if [ -f "$LOCK/pid" ] || [ -d "$LOCK" ]; then
+            exit 0
+        fi
+        printf 'wake.sh: cannot create the lock %s\n' "$LOCK" >&2
         exit 1
     fi
+done
+if [ -n "$takeover_marker" ]; then
+    rm -f "$takeover_marker"
+    takeover_marker=
 fi
-if ! mkdir "$LOCK" 2>/dev/null; then
-    if [ -d "$LOCK" ]; then
-        # Another run made the lock between the check above and this mkdir.
-        exit 0
-    fi
-    printf 'wake.sh: cannot create the lock %s\n' "$LOCK" >&2
-    exit 1
-fi
-lock_owned=1
-printf '%s\n' "$$" > "$LOCK/pid"
 
 last=
 if [ -f "$STATE" ]; then
