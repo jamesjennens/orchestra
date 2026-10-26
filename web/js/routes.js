@@ -31,6 +31,7 @@ export const ROUTE_PATTERNS = [
   ['referenceRecord', '/p/{pid}/records/references/{key}'],
   ['referenceRecord', '/p/{pid}/references/{key}'],
   ['designPage', '/p/{pid}/designs/{scope}'],
+  ['tracePage', '/p/{pid}/trace/{view}'],
   ['capabilityRecord', '/p/{pid}/records/capabilities/{key}'],
   ['capabilityRecord', '/p/{pid}/capabilities/{key}'],
   ['decisions', '/p/{pid}/decisions'],

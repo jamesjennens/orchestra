@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import sys
+import shutil
 import tempfile
 import time
 import unittest
@@ -558,7 +559,7 @@ class TokenCostTests(Fixture):
         self.assertEqual(json.dumps([row for row in t.tokens_view(snap) if not mine(row)]),
                          json.dumps(t.tokens_view(alone)))
         planted = [row for row in t.tokens_view(snap) if mine(row)]
-        self.assertEqual(planted[-1], {'pointer': None, 'where': {'task': 'trial-0planted'},
+        self.assertEqual(planted[-1], {'pointer': None, 'where': {'task': 'trial-0planted', 'field': 'description'},
                                        'flags': ['tokens-not-checked'], 'omitted': 2500 - t.TOKENS_PER_SOURCE_MAX})
         lines = {line['view']: line for line in after['summary']['rows']}
         old = {line['view']: line for line in before['summary']['rows']}
@@ -572,6 +573,51 @@ class TokenCostTests(Fixture):
                       after['summary']['coverage']['text'])
         row = next(r for r in after['tasks']['rows'] if r['id'] == 'trial-0planted')
         self.assertEqual(row['tokens_not_checked'], 2500 - t.TOKENS_PER_SOURCE_MAX)
+
+    def test_each_field_is_its_own_source_and_the_description_keeps_its_flags(self):
+        # Re-review N1 and N2(a): a 300-token checkpoint (15 items of 20; a source is at most 240 characters) cuts
+        # only itself: the description and the contribution (a summary holds at most 1,200 characters) keep theirs.
+        from test_briefing import TASK, append_checkpoint, checkpoint
+        row = task(TASK, 'Cites req:GHOST and req:R01@2 here.', assignee='lane-z')
+        self.work.append(row)
+        append_checkpoint([row], 'cp-1', checkpoint([row], open_items=[
+            dict(id='q%d' % n, kind='question', text='Which?', source=' '.join('req:C%03d' % (n * 20 + k) for k in range(20)))
+            for n in range(15)]))
+        contribution = contribution_note(TASK, 'k-z', 'lane-z', 1)
+        record = json.loads(contribution['text'][len(w.PREFIX):])
+        record['summary'] = ' '.join('req:S%02d' % k for k in range(100))
+        contribution['text'] = w.PREFIX + canonical_bytes(record).decode()
+        row['comments'].append(contribution)
+        snap = self.snap()
+        rows = [r for r in t.tokens_view(snap) if r['where'].get('task') == TASK]
+        described = {r['pointer']: r['flags'] for r in rows if r['where'].get('field') == 'description'}
+        self.assertEqual(described, {'req:GHOST': ['unknown-key'], 'req:R01@2': ['superseded']})
+        cut = {r['where']['field']: r['omitted'] for r in rows if r['pointer'] is None}
+        self.assertEqual(cut, {'checkpoint': 100})
+        contributed = [r for r in rows if r['where'].get('field') == 'contribution-summary']
+        self.assertEqual(len(contributed), 100)   # every contribution token checked, despite the checkpoint
+        task_row = next(r for r in t.trace(snap, 'tasks')['rows'] if r['id'] == TASK)
+        self.assertEqual(task_row['flags'], ['cites-superseded-revision'])
+        self.assertEqual(task_row['tokens_not_checked'], 100)
+
+    def test_a_single_row_near_the_cap_still_fits_with_a_real_signed_cursor(self):
+        # Re-review N2(b): what the route adds after the cut (the generation and a signed next_cursor) still fits.
+        import http_service
+        from types import SimpleNamespace
+        self.work += [task('trial-y%03d' % n, 'req:M%03d' % n, title='y' * 3000) for n in range(3)]
+        options = t.parse_options(['tasks', '--limit', '1'])
+        whole = t.answer(self.rows(), PROJECT, options, operators=OPERATORS, members=MEMBERS, now=NOW)
+        size = len(json.dumps(whole, ensure_ascii=False).encode('utf-8'))
+        principal = SimpleNamespace(user_id='u-view')
+        for cap in (size + 50, size + 100, size + t.TAIL_RESERVE - 1):
+            with self.subTest(cap=cap), patch.object(t, 'ANSWER_MAX', cap):
+                answer = t.answer(self.rows(), PROJECT, options, operators=OPERATORS, members=MEMBERS, now=NOW)
+                following = answer.pop('next_offset')
+                self.assertIsNotNone(following)
+                answer['next_cursor'] = http_service.make_cursor(principal, PROJECT, {'view': 'tasks', 'limit': '1'},
+                                                                 following, extra={'g': answer['generation']},
+                                                                 key='k' * 43)
+                self.assertLessEqual(len(json.dumps(answer, ensure_ascii=False).encode('utf-8')), cap)
 
     def test_a_planted_design_section_blinds_only_itself(self):
         snap = self.snap()
@@ -695,6 +741,174 @@ class EndpointLockTests(unittest.TestCase):
                 patch.object(endpoint, 'configured_verifiers', lambda root: []):
             endpoint.trace_answer(Path('.'), Path('.'), PROJECT, ['summary'], 'actor', SimpleNamespace(store='x'))
         self.assertEqual(seen, {'shared': True, 'rows': True, 'members': True, 'governance': True, 'views': False})
+
+
+class DescriptionPointerTests(Fixture):
+    """Part 2: the task page shows its description's own req: and design: tokens, resolved by the brief."""
+
+    def brief(self, description):
+        import briefing
+        from test_briefing import TASK
+        row = task(TASK, description)
+        rows = self.rows() + [row]
+        with patch('requirement_governance.snapshot', return_value=None):
+            return briefing.brief(rows, PROJECT, TASK, operators=OPERATORS)
+
+    def test_the_brief_resolves_the_descriptions_traceability_tokens(self):
+        result = self.brief('Implements req:R01@2 and req:GHOST and design:server#nowhere and task:other prose.')
+        shown = result['description_pointers']
+        self.assertEqual([(p['pointer'], p['state'], p.get('flags')) for p in shown['pointers']],
+                         [('req:R01@2', 'superseded', ['superseded']), ('req:GHOST', 'unavailable', ['unknown-key']),
+                          ('design:server#nowhere', 'live', ['unknown-section'])])
+        self.assertEqual(shown['pointers_omitted'], 0)
+
+    def test_no_traceability_token_no_key(self):
+        self.assertNotIn('description_pointers', self.brief('Only prose and task:other here.'))
+
+
+class TraceWebTests(unittest.TestCase):
+    """Part 2 (TRACEABILITY_DESIGN §5.2): the Coverage panel, the Designs list and the view pages render the
+    server's rows as text only (h(), never markup), say "partial", and link only where the row names a page."""
+
+    HOSTILE = '<script>alert(1)</script><img src=x onerror=alert(2)>\u202eevil'
+
+    def run_web(self, code, payload):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        kit = Path(__file__).resolve().parents[1]
+        done = test_http_web.run_node_module(self, node, code, (kit / 'tests/web_dom_shim.mjs').as_uri(),
+                                             (kit / 'web/js/views/trace.js').as_uri(), json.dumps(payload))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_every_view_renders_hostile_text_as_text(self):
+        hostile = {'text': self.HOSTILE, 'omitted_chars': 0}
+        rows = {
+            'requirements': [{'key': 'R01', 'title': hostile, 'tasks': ['t-1'], 'tasks_omitted': 0, 'designs': [],
+                              'designs_omitted': 0, 'capabilities': [], 'capabilities_omitted': 0, 'flags': ['no-design']}],
+            'tasks': [{'id': 't-1', 'title': hostile, 'status': 'open', 'cites': [
+                {'pointer': 'req:R01@1', 'where': 'description', 'state': 'superseded', 'flags': ['superseded']}],
+                'cites_omitted': 0, 'tokens_not_checked': 3, 'flags': ['cites-superseded-revision']}],
+            'tokens': [{'pointer': 'req:GHOST', 'where': {'task': 't-1', 'field': 'description'}, 'flags': ['unknown-key']},
+                       {'pointer': None, 'where': {'design': 's', 'section': 'x'}, 'flags': ['tokens-not-checked'],
+                        'omitted': 7}],
+            'decisions': [{'kind': 'possible-decision', 'id': 'c-1', 'task': 't-1', 'text': hostile,
+                           'flags': ['possible-decision-in-comment'], 'heuristic': True}],
+            'designs': [{'scope': 's', 'title': hostile, 'selected': True, 'state': 'unverified',
+                         'flags': ['unverified']}],
+            'round': [{'epic': 'e-1', 'scope': 's', 'title': hostile, 'published_at': None,
+                       'publication': 'publication not recorded', 'lanes': [
+                           {'task': 't-2', 'title': hostile, 'plan_at': None, 'delivered_at': None,
+                            'cross_reviews': [], 'cross_reviews_omitted': 0, 'flags': []}],
+                       'lanes_omitted': 2, 'flags': []}],
+        }
+        code = '''await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const input=JSON.parse(process.argv[3]);
+const ctx={href:(p)=>'#'+p};
+const out={};
+for(const [name,rows] of Object.entries(input)){
+  const items=rows.map((row)=>view.rowLine(ctx,'pp',name,row));
+  out[name]={text:items.map((el)=>el.textContent).join('|'),
+    scripts:items.reduce((n,el)=>n+el.querySelectorAll('script').length+el.querySelectorAll('img').length,0),
+    links:items.flatMap((el)=>Array.from(el.querySelectorAll('a')).map((a)=>a.getAttribute('href')))};
+}
+console.log(JSON.stringify(out));'''
+        out = self.run_web(code, rows)
+        for name, result in out.items():
+            with self.subTest(view=name):
+                self.assertEqual(result['scripts'], 0)
+                self.assertTrue(all(link.startswith('#/p/pp/') for link in result['links']), result['links'])
+        for name in ('requirements', 'tasks', 'decisions', 'designs', 'round'):
+            self.assertIn('<script>alert(1)</script>', out[name]['text'], name)
+        self.assertIn('3 more tokens not checked', out['tasks']['text'])
+        self.assertIn('7 tokens not checked', out['tokens']['text'])
+        self.assertIn('2 more lanes', out['round']['text'])
+        self.assertIn('#/p/pp/designs/s', out['designs']['links'])
+
+    def test_the_coverage_panel_and_designs_list_read_the_server_and_say_partial(self):
+        code = '''await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const input=JSON.parse(process.argv[3]);
+const ctx={href:(p)=>'#'+p,api:{trace:async(pid,params)=>{
+  if(input.fail)throw Object.assign(new Error('Not found'),{status:404});
+  return params.view==='summary'?input.summary:input.designs;}}};
+const panel=view.coveragePanel(ctx,'pp');const list=view.designsPanel(ctx,'pp');
+await new Promise((r)=>setTimeout(r,0));await new Promise((r)=>setTimeout(r,0));
+console.log(JSON.stringify({panel:panel.textContent,hidden:panel.hidden,list:list.textContent,listHidden:list.hidden,
+  links:Array.from(panel.querySelectorAll('a')).map((a)=>a.getAttribute('href'))}));'''
+        summary = {'rows': [{'view': 'requirements', 'total': 2, 'partial': True, 'counts': {'no-task': 1}},
+                            {'view': 'tokens', 'total': 4, 'partial': False, 'counts': {}}],
+                   'designs': True, 'coverage': {'text': self.HOSTILE}}
+        designs = {'rows': [{'scope': 's', 'title': {'text': 'S', 'omitted_chars': 0}, 'selected': False,
+                             'state': 'not-selected', 'requirements': {'cited': 3, 'planned': 1},
+                             'flags': ['not-selected']}]}
+        out = self.run_web(code, {'summary': summary, 'designs': designs})
+        self.assertIn('2 requirements: 1 no-task (partial)', out['panel'])
+        self.assertIn('4 tokens', out['panel'])
+        self.assertIn('<script>alert(1)</script>', out['panel'])
+        self.assertEqual(out['links'], ['#/p/pp/trace/requirements', '#/p/pp/trace/tokens'])
+        self.assertIn('design.s', out['list'])
+        self.assertIn('requirements 3 cited, 1 in a plan phase', out['list'])
+        silent = self.run_web(code, {'fail': True})
+        self.assertEqual((silent['hidden'], silent['listHidden']), (True, True))
+
+    def test_a_view_page_shows_more_while_the_server_has_a_next_page(self):
+        code = '''await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const pages=[{rows:[{pointer:'req:A',where:{task:'t'},flags:['unknown-key']}],total:2,next_cursor:'c1',coverage:{text:'x'}},
+             {rows:[{pointer:'req:B',where:{task:'t'},flags:['unknown-key']}],total:2,next_cursor:null,coverage:{text:'x'}}];
+const asked=[];
+const ctx={href:(p)=>'#'+p,render:()=>{},api:{trace:async(pid,params)=>{asked.push(params);return pages[asked.length-1];}}};
+const el=await view.page(ctx,{pid:'pp',view:'tokens'});
+const more=el.querySelectorAll('button')[0];
+const before=more.hidden;
+more.listeners.click[0]();
+await new Promise((r)=>setTimeout(r,0));
+console.log(JSON.stringify({rows:el.querySelectorAll('li').length,before,after:more.hidden,asked}));'''
+        out = self.run_web(code, {})
+        self.assertEqual(out['rows'], 2)
+        self.assertEqual((out['before'], out['after']), (False, True))
+        self.assertEqual(out['asked'], [{'view': 'tokens'}, {'view': 'tokens', 'cursor': 'c1'}])
+
+
+class TraceRouteTests(unittest.TestCase):
+    def test_each_view_has_its_page_route(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        kit = Path(__file__).resolve().parents[1]
+        code = '''const routes=await import(process.argv[1]);
+console.log(JSON.stringify(JSON.parse(process.argv[2]).map((v)=>routes.matchRoute('/p/pp/trace/'+v))));'''
+        done = test_http_web.run_node_module(self, node, code, (kit / 'web/js/routes.js').as_uri(),
+                                             json.dumps(list(t.VIEWS)))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        found = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual({(m or {}).get('name') for m in found}, {'tracePage'})
+        self.assertEqual([m['params']['view'] for m in found], list(t.VIEWS))
+
+
+def _team_harness():
+    from test_http_web import TeamHarness
+    return TeamHarness
+
+
+class InProcessBriefTests(_team_harness()):
+    """The in-process backend's brief carries the description's req: and design: tokens too."""
+
+    def test_the_task_brief_carries_description_pointers(self):
+        made = self.request('POST', self.path('/tasks'), {'title': 'Cites', 'description': 'See req:GHOST here.'},
+                            token=self.olive)
+        self.assertEqual(made.status, 201, made.data)
+        brief = self.request('GET', self.path('/tasks/%s/brief' % made.data['id']), token=self.olive)
+        self.assertEqual(brief.status, 200, brief.data)
+        pointers = brief.data['description_pointers']['pointers']
+        self.assertEqual([(p['pointer'], p['flags']) for p in pointers], [('req:GHOST', ['unknown-key'])])
+        plain = self.request('GET', self.path('/tasks/%s/brief' % self.task), token=self.olive)
+        self.assertNotIn('description_pointers', plain.data)
 
 
 if __name__ == '__main__':
