@@ -3065,6 +3065,8 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
+    ('trace --verify [--repo DIR] [--record | --payloads FILE]',
+     "check each accepted design document against git at its pinned commit (verified, design-drift)"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),
