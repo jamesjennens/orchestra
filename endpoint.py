@@ -3319,7 +3319,8 @@ def framed_files(root,path,actor,header,frame):
         name=task_files.clean_name(header['name'])
         sha256=task_files.check_sha256(header['sha256'])
         known=task_files.read_entry(path,task,sha256)
-        if known is not None and known.get('withdrawn') is None and known['name']==name and task_files.blob_size(path,sha256)==known['bytes']:
+        # kittrial-5bb.418 review r2 (N1): a design document's entry is not an attached file; it is never a replay.
+        if known is not None and known.get('withdrawn') is None and known.get('direction')!=task_files.DESIGN and known['name']==name and task_files.blob_size(path,sha256)==known['bytes']:
             return answer(dict(task_files.view(known),replayed=True),200)
         length=header['bytes']
         task_files.check_room(path,task,length,limit)

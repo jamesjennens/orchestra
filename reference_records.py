@@ -238,6 +238,10 @@ def valid_authority(value):
         # turn a stored entry malformed.
         if any(ord(character) < 32 or 127 <= ord(character) < 160 for character in value['path']):
             raise ValueError('authority.path of a repo-document must not contain a control character')
+        # Review r2 (b2): nor a bidi, zero-width, line-separator, tag or other invisible character: the kit's rule
+        # for text other people read, as task-file names apply it (task_files.plain).
+        from review_workflow import plain_text
+        plain_text(value['path'], 'authority.path of a repo-document')
         if not isinstance(value['sha256'], str) or not design_documents.SHA256.fullmatch(value['sha256']):
             raise ValueError('authority.sha256 must be the 64-character lowercase hex sha256 of the document')
     elif kind == 'url':
@@ -432,6 +436,16 @@ def _validate_content(payload):
     valid_authority(payload['authority'])
     # kittrial-5bb.418 (Q3): a design.<scope> revision written from this kit on carries its document. The
     # repo-path design entries written before stay readable (their sections unchecked, their state unverified).
+    if design_documents.is_document_authority(payload['authority']):
+        # Review r2 (b2): plain_text's fixed lists do not name every invisible character (U+061C, the Arabic letter
+        # mark, passes them), so a written repo-document path also refuses every format, separator, private-use,
+        # surrogate or unassigned character. A WRITE rule only: Unicode categories move between Python versions,
+        # and a rule read back on every read must not turn a stored entry malformed after an upgrade.
+        import unicodedata
+        if any(unicodedata.category(character) in ('Cf', 'Zl', 'Zp', 'Co', 'Cs', 'Cn')
+               for character in payload['authority']['path']):
+            raise ValueError('authority.path of a repo-document must be plain text (no invisible or unassigned '
+                             'characters)')
     if design_documents.is_design_key(payload.get('key')) != design_documents.is_document_authority(payload['authority']):
         raise ValueError('a design.<scope> entry is written with a repo-document authority (its document attached), '
                          'and a repo-document authority only on a design.<scope> entry')
@@ -822,6 +836,7 @@ def _store_document(payload, project, document, limits):
     if not design_documents.is_design_key(payload['key']):
         raise ValueError('a repo-document authority belongs to a design.<scope> entry')
     authority = valid_authority(payload['authority'])
+    _validate_content(payload)              # the write-time content rules too, before a byte is stored
     data = design_documents.document_bytes(document)
     if hashlib.sha256(data).hexdigest() != authority['sha256']:
         raise ValueError('the document sent is not the one authority.sha256 names (its sha256 is %s)'
