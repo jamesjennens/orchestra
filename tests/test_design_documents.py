@@ -328,6 +328,18 @@ class UploadTests(DesignCase):
                     self.propose_design(text, authority=authority(text, path=path))
                 self.nothing_written(writes, blobs)
 
+    def test_a_stored_repo_document_record_with_an_invisible_path_never_parses(self):
+        # The read side of b2: plain_text runs inside valid_authority, so a record carrying such a path (planted,
+        # or written before this rule) is not a readable revision.
+        self.propose_design()
+        body = next(c['text'] for c in self.anchor()['comments'] if c['text'].startswith(rr.ENTRY_V3_PREFIX))
+        record = json.loads(body[len(rr.ENTRY_V3_PREFIX):])
+        for code in (0x202E, 0x200B):
+            changed = dict(record, authority=dict(record['authority'], path='docs/a' + chr(code) + 'b.md'))
+            changed.pop('sha256')
+            changed['sha256'] = rr.content_hash(changed)
+            self.assertIsNone(rr.parse_entry(rr.ENTRY_V3_PREFIX + rr.canonical_bytes(changed).decode('utf-8')))
+
     def test_a_repo_path_authority_keeps_its_earlier_rule(self):
         # Only repo-document paths are tightened: a repo-path entry is re-validated on every read.
         rr.valid_authority({'type': 'repo-path', 'path': 'docs/a' + chr(0x202E) + 'b.md', 'commit': 'a' * 40})
