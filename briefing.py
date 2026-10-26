@@ -14,6 +14,8 @@ from requirements import canonical_bytes, content_hash
 
 PREFIX='Kind: task-checkpoint-v1\n'
 KINDS={'blocker','question','decision','correction','dependency'}
+GROUPING_ADVICE=('To fit the limit, group the items: one open item per theme with an id prefix, resolved ones folded into one entry, '
+ 'and a longer text in a repository document that an item source links')
 CHECKPOINT_ITEMS_MAX=100
 CHECKPOINT_TEXT_LIMIT=400
 #: The top-level text fields of a checkpoint and their limits; the validator and the
@@ -279,7 +281,9 @@ def checkpoint_problems(p,task):
         if field not in p:continue
         items=p[field]
         if not isinstance(items,list) or len(items)>CHECKPOINT_ITEMS_MAX:
-            problems.append('%s: expected a list of at most %d items' % (field,CHECKPOINT_ITEMS_MAX));continue
+            problems.append('%s: expected a list of at most %d items' % (field,CHECKPOINT_ITEMS_MAX))
+            if isinstance(items,list):problems.append(GROUPING_ADVICE)
+            continue
         ids=[]
         for index,item in enumerate(items):
             path='%s[%d]' % (field,index)
