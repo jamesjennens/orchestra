@@ -138,6 +138,12 @@ class UploadTests(DesignCase):
                     self.propose_design(text, authority=auth)
                 self.nothing_written(writes, blobs)
 
+    def test_the_front_block_is_required_where_the_document_opens(self):
+        for text in ('# Just prose\n', '# Title\n' + document()):
+            with self.assertRaisesRegex(ValueError, 'must open with a <!-- design-v1'):
+                dd.front_block(text)
+        self.assertEqual(dd.front_block('﻿\r\n' + document())['scope'], SCOPE)
+
     def test_text_that_is_not_utf8_is_refused_by_the_bytes_check_itself(self):
         for text in ('\ud800', 'a\udfffb'):
             with self.assertRaisesRegex(ValueError, 'valid UTF-8'):
@@ -163,6 +169,8 @@ class UploadTests(DesignCase):
         exact = document(body='')
         exact = exact + 'x' * (dd.DOCUMENT_MAX_BYTES - len(exact.encode('utf-8')))
         self.assertEqual(len(dd.document_bytes(exact)), dd.DOCUMENT_MAX_BYTES)
+        with self.assertRaisesRegex(ValueError, 'the limit is'):
+            dd.document_bytes(exact + 'x')
         headings = ''.join('## H%d\n' % n for n in range(dd.HEADINGS_MAX))
         self.assertEqual(len(dd.derive_index(document(body=headings), KEY, 'a.md', 'a' * 40)['headings']),
                          dd.HEADINGS_MAX)
@@ -200,9 +208,10 @@ class UploadTests(DesignCase):
             with self.subTest(path=path):
                 with self.assertRaisesRegex(ValueError, 'authority.path'):
                     self.propose_design(text, authority=authority(text, path=path))
-        for bad in ({'commit': 'abc'}, {'sha256': 'A' * 64}):
+        for bad, why in (({'commit': 'abc'}, 'authority.commit'), ({'sha256': 'A' * 64}, 'authority.sha256 must be'),
+                         ({'sha256': 'a' * 63}, 'authority.sha256 must be')):
             with self.subTest(bad=bad):
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(ValueError, why):
                     self.propose_design(text, authority=dict(authority(text), **bad))
         without = authority(text)
         del without['commit']
