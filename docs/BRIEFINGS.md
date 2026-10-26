@@ -391,8 +391,9 @@ python http_client.py --base-url https://office.example --token=TOKEN work PROJE
 Its `Client.task_summaries(PROJECT, [TASK, TASK2])` method posts
 `{"tasks":["TASK","TASK2"]}` to `/v1/projects/PROJECT/tasks/summary`. This is a read,
 without an idempotency reservation. Current project read authority is required,
-including current membership and credential scope. Record anchors and the merge slot
-are hidden just as on the task surface. A hidden task ID and an unknown ID return
+including current membership and credential scope. Record anchors (including malformed
+anchors), the merge slot and rows of issue type `event` or `gate` are hidden just as
+on the task surface. A hidden task ID and an unknown ID return
 exactly the same missing item; the read never probes again to explain absence.
 
 Both forms return `schema_version: 1` and `items` in requested order. Each item has
@@ -408,7 +409,8 @@ summary fields, not provenance completeness or incorporation of all history.
 
 `last_post` is the latest ordinary nonblank comment, ordered by timestamp then native
 comment-ID text, with `comment_id`, `timestamp`, `author` and
-`author_omitted_chars`. Reserved record comments, including review, integration,
+`author_omitted_chars`. Record-family comments of any version and reserved record
+comments, including review, integration,
 checkpoint and lane-state records, never become ordinary posts. No checkpoint body,
 provenance map, item text or task description is returned. Next actions are clipped
 to 500 characters and authors to 96, with exact omitted-character counts. Unusable

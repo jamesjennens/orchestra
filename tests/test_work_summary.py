@@ -50,7 +50,7 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(len(got['items']), 100)
             self.assertTrue(got['items'][0]['found'])
 
-    def test_hidden_anchor_and_merge_slot_match_unknown_without_hiding_visible_types(self):
+    def test_hidden_anchor_merge_slot_events_and_gates_match_unknown(self):
         # Use an actual existing record family, including the matching label.
         data = self.fixture()
         data[0]['labels'] = ['reference']
@@ -64,7 +64,27 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summary.read(data, ['trial-merge-slot'])['items'][0], summary.missing('trial-merge-slot'))
         for kind in ('event', 'gate'):
             visible = dict(rows()[0], issue_type=kind, comments=[])
-            self.assertTrue(summary.read([visible], [TASK])['items'][0]['found'])
+            self.assertEqual(summary.read([visible], [TASK]), summary.read([], [TASK]))
+
+    def test_malformed_record_anchor_is_exactly_unknown(self):
+        data = self.fixture()
+        import record_json
+        data[0].update(malformed=True, labels=['reference'])
+        data = record_json.mark_selected(data, [TASK], ['reference'])
+        from reserved_comments import is_record_anchor
+        self.assertTrue(is_record_anchor(data[0]))
+        self.assertEqual(summary.read(data, [TASK]), summary.read([], [TASK]))
+
+    def test_broad_record_comment_families_never_win_host_last_post(self):
+        for family in ('reference-v1', 'capability-v1', 'reference-tombstone-v1'):
+            for prefix in ('', '\ufeff'):
+                with self.subTest(family=family, prefix=prefix):
+                    data = rows()
+                    data[0]['comments'] = [
+                        comment('ordinary', 'Visible post', stamp='2026-09-16T00:00:00Z'),
+                        comment('record', prefix + 'Kind: ' + family + '\r\n{}',
+                                stamp='2026-09-17T00:00:00Z')]
+                    self.assertEqual(summary.read(data, [TASK])['items'][0]['last_post']['comment_id'], 'ordinary')
 
     def test_checkpoint_is_linked_not_comment_order_and_state_is_only_declared(self):
         data = self.fixture()
@@ -197,6 +217,28 @@ class SelectionReuseTests(unittest.TestCase):
 
 
 class PrototypeHttpSummaryTests(unittest.TestCase):
+    def test_portable_http_record_families_and_non_task_rows(self):
+        from test_http_client import ClientCase, ADMIN, ADMIN_PASSWORD
+        harness = ClientCase(methodName='runTest')
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        caller = harness.client()
+        caller.login(ADMIN, ADMIN_PASSWORD)
+        project = caller.create_project('Synthetic summary filters')['id']
+        task = caller.create_task(project, 'Visible task')['id']
+        for family in ('reference-v1', 'capability-v1', 'reference-tombstone-v1'):
+            with self.subTest(family=family):
+                harness.backend.state['tasks'][task]['comments'] = [
+                    comment('ordinary', 'Visible post', stamp='2026-09-16T00:00:00Z'),
+                    comment('record', '\ufeffKind: ' + family + '\r\n{}', stamp='2026-09-17T00:00:00Z')]
+                got = caller.task_summaries(project, [task])['items'][0]
+                self.assertEqual(got['last_post']['comment_id'], 'ordinary')
+        row = harness.backend.state['tasks'][task]
+        for kind in ('event', 'gate'):
+            row['issue_type'] = kind
+            with self.subTest(kind=kind):
+                self.assertEqual(caller.task_summaries(project, [task])['items'][0], summary.missing(task))
+
     def test_portable_http_backend_reads_saved_checkpoint_and_ignores_unusable_lane_state(self):
         from test_http_client import ClientCase, ADMIN, ADMIN_PASSWORD
         harness = ClientCase(methodName='runTest')

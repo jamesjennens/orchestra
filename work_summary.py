@@ -3,7 +3,7 @@
 from activity import parse_moment, utc_text
 from briefing import checkpoint_state, identity
 from coordination import is_merge_slot
-from reserved_comments import is_record_anchor, reserved_match
+from reserved_comments import is_record_anchor, is_record_comment, reserved_match
 
 IDS_MAX = 100
 NEXT_ACTION_MAX = 500
@@ -91,7 +91,7 @@ def item(row):
             if not isinstance(comment, dict):
                 raise ValueError('Unusable comment')
             body = comment.get('text')
-            if not isinstance(body, str) or not body.strip() or reserved_match(body) is not None:
+            if not isinstance(body, str) or not body.strip() or is_record_comment(body) or reserved_match(body) is not None:
                 continue
             cid = comment_identity(comment)
             candidate = (parse_moment(comment.get('created_at')), cid, comment)
@@ -118,7 +118,7 @@ def read(rows, ids, project=None):
             continue
         if project is not None and row.get('project_id') not in (None, project):
             continue
-        if is_record_anchor(row) or is_merge_slot(row):
+        if row.get('issue_type') in ('event', 'gate') or is_record_anchor(row) or is_merge_slot(row):
             continue
         if row['id'] in selected:
             duplicates.add(row['id'])
