@@ -194,12 +194,15 @@ class RoomsItemsRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTest
         self.assertEqual(200, answer.status, answer.data)
         return answer.data.get('items') or []
 
-    def decision_endpoint(self, rid, sequence, title, text, evidence, operation_id):
+    def decision_endpoint(self, rid, sequence, title, text, evidence, operation_id,
+                          who='alex', project='pp', capability=None, descriptor=None):
         """Call the service-only room-decision action directly with a forged payload."""
-        principal = self.service.authenticate(self.tokens['alex'])
+        principal = self.service.authenticate(self.tokens[who])
         authority = held.http_service.authority_request(
-            principal, 'pp', held.http_service.CAP_COORDINATE,
+            principal, project, capability or held.http_service.CAP_COORDINATE,
             now=self.service._expiry_now())
+        if descriptor:
+            authority.update(descriptor)
         body = {'schema_version': 1, 'operation': 'issue', 'room': rid,
                 'sequence': sequence, 'title': title, 'text': text,
                 'evidence': evidence, 'operation_id': operation_id}
@@ -298,6 +301,62 @@ class RoomsItemsRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTest
                                         self.pointer(rid), 'room-binding-archived')
         self.assertEqual(2, closed.get('returncode'), closed)
         self.assertEqual(before, len(self.export_rows()))
+
+    def test_r7_a_proposal_cancel_uses_the_authors_session_journal_row(self):
+        # W9: the author's proposal row is session-bound and sufficient for cancellation;
+        # it is named exactly, with no uncertainty from the room decision's account row rule.
+        rid = self.room('R7 proposal session')
+        self.assertEqual(201, self.item(rid, who='casey', title='Candidate',
+                                        text='A contributor candidate.', key='r7w-item').status)
+        before = {proposal['key'] for proposal in self.proposals()}
+        self.fail_first_append()
+        failed = self.decide(rid, 'casey', key='r7w-accept')
+        self.assertEqual(500, failed.status, failed.data)
+        proposals = [proposal for proposal in self.proposals()
+                     if proposal['key'] not in before]
+        self.assertEqual(1, len(proposals), proposals)
+        cancelled = self.request('POST', '/v1/projects/pp/rooms/%s/items/1/intent/cancel' % rid,
+                                 {'reason': 'author cancels'}, token=self.tokens['casey'],
+                                 key='r7w-cancel')
+        self.assertEqual(200, cancelled.status, cancelled.data)
+        self.assertEqual([proposals[0]['key']], cancelled.data['records'])
+        self.assertFalse(cancelled.data['record_may_exist'])
+
+    def test_r7_room_decision_endpoint_rechecks_signed_authority(self):
+        # M1 and M2 have equivalent earlier refusals in requirement_editor and
+        # service_descriptor. M3 is killed by a real second-project descriptor.
+        # M16: issue requires coordinate even when the signed descriptor asks for less.
+        from http_authority import CAP_COORDINATE, CAP_READ, required_capability
+        rb.admin.add_project(self.root, 'qq')
+        admin = self.admin_token()
+        second = self.request('POST', '/v1/projects', {'project_id': 'qq', 'name': 'QQ'},
+                              token=admin)
+        self.assertIn(second.status, (200, 201, 409), second.data)
+        coordinator = self.request('PUT', '/v1/projects/qq/members/%s' % self.ids['alex'],
+                                   {'role': 'coordinator'}, token=admin)
+        self.assertIn(coordinator.status, (200, 201), coordinator.data)
+        rid = self.room('R7 signed authority')
+        self.assertEqual(201, self.item(rid, who='casey', kind='decision', title='Use CSV',
+                                        text='Emit CSV first.', key='r7a-item').status)
+        body = {'schema_version': 1, 'operation': 'issue', 'room': rid, 'sequence': 1,
+                'title': 'Use CSV', 'text': 'Emit CSV first.', 'evidence': self.pointer(rid),
+                'operation_id': 'r7a-mapping'}
+        self.assertEqual(CAP_COORDINATE, required_capability({
+            'action': 'room-decision', 'args': [json.dumps(body, sort_keys=True)]}))
+        before = len(self.export_rows())
+        cases = (
+            ('role', {'who': 'casey'}),
+            ('session', {'descriptor': {'via': 'credential'}}),
+            ('project', {'project': 'qq'}),
+            ('capability', {'capability': CAP_READ}),
+        )
+        for label, options in cases:
+            with self.subTest(case=label):
+                refused = self.decision_endpoint(
+                    rid, 1, 'Use CSV', 'Emit CSV first.', self.pointer(rid),
+                    'r7a-' + label, **options)
+                self.assertIn(refused.get('returncode'), (2, 126), (label, refused))
+                self.assertEqual(before, len(self.export_rows()), label)
 
     # -- round 5 (request 01a16bd3): retries across people, through the REAL operation journal --
     def promote(self, who, role):

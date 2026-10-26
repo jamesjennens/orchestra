@@ -419,6 +419,40 @@ class WebViewTests(unittest.TestCase):
             self.assertIn(text, work)
         overview = project[project.index('export async function overview'):project.index('export async function reviews')]
         self.assertLess(overview.index('project.usable === false'), overview.index("'New task'"))
+        # Slice 3 (kittrial-5bb.416): the task list leads, then a link to the Lanes
+        # page and the closed Coordinator tools fold; the lanes board lives on the
+        # Lanes page, never in the overview.
+        # r3 (review item b2): the summary strip leads, then the Tasks panel with
+        # the toolbar in its head above the table (mock-up project.html:44-80),
+        # then the closed Coordinator tools fold (project.html:82-89). The page
+        # head ('New task' action) stays first; the order pin is on the FINAL
+        # return's children only (r4): slicing from the last 'return h(' of
+        # overview() keeps the const definitions above it out of the comparison.
+        self.assertLess(overview.index('tableHost'), overview.index('Coordinator tools'))
+        final = overview[overview.rindex('return h('):]
+        # Source order of the rendered children in the final return: the page
+        # head, the setup line, the summary section, the tasks panel host, the
+        # Lanes link, the fold, then the strip. The markers are code-only
+        # (leading quote / newline indent) so the comments above the return
+        # cannot satisfy them.
+        self.assertLess(final.index('\n    summary,'), final.index('tasksPanel(tableHost)'))
+        self.assertLess(final.index('tasksPanel(tableHost)'), final.index('/lanes'))
+        self.assertLess(final.index('/lanes'), final.index("Coordinator tools '"))
+        self.assertLess(final.index("Coordinator tools '"), final.index('strip);'))
+        self.assertIn("Coordinator tools '", final)
+        # The toolbar heads the Tasks panel: it is built into the panel head,
+        # above the table host it is called with.
+        panel = overview[overview.index('const tasksPanel'):]
+        self.assertLess(panel.index('Tasks'), panel.index('toolbar'))
+        self.assertLess(panel.index('toolbar'), panel.index('host);'))
+        self.assertIn('Who acts next is named on each row', overview)
+        # Notes item: the who-acts text and the fold's contents render (id-free
+        # fallback, never null; coordinator tools inside the closed fold).
+        self.assertIn('data-who-acts', overview)
+        self.assertIn('mergeSlotPanel(ctx, project)', overview)
+        self.assertIn('guidancePanel(ctx, project)', overview)
+        self.assertNotIn('lanesPanel(ctx, project)', overview)
+        self.assertIn('`/p/${pid}/lanes`', overview)
         self.assertIn('unusableBanner(project)', project[project.index('export async function settings'):])
         self.assertIn('project.usable === false', task)
 

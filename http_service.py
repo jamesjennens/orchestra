@@ -59,6 +59,7 @@ from coordination import MERGE_SLOT_SUFFIX, is_merge_slot, merge_slot_sentence
 from reserved_comments import (ANCHOR_READ_IDS_MAX, carries_record_label, hide_records,
                                is_record_anchor)
 from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF, CAP_AGENTS,
+                       CAP_NUDGE_CARRY, NUDGES_SCOPE,
                        CAP_APPROVE,
                        CAP_CHECKPOINTS, CAP_FEEDBACK, CAP_PROPOSALS, CAP_ROOMS_POST, CAP_COORDINATE,
                        CAP_RELEASE,
@@ -3435,6 +3436,9 @@ class EndpointBackend:
         The service-only ``room-decision`` endpoint action re-checks the signed-in
         owner/coordinator authority live and the item's stored title/text before writing.
         """
+        if (principal.via != 'session' or principal.credential_id
+                or getattr(principal, 'agent_id', None)):
+            raise forbidden('Deciding a room item needs a signed-in person; an agent credential cannot decide an item.')
         operation_id = fields['operation_id']
         authority = authority_request(principal, project_id, CAP_COORDINATE,
                                       now=self.service._expiry_now())
@@ -4946,13 +4950,19 @@ STREAMED = set()
 #: authority checks, so the larger DESIGN_BODY_BYTES is never read for a caller who may not use it:
 #: the reference propose and revise (a design.<scope> revision carries its document).
 DEFERRED_BODY = {'references_propose', 'references_revise'}
+#: The only routes a nudge carrier's credential (scope ``nudges``) may call (kittrial-5bb.415). The
+#: dispatcher refuses it everywhere else before the route runs, so a route written later is closed to it
+#: by default; ``tests/test_lane_nudge_carrier.py`` sweeps every route to prove it.
+CARRIER_ROUTES = set()
 
 
-def route(method, pattern, *, anonymous=False, csrf=True, stream=False):
+def route(method, pattern, *, anonymous=False, csrf=True, stream=False, carrier=False):
     compiled = re.compile('^' + pattern + '$')
 
     def register(handler):
         ROUTES.append((method, compiled, handler.__name__, anonymous, csrf))
+        if carrier:
+            CARRIER_ROUTES.add(handler.__name__)
         if stream:
             STREAMED.add(handler.__name__)
         return handler
@@ -5263,6 +5273,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                                self._idempotency_key(), self._body_hash, auth_source,
                                self._is_secure(), route_target)
             begun = (name, ctx.idempotency_key is not None)
+            if self._principal is not None and self._principal.via == 'credential' \
+                    and NUDGES_SCOPE in self._principal.scopes and name not in CARRIER_ROUTES:
+                raise forbidden('Credential scope does not permit this operation')
             status, response = getattr(self, name)(ctx)
             if status is not None:              # None: the route sent its own answer (a file download)
                 self._send_json(status, response)
@@ -6996,8 +7009,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         """Every pending intent's outcome in a room, worked out before the locks (round 6, s1).
 
         The room's lines are read under the room lock for that moment only; each outcome is
-        then resolved with no lock held. Keyed by the intent's identity: if an intent changed
-        before the caller takes its locks, its cancel line falls back to "a record may exist".
+        then resolved with no lock held. Keyed by the intent's identity and ordered attempt
+        authors: if either changed before the caller takes its locks, its cancel line falls
+        back to "a record may exist".
         """
         try:
             with self._rooms_lock(project):
@@ -7010,9 +7024,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         for sequence in wanted:
             pending = rooms.pending_accept_intent(lines, sequence)
             if pending is not None:
-                outcomes[pending['identity']] = self._room_attempt_outcomes(
+                authors = tuple(author['id'] for author in
+                                rooms.intent_authors(lines, pending['identity']))
+                outcomes[(pending['identity'], authors)] = self._room_attempt_outcomes(
                     pid, project, room_id, pending, lines)
         return outcomes
+
+    def _room_locked_outcome(self, project, room_id, outcomes, pending):
+        lines = rooms.load_lines(project, room_id)
+        authors = tuple(author['id'] for author in
+                        rooms.intent_authors(lines, pending['identity']))
+        return outcomes.get((pending['identity'], authors), ((), True))
 
     def _room_item_record(self, ctx, pid, item, evidence, parent=None, base=None,
                           record_kind=None, earlier=(), intent=None, log_attempt=None):
@@ -7487,7 +7509,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             # Round 5 (b2): archive cancels every pending accept intent in the room first.
             return rooms.archive(project, ctx.params['rid'], actor, operation_id,
                                  payload.get('reason'), self._rooms_limits(),
-                                 outcome=lambda pending: outcomes.get(pending['identity'], ((), True)))
+                                 outcome=lambda pending: self._room_locked_outcome(
+                                     project, ctx.params['rid'], outcomes, pending))
         return self._rooms_write(ctx, 'rooms.archive', CAP_COORDINATE, write,
                                  reason='room %s' % ctx.params['rid'], item_first=True)
 
@@ -7522,7 +7545,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                         result = rooms.moderate(
                             project, ctx.params['rid'], sequence, payload['reason'],
                             operation_id, actor, self._rooms_limits(),
-                            outcome=lambda pending: outcomes.get(pending['identity'], ((), True)))
+                            outcome=lambda pending: self._room_locked_outcome(
+                                     project, ctx.params['rid'], outcomes, pending))
             except rooms.Refusal as refusal:
                 raise self._rooms_refusal(refusal) from None
             return result, result
@@ -13185,6 +13209,43 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Why this viewer got this scope, so the page states the rule in force from the answer.
         body['scope_basis'] = basis
         body['scope_role'] = role
+        # Display names for the lane rows, from the same resolver the task list
+        # uses for assignee names (kittrial-5bb.416): display only, never used
+        # for any authority or matching decision. A lane with no resolvable
+        # name keeps its label; the page shows this server text and never
+        # builds a name itself.
+        # The waited-on side of a HELD row gets the same treatment (r3): a role
+        # ('coordinator', 'reviewer', 'user') stays the server's role word, an actor
+        # id resolves to its display name, 'you' stays 'you', and unknown stays
+        # absent, so the page never decides a name from an id (assignee_names).
+        try:
+            wanted = []
+            for lane in body.get('items') or []:
+                if not isinstance(lane, dict):
+                    continue
+                if isinstance(lane.get('actor'), str):
+                    wanted.append(lane.get('actor'))
+                for entry in lane.get('held') or []:
+                    if (isinstance(entry, dict) and isinstance(entry.get('waiting_on'), str)
+                            and entry.get('waiting_on') != 'you'):
+                        wanted.append(entry.get('waiting_on'))
+            names = self._actor_names(wanted, ctx.params['pid'])
+        except Exception:
+            names = {}
+        for lane in body.get('items') or []:
+            if not isinstance(lane, dict):
+                continue
+            actor = lane.get('actor')
+            lane['display_name'] = (names.get(actor, lane.get('lane'))
+                                    if isinstance(actor, str) else lane.get('lane'))
+            for entry in lane.get('held') or []:
+                if not isinstance(entry, dict):
+                    continue
+                waited = entry.get('waiting_on')
+                if isinstance(waited, str) and waited and waited != 'you':
+                    entry['waiting_on_name'] = names.get(waited, waited)
+                else:
+                    entry['waiting_on_name'] = None
         continuation = body.get('next_offset')
         body['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, continuation,
                                            key=self.service.cursor_key())
@@ -13229,8 +13290,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         """Ask that a fixed message reach one stalled lane (kittrial-5bb.413; design kittrial-5bb.409).
 
         ``coordinate`` in THIS project, live: an owner, a coordinator, a superuser, or an agent whose
-        coordinator grant is effective. Nothing is delivered here (no carrier yet): the request is
-        kept, audited and shown on the board, and ends ``not-deliverable``.
+        coordinator grant is effective. Nothing is delivered here: the request is kept, audited and
+        shown on the board, and a carrier (kittrial-5bb.415) claims it and answers once.
         """
         self._project(ctx, CAP_COORDINATE)
         payload = dict(ctx.payload or {})
@@ -13278,6 +13339,50 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise HttpError(400, 'invalid_request', 'limit must be a whole number, 1 to 100')
         return 200, dict(self.service.nudge_list(ctx.params['pid'], lane, int(raw) if raw else 20),
                          generated_at=now_iso(self.service._now()))
+
+    # -- the nudge carrier (kittrial-5bb.415; docs/NUDGE_CARRIER.md) --------------------------------
+    CARRIER_FIELDS = ('kind', 'lanes')
+    OUTCOME_FIELDS = ('outcome', 'detail')
+
+    def _carrier_gate(self, ctx):
+        self.service.check_authority(ctx.principal, None, CAP_NUDGE_CARRY)
+
+    @route('GET', r'/v1/me/nudges', carrier=True)
+    def me_nudges(self, ctx):
+        """The carrier's own open requests: id, project, lane, message key and message set (no reason, no note)."""
+        self._carrier_gate(ctx)
+        return 200, dict(self.service.carrier_nudges(ctx.principal), generated_at=now_iso(self.service._now()))
+
+    @route('POST', r'/v1/me/carrier', carrier=True)
+    def me_carrier(self, ctx):
+        """The carrier's heartbeat: its kind and the lanes it reaches. Not audited (one every 30 seconds)."""
+        self._carrier_gate(ctx)
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, self.CARRIER_FIELDS, 'A carrier heartbeat')
+        answer, wrote = self.service.carrier_heartbeat(ctx.principal, payload)
+        if wrote:
+            self.service.store.save_soon()
+        return 200, answer
+
+    @route('POST', r'/v1/me/nudges/(?P<nid>nudge-[0-9a-f]{24})/claim', carrier=True)
+    def me_nudge_claim(self, ctx):
+        """Lease one open request for two minutes (a lapsed lease makes it pending again)."""
+        def claim():
+            refuse_unknown_fields(dict(ctx.payload or {}), (), 'A nudge claim')
+            return self.service.carrier_claim(ctx.principal, ctx.params['nid'], request_id=ctx.request_id)
+        return self._mutate(ctx, 'lanes.nudge.claim', None, claim, capability=CAP_NUDGE_CARRY, audit_success=False,
+                            replay_check=lambda: self.service.carrier_claim_held(ctx.principal, ctx.params['nid']))
+
+    @route('POST', r'/v1/me/nudges/(?P<nid>nudge-[0-9a-f]{24})/outcome', carrier=True)
+    def me_nudge_outcome(self, ctx):
+        """Answer a claimed request once with a closed outcome; refused after expiry and to a non-claimer."""
+        payload = dict(ctx.payload or {})
+
+        def answer():
+            refuse_unknown_fields(payload, self.OUTCOME_FIELDS, 'A nudge outcome')
+            return self.service.carrier_outcome(ctx.principal, ctx.params['nid'], payload, request_id=ctx.request_id)
+        return self._mutate(ctx, 'lanes.nudge.outcome', None, answer, capability=CAP_NUDGE_CARRY,
+                            audit_success=False)
 
     def _lanes_idle_minutes(self, raw):
         """The page's threshold argument, or the refusal that names the read's own range.

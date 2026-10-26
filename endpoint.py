@@ -1839,6 +1839,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         by_service=authority_config is not None and require_authority
         writes=capability_records.WRITE_COMMANDS+(capability_records.HTTP_WRITE_COMMANDS if by_service else ())
         if not args or args[0] not in writes:
+            from capabilities import CLIENT_COMMANDS
+            if args[:1] and args[0] in CLIENT_COMMANDS and not any(token in ('--help','-h') for token in args):
+                raise ValueError(client_capability_sentence(CLIENT_COMMANDS[CLIENT_COMMANDS.index(args[0])]))
             if args[:1]==['validate'] and not any(token in ('--help','-h') for token in args):
                 result=capability_records.validate(args,request.get('attachments',{}),run,configured_operators(root))
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n',
@@ -3164,6 +3167,17 @@ def client_out_of_date_sentence(name):
             'it carries its own wait logic, so wait needs no other kit file beside it (the '
             'capability commands still need capabilities.py).'
             % (name, KIT_VERSION))
+
+
+def client_capability_sentence(name):
+    """One plain sentence for a `capability` subcommand the client runs, sent to the endpoint (kittrial-5bb.310).
+
+    ``name`` is only ever a member of ``capabilities.CLIENT_COMMANDS`` - a fixed table, never request
+    text - and nothing else about the request is echoed.
+    """
+    return ('`capability %s` runs in the client, not on the server: it reads the checkout on your machine, '
+            'which the server cannot see. Run it as `python client.py --config CONFIG --project PROJECT '
+            'capability %s ...`.' % (name, name))
 
 
 def outside_contributor_interface(name):

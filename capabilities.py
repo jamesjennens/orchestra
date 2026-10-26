@@ -64,6 +64,10 @@ LOOKUP_SCHEMA = 'capability-lookup-v1'
 RESOLVE_SCHEMA = 'capability-resolve-v1'
 TRUST = 'repository-content'
 COMMANDS = ('lookup', 'resolve', 'index')
+#: Every `capability` subcommand the CLIENT runs on the caller's own machine: its parser's COMMANDS, and `check`
+#: (client.py dispatches it). The endpoint reads this to tell a caller who sent one there (kittrial-5bb.310);
+#: tests/test_endpoint_help.py derives the same set from the parser and from client.py and holds them equal.
+CLIENT_COMMANDS = COMMANDS + ('check',)
 SOURCES = ('auto', 'ast', 'graphify')
 DEFAULT_GRAPH = 'graphify-out/graph.json'
 
