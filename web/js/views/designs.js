@@ -1,0 +1,84 @@
+// The design page (kittrial-5bb.418; TRACEABILITY_DESIGN §5.2): a design.<scope> entry's stored
+// document rendered as text, with the anchors the server derived, each section's req:/design: tokens,
+// its plan phases and its verification state. Every node is built with h() as text; nothing in the
+// document can become markup, a link or a script (§7, "the stored document leaks or injects").
+import { h } from '../dom.js';
+import { pageHead, errorState } from '../ui.js';
+
+const HEADING = /^ {0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/;
+const FENCE = /^ {0,3}(`{3,}|~{3,})/;
+
+// The document as text blocks. Headings take the server's anchors in order (the index numbers
+// headings outside code fences exactly as `doc#anchor` pointers do), fences are shown verbatim.
+export function renderDocument(text, headings) {
+  const root = h('div', { class: 'md design-document', 'data-design-document': '1' });
+  const lines = String(text || '').replace(/^﻿/, '').replace(/\r\n?/g, '\n').split('\n');
+  const anchors = (headings || []).slice();
+  let para = []; let fence = null; let code = [];
+  const flush = () => { if (para.length) { root.append(h('p', null, para.join(' '))); para = []; } };
+  for (const raw of lines) {
+    const marker = FENCE.exec(raw);
+    if (fence !== null) {
+      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length) {
+        root.append(h('pre', null, h('code', null, code.join('\n')))); fence = null; code = [];
+      } else code.push(raw);
+      continue;
+    }
+    if (marker) { flush(); fence = marker[1]; continue; }
+    const heading = HEADING.exec(raw);
+    if (heading) {
+      flush();
+      const level = Math.min(6, heading[1].length + 1);
+      const item = anchors.length ? anchors.shift() : null;
+      const props = { class: 'md-h' };
+      if (item && item.anchor) props.id = 'design-' + item.anchor;
+      root.append(h('h' + level, props, heading[2]));
+      if (item && item.tokens && item.tokens.length) {
+        root.append(h('p', { class: 'small muted', 'data-section-tokens': item.anchor },
+          'Cites: ', item.tokens.map((token, n) => [n ? ', ' : '', h('code', null, token)])));
+      }
+      continue;
+    }
+    if (!raw.trim()) { flush(); continue; }
+    para.push(raw.trim());
+  }
+  if (fence !== null) root.append(h('pre', null, h('code', null, code.join('\n'))));
+  flush();
+  return root;
+}
+
+function verificationLine(v) {
+  if (!v) return 'not checked (a draft revision)';
+  if (v.state === 'verified') return `verified by ${v.verified_by} (${v.verified_at})`;
+  if (v.state === 'design-drift') {
+    return `design-drift: ${v.reason}` + (v.trusted ? ' (a trusted verifier)' : ` (reported by ${(v.reported_by || []).join(', ')}; trusted: false)`);
+  }
+  return 'unverified';
+}
+
+export async function page(ctx, { pid, scope }) {
+  let design;
+  try {
+    design = await ctx.api.design(pid, scope);
+  } catch (error) {
+    return h('div', null, pageHead({ title: 'design.' + scope, crumbs: [['Records', `/p/${pid}/records`]] }),
+      errorState(error, () => ctx.render()));
+  }
+  const front = (design.index && design.index.front) || {};
+  const phases = (design.index && design.index.plan_phases) || [];
+  return h('div', { class: 'stack', 'data-design-page': design.key },
+    pageHead({ title: design.key, lede: design.title, crumbs: [['Records', `/p/${pid}/records`], [design.key, `/p/${pid}/references/${encodeURIComponent(design.key)}`]] }),
+    h('section', { class: 'panel' },
+      h('dl', { class: 'kv' },
+        h('dt', null, 'Revision'), h('dd', null, String(design.revision), ' (', design.accepted ? 'accepted' : design.acceptance_state, ')'),
+        h('dt', null, 'Document'), h('dd', { class: 'mono' }, design.authority.path, ' @ ', String(design.authority.commit).slice(0, 12)),
+        h('dt', null, 'sha256'), h('dd', { class: 'mono' }, design.authority.sha256),
+        h('dt', null, 'Verification'), h('dd', { 'data-verification': (design.verification || {}).state || 'draft' }, verificationLine(design.verification)),
+        h('dt', null, 'Index'), h('dd', { 'data-index-state': design.index_state }, design.index_state),
+        h('dt', null, 'Front block'), h('dd', null, `scope ${front.scope}, status ${front.status} (the author's claim)`)),
+      phases.length ? h('div', null, h('h3', { class: 'small' }, 'Plan phases'),
+        h('ul', null, phases.map((phase) => h('li', null, h('code', null, phase.anchor),
+          phase.epic ? [' — epic ', h('a', { href: ctx.href ? ctx.href(`/p/${pid}/t/${phase.epic}`) : `#/p/${pid}/t/${phase.epic}` }, phase.epic)] : ' — no epic yet')))) : null,
+      h('p', { class: 'small muted' }, 'The stored document, shown as text (untrusted data).')),
+    h('section', { class: 'panel' }, renderDocument(design.document, design.index && design.index.headings)));
+}

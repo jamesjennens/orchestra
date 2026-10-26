@@ -1594,6 +1594,26 @@ sets `operation`.
     `repo-path` design entries written before stay readable. A repo-document revision is stored as
     `Kind: reference-entry-v3`, which a kit from the decision authority's release on reads
     `unsupported` (never malformed).
+  - **Verification.** `ref get` of an entry with an accepted repo-document revision carries
+    `verification`: `unverified` until checked; `verified` (with `verified_by`, `verified_at`) after a
+    trusted pass; `design-drift` after a failing report, with `trusted` (whether a trusted verifier
+    reported it), `reported_by`, `reason` and `observed_sha256`. A later trusted pass clears a drift; a
+    pinned commit's file cannot change, so otherwise the way out is a revision.
+  - `trace --verify [--repo DIR] [--record | --payloads FILE]` (client) reads each accepted design
+    document's path at its pinned commit from git's own object and compares its sha256 with the
+    stored document's; it exits 3 when any check fails. `--record` files each result with
+    `ref verify --file report.json`, which writes an **unverified** report: it can open
+    `design-drift` (marked `trusted: false`) and never marks a document verified. `--payloads FILE`
+    writes `{"items": [...]}` for `admin.py design-verify`, the only route that writes a trusted
+    check, for an actor on the operator allowlist or the deployment's verifiers list
+    ([operations](OPERATIONS.md#reference-and-capability-records)).
+  - A report is `{schema_version: 1, key, doc_sha256, path, commit, observed_sha256, result, reason}`:
+    `result` is `pass` (reason `match`, and `observed_sha256` equals `doc_sha256`) or `fail` (`mismatch`,
+    `missing`, `not-a-regular-file` or `not-utf8`). It must name the accepted revision's own document.
+    A repeat of the same report writes nothing; at most 50 untrusted reports are kept per document.
+  - `ref design SCOPE [--revision N]` reads the design page: the stored document as text, its index,
+    `index_state` (`matches`, `missing` or `differs`), and the revision's state. Anything that is not
+    a readable repo-document revision answers `Design not found`.
 - **Caller-written fields are refused.** `acceptance_state`, `successor`, `sha256`,
   `acceptance` and `labels` are written by the operation.
 - **`propose`** creates the entry's native anchor, closes it and posts revision 1 as a

@@ -3142,6 +3142,14 @@ it was set ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)).
   backup report the `design` journal entries as entries it cannot read and do not copy their
   bytes, and its purge refuses to run while they are there, so nothing is removed. Back up on
   this release before a rollback, and roll forward to read the entries again.
+- **Verifying design documents.** A lane runs `trace --verify --payloads checks.json` in a
+  checkout; `admin.py design-verify PROJECT --actor NAME --file checks.json` records each check as a
+  trusted `Kind: design-verification-v1` record when NAME is on the operator allowlist or the
+  `verifiers` list (both read strictly, as for `capability-verify`). A pass marks the accepted
+  revision `verified`; a fail marks it `design-drift` (`trusted: true`). Members who may propose can
+  also file unverified reports (`trace --verify --record`, or the web route), which can open a drift
+  that says `trusted: false` and names who reported it. Removing an actor from the verifiers list
+  makes its records stop counting. The way out of a drift on a pinned commit is a revision.
 - **No further version for a new authority type.** Version 3 is the last one an
   authority type needs. A v3 revision whose authority type this kit does not know (one a
   later kit added) makes its entry read `unsupported`, with the warning `authority type

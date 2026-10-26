@@ -590,6 +590,11 @@ export async function referencePage(ctx, { pid, key }) {
       h('dt', null, 'Native anchor'), h('dd', { class: 'mono' }, entry.native_id || entry.task || '—'),
       h('dt', null, 'Authority kind'), h('dd', { class: 'mono' }, entry.authority_kind || auth.type || '—'),
       h('dt', null, 'Authority'), h('dd', { class: 'mono', 'data-points-to': auth.path || auth.url || auth.id || '' }, formatAuthority(auth)),
+      // kittrial-5bb.418: a design document is read on its own page, as text, before it is accepted.
+      auth.type === 'repo-document' && String(entry.key || '').startsWith('design.') ? [
+        h('dt', null, 'Design document'),
+        h('dd', { 'data-design-link': '1' }, h('a', { href: ctx.href ? ctx.href(`/p/${pid}/designs/${encodeURIComponent(String(entry.key).slice(7))}`) : `#/p/${pid}/designs/${encodeURIComponent(String(entry.key).slice(7))}` }, 'Read the stored document'),
+          entry.verification ? ' — ' + entry.verification.state : '')] : null,
       h('dt', null, 'Owner'), h('dd', { class: 'mono' }, shown.owner || '—'),
       h('dt', null, 'Review by'), h('dd', { class: 'mono' }, `${shown.review_by || '—'} (${entry.due || 'ok'})`),
       h('dt', null, 'Tags'), h('dd', null, (shown.tags || []).join(', ') || '—'),

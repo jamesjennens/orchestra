@@ -541,5 +541,274 @@ console.log(JSON.stringify({same: ok.text===text, sha256: ok.sha256, refused}));
         self.assertIn('UTF-8', result['refused'])
 
 
+# -- part 2: verification (Q4), the design page, trace --verify ---------------------------------
+
+VERIFIER = 'verifier-1'
+
+
+class VerificationTests(DesignCase):
+    """§5.1 step 4 and the coordinator's Q4: mirror capabilities; an untrusted drift says so."""
+
+    def setUp(self):
+        super().setUp()
+        self.text = document()
+        self.propose_design(self.text)
+        self.accept_design(1)
+        self.auth = authority(self.text)
+
+    def report(self, result='fail', observed='0' * 64, reason=None, **extra):
+        payload = {'schema_version': 1, 'key': KEY, 'doc_sha256': self.auth['sha256'], 'path': self.auth['path'],
+                   'commit': self.auth['commit'], 'result': result,
+                   'observed_sha256': self.auth['sha256'] if result == 'pass' else observed,
+                   'reason': reason or ('match' if result == 'pass' else 'mismatch')}
+        payload.update(extra)
+        return payload
+
+    def file(self, payload, actor='alice', route='endpoint', verifiers=(VERIFIER,)):
+        self.native.actor = actor
+        return rr.write_verification(payload, actor, self.native, operators=[OPERATOR], verifiers=list(verifiers),
+                                     route=route)
+
+    def state(self, verifiers=(VERIFIER,)):
+        return rr.get(rr.read_key_rows(self.native, KEY), KEY, [OPERATOR], verifiers=list(verifiers))['verification']
+
+    def test_an_accepted_document_reads_unverified_until_a_trusted_check(self):
+        self.assertEqual(self.state()['state'], 'unverified')
+
+    def test_an_untrusted_failing_report_opens_drift_marked_untrusted(self):
+        self.file(self.report())
+        state = self.state()
+        self.assertEqual((state['state'], state['trusted'], state['reported_by']), ('design-drift', False, ['alice']))
+
+    def test_an_untrusted_pass_never_verifies(self):
+        self.file(self.report('pass'))
+        self.assertEqual(self.state()['state'], 'unverified')
+        self.file(self.report('pass'), actor=VERIFIER)          # a listed name, but not the host route
+        self.assertEqual(self.state()['state'], 'unverified')
+
+    def test_the_host_route_by_a_listed_actor_verifies_and_a_trusted_fail_is_trusted_drift(self):
+        self.file(self.report('pass'), actor=VERIFIER, route='host')
+        self.assertEqual((self.state()['state'], self.state()['verified_by']), ('verified', VERIFIER))
+        self.file(self.report('fail'), actor=OPERATOR, route='host')
+        state = self.state()
+        self.assertEqual((state['state'], state['trusted'], state['reported_by']), ('design-drift', True, [OPERATOR]))
+
+    def test_the_host_route_refuses_an_unlisted_actor(self):
+        with self.assertRaisesRegex(ValueError, 'operator allowlist or the verifiers list'):
+            self.file(self.report('pass'), actor='mallory', route='host')
+
+    def test_a_later_trusted_pass_clears_an_untrusted_drift(self):
+        self.file(self.report())
+        self.file(self.report('pass'), actor=VERIFIER, route='host')
+        self.assertEqual(self.state()['state'], 'verified')
+
+    def test_a_trusted_record_counts_only_while_its_author_is_listed_and_is_its_author(self):
+        self.file(self.report('pass'), actor=VERIFIER, route='host')
+        self.assertEqual(self.state(verifiers=())['state'], 'unverified')
+        row = self.native.row(self.anchor()['id'])
+        row['comments'][-1]['author'] = 'someone-else'
+        self.assertEqual(self.state()['state'], 'unverified')
+
+    def test_a_report_names_the_accepted_document_or_is_refused(self):
+        for bad in ({'doc_sha256': '1' * 64}, {'commit': 'b' * 40}, {'path': 'other.md'}):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, 'not the accepted revision'):
+                    self.file(self.report(**bad))
+        with self.assertRaisesRegex(ValueError, 'Unknown reference key'):
+            self.file(self.report(key='design.nothing'))
+
+    def test_a_draft_only_design_has_nothing_to_verify(self):
+        text = document(scope='draft-design')
+        self.propose_design(text, key='design.draft-design', operation_id='draft-1')
+        auth = authority(text)
+        payload = self.report(key='design.draft-design', doc_sha256=auth['sha256'])
+        with self.assertRaisesRegex(ValueError, 'no accepted design document'):
+            self.file(payload)
+
+    def test_report_rules(self):
+        for bad, why in (({'result': 'pass', 'observed_sha256': '0' * 64, 'reason': 'match'}, 'a pass is'),
+                         ({'result': 'fail', 'reason': 'match'}, 'result is pass'),
+                         ({'observed_sha256': 'x'}, 'observed_sha256'),
+                         ({'extra': 1}, 'exactly')):
+            with self.subTest(bad=bad):
+                payload = self.report()
+                payload.update(bad)
+                if bad.get('result') == 'pass':
+                    payload['observed_sha256'] = '0' * 64
+                with self.assertRaisesRegex(ValueError, why):
+                    self.file(payload)
+
+    def test_a_repeated_report_writes_nothing_and_untrusted_reports_are_bounded(self):
+        self.assertTrue(self.file(self.report())['recorded'])
+        writes = self.writes()
+        self.assertFalse(self.file(self.report())['recorded'])
+        self.assertEqual(self.writes(), writes)
+        with patch.object(dd, 'UNTRUSTED_REPORTS_MAX', 2):
+            self.file(self.report(observed='1' * 64))
+            with self.assertRaisesRegex(ValueError, 'already holds 2 reports'):
+                self.file(self.report(observed='2' * 64))
+            self.file(self.report('pass'), actor=VERIFIER, route='host')   # the trusted route is not bounded
+
+    def test_the_verification_prefix_is_reserved_and_a_record_comment(self):
+        self.file(self.report())
+        body = next(c['text'] for c in self.anchor()['comments'] if c['text'].startswith(dd.VERIFICATION_PREFIX))
+        self.assertTrue(reserved_comments.is_record_comment(body))
+        for text in (body, body.replace('verification-v1', 'verification-v4')):
+            with self.assertRaises(ValueError):
+                reserved_comments.check_raw_request(['comments', 'add', 'ref-1', text], {}, actor='alice', task='ref-1')
+
+    def test_a_verified_identity_counts_only_from_the_host_route(self):
+        record = dd.verification_record(self.report('pass'), VERIFIER, 'endpoint', 'verified', '2026-01-01T00:00:00Z')
+        self.native.add_comment(self.anchor()['id'], dd.verification_body(record), author=VERIFIER)
+        self.assertEqual(self.state()['state'], 'unverified')
+
+    def test_a_planted_trusted_looking_record_by_another_author_never_verifies(self):
+        record = dd.verification_record(self.report('pass'), VERIFIER, 'host', 'verified', '2026-01-01T00:00:00Z')
+        self.native.add_comment(self.anchor()['id'], dd.verification_body(record), author='mallory')
+        self.assertEqual(self.state()['state'], 'unverified')
+
+
+class DesignPageTests(DesignCase):
+    def page(self, scope=SCOPE, revision=None, rows=None):
+        return rr.design_page(rows if rows is not None else rr.read_key_rows(self.native, 'design.' + scope), scope,
+                              self.project, [OPERATOR], [VERIFIER], revision)
+
+    def test_the_page_carries_the_document_its_index_and_its_state(self):
+        text = document()
+        self.propose_design(text)
+        page = self.page()
+        self.assertEqual(page['document'], text)
+        self.assertEqual(page['index_state'], 'matches')
+        self.assertEqual(page['accepted'], False)
+        self.assertIsNone(page['verification'])
+        self.accept_design(1)
+        page = self.page()
+        self.assertEqual((page['accepted'], page['verification']['state']), (True, 'unverified'))
+        self.assertEqual([h['anchor'] for h in page['index']['headings']], ['server-redesign', 'plan-phase-1'])
+
+    def test_another_revision_is_shown_by_number(self):
+        first = document()
+        self.propose_design(first)
+        self.accept_design(1)
+        second = document(body='# Changed\n')
+        self.revise_design(second, 3)
+        self.assertEqual(self.page()['document'], first)
+        self.assertEqual(self.page(revision=3)['document'], second)
+
+    def test_a_differing_index_beside_the_derived_one_is_shown(self):
+        self.propose_design()
+        index = copy.deepcopy(dd.parse_index(next(c['text'] for c in self.anchor()['comments']
+                                                  if c['text'].startswith(dd.INDEX_PREFIX))))
+        index['headings'] = []
+        index.pop('sha256')
+        index['sha256'] = dd.content_hash(index)
+        self.native.add_comment(self.anchor()['id'], dd.index_body(index))
+        self.assertEqual(self.page()['index_state'], 'differs')
+
+    def test_every_absent_or_hidden_design_answers_the_same_refusal(self):
+        self.propose_design()
+        self.propose(key='calendar.trading', operation_id='plain')
+        cases = {'unknown scope': dict(scope='nothing'), 'not a design key': dict(scope='x', rows=self.native.rows),
+                 'no such revision': dict(revision=9), 'hidden (no rows readable)': dict(rows=[]),
+                 'another project': dict(rows=[dict(row, project_id='other') for row in self.native.rows
+                                               if False])}
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as caught:
+                    self.page(**kwargs)
+                self.assertEqual(str(caught.exception), 'Design not found')
+        os.remove(str(task_files.blob_path(self.project, authority(document())['sha256'])))
+        with self.assertRaisesRegex(ValueError, '^Design not found$'):
+            self.page()
+
+
+@unittest.skipIf(shutil.which('git') is None, 'git is not installed')
+class TraceVerifyClientTests(unittest.TestCase):
+    """`trace --verify`: the checkout's file at the pinned commit against the stored document."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.repo), True)
+        for args in (('init', '-q'), ('config', 'user.email', 't@example.invalid'), ('config', 'user.name', 'T'),
+                     ('config', 'core.autocrlf', 'false')):
+            subprocess.run(['git', '-C', str(self.repo), *args], check=True, capture_output=True)
+        (self.repo / 'docs').mkdir()
+        self.text = document()
+        (self.repo / 'docs' / 'D.md').write_bytes(self.text.encode('utf-8'))
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-q', '-m', 'd'], check=True, capture_output=True)
+        self.commit = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], check=True,
+                                     capture_output=True, text=True).stdout.strip()
+
+    def run_trace(self, stored_sha, extra=()):
+        import client
+        calls = []
+        entry = {'key': KEY, 'record': {'authority': {'type': 'repo-document', 'path': 'docs/D.md',
+                                                       'commit': self.commit, 'sha256': stored_sha}}}
+
+        def fake(config, project, actor, args, action='bd', path=None):
+            calls.append(list(args))
+            if args[0] == 'list':
+                body = {'items': [{'key': KEY}, {'key': 'calendar.trading'}], 'next_offset': None}
+            elif args[0] == 'get':
+                body = entry
+            else:
+                body = {'recorded': True}
+            return {'returncode': 0, 'stdout': json.dumps(body), 'stderr': ''}
+        out = self.repo / 'out.json'
+        with patch.object(client, 'request', side_effect=fake):
+            code = client._trace_command(['--verify', '--repo', str(self.repo), *extra], {}, 'p', 'alice', str(out))
+        return code, json.loads(out.read_text(encoding='utf-8')), calls
+
+    def test_a_match_passes_and_a_different_stored_document_fails(self):
+        code, summary, calls = self.run_trace(hashlib.sha256(self.text.encode('utf-8')).hexdigest())
+        self.assertEqual((code, summary['passed'], summary['failed']), (0, 1, 0))
+        self.assertEqual([c[0] for c in calls], ['list', 'get'])
+        code, summary, _ = self.run_trace('1' * 64)
+        self.assertEqual((code, summary['failed'], summary['results'][0]['reason']), (3, 1, 'mismatch'))
+
+    def test_record_files_each_report_and_payloads_writes_the_host_file(self):
+        digest = hashlib.sha256(self.text.encode('utf-8')).hexdigest()
+        _, summary, calls = self.run_trace(digest, ['--record'])
+        self.assertEqual(calls[-1][:2], ['verify', '--file'])
+        target = self.repo / 'payloads.json'
+        self.run_trace(digest, ['--payloads', str(target)])
+        items = json.loads(target.read_text(encoding='utf-8'))['items']
+        self.assertEqual(items[0], {'schema_version': 1, 'key': KEY, 'doc_sha256': digest, 'path': 'docs/D.md',
+                                    'commit': self.commit, 'observed_sha256': digest, 'result': 'pass',
+                                    'reason': 'match'})
+        dd.check_verification_payload(items[0])
+
+    def test_trace_without_verify_says_where_trace_is(self):
+        import client
+        with self.assertRaisesRegex(ValueError, 'trace --verify'):
+            client._trace_command([], {}, 'p', 'alice', None)
+
+
+class DesignPageWebTests(unittest.TestCase):
+    def test_the_document_renders_as_text_with_the_servers_anchors(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        code = '''await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const text='# Title <script>evil()</script>\\n\\n[link](javascript:evil) <img src=x onerror=evil()> \\u202e\\n\\n```\\n# not a heading\\n```\\n## Plan phase 1\\n';
+const el=view.renderDocument(text,[{anchor:'title-scriptevilscript',tokens:['req:k@1']},{anchor:'plan-phase-1',tokens:[]}]);
+console.log(JSON.stringify({text:el.textContent,scripts:el.querySelectorAll('script').length,
+ images:el.querySelectorAll('img').length,links:el.querySelectorAll('a').length,
+ ids:[...el.querySelectorAll('h2'),...el.querySelectorAll('h3')].map(x=>x.getAttribute('id')),pre:el.querySelectorAll('pre').length}));'''
+        done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web/js/views/designs.js').as_uri())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertIn('<script>evil()</script>', result['text'])
+        self.assertIn('<img src=x onerror=evil()>', result['text'])
+        self.assertEqual((result['scripts'], result['images'], result['links']), (0, 0, 0))
+        self.assertEqual(result['ids'], ['design-title-scriptevilscript', 'design-plan-phase-1'])
+        self.assertEqual(result['pre'], 1)
+        self.assertIn('# not a heading', result['text'])
+
+
 if __name__ == '__main__':
     unittest.main()

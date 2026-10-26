@@ -2242,6 +2242,7 @@ class EndpointBackend:
         # Files attached to a task (kittrial-5bb.370): the canonical `task-file` action.
         'files.record', 'files.withdraw',
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
+        'references.verify',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
         'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
         # Delegated decision rights (kittrial-5bb.407): the canonical `delegation` action.
@@ -3305,6 +3306,17 @@ class EndpointBackend:
 
     def references_find(self, project_id, phrase, limit=5):
         return self._ref_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
+
+    def design(self, project_id, scope, revision=None):
+        """kittrial-5bb.418: the design page through `ref design SCOPE`; anything not there is a 404."""
+        args = ['design', caller_arg(scope, 'scope')] + (['--revision', revision] if revision else [])
+        reply = self._endpoint('ref', project_id, self.actor_namespace + '/read', args)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and 'Design not found' in (reply.get('stderr') or ''):
+            raise not_found('Design not found')
+        payload = self._checked(reply, 'ref', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical design read returned an unexpected shape')
+        return payload
 
     def capabilities(self, project_id, options):
         """One page of the capability catalog through the endpoint's read-only `capability list`."""
@@ -10870,6 +10882,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                           'owner', 'review_by', 'tags', 'decisions', 'document')
     REF_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'title', 'statement',
                          'authority', 'owner', 'review_by', 'tags', 'decisions', 'document')
+    REF_VERIFY_FIELDS = ('key', 'doc_sha256', 'path', 'commit', 'observed_sha256', 'result', 'reason')
     REF_ACCEPT_FIELDS = ('key', 'revision', 'expected_revision', 'record_sha256', 'expected_sha256',
                          'acceptance_state', 'acceptance', 'decision', 'evidence', 'decision_id',
                          'owners', 'approvers', 'policy', 'unverified_pointer_reason')
@@ -11315,6 +11328,38 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._records_write(ctx, 'references.revise', 'revise',
                                    self.REF_REVISE_FIELDS, 'A reference revision',
                                    coordinator=False, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/verifications')
+    def references_verify(self, ctx):
+        # kittrial-5bb.418 (Q4): a design-document report from a member who may propose (records capability,
+        # role contributor, coordinator or owner); never a viewer or an outsider. Written unverified: it can
+        # open design-drift (trusted: false, reported_by) and never marks a document verified.
+        return self._records_write(ctx, 'references.verify', 'verify',
+                                   self.REF_VERIFY_FIELDS, 'A design verification',
+                                   coordinator=False, key_param=True, status=201)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/designs/(?P<scope>[a-z0-9][a-z0-9.-]{0,72})')
+    def design_get(self, ctx):
+        """kittrial-5bb.418: the design page read: a design.<scope> entry's stored document as text, its index
+        and state. One 404 for every caller who may not read it and every scope that is not there."""
+        absent = not_found('Design not found')
+        try:
+            self._project(ctx, CAP_READ)
+            self._records_backend()
+        except HttpError:
+            raise absent from None
+        revision = ctx.query.get('revision')
+        if revision is not None and not re.fullmatch(r'[1-9][0-9]{0,8}', revision):
+            raise absent
+        reader = getattr(self.backend, 'design', None)
+        if reader is None:
+            raise absent
+        try:
+            return 200, reader(ctx.params['pid'], ctx.params['scope'], revision)
+        except HttpError as error:
+            if error.status in (400, 404, 422):
+                raise absent from None
+            raise
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/accept')
     def references_accept(self, ctx):
