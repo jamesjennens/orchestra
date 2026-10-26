@@ -759,6 +759,38 @@ class VerificationTests(DesignCase):
         self.assertEqual(self.state()['state'], 'unverified')
 
 
+class IndexShapeTests(DesignCase):
+    """Review of part 1 (part-2 notes): only a fully well-formed stored index is ever used by a reader."""
+
+    def test_every_derived_index_parses_back(self):
+        self.propose_design()
+        index = self.indexes()[0]
+        self.assertEqual(dd.parse_index(dd.index_body(index)), index)
+
+    def test_an_index_with_any_malformed_value_is_ignored(self):
+        self.propose_design()
+        good = self.indexes()[0]
+        changes = {
+            'front scope of another key': lambda i: i['front'].update(scope='other'),
+            'front status': lambda i: i['front'].update(status='chosen'),
+            'front list item': lambda i: i['front'].update(requirements=['x' * 500]),
+            'heading level': lambda i: i['headings'][0].update(level=9),
+            'heading title': lambda i: i['headings'][0].update(title='t' * 500),
+            'heading tokens': lambda i: i['headings'][0].update(tokens=[1]),
+            'phase anchor': lambda i: i['plan_phases'][0].update(anchor='not-a-phase'),
+            'phase epic': lambda i: i['plan_phases'][0].update(epic='<b>'),
+            'phase fields': lambda i: i['plan_phases'][0].update(extra=1),
+            'phase line': lambda i: i['plan_phases'][0].update(contract=['c' * 500]),
+        }
+        for name, change in changes.items():
+            with self.subTest(name):
+                bad = copy.deepcopy(good)
+                change(bad)
+                bad.pop('sha256')
+                bad['sha256'] = dd.content_hash(bad)
+                self.assertIsNone(dd.parse_index(dd.index_body(bad)))
+
+
 class DesignPageTests(DesignCase):
     def page(self, scope=SCOPE, revision=None, rows=None):
         return rr.design_page(rows if rows is not None else rr.read_key_rows(self.native, 'design.' + scope), scope,

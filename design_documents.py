@@ -209,15 +209,36 @@ def parse_index(body):
                 or type(index['bytes']) is not int or not isinstance(index['path'], str) \
                 or not isinstance(index['commit'], str):
             return None
+        # Every value is checked before any reader uses it (review of part 1: the native author of an index
+        # proves nothing, so a reader that cannot re-derive it from the bytes trusts only a well-formed one).
         front = index['front']
-        if not isinstance(front, dict) or tuple(sorted(front)) != tuple(sorted(FRONT_FIELDS)):
+        if not isinstance(front, dict) or tuple(sorted(front)) != tuple(sorted(FRONT_FIELDS)) \
+                or not isinstance(front['scope'], str) or not SCOPE.fullmatch(front['scope']) \
+                or front['scope'] != scope_of(index['key']) or front['status'] not in FRONT_STATUSES \
+                or any(not _strings(front[name], FRONT_ITEMS_MAX)
+                       or any(not item or len(item) > FRONT_ITEM_MAX for item in front[name])
+                       for name in ('requirements', 'decisions_open', 'alternatives', 'supersedes')):
             return None
         headings = index['headings']
         if not isinstance(headings, list) or len(headings) > HEADINGS_MAX or any(
                 not isinstance(item, dict) or set(item) != {'anchor', 'level', 'title', 'tokens'}
-                or not isinstance(item['anchor'], str) or not _strings(item['tokens']) for item in headings):
+                or not isinstance(item['anchor'], str) or not 0 < len(item['anchor']) <= 1000
+                or type(item['level']) is not int or not 1 <= item['level'] <= 6
+                or not isinstance(item['title'], str) or len(item['title']) > TITLE_MAX
+                or not _strings(item['tokens'], TOKENS_MAX) for item in headings) \
+                or sum(len(item['tokens']) for item in headings) > TOKENS_MAX:
             return None
-        if not isinstance(index['plan_phases'], list):
+        phases = index['plan_phases']
+        if not isinstance(phases, list) or len(phases) > HEADINGS_MAX or any(
+                not isinstance(phase, dict)
+                or set(phase) != {'anchor', 'contract', 'test_oracles', 'requirements', 'epic'}
+                or not isinstance(phase['anchor'], str) or not PLAN_PHASE.fullmatch(phase['anchor'])
+                or any(not _strings(phase[name], PHASE_LINES_MAX)
+                       or any(len(line) > PHASE_LINE_MAX for line in phase[name])
+                       for name in ('contract', 'test_oracles', 'requirements'))
+                or (phase['epic'] is not None and (not isinstance(phase['epic'], str)
+                                                   or not ISSUE_ID.fullmatch(phase['epic'])))
+                for phase in phases):
             return None
     except (ValueError, TypeError, KeyError, UnicodeError):
         return None
