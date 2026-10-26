@@ -295,12 +295,15 @@ class _RecordsScenarioMixin:
         # unknown project: hidden equals absent.
         harness.create_account(self.owner_token, 'trace-outsider', 'rec-password-1')
         outsider, _, _ = harness.login('trace-outsider', 'rec-password-1')
-        other = harness.request('POST', '/v1/projects', {'project_id': 'qq', 'name': 'Other'}, token=self.owner_token)
-        self.assertEqual(other.status, 201, other.data)
+        # An agent whose grant of this project was taken away (a native host holds one project here).
         elsewhere = harness.request('POST', '/v1/agents', {'name': 'Elsewhere', 'working_directory': '/tmp/elsewhere',
-                                                           'projects': ['qq'], 'scopes': ['tasks']},
+                                                           'projects': [pid], 'scopes': ['tasks']},
                                     token=self.owner_token)
         self.assertEqual(elsewhere.status, 201, elsewhere.data)
+        self.assertEqual(get(elsewhere.data['credential']['secret']).status, 200)
+        ungranted = harness.request('PATCH', '/v1/agents/' + elsewhere.data['agent']['id'], {'projects': []},
+                                    token=self.owner_token)
+        self.assertEqual(ungranted.status, 200, ungranted.data)
         absent = [get(outsider), get(elsewhere.data['credential']['secret']),
                   get(people['viewer']['token'], project='no-such-project'), get(outsider, view='tokens')]
         self.assertEqual({(r.status, r.data['error']['code'], r.data['error']['message']) for r in absent},
