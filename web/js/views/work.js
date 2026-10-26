@@ -40,14 +40,15 @@ export async function home(ctx) {
     body);
   const myAgents = data.agents || [];
   // Slice 5 (kittrial-5bb.427, design 2.5): My work shows one row per agent that
-  // needs its owner; the full card grid stays on My agents. The row still renders
-  // through agentCard (data-agent with the name as its first H3 is kept); only
-  // the membership here is narrowed, from the server's attention state.
+  // needs its owner; the full card grid stays on My agents. The row keeps
+  // DIV[data-agent] with the name as its first H3 (pinned); only the lead
+  // line is added.
   const needed = myAgents.filter((a) => ['feedback', 'idle'].includes(attentionOf(a)));
   const agentsPanel = needed.length ? h('section', { class: 'panel', 'aria-labelledby': 'h-agents' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'h-agents' }, 'Your agents ', h('span', { class: 'nav-count' }, `${needed.length} need you`)),
       h('span', { class: 'small muted' }, 'As of ', new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), ' · ', h('button', { type: 'button', class: 'link', onclick: () => ctx.render() }, 'Refresh'))),
-    h('div', { class: 'panel-body agent-grid' }, needed.map((a) => agentCard(ctx, a, { compact: false })))) : null;
+    h('div', { class: 'panel-body agent-grid' }, needed.map((a) => h('div', { class: 'stack', 'data-agent': a.id || a.agent_id || a.name },
+      agentCard(ctx, a, { compact: false }))))) : null;
   return h('div', { class: 'stack' },
     pageHead({ title: 'My work', lede: `Everything waiting on you across ${ctx.projects.filter((p) => !p.archived).length} active project(s). Opening a task never marks it done.` }),
     incomplete ? h('div', { class: 'banner' }, 'Some projects could not be read just now, or there is more work than one page shows. Open a project to see all of its tasks.') : null,

@@ -112,11 +112,16 @@ export async function detail(ctx, { pid, rid }) {
   }
 
   // Slice 5 (kittrial-5bb.427, design 2.6): moderation is a fold on each message
-  // (mock-up room.html:40 `details > summary "Moderate"`), shown to owners and
-  // coordinators. The message-number form is gone: the fold passes the sequence
-  // of its own message. The reason hint stays on the fold.
+  // (mock-up room.html:40 `details > summary "Moderate"`). The message-number
+  // form is gone: the fold passes the sequence of its own message. The reason
+  // hint stays on the fold. Review r2: offer it only on message/item lines that
+  // are not moderated — the server refuses a second moderation with 409
+  // (rooms.py:1669 already_moderated) and a 404 for other kinds
+  // (rooms.py:1666 not_found), so do not offer it there.
   function moderateFold(message) {
     if (!canModerate(project)) return null;
+    if (message.kind !== 'message' && message.kind !== 'item') return null;
+    if (message.moderated) return null;
     const fold = h('details', { class: 'small' },
       h('summary', { class: 'muted' }, 'Moderate'),
       h('form', { class: 'form', novalidate: true },

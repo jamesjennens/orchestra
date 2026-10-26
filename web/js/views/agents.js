@@ -123,16 +123,21 @@ export function agentCard(ctx, raw, { compact = false } = {}) {
     : agent.summary ? agent.summary
     : agent.attention === 'idle' ? `${agent.claimable} unclaimed task(s) in its projects.` : null;
   const next = nextText ? h('p', { class: 'next' }, 'Next: ', nextText, ' ',
-    h('span', { class: 'who-acts ' + (needsOwner ? 'you' : 'agent') }, needsOwner ? 'you' : 'agent')) : null;
+    needsOwner ? h('span', { class: 'who-acts you' }, 'you') : null) : null;
+  // Review r2 (notes item): the Next line says it once — the item list below is
+  // the rest, never the same sentence again. Mock-up agents.html:35/46 keeps a
+  // bare "nothing from you" Next with no chip on the agent case.
+  const rest = agent.items && agent.items.length ? agent.items.slice(1) : [];
   return h('article', { class: 'agent-card' + (agent.attention === 'feedback' ? ' needs' : '') },
     h('div', { class: 'agent-head' },
       h('div', null, h('h3', null, agent.display_name), h('div', { class: 'small muted' }, agent.tool || 'Agent', agent.last_seen_at ? [' · last active ', time(agent.last_seen_at)] : ' · not connected yet')),
       attentionChip(agent.attention)),
     next,
-    agent.items && agent.items.length ? h('ul', { class: 'agent-items' }, agent.items.map((i) => h('li', null,
+    rest.length ? h('ul', { class: 'agent-items' }, rest.map((i) => h('li', null,
       h('a', { href: ctx.href(`/p/${i.project_id}/t/${i.task_id}`) }, i.title), h('span', { class: 'small muted' }, ' — ', i.text)))) :
-      agent.summary ? h('p', { class: 'small muted' }, agent.summary) :
-      agent.attention === 'idle' ? h('p', { class: 'small muted' }, `${agent.claimable} unclaimed task(s) in its projects.`) : null,
+      agent.items && agent.items.length ? null :
+      agent.summary && nextText !== agent.summary ? h('p', { class: 'small muted' }, agent.summary) :
+      agent.attention === 'idle' && !nextText ? h('p', { class: 'small muted' }, `${agent.claimable} unclaimed task(s) in its projects.`) : null,
     h('div', { class: 'resume' },
       h('div', { class: 'resume-row' },
         h('span', { class: 'resume-label' }, 'Folder'),

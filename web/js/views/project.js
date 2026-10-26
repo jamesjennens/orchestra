@@ -1,6 +1,7 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
+import { proposeSection } from './proposals.js';
 export { proposeSection } from './proposals.js';
 import { setupHint } from './setup.js';
 import { mergeSlotPanel } from './merge_slot.js';
@@ -480,9 +481,12 @@ export async function reviews(ctx, { pid }) {
             h('td', { class: 'hide-narrow num' }, String(openRequests(t))),
             h('td', { class: 'hide-narrow muted' }, (t.contribution && t.contribution.at) || t.updated_at ? time((t.contribution && t.contribution.at) || t.updated_at) : ''))))))) :
         h('p', { class: 'empty-line' }, `${title}: none.`);
+      // Review b1 (kittrial-5bb.427 r2): the empty 'error' group above is null,
+      // so filter before sorting — sorting first reads .rows of null and the
+      // Reviews page crashes in the normal case (no error-state item).
       return { key, rows: rows.length, body };
-    }).sort((a, b) => b.rows - a.rows).map(({ body }) => body),
-    proposeSection(ctx, pid, { folded: true })));
+    }).filter(Boolean).sort((a, b) => b.rows - a.rows).map(({ body }) => body),
+    proposeSection(ctx, pid, { folded: true }));
 }
 
 // One sentence, said on the page and again before the form: whose feedback this is
