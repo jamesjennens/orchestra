@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "operation_id": "kittrial-5bb-314-create-child-fields",
+  "key": "coordination.create-child-fields",
+  "name": "Atomic child creation with an assignee and priority",
+  "aliases": [
+    "create child assignee priority",
+    "create-child fields",
+    "assigned child creation"
+  ],
+  "summary": "create-child accepts optional assignee and priority fields in its one native create, eliminating separate follow-up updates. The endpoint reuses the raw update's exact assignee resolver and assigned-mode authority guard; bd validates the identical dry-run before any issue or receipt is written. Omitting the fields preserves the legacy request digest, native arguments and result, while changing either on replay is refused.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONAL_WORKFLOW.md#create-children-without-guessing-ids"
+  ],
+  "code": [
+    "coordination.py::apply_native",
+    "endpoint.py::_resolved_bd_assignee",
+    "endpoint.py::_guard_claiming_on_assignment",
+    "endpoint.py::execute",
+    "http_authority.py::required_capability"
+  ],
+  "tests": [
+    "tests/test_coordination.py",
+    "tests/test_assignee_names_endpoint.py",
+    "tests/test_claiming_real_bd.py",
+    "tests/test_authority_block_followups.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "coordination",
+    "assignment",
+    "idempotency"
+  ]
+}

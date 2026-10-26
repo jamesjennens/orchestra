@@ -1510,7 +1510,7 @@ sets `operation`.
   - `title`: at most 200 characters.
   - `statement`: at most 2,000 characters. It is untrusted text, and it never
     appears in an error.
-  - `authority`: one of three types.
+  - `authority`: one of five types.
     - `repo-path`: a relative path with no `..`, an optional 40-hex `commit` and an
       optional `anchor`.
     - `url`: `https` only, no userinfo, with a `retrieved` date no later than today.
@@ -1567,6 +1567,33 @@ sets `operation`.
     refused until it points at a decision that exists.
   - A decision revision is stored as `Kind: reference-entry-v3`. A kit older than this
     one does not serve an entry that holds one.
+- **A repo-document authority** (kittrial-5bb.418) is what a `design.<scope>` entry is written
+  with, and only such an entry (TRACEABILITY_DESIGN.md §5.1):
+
+  ```json
+  {"type": "repo-document", "path": "docs/design/SERVER_REDESIGN.md", "commit": "<40-hex>",
+   "anchor": "design-v1", "sha256": "<64-hex sha256 of the document>"}
+  ```
+
+  - `path` follows the `repo-path` rules; `commit` and `sha256` are required; `anchor` is optional.
+  - The propose or revise carries the document itself:
+    `ref propose|revise --file entry.json --document-from-git [--repo DIR]` reads the authority's
+    path at its commit from git's own object (never the working tree), refuses a symlink, a
+    submodule, a tree or a missing path, keeps the bytes exactly (line endings, a byte-order mark),
+    fills in `sha256` when the entry has none and refuses one that does not match. Over HTTP the
+    body's `document` field is the Markdown text.
+  - The server checks the document before it writes anything: strict UTF-8, no NUL, at most 1 MiB,
+    a `<!-- design-v1 ... -->` front block whose `scope` is the key's, at most 400 headings, at most
+    2,000 `req:` and `design:` tokens, and an index of at most 100,000 bytes. It stores the bytes in
+    the project's task-files store and writes the index it derives from them as a reserved
+    `Kind: design-index-v1` record on the entry's anchor (no raw comment can write one).
+  - An accept re-reads the stored bytes and refuses unless they still hash to `sha256`, exactly the
+    index derived from them is on the anchor (no differing one beside it), and the scope matches.
+  - A direct accepted revision (`draft`) cannot carry a document: propose, then accept.
+  - From this kit on a `design.<scope>` entry is written with a repo-document authority; the
+    `repo-path` design entries written before stay readable. A repo-document revision is stored as
+    `Kind: reference-entry-v3`, which a kit from the decision authority's release on reads
+    `unsupported` (never malformed).
 - **Caller-written fields are refused.** `acceptance_state`, `successor`, `sha256`,
   `acceptance` and `labels` are written by the operation.
 - **`propose`** creates the entry's native anchor, closes it and posts revision 1 as a
@@ -2233,7 +2260,14 @@ Incremental `lifecycle.py release --live-verified` selection can add
 deployment. It is valid only with `live_verified=true`, without rollback, in the
 same environment, with the target's exact source/integration commits. The endpoint
 requires that scope to remain live and deployed=passed; otherwise it refuses before
-writing and requests a fresh export. The field is request-only: native scope and
+writing and requests a fresh export; the refusal names the task, the scope it was
+bound to, the live scope (or that nothing is live) and the time of the newest record
+in the view compared (kittrial-5bb.313). `lifecycle.py release` without `--export`
+plans from a live read made through the caller's existing `bd` reads (`list --all
+--limit 0 --json`, then `show IDS --json --include-comments` for rows with comments),
+so a release of many targets after other writes needs no retry; `--export FILE` keeps
+planning from the file as before, and the endpoint re-verifies every target under
+its lock either way. The field is request-only: native scope and
 fact payloads retain their old shape. A target being restored receives live before
 verification on the first command, without a verification-only binding.
 

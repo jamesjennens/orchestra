@@ -2688,7 +2688,7 @@ def descriptor_actor_denial(request, authority_config, reserved):
 #: are not judged there at all: they carry their own exact check
 #: (``project_creation.SERVICE_ACTIONS``).
 BLOCK_CAPABILITIES = {
-    'work': {'lanes': CAP_READ},
+    'work': {'lanes': CAP_READ, 'summary': CAP_READ},
     # The HTTP coordinator read uses exactly this canonical wait form. Other
     # wait forms have no web authority entry and cannot inherit its wider view.
     'wait': {'--coordinator': CAP_COORDINATE},
@@ -2699,7 +2699,8 @@ BLOCK_CAPABILITIES = {
     'task-assign': CAP_COORDINATE,         # dedicated assignee-only guarded operation
     'task-release': CAP_TASKS,             # releasing your OWN claim (kittrial-5bb.301)
     'assignment-roster': CAP_COORDINATE,   # project-scoped existing assignment targets
-    'coordinate': {'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
+    'coordinate': {'create-child': CAP_COORDINATE,
+                   'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
                    'merge-release': CAP_COORDINATE, 'merge-create': CAP_PROJECT_ADMIN},
     'web-merge-slot': {'check': CAP_READ, 'acquire': CAP_COORDINATE,
                        'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,

@@ -219,6 +219,25 @@ class ClaimingRealBdTests(held.Members, fixes.Harness, rb.RealBdLabelAliasTests)
         after = self.task_ids()
         self.assertEqual(before, after)  # neither create wrote a row
 
+    def test_create_child_assignment_uses_the_same_assigned_mode_guard(self):
+        parent = self.new('assigned child parent')
+        seeded = self.bd('update', parent, '--assignee', self.ids['casey'], '--json')
+        self.assertEqual(0, seeded.returncode, seeded.stderr)
+        self.assertEqual(200, self.set_claiming('alex', 'assigned').status)
+        body = dict(operation='create-child', request_id='assigned-create-child',
+                    parent=parent, title='Assigned child', description='', type='task',
+                    assignee=self.ids['casey'], priority=1)
+        def create(actor):
+            return rb.endpoint.execute(self.root, {'project': 'pp', 'actor': actor,
+                                                   'action': 'coordinate',
+                                                   'args': [json.dumps(body)], 'attachments': {}})
+        before = self.task_ids()
+        with self.assertRaises(ValueError) as caught:
+            create('session-worker')
+        self.assertIn(claiming.CLAIM_REFUSAL, str(caught.exception))
+        self.assertEqual(before, self.task_ids())
+        self.assertFalse(any((self.project / '.coordination-requests').glob('*.json')))
+
     def test_a_status_shorthand_cannot_claim_an_unassigned_task_under_assigned(self):
         # kittrial-5bb.352 review item B2: `-s=in_progress`, `-sin_progress`,
         # `-qs in_progress` and `-qsin_progress` all move an unassigned task to

@@ -73,6 +73,37 @@ class AssigneeNameEndpointTests(RulesHelpers, unittest.TestCase):
         self.assertIn('actor id', str(caught.exception))
         self.assertEqual(before, self.row(task))
 
+    def test_create_child_resolves_assignee_and_stores_priority_with_atomic_replay_checks(self):
+        actor = self.a_session()
+        self.write_registry([(actor, self.NAME)])
+        parent = self.task('parent for assigned child')
+        body = dict(operation='create-child', request_id='assigned-child-' + uuid.uuid4().hex,
+                    parent=parent, title='Assigned child', description='Atomic create', type='task',
+                    assignee=self.NAME, priority=1)
+        reply = self.endpoint('coordinate', 'ops', [json.dumps(body)])
+        self.assertEqual(0, reply['returncode'], reply)
+        self.assertIn(actor, reply['stderr'])
+        made = json.loads(reply['stdout'])
+        row = self.row(made['id'])
+        self.assertEqual(actor, row['assignee'])
+        self.assertEqual(1, row['priority'])
+        again = self.endpoint('coordinate', 'ops', [json.dumps(body)])
+        self.assertEqual({'id': made['id'], 'reconciled': True}, json.loads(again['stdout']))
+        for field, value in (('assignee', actor), ('priority', 2)):
+            with self.subTest(changed=field):
+                with self.assertRaisesRegex(ValueError, 'different content or actor'):
+                    self.endpoint('coordinate', 'ops', [json.dumps(dict(body, **{field: value}))])
+        before = {row['id'] for row in self.rows()}
+        receipts_before = sorted((self.project / '.coordination-requests').iterdir())
+        for field, value in (('assignee', 'nobody-at-all'), ('priority', 9)):
+            with self.subTest(refused=field):
+                refused = dict(body, request_id='refused-' + field + '-' + uuid.uuid4().hex)
+                refused[field] = value
+                with self.assertRaisesRegex(ValueError, field):
+                    self.endpoint('coordinate', 'ops', [json.dumps(refused)])
+                self.assertEqual(before, {row['id'] for row in self.rows()})
+                self.assertEqual(receipts_before, sorted((self.project / '.coordination-requests').iterdir()))
+
     def test_raw_operator_assign_refuses_a_case_variant(self):
         # Kills the M2 mutant (case-insensitive matching) through the real endpoint.
         self.write_registry([(self.a_session(), self.NAME)])

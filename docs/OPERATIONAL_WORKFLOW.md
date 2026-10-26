@@ -214,6 +214,12 @@ here performs an actual software deployment: these commands record lifecycle fac
 
 The writing command asks the ENDPOINT which integrations are reverted before it selects (rev2 item 5): one read-only `release-query` request returns the host-issued revert set that `review` uses, so the default command works without `--journal` and without `ORCHESTRA_OPERATORS` on the caller's machine. If the endpoint cannot be asked, the command falls back to the local `--journal` view and says so in the report's `warnings`. A `--dry-run` stays offline and uses the local view (pass `--journal PROJECT` for a host-accurate dry run); it **says so in its own output** (rev3 item 3.4): the report carries `reverts_source: "local"` and a `dry_run_revert_note`, and `warnings` repeats that the offline dry run can list a target the writing run skips, because the writing run asks the endpoint. What only the client checks is unchanged: Git ancestry and release membership are decided in the caller's checkout, and the endpoint re-verifies only that each named target is a trusted `integrated=passed` scope and is not host-reverted, in its own export.
 
+Without `--export`, `release` reads the project live through the same `bd list`
+and `bd show` reads every contributor already has (no new read action), so it plans
+from the current state and needs no retry after other writes land
+(kittrial-5bb.313). `--export FILE` still plans from the file; `--dry-run` and `--journal` still apply the local journal view to the rows read. A refusal for a moved
+binding or a target that is not integrated names the task, the expected and live
+scope and the time of the newest record compared.
 `--live-verified` requires a fresh export after the actual deploy. An
 incrementally carried integration that is still live but unverified is selected
 with a `verify_scope` binding to its actual recorded deployment; the endpoint
@@ -368,7 +374,9 @@ Save `child.json`:
   "parent": "example-job",
   "title": "Add a parser fixture",
   "description": "Intent: cover the agreed input. Scope: tests/parser. Acceptance: fixture passes and the task records its commit.",
-  "type": "task"
+  "type": "task",
+  "assignee": "alex/session1",
+  "priority": 1
 }
 ```
 
@@ -380,9 +388,11 @@ When children will run in parallel, include the task template's `Owns / must not
 change` declaration in `description`, so each child states the files or areas it may
 change and the files or areas it must not change before it is authorized.
 
-Use the returned native child ID in all references. The request is bound to its actor and content, reserved durably, and marked on the native issue so a retry can reconcile instead of creating a duplicate. Inspect uncertain outcomes and retry only the same request. A reserved request with **no visible native issue** stops for operator reconciliation; do not bypass it with a new request ID or delete its reservation. Duplicate native matches also require reconciliation.
+`assignee` and `priority` are optional. Omitting both preserves the original request digest and native defaults. An assignee uses the same exact-actor/unique-display-name resolution as `bd update --assignee`; a web caller needs coordinate authority, and the project's `assigned` claiming mode applies the same operator-or-coordinator guard as a raw create or update. Priority goes to bd unchanged as its own native value, so bd's validation and default remain authoritative.
 
-Before anything is reserved, `create-child` runs the **identical create with `--dry-run`** (plus `--validate` for a `decision`). bd is the single source of truth for validation: the preflight writes nothing, so a refused description or a missing parent leaves the request ID free for corrected content instead of stranding it. The kit never re-implements bd's section matching.
+Use the returned native child ID in all references. The request is bound to its actor and content, reserved durably, and marked on the native issue so a retry can reconcile instead of creating a duplicate. Inspect uncertain outcomes and retry only the same request. Changing either optional field under the same request ID is a different request and is refused. A reserved request with **no visible native issue** stops for operator reconciliation; do not bypass it with a new request ID or delete its reservation. Duplicate native matches also require reconciliation.
+
+Before anything is reserved, `create-child` runs the **identical create with `--dry-run`** (plus `--validate` for a `decision`), including an assignee and priority when present. bd is the single source of truth for priority validation: the preflight writes nothing, so a refused assignee, priority, description or missing parent leaves no issue or receipt and the request ID free for corrected content. The kit never re-implements bd's section matching.
 
 A real create that exits nonzero **after** a passing preflight is not proof that nothing was written: bd can commit the issue and then fail (for example while adding the request label), and that commit may not be visible to an immediate label read. Such a request stays `pending` and must be reconciled; a retry under the same ID is refused rather than risking a duplicate.
 

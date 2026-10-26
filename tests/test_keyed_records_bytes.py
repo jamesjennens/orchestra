@@ -161,7 +161,10 @@ def run_scenario(module, steps):
                     else:
                         outcome = ('ok', module.reconcile(project, *args, native, **kwargs))
                 except (ValueError, RuntimeError) as error:
-                    outcome = ('refused', type(error).__name__, str(error))
+                    # The refusal a caller sees: kittrial-5bb.418 made the uncertain-write ValueError a subclass
+                    # (keyed_records.UncertainOutcome) with the identical message; to every caller it is a ValueError.
+                    kind = 'ValueError' if isinstance(error, ValueError) else type(error).__name__
+                    outcome = ('refused', kind, str(error))
                 outcomes.append(outcome)
         journals = {path.relative_to(project).as_posix(): path.read_bytes()
                     for path in sorted(project.rglob('*.json'))}

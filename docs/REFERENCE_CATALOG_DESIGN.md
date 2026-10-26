@@ -1926,3 +1926,13 @@ refused. Now that comment is malformed and a void repairs it. What remains is a
 record somebody builds by hand, valid in every byte, with a made-up type. The
 reader cannot tell it from a later kit's record; no kit will ever read it; and the
 way out is the operator's host procedure, which OPERATIONS names.
+
+### 18.6 A later type inside v3: `repo-document` (kittrial-5bb.418)
+
+The first type written under the 18.5 rule. A `design.<scope>` entry's authority is
+`{type: "repo-document", path, commit, anchor?, sha256}`: a repository file whose exact bytes the
+server stores, with an index it derives (TRACEABILITY_DESIGN.md §5.1, design_documents.py). It is a
+new type rather than a field added to `repo-path` because `repo-path` is a v1 type with a closed
+field set: an older kit would read an extra `sha256` as a malformed entry, a void target. Inside
+v3 an older kit reads it `unsupported`, as 18.5 promises, and this kit's tests run the previous
+release's reader against such an entry to show it.

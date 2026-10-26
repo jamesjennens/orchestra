@@ -930,7 +930,27 @@ def checkpoint_snapshot(rows, row, state):
     return snapshot(rows, project, row['id'])
 
 
-def assignee_comment_pending(row, state=None, response=None, full=None, authority=None):
+def checkpoint_selection(full, state, index, comment, cache=None):
+    """Reuse selection only for the same request's snapshot and parsed history.
+
+    An assignee's earlier checkpoint and the current checkpoint have different
+    indexes. Identity checks prevent reuse across snapshots or new parses.
+    """
+    cid, payload = state['history'][index]
+    key = (str(cid), index)
+    found = cache.get(key) if cache is not None else None
+    if (found is not None and found[0] is full and found[1] is state['history']
+            and found[2] == (comment.get('author'), comment.get('created_at'))):
+        return found[3]
+    data = excluding_checkpoint(full, cid, comment.get('author'))
+    prov = retained_provenance(state, upto=index)
+    result = (data, prov, newer_selection(data, prov, comment.get('created_at')))
+    if cache is not None:
+        cache[key] = (full, state['history'], (comment.get('author'), comment.get('created_at')), result)
+    return result
+
+
+def assignee_comment_pending(row, state=None, response=None, full=None, authority=None, selection_cache=None):
     """Unconsumed comments for an open assignee, reusing checkpoint provenance.
 
     Review state does not decide whether a person has written to the assignee.
@@ -954,9 +974,7 @@ def assignee_comment_pending(row, state=None, response=None, full=None, authorit
         if own:
             index, cid, payload = own[-1]
             comment = comments[str(cid)]
-            data = excluding_checkpoint(full, cid, comment.get('author'))
-            selected = newer_selection(data, retained_provenance(state, upto=index),
-                                       comment.get('created_at'))[1]
+            selected = checkpoint_selection(full, state, index, comment, selection_cache)[2][1]
         acknowledged = None
         if isinstance(response, dict) and same_activity_actor(response.get('author'), owner):
             acknowledged = row['id'] + '-c' + str(response['comment_id'])
@@ -1292,7 +1310,7 @@ def newer_selection(data,prov,checkpoint_timestamp):
     entries,fresh,changed_late,unverified=unincorporated(data,prov)
     return coverage,entries,fresh,changed_late,unverified
 
-def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off',field_changes=None,marker_fields=None):
+def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off',field_changes=None,marker_fields=None,selection=None):
     """Bounded, per-entry view of activity the current checkpoint did not incorporate.
 
     `prov` is the checkpoint's normalized provenance, so edited entries (same ID,
@@ -1303,7 +1321,8 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     are tracked to an explicit acknowledged/resolved/superseded disposition; every
     collection is bounded with an explicit omitted count. Reading changes nothing.
     """
-    coverage,entries,fresh,changed_late,unverified=newer_selection(data,prov,checkpoint_timestamp)
+    coverage,entries,fresh,changed_late,unverified=(newer_selection(data,prov,checkpoint_timestamp)
+                                                 if selection is None else selection)
     own=[e for e in entries if same_activity_actor(e['author'],owner)]
     others=[e for e in entries if not same_activity_actor(e['author'],owner)]
     authors=sorted({e['author'] for e in others})
@@ -2015,7 +2034,7 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
             'fields':list(fields or []),'fields_note':None if current else fields_note,
             'history':history,'note':note}
 
-def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None):
+def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None,selection_cache=None):
     """Bounded queue fields; share the brief's linked state and full-row snapshot.
 
     This is the ONE computation of the newer-activity fields (kittrial-5bb.354,
@@ -2053,9 +2072,10 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None
         prov=retained_provenance(state);digest=fields_digest(row)
         newer=None
         if not cursor_matches(p['activity_cursor'],data):
+            selection = checkpoint_selection(full, state, len(state['history']) - 1, c, selection_cache)[2]
             newer=newer_activity_summary(data,prov,c.get('created_at'),
                                          context[0],dispositions,direction_data,counted,_directions_off_reason,
-                                         marker_fields=digest)
+                                         marker_fields=digest,selection=selection)
         fields=activity_fields(row,c,prov,digest,newer,
                                len(unresolved_directions(direction_data,dispositions,context[0],counted)),
                                data=full)

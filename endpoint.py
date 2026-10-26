@@ -1399,7 +1399,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             lanes_scope,request.get('lanes_scope') if isinstance(request,dict) else None)
         def work_effect():
             read_context = {}
-            if action in ('work', 'wait'):
+            if action in ('work', 'wait') and args[:1] != ['summary']:
                 read_context['comment_authority'] = comment_contact_authority(root,path,operators,authority_config)
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,
@@ -1766,14 +1766,18 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         coordinator=args[0] in reference_records.HTTP_WRITE_COMMANDS
         identity_check,party_check,_=_records_http_context(coordinator,run_warnings,run,'references')
-        payload=reference_records.write_payload(args,request.get('attachments',{}),commands=writes)
+        # kittrial-5bb.418: a design.<scope> propose or revise carries its document as a second
+        # attachment (flag --document), checked, stored and indexed by reference_records.
+        payload,document=reference_records.write_payload_and_document(args,request.get('attachments',{}),commands=writes)
         runner=NativeRunner(run, project=path)
         def ref_effect():
+            import task_files
             try:
                 result=reference_records.apply_native(payload,actor,runner,path,operator=coordinator,
                                                       operators=configured_operators(root),
                                                       web_coordinator=coordinator,party_check=party_check,
-                                                      web_service=by_service)
+                                                      web_service=by_service,document=document,
+                                                      document_limits=task_files.limits(root,run_warnings))
             except RecordsRefusal as error:
                 return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
@@ -2785,11 +2789,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                     owners=owner_loader(path,'lifecycle_authors'),**diagnostic_context)
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
+                def create_assignment(args):
+                    import assignee_names
+                    try:
+                        resolved,note=_resolved_bd_assignee(root,path,actor,authority_config,args)
+                    except assignee_names.NameRefusal as error:
+                        raise ValueError('Invalid child assignee: '+str(error)) from None
+                    _guard_claiming_on_assignment(root,path,actor,authority_config,request,resolved)
+                    if note:run_warnings.append(note)
+                    return resolved
                 result=coordinate(payload,actor,runner,path,operators=coordinate_operators,
                                   coordinator_writes=rules['coordinator_writes'],
                                   independent_approval=rules['independent_approval'],
                                   owners=owner_loader(path,'coordinator_writes'),
-                                  review_writes=configured_review_writes(root,warnings=switch_warnings))
+                                  review_writes=configured_review_writes(root,warnings=switch_warnings),
+                                  create_assignment=create_assignment)
             else:
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)
@@ -3296,7 +3310,8 @@ def framed_files(root,path,actor,header,frame):
         name=task_files.clean_name(header['name'])
         sha256=task_files.check_sha256(header['sha256'])
         known=task_files.read_entry(path,task,sha256)
-        if known is not None and known.get('withdrawn') is None and known['name']==name and task_files.blob_size(path,sha256)==known['bytes']:
+        # kittrial-5bb.418 review r2 (N1): a design document's entry is not an attached file; it is never a replay.
+        if known is not None and known.get('withdrawn') is None and known.get('direction')!=task_files.DESIGN and known['name']==name and task_files.blob_size(path,sha256)==known['bytes']:
             return answer(dict(task_files.view(known),replayed=True),200)
         length=header['bytes']
         task_files.check_room(path,task,length,limit)
