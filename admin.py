@@ -2322,6 +2322,31 @@ def run_bd(root,name,args):
     location=[] if args and args[0]=='init' else ['--directory',path]
     return checked([root/'bin/bd',*location,'--sandbox',*args],env=environment(root),cwd=path).stdout
 
+def read_regular_text(path):
+    """The text of a regular file, never following a symlink and never blocking on a FIFO.
+
+    A FIFO or device put in the file's place answers at once with ValueError instead of
+    hanging the read (kittrial-5bb.171, as ``read_sidecar_json`` does for a sidecar). An
+    unreadable file raises OSError.
+    """
+    flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
+    fd=os.open(str(path),flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):raise ValueError('%s is not a regular file'%Path(path).name)
+        with os.fdopen(fd,'rb') as handle:
+            fd=None
+            return handle.read().decode('utf-8')
+    finally:
+        if fd is not None:os.close(fd)
+
+def project_metadata_document(root,name):
+    """The parsed ``.beads/metadata.json`` object, or None when it cannot be read or is not an object."""
+    try:
+        data=json.loads(read_regular_text(project_dir(root,name)/'.beads'/'metadata.json'))
+    except (OSError,ValueError,RecursionError):
+        return None
+    return data if isinstance(data,dict) else None
+
 def project_server_metadata(root,name):
     """(host,port,user,database) from the project's ``.beads/metadata.json``, or None.
 
@@ -2331,11 +2356,8 @@ def project_server_metadata(root,name):
     recorded failure reason. A project without those keys (an older or partial
     project) has no SQL coordinates, and the caller keeps the pre-existing native path.
     """
-    try:
-        data=json.loads((project_dir(root,name)/'.beads'/'metadata.json').read_text(encoding='utf-8'))
-    except (OSError,ValueError):
-        return None
-    if not isinstance(data,dict):return None
+    data=project_metadata_document(root,name)
+    if data is None:return None
     keys=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
     if not all(data.get(key) for key in keys):return None
     return tuple(data[key] for key in keys)
@@ -2343,7 +2365,7 @@ def project_server_metadata(root,name):
 def project_metadata_state(root,name):
     """What ``.beads/metadata.json`` says about a project, for the checks that must not guess.
 
-    ``server`` (it records the Dolt server coordinates), ``absent`` (no such file: the
+    ``server`` (it records the Dolt server coordinates and ``dolt_mode`` server), ``absent`` (no such file: the
     project was never initialized), or ``unreadable`` (the file is there but cannot be
     opened, is not JSON, or does not record the coordinates). Every project this kit
     creates is a server project (``bd init --server``), so ``unreadable`` never means "an
@@ -2357,7 +2379,11 @@ def project_metadata_state(root,name):
         return 'absent'
     except OSError:
         return 'unreadable'
-    return 'server' if project_server_metadata(root,name) is not None else 'unreadable'
+    if project_server_metadata(root,name) is None:return 'unreadable'
+    # bd runs embedded for any other dolt_mode (a missing one too): it CREATES .beads/embeddeddolt
+    # and lists nothing, even with the server coordinates present (kittrial-5bb.171 item 1).
+    data=project_metadata_document(root,name)
+    return 'server' if data is not None and data.get('dolt_mode')=='server' else 'unreadable'
 
 def server_database_name(root,name):
     """Return the case-insensitively matched server database name, if any."""
@@ -3879,7 +3905,7 @@ def retire_findings(root,name):
             unreadable[journal]=unreadable.get(journal,0)+1;continue
         for receipt in directory.glob('*.json'):
             try:
-                status=json.loads(receipt.read_text(encoding='utf-8'))['status']
+                status=json.loads(read_regular_text(receipt) if journal=='.open-item-requests' else receipt.read_text(encoding='utf-8'))['status']
                 if not isinstance(status,str):raise ValueError('status')
                 if status=='pending':pending[journal]=pending.get(journal,0)+1
             except (OSError,ValueError,KeyError,TypeError):
@@ -4606,7 +4632,7 @@ def read_sidecar_json(path):
     finally:
         if fd is not None:os.close(fd)
     try:return json.loads(raw.decode('utf-8')),None
-    except ValueError:return None,'it is not valid JSON'
+    except (ValueError,RecursionError):return None,'it is not valid JSON'
 
 def native_backup_manifest(directory):
     """``(manifest, None)`` for a native backup directory, or ``(None, reason)``.
@@ -4896,7 +4922,7 @@ def backup_project(root,name):
         if owner_answers.is_symlink():raise ValueError('Owner answers journal must not be a symlink')
         for record in owner_answers.glob('*.json'):
             if record.is_symlink():raise ValueError('Owner answers journal entry must not be a symlink')
-            files[OWNER_ANSWERS_JOURNAL+'/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
+            files[OWNER_ANSWERS_JOURNAL+'/'+record.name]=record_json.loads(read_regular_text(record))
         # The record journals (kittrial-5bb.64). This kit writes none, but after a
         # rollback from a later slice they exist and must round-trip.
         for journal in RECORD_JOURNALS:
@@ -4904,7 +4930,7 @@ def backup_project(root,name):
             if folder.is_symlink():raise ValueError('Record journal %s must not be a symlink'%journal)
             for record in folder.glob('*.json'):
                 if record.is_symlink():raise ValueError('Record journal receipt must not be a symlink')
-                files[journal+'/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+                files[journal+'/'+record.name]=json.loads(read_regular_text(record) if journal=='.open-item-requests' else record.read_text(encoding='utf-8'))
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}

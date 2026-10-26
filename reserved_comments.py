@@ -1984,6 +1984,15 @@ def reserved_match(body):
         if versioned:
             kind, operation = _RECORD_KIND_RESERVATIONS[versioned.group(1)]
             return (versioned.group(0), kind, operation)
+        # A lookalike of a record family that carries no version line (`Kind: owner-answer-v1`
+        # without its newline, `-vx`, `-v1x`) is hidden from history by is_record_comment, so the
+        # raw write is refused as well: one family list for both (kittrial-5bb.171 item 3).
+        for family in RECORD_COMMENT_FAMILIES:
+            if view.startswith(family):
+                key = next((k for k in _RECORD_KIND_RESERVATIONS if ('Kind: %s-' % k).startswith(family)
+                            or family.startswith('Kind: %s-' % k)), None)
+                kind, operation = _RECORD_KIND_RESERVATIONS[key]
+                return (family, kind, operation)
     return None
 
 

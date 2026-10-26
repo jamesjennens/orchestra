@@ -213,7 +213,7 @@ def _guard_reserved_labels(root,path,args,actor):
         if carries_record_label(row):
             row['comments']=_native_comments(root,path,actor,canonical)
             if is_record_anchor(row):
-                raise ValueError('Refusing to replace labels on %s: it is a reference/proposal/settings/capability record anchor, whose labels only its record operations may change. --add-label remains available for ordinary labels.'%(canonical,))
+                raise ValueError('Refusing to replace labels on %s: it is a reference/proposal/settings/capability/open-item record anchor, whose labels only its record operations may change. --add-label remains available for ordinary labels.'%(canonical,))
 
 def _native_anchor_rows(root,path,actor,tokens):
     """Resolve every named token to its canonical id and row, in ONE native read.
@@ -400,7 +400,7 @@ def _guard_record_anchor_status(root,path,args,actor):
     for token in targets:
         canonical,row=rows[token]
         if is_record_anchor(row):
-            raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability record anchor, '
+            raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability/open-item record anchor, '
                              'whose status only its record operations may change.'%(command,canonical))
         # The merge slot is held and released only through `coordinate` (kittrial-5bb.113).
         if is_merge_slot(row):
@@ -446,7 +446,7 @@ def _guard_record_anchor_title(root,path,args,actor,rows=None):
     for token in targets:
         canonical,row=read[token]
         if is_record_anchor(row):
-            raise ValueError('Refusing to update the title of %s: it is a reference/proposal/settings/capability record '
+            raise ValueError('Refusing to update the title of %s: it is a reference/proposal/settings/capability/open-item record '
                              'anchor, and its title is how the kit finds it.'%canonical)
 
 #: bd 1.2.2's structured answer when `show ID` resolved to no single row. bd prints it both
@@ -2867,7 +2867,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     # the native write).
     label=reserved_label_in_args(args)
     if label==MERGE_SLOT_LABEL:raise ValueError('The label %s marks the merge slot of a project and is reserved: it is not added, removed or replaced on any task. Only `coordinate` writes it (merge-create restores it on a damaged slot).'%label)
-    if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise)')
+    if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise); `open-item:` labels belong to open item records, which no command writes yet')
     # bd 1.2.2 accepts the undocumented `create --label` alias of --labels, so a
     # table built only from --help missed a whole label-writing spelling. Every
     # accepted alias is now in the table above; an unresolvable create/update

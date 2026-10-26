@@ -27,7 +27,7 @@ OPERATOR = 'ops-james'
 # The move renames a directory while its own coordination lock file is held open, which
 # POSIX allows and Windows refuses; the command itself is POSIX-only (it takes fcntl locks).
 REAL_SQL = admin.sql
-SERVER = {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317, 'dolt_server_user': 'root'}
+SERVER = {'dolt_mode': 'server', 'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317, 'dolt_server_user': 'root'}
 
 
 def server_project(root, name):
