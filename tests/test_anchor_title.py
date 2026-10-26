@@ -106,7 +106,7 @@ class GuardTests(unittest.TestCase):
                     with self.assertRaises(ValueError) as refused:
                         self.guard(argv, {'pp-3q2': row})
                     self.assertEqual(str(refused.exception),
-                                     'Refusing to update the title of pp-3q2: it is a reference/proposal/settings/capability '
+                                     'Refusing to update the title of pp-3q2: it is a reference/proposal/settings/capability/open-item '
                                      'record anchor, and its title is how the kit finds it.')
 
     def test_at_least_the_reference_and_capability_anchors_are_covered(self):

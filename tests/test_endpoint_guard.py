@@ -618,6 +618,12 @@ class EndpointLabelAliasGuardTests(_EndpointRootMixin, unittest.TestCase):
                             self.bd(args)
             run.assert_not_called()
 
+    def test_the_reserved_label_refusal_names_open_item_labels(self):
+        # kittrial-5bb.171 item 4
+        with mock.patch.object(endpoint.subprocess, 'run'):
+            with self.assertRaisesRegex(ValueError, 'labels belong to open item records'):
+                self.bd(['create', 'x', '--label', self.RESERVED[0]])
+
     def test_unrecognized_create_update_flag_is_refused(self):
         with mock.patch.object(endpoint.subprocess, 'run') as run:
             for args in (['create', 'x', '--labell', 'requirement'],

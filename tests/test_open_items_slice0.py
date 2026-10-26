@@ -12,6 +12,7 @@ of the journal validation, and that no kit module writes a record or a journal.
 import contextlib
 from void_test_helpers import without_void_tracker
 import copy
+import threading
 import io
 import json
 import os
@@ -26,6 +27,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import admin
+import coordination
 import open_items
 import recovery
 import reserved_comments as rc
@@ -48,7 +50,7 @@ ORDINARY_LABELS = ['open-item', 'open-items', 'open-item-old', 'openitem', 'Open
                    'decision', 'decision:x', 'ops']
 JOURNALS = ('.open-item-requests', '.owner-answers')
 STAMP = '2026-10-06T09:00:00Z'
-SERVER_METADATA = {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 3307, 'dolt_server_user': 'root',
+SERVER_METADATA = {'dolt_mode': 'server', 'dolt_server_host': '127.0.0.1', 'dolt_server_port': 3307, 'dolt_server_user': 'root',
                    'dolt_database': 'project'}
 
 
@@ -392,6 +394,47 @@ class JournalTests(unittest.TestCase):
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps(record), encoding='utf-8')
 
+    @without_void_tracker
+    @unittest.skipUnless(os.name == 'posix', 'POSIX modes')
+    def test_restored_journals_have_the_mode_every_journal_has(self):
+        # kittrial-5bb.171 Q1: restore writes through atomic() like every other journal (664), nothing tighter.
+        files = {'.open-item-requests/' + 'a' * 64 + '.json': receipt(operation='questions-ask'),
+                 entry_name(answer_entry()): answer_entry()}
+        for name, record in files.items():
+            self.write(name, record)
+        with patch.object(admin, 'run_bd', return_value='synced'):
+            admin.backup_project(self.root, 'source')
+        admin.restore_coordination(self.root, 'source', 'destination')
+        reference = self.destination / 'reference.json'
+        coordination.atomic(reference, '{}')
+        for name in files:
+            self.assertEqual((self.destination / name).stat().st_mode & 0o777, reference.stat().st_mode & 0o777, name)
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'needs FIFOs')
+    def test_a_fifo_in_either_open_item_journal_does_not_block_the_backup(self):
+        # kittrial-5bb.171 item 2: the read is non-blocking and refuses a non-regular entry.
+        for journal in JOURNALS:
+            with self.subTest(journal=journal):
+                folder = self.source / journal
+                folder.mkdir(exist_ok=True)
+                os.mkfifo(str(folder / ('c' * 64 + '.json')))
+                outcome = []
+
+                def attempt():
+                    try:
+                        with patch.object(admin, 'run_bd', return_value='synced'):
+                            admin.backup_project(self.root, 'source')
+                        outcome.append('ok')
+                    except (OSError, ValueError) as error:
+                        outcome.append(type(error).__name__)
+                worker = threading.Thread(target=attempt, daemon=True)
+                worker.start()
+                worker.join(20)
+                if worker.is_alive():
+                    self.fail('the backup blocked on a FIFO in %s' % journal)
+                self.assertNotEqual(outcome, ['ok'])
+                os.unlink(str(folder / ('c' * 64 + '.json')))
+
     def test_the_journal_tables(self):
         self.assertIn('.open-item-requests', admin.RECORD_JOURNALS)
         self.assertIn('.open-item-requests', admin.RESERVATION_JOURNALS)
@@ -545,6 +588,10 @@ class LabelCheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(report['unreadable'], ['../x', 'gamma', 'nosuch'])
         self.assertIn('error', report['projects']['gamma'])
+        # An invalid name reads like an unknown one and bd is never run for it (kittrial-5bb.171 item 6).
+        for name in ('nosuch', '../x'):
+            self.assertEqual(report['projects'][name], {'error': 'unknown or uninitialized project'})
+        self.assertNotIn('../x', [name for name, _ in self.calls])
 
 
     def test_damaged_metadata_is_unreadable_and_bd_never_runs(self):
