@@ -109,17 +109,35 @@ export function scopesLine(raw) {
 }
 
 // One agent's card: status, what is waiting, and exactly where to go to resume it.
+// Slice 5 (kittrial-5bb.427, design 2.5): the card leads with the next step, read
+// from the server's attention summary, and who acts on it; nothing is decided
+// here. The compact row on My work keeps DIV[data-agent] with the name as its
+// first H3 (pinned); only the lead line is added.
 export function agentCard(ctx, raw, { compact = false } = {}) {
   const agent = normalize(ctx, raw);
   const folder = agent.working_directory;
+  // The next step is the server's own words (attention.summary); the actor is the
+  // owner whenever the server says feedback/idle, else the agent.
+  const needsOwner = ['feedback', 'idle'].includes(agent.attention);
+  const nextText = agent.items && agent.items.length ? agent.items[0].text
+    : agent.summary ? agent.summary
+    : agent.attention === 'idle' ? `${agent.claimable} unclaimed task(s) in its projects.` : null;
+  const next = nextText ? h('p', { class: 'next' }, 'Next: ', nextText, ' ',
+    needsOwner ? h('span', { class: 'who-acts you' }, 'you') : null) : null;
+  // Review r2 (notes item): the Next line says it once — the item list below is
+  // the rest, never the same sentence again. Mock-up agents.html:35/46 keeps a
+  // bare "nothing from you" Next with no chip on the agent case.
+  const rest = agent.items && agent.items.length ? agent.items.slice(1) : [];
   return h('article', { class: 'agent-card' + (agent.attention === 'feedback' ? ' needs' : '') },
     h('div', { class: 'agent-head' },
       h('div', null, h('h3', null, agent.display_name), h('div', { class: 'small muted' }, agent.tool || 'Agent', agent.last_seen_at ? [' · last active ', time(agent.last_seen_at)] : ' · not connected yet')),
       attentionChip(agent.attention)),
-    agent.items && agent.items.length ? h('ul', { class: 'agent-items' }, agent.items.map((i) => h('li', null,
+    next,
+    rest.length ? h('ul', { class: 'agent-items' }, rest.map((i) => h('li', null,
       h('a', { href: ctx.href(`/p/${i.project_id}/t/${i.task_id}`) }, i.title), h('span', { class: 'small muted' }, ' — ', i.text)))) :
-      agent.summary ? h('p', { class: 'small muted' }, agent.summary) :
-      agent.attention === 'idle' ? h('p', { class: 'small muted' }, `${agent.claimable} unclaimed task(s) in its projects.`) : null,
+      agent.items && agent.items.length ? null :
+      agent.summary && nextText !== agent.summary ? h('p', { class: 'small muted' }, agent.summary) :
+      agent.attention === 'idle' && !nextText ? h('p', { class: 'small muted' }, `${agent.claimable} unclaimed task(s) in its projects.`) : null,
     h('div', { class: 'resume' },
       h('div', { class: 'resume-row' },
         h('span', { class: 'resume-label' }, 'Folder'),
