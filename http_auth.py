@@ -3689,7 +3689,12 @@ class Service:
         raise not_found(self.NUDGE_GONE)
 
     def carrier_heartbeat(self, principal, payload):
-        """Record that this carrier is up and which lanes it reaches, and stamp the open requests it can carry."""
+        """Record that this carrier is up and which lanes it reaches, and stamp the open requests it can carry.
+
+        ``(answer, wrote)``. A beat sooner than ``nudges.CARRIER_MIN_INTERVAL`` after the agent's last accepted
+        one is answered with that earlier answer (same ``seen_at``, so visibly not re-stamped) and does no
+        scan and no write: ``wrote`` is False. The last accepted time is kept in memory only.
+        """
         with self.store.lock:
             agent = self._carrier_agent(principal)
             kind = payload.get('kind')
@@ -3700,6 +3705,10 @@ class Service:
                     any(not isinstance(lane, str) or not nudges.LANE_LABEL.fullmatch(lane) for lane in lanes):
                 raise invalid('lanes must be a list of at most %d lane actor labels' % nudges.CARRIER_LANES_MAX)
             now = self._now()
+            beats = self.__dict__.setdefault('_carrier_beats', {})
+            last = beats.get(agent['id'])
+            if last is not None and 0 <= now - last[0] < nudges.CARRIER_MIN_INTERVAL:
+                return dict(last[1]), False
             registry = self._carrier_registry(create=True)
             registry[agent['id']] = {'kind': kind, 'lanes': sorted(set(lanes)), 'user_id': principal.user_id,
                                      'seen_ts': now, 'seen_at': now_iso(now)}
@@ -3715,7 +3724,12 @@ class Service:
                 del registry[gone]
             while len(registry) > nudges.CARRIERS_MAX:
                 del registry[min(registry, key=lambda key: registry[key].get('seen_ts') or 0)]
-        return {'seen_at': now_iso(now), 'poll_seconds': nudges.CARRIER_POLL, 'message_set': nudge_messages.MESSAGE_SET}
+            answer = {'seen_at': now_iso(now), 'poll_seconds': nudges.CARRIER_POLL,
+                      'message_set': nudge_messages.MESSAGE_SET}
+            beats[agent['id']] = (now, answer)
+            for gone in [key for key in beats if key not in registry]:
+                del beats[gone]
+        return dict(answer), True
 
     def carrier_nudges(self, principal):
         """The carrier's own open requests: ``{id, project, lane, message, message_set}``, nothing else."""

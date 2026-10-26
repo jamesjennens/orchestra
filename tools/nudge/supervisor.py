@@ -56,7 +56,8 @@ class Terminal:
         return False
 
     def type_line(self, text):
-        """Type ``text`` as the terminal's next input, then Enter."""
+        """Type ``text`` as the terminal's next input, then Enter. True only if it was typed; False if the
+        terminal refused at the moment of typing (it was blocked then), in which case nothing was typed."""
         raise NotImplementedError
 
     def restart(self, command):
@@ -64,7 +65,13 @@ class Terminal:
         raise NotImplementedError
 
 
+#: What the single tmux command prints to say which branch ran.
+TYPED, REFUSED = 'orchestra-typed', 'orchestra-refused'
+
+
 class TmuxTerminal(Terminal):
+    BLOCKED_FORMAT = '#{||:#{pane_in_mode},#{pane_dead}}'
+
     def __init__(self, target, tmux='tmux'):
         self.target, self.tmux = target, tmux
 
@@ -92,9 +99,20 @@ class TmuxTerminal(Terminal):
         code, out = self._run('display-message', '-p', '-t', self.target, '#{pane_in_mode} #{pane_dead}')
         return code != 0 or out.split() != ['0', '0']
 
+    @staticmethod
+    def _quoted(text):
+        # One double-quoted word of tmux's own command language: what it must not read as syntax is escaped.
+        return '"%s"' % ''.join('\\' + c if c in '\\"$;#~' else c for c in text)
+
     def type_line(self, text):
-        self._run('send-keys', '-t', self.target, '-l', text)
-        self._run('send-keys', '-t', self.target, 'Enter')
+        # The check and the keys are ONE tmux command, so a scroll cannot slip in between; which branch ran
+        # is read back from the same command's own output.
+        target = self._quoted(self.target)
+        send = 'send-keys -t %s -l %s ; send-keys -t %s Enter ; display-message -p %s' % (
+            target, self._quoted(text), target, TYPED)
+        code, out = self._run('if-shell', '-F', '-t', self.target, self.BLOCKED_FORMAT,
+                              'display-message -p %s' % REFUSED, send)
+        return code == 0 and out.split()[-1:] == [TYPED]
 
     def restart(self, command):
         import shlex
@@ -268,7 +286,9 @@ class Supervisor:
             return 'failed', 'no-session'
         if not at_prompt(terminal, setting):
             return 'failed', 'not-at-prompt'
-        terminal.type_line(text)
+        if not terminal.type_line(text):
+            # The terminal turned blocked after the check: nothing was typed, so nothing is reported delivered.
+            return 'failed', 'not-at-prompt'
         self.typed[lane] = now
         return ('restarted' if restarted else 'delivered'), None
 

@@ -31,6 +31,9 @@ answer them: it cannot make a lane do anything, because the text is fixed.
   a carrier that does not hold the claim are refused (409 or 403).
 - `POST /v1/me/carrier` with `{kind: "supervisor" | "bridge", lanes: [...]}` (at most 50 lane labels): the
   heartbeat. Poll no faster than every 30 seconds (the answer says `poll_seconds`).
+  The server enforces a floor of 20 seconds per agent between accepted beats: a sooner one is answered `200` with
+  the earlier answer (same `seen_at`), is not re-stamped, scans nothing and writes nothing, whatever its body
+  (a malformed body is still refused). The 90-second window absorbs the wait; the time is kept in memory only.
 
 Both claim and outcome are audited (`lanes.nudge.claim`, `lanes.nudge.outcome`); the heartbeat is not.
 
@@ -54,7 +57,9 @@ account leaving or being disabled after the end. A carrier first heard after the
 
 `tools/nudge/supervisor.py` (README beside it): types only when the pane's foreground process is the lane's
 harness at its prompt (not in tmux copy or scroll mode, not a dead pane), never sends the token anywhere a
-redirect points, and refuses to start when its config (which holds the token) is a symlink or readable by
+redirect points, checks the pane and types in ONE tmux command (`if-shell -F` on
+`pane_in_mode`/`pane_dead`) and reports `delivered` only when that command printed that the typing branch ran (a pane
+that turned blocked in between is `failed not-at-prompt`, nothing typed), and refuses to start when its config (which holds the token) is a symlink or readable by
 group or others.
 
 ## The VS Code Bridge (a contract, not code)

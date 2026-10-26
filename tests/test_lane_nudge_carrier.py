@@ -10,6 +10,7 @@ import json
 import re
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
@@ -517,6 +518,72 @@ class NoCarrierTests(CarrierCase):
         self.assertEqual(200, answer.status, answer.data)
         self.assertEqual((nudges.CARRIER_POLL, nudge_messages.MESSAGE_SET), (answer.data['poll_seconds'], answer.data['message_set']))
         self.assertEqual({agent_id: ['a', 'b']}, {k: v['lanes'] for k, v in self.service.state['nudge_carriers'].items()})
+
+
+class HeartbeatIntervalTests(CarrierCase):
+    """The server, not the client, keeps a carrier to one accepted beat per ``CARRIER_MIN_INTERVAL``."""
+
+    def measured(self, call):
+        """``(answer, saves, scans)``: every request saves its last-use stamp, so ``saves`` is read against a GET."""
+        saves, scans = mock.Mock(), mock.Mock(wraps=self.service._carrier_sees)
+        with mock.patch.object(self.service.store, 'save_soon', saves), \
+                mock.patch.object(self.service, '_carrier_sees', scans):
+            answer = call()
+        return answer, saves.call_count, scans.call_count
+
+    def reads(self, secret):
+        return self.measured(lambda: self.request('GET', '/v1/me/nudges', token=secret))[1]
+
+    def test_a_burst_of_beats_does_no_extra_scan_and_no_write_and_repeats_the_first_answer(self):
+        secret, agent = self.carrier('carl')
+        nudge_id = self.ask(self.ids['carl'])
+        first = self.beat(secret, [self.ids['carl']])
+        stamp, entry = self.state(nudge_id)['carrier_seen_ts'], dict(self.service.state['nudge_carriers'][agent])
+        baseline = self.reads(secret)
+        for gap in (1, 4, 5, 7):
+            self.later(gap)
+            again, saves, scans = self.measured(lambda: self.beat(secret, [self.ids['carl']], kind='bridge'))
+            self.assertEqual((200, first.data, baseline, 0), (again.status, again.data, saves, scans))
+        self.assertEqual(stamp, self.state(nudge_id)['carrier_seen_ts'])
+        self.assertEqual(entry, self.service.state['nudge_carriers'][agent])
+
+    def test_a_beat_after_the_interval_is_accepted_stamps_and_writes(self):
+        secret, _ = self.carrier('carl')
+        nudge_id = self.ask(self.ids['carl'])
+        first = self.beat(secret, [self.ids['carl']])
+        stamp, baseline = self.state(nudge_id)['carrier_seen_ts'], self.reads(secret)
+        self.later(nudges.CARRIER_MIN_INTERVAL - 3)
+        self.beat(secret, [self.ids['carl']])
+        self.assertEqual(stamp, self.state(nudge_id)['carrier_seen_ts'])
+        self.later(6)
+        later, saves, scans = self.measured(lambda: self.beat(secret, [self.ids['carl']]))
+        self.assertEqual((200, baseline + 1), (later.status, saves))
+        self.assertGreater(scans, 0)
+        self.assertNotEqual(first.data['seen_at'], later.data['seen_at'])
+        self.assertGreater(self.state(nudge_id)['carrier_seen_ts'], stamp)
+
+    def test_two_agents_are_throttled_independently(self):
+        one, _ = self.carrier('carl', 'CarrierOne')
+        two, _ = self.carrier('carl', 'CarrierTwo')
+        self.assertEqual(200, self.beat(one, [self.ids['carl']]).status)
+        baseline = self.reads(two)
+        answer, saves, _ = self.measured(lambda: self.beat(two, [self.ids['carl']]))
+        self.assertEqual((200, baseline + 1), (answer.status, saves))
+        self.assertEqual(baseline, self.measured(lambda: self.beat(one, [self.ids['carl']]))[1])
+
+    def test_a_malformed_beat_is_refused_even_inside_the_interval(self):
+        secret, _ = self.carrier('carl')
+        self.assertEqual(200, self.beat(secret, [self.ids['carl']]).status)
+        self.assertIn(self.beat(secret, ['not a lane label']).status, (400, 422))
+
+    def test_the_last_accepted_times_are_only_kept_for_agents_with_an_entry(self):
+        secret, agent = self.carrier('carl')
+        self.beat(secret, [self.ids['carl']])
+        self.assertIn(agent, self.service._carrier_beats)
+        self.service.state['nudge_carriers'].pop(agent)
+        self.later(nudges.CARRIER_MIN_INTERVAL + 3)
+        self.beat(secret, [self.ids['carl']])
+        self.assertEqual({agent}, set(self.service._carrier_beats))
 
 
 class MessageTests(unittest.TestCase):

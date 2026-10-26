@@ -13220,8 +13220,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._carrier_gate(ctx)
         payload = dict(ctx.payload or {})
         refuse_unknown_fields(payload, self.CARRIER_FIELDS, 'A carrier heartbeat')
-        answer = self.service.carrier_heartbeat(ctx.principal, payload)
-        self.service.store.save_soon()
+        answer, wrote = self.service.carrier_heartbeat(ctx.principal, payload)
+        if wrote:
+            self.service.store.save_soon()
         return 200, answer
 
     @route('POST', r'/v1/me/nudges/(?P<nid>nudge-[0-9a-f]{24})/claim', carrier=True)
