@@ -17,6 +17,13 @@ from test_coordinator_rules_endpoint import RulesHelpers
 
 
 class CapabilityShapeTests(unittest.TestCase):
+    def test_create_child_requires_coordinate_capability(self):
+        request = {'action': 'coordinate', 'args': [json.dumps({
+            'operation': 'create-child', 'request_id': 'child-1', 'parent': 'pp-job',
+            'title': 'Child', 'description': '', 'type': 'task'})]}
+        self.assertEqual(http_authority.CAP_COORDINATE,
+                         http_authority.required_capability(request))
+
     def test_nontext_capabilities_are_known_denials_for_sessions_and_credentials(self):
         state = harness.authority_state()
         for make in (lambda: harness.session_block(harness.OWNER, 'read'),
@@ -36,7 +43,6 @@ class EndpointRefusalTests(harness.EndpointHarness):
                              ('lifecycle', ['{}']), ('bd', ['close', harness.TASK]),
                              ('bd', ['reopen', harness.TASK]),
                              ('bd', ['dep', 'add', harness.TASK, 'pp-other']),
-                             ('coordinate', [json.dumps({'operation': 'create-child'})]),
                              ('coordinate', [json.dumps({'operation': 'future-operation'})]),
                              ('web-merge-slot', [json.dumps({'operation': 'future-operation'})])):
             with self.subTest(action=action, args=args):
@@ -129,9 +135,11 @@ class NativeBlockRefusalTests(RulesHelpers, unittest.TestCase):
         cases = [('bd', ['close', task]), ('bd', ['reopen', task]),
                  ('bd', ['comments', 'add', task, 'Viewer remark']),
                  ('bd', ['dep', 'add', task, other]),
+                 ('bd', ['create', 'Viewer assigned raw child', '--assignee', 'other-party', '--json']),
                  ('coordinate', [json.dumps({'operation': 'create-child', 'parent': task,
                                              'title': 'Viewer child', 'request_id': 'x7-child',
-                                             'description': '', 'type': 'task'})]),
+                                             'description': '', 'type': 'task',
+                                             'assignee': 'other-party', 'priority': 1})]),
                  ('coordinate', [json.dumps({'operation': 'merge-acquire', 'task': task, 'target': 'main'})])]
         cases += [('lifecycle', [json.dumps(body)]) for body in payloads]
         for action, args in cases:

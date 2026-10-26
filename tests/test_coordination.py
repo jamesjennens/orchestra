@@ -165,6 +165,50 @@ class CoordinationTests(unittest.TestCase):
         preflight = next(c for c in self.native.calls if c[0] == 'create' and '--dry-run' in c)
         self.assertEqual([a for a in preflight if a != '--dry-run'], create)
 
+    def test_child_without_new_fields_keeps_legacy_digest_arguments_and_result(self):
+        legacy_digest = '37e924490c48d5a7e1252eae3120e806ba9501253e147d51028e02fda7521fd5'
+        self.assertEqual({'id': 'sample-job.7', 'reconciled': False}, self.apply(CHILD))
+        create = next(c for c in self.native.calls if c[0] == 'create' and '--dry-run' not in c)
+        self.assertEqual(['create', '--title', CHILD['title'], '--parent', CHILD['parent'],
+                          '--description', CHILD['description'], '--type', CHILD['type'],
+                          '--no-inherit-labels', '--labels',
+                          'request:efac7609acb5950956d6bf6a1ac80ef8a79fc50519b479dfd5b0b5b011d58c99,request-content:' + legacy_digest,
+                          '--json'], create)
+        receipt = json.loads(next((self.project / '.coordination-requests').iterdir()).read_text())
+        self.assertEqual(legacy_digest, receipt['sha256'])
+        self.assertEqual({'id': 'sample-job.7', 'reconciled': True}, self.apply(CHILD))
+
+    def test_child_fields_use_the_shared_assignment_callback_for_both_native_calls(self):
+        seen = []
+        def assignment(args):
+            seen.append(list(args))
+            resolved = list(args)
+            resolved[resolved.index('--assignee') + 1] = 'session-resolved'
+            return resolved
+        payload = dict(CHILD, assignee='Worker One', priority=1)
+        result = coordination.apply_native(payload, 'alice', self.native, self.project,
+                                          create_assignment=assignment)
+        self.assertEqual({'id': 'sample-job.7', 'reconciled': False}, result)
+        self.assertEqual(1, len(seen))
+        create = next(c for c in self.native.calls if c[0] == 'create' and '--dry-run' not in c)
+        self.assertEqual('session-resolved', create[create.index('--assignee') + 1])
+        self.assertEqual('1', create[create.index('--priority') + 1])
+        preflight = next(c for c in self.native.calls if c[0] == 'create' and '--dry-run' in c)
+        self.assertEqual([a for a in preflight if a != '--dry-run'], create)
+
+    def test_child_assignment_and_priority_refusals_write_no_issue_or_receipt(self):
+        def refuse_assignment(args):
+            raise ValueError('assignee is unknown')
+        with self.assertRaisesRegex(ValueError, 'assignee'):
+            coordination.apply_native(dict(CHILD, assignee='nobody'), 'alice', self.native,
+                                      self.project, create_assignment=refuse_assignment)
+        self.native.refuse_preflight = 'invalid priority "9"'
+        with self.assertRaisesRegex(ValueError, 'priority'):
+            coordination.apply_native(dict(CHILD, request_id='session/bad-priority', priority=9),
+                                      'alice', self.native, self.project)
+        self.assertEqual([], self.native.issues)
+        self.assertEqual([], list((self.project / '.coordination-requests').iterdir()))
+
     def test_lost_and_malformed_create_response_reconcile_without_duplicates(self):
         for outcome in ('lost-response', 'malformed-response'):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
@@ -191,7 +235,8 @@ class CoordinationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'different content or actor'):
             self.apply(CHILD, actor='bob')
         for field, value in (('title', 'different'), ('parent', 'another-job'),
-                             ('description', 'new intent'), ('type', 'bug')):
+                             ('description', 'new intent'), ('type', 'bug'),
+                             ('assignee', 'bob'), ('priority', 1)):
             with self.subTest(field=field):
                 with self.assertRaisesRegex(ValueError, 'different content or actor'):
                     self.apply(dict(CHILD, **{field: value}))
