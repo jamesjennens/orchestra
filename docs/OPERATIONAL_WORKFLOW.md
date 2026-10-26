@@ -214,6 +214,12 @@ here performs an actual software deployment: these commands record lifecycle fac
 
 The writing command asks the ENDPOINT which integrations are reverted before it selects (rev2 item 5): one read-only `release-query` request returns the host-issued revert set that `review` uses, so the default command works without `--journal` and without `ORCHESTRA_OPERATORS` on the caller's machine. If the endpoint cannot be asked, the command falls back to the local `--journal` view and says so in the report's `warnings`. A `--dry-run` stays offline and uses the local view (pass `--journal PROJECT` for a host-accurate dry run); it **says so in its own output** (rev3 item 3.4): the report carries `reverts_source: "local"` and a `dry_run_revert_note`, and `warnings` repeats that the offline dry run can list a target the writing run skips, because the writing run asks the endpoint. What only the client checks is unchanged: Git ancestry and release membership are decided in the caller's checkout, and the endpoint re-verifies only that each named target is a trusted `integrated=passed` scope and is not host-reverted, in its own export.
 
+Without `--export`, `release` reads the project live through the same `bd list`
+and `bd show` reads every contributor already has (no new read action), so it plans
+from the current state and needs no retry after other writes land
+(kittrial-5bb.313). `--export FILE` still plans from the file; `--dry-run` and `--journal` still apply the local journal view to the rows read. A refusal for a moved
+binding or a target that is not integrated names the task, the expected and live
+scope and the time of the newest record compared.
 `--live-verified` requires a fresh export after the actual deploy. An
 incrementally carried integration that is still live but unverified is selected
 with a `verify_scope` binding to its actual recorded deployment; the endpoint
