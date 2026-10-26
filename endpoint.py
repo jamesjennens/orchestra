@@ -1714,13 +1714,39 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     # the project requires approval by another party (approval_by_another_party or
                     # independent_approval) the agent faces exactly the rule a person faces below.
                     delegation_check(state,decision_id)
-                    if not isinstance(proposer,str) or not proposer:
+                    import record_acceptance as shared_acceptance
+                    head=(actor.split('/',1)[0] if isinstance(actor,str) else None)
+                    caller_parties=set(actor_parties(state,actor,name))
+                    if user_id:caller_parties.add(user_id)
+                    proposer_parties=(set(actor_parties(state,proposer,name))
+                                      if isinstance(proposer,str) and proposer else set())
+                    if isinstance(proposer,str) and proposer:
+                        if proposer.split('/',1)[0]==head:
+                            raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
+                                                     'whatever its delegation says.')
+                    else:
                         raise RecordsRefusal(403,'This draft has no recorded proposer, so no delegation can admit it.')
-                    if proposer.split('/',1)[0]==(actor.split('/',1)[0] if isinstance(actor,str) else actor):
-                        raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
-                                                 'whatever its delegation says.')
+                    same_session_owner=False
+                    if rules.get('independent_approval') and isinstance(proposer,str) and proposer:
+                        try:
+                            owners=approval_owners(owner_loader(path,'independent_approval'))
+                        except CoordinatorRuleRefusal as error:
+                            raise RecordsRefusal(409,str(error)) from None
+                        same_session_owner=same_party(actor,proposer,owners)
                     if not approval_by_another:
                         return
+                    # proposer_known/own_draft are refused above, so decide's
+                    # defaults (True/False) carry the same values (notes tidy-up).
+                    may,reason=shared_acceptance.decide(
+                        can_coordinate=True,approval_by_another_party=approval_by_another,
+                        waiting=True,by_agent=True,agent_head=head,
+                        delegation_covers_kind=True,delegation_missing=False,
+                        caller_parties=caller_parties,draft_parties=proposer_parties,
+                        own_party=bool(caller_parties & proposer_parties),
+                        independent_hold=bool(same_session_owner))
+                    if not may:
+                        raise RecordsRefusal(403,reason)
+                    return
                 elif not approval_by_another:
                     return
                 caller_parties=set(actor_parties(state,actor,name))

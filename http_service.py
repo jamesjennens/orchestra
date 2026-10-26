@@ -4968,7 +4968,7 @@ def task_matches(task, filters):
 class RouteContext:
     __slots__ = ('principal', 'payload', 'query', 'params', 'request_id',
                  'idempotency_key', 'body_hash', 'auth_source', 'secure',
-                 'route_target', 'authorize')
+                 'route_target', 'authorize', '_records_delegation_cache')
 
     def __init__(self, principal, payload, query, params, request_id, idempotency_key,
                  body_hash, auth_source, secure, route_target):
@@ -11020,7 +11020,197 @@ class ApiHandler(BaseHTTPRequestHandler):
         can_coordinate = role in ('coordinator', 'owner') and holds(CAP_COORDINATE)
         return can_propose, can_coordinate
 
-    def _enrich_record_view(self, ctx, pid, capabilities, item):
+    def _viewer_may_accept(self, ctx, pid, item, can_coordinate, record_kind=None):
+        """(may_accept, reason): the ONE server field gating 'Review & accept'.
+
+        Never combined in the page: the page shows 'Review & accept' only when
+        ``may_accept`` is true, else 'View'. The decision is the shared
+        ``record_acceptance.decide`` predicate (kittrial-5bb.420 r2, review
+        item b1), the SAME rule the accept route enforces through endpoint.py
+        ``party_check``/``delegation_check``. The accept route still enforces
+        on its own. ``reason`` is a short plain sentence for display only.
+
+        ``record_kind`` is the record family the route handler already knows
+        (``'references'`` or ``'capabilities'``) and MUST pass explicitly: every
+        caller does (the default is fail-closed, never a guess), so a
+        references-only delegation is never asked about capabilities (review
+        item r2-field-references).
+        """
+        import record_acceptance
+        if record_kind not in ('references', 'capabilities'):
+            return False, 'The record family could not be read.'
+        by_agent = getattr(ctx.principal, 'via', None) == 'credential'
+        entry_state = item.get('state')
+        proposed = item.get('proposed')
+        has_proposed_block = isinstance(proposed, dict) and bool(proposed)
+        # An r1-shaped waiting row carries NO proposed block (the block rides
+        # only on get/detail): fall back to proposed_revision/proposed_sha256,
+        # which list_entries sets from entry['proposed'] (both None when no
+        # draft waits). A full-catalog settled row has neither (both None) and
+        # stays not-waiting (review b2).
+        waiting = bool(
+            (has_proposed_block
+             or item.get('proposed_revision') is not None
+             or item.get('proposed_sha256') is not None)
+            and (entry_state in ('draft-only', 'draft', 'proposed')
+                 or (bool(item.get('waiting_acceptance')) and entry_state == 'accepted')))
+        with self.service.store.lock:
+            seen = self.service.state.get('settings_seen')
+            seen_flag = bool(isinstance(seen, dict) and seen.get('approval_by_another_party'))
+            service_flag = bool(self.service.approval_by_another_party)
+        # The installation's independent_approval rule (endpoint.py reads it as
+        # rules['independent_approval'] under the write's lock; review b1): the
+        # web-service state has no deployment root, so this enrichment reads
+        # the SAME canonical root the endpoint subprocess was launched with
+        # (self.backend.root). Read per request, never cached: a rule flip
+        # applies to the next read. (No fcntl/module import at module level;
+        # coordinator_rule is a plain JSON read — POSIX-safe by construction.)
+        try:
+            from admin import coordinator_rule
+            from pathlib import Path
+            backend_root = getattr(self.backend, 'root', None)
+            if backend_root:
+                try:
+                    independent = bool(coordinator_rule(Path(backend_root), 'independent_approval'))
+                except Exception:
+                    independent = False
+            else:
+                independent = False
+        except Exception:
+            independent = False
+        approval_by_another = bool(service_flag or seen_flag or independent)
+        caller_names = [getattr(ctx.principal, 'actor', None) or ctx.principal.user_id,
+                        ctx.principal.user_id]
+        draft_proposer = (
+            item.get('proposed_by')
+            or (item.get('draft') or {}).get('proposer')
+            or (item.get('proposer')
+                if item.get('state') in ('draft-only', 'draft', 'proposed')
+                or item.get('waiting_acceptance') or item.get('has_pending_draft')
+                else None)
+        )
+        draft_authors = [a for a in (item.get('draft_authors') or []) if isinstance(a, str) and a]
+        if not draft_authors and isinstance(draft_proposer, str) and draft_proposer:
+            draft_authors = [draft_proposer]
+        caller_parties = set()
+        draft_parties = set()
+        for name in caller_names:
+            if isinstance(name, str) and name:
+                caller_parties |= self.service.actor_parties(name, pid, by_agent)
+        for name in draft_authors:
+            if isinstance(name, str) and name:
+                draft_parties |= self.service.actor_parties(name, pid, by_agent)
+        actor = getattr(ctx.principal, 'actor', '') or ''
+        head = actor.split('/', 1)[0] if isinstance(actor, str) else ''
+        own_draft = bool(head) and any(
+            isinstance(a, str) and a.split('/', 1)[0] == head for a in draft_authors)
+        # The route's session-owner sameness (endpoint.py party_check reads the
+        # project's .sessions.json owners map via owner_loader, review t1): the
+        # field reads the same project directory the endpoint backend was
+        # launched with (self.backend.root). sessions/review_workflow import no
+        # POSIX-only module at module level, so this lazy read keeps the
+        # no-fcntl pin green. An unreadable-or-missing registry fails closed:
+        # the field refuses exactly where the route answers 409/403.
+        independent_hold = False
+        if independent and waiting and approval_by_another and can_coordinate:
+            try:
+                from pathlib import Path as _Path
+                import admin as _admin
+                import sessions as _sessions
+                from review_workflow import same_party as _same_party
+                _project_dir = _admin.project_dir(_Path(backend_root), pid)
+                _owners = _sessions.owners(_project_dir)
+                _actor = getattr(ctx.principal, 'actor', '') or ctx.principal.user_id
+                for _prop in draft_authors:
+                    if isinstance(_actor, str) and _actor and _same_party(_actor, _prop, _owners):
+                        independent_hold = True
+                        break
+            except Exception:
+                if by_agent:
+                    return False, 'Whether a delegation covers this agent could not be read.'
+                return False, ('A coordinator may not accept or verify a record whose draft was proposed '
+                               'by the same party while approval_by_another_party is enabled.')
+        covered = None
+        unreadable = False
+        refused = False
+        if by_agent:
+            covered = self._coverage_for(ctx, pid, record_kind)
+            if covered is None:
+                unreadable = True
+            elif covered is not True:
+                refused = True
+        return record_acceptance.decide(
+            can_coordinate=can_coordinate,
+            approval_by_another_party=approval_by_another,
+            waiting=waiting,
+            by_agent=by_agent,
+            agent_head=head or None,
+            delegation_covers_kind=covered,
+            delegation_refused=refused,
+            delegation_missing=False,
+            proposer_known=True,
+            delegation_unreadable=unreadable,
+            caller_parties=caller_parties,
+            draft_parties=draft_parties,
+            own_draft=own_draft,
+            own_party=bool(caller_parties & draft_parties),
+            independent_hold=independent_hold)
+
+    def _coverage_for(self, ctx, pid, kind):
+        """Whether a delegation in force covers the caller's agent FOR KIND.
+
+        ``kind`` is ``'references'`` or ``'capabilities'`` (review item b1):
+        a delegation narrowed to references never admits a capability draft.
+        Returns ``True`` (covered), ``False`` (a readable answer covering
+        nothing for this kind), or ``None`` (the delegations read refused or
+        this backend has no delegation signal, so the agent is uncovered,
+        the same refusal the accept route would give). Cached per (pid, kind).
+        """
+        cache = getattr(ctx, '_records_delegation_cache', None)
+        if cache is None:
+            cache = {}
+            ctx._records_delegation_cache = cache
+        key = (pid, kind)
+        if key in cache:
+            return cache[key]
+        covered = None
+        try:
+            read = getattr(self.backend, 'delegations_read', None)
+            if read is not None and getattr(ctx.principal, 'via', None) == 'credential':
+                actor = getattr(ctx.principal, 'actor', '') or ''
+                head = actor.split('/', 1)[0]
+                payload = read(pid, ctx.principal)
+                for entry in (payload.get('granted_agents') or []):
+                    if isinstance(entry, dict) and entry.get('agent') == head:
+                        covered = bool(entry.get('covered'))
+                        break
+                else:
+                    covered = False
+                if covered and kind is not None:
+                    kinds = set()
+                    for row in (payload.get('items') or []):
+                        if not isinstance(row, dict):
+                            continue
+                        delegation = row.get('delegation')
+                        if not isinstance(delegation, dict):
+                            continue
+                        if delegation.get('grantee') not in (head, 'coordinator-grant'):
+                            continue
+                        if delegation.get('right') != 'record-acceptance':
+                            continue
+                        scope = delegation.get('scope') or []
+                        if not isinstance(scope, list) or not scope:
+                            continue
+                        kinds |= {part for part in scope if isinstance(part, str)}
+                    covered = kind in kinds
+            elif getattr(ctx.principal, 'via', None) == 'credential':
+                covered = False
+        except HttpError:
+            covered = None
+        cache[key] = covered
+        return covered
+
+    def _enrich_record_view(self, ctx, pid, capabilities, item, record_kind=None):
         if not isinstance(item, dict):
             return item
         item = dict(item)
@@ -11121,15 +11311,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
+        may_accept, may_reason = self._viewer_may_accept(ctx, pid, item, can_coordinate,
+                                                        record_kind=record_kind)
+        item['viewer_may_accept'] = bool(may_accept)
+        item['viewer_may_accept_reason'] = may_reason
         return item
 
-    def _enrich_records_list(self, ctx, pid, result):
+    def _enrich_records_list(self, ctx, pid, result, record_kind=None):
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         can_propose, can_coordinate = self._records_standing(ctx, pid, capabilities)
         result = dict(result)
         for list_key in ('items', 'records', 'candidates'):
             if isinstance(result.get(list_key), list):
-                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item)
+                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item,
+                                                             record_kind=record_kind)
                                     for item in result[list_key]]
         if 'items' not in result and isinstance(result.get('records'), list):
             seen = {r.get('key') for r in result['records'] if isinstance(r, dict)}
@@ -11271,7 +11466,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                          capability=needed)
             capabilities = self.service.capabilities_for(ctx.principal, pid)
             if isinstance(result, dict):
-                result = self._enrich_record_view(ctx, pid, capabilities, result)
+                result = self._enrich_record_view(ctx, pid, capabilities, result,
+                                                  record_kind=route_name.split('.')[0])
             return result, result
         return self._mutate(ctx, route_name, pid, mutate_record, status=status,
                             capability=needed, serialize=False, canonical=True,
@@ -11367,7 +11563,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             options = reference_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('ref list: ', ''))
-        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options))
+        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options),
+                                             record_kind='references')
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
@@ -11392,7 +11589,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             raise invalid(str(error).replace('ref find: ', ''))
         result = self.backend.references_find(pid, phrase, parsed_limit)
-        return 200, self._enrich_records_list(ctx, pid, result)
+        return 200, self._enrich_records_list(ctx, pid, result, record_kind='references')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')')
     def references_get(self, ctx):
@@ -11400,7 +11597,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         return 200, self._enrich_record_view(
-            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']))
+            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']),
+            record_kind='references')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_propose(self, ctx):
@@ -11486,7 +11684,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             options = capability_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('capability list: ', ''))
-        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options))
+        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options),
+                                             record_kind='capabilities')
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
@@ -11511,7 +11710,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             raise invalid(str(error).replace('capability find: ', ''))
         result = self.backend.capabilities_find(pid, phrase, parsed_limit)
-        return 200, self._enrich_records_list(ctx, pid, result)
+        return 200, self._enrich_records_list(ctx, pid, result, record_kind='capabilities')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')')
     def capabilities_get(self, ctx):
@@ -11519,7 +11718,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         return 200, self._enrich_record_view(
-            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']))
+            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']),
+            record_kind='capabilities')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
     def capabilities_propose(self, ctx):
