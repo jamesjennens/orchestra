@@ -26,7 +26,7 @@ The checkpoint validator and `checkpoint --help` read their numbers from
 | acceptance | 1000 characters |
 | summary | 1000 characters |
 | next_action | 600 characters |
-| open_items | 100 entries |
+| open_items | 100 entries (group them: one open item per theme with an id prefix; fold resolved ones; for a longer text link a repository document in the item source) |
 | open item text | 400 characters |
 | open item source | 240 characters |
 | resolved | 100 entries |

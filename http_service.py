@@ -6241,6 +6241,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._task_title(title)
         if description is not None and not isinstance(description, str):
             raise invalid('Task description must be text')
+        if description is not None and len(description) > 20000:
+            raise invalid('Task description is too long')
         if status is not None and status not in ('open', 'closed'):
             raise invalid('Task status must be open or closed')
         if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
@@ -10442,6 +10444,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._task_title(payload.get('title'))
         if payload.get('description') is not None and not isinstance(payload['description'], str):
             raise invalid('Task description must be text')
+        if len(payload.get('description') or '') > 20000:
+            raise invalid('Task description is too long')
         self._bind_task_actor(ctx, payload)
 
         def create():

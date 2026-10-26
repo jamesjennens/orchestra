@@ -1263,6 +1263,9 @@ The rules:
     `--help`, `- item` or `@attachment:0` is stored as written. The one exception is
     clearing a description on update: the empty value is sent inline, because the
     native tool refuses an empty body file and an empty value cannot be a flag.
+  - a task description is at most 20,000 characters on create and on update, on the HTTP
+    route and on the native route alike (`Task description is too long`). For a longer text,
+    keep it in a repository document and link it from the description.
 - **Who reads coordinator text.** A rejection reason, a coordinator question and an
   escalation question are returned only to the submitter and to members with
   `reviews.approve`. Everyone else gets `null` and `withheld: true`.
