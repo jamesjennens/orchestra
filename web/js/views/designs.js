@@ -5,18 +5,18 @@
 import { h } from '../dom.js';
 import { pageHead, errorState } from '../ui.js';
 
-const HEADING = /^ {0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/;
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
 const BOM = /^﻿/;
-const HEADING_LINE_MAX = 1000;
 
 // The document as text blocks. The server says which line each of its index's headings is on
-// (`heading_lines`, from the same capabilities.markdown_headings that builds the index), so anchors are
-// placed by line and never by a second copy of the heading rule (review of part 2, N4). Lines are split
-// as the server splits them: on LF only, a trailing CR dropped. Fences are shown verbatim.
+// (`heading_lines`, from the same capabilities.markdown_headings that builds the index), and a line is a
+// heading here exactly when the server says so: its level and title are the server's, never a second
+// match of the heading rule (review of part 2, N4 and n1). Lines are split as the server splits them: on
+// LF only, every trailing CR dropped (Python's rstrip of CR); a lone CR or U+2028 splits nothing. Fences
+// are shown verbatim.
 export function renderDocument(text, headings, headingLines) {
   const root = h('div', { class: 'md design-document', 'data-design-document': '1' });
-  const lines = String(text || '').replace(BOM, '').split('\n').map((line) => line.replace(/\r$/, ''));
+  const lines = String(text || '').replace(BOM, '').split('\n').map((line) => line.replace(/\r+$/, ''));
   const byLine = new Map();
   (headingLines || []).forEach((number, n) => { if ((headings || [])[n]) byLine.set(number, headings[n]); });
   let para = []; let fence = null; let code = []; let lineNumber = 0;
@@ -32,14 +32,11 @@ export function renderDocument(text, headings, headingLines) {
     }
     if (marker) { flush(); fence = marker[1]; continue; }
     const item = byLine.get(lineNumber) || null;
-    const heading = raw.length <= HEADING_LINE_MAX ? HEADING.exec(raw) : null;
-    if (heading) {
+    if (item) {
       flush();
-      const level = Math.min(6, heading[1].length + 1);
-      const props = { class: 'md-h' };
-      if (item && item.anchor) props.id = 'design-' + item.anchor;
-      root.append(h('h' + level, props, heading[2]));
-      if (item && item.tokens && item.tokens.length) {
+      const level = Math.min(6, Math.max(1, Number(item.level) || 1) + 1);
+      root.append(h('h' + level, { class: 'md-h', id: 'design-' + item.anchor }, String(item.title || '')));
+      if (item.tokens && item.tokens.length) {
         root.append(h('p', { class: 'small muted', 'data-section-tokens': item.anchor },
           'Cites: ', item.tokens.map((token, n) => [n ? ', ' : '', h('code', null, token)])));
       }

@@ -3153,7 +3153,8 @@ it was set ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)).
   revision `verified`; a fail marks it `design-drift` (`trusted: true`). Members who may propose can
   also file unverified reports (`trace --verify --record`, or the web route), which can open a drift
   that says `trusted: false` and names who reported it. Removing an actor from the verifiers list
-  makes its records stop counting. The way out of a drift on a pinned commit is a revision.
+  makes its records stop counting. A trusted re-check clears a drift; otherwise the way out of a drift
+  on a pinned commit is a revision. `admin.py design-verify` exits 1 when it refused any item.
 - **No further version for a new authority type.** Version 3 is the last one an
   authority type needs. A v3 revision whose authority type this kit does not know (one a
   later kit added) makes its entry read `unsupported`, with the warning `authority type

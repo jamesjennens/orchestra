@@ -275,7 +275,9 @@ def _trace_command(args,config,project,actor,out):
     text=json.dumps(summary,indent=2)+'\n'
     if out:Path(out).write_text(text,encoding='utf-8')
     else:sys.stdout.write(text)
-    return 0 if summary['failed']==0 else 3
+    # 3: a check failed. 4 (review of part 2, n5): nothing was checked, so a CI step cannot pass silently.
+    if summary['failed']:return 3
+    return 4 if summary['checked']==0 else 0
 
 def _design_document_args(args):
     """kittrial-5bb.418: `ref propose|revise --file entry.json --document-from-git [--repo DIR]`.

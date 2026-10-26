@@ -763,6 +763,18 @@ class VerificationTests(DesignCase):
         self.assertFalse(self.file(self.report())['recorded'])
         self.assertEqual(self.writes(), writes)
 
+    def test_a_host_pass_after_an_identical_untrusted_pass_is_written_and_verifies(self):
+        # Review of part 2, n2: the repeat rule compares submitter and route, not only the result.
+        self.file(self.report('pass'))
+        self.assertTrue(self.file(self.report('pass'), actor=VERIFIER, route='host')['recorded'])
+        self.assertEqual(self.state()['state'], 'verified')
+
+    def test_another_members_identical_fail_is_written_and_named(self):
+        # n2: bob's fail identical to alice's is no repeat of alice's.
+        self.file(self.report())
+        self.assertTrue(self.file(self.report(), actor='bob')['recorded'])
+        self.assertEqual(self.state()['reported_by'], ['alice', 'bob'])
+
     def test_a_verifier_recheck_after_a_newer_fail_is_written_and_clears_it(self):
         # Review of part 2 (B1): pass(V), fail(contributor), pass(V) reads verified.
         self.file(self.report('pass'), actor=VERIFIER, route='host')
@@ -1013,13 +1025,43 @@ class TraceVerifyClientTests(unittest.TestCase):
         with patch.object(client, 'request', side_effect=fake):
             code = client._trace_command(['--verify', '--repo', str(self.repo), '--record'], {}, 'p', 'alice', str(out))
         summary = json.loads(out.read_text(encoding='utf-8'))
-        self.assertEqual((code, summary['checked'], summary['failed']), (0, 0, 0))
+        # n5: nothing checked is exit 4, never a silent pass.
+        self.assertEqual((code, summary['checked'], summary['failed']), (4, 0, 0))
         self.assertFalse(summary['results'][0]['checked'])
 
     def test_trace_without_verify_says_where_trace_is(self):
         import client
         with self.assertRaisesRegex(ValueError, 'trace --verify'):
             client._trace_command([], {}, 'p', 'alice', None)
+
+
+class DesignPageAnchorTests(unittest.TestCase):
+    """Review of part 2, n1: every anchor the server derives is rendered on its line, whatever the bytes."""
+
+    def test_the_page_renders_exactly_the_servers_headings_on_their_lines(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        from capabilities import markdown_headings
+        text = ('<!-- design-v1\nscope: s\nstatus: candidate\n-->\n# One\r\r\n## Two\u2028still two\n'
+                '## Lone\rcarriage\n# ' + '\U0001D400' * 600 + '\n```\n# fenced\n```\n### Three\n#nospace\n')
+        found = markdown_headings(text.encode('utf-8'))
+        index = dd.derive_index(text, 'design.s', 'a.md', 'a' * 40)
+        lines = [item[0] for item in found][:len(index['headings'])]
+        code = '''await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const input=JSON.parse(process.argv[3]);
+const el=view.renderDocument(input.text,input.headings,input.lines);
+const ids=[];for(const tag of ['h2','h3','h4','h5','h6','h7']){for(const x of el.querySelectorAll(tag))ids.push(x.getAttribute('id'));}
+console.log(JSON.stringify({ids}));'''
+        payload = json.dumps({'text': text, 'headings': index['headings'], 'lines': lines})
+        done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web/js/views/designs.js').as_uri(), payload)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        rendered = json.loads(done.stdout.strip().splitlines()[-1])['ids']
+        self.assertEqual(sorted(rendered), sorted('design-' + h['anchor'] for h in index['headings']))
+        self.assertEqual(len(index['headings']), 5)
 
 
 class DesignVerifyCommandTests(DesignCase):
@@ -1086,7 +1128,7 @@ class DesignPageWebTests(unittest.TestCase):
         code = '''await import(process.argv[1]);
 const view=await import(process.argv[2]);
 const text='# Title <script>evil()</script>\\n\\n[link](javascript:evil) <img src=x onerror=evil()> \\u202e\\n\\n```\\n# not a heading\\n```\\n## Plan phase 1\\n';
-const el=view.renderDocument(text,[{anchor:'title-scriptevilscript',tokens:['req:k@1']},{anchor:'plan-phase-1',tokens:[]}],[1,8]);
+const el=view.renderDocument(text,[{anchor:'title-scriptevilscript',level:1,title:'Title <script>evil()</script>',tokens:['req:k@1']},{anchor:'plan-phase-1',level:2,title:'Plan phase 1',tokens:[]}],[1,8]);
 console.log(JSON.stringify({text:el.textContent,scripts:el.querySelectorAll('script').length,
  images:el.querySelectorAll('img').length,links:el.querySelectorAll('a').length,
  ids:[...el.querySelectorAll('h2'),...el.querySelectorAll('h3')].map(x=>x.getAttribute('id')),pre:el.querySelectorAll('pre').length}));'''
