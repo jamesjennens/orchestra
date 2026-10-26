@@ -121,10 +121,7 @@ ALLOWED={'list','show','ready','search','count','create','update','close','reope
 # spelling-aware reserved_comments.operator_only_in_args() below.
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
-# The same bound the HTTP create/update routes apply to a task description (http_service.py).
-DESCRIPTION_MAX=20000
-DESCRIPTION_TOO_LONG=('Task description is too long: at most %d characters. Keep the description short and link a longer '
-                      'repository document from it.'%DESCRIPTION_MAX)
+from field_limits import DESCRIPTION_MAX,DESCRIPTION_TOO_LONG
 
 
 def _description_over_limit(args,attachments):
@@ -137,7 +134,12 @@ def _description_over_limit(args,attachments):
             item=(attachments or {}).get(a.partition(':')[2])
             if isinstance(item,dict) and item.get('flag')=='--body-file' and isinstance(item.get('text'),str) and len(item['text'])>DESCRIPTION_MAX:return True
         elif a in ('--description','-d') and i+1<n and not args[i+1].startswith('@attachment:') and len(args[i+1])>DESCRIPTION_MAX:return True
-        elif a.startswith('--description=') and len(a)-len('--description=')>DESCRIPTION_MAX:return True
+        else:
+            # pflag spellings with the value joined: --description=V, -d=V and -dV.
+            for lead in ('--description=','-d=','-d'):
+                if a.startswith(lead):
+                    if len(a)-len(lead)>DESCRIPTION_MAX:return True
+                    break
     return False
 
 def _guidance_ack_version(args):

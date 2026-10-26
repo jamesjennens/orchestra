@@ -62,6 +62,8 @@ class NativeBoundTests(RulesHelpers, unittest.TestCase):
             'inline': lambda t: (['create', 'n-inline-' + tag, '--description', t, '--json'], None),
             'short': lambda t: (['create', 'n-short-' + tag, '-d', t, '--json'], None),
             'equals': lambda t: (['create', 'n-equals-' + tag, '--description=' + t, '--json'], None),
+            'joined short': lambda t: (['create', 'n-joined-' + tag, '-d' + t, '--json'], None),
+            'short equals': lambda t: (['create', 'n-sheq-' + tag, '-d=' + t, '--json'], None),
             'attached': lambda t: (['create', 'n-att-' + tag, '@attachment:0', '--json'], self.attached(t)),
         }
         for name, build in spellings.items():
@@ -78,6 +80,32 @@ class NativeBoundTests(RulesHelpers, unittest.TestCase):
                     self.native(args, att)
                 self.assertIn(SAID, str(caught.exception))
                 self.assertEqual(before, len(self.rows()), 'a refused create wrote a row')
+
+    def test_create_child_refuses_one_over_before_any_receipt_or_row(self):
+        parent = self.task('parent')
+        for size in (BOUND, BOUND + 1):
+            with self.subTest(size=size):
+                before = len(self.rows())
+                body = dict(operation='create-child', parent=parent, title='child %d' % size,
+                            request_id='child-%d-%s' % (size, uuid.uuid4().hex[:6]),
+                            description='x' * size, type='task')
+                if size == BOUND:
+                    done = self.endpoint('coordinate', 'worker', [json.dumps(body)])
+                    self.assertEqual(0, done['returncode'], done)
+                else:
+                    with self.assertRaises(ValueError) as caught:
+                        self.endpoint('coordinate', 'worker', [json.dumps(body)])
+                    self.assertIn(SAID, str(caught.exception))
+                    self.assertEqual(before, len(self.rows()))
+                    receipts = list(self.root.rglob('*%s*' % body['request_id']))
+                    self.assertEqual([], receipts, 'a refused child left a receipt')
+
+    def test_a_description_given_as_a_raw_file_path_is_still_not_reachable(self):
+        for flag in ('--body-file', '-f', '--file'):
+            with self.subTest(flag=flag):
+                with self.assertRaises(ValueError) as caught:
+                    self.native(['create', 'raw path', flag, '/etc/hostname', '--json'])
+                self.assertIn('operator-only', str(caught.exception))
 
     def test_native_update_refuses_one_over_and_leaves_the_description(self):
         task = self.task('update bound')
@@ -105,6 +133,17 @@ class DocumentsAgreeTests(unittest.TestCase):
             self.assertEqual(BOUND, fixture.endpoint.DESCRIPTION_MAX)
         self.assertIn('%d entries' % briefing.CHECKPOINT_ITEMS_MAX, text['templates/CHECKPOINT.md'])
         self.assertIn('<= %d each' % briefing.CHECKPOINT_ITEMS_MAX, text['docs/CLI_CONTRACT.md'])
+
+    def test_every_route_uses_the_one_constant(self):
+        import field_limits
+        self.assertEqual(BOUND, field_limits.DESCRIPTION_MAX)
+        self.assertEqual(field_limits.DESCRIPTION_TOO_LONG.split(':')[0], SAID)
+        for name in ('http_service.py', 'endpoint.py', 'coordination.py', 'requirement_http.py'):
+            with self.subTest(module=name):
+                text = read(name)
+                self.assertIn('DESCRIPTION_MAX', text)
+                self.assertNotRegex(text, r'[>=<(,] ?20000\b', 'a literal 20000 bound')
+                self.assertNotIn("invalid('Task description is too long')", text)
 
     def test_the_documents_name_the_way_around_each_limit(self):
         for name in ('docs/CLI_CONTRACT.md', 'templates/CHECKPOINT.md'):
