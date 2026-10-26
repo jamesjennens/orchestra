@@ -267,6 +267,61 @@ class UploadTests(DesignCase):
             self.revise_design(document(body='# Third\n'), 2, limits={'max_project_bytes': 10})
         self.nothing_written(writes, blobs)
 
+    def test_a_refusal_whose_text_says_uncertain_still_removes_the_bytes(self):
+        # Review b1: refusals echo caller text, so 'uncertain' in a decision id or key must not keep a blob.
+        for extra in ({'decisions': ['zz-uncertain']}, {'key': 'design.uncertain', 'expected_sha256': '0' * 64,
+                                                        'operation': 'revise', 'revision': 2}):
+            with self.subTest(extra=extra):
+                key = extra.get('key', KEY)
+                text = document(scope=key[len('design.'):])
+                with self.assertRaises(ValueError) as caught:
+                    self.propose_design(text, key=key, operation_id='orphan-' + key, **{k: v for k, v in extra.items()
+                                                                                      if k != 'key'})
+                self.assertIn('uncertain', str(caught.exception))
+                self.assertNotIsInstance(caught.exception, rr.core.UncertainOutcome)
+                self.assertEqual(self.blobs(), [])
+                self.assertEqual(task_files.project_bytes(self.project), 0)
+
+    def test_a_genuinely_uncertain_write_keeps_the_bytes_for_its_retry(self):
+        self.native.fail_comment_prefix = rr.ENTRY_V3_PREFIX
+        with self.assertRaises(rr.core.UncertainOutcome):
+            self.propose_design()
+        self.assertEqual(self.blobs(), [authority(document())['sha256']])
+        self.native.fail_comment_prefix = None
+        self.propose_design()
+        self.assertEqual(self.blobs(), [authority(document())['sha256']])
+        self.assertEqual(len(self.indexes()), 1)
+
+    def test_a_document_in_another_project_never_serves_this_one(self):
+        # The plan's cross-project row: the bytes, the journal and the index live in one project's folder and
+        # anchor; another project with the same rows but its own (empty) store cannot accept, page or count it.
+        self.propose_design()
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(other), True)
+        record = rr.existing_revisions(self.anchor())[1]
+        token = rr._PROJECT.set(other)
+        try:
+            with self.assertRaisesRegex(ValueError, 'cannot be read'):
+                rr.document_acceptance_rules(record, self.native)
+        finally:
+            rr._PROJECT.reset(token)
+        self.assertEqual(task_files.project_bytes(other), 0)
+        self.assertEqual(task_files.all_entries(other), [])
+        foreign = [dict(row, project_id='other') for row in self.native.rows]
+        self.assertEqual(dd.indexes_for(next((r for r in foreign if r['id'] == self.anchor()['id'])), KEY,
+                                        authority(document())), self.indexes())   # rows carry no project rule
+        import briefing
+        pointer = briefing.parse_context_pointers('design:%s#plan-phase-1' % SCOPE)[0]
+        answer = briefing.ContextPointers(foreign, 'trial', operators=[OPERATOR]).resolve(pointer)
+        self.assertEqual(answer['flags'], ['unknown-scope'])
+
+    def test_a_repo_document_path_is_one_plain_line(self):
+        text = document()
+        for path in ('docs/a\nb.md', 'docs/a\x00b.md', 'docs/a\tb.md', 'docs/a\x85b.md', 'docs/a\x7fb.md'):
+            with self.subTest(path=repr(path)):
+                with self.assertRaisesRegex(ValueError, 'control character|authority.path'):
+                    self.propose_design(text, authority=authority(text, path=path.encode().decode('unicode_escape')))
+
     def test_a_refused_revision_removes_the_bytes_it_stored(self):
         self.propose_design()
         blobs = self.blobs()
@@ -325,6 +380,17 @@ class AcceptanceTests(DesignCase):
         self.assertEqual(len(self.indexes()), 1)
         self.assertEqual(self.accept_design(1)['state'], 'accepted')
 
+    def test_an_index_for_the_same_bytes_at_another_path_or_commit_is_not_this_documents(self):
+        # Review G2: the index binds the document's path and commit too.
+        index = copy.deepcopy(self.indexes()[0])
+        for change in ({'path': 'docs/other.md'}, {'commit': 'c' * 40}):
+            planted = dict(index, headings=[], **change)
+            planted.pop('sha256')
+            planted['sha256'] = dd.content_hash(planted)
+            self.native.add_comment(self.anchor()['id'], dd.index_body(planted), author='mallory')
+        self.assertEqual(len(self.indexes()), 1)
+        self.assertEqual(self.accept_design(1)['state'], 'accepted')
+
     def test_an_identical_second_index_does_not_refuse(self):
         self.native.add_comment(self.anchor()['id'], dd.index_body(self.indexes()[0]))
         self.assertEqual(self.accept_design(1)['state'], 'accepted')
@@ -372,6 +438,21 @@ class StoreTests(DesignCase):
         report = task_files.verify(self.project)
         self.assertEqual(report['missing'], [])
         self.assertEqual(report['orphans'], [])
+
+    def test_no_file_route_lists_serves_or_withdraws_a_design_document(self):
+        # Review: the SSH file list showed the design entry on the anchor; HTTP refuses anchors.
+        outcome = self.propose_design()
+        anchor, digest = outcome['native_id'], outcome['document']['sha256']
+        self.assertEqual(task_files.listing(self.project, anchor, True), [])
+        with self.assertRaises(task_files.Refusal) as caught:
+            task_files.download_target(self.project, anchor, digest)
+        self.assertEqual(caught.exception.status, 404)
+        payload = {'schema_version': 1, 'operation': 'coordinator-withdraw', 'task': anchor, 'sha256': digest,
+                   'reason': 'remove it'}
+        with self.assertRaises(task_files.Refusal) as caught:
+            task_files.apply(payload, OPERATOR, self.native, self.project, lambda: '2026-10-26T00:00:00Z')
+        self.assertEqual(caught.exception.status, 404)
+        self.assertEqual(dd.read_document(self.project, digest), document().encode('utf-8'))
 
     def test_an_upload_can_never_name_the_design_direction(self):
         with self.assertRaises(task_files.Refusal):
