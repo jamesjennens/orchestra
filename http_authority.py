@@ -358,6 +358,10 @@ CAP_AGENTS = 'agents.manage'
 #: by a session or a worker credential: the route that needs it takes no target agent id
 #: at all, so it can only ever reach the caller's own record.
 CAP_AGENT_SELF = 'agent.self'
+#: The lane nudge carrier (kittrial-5bb.415): list, claim and answer the nudge requests of the
+#: carrier's own account. Held by no role and by no scope but ``nudges``, which is never combined.
+CAP_NUDGE_CARRY = 'nudge.carry'
+NUDGES_SCOPE = 'nudges'
 
 ROLES = ('viewer', 'contributor', 'coordinator', 'owner')
 RANK = {'viewer': 0, 'contributor': 1, 'coordinator': 2, 'owner': 3}
@@ -372,6 +376,9 @@ SCOPE_CAPABILITIES = {
     # .58's agent-proposal scope: recognised since slice 0 (kittrial-5bb.64), it grants
     # the proposal write capability since slice 1b (kittrial-5bb.70).
     'proposals': frozenset({CAP_PROPOSALS}),
+    # The nudge carrier's whole authority (kittrial-5bb.415). Alone on its credential, never a
+    # project capability and never the baseline read (``credential_capabilities``).
+    NUDGES_SCOPE: frozenset({CAP_NUDGE_CARRY}),
 }
 CREDENTIAL_SCOPES = tuple(sorted(SCOPE_CAPABILITIES))
 
@@ -576,6 +583,10 @@ def credential_capabilities(state, credential, issuer, project_id):
     scope set; every other issuer must still be a current member, and a demotion
     immediately narrows the credential.
     """
+    if NUDGES_SCOPE in (credential.get('scopes') or []):
+        # A carrier's credential reads no task, board or comment and holds no project capability,
+        # whatever else is on it (a mixed list is damage and fails closed).
+        return frozenset()
     caps = {CAP_READ}
     for scope in credential.get('scopes') or []:
         caps |= SCOPE_CAPABILITIES.get(scope, frozenset())
@@ -625,6 +636,55 @@ def coordinator_grant_capabilities(state, credential, project_id, held):
     if grant is None or not grant_issuer_holds(state, project_id, grant):
         return frozenset()
     return frozenset(cap for cap in GRANT_CAPABILITIES if cap in held)
+
+
+def account_in_project(state, user_id, project_id):
+    """Whether this account is NOW an enabled superuser or a member of the project (kittrial-5bb.415 r2).
+
+    A carrier credential carries no role, so its reach is cut off with the account's membership, as
+    ``credential_capabilities`` cuts off every other credential. Anything unreadable is no.
+    """
+    users = state.get('users') if isinstance(state, dict) and isinstance(state.get('users'), dict) else {}
+    user = users.get(user_id)
+    if not isinstance(user, dict) or user.get('disabled'):
+        return False
+    if user.get('superuser'):
+        return True
+    members = state.get('memberships') if isinstance(state.get('memberships'), dict) else {}
+    project = members.get(project_id)
+    return isinstance(project, dict) and project.get(user_id) in ROLE_CAPABILITIES
+
+
+def still_coordinates(state, requested_by, project_id):
+    """Whether the requester of a stored nudge may coordinate in this project NOW (kittrial-5bb.415).
+
+    ``requested_by`` is the record's ``{kind, user_id, agent_id}``. A person: an enabled account
+    that is a superuser or holds ``coordinate`` in the project. An agent: it is enabled and still
+    granted the project, its account is enabled and holds ``coordinate`` there, and its coordinator
+    grant is effective (:func:`grant_issuer_holds`) -- the rule ``decide`` applies to its credential.
+    Anything unreadable is no.
+    """
+    if not isinstance(state, dict) or not isinstance(requested_by, dict):
+        return False
+    users = state.get('users') if isinstance(state.get('users'), dict) else {}
+    user = users.get(requested_by.get('user_id'))
+    if not isinstance(user, dict) or user.get('disabled'):
+        return False
+    if user.get('superuser'):
+        held = ROLE_CAPABILITIES['owner']
+    else:
+        members = state.get('memberships') if isinstance(state.get('memberships'), dict) else {}
+        role = (members.get(project_id) or {}).get(user.get('id')) if isinstance(members.get(project_id), dict) else None
+        held = ROLE_CAPABILITIES.get(role, frozenset())
+    if requested_by.get('kind') != 'agent':
+        return CAP_COORDINATE in held
+    agent = (state.get('agents') or {}).get(requested_by.get('agent_id'))
+    if not isinstance(agent, dict) or not agent.get('enabled') or project_id not in (agent.get('projects') or []):
+        return False
+    if agent.get('owner') != user.get('id'):
+        return False
+    grant = coordinator_grant(state, project_id, agent['id']) if agent.get('id') else None
+    return grant is not None and grant_issuer_holds(state, project_id, grant) and CAP_COORDINATE in held
 
 
 def release_grant(state, project_id, agent_id):
@@ -874,6 +934,16 @@ def decide(state, request, *, now=None, allow_self_user=None):
         if capability in (CAP_ACCOUNTS_ADMIN, CAP_PROJECT_CREATE, CAP_AGENTS, CAP_PROJECT_HOST_CREATE):
             raise deny(403, 'forbidden',
                        'A worker credential cannot perform administrative operations')
+        if capability == CAP_NUDGE_CARRY:
+            # Not project-scoped: the routes take no project. Only an enabled agent's credential
+            # whose scopes are EXACTLY ``nudges`` (kittrial-5bb.415); the lane and project checks
+            # are the service's, on each record.
+            agent = state.get('agents', {}).get(credential.get('agent_id')) if credential.get('agent_id') else None
+            if list(credential.get('scopes') or []) != [NUDGES_SCOPE]:
+                raise deny(403, 'forbidden', 'A carrier credential holds exactly the nudges scope')
+            if not isinstance(agent, dict) or not agent.get('enabled'):
+                raise deny(401, 'unauthenticated', 'Agent is disabled')
+            return {'role': 'carrier'}
         if capability == CAP_AGENT_SELF:
             # An agent credential's authority over its OWN record only (kittrial-5bb.302).
             # It is not project-scoped: the route it authorizes takes no project and no
@@ -916,6 +986,8 @@ def decide(state, request, *, now=None, allow_self_user=None):
     if not isinstance(user, dict) or user.get('disabled'):
         raise deny(401, 'unauthenticated', 'Authentication is no longer valid')
 
+    if capability == CAP_NUDGE_CARRY:
+        raise deny(403, 'forbidden', 'A carrier credential is required')
     if capability == CAP_AGENT_SELF:
         # Only an agent credential holds this (kittrial-5bb.302). A person acts on an
         # agent as its owner through PATCH /v1/agents/{id}, not as the agent itself.

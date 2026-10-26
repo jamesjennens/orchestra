@@ -396,7 +396,8 @@ read first, then the project-page panel).
 `GET /v1/projects/{pid}/nudges` lists the requests (a coordinator only), and each lanes row carries
 a `nudge` field (the lane's newest request in this project, never its note). The design is
 `docs/design/LANE_NUDGE_DESIGN.md` (kittrial-5bb.409, commit f84679f; it lands with the next
-release). There is no carrier yet: a request is kept and audited, and ends `not-deliverable`.
+release). A request is kept and audited; the carrier of kittrial-5bb.415 (`docs/NUDGE_CARRIER.md`) claims
+it and answers once, and a request nobody claimed ends `not-deliverable` (no carrier seen) or `expired`.
 
 Follow-ups (kittrial-5bb.414): every refusal of the request, including a 404 for a lane not on the
 board and a 422 for a bad body, is audited as refused and writes no record; a retry with the same key

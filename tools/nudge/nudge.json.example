@@ -1,0 +1,12 @@
+{
+  "server": "https://REPLACE.example.invalid",
+  "token": "REPLACE_WITH_THE_NUDGES_CREDENTIAL",
+  "lanes": {
+    "REPLACE_LANE_ACTOR_LABEL": {
+      "target": "REPLACE_TMUX_TARGET",
+      "harness": "REPLACE_HARNESS_PROCESS_NAME",
+      "prompt": "REPLACE_REGEX_OF_THE_HARNESS_PROMPT_LINE",
+      "start_command": ["REPLACE_HARNESS", "REPLACE_ARGUMENTS"]
+    }
+  }
+}

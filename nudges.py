@@ -4,8 +4,9 @@ Slice 1 of docs/design/LANE_NUDGE_DESIGN.md (kittrial-5bb.409). A coordinator as
 audited server-written record, that a fixed message reach a stalled lane. This module is the pure
 half: what a request may say, the record the server keeps in ``state['nudges'][project]``, the rate
 limits and the lazy expiry. Authority, the lane read, the audit and the write are the service's
-(``Service.request_nudge``); there is no carrier yet, so a request that nobody claims ends as
-``not-deliverable`` once its time is up. Nothing here reads a file, a clock or the network: the
+(``Service.request_nudge``). A carrier (kittrial-5bb.415, docs/NUDGE_CARRIER.md) claims a request and
+answers it once; one nobody claims ends ``not-deliverable`` (no carrier seen) or ``expired`` once its
+time is up. Nothing here reads a file, a clock or the network: the
 caller passes ``now`` as epoch seconds.
 
 Library only: it has no ``__main__`` block.
@@ -22,8 +23,27 @@ REASONS = ('stalled-at-prompt', 'api-error', 'lost-wake', 'no-answer', 'other')
 NOTE_MAX = 200
 
 PENDING = 'pending'
+CLAIMED = 'claimed'
 NOT_DELIVERABLE = 'not-deliverable'
 NO_CARRIER = 'no-carrier'
+EXPIRED = 'expired'
+CANCELLED = 'cancelled'
+#: A carrier's closed answers (design section 3): ``failed`` takes one of ``FAILED_DETAILS``.
+OUTCOMES = ('delivered', 'restarted', 'failed', 'unsupported', 'coalesced')
+FAILED_DETAILS = ('not-at-prompt', 'no-session', 'start-failed')
+OPEN = (PENDING, CLAIMED)
+REQUESTER_LOST = 'requester-lost-authority'
+UNCLAIMED = 'unclaimed'
+UNANSWERED = 'unanswered'
+
+#: A claim is a lease of two minutes; a lapsed one is open again until the request expires.
+CLAIM_TTL = 2 * 60
+#: A carrier polls no faster than every 30 seconds; none seen within three polls is no carrier.
+CARRIER_POLL = 30
+CARRIER_WINDOW = 3 * CARRIER_POLL
+CARRIER_KINDS = ('supervisor', 'bridge')
+CARRIERS_MAX = 64
+CARRIER_LANES_MAX = 50
 
 #: A request nobody carried out is over after this long (design section 1.3 rule 5).
 PENDING_TTL = 15 * 60
@@ -106,7 +126,7 @@ def new_record(project_id, fields, requested_by, snapshot, now, iso):
             'lane': fields['lane'], 'message': fields['message'], 'reason': fields['reason'],
             'note': fields['note'], 'requested_by': requested_by, 'requested_at': iso(now),
             'requested_ts': now, 'declared_wait': snapshot, 'state': PENDING,
-            'claimed_by': None, 'claim_expires_at': None, 'outcome_at': None, 'outcome_detail': None}
+            'claimed_by': None, 'claim_expires_at': None, 'claim_expires_ts': None, 'outcome_at': None, 'outcome_detail': None}
 
 
 def _stamp(record):
@@ -115,21 +135,51 @@ def _stamp(record):
 
 
 def expired(record, now):
-    return record.get('state') == PENDING and now - _stamp(record) >= PENDING_TTL
+    """An open request (pending or claimed) whose fifteen minutes are over."""
+    return record.get('state') in OPEN and now - _stamp(record) >= PENDING_TTL
 
 
-def effective(record, now, iso):
-    """The record as it stands at ``now``: a pending one past its time is ``not-deliverable``.
+def note_carrier(record, now):
+    """Stamp an open request that a carrier of its lane was heard ``now``, while it can still be heard for it.
 
-    Reading never writes (``Service.request_nudge`` settles the stored ones on the next request);
-    with no carrier in this slice, ``no-carrier`` is the only reason a request goes unanswered.
+    The stamp is on the RECORD and is written only before the request's own end, so what a carrier
+    could have done for it is fixed by then: nothing heard later, no entry dropped, and no account
+    removed after the end can change how it settles (kittrial-5bb.415 round 3). True when stamped.
     """
-    if not expired(record, now):
+    if record.get('state') in OPEN and now < _stamp(record) + PENDING_TTL:
+        record['carrier_seen_ts'] = now
+        return True
+    return False
+
+
+def effective(record, now, iso, carried=None):
+    """The record as it stands at ``now``; reading never writes (``settle`` writes it).
+
+    An open one past its time ends: never claimed, it is ``expired`` when a carrier of the lane was
+    seen within ``CARRIER_WINDOW`` of that moment (``carried(record, moment)``) and
+    ``not-deliverable`` / ``no-carrier`` when none was; one claimed and never answered is
+    ``expired``. A claim whose lease lapsed before that is pending again.
+    """
+    if record.get('state') not in OPEN:
         return record
-    return dict(record, state=NOT_DELIVERABLE, outcome_detail=NO_CARRIER, outcome_at=iso(_stamp(record) + PENDING_TTL))
+    if expired(record, now):
+        ends = _stamp(record) + PENDING_TTL
+        if record['state'] == CLAIMED:
+            return dict(record, state=EXPIRED, outcome_detail=UNANSWERED, outcome_at=iso(ends))
+        if carried is not None and carried(record, ends):
+            return dict(record, state=EXPIRED, outcome_detail=UNCLAIMED, outcome_at=iso(ends))
+        return dict(record, state=NOT_DELIVERABLE, outcome_detail=NO_CARRIER, outcome_at=iso(ends))
+    if record['state'] == CLAIMED and not live_claim(record, now):
+        return dict(record, state=PENDING, claimed_by=None, claim_expires_at=None, claim_expires_ts=None)
+    return record
 
 
-def settle(records, now, iso):
+def live_claim(record, now):
+    stamp = record.get('claim_expires_ts')
+    return record.get('state') == CLAIMED and type(stamp) in (int, float) and stamp > now
+
+
+def settle(records, now, iso, carried=None):
     """Write the lazy expiry and the bound into ``records``; ``True`` when anything changed."""
     changed = False
     for record in records:
@@ -139,10 +189,12 @@ def settle(records, now, iso):
             record['requested_ts'] = now
             changed = True
     for position, record in enumerate(records):
-        if isinstance(record, dict) and expired(record, now):
-            records[position] = effective(record, now, iso)
-            changed = True
-    finished = [record for record in records if isinstance(record, dict) and record.get('state') != PENDING]
+        if isinstance(record, dict) and record.get('state') in OPEN:
+            settled = effective(record, now, iso, carried)
+            if settled is not record:
+                records[position] = settled
+                changed = True
+    finished = [record for record in records if isinstance(record, dict) and record.get('state') not in OPEN]
     drop = [record for record in finished if now - _stamp(record) > KEEP_SECONDS]
     spare = len(records) - len(drop) - KEEP_RECORDS
     if spare > 0:
@@ -160,7 +212,7 @@ def pending_for(records, lane, message, now):
     """The open request for this lane and message, or ``None`` (a double click is one nudge)."""
     for record in reversed(records):
         if (isinstance(record, dict) and record.get('lane') == lane and record.get('message') == message
-                and record.get('state') == PENDING and not expired(record, now)):
+                and record.get('state') in OPEN and not expired(record, now)):
             return record
     return None
 
