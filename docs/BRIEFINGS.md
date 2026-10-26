@@ -328,9 +328,13 @@ Copy tokens exactly. Malformed or altered tokens can fail decoding, schema, scop
 ## Pointers in checkpoint source and evidence
 
 Open-item `source` and resolved-item `evidence` may mix prose and whitespace-separated
-`KIND:VALUE` tokens. The ten lowercase kinds are `task`, `comment`, `ref`, `cap`, `item`,
-`file`, `room`, `commit`, `doc` and `archive`; values have 1–200 characters from
-`[A-Za-z0-9._/#:-]`. A nonmatching token is ordinary prose. Punctuation is literal:
+`KIND:VALUE` tokens. The twelve lowercase kinds are `task`, `comment`, `ref`, `cap`, `item`,
+`file`, `room`, `commit`, `doc`, `archive`, `req` and `design`; values have 1–200 characters from
+`[A-Za-z0-9._/#:-]`. The two traceability kinds also fix their value's shape
+(docs/design/TRACEABILITY_DESIGN.md §2.4): `req:KEY` or `req:KEY@REV` (REV a positive
+revision number; `@` is legal only there), and `design:SCOPE` or `design:SCOPE#SECTION`
+(`design.SCOPE` is a reference key). A nonmatching token is ordinary prose, including a
+malformed `req:` or `design:` value such as `req:KEY@x`. Punctuation is literal:
 `task:x.` names `x.`, not `x`; separate sentence punctuation with whitespace.
 No checkpoint field, validation rule or stored byte changes, and an older kit can carry
 the strings unchanged.
@@ -359,6 +363,27 @@ The five states are:
   item, commit, doc and archive. No file, room, repository or document is fetched.
 - `unresolved`: beyond 10 resolved pointers per item or 50 per brief. Tokens remain
   listed and contribute to `pointers_omitted`.
+
+`req:` and `design:` entries also carry `flags`, a list (empty when nothing is wrong):
+
+- `req:` resolves against the project's requirement records. `req:KEY` means the newest
+  accepted revision, or the newest revision when none is accepted. A resolved entry carries
+  `reference: {id, revision, sha256}` and follows with `requirements get ID`. Flags:
+  `unknown-key` (no single readable requirement has that key; hidden, absent and another
+  project's read the same), `unknown-revision`, `draft` (the revision is not accepted),
+  `superseded` (a newer accepted revision exists, or the owner superseded the requirement)
+  and `withdrawn` (the owner withdrew it). A superseded or withdrawn requirement reads
+  state `superseded`, never `live`. Acceptance is the requirements read's own check
+  (`resolved_acceptance` with the operator list); owner decisions are checked against
+  the project's requirements governance, which the brief reads only when a `req:` token
+  is present. A ledger, acceptance or owner state that cannot be verified reads
+  `unavailable` with no flags.
+- `design:` resolves against the reference entry `design.SCOPE`. Flags: `unknown-scope`
+  (no such readable entry) and `not-selected` (only a draft revision). A retired entry
+  reads `superseded`. A `#SECTION` is shown as `section: {anchor, state: "unchecked"}`:
+  headings are checked once designs are indexed on the server.
+
+Text output appends `flags=...` and `section=ANCHOR unchecked` to these lines.
 
 Every pointer carries `trust: data`. Labels pass through `plain_text` before clipping
 at 120 characters, without leaving a partial Unicode escape. Text display folds line

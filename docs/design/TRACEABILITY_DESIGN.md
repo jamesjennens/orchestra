@@ -201,7 +201,7 @@ rules: a whitespace-separated `KIND:VALUE` token; prose otherwise; never a refus
 
 | kind | value | resolves to | flags |
 | --- | --- | --- | --- |
-| `req` | `KEY@REV`, e.g. `req:srv.backup@2`; `KEY` alone means "current" | the requirement record's revision `REV` (an exact reference once resolved: id, revision, sha256) | `unknown-key`; `unknown-revision`; `superseded` (a newer accepted revision exists); `draft` (the revision is not accepted) |
+| `req` | `KEY@REV`, e.g. `req:srv.backup@2`; `KEY` alone means "current" | the requirement record's revision `REV` (an exact reference once resolved: id, revision, sha256) | `unknown-key`; `unknown-revision`; `superseded` (a newer accepted revision exists, or the owner superseded the requirement); `draft` (the revision is not accepted); `withdrawn` (the owner withdrew the requirement; added by slice 2, kittrial-5bb.417) |
 | `design` | `SCOPE#section`, e.g. `design:server-redesign#plan-phase-2`; `SCOPE` alone means the whole design | the selected design (`design.<scope>`'s pinned file and commit) and a heading in it | `unknown-scope` (no `design.<scope>` entry); `unknown-section` (no such heading in the design's server-held index, §5.1); `not-selected` (the entry exists but its revision is not accepted) |
 
 **Where tokens go:**
@@ -564,6 +564,13 @@ of a kittrial-sized export, as the context index did for find.
    with the flags of §2.4, resolved on the server: `design:` resolves against `design-index-v1`
    records (slice 3). Until slice 3 lands, a `design:` token resolves to `unknown-scope` unless the
    entry exists, and its section reads `unchecked`.
+   - **As built (kittrial-5bb.417).** The kinds are in the one parser (briefing.py,
+     `parse_context_pointers`). A malformed value is prose (§2.1). A requirement withdrawn or
+     superseded by its owner (`requirement-owner-state-v1`) reads state `superseded` with flag
+     `withdrawn` or `superseded`, never `live`. Anything the requirements read cannot verify
+     reads `unavailable`. The governance snapshot that owner decisions are checked against is
+     read only for a brief holding a `req:` token. `unknown-section` waits for slice 3. See
+     docs/BRIEFINGS.md "Pointers in checkpoint source and evidence".
 3. **Design documents on the server: upload, index, verify.**
    - The upload on propose and revise, for the web form and the client.
    - The repo-path authority with `sha256` (a new authority version).

@@ -541,7 +541,13 @@ def inline_context_text(value):
     return plain_text(text)
 
 
-CONTEXT_POINTER_RE = re.compile(r'(task|comment|ref|cap|item|file|room|commit|doc|archive):([A-Za-z0-9._/#:-]{1,200})\Z')
+CONTEXT_POINTER_RE = re.compile(r'(task|comment|ref|cap|item|file|room|commit|doc|archive|req|design):([A-Za-z0-9._/#:@-]{1,200})\Z')
+# The traceability kinds (TRACEABILITY_DESIGN.md §2.4) also fix their value's shape;
+# a value outside it is prose, like any token outside the grammar (§2.1). `@` is
+# legal only as the one revision separator of a `req` value, so the ten older kinds
+# read exactly as before.
+REQ_POINTER_VALUE_RE = re.compile(r'([A-Za-z0-9._/#:-]+)(?:@([1-9][0-9]{0,8}))?\Z')
+DESIGN_POINTER_VALUE_RE = re.compile(r'([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*)(?:#([A-Za-z0-9._-]{1,120}))?\Z')
 CONTEXT_POINTER_ITEM_MAX = 10
 CONTEXT_POINTER_BRIEF_MAX = 50
 
@@ -553,9 +559,25 @@ def parse_context_pointers(text):
     result=[]
     for token in text.split():
         match=CONTEXT_POINTER_RE.fullmatch(token)
-        if match:
-            result.append({'pointer':token,'kind':match[1],'value':match[2]})
+        if not match:
+            continue
+        kind,value=match[1],match[2]
+        if kind=='req':
+            if not REQ_POINTER_VALUE_RE.fullmatch(value):
+                continue
+        elif kind=='design':
+            if not DESIGN_POINTER_VALUE_RE.fullmatch(value):
+                continue
+        elif '@' in value:
+            continue
+        result.append({'pointer':token,'kind':kind,'value':value})
     return result
+
+
+def needs_requirement_governance(*groups):
+    """Whether any item's text holds a `req:` token (the only kind that reads governance)."""
+    return any(pointer['kind']=='req' for items,field in groups for item in items or []
+               if isinstance(item,dict) for pointer in parse_context_pointers(item.get(field)))
 
 
 class ContextPointers:
@@ -565,10 +587,14 @@ class ContextPointers:
     supplies project-scoped, already-authorized rows. ``can_read`` is an optional
     additional restriction for direct embedders/tests; it never widens that scope.
     Unloaded kinds are uniformly unchecked; absent/hidden loaded kinds unavailable.
+    ``governance`` is the project's requirements-governance snapshot, already read by
+    the caller (``requirement_governance.snapshot``), as data: owner requirement
+    evidence is checked against it, and without it that evidence is unverifiable.
     """
-    def __init__(self,rows,project,operators=None,can_read=None):
+    def __init__(self,rows,project,operators=None,can_read=None,governance=None):
         self.project=project
         self.operators=operators
+        self.governance=governance
         self.remaining=CONTEXT_POINTER_BRIEF_MAX
         self._source_rows=rows
         self._can_read=can_read
@@ -577,6 +603,7 @@ class ContextPointers:
         self.comments={}
         self.catalogs={}
         self.reviews={}
+        self.requirements=None
     def _load(self):
         # Pure prose and unchecked kinds never build a project-wide index.
         if self.rows is not None:
@@ -594,9 +621,132 @@ class ContextPointers:
                 if isinstance(comment,dict) and comment.get('id') is not None and not is_record_comment(comment.get('text',comment.get('body'))):
                     self.comments.setdefault(str(comment['id']),[]).append((row,comment))
 
+    def _catalog(self,kind):
+        if kind not in self.catalogs:
+            import reference_records,capability_records
+            module=reference_records if kind=='ref' else capability_records
+            entries,_=module.catalog(self.rows,self.operators)
+            indexed={}
+            for item in entries:
+                indexed.setdefault(item.get('key'),[]).append(item)
+            self.catalogs[kind]=indexed
+        return self.catalogs[kind]
+
+    def _requirement_index(self):
+        """Requirement rows by every key a revision comment on them claims.
+
+        The claim is read leniently here only to find the row; resolution then reads
+        the row's strict ledger, so a malformed ledger is unavailable, never unknown.
+        """
+        if self.requirements is None:
+            from requirement_records import REVISION_PREFIX
+            from reserved_comments import parse_requirement_record
+            self.requirements={}
+            for row in self.rows:
+                if 'requirement' not in (row.get('labels') or []):
+                    continue
+                keys=set()
+                for comment in row.get('comments') or []:
+                    text=comment.get('text') if isinstance(comment,dict) else None
+                    if isinstance(text,str) and text.startswith(REVISION_PREFIX):
+                        record=parse_requirement_record(text)
+                        if record is not None and isinstance(record.get('key'),str):
+                            keys.add(record['key'])
+                for key in keys:
+                    self.requirements.setdefault(key,[]).append(row)
+        return self.requirements
+
+    def _governed(self,evidence):
+        if self.governance is None:
+            raise ValueError('Owner requirement evidence cannot be checked without governance')
+        from requirement_governance import validate_evidence_files
+        validate_evidence_files(self.governance,self.project,evidence)
+
+    def _requirement(self,entry,key,number):
+        """§2.4 `req`: flags unknown-key, unknown-revision, draft, superseded, withdrawn."""
+        rows=self._requirement_index().get(key,[])
+        if len(rows)!=1:
+            entry['flags']=['unknown-key']
+            return None,None
+        row=rows[0]
+        import requirement_records as records
+        import requirement_owner_records as owner_records
+        try:
+            revisions=records.existing_revisions(row)
+            if records.existing_kind(row)!='requirement' or not revisions:
+                raise ValueError('not a requirement')
+            if {record.get('key') for record in revisions.values()}!={key}:
+                raise ValueError('conflicting keys')
+            for evidence in owner_records.existing_acceptances(row).values():
+                self._governed(evidence)
+            accepted=[n for n in sorted(revisions) if records.resolved_acceptance(row,revisions[n],self.operators)]
+            if any(revisions[n]['acceptance_state']=='accepted' and n not in accepted for n in revisions):
+                raise ValueError('acceptance cannot be verified')
+            terminal,_=owner_records.state_ledger(row)
+            if terminal is not None:
+                self._governed(terminal)
+        except (ValueError,TypeError,KeyError):
+            # The same failures the requirements read shows as unreadable: never promoted.
+            entry['flags']=[]
+            return None,None
+        if number is None:
+            number=accepted[-1] if accepted else max(revisions)
+        elif number not in revisions:
+            entry['flags']=['unknown-revision']
+            return None,None
+        record=revisions[number]
+        flags=[]
+        if number not in accepted:
+            flags.append('draft')
+        if any(n>number for n in accepted):
+            flags.append('superseded')
+        if terminal is not None and terminal['state'] not in flags:
+            flags.append(terminal['state'])
+        entry['state']='superseded' if {'superseded','withdrawn'} & set(flags) else 'live'
+        entry['flags']=flags
+        entry['reference']={'id':row['id'],'revision':number,'sha256':record['sha256']}
+        return record.get('title'),'requirements get '+str(row['id'])
+
+    def _design(self,entry,scope,section):
+        """§2.4 `design` before slice 3: unknown-scope or not-selected; the section unchecked."""
+        entry['flags']=['unknown-scope']
+        label=follow=None
+        matches=self._catalog('ref').get('design.'+scope,[])
+        if len(matches)==1 and matches[0].get('state') not in ('malformed','unsupported','conflicted','incomplete'):
+            view=matches[0]
+            record=view.get('record')
+            proposed=view.get('proposed')
+            if record is not None:
+                entry['state']='superseded' if record.get('acceptance_state')=='superseded' else 'live'
+                entry['flags']=[]
+            elif proposed is not None:
+                record=proposed
+                entry['state']='live'
+                entry['flags']=['not-selected']
+            if record is not None:
+                label=record.get('name') or record.get('title') or 'design.'+scope
+                follow='ref get design.'+scope
+        if section is not None:
+            # Headings are checked against the server-held design index of slice 3.
+            entry['section']={'anchor':section,'state':'unchecked'}
+        return label,follow
+
     def resolve(self,pointer):
         kind,value=pointer['kind'],pointer['value']
         entry={'pointer':pointer['pointer'],'kind':kind,'state':'unchecked','trust':'data'}
+        if kind in ('req','design'):
+            self._load()
+            entry['state']='unavailable'
+            if kind=='req':
+                match=REQ_POINTER_VALUE_RE.fullmatch(value)
+                label,follow=self._requirement(entry,match[1],int(match[2]) if match[2] else None)
+            else:
+                match=DESIGN_POINTER_VALUE_RE.fullmatch(value)
+                label,follow=self._design(entry,match[1],match[2])
+            if entry['state'] in ('live','superseded'):
+                entry['label']=clip_context_label(label)
+                entry['follow']=follow
+            return entry
         if kind not in ('task','comment','ref','cap'):
             return entry
         self._load()
@@ -626,15 +776,7 @@ class ContextPointers:
                     if any(str(item.get('comment_id'))==value and item.get('relation')=='supersedes' for item in prior):
                         entry['state']='superseded'
         else:
-            if kind not in self.catalogs:
-                import reference_records,capability_records
-                module=reference_records if kind=='ref' else capability_records
-                entries,_=module.catalog(self.rows,self.operators)
-                indexed={}
-                for item in entries:
-                    indexed.setdefault(item.get('key'),[]).append(item)
-                self.catalogs[kind]=indexed
-            matches=self.catalogs[kind].get(value,[])
+            matches=self._catalog(kind).get(value,[])
             if len(matches)==1:
                 view=matches[0]
                 record=view.get('record') or view.get('proposed')
@@ -1512,7 +1654,17 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                        +[w for w in integration_warnings if w.startswith(RECONCILIATION_WARNING_PREFIX)]),
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
     if p is not None:
-        pointers=ContextPointers(rows,project,operators)
+        governance=None
+        # Read the governance snapshot only for a `req:` token: every other brief reads
+        # nothing new (TRACEABILITY_DESIGN §2.4; context index §2.1.2 "no new I/O").
+        if journal is not None and needs_requirement_governance((result['unresolved']['items'],'source'),
+                                                                (p['resolved'][:limit],'evidence')):
+            import requirement_governance
+            try:
+                governance=requirement_governance.snapshot(journal,project)
+            except (ValueError,OSError):
+                governance=None
+        pointers=ContextPointers(rows,project,operators,governance=governance)
         result['unresolved']['pointer_items']=pointers.item_pointers(result['unresolved']['items'],'source')
         result['resolved']={'items':p['resolved'][:limit],
                             'pointer_items':pointers.item_pointers(p['resolved'][:limit],'evidence'),
@@ -2279,7 +2431,12 @@ def format_context_pointers(item):
     lines=[]
     for pointer in item.get('pointers') or []:
         label=inline_context_text((pointer.get('label') or {}).get('text'))
-        lines.append('  '+pointer['pointer']+' ['+pointer['state']+'; trust=data]'+(' '+label if label else ''))
+        # Flags and the section anchor are kit vocabulary and the token's own value.
+        extra=(' flags='+(','.join(pointer['flags']) or 'none') if 'flags' in pointer else '')
+        section=pointer.get('section')
+        if isinstance(section,dict):
+            extra+=' section='+str(section.get('anchor'))+' '+str(section.get('state'))
+        lines.append('  '+pointer['pointer']+' ['+pointer['state']+'; trust=data]'+extra+(' '+label if label else ''))
     if item.get('pointers_omitted'):
         lines.append('  Pointers unresolved by bounds: '+str(item['pointers_omitted']))
     return lines
