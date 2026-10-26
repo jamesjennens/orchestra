@@ -10832,49 +10832,130 @@ class ApiHandler(BaseHTTPRequestHandler):
         can_coordinate = role in ('coordinator', 'owner') and holds(CAP_COORDINATE)
         return can_propose, can_coordinate
 
-    def _viewer_may_accept(self, ctx, pid, item, can_coordinate, self_accept_blocked):
+    def _viewer_may_accept(self, ctx, pid, item, can_coordinate, record_kind=None):
         """(may_accept, reason): the ONE server field gating 'Review & accept'.
 
         Never combined in the page: the page shows 'Review & accept' only when
-        ``may_accept`` is true, else 'View'. The same checks the accept route
-        enforces (endpoint.py ``party_check``): a coordinator (owner role) whose
-        own party did not propose the draft, and — for an agent caller — a
-        delegation in force covering that agent. The accept route still enforces
+        ``may_accept`` is true, else 'View'. The decision is the shared
+        ``record_acceptance.decide`` predicate (kittrial-5bb.420 r2, review
+        item b1), the SAME rule the accept route enforces through endpoint.py
+        ``party_check``/``delegation_check``. The accept route still enforces
         on its own. ``reason`` is a short plain sentence for display only.
         """
+        import record_acceptance
+        record_kind = record_kind or self._record_kind(ctx, item)
         by_agent = getattr(ctx.principal, 'via', None) == 'credential'
-        if not can_coordinate:
-            return False, 'Only the project coordinator may accept.'
-        if self_accept_blocked:
-            return False, 'A coordinator may not accept a draft their own party proposed.'
-        if by_agent and item.get('needs_delegation'):
-            covered = self._coverage_for(ctx, pid)
-            if covered is True:
-                return True, ''
-            if covered is False:
-                return False, 'An agent accepts only within a delegation in force.'
-            return False, 'Whether a delegation covers this agent could not be read.'
-        return True, ''
+        entry_state = item.get('state')
+        proposed = item.get('proposed')
+        has_proposed_block = isinstance(proposed, dict) and bool(proposed)
+        # An r1-shaped waiting row carries NO proposed block (the block rides
+        # only on get/detail): fall back to proposed_revision/proposed_sha256,
+        # which list_entries sets from entry['proposed'] (both None when no
+        # draft waits). A full-catalog settled row has neither (both None) and
+        # stays not-waiting (review b2).
+        waiting = bool(
+            (has_proposed_block
+             or item.get('proposed_revision') is not None
+             or item.get('proposed_sha256') is not None)
+            and (entry_state in ('draft-only', 'draft', 'proposed')
+                 or (bool(item.get('waiting_acceptance')) and entry_state == 'accepted')))
+        with self.service.store.lock:
+            seen = self.service.state.get('settings_seen')
+            seen_flag = bool(isinstance(seen, dict) and seen.get('approval_by_another_party'))
+            service_flag = bool(self.service.approval_by_another_party)
+        # The installation's independent_approval rule (endpoint.py reads it as
+        # rules['independent_approval'] under the write's lock; review b1): the
+        # web-service state has no deployment root, so this enrichment reads
+        # the SAME canonical root the endpoint subprocess was launched with
+        # (self.backend.root). Read per request, never cached: a rule flip
+        # applies to the next read. (No fcntl/module import at module level;
+        # coordinator_rule is a plain JSON read — POSIX-safe by construction.)
+        try:
+            from admin import coordinator_rule
+            from pathlib import Path
+            backend_root = getattr(self.backend, 'root', None)
+            if backend_root:
+                try:
+                    independent = bool(coordinator_rule(Path(backend_root), 'independent_approval'))
+                except Exception:
+                    independent = False
+            else:
+                independent = False
+        except Exception:
+            independent = False
+        approval_by_another = bool(service_flag or seen_flag or independent)
+        caller_names = [getattr(ctx.principal, 'actor', None) or ctx.principal.user_id,
+                        ctx.principal.user_id]
+        draft_proposer = (
+            item.get('proposed_by')
+            or (item.get('draft') or {}).get('proposer')
+            or (item.get('proposer')
+                if item.get('state') in ('draft-only', 'draft', 'proposed')
+                or item.get('waiting_acceptance') or item.get('has_pending_draft')
+                else None)
+        )
+        draft_authors = [a for a in (item.get('draft_authors') or []) if isinstance(a, str) and a]
+        if not draft_authors and isinstance(draft_proposer, str) and draft_proposer:
+            draft_authors = [draft_proposer]
+        caller_parties = set()
+        draft_parties = set()
+        for name in caller_names:
+            if isinstance(name, str) and name:
+                caller_parties |= self.service.actor_parties(name, pid, by_agent)
+        for name in draft_authors:
+            if isinstance(name, str) and name:
+                draft_parties |= self.service.actor_parties(name, pid, by_agent)
+        actor = getattr(ctx.principal, 'actor', '') or ''
+        head = actor.split('/', 1)[0] if isinstance(actor, str) else ''
+        own_draft = bool(head) and any(
+            isinstance(a, str) and a.split('/', 1)[0] == head for a in draft_authors)
+        covered = None
+        unreadable = False
+        refused = False
+        if by_agent:
+            covered = self._coverage_for(ctx, pid, record_kind or 'references')
+            if record_kind is None:
+                other = self._coverage_for(ctx, pid, 'capabilities')
+                if covered is not True or other is not True:
+                    covered = False if (covered is False or other is False) else covered
+            if covered is None:
+                unreadable = True
+            elif covered is not True:
+                refused = True
+        return record_acceptance.decide(
+            can_coordinate=can_coordinate,
+            approval_by_another_party=approval_by_another,
+            waiting=waiting,
+            by_agent=by_agent,
+            agent_head=head or None,
+            delegation_covers_kind=covered,
+            delegation_refused=refused,
+            delegation_missing=False,
+            proposer_known=True,
+            delegation_unreadable=unreadable,
+            caller_parties=caller_parties,
+            draft_parties=draft_parties,
+            own_draft=own_draft,
+            own_party=bool(caller_parties & draft_parties),
+            independent_hold=False)
 
-    def _coverage_for(self, ctx, pid):
-        """Whether a delegation in force covers the caller's agent (kittrial-5bb.420).
+    def _coverage_for(self, ctx, pid, kind):
+        """Whether a delegation in force covers the caller's agent FOR KIND.
 
-        Read once per request through the same live ``delegation list`` read the
-        accept route enforces under its lock; a caller the read refuses (or an
-        older backend without it) gets no coverage. Person callers never need
-        this; only an agent's acceptance is gated on a delegation.
-
-        A backend without the canonical endpoint's delegation read (the
-        service-local backend the web tests use) has no coverage signal: an
-        agent there is treated as uncovered, the same refusal the accept route
-        (which has no delegation decision id to check) would give.
+        ``kind`` is ``'references'`` or ``'capabilities'`` (review item b1):
+        a delegation narrowed to references never admits a capability draft.
+        Returns ``True`` (covered), ``False`` (a readable answer covering
+        nothing for this kind), or ``None`` (the delegations read refused or
+        this backend has no delegation signal, so the agent is uncovered,
+        the same refusal the accept route would give). Cached per (pid, kind).
         """
         cache = getattr(ctx, '_records_delegation_cache', None)
         if cache is None:
             cache = {}
             ctx._records_delegation_cache = cache
-        if pid in cache:
-            return cache[pid]
+        key = (pid, kind)
+        if key in cache:
+            return cache[key]
         covered = None
         try:
             read = getattr(self.backend, 'delegations_read', None)
@@ -10888,12 +10969,48 @@ class ApiHandler(BaseHTTPRequestHandler):
                         break
                 else:
                     covered = False
+                if covered and kind is not None:
+                    kinds = set()
+                    for row in (payload.get('items') or []):
+                        if not isinstance(row, dict):
+                            continue
+                        delegation = row.get('delegation')
+                        if not isinstance(delegation, dict):
+                            continue
+                        if delegation.get('grantee') not in (head, 'coordinator-grant'):
+                            continue
+                        if delegation.get('right') != 'record-acceptance':
+                            continue
+                        scope = delegation.get('scope') or []
+                        if not isinstance(scope, list) or not scope:
+                            continue
+                        kinds |= {part for part in scope if isinstance(part, str)}
+                    covered = kind in kinds
             elif getattr(ctx.principal, 'via', None) == 'credential':
                 covered = False
         except HttpError:
             covered = None
-        cache[pid] = covered
+        cache[key] = covered
         return covered
+
+    def _record_kind(self, ctx, item):
+        """``'references'`` or ``'capabilities'`` for one enriched item, or None."""
+        for probe in (item.get('item_kind'), item.get('kind')):
+            if probe in ('references', 'capabilities'):
+                return probe
+            if probe == 'reference':
+                return 'references'
+            if probe == 'capability':
+                return 'capabilities'
+        if isinstance(item.get('verification'), dict) or 'verification_state' in item:
+            return 'capabilities'
+        route = getattr(ctx, 'route_target', None)
+        if isinstance(route, str):
+            if route.startswith('references.'):
+                return 'references'
+            if route.startswith('capabilities.'):
+                return 'capabilities'
+        return None
 
     def _enrich_record_view(self, ctx, pid, capabilities, item):
         if not isinstance(item, dict):
@@ -10996,8 +11113,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
-        may_accept, may_reason = self._viewer_may_accept(
-            ctx, pid, item, can_coordinate, item.get('self_accept_blocked'))
+        may_accept, may_reason = self._viewer_may_accept(ctx, pid, item, can_coordinate)
         item['viewer_may_accept'] = bool(may_accept)
         item['viewer_may_accept_reason'] = may_reason
         return item

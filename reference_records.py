@@ -883,15 +883,18 @@ def _list_item(entry, current=None, web_service=False):
             'acceptance_inert': entry.get('acceptance_inert', False),
             # What kind of authority the listed revision carries, and whether that revision
             # is the accepted record: a draft attestation is never shown unmarked.
-            # The authority object itself rides along for the waiting queue, whose
-            # authority cell prints an attested draft (kittrial-5bb.420 2.3: the cell
-            # read only rec.authority/item.authority and showed a dash although the
-            # draft's attestation was there).
-            'authority': source.get('authority'),
-            'proposed_authority': proposed.get('authority'),
-            'record_authority': record.get('authority'),
             'authority_kind': authority_kind(source) if source else None, 'authority_accepted': entry['record'] is not None}
     if web_service:
+        # The authority object itself rides along ONLY for the web waiting queue
+        # (endpoint.py's ref/capability reads run with web_service=False, so the
+        # CLI ref/capability list payloads keep only the authority_kind and
+        # authority_accepted flags above; review notes, r2). The waiting queue's
+        # authority cell prints an attested draft (kittrial-5bb.420 2.3: the cell
+        # read only rec.authority/item.authority and showed a dash although the
+        # draft's attestation was there).
+        item['authority'] = source.get('authority')
+        item['proposed_authority'] = proposed.get('authority')
+        item['record_authority'] = record.get('authority')
         item.update(
             waiting_acceptance=waiting,
             proposed_revision=(entry['proposed'] or {}).get('revision'),

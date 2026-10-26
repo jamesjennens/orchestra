@@ -1345,13 +1345,15 @@ class _RecordsScenarioMixin:
         self.assertEqual(c_ver_ok.data['proposer'], people['coord2']['uid'])
 
     def run_viewer_may_accept_suite(self):
-        """The ONE server field gating 'Review & accept' (kittrial-5bb.420 item 2).
+        """The ONE server field gating 'Review & accept' (kittrial-5bb.420 r2, review b1/b2).
 
         The page must never combine flags itself: it shows 'Review & accept' only
         when the waiting item's ``viewer_may_accept`` is true, else 'View'. The
-        field is computed by the same checks the accept route enforces
-        (can_coordinate, self_accept_blocked, approval_by_another_party, the
-        .407 delegation-in-force check for agents), never a copy; the accept route
+        field is the shared ``record_acceptance.decide`` predicate, the SAME rule
+        the accept route enforces through endpoint.py ``party_check`` and
+        ``delegation_check`` (kind-specific: a references-only delegation never
+        admits a capability draft; an accepted row with nothing waiting refuses
+        with 'Nothing waits to be accepted'), never a copy; the accept route
         still enforces on its own. An owner, a person coordinator, a contributor,
         a viewer, an agent with and without a delegation, and an own draft each
         get the right button, and a forced accept the page did not offer is still
@@ -1447,6 +1449,116 @@ class _RecordsScenarioMixin:
                 harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = False
                 harness.service.store.save()
 
+    def run_shared_predicate_rows_suite(self):
+        """Review b1 probe rows as named tests (kittrial-5bb.420 r2): field and route agree.
+
+        The shared ``record_acceptance.decide`` predicate, the enriched waiting
+        item's ``viewer_may_accept`` field, and the accept route's answer MUST
+        agree: a row the page offers ('Review & accept') is one the route
+        accepts, and a row the route refuses offers 'View'. The matrix covers
+        the narrowed-scope delegation (references-only never admits a capability
+        draft) and ``independent_approval`` for a person coordinator on their
+        own draft and an agent on its owner's draft.
+        """
+        import record_acceptance
+        harness = self.harness
+        people = self._setup_actors(harness)
+        agent1 = people['coord1_agent']
+        agent3 = people['coord2_agent']
+        pid = self.pid
+        for ag in (agent1, agent3):
+            g = harness.request('PUT', f'/v1/projects/{pid}/agents/{ag["id"]}/coordinator', {}, token=self.owner_token)
+            self.assertEqual(g.status, 200, g.data)
+        cap_sha = self._setup_probe_drafts(harness, people)
+        narrow = self._delegate(harness, title='Probe references-only delegation',
+                                scope=('references',))
+        by_other = cap_sha
+        ref_decide = record_acceptance.decide(
+            can_coordinate=True, approval_by_another_party=False, waiting=True,
+            by_agent=True, agent_head='probe-agent', delegation_covers_kind=True,
+            caller_parties={'probe-agent'}, draft_parties={'someone-else'},
+            own_draft=False, own_party=False)
+        cap_decide = record_acceptance.decide(
+            can_coordinate=True, approval_by_another_party=False, waiting=True,
+            by_agent=True, agent_head='probe-agent', delegation_covers_kind=False,
+            delegation_refused=True,
+            caller_parties={'probe-agent'}, draft_parties={'someone-else'},
+            own_draft=False, own_party=False)
+        self.assertEqual(ref_decide, (True, ''))
+        self.assertEqual(cap_decide[0], False)
+        self.assertIn('delegation', cap_decide[1])
+        refused = harness.request(
+            'POST', f'/v1/projects/{pid}/capabilities/probe.narrow-cap2/accept',
+            {'expected_revision': 1, 'record_sha256': by_other,
+             'evidence': 'Probe narrowed scope refuses capability.', 'decision_id': narrow},
+            token=agent1['token'], key='probe-narrow-cap2-accept')
+        self.assertEqual(refused.status, 403, refused.data)
+        self.assertIn('covers references, not capabilities', refused.data['error']['message'])
+        # installation independent_approval (review b1): the shared predicate
+        # refuses a person coordinator on their own draft and an agent on its
+        # owner's draft, even with a live delegation covering the kind.
+        self.assertEqual(
+            record_acceptance.decide(
+                can_coordinate=True, approval_by_another_party=True, waiting=True,
+                by_agent=False, caller_parties={'coord1'}, draft_parties={'coord1'},
+                own_party=True),
+            (False, 'A coordinator may not accept or verify a record whose draft was proposed '
+                    'by the same party while approval_by_another_party is enabled.'))
+        self.assertEqual(
+            record_acceptance.decide(
+                can_coordinate=True, approval_by_another_party=True, waiting=True,
+                by_agent=True, agent_head='agent1', delegation_covers_kind=True,
+                caller_parties={'owner1'}, draft_parties={'owner1'},
+                own_draft=False, own_party=True)[0],
+            False)
+
+    def _setup_probe_drafts(self, harness, people):
+        import datetime
+        today = datetime.date.today().isoformat()
+        other_ref = _valid_ref_propose('probe.narrow-ref2', title='Probe Narrow Ref2')
+        other_ref['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
+                                  'observed': today, 'how': 'Checked the live board before proposing.'}
+        made = harness.request('POST', f'/v1/projects/{self.pid}/references', other_ref,
+                               token=people['coord2']['token'], key='probe-narrow-ref2-propose')
+        self.assertEqual(made.status, 201, made.data)
+        other_cap_body = _valid_cap_propose('probe.narrow-cap2', name='Probe Narrow Cap2')
+        other_cap_body['aliases'] = ['probe.narrow.cap2']
+        other_cap = harness.request('POST', f'/v1/projects/{self.pid}/capabilities', other_cap_body,
+                                    token=people['coord2']['token'], key='probe-narrow-cap2-propose')
+        self.assertEqual(other_cap.status, 201, other_cap.data)
+        return other_cap.data['sha256']
+
+    def run_nothing_waits_suite(self):
+        """Review b2: an accepted row with nothing waiting refuses with a reason.
+
+        A record with no waiting draft answers ``viewer_may_accept`` false with
+        'Nothing waits to be accepted.' (``record_acceptance.NOTHING_WAITING_REASON``),
+        so the accepted panel never offers 'Review & accept' for it (a second
+        accept would answer 409). The waiting rows keep their own gate.
+        """
+        harness = self.harness
+        people = self._setup_actors(harness)
+        coord1 = people['coord1']['token']
+        pid = self.pid
+        prop = harness.request('POST', f'/v1/projects/{pid}/references',
+                               _valid_ref_propose('probe.settled-ref', title='Probe Settled Ref'),
+                               token=coord1, key='probe-settled-propose')
+        self.assertEqual(prop.status, 201, prop.data)
+        acc = harness.request(
+            'POST', f'/v1/projects/{pid}/references/probe.settled-ref/accept',
+            {'expected_revision': 1, 'record_sha256': prop.data['sha256'],
+             'evidence': 'Probe settles the draft.'},
+            token=coord1, key='probe-settled-accept')
+        self.assertEqual(acc.status, 200, acc.data)
+        view = harness.request('GET', f'/v1/projects/{pid}/references/probe.settled-ref', token=coord1)
+        self.assertEqual(view.status, 200, view.data)
+        self.assertFalse(view.data['viewer_may_accept'], view.data)
+        self.assertEqual(view.data['viewer_may_accept_reason'], 'Nothing waits to be accepted.')
+        listed = harness.request('GET', f'/v1/projects/{pid}/references', token=coord1)
+        (item,) = [i for i in listed.data['items'] if i['key'] == 'probe.settled-ref']
+        self.assertFalse(item.get('viewer_may_accept'), item)
+        self.assertEqual(item.get('viewer_may_accept_reason'), 'Nothing waits to be accepted.')
+
 
 @unittest.skipUnless(os.name == 'nt', 'POSIX runs NativeWebRecordsTests against real endpoint.py and real bd')
 class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
@@ -1487,6 +1599,12 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
     def test_viewer_may_accept_gate(self):
         self.run_viewer_may_accept_suite()
 
+    def test_shared_predicate_probe_rows(self):
+        self.run_shared_predicate_rows_suite()
+
+    def test_nothing_waits_gate(self):
+        self.run_nothing_waits_suite()
+
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
@@ -1522,6 +1640,14 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_viewer_may_accept_gate(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_viewer_may_accept_suite()
+
+    def test_native_shared_predicate_probe_rows(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_shared_predicate_rows_suite()
+
+    def test_native_nothing_waits_gate(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_nothing_waits_suite()
 
 
 
