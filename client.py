@@ -292,9 +292,12 @@ def _interpreter_refusal(returncode,stdout,stderr,config):
         return server_text(found.group(1))+(' '+tail if tail else '')+note
     return server_text(stderr.strip())
 
-def request(config,project,actor,args,action='bd',path=None,document=None):
+def request(config,project,actor,args,action='bd',path=None):
+    return _send(config,_wire(project,actor,args,action,path))
+
+def _send(config,wire):
+    """One request already on the wire (request, and a design document's propose or revise)."""
     argv,label = _argv(config)
-    wire = _wire(project,actor,args,action,path,document)
     try:
         # A captured console child can still flash a window when the client is
         # launched by a GUI/agent on Windows. Preserve pipes and exit status.
@@ -1907,7 +1910,7 @@ def main():
         args,document,temporary=_design_document_args(args)
     try:
         result=(request(config_doc,a.project,a.actor,args,action,path) if document is None else
-                request(config_doc,a.project,a.actor,args,action,path,document))
+                _send(config_doc,_wire(a.project,a.actor,args,action,path,document)))
     finally:
         if temporary:
             Path(temporary).unlink(missing_ok=True)
