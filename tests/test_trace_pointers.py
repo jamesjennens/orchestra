@@ -324,8 +324,26 @@ class OwnerRequirementTests(unittest.TestCase):
         self.assertEqual((answer['state'], answer['flags']), ('unavailable', []))
 
 
+def design_document(scope):
+    """A minimal design document for `design.<scope>` (kittrial-5bb.418: every new design entry carries one)."""
+    return '<!-- design-v1\nscope: %s\nstatus: candidate\n-->\n# Design\n\n## Plan phase 2\n' % scope
+
+
 class DesignPointerTests(ReferenceCase):
     """`design:SCOPE#section` against the reference entry `design.<scope>` (§2.2)."""
+
+    def propose(self, **extra):
+        key = extra.get('key', 'calendar.trading')
+        if not key.startswith('design.'):
+            return super().propose(**extra)
+        import hashlib
+        import reference_records
+        from test_reference_records import entry
+        text = design_document(key[len('design.'):])
+        extra['authority'] = {'type': 'repo-document', 'path': 'docs/design/DESIGN.md', 'commit': 'a' * 40,
+                              'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest()}
+        self.native.actor = 'alice'
+        return reference_records.apply_native(entry(**extra), 'alice', self.native, self.project, document=text)
 
     def resolve(self, token, data=None, **kwargs):
         return resolve(token, self.native.rows if data is None else data, operators=[OPERATOR], **kwargs)

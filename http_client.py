@@ -46,6 +46,53 @@ import tempfile
 from urllib.parse import quote, urlencode, urlsplit
 
 
+DESIGN_DOCUMENT_MAX_BYTES = 1024 * 1024
+
+
+def _document_from_git(entry, repo):
+    """kittrial-5bb.418: (entry with authority.sha256, document text) for --document-from-git.
+
+    The entry's repo-document authority names the path and commit. The document is git's own object at
+    that commit (never the working tree), refused unless it is a regular file (no symlink, submodule or
+    tree), at most 1 MiB and UTF-8; its bytes are kept exactly (line endings, a byte-order mark). This
+    client stays standalone, so it repeats the kit's design_documents.document_from_git rather than
+    importing it."""
+    import subprocess
+    authority = entry.get('authority') if isinstance(entry, dict) else None
+    if not isinstance(authority, dict) or authority.get('type') != 'repo-document' \
+            or not isinstance(authority.get('path'), str) or not isinstance(authority.get('commit'), str):
+        raise ValueError('--document-from-git needs an entry whose authority is a repo-document with a path and commit')
+    path, commit = authority['path'], authority['commit']
+
+    def git(*args):
+        done = subprocess.run(['git', '--no-optional-locks', '-C', repo, *args], capture_output=True, timeout=30,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if done.returncode:
+            raise ValueError('git cannot read %s at %s' % (path, commit[:12]))
+        return done.stdout
+    found = []
+    for item in git('ls-tree', '-z', '--full-tree', commit, '--', path).split(b'\0'):
+        meta, _, name = item.partition(b'\t')
+        if item and name.decode('utf-8', 'replace') == path and len(meta.split()) == 3:
+            found.append(meta.split())
+    if len(found) != 1:
+        raise ValueError('commit %s holds no file %s' % (commit[:12], path))
+    mode, kind, obj = (part.decode('ascii', 'replace') for part in found[0])
+    if kind != 'blob' or mode not in ('100644', '100755'):
+        raise ValueError('%s at %s is not a regular file (git mode %s, %s)' % (path, commit[:12], mode, kind))
+    data = git('cat-file', 'blob', obj)
+    if len(data) > DESIGN_DOCUMENT_MAX_BYTES:
+        raise ValueError('the design document is %d bytes; the limit is 1 MiB' % len(data))
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise ValueError('%s at %s is not UTF-8 text' % (path, commit[:12])) from None
+    sha256 = hashlib.sha256(data).hexdigest()
+    if authority.get('sha256') not in (None, sha256):
+        raise ValueError('authority.sha256 is not the sha256 of %s at %s (%s)' % (path, commit[:12], sha256))
+    return dict(entry, authority=dict(authority, sha256=sha256)), text
+
+
 def _lifecycle_body_file(path):
     """Bound caller text before decoding, while keeping the copied client standalone."""
     with open(path, 'rb') as stream:
@@ -938,6 +985,10 @@ def _build_parser():
     ref.add_argument('--limit', type=int)
     ref.add_argument('--cursor')
     ref.add_argument('--file', help='UTF-8 JSON HTTP request body for mutations')
+    ref.add_argument('--document-from-git', action='store_true',
+                     help='propose/revise of a design.<scope> entry: attach the document its repo-document '
+                          'authority names, read from git at the pinned commit')
+    ref.add_argument('--repo', default='.', help='the checkout --document-from-git reads (default: .)')
     ref.add_argument('--idempotency-key', help='reuse exactly this key and body after an uncertain result')
     cap = sub.add_parser('capability', help='read or mutate project capability records')
     cap.add_argument('project')
@@ -1067,6 +1118,11 @@ def main(argv=None):
                 if not args.file:
                     parser.error('%s requires --file' % op)
                 body = _lifecycle_body_file(args.file)
+                if args.document_from_git:
+                    if op not in ('propose', 'revise'):
+                        parser.error('--document-from-git goes with propose or revise')
+                    body, document = _document_from_git(body, args.repo)
+                    body['document'] = document
                 if op == 'propose':
                     result = client.propose_reference(args.project, body, args.idempotency_key)
                 else:

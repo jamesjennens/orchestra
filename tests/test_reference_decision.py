@@ -280,7 +280,7 @@ class ReaderTests(DecisionCase):
             rr.read(['list', '--authority', 'rule'], self.native, [OPERATOR])
         usage = rr.help_payload()
         self.assertIn('--authority repository|url|attested|decision', usage['usage'][1])
-        self.assertEqual(usage['authority']['types'], ['attestation', 'decision', 'repo-path', 'url'])
+        self.assertEqual(usage['authority']['types'], ['attestation', 'decision', 'repo-document', 'repo-path', 'url'])
 
     def test_brief_and_work_carry_the_kind(self):
         self.propose(**decided(review_by='2026-10-10'))

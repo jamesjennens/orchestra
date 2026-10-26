@@ -3127,6 +3127,25 @@ it was set ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)).
   otherwise); one contributor's v3 draft makes it read a whole accepted entry
   `unsupported`; it cannot write to, void or release such an entry; and its backup and
   restore are unaffected. Nothing is lost; roll forward to read them.
+- **Design documents (kittrial-5bb.418).** A `design.<scope>` entry carries its document
+  (a `repo-document` authority, [CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)). The
+  bytes are kept in the project's `.task-files` store, journaled as a task-file entry of direction
+  `design` on the entry's anchor, so `task-files verify`, the backup's `NAME.task-files` copy,
+  `restore-new` and the project's byte limit cover them, and `task-files purge` never removes one
+  (its anchor is a closed catalog row by construction). `task_files.max_design_documents` (200)
+  bounds how many distinct documents a project holds. The server-derived index is a reserved
+  `Kind: design-index-v1` comment on the anchor. An accept of a design revision re-reads the
+  stored bytes: a missing or changed file, or a differing index beside the derived one, refuses it,
+  naming the cause; repair the store from a backup, or remove the stray record with the host
+  procedure for an orphan record. A propose or revise that is refused removes the bytes it stored;
+  one whose native write is uncertain keeps them for its retry. A host fault in between (a timeout
+  or a disk error before the operation's pending receipt is written) can leave stored bytes that no
+  entry names: they count toward nothing, `task-files verify` lists them as orphans, and
+  `task-files purge` removes them once they are a day old. **Rollback:** a kit before this one reads a repo-document
+  revision `unsupported` (as for any later authority type, below); its `task-files verify` and
+  backup report the `design` journal entries as entries it cannot read and do not copy their
+  bytes, and its purge refuses to run while they are there, so nothing is removed. Back up on
+  this release before a rollback, and roll forward to read the entries again.
 - **No further version for a new authority type.** Version 3 is the last one an
   authority type needs. A v3 revision whose authority type this kit does not know (one a
   later kit added) makes its entry read `unsupported`, with the warning `authority type

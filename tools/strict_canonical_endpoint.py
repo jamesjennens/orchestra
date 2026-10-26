@@ -619,11 +619,11 @@ def dispatch(canonical, request, tmp, run=None):
                                 'by the same party while approval_by_another_party is enabled.')
                     party_check = _party_check
             if action == 'ref':
-                payload = reference_records.write_payload(args, attachments, commands=writes)
+                payload, document = reference_records.write_payload_and_document(args, attachments, commands=writes)
                 result = reference_records.apply_native(
                     payload, actor, run, canonical.path, operator=coordinator,
                     operators=operators, web_coordinator=coordinator, party_check=party_check,
-                    web_service=by_service)
+                    web_service=by_service, document=document)
             else:
                 result = records.write(
                     args, attachments, actor, run, canonical.path, operators,

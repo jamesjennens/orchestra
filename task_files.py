@@ -49,6 +49,11 @@ WITHDRAWN_PREFIX = 'Kind: task-file-withdrawn-v1\n'
 TO_WORKER = 'to-worker'
 FROM_WORKER = 'from-worker'
 DIRECTIONS = (TO_WORKER, FROM_WORKER)
+#: kittrial-5bb.418: the stored document of a `design.<scope>` reference revision, journaled on the entry's
+#: anchor by design_documents (never by an upload, which may name only DIRECTIONS). A journal direction only:
+#: backup, restore, verify and the project's byte limit count it; purge keeps it whatever its anchor's status.
+DESIGN = 'design'
+JOURNAL_DIRECTIONS = DIRECTIONS + (DESIGN,)
 NAME_LIMIT = 128
 NOTE_LIMIT = 1000
 REASON_LIMIT = 1000
@@ -78,6 +83,8 @@ LIMIT_DEFAULTS = {
     # The defaults let 25 MiB take 60 s + 800 s.
     'min_transfer_bytes_per_second': 32 * 1024,
     'transfer_grace_seconds': 60,
+    # kittrial-5bb.418: how many distinct design documents (design.<scope> revisions' stored files) a project holds.
+    'max_design_documents': 200,
 }
 #: The two that may be 0 (keep no disk free) without meaning "nothing at all".
 LIMIT_ZERO_ALLOWED = ('min_free_bytes',)
@@ -419,7 +426,7 @@ def _valid_entry(entry, task, sha256):
         return False
     if type(entry.get('bytes')) is not int or entry['bytes'] < 0:
         return False
-    if entry.get('direction') not in DIRECTIONS or not isinstance(entry.get('by'), str):
+    if entry.get('direction') not in JOURNAL_DIRECTIONS or not isinstance(entry.get('by'), str):
         return False
     try:
         clean_name(entry.get('name'))
@@ -486,8 +493,12 @@ def entries(project, task):
 
 
 def live(project, task):
-    """The task's files a person may be shown: journal entries not withdrawn (a purged one is shown as purged)."""
-    return [entry for entry in entries(project, task) if entry.get('withdrawn') is None]
+    """The task's files a person may be shown: journal entries not withdrawn (a purged one is shown as purged).
+
+    kittrial-5bb.418 review: a design document's entry (direction `design`, on a reference anchor) is never a
+    task file: no list shows it and no file route serves it, on SSH as on HTTP (which refuses anchors)."""
+    return [entry for entry in entries(project, task) if entry.get('withdrawn') is None
+            and entry.get('direction') != DESIGN]
 
 
 def held(project, task):
@@ -731,6 +742,9 @@ def apply(payload, actor, run, project, now, limit=None):
     sha256 = payload['sha256']
     row = _row(run, task)
     current = read_entry(project, task, sha256)
+    if current is not None and current.get('direction') == DESIGN:
+        # kittrial-5bb.418 review: a design document's journal entry is not a task file; no file route touches it.
+        raise Refusal(404, 'not_found', 'No such file on this task.')
     if operation.endswith('-record'):
         if operation == 'assignee-record' and not is_assignee(row, actor):
             raise Refusal(403, 'forbidden', 'Only the task\'s current assignee attaches files from the worker, '
@@ -835,7 +849,7 @@ def listing(project, task, may):
 def download_target(project, task, sha256):
     """``(entry, open handle)`` of a live file of ``task``, or :class:`Refusal`; the caller closes the handle."""
     entry = read_entry(project, task, sha256)
-    if entry is None or entry.get('withdrawn') is not None:
+    if entry is None or entry.get('withdrawn') is not None or entry.get('direction') == DESIGN:
         raise Refusal(404, 'not_found', 'No such file on this task.')
     if entry.get('purged'):
         raise Refusal(410, 'gone', purged_sentence(entry))
@@ -1341,6 +1355,11 @@ def purge_plan(project, closed_before, rows, now_seconds=None):
     needed, candidates = set(), []
     for relative, entry in entries_now:
         if entry.get('purged'):
+            continue
+        if entry.get('direction') == DESIGN:
+            # kittrial-5bb.418: a design document is what a reference revision selected; its anchor is a closed
+            # catalog row by construction, and the revision never stops needing the bytes.
+            needed.add(entry['sha256'])
             continue
         row = rows.get(entry['task'])
         why = 'withdrawn' if entry.get('withdrawn') is not None else (

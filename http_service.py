@@ -95,6 +95,10 @@ def service_identity():
 
 
 MAX_BODY_BYTES = 262144
+#: kittrial-5bb.418: the body a design.<scope> reference propose or revise may send, its document inside it
+#: (1 MiB of Markdown, design_documents.DOCUMENT_MAX_BYTES, plus the JSON escaping). Only those two routes, and
+#: only after authentication, the capability and the membership role passed (_read_deferred_body).
+DESIGN_BODY_BYTES = 1536 * 1024
 MAX_ATTACHMENTS = 8
 MAX_ATTACHMENT_BYTES = 65536
 MAX_ATTACHMENT_TOTAL = 262144
@@ -3261,8 +3265,16 @@ class EndpointBackend:
             if isinstance(body.get('acceptance'), dict) and not body['acceptance'].get('decision_id'):
                 body['acceptance'] = dict(body['acceptance'], decision_id=body['operation_id'])
             action_name = 'ref' if route.startswith('references.') else 'capability'
-            return (action_name, project_id, [payload['command'], '@attachment:0'],
-                    {'0': {'flag': '--file', 'text': json.dumps(body, ensure_ascii=False)}})
+            document = body.pop('document', None) if action_name == 'ref' else None
+            args = [payload['command'], '@attachment:0']
+            attachments = {'0': {'flag': '--file', 'text': json.dumps(body, ensure_ascii=False)}}
+            if document is not None:
+                # kittrial-5bb.418: the design document travels as the client's second attachment does.
+                if not isinstance(document, str):
+                    raise invalid('document must be the Markdown text of the design document')
+                args.append('@attachment:1')
+                attachments['1'] = {'flag': '--document', 'text': document}
+            return (action_name, project_id, args, attachments)
         raise invalid('Backend route is not implemented for the canonical endpoint: %s' % route)
 
     # -- reads (no canonical mutation) ----------------------------------------
@@ -4926,6 +4938,10 @@ STREAMED = set()
 #: dispatcher refuses it everywhere else before the route runs, so a route written later is closed to it
 #: by default; ``tests/test_lane_nudge_carrier.py`` sweeps every route to prove it.
 CARRIER_ROUTES = set()
+#: kittrial-5bb.418: the routes whose JSON body is read by the route itself, after its own
+#: authority checks, so the larger DESIGN_BODY_BYTES is never read for a caller who may not use it:
+#: the reference propose and revise (a design.<scope> revision carries its document).
+DEFERRED_BODY = {'references_propose', 'references_revise'}
 
 
 def route(method, pattern, *, anonymous=False, csrf=True, stream=False, carrier=False):
@@ -5223,14 +5239,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise not_found('No such operation')
             name, anonymous, csrf, params = match
             stream = name in STREAMED
-            if stream:
+            deferred = name in DEFERRED_BODY
+            self._linger_cap = None
+            if stream or deferred:
                 # The streamed upload's answer always ends the connection: a refusal before its
                 # body was read, or a body that was not what its Content-Length said, must never
                 # leave bytes behind that the next request on this connection would be read from.
                 self._say_close = True
                 self._body_unread = True              # until the route has read it (kittrial-5bb.380)
+                if deferred:
+                    # kittrial-5bb.418: a deferred JSON body refused before it was read is drained
+                    # for a clean close only up to the normal body limit, never the upload's 64 MiB.
+                    self._linger_cap = self.max_body
             payload, auth_source = self._read_request(method, anonymous, params, csrf,
-                                                      request_id, stream=stream)
+                                                      request_id, stream=stream or deferred)
             # The semantic route target is the method plus the concrete path (with the
             # real account/project/task id substituted). It is the idempotency
             # namespace, so two different targets never share a receipt.
@@ -5313,8 +5335,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             ends = time.monotonic() + self.LINGER_SECONDS
             taken = 0
+            cap = getattr(self, '_linger_cap', None) or self.LINGER_BYTES
             try:
-                while taken < self.LINGER_BYTES:
+                while taken < cap:
                     left = ends - time.monotonic()
                     if left <= 0:
                         break
@@ -5452,6 +5475,71 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not IDEMPOTENCY_KEY.fullmatch(key):
             raise invalid('Idempotency-Key must be 8-128 URL-safe characters')
         return key
+
+    def _read_deferred_body(self, ctx, key=None):
+        """kittrial-5bb.418: read a DEFERRED_BODY route's JSON body, now that the route's authority checks passed.
+
+        Content-Length is required (411 without it; chunked transfer is refused) and checked before a byte is
+        read: at most DESIGN_BODY_BYTES when the key may be a design.<scope> entry (`key` is the route's key,
+        None when it is in the body), else the normal ``max_body``. A body over ``max_body`` whose key is not
+        a design entry is refused once read (the propose route learns its key from the body). A body shorter
+        than its Content-Length is a client that went away (nothing to answer); a longer one is never read
+        past its Content-Length, and the connection ends with the answer.
+        """
+        import design_documents
+        if (self.headers.get('Transfer-Encoding') or '').strip():
+            raise invalid('Send this body with a Content-Length; chunked transfer is not accepted here')
+        header = self.headers.get('Content-Length')
+        if header is None:
+            raise HttpError(411, 'length_required', 'Send the request body with a Content-Length')
+        if not re.fullmatch(r'[0-9]{1,12}', header.strip()):
+            raise invalid('Invalid Content-Length')
+        length = int(header.strip())
+        large = max(self.max_body, DESIGN_BODY_BYTES)
+        allowed = large if key is None or design_documents.is_design_key(key) else self.max_body
+        if length > allowed:
+            raise HttpError(413, 'payload_too_large', 'Request body exceeds the configured limit')
+        body = self._read_exact(length) if length else b''
+        self._body_unread = False
+        self._linger_cap = None
+        payload = self._json_body(body) if body else None
+        named = key if key is not None else (payload or {}).get('key')
+        if length > self.max_body and not design_documents.is_design_key(named):
+            raise HttpError(413, 'payload_too_large', 'Request body exceeds the configured limit')
+        try:
+            self._body_hash = request_hash(payload)
+        except UnicodeEncodeError:
+            raise invalid('The request holds text that is not valid Unicode (half of a surrogate pair)') from None
+        ctx.payload = payload
+        ctx.body_hash = self._body_hash
+
+    def _read_exact(self, length):
+        self._continue()
+        if not getattr(self, '_guarded', False):
+            body = self.rfile.read(length)
+        else:
+            self.server.watch(self.connection, self.server.client_seconds)
+            try:
+                body = self.rfile.read(length)
+            except OSError:
+                body = b''
+            finally:
+                self.server.unwatch(self.connection)
+        if len(body) < length:
+            raise ConnectionAbortedError('the request body did not arrive')
+        return body
+
+    def _json_body(self, body):
+        content_type = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+        if content_type != 'application/json':
+            raise unsupported('Content-Type must be application/json')
+        try:
+            payload = record_json.loads(body)
+        except (ValueError, UnicodeError):
+            raise invalid('Request body is not valid JSON')
+        if not isinstance(payload, dict):
+            raise invalid('Request body must be a JSON object')
+        return payload
 
     def _read_request(self, method, anonymous, params, csrf, request_id, stream=False):
         body = b'' if stream else self._read_body()
@@ -5997,7 +6085,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # A retry of a file already attached under this name: answered from the record,
                 # without reading the body again (design 3a: an idempotent 200).
                 known = task_files.read_entry(project, tid, expected)
-                if known is not None and known.get('withdrawn') is None and known['name'] == name and \
+                # kittrial-5bb.418 review r2 (N1): a design document's entry is not an attached file.
+                if known is not None and known.get('withdrawn') is None and known.get('direction') != task_files.DESIGN \
+                        and known['name'] == name and \
                         task_files.blob_size(project, expected) == known['bytes']:
                     return 200, dict(task_files.view(known), replayed=True)
             task_files.check_room(project, tid, length, limit)
@@ -10801,10 +10891,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                        'admin.py requirement-apply.' % label)
 
     # -- reference and capability records over the web (kittrial-5bb.213) -----
+    # kittrial-5bb.418: `document` is the Markdown text of a design.<scope> revision's repo-document.
     REF_PROPOSE_FIELDS = ('key', 'revision', 'expected_sha256', 'title', 'statement', 'authority',
-                          'owner', 'review_by', 'tags', 'decisions')
+                          'owner', 'review_by', 'tags', 'decisions', 'document')
     REF_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'title', 'statement',
-                         'authority', 'owner', 'review_by', 'tags', 'decisions')
+                         'authority', 'owner', 'review_by', 'tags', 'decisions', 'document')
     REF_ACCEPT_FIELDS = ('key', 'revision', 'expected_revision', 'record_sha256', 'expected_sha256',
                          'acceptance_state', 'acceptance', 'decision', 'evidence', 'decision_id',
                          'owners', 'approvers', 'policy', 'unverified_pointer_reason')
@@ -11076,6 +11167,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         needed = CAP_COORDINATE if coordinator else CAP_RECORDS
         self._project(ctx, needed)
         self._require_record_membership(ctx, coordinator=coordinator)
+        if route_name in ('references.propose', 'references.revise'):
+            # kittrial-5bb.418: the body is read only now, after the capability and the role passed.
+            self._read_deferred_body(ctx, ctx.params.get('key') if key_param else None)
         fields, operation_id = self._proposal_body(ctx, allowed_fields, where)
         pid = ctx.params['pid']
         if key_param and 'key' in fields and fields['key'] != ctx.params['key']:

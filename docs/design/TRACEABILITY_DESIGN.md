@@ -580,6 +580,17 @@ of a kittrial-sized export, as the context index did for find.
    - `trace --verify` with the verifiers list, and `design-drift` and `unverified` states.
    - The design page on the web, rendered as text.
    - Tests: the §7 rows for upload, index and drift.
+   - **As built, part 1 (kittrial-5bb.418): upload, index, acceptance.** The authority is a new
+     type, `repo-document`, inside a `reference-entry-v3` record (a `sha256` added to the v1
+     `repo-path` type would make an older kit read the entry malformed; inside v3 it reads
+     `unsupported`). New `design.<scope>` entries must use it. The document travels in the
+     propose or revise itself (the HTTP body's `document`, read only after the route's authority
+     checks with a 1.5 MiB cap from Content-Length; the client's `--document-from-git`, from git's
+     object at the pinned commit). Its bytes are a task-file entry of direction `design` on the
+     anchor, so backup, verify and the byte limit count them and purge keeps them. The index is a
+     function of the bytes, key, path and commit, so revisions that pin one document share it and
+     an accepted revision keeps its own. Part 2 builds `trace --verify`, the design page and
+     `unknown-section`.
 4. **The trace read on the server, and the Coverage panel.**
    - `GET /trace` and the endpoint action, all six views, bounds, permission before counts, the
      no-design case.

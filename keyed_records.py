@@ -402,8 +402,15 @@ def prior_state(prior, digest, actor):
                      'operator reconcile it.')
 
 
+class UncertainOutcome(ValueError):
+    """A native write that did not confirm (kittrial-5bb.418 review b1): its outcome is unknown.
+
+    A ValueError, so every caller that refuses on ValueError still does; a caller that must tell an
+    uncertain write from a refusal checks this type, never the message, which can carry caller text."""
+
+
 def uncertain(message, action, spec):
-    return ValueError('%s The native %s did not confirm; the outcome is uncertain, so this operation ID stays '
+    return UncertainOutcome('%s The native %s did not confirm; the outcome is uncertain, so this operation ID stays '
                       'pending. Inspect native state and complete it with %s before '
                       'retrying.' % (message, action, spec.reconcile_command))
 

@@ -239,6 +239,11 @@ TASK_FILE_WITHDRAWN_PREFIX = 'Kind: task-file-withdrawn-v1\n'
 # entry (``<project>/.delegations/``), so one planted where the prefix is not reserved (an
 # older kit) grants nothing. Not a record-anchor family: every surface reads it as a comment.
 DELEGATION_PREFIX = 'Kind: delegation-v1\n'
+# kittrial-5bb.418 (TRACEABILITY_DESIGN §5.1 step 2). The index of a design document, derived by
+# the server from the stored bytes and written by the propose or revise of a design.<scope>
+# reference entry (design_documents). Reserved, every version, so no raw `comments add` can plant
+# one; acceptance re-derives it from the bytes and refuses when a differing one is on the anchor.
+DESIGN_INDEX_PREFIX = 'Kind: design-index-v1\n'
 
 RESERVED = (
     (TASK_ASSIGNMENT_PREFIX, 'task assignment notice', 'the dedicated coordinate assignment operation'),
@@ -282,6 +287,8 @@ RESERVED = (
     (DELEGATION_PREFIX, 'delegation record',
      "the delegations route (a person owner's web session) or admin.py delegation-record on the "
      'coordination host'),
+    (DESIGN_INDEX_PREFIX, 'design document index',
+     'ref propose|revise of a design.<scope> entry with its document (the server writes the index)'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
@@ -942,7 +949,7 @@ RECORD_ANCHOR_LABELS = frozenset(RECORD_ANCHOR_FAMILIES)
 RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: proposal-disposition-', 'Kind: contribution-settings-',
                            'Kind: capability-', 'Kind: open-item-', 'Kind: item-resolution-',
-                           'Kind: owner-answer-', 'Kind: coordinator-decision-')
+                           'Kind: owner-answer-', 'Kind: coordinator-decision-', 'Kind: design-index-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
 SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3)})

@@ -134,7 +134,7 @@ class RecordVersionTests(AttestationCase):
         with self.assertRaisesRegex(ValueError, 'review_by must be at most 6 months after authority.observed '
                                                 r'\(2027-03-20\)'):
             self.propose(**attested(review_by='2027-03-21'))
-        with self.assertRaisesRegex(ValueError, 'authority.type must be repo-path, url, attestation or decision'):
+        with self.assertRaisesRegex(ValueError, 'authority.type must be repo-path, url, attestation, decision or repo-document'):
             self.propose(**attested(authority={'type': 'rumour'}))
         self.assertEqual(self.native.writes(), [])
         # The edge is allowed: review on the last day of the window, and an optional source.

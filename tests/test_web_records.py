@@ -109,6 +109,114 @@ def _valid_cap_results(passed=True):
 class _RecordsScenarioMixin:
     """Shared scenario assertions run against both the strict canonical endpoint and real bd."""
 
+    # -- kittrial-5bb.418: a design document over HTTP (TRACEABILITY_DESIGN §5.1; Q2's conditions) -------
+
+    def _design_body(self, text, key='design.web-design'):
+        import hashlib
+        body = _valid_ref_propose(key=key, title='Web design', statement='The selected web design.')
+        body['authority'] = {'type': 'repo-document', 'path': 'docs/design/WEB.md', 'commit': 'b' * 40,
+                             'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest()}
+        body['document'] = text
+        return body
+
+    def _raw(self, harness, path, headers, body=b'', close_write=False, wait=10):
+        """One hand-written request: answers None when the server closed without answering."""
+        import socket
+        lines = ['POST %s HTTP/1.1' % path, 'Host: 127.0.0.1'] + ['%s: %s' % item for item in headers.items()]
+        connection = socket.create_connection(('127.0.0.1', harness.port), timeout=wait)
+        try:
+            connection.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode('ascii') + body)
+            if close_write:
+                connection.shutdown(socket.SHUT_WR)
+            received = b''
+            while True:
+                try:
+                    piece = connection.recv(65536)
+                except (ConnectionResetError, socket.timeout):
+                    break
+                if not piece:
+                    break
+                received += piece
+                if b'\r\n\r\n' in received:
+                    head, _, rest = received.partition(b'\r\n\r\n')
+                    length = [int(line.split(b':', 1)[1]) for line in head.split(b'\r\n')
+                              if line.lower().startswith(b'content-length:')]
+                    if length and len(rest) >= length[0]:
+                        break
+        finally:
+            connection.close()
+        if not received:
+            return None
+        return int(received.split(b' ', 2)[1])
+
+    def run_design_document_suite(self):
+        harness = self.harness
+        people = self._setup_actors(harness)
+        path = f'/v1/projects/{self.pid}/references'
+        text = '<!-- design-v1\r\nscope: web-design\r\nstatus: candidate\r\n-->\r\n# Web design\r\n\r\n## Plan phase 1\r\n'
+
+        def auth(name):
+            return {'Authorization': 'Bearer ' + people[name]['token']}
+
+        big = 2 * 1024 * 1024
+        # Q2: the larger body is never read for an anonymous or under-privileged caller. The server answers
+        # from the headers alone (the body is never sent here), so it read nothing.
+        self.assertEqual(self._raw(harness, path, {'Content-Type': 'application/json',
+                                                   'Content-Length': str(1024 * 1024)}), 401)
+        self.assertEqual(self._raw(harness, path, dict(auth('viewer'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(1024 * 1024)})), 403)
+        # A contributor past the role check: over DESIGN_BODY_BYTES is refused before a byte is read.
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(big)})), 413)
+        # A revise of a key that is not a design entry may not send more than the normal limit.
+        self.assertEqual(self._raw(harness, path + '/kit.guide/revisions', dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(300 * 1024)})), 413)
+        # Content-Length is required, digits only; chunked transfer is refused.
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{'Content-Type': 'application/json'})), 411)
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': '+12'}), b'{}' * 6), 422)
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': '12abc'}), b'{}' * 6), 422)
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked'}), b'0\r\n\r\n'), 422)
+        # A body over the normal limit whose key is not a design entry is refused once read.
+        plain = _valid_ref_propose(key='kit.padded', statement='s')
+        plain['title'] = 'x' * 10
+        raw = json.dumps(dict(plain, decisions=[]) | {'tags': ['ops']}).encode('utf-8')
+        padded = raw[:-1] + b' ' * (300 * 1024) + b'}'
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(len(padded))}), padded), 413)
+        # A Content-Length shorter than the body: the cut body is not JSON.
+        good = json.dumps(self._design_body(text)).encode('utf-8')
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(len(good) - 10)}), good), 422)
+        # A Content-Length longer than the body: the client went away; nothing is answered or written.
+        self.assertIsNone(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(len(good) + 100)}), good, close_write=True))
+        self.assertEqual(harness.request('GET', path + '/design.web-design', token=people['coord1']['token']).status,
+                         404)
+        # The design document itself, over 256 KiB of JSON and well under 1.5 MiB, by a contributor.
+        long_text = text + ('word ' * 70000) + '\r\n'
+        proposed = harness.request('POST', path, self._design_body(long_text), token=people['contrib']['token'],
+                                   key='design-web-1')
+        self.assertEqual(proposed.status, 201, proposed.data)
+        self.assertEqual(proposed.data['document']['bytes'], len(long_text.encode('utf-8')))
+        # The idempotency receipt binds the body read by the route: the same key with another document is refused.
+        again = harness.request('POST', path, self._design_body(long_text + 'more\r\n'),
+                                token=people['contrib']['token'], key='design-web-1')
+        self.assertGreaterEqual(again.status, 400, again.data)
+        draft = harness.request('GET', path + '/design.web-design', token=people['coord1']['token'])
+        self.assertEqual(draft.status, 200, draft.data)
+        accepted = harness.request('POST', path + '/design.web-design/accept',
+                                   {'expected_revision': 1, 'record_sha256': proposed.data['sha256'],
+                                    'evidence': 'Read the stored design document.'},
+                                   token=people['coord2']['token'], key='design-web-accept')
+        self.assertEqual(accepted.status, 200, accepted.data)
+        # A viewer may not propose one even with a small body (the role, as for every reference write).
+        small = harness.request('POST', path, self._design_body(text, key='design.other-web'),
+                                token=people['viewer']['token'], key='design-viewer')
+        self.assertEqual(small.status, 403, small.data)
+
     def _setup_actors(self, harness):
         owner = self.owner_token
         people = {}
@@ -1381,6 +1489,9 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
     def test_delegated_record_acceptance(self):
         self.run_delegation_suite()
 
+    def test_design_document_upload_and_its_body_limits(self):
+        self.run_design_document_suite()
+
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
@@ -1412,6 +1523,10 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_self_acceptance_and_approval_by_another_party(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_self_acceptance_and_party_rules_suite()
+
+    def test_native_design_document_upload_and_its_body_limits(self):
+        self.deployment(operators=['ops'], coordinator_writes=True)
+        self.run_design_document_suite()
 
 
 

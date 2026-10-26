@@ -4042,6 +4042,7 @@ number keeps its default, with a warning in the service's log:
 | `max_transfers_per_project` | 3 (one project's share of `max_transfers`) | `503` with `Retry-After` |
 | `min_transfer_bytes_per_second` | 32 KiB | `408` for an upload; a download is cut off |
 | `transfer_grace_seconds` | 60 | (added to the time above) |
+| `max_design_documents` | 200 | `422`: a project holds at most this many distinct design documents (kittrial-5bb.418); they count toward `max_project_bytes` too |
 
 A reverse proxy in front of the site has its own body limit (nginx `client_max_body_size`);
 raise it to `max_file_bytes`, or uploads near the limit are cut by the proxy.
@@ -4066,6 +4067,17 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
 | `GET /v1/projects/{id}/delegations` | `projects.read` | any member: the delegations recorded in the project, in force or not, and which agents holding the coordinator grant they cover |
 | `POST /v1/projects/{id}/delegations` | `project.admin` | only a person `owner` of the project signed in to the web (its own session); never an agent or worker credential, a coordinator, or a superuser without the owner role (`403`) |
 
+- **A design document travels with its reference revision** (kittrial-5bb.418). The propose and
+  revise routes take a `document` field (the Markdown text) for a `design.<scope>` entry with a
+  `repo-document` authority ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)). Their body is
+  read by the route itself, only after authentication, the `records` capability and the membership
+  role have passed; until then nothing beyond the normal limit is read (a refused request's body is
+  drained for a clean close up to 256 KiB at most). Content-Length is then required (`411` without it;
+  chunked transfer and a Content-Length that is not digits are refused, `422`) and checked before a
+  byte is read: at most 1.5 MiB, or the normal `max_body` (256 KiB) for a revise of a key that is not a
+  design entry (`413`). A propose over 256 KiB whose body names a key that is not a design entry is
+  refused once read (`413`). A body shorter than its Content-Length is a client that went away: nothing
+  is written or answered. These two routes always end the connection with their answer.
 - **A superuser without membership in the project is refused (`403`) on every write route.**
   `http_authority.decide()` has no separate superuser path for `coordinate` or `records`, and
   both the web service and `endpoint.py` require the caller's account to be a member of the

@@ -206,7 +206,7 @@ class NoUnguardedParseTests(unittest.TestCase):
                            'a damaged, unreadable or nested file is caught and read as the restrictive '
                            '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
                            'permissive default'),
-        'client.py': (16, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
+        'client.py': (17, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
                          'kittrial-5bb.285 added the wait read\'s answer from the endpoint (and wait\'s --config read, '
                          'which kittrial-5bb.373 merged with main()\'s --config read into one parse after delivery; '
                          "neither is a record comment or a caller's payload). The twelfth (kittrial-5bb.327 "
@@ -214,7 +214,9 @@ class NoUnguardedParseTests(unittest.TestCase):
                          'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
                          'treated as absent. The last three (kittrial-5bb.384) are the `files` command\'s reads of the endpoint\'s own answer line '
                          'and of the file record inside it, on the caller\'s machine; kittrial-5bb.402 adds the '
-                         'validate command\'s read of the endpoint\'s validation result'),
+                         'validate command\'s read of the endpoint\'s validation result; kittrial-5bb.418 adds '
+                         'ref propose|revise --document-from-git\'s read of the caller\'s own entry file, on the '
+                         'caller\'s machine, before it is sent as the --file attachment the endpoint parses itself'),
         'coordination.py': (7, 'bd output'),
         'endpoint.py': (6, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
                            'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own); the sixth '
@@ -371,7 +373,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # http_authority reads the operation of an attached review record through the guard,
             # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
             # lifecycle.py also guards exported correction payloads in its offline reader.
-            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 4, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
+            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 5, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
             # The simple owner adapter guards bd's decision-create receipt too. The third
             # (kittrial-5bb.388) guards the service-only room-decision payload the route
             # transports (room, item number, title, text and pointer) before it is used.
