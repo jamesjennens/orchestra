@@ -367,6 +367,22 @@ class _RecordsScenarioMixin:
         # The route refuses an over-long page itself, before the endpoint is asked.
         self.assertEqual(get(viewer, view='tokens', limit='51').data['error']['message'],
                          'limit must be between 1 and 50')
+        # Review b2: the reviewer's shape, 10 tasks of 1,000 distinct req: tokens, through the route (it took
+        # 8.4-8.9 s per read before; now one ledger validation per answer and at most 2,000 tokens resolved).
+        import time
+        for number in range(10):
+            planted = harness.request('POST', f'/v1/projects/{pid}/tasks',
+                                      {'title': 'Planted %d' % number,
+                                       'description': ' '.join('req:R01@%d' % (number * 1000 + k + 1)
+                                                               for k in range(1000))},
+                                      token=self.owner_token)
+            self.assertEqual(planted.status, 201, planted.data)
+        started = time.perf_counter()
+        heavy = get(viewer, view='tokens')
+        elapsed = time.perf_counter() - started
+        self.assertEqual(heavy.status, 200, heavy.data)
+        self.assertIn('distinct tokens not checked', heavy.data['coverage']['text'])
+        self.assertLess(elapsed, 5.0)
         summary = get(viewer)
         self.assertEqual(summary.status, 200, summary.data)
         self.assertEqual([line['view'] for line in summary.data['rows']],
