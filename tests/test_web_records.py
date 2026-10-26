@@ -43,13 +43,16 @@ Covers:
      explicitly (`checkout_validated: False` on web acceptance and web attestation because the web service
      has no repository checkout; `verification_state: 'attested'`, `trusted: False`, `attested: True`).
 """
+import datetime
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(KIT), str(KIT / 'tests')]
@@ -65,6 +68,11 @@ from test_coordinator_rules_endpoint import RulesHelpers
 STRICT_ENDPOINT = KIT / 'tools' / 'strict_canonical_endpoint.py'
 
 
+def _review_by():
+    today = datetime.date(*time.gmtime()[:3])
+    return (today + datetime.timedelta(days=365)).isoformat()
+
+
 def _valid_ref_propose(key='kit.guide', title='Kit Guide', statement='Operational guide for the kit.'):
     return {
         'key': key,
@@ -72,7 +80,7 @@ def _valid_ref_propose(key='kit.guide', title='Kit Guide', statement='Operationa
         'statement': statement,
         'authority': {'type': 'repo-path', 'path': 'docs/OPERATIONS.md', 'commit': 'a' * 40},
         'owner': 'person:maintainer',
-        'review_by': '2026-12-31',
+        'review_by': _review_by(),
         'tags': ['ops'],
         'decisions': [],
     }
@@ -1563,6 +1571,12 @@ class WebRecordsScreenTests(unittest.TestCase):
         completed = subprocess.run(
             [node, str(script)], cwd=str(KIT), capture_output=True, text=True, encoding='utf-8', timeout=30)
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+
+class ReviewByFixtureTests(unittest.TestCase):
+    def test_review_by_is_one_year_after_the_utc_date(self):
+        with patch('time.gmtime', return_value=time.struct_time((2028, 10, 25, 12, 0, 0, 3, 299, 0))):
+            self.assertEqual(_review_by(), '2029-10-25')
 
 
 if __name__ == '__main__':
