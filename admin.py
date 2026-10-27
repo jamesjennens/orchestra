@@ -1040,6 +1040,45 @@ LIFECYCLE_VOID_AUDIT_KEY = 'lifecycle_void_writes_audit'
 LIFECYCLE_VOID_AUDIT_MAX = 20
 
 
+#: The installation switches that refuse a web write while off (kittrial-5bb.434): the name, the writes it
+#: lets through, and the operator command that turns it on. Read by `installation_switches` for the web.
+INSTALLATION_SWITCHES = (
+    ('review_workflow_writes',
+     'the newer review operations: withdraw, request-review, resolve-item, decline-review, an item severity and a '
+     'request-changes summary',
+     'admin.py review-writes on --actor OPERATOR'),
+    ('checkpoint_provenance_writes',
+     'checkpoints written with their retained provenance, so the directions given on a task can be resolved',
+     'admin.py checkpoint-provenance-writes on --actor OPERATOR'),
+    ('web_lifecycle_mark_writes',
+     'the integration mark from the web: recording integrated as passed on a task',
+     'admin.py web_lifecycle_mark_writes on --actor OPERATOR'),
+)
+
+
+def installation_switches(root):
+    """Each web-write switch's name, state (`on`, `off` or `unreadable`), what it unlocks and the operator
+    command (kittrial-5bb.434). The state is the one the writers themselves read, through their own readers;
+    nothing here can change a switch, and no path, value or actor is returned."""
+    from briefing import checkpoint_writes_enabled
+    import contextlib
+    import io
+    readers = {'review_workflow_writes': lambda: review_workflow_writes(root, warnings=[]),
+               'checkpoint_provenance_writes': lambda: checkpoint_writes_enabled(root),
+               'web_lifecycle_mark_writes': lambda: web_lifecycle_mark_writes(root)}
+    items = []
+    for name, unlocks, command in INSTALLATION_SWITCHES:
+        try:
+            # A reader that warns on a malformed value prints to stderr; the state it returns is what counts.
+            with contextlib.redirect_stderr(io.StringIO()):
+                value = readers[name]()
+            state = 'on' if value is True else 'off'
+        except (ValueError, OSError):
+            state = 'unreadable'
+        items.append({'name': name, 'state': state, 'unlocks': unlocks, 'command': command})
+    return items
+
+
 def web_lifecycle_mark_writes(root):
     """Separate installation-only gate; no upgrade or VOID switch enables it."""
     value = config(root).get('web_lifecycle_mark_writes', False)

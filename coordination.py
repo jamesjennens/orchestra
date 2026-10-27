@@ -27,6 +27,8 @@ from requirements import content_hash, load_json
 # documentation hint, appended to an error when native validation itself reports
 # missing sections; it is not a gate and must not refuse a text bd accepts.
 REQUIRED_SECTIONS = {'decision': ('Decision', 'Rationale', 'Alternatives Considered')}
+#: The types create-child files (kittrial-5bb.434: the web route takes exactly this list; no epic).
+CHILD_TYPES = ('task', 'bug', 'feature', 'chore', 'decision')
 # A receipt in one of these states may be replaced under the same request ID by
 # its original actor, or by any actor after an explicit operator release.
 RELEASABLE = ('failed', 'released')
@@ -513,7 +515,7 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
             if is_merge_slot(parent):raise ValueError(merge_slot_sentence(parent.get('id'))+'; it takes no child')
         if not isinstance(p['title'],str) or not p['title'].strip() or not isinstance(p['description'],str):raise ValueError('Child needs title and description')
         if len(p['description'])>DESCRIPTION_MAX:raise ValueError(DESCRIPTION_TOO_LONG)
-        if p['type'] not in ('task','bug','feature','chore','decision'):raise ValueError('Invalid child type')
+        if p['type'] not in CHILD_TYPES:raise ValueError('Invalid child type')
         if 'assignee' in p and not isinstance(p['assignee'],str):raise ValueError('Child assignee must be text')
         identity=content_hash({'request_id':p['request_id']})
         digest=content_hash({'actor':actor,'payload':p})

@@ -436,6 +436,9 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     hasCsrf: () => Boolean(csrf),
     assignmentRoster: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/assignment-roster`, { params }),
     assignTask: (pid, tid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/assign`, body),
+    // kittrial-5bb.434: a child task by a coordinator, and the installation switches (read only)
+    createChild: (pid, tid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/tasks/${encodeURIComponent(tid)}/children`, body),
+    switches: (pid) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/switches`),
     async logout() {
       // A page that is signing out stops its keep-alive loops first (kittrial-5bb.330).
       for (const stop of [...keepAliveStops]) stop();
