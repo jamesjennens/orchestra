@@ -133,20 +133,11 @@ def matches(entry, project, row):
 def _regular_bytes(path):
     if path.is_symlink():
         raise ValueError('Web lifecycle mark is a symlink')
-    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0))
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RECORD_BYTES:
-            raise ValueError('Web lifecycle mark is not a bounded regular file')
+    def validate(info):
         if os.name != 'nt' and stat.S_IMODE(info.st_mode) & 0o022:
             raise ValueError('Web lifecycle mark member is group- or world-writable')
-        with os.fdopen(fd, 'rb', closefd=False) as stream:
-            data = stream.read(MAX_RECORD_BYTES + 1)
-        if len(data) > MAX_RECORD_BYTES:
-            raise ValueError('Web lifecycle mark exceeds byte bound')
-        return data
-    finally:
-        os.close(fd)
+    from admin import read_regular_text
+    return read_regular_text(path, limit=MAX_RECORD_BYTES, raw=True, validate=validate)
 
 
 def read_journal(project):

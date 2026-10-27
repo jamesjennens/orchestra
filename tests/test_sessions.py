@@ -1,6 +1,8 @@
 import io
 from void_test_helpers import without_void_tracker
 import json
+import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -13,6 +15,27 @@ import client
 import admin
 import worker
 
+
+class BlockingReadTimeout(Exception):
+    pass
+
+
+def bounded(call):
+    previous = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(BlockingReadTimeout()))
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def make_fifo(case, path):
+    if not hasattr(os, 'mkfifo'):
+        case.skipTest('mkfifo is unavailable')
+    os.mkfifo(path)
+
+
 class SessionTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
@@ -20,6 +43,26 @@ class SessionTests(unittest.TestCase):
         self.export=Mock(return_value='')
     def register(self,name='Worker',rid=None):
         return sessions.execute(self.path,'example',['register','--name',name,'--request-id',rid or str(uuid.uuid4())],self.export)
+
+    def test_regular_file_registry_missing_damaged_and_valid_classifications(self):
+        target = self.path / '.sessions.json'
+        self.assertEqual({'schema_version': 1, 'records': {}}, sessions.read_registry(self.path))
+        target.write_text('{bad', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            sessions.read_registry(self.path)
+        target.write_text('{"schema_version":1,"records":{}}', encoding='utf-8')
+        self.assertEqual({'schema_version': 1, 'records': {}}, sessions.read_registry(self.path))
+
+    def test_fifo_and_nonregular_registry_never_block_and_fail_closed(self):
+        target = self.path / '.sessions.json'
+        make_fifo(self, target)
+        with self.assertRaises(ValueError):
+            bounded(lambda: sessions.read_registry(self.path))
+        target.unlink()
+        target.mkdir()
+        with self.assertRaises(ValueError):
+            sessions.read_registry(self.path)
+
     def test_same_readable_name_gets_distinct_actors(self):
         a=self.register();b=self.register()
         self.assertNotEqual(a['session']['actor'],b['session']['actor'])

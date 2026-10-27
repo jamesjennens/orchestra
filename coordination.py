@@ -17,7 +17,8 @@ import secrets
 import stat
 import time
 from pathlib import Path
-from requirements import content_hash, load_json
+from regular_file import read_regular_text
+from requirements import _fail, _unique_object, canonical_bytes, content_hash, load_json
 
 
 # Native `bd create --validate` enforces the type templates, and the identical
@@ -69,11 +70,28 @@ def _unique_temporary(path):
             continue
     raise OSError('Could not create a unique temporary file beside %s; nothing was written'%path)
 
+def _load_host_json(path):
+    """Load a coordination journal with the manifest reader's JSON contract."""
+    try:
+        payload=read_regular_text(path,raw=True)
+    except (OSError, ValueError) as exc:
+        detail = exc.strerror or exc if isinstance(exc, OSError) else exc
+        _fail('cannot read %s: %s'%(path,detail))
+    try:
+        result=record_json.loads(payload.decode('utf-8'),object_pairs_hook=_unique_object)
+        canonical_bytes(result)
+        return result
+    except UnicodeDecodeError:
+        _fail('cannot read %s: not valid UTF-8'%path)
+    except json.JSONDecodeError as exc:
+        _fail('cannot parse %s as JSON: %s'%(path,exc))
+
+
 def _same_bytes(path,payload):
     """Whether ``path`` already holds exactly ``payload`` (a lost-race target)."""
     if path.is_symlink():return False
-    try:return path.read_text(encoding='utf-8')==payload
-    except (OSError,UnicodeError):return False
+    try:return read_regular_text(path)==payload
+    except (OSError,UnicodeError,ValueError):return False
 
 def _discard(tmp):
     try:tmp.unlink()
@@ -290,7 +308,7 @@ def reconcile_request(project, request_id, actor, reason, disposition, run, at=N
     identity=content_hash({'request_id':request_id})
     receipt=project/'.coordination-requests'/(identity+'.json')
     if not receipt.exists():raise ValueError('No coordination request reservation exists for that request ID')
-    prior=load_json(receipt)
+    prior=_load_host_json(receipt)
     if not isinstance(prior,dict) or not isinstance(prior.get('status'),str):
         raise ValueError('Malformed coordination request receipt; inspect before reconciling')
     audit=prior.get('reconciliation') or {}
@@ -519,7 +537,7 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         digest=content_hash({'actor':actor,'payload':p})
         journal=project/'.coordination-requests';journal.mkdir(exist_ok=True)
         receipt=journal/(identity+'.json')
-        prior=load_json(receipt) if receipt.exists() else None
+        prior=_load_host_json(receipt) if receipt.exists() else None
         reusable=resubmittable(prior,actor)
         if prior and prior['sha256']!=digest and not reusable:raise ValueError('Request ID already reserved for different content or actor')
         label='request:'+identity
@@ -649,7 +667,7 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         if isinstance(state,dict) and state.get('error'):detail=' (%s)' % state['error']
         raise ValueError('Merge slot does not exist for this project%s; run the merge-create operation to create it before checking, acquiring or releasing' % detail)
     if merge_slot_damaged(state):raise ValueError(SLOT_DAMAGED)
-    context=load_json(context_path) if context_path.exists() else None
+    context=_load_host_json(context_path) if context_path.exists() else None
     if op=='merge-check':
         state['context']=context if context and context['holder']==state.get('holder') else None
         return state

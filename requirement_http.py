@@ -21,7 +21,7 @@ import requirement_terminal as terminal
 import record_json
 from coordination import atomic, identifier
 from http_authority import REQUIREMENT_EDITOR_REFUSED
-from requirements import canonical_bytes, content_hash, load_json
+from requirements import canonical_bytes, content_hash
 
 JOURNAL = '.requirement-owner-requests'
 RECOVERY_READ_ERROR = 'Requirement operation receipt is unreadable. Ask the host operator to reconcile it.'
@@ -65,26 +65,20 @@ def read_owner_receipt(path, missing=False):
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode):
             raise ValueError(RECOVERY_READ_ERROR)
-        flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0)
-        flags |= getattr(os, 'O_NOFOLLOW', 0)
-        fd = os.open(path, flags)
+        def validate(opened):
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError(RECOVERY_READ_ERROR)
+        from admin import read_regular_text
+        payload = read_regular_text(path, limit=1024 * 1024, raw=True, validate=validate)
     except FileNotFoundError:
         if missing:
             return None
         raise ValueError(RECOVERY_READ_ERROR) from None
-    except OSError:
+    except (OSError, ValueError):
         # Classify an unreadable receipt before the guarded effect can mistake
         # the filesystem exception for an uncertain canonical write.
         raise ValueError(RECOVERY_READ_ERROR) from None
     try:
-        with os.fdopen(fd, 'rb') as handle:
-            opened = os.fstat(handle.fileno())
-            if (not stat.S_ISREG(opened.st_mode)
-                    or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)):
-                raise ValueError(RECOVERY_READ_ERROR)
-            payload = handle.read(1024 * 1024 + 1)
-        if len(payload) > 1024 * 1024:
-            raise ValueError(RECOVERY_READ_ERROR)
         receipt = record_json.loads(payload.decode('utf-8'), object_pairs_hook=_unique_object)
         canonical_bytes(receipt)
         return validate_receipt(receipt)

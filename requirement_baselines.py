@@ -68,22 +68,17 @@ def _read(path, limit, missing=False):
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or _reparse(info):
             raise ValueError(REPAIR)
-        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
-        fd = os.open(path, flags)
-        with os.fdopen(fd, 'rb') as handle:
-            opened = os.fstat(handle.fileno())
-            if (not stat.S_ISREG(opened.st_mode) or _reparse(opened)
+        def validate(opened):
+            if (_reparse(opened)
                     or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)):
                 raise ValueError(REPAIR)
-            raw = handle.read(limit + 1)
-        if len(raw) > limit:
-            raise ValueError(REPAIR)
-        return raw
+        from admin import read_regular_text
+        return read_regular_text(path, limit=limit, raw=True, validate=validate)
     except FileNotFoundError:
         if missing:
             return None
         raise ValueError(REPAIR) from None
-    except OSError:
+    except (OSError, ValueError):
         raise ValueError(REPAIR) from None
 
 

@@ -1063,7 +1063,7 @@ class AnchoredKind:
         with lock():
             journal = core.journal_dir(project, self.journal)
             receipt = core.receipt_path(journal, identity, self.noun)
-            prior = load_json(receipt) if receipt.exists() else None
+            prior = core.read_host_json(receipt) if receipt.exists() else None
             if prior is not None and (prior.get('sha256') != digest or prior.get('operation') != 'apply-batch'):
                 raise ValueError('Operation ID already used for a different batch; a changed list needs a new '
                                  'operation ID.')
@@ -1094,7 +1094,7 @@ class AnchoredKind:
         """One batch item, under one hold of the coordination lock."""
         operation_id = item_operation_id(payload['operation_id'], item['key'])
         item_receipt = core.receipt_path(journal, content_hash({'operation_id': operation_id}), self.noun)
-        done = load_json(item_receipt) if item_receipt.exists() else None
+        done = core.read_host_json(item_receipt) if item_receipt.exists() else None
         if isinstance(done, dict) and done.get('status') == 'complete':
             try:
                 self.require_unique_key(self.read_key_rows(run, item['key']), item['key'])
@@ -1266,7 +1266,7 @@ class AnchoredKind:
             if identity is None or not SHA256_TEXT.match(identity) or not journal.is_dir() or journal.is_symlink():
                 continue
             receipt = core.receipt_path(journal, identity, self.noun)
-            prior = load_json(receipt) if receipt.exists() else None
+            prior = core.read_host_json(receipt) if receipt.exists() else None
             if not isinstance(prior, dict) or prior.get('status') != 'pending':
                 continue
             if prior.get('id') not in (None, issue_id):

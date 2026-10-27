@@ -111,22 +111,11 @@ def project_generation(root, name):
 
 def _read_no_follow(path):
     """The file's bytes, or ``None`` - opened without following a final symlink."""
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
     try:
-        descriptor = os.open(str(path), flags)
-    except OSError:
+        from admin import read_regular_text
+        return read_regular_text(path, raw=True)
+    except (OSError, ValueError):
         return None
-    try:
-        chunks = []
-        while True:
-            chunk = os.read(descriptor, 1 << 20)
-            if not chunk:
-                return b''.join(chunks)
-            chunks.append(chunk)
-    except OSError:
-        return None
-    finally:
-        os.close(descriptor)
 
 
 def _cache_directory(path):
@@ -288,17 +277,11 @@ def _header_key(cache):
     five concurrent reads SLOWER than the kit before the cache). The header is
     one short line by construction; a first chunk without a newline in it is not
     this format's file and answers ``None``."""
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
     try:
-        descriptor = os.open(str(cache / FILE_NAME), flags)
-    except OSError:
+        from admin import read_regular_text
+        chunk = read_regular_text(cache / FILE_NAME, prefix=4096, raw=True)
+    except (OSError, ValueError):
         return None
-    try:
-        chunk = os.read(descriptor, 4096)
-    except OSError:
-        return None
-    finally:
-        os.close(descriptor)
     if b'\n' not in chunk:
         return None
     import record_json

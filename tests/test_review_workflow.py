@@ -148,5 +148,26 @@ class ReviewWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'current contribution'):
             self.send(self.payload('approve', contribution='unknown', summary='Approved'), 'reviewer')
 
+    def test_host_revert_journal_delegates_and_preserves_the_exact_file_bound(self):
+        import tempfile
+        payload = dict(schema_version=1, operation=w.REVERT_OPERATION, operation_id='revert-1',
+                       task='task-1', contribution='c1', integration_commit='a' * 40,
+                       revert_commit='b' * 40, operator='ops', reason='Restore the prior release')
+        entry = w.revert_journal_entry(w.JOURNAL_REVERT, payload, 'c9', 'ops', task='task-1',
+                                      contribution='c1', integration_commit='a' * 40,
+                                      revert_commit='b' * 40)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / w.JOURNAL_DIR / (entry['sha256'] + '.json')
+            path.parent.mkdir()
+            raw = w.canonical_bytes(entry)
+            path.write_bytes(raw + b' ' * (w.JOURNAL_FILE_LIMIT - len(raw)))
+            reverts, retractions, invalid = w.host_revert_journal(root)
+            self.assertEqual((list(reverts), retractions, invalid), (['c9'], {}, []))
+            path.write_bytes(raw + b' ' * (w.JOURNAL_FILE_LIMIT + 1 - len(raw)))
+            self.assertEqual(w.host_revert_journal(root), ({}, {}, [w.JOURNAL_DIR + '/' + path.name]))
+            path.write_text('{"payload":{},"payload":{}}', encoding='utf-8')
+            self.assertEqual(w.host_revert_journal(root), ({}, {}, [w.JOURNAL_DIR + '/' + path.name]))
+
 
 if __name__ == '__main__': unittest.main()

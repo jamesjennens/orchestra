@@ -203,6 +203,18 @@ class EmptyWakeRecordTests(unittest.TestCase):
         self.assertLessEqual(len(entries), wake_log.MAX_ENTRIES)
         self.assertEqual(entries[-1]['task'], 't%d' % (wake_log.MAX_ENTRIES + 11))
 
+    def test_snapshot_regular_missing_damaged_and_bounded_controls(self):
+        snapshot = self.root / 'snapshot.json'
+        self.assertIsNone(wake_log._read_snapshot(snapshot))
+        snapshot.write_text('{not json', encoding='utf-8')
+        self.assertIsNone(wake_log._read_snapshot(snapshot))
+        snapshot.write_text(json.dumps({'schema': waiting.WAIT_STATE_SCHEMA,
+                                       'fingerprint': waiting.fingerprint([]), 'items': []}),
+                            encoding='utf-8')
+        self.assertEqual(wake_log._read_snapshot(snapshot)['items'], [])
+        snapshot.write_bytes(b' ' * (waiting.MAX_STATE_BYTES + 1))
+        self.assertIsNone(wake_log._read_snapshot(snapshot))
+
     def test_two_concurrent_writers_lose_nothing_and_duplicate_nothing(self):
         # Two waits by the same actor may run at once (an SSH wait and a bridge wait, or
         # a restarted client): the lane lock must make the read-modify-write one step.

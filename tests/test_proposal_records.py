@@ -1125,6 +1125,25 @@ class FromFeedbackTests(ProposalCase):
             pr.write(['revise', '--from-feedback', 'x', '@attachment:0'], {}, SUBMITTER, self.native, self.project,
                      OPS)
 
+    def test_host_feedback_and_session_reads_reject_duplicate_and_invalid_utf8(self):
+        entry = self.entry()
+        raw = self.feed.read_text(encoding='utf-8')
+        self.feed.write_text('{"entry_id":"duplicate",' + raw[1:], encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'does not validate'):
+            pr.feedback_origin(self.feed, entry['entry_id'])
+        self.feed.write_bytes(b'\xff')
+        with self.assertRaisesRegex(ValueError, 'does not validate'):
+            pr.feedback_origin(self.feed, entry['entry_id'])
+        sessions = self.project / '.sessions.json'
+        sessions.write_text('{"records":{},"records":{}}', encoding='utf-8')
+        self.assertEqual(pr.session_names(self.project), {})
+        sessions.write_bytes(b'\xff')
+        self.assertEqual(pr.session_names(self.project), {})
+        self.feed.write_text('', encoding='utf-8')
+        unicode_entry = self.entry('fb-unicode', body='first\u2028second\u0085third')
+        _, body = pr.feedback_origin(self.feed, unicode_entry['entry_id'])
+        self.assertEqual(body, unicode_entry['body'])
+
     def test_review_and_decide_stay_host_commands_without_http_authority(self):
         for command in ('review', 'decide'):
             with self.assertRaisesRegex(ValueError, 'is a host command'):

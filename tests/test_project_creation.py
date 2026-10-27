@@ -746,13 +746,13 @@ class UnopenableRecordTests(Operators):
         """A record whose every read fails, as a file owned by another user would."""
         path = self.records_dir() / (name + '.json')
         path.write_text(json.dumps({'project': name, 'by': ALICE, 'state': 'created'}), encoding='utf-8')
-        real = Path.read_text
+        real = os.open
 
-        def read_text(target, *args, **kwargs):
+        def refused(target, flags, *args, **kwargs):
             if Path(target) == path:
                 raise PermissionError(13, 'Permission denied', str(path))
-            return real(target, *args, **kwargs)
-        patcher = unittest.mock.patch.object(Path, 'read_text', read_text)
+            return real(target, flags, *args, **kwargs)
+        patcher = unittest.mock.patch.object(pc.os, 'open', refused)
         patcher.start()
         self.addCleanup(patcher.stop)
         return path

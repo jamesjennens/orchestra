@@ -371,6 +371,19 @@ class RecordTests(MissLogCase):
                                                      phrases={'merge slot': {'count': 1, 'first': T0,
                                                                              'last': T0}}))
 
+    def test_load_delegates_the_existing_bounded_regular_file_guard(self):
+        self.file.write_text(json.dumps(cm._fresh(T0)), encoding='utf-8')
+        real = admin.read_regular_text
+        calls = []
+        def read(path, **kwargs):
+            calls.append((path, kwargs))
+            return real(path, **kwargs)
+        with patch.object(admin, 'read_regular_text', side_effect=read):
+            log, state = cm.load(self.project)
+        self.assertEqual(state, 'ok')
+        self.assertTrue(cm._valid(log))
+        self.assertEqual(calls, [(self.file, {'limit': cm.FILE_BYTES_MAX, 'raw': True})])
+
     def test_an_oversized_file_is_not_read(self):
         self.file.write_bytes(b' ' * (cm.FILE_BYTES_MAX + 1))
         with patch.object(cm.os, 'fdopen', side_effect=AssertionError('read')), \

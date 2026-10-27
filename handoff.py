@@ -5,7 +5,15 @@ import re
 from datetime import datetime, timezone
 from coordination import atomic
 from field_limits import check_text
-from requirements import canonical_bytes, content_hash
+from requirements import _unique_object, canonical_bytes, content_hash
+
+
+def read_journal_json(path):
+    from admin import read_regular_text
+    value = record_json.loads(read_regular_text(path), object_pairs_hook=_unique_object)
+    canonical_bytes(value)
+    return value
+
 
 ACTOR=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}')
@@ -103,7 +111,7 @@ def request(path, actor, p):
     file=folder/(content_hash({'request_id':p['request_id']})+'.json')
     if file.is_symlink() or file.with_suffix('.tmp').is_symlink():raise ValueError('Invalid handoff request path')
     digest=content_hash(p)
-    record=json.loads(file.read_text(encoding='utf-8')) if file.exists() else None
+    record=read_journal_json(file) if file.exists() else None
     if record:
         validate_request_record(record)
         if record['digest']!=digest or record['requester']!=actor:raise ValueError('Handoff request ID reused with different content')
@@ -153,12 +161,12 @@ def disposition(path, actor, p, run, operator=False):
     if p['supersedes'] is not None and not UUID.fullmatch(p['supersedes']):raise ValueError('Invalid superseded request')
     file=_request_file(path,p['request_id'])
     if not file.exists():raise ValueError('Unknown handoff request')
-    record=json.loads(file.read_text(encoding='utf-8'));validate_request_record(record)
+    record=read_journal_json(file);validate_request_record(record)
     if p['task']!=record['task']:raise ValueError('Handoff disposition task does not match stored request')
     recovery_file=guarded_file(path,'.handoff-recoveries',content_hash({'request_id':p['request_id']})+'.json')
     identity=recovery_identity(p,actor,operator)
     if recovery_file.exists():
-        stored=json.loads(recovery_file.read_text(encoding='utf-8'))
+        stored=read_journal_json(recovery_file)
         validate_recovery(stored)
         if stored!=identity:
             raise ValueError('Handoff recovery disposition identity changed')
@@ -168,7 +176,7 @@ def disposition(path, actor, p, run, operator=False):
             return dict(record,reconciled=True)
         raise ValueError('Handoff request already has a disposition')
     if p['disposition']=='accept' and _reconcile_completed_request(path, record, actor, p, run, operator):
-        return dict(json.loads(file.read_text(encoding='utf-8')), reconciled=True)
+        return dict(read_journal_json(file), reconciled=True)
     try:
         rows=json.loads(run(['show',p['task'],'--json']))
     except (ValueError, RecursionError):
@@ -205,7 +213,7 @@ def _reconcile_completed_request(path, request_record, actor, disposition, run=N
     receipt_file=guarded_file(path,'.handoffs',content_hash({'operation_id':operation_id})+'.json')
     if not receipt_file.exists():
         return False
-    receipt=json.loads(receipt_file.read_text(encoding='utf-8'))
+    receipt=read_journal_json(receipt_file)
     validate_receipt(receipt)
     payload=receipt['identity']['payload']
     receipt_identity=receipt['identity']
@@ -221,7 +229,7 @@ def _reconcile_completed_request(path, request_record, actor, disposition, run=N
         if recovery is not None and recovery!=expected_recovery:
             raise ValueError('Handoff recovery disposition identity changed')
         recovery_file=guarded_file(path,'.handoff-recoveries',content_hash({'request_id':request_record['request_id']})+'.json')
-        if recovery_file.exists() and json.loads(recovery_file.read_text(encoding='utf-8'))!=expected_recovery:
+        if recovery_file.exists() and read_journal_json(recovery_file)!=expected_recovery:
             raise ValueError('Handoff recovery disposition identity changed')
     if not operator and receipt_identity['operator']:
         raise ValueError('Recovery authority does not match original handoff authority')
@@ -283,7 +291,7 @@ def execute(path, actor, p, run, operator=False, recovery=None):
     folder.mkdir(exist_ok=True)
     file=folder/(content_hash({'operation_id':p['operation_id']})+'.json')
     if file.is_symlink() or file.with_suffix('.tmp').is_symlink():raise ValueError('Invalid journal path')
-    record=json.loads(file.read_text(encoding='utf-8')) if file.exists() else None
+    record=read_journal_json(file) if file.exists() else None
     if file.exists():validate_receipt(record)
     if recovery is None and record:
         recovery=record['identity'].get('recovery')
@@ -306,7 +314,7 @@ def execute(path, actor, p, run, operator=False, recovery=None):
         request_id=p['operation_id'][8:] if p['operation_id'].startswith('handoff-') else ''
         request_file=_request_file(path,request_id) if request_id else None
         if request_file and request_file.exists():
-            request_record=json.loads(request_file.read_text(encoding='utf-8'))
+            request_record=read_journal_json(request_file)
             validate_request_record(request_record)
             if request_record['status']=='pending':
                 _reconcile_completed_request(path,request_record,actor,p['approval'],run,operator)
@@ -332,7 +340,7 @@ def execute(path, actor, p, run, operator=False, recovery=None):
     request_id=p['operation_id'][8:] if p['operation_id'].startswith('handoff-') else ''
     request_file=_request_file(path,request_id) if request_id else None
     if request_file and request_file.exists():
-        request_record=json.loads(request_file.read_text(encoding='utf-8'))
+        request_record=read_journal_json(request_file)
         validate_request_record(request_record)
         if request_record['status']=='pending':
             _reconcile_completed_request(path,request_record,actor,p['approval'],run,operator)

@@ -1537,7 +1537,7 @@ def _read_review_writes_audit(root):
     if not path.is_file():
         return None,None
     try:
-        record=record_json.loads(path.read_text(encoding='utf-8'))
+        record=record_json.loads(read_regular_text(path))
     except (OSError,UnicodeError,ValueError):
         return [],'unreadable or not valid JSON'
     return _review_writes_history(record)
@@ -2322,22 +2322,10 @@ def run_bd(root,name,args):
     location=[] if args and args[0]=='init' else ['--directory',path]
     return checked([root/'bin/bd',*location,'--sandbox',*args],env=environment(root),cwd=path).stdout
 
-def read_regular_text(path):
-    """The text of a regular file, never following a symlink and never blocking on a FIFO.
-
-    A FIFO or device put in the file's place answers at once with ValueError instead of
-    hanging the read (kittrial-5bb.171, as ``read_sidecar_json`` does for a sidecar). An
-    unreadable file raises OSError.
-    """
-    flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
-    fd=os.open(str(path),flags)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):raise ValueError('%s is not a regular file'%Path(path).name)
-        with os.fdopen(fd,'rb') as handle:
-            fd=None
-            return handle.read().decode('utf-8')
-    finally:
-        if fd is not None:os.close(fd)
+def read_regular_text(path,limit=None,raw=False,validate=None,prefix=None):
+    """Read a regular file through the shared nonblocking, no-follow primitive."""
+    from regular_file import read_regular_text as read
+    return read(path,limit=limit,raw=raw,validate=validate,prefix=prefix)
 
 def project_metadata_document(root,name):
     """The parsed ``.beads/metadata.json`` object, or None when it cannot be read or is not an object."""
@@ -2449,7 +2437,7 @@ def project_backup_record(root,name):
     reads as None, which keeps a project with no recorded target on its pre-existing path.
     """
     try:
-        data=json.loads((project_dir(root,name)/'.beads'/'dolt-backup.json').read_text(encoding='utf-8'))
+        data=json.loads(read_regular_text(project_dir(root,name)/'.beads'/'dolt-backup.json'))
     except (OSError,ValueError):
         return None
     return data if isinstance(data,dict) else None
@@ -2644,10 +2632,11 @@ def adopt_project_identity(root,name):
     identity=project_identity(root,metadata[3])
     if identity is None:return None
     path=project_dir(root,name)/'.beads'/'metadata.json'
-    data=json.loads(path.read_text(encoding='utf-8'))
+    opened=[]
+    data=json.loads(read_regular_text(path,validate=opened.append))
     if data.get('project_id')==identity:return None
     data['project_id']=identity
-    mode=path.stat().st_mode&0o777
+    mode=opened[0].st_mode&0o777
     fd,temporary=tempfile.mkstemp(prefix=path.name+'.',suffix='.tmp',dir=str(path.parent))
     try:
         with os.fdopen(fd,'w',encoding='utf-8') as handle:
@@ -3452,7 +3441,7 @@ def project_merge_slot_state(root,name,path=None):
     # bd is never run without the server coordinates: it would fall back to an embedded
     # database and CREATE .beads/embeddeddolt here (see project_metadata_state).
     try:
-        metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
+        metadata=json.loads(read_regular_text(path/'.beads'/'metadata.json'))
     except (OSError,ValueError,UnicodeError):
         metadata=None
     if server_metadata_fault(metadata) is not None:
@@ -3926,7 +3915,7 @@ def retire_findings(root,name):
             unreadable[journal]=unreadable.get(journal,0)+1;continue
         for receipt in directory.glob('*.json'):
             try:
-                status=json.loads(read_regular_text(receipt) if journal=='.open-item-requests' else receipt.read_text(encoding='utf-8'))['status']
+                status=json.loads(read_regular_text(receipt))['status']
                 if not isinstance(status,str):raise ValueError('status')
                 if status=='pending':pending[journal]=pending.get(journal,0)+1
             except (OSError,ValueError,KeyError,TypeError):
@@ -4635,23 +4624,12 @@ def read_sidecar_json(path):
     if path.is_symlink():return None,'it is a symlink'
     if not path.exists():return None,None
     if not path.is_file():return None,'it is not a regular file'
-    # Opened without following a symlink and without blocking, then checked to be a regular
-    # file on the open descriptor: a FIFO or device put in place between the checks above
-    # and the open answers at once instead of hanging the read (kittrial-5bb.150).
-    flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
     try:
-        fd=os.open(str(path),flags)
+        raw=read_regular_text(path,raw=True)
     except OSError as error:
         return None,'it cannot be read (%s)'%error.__class__.__name__
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):return None,'it is not a regular file'
-        with os.fdopen(fd,'rb') as handle:
-            fd=None
-            raw=handle.read()
-    except OSError as error:
-        return None,'it cannot be read (%s)'%error.__class__.__name__
-    finally:
-        if fd is not None:os.close(fd)
+    except ValueError:
+        return None,'it is not a regular file'
     # record_json.loads bounds the nesting (record_json.NESTING_MAX) on every Python; the RecursionError
     # catch stays as a backstop (kittrial-5bb.171).
     try:return record_json.loads(raw.decode('utf-8')),None
@@ -4752,7 +4730,7 @@ def report_native_backup_change(root,source):
 
 def _atomic_copy(source,destination):
     """Replace ``destination`` with a byte-for-byte copy of ``source``, atomically."""
-    _atomic_write_bytes(Path(destination),Path(source).read_bytes())
+    _atomic_write_bytes(Path(destination),read_regular_text(source,raw=True))
 
 @contextmanager
 def last_complete_guard(root,name):
@@ -4792,7 +4770,7 @@ def last_complete_guard(root,name):
             try:
                 if last_complete.is_file() and not last_complete.is_symlink():
                     _atomic_copy(last_complete,bundle)
-            except OSError:
+            except (OSError, ValueError):
                 pass
         raise
 
@@ -4862,27 +4840,27 @@ def backup_project(root,name):
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
         for record in sorted((path/'.coordination-requests').glob('*.json')):
             if record.is_symlink():raise ValueError('Coordination receipt must not be a symlink')
-            files['.coordination-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.coordination-requests/'+record.name]=json.loads(read_regular_text(record))
         context=path/'.merge-context.json'
-        if context.exists():files[context.name]=json.loads(context.read_text(encoding='utf-8'))
+        if context.exists():files[context.name]=json.loads(read_regular_text(context))
         registry=path/'.sessions.json'
         if registry.is_symlink():raise ValueError('Session registry must not be a symlink')
-        if registry.exists():files[registry.name]=json.loads(registry.read_text(encoding='utf-8'))
+        if registry.exists():files[registry.name]=json.loads(read_regular_text(registry))
         handoffs=path/'.handoffs'
         if handoffs.is_symlink():raise ValueError('Handoff journal must not be a symlink')
         for record in handoffs.glob('*.json'):
             if record.is_symlink():raise ValueError('Handoff receipt must not be a symlink')
-            files['.handoffs/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.handoffs/'+record.name]=json.loads(read_regular_text(record))
         requests=path/'.handoff-requests'
         if requests.is_symlink():raise ValueError('Handoff request journal must not be a symlink')
         for record in requests.glob('*.json'):
             if record.is_symlink():raise ValueError('Handoff request record must not be a symlink')
-            files['.handoff-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.handoff-requests/'+record.name]=json.loads(read_regular_text(record))
         recoveries=path/'.handoff-recoveries'
         if recoveries.is_symlink():raise ValueError('Handoff recovery journal must not be a symlink')
         for record in recoveries.glob('*.json'):
             if record.is_symlink():raise ValueError('Handoff recovery record must not be a symlink')
-            files['.handoff-recoveries/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.handoff-recoveries/'+record.name]=json.loads(read_regular_text(record))
         # The requirement journals are the operator's recovery cache for
         # requirement-apply/backfill: back them up so a restore keeps the F3
         # acceptance evidence and the pending/reconciled operation IDs.
@@ -4890,12 +4868,12 @@ def backup_project(root,name):
         if requirement_requests.is_symlink():raise ValueError('Requirement request journal must not be a symlink')
         for record in requirement_requests.glob('*.json'):
             if record.is_symlink():raise ValueError('Requirement request receipt must not be a symlink')
-            files['.requirement-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.requirement-requests/'+record.name]=json.loads(read_regular_text(record))
         requirement_backfills=path/'.requirement-backfills'
         if requirement_backfills.is_symlink():raise ValueError('Requirement backfill journal must not be a symlink')
         for record in requirement_backfills.glob('*.json'):
             if record.is_symlink():raise ValueError('Requirement backfill receipt must not be a symlink')
-            files['.requirement-backfills/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.requirement-backfills/'+record.name]=json.loads(read_regular_text(record))
         # The host-issued integration revert journal (kittrial-5bb.52 P1). It is the
         # proof a revert was issued on this host, so a restore that dropped it would
         # silently un-revert every reverted contribution: it is backed up, validated
@@ -4906,7 +4884,7 @@ def backup_project(root,name):
         if revert_journal.is_symlink():raise ValueError('Integration revert journal must not be a symlink')
         for record in revert_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Integration revert journal entry must not be a symlink')
-            files['.integration-reverts/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.integration-reverts/'+record.name]=json.loads(read_regular_text(record))
         # The host-issued assignee follow-on journal (kittrial-5bb.343). It is the
         # proof a hand-back was recorded on this host, so a restore that dropped it
         # would silently make every recorded hand-back inert: it is backed up,
@@ -4915,21 +4893,21 @@ def backup_project(root,name):
         if followon_journal.is_symlink():raise ValueError('Assignee follow-on journal must not be a symlink')
         for record in followon_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Assignee follow-on journal entry must not be a symlink')
-            files['.assignee-followons/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.assignee-followons/'+record.name]=json.loads(read_regular_text(record))
         # The host-issued lane fault clear journal (kittrial-5bb.398), backed up and restored
         # like the follow-on journal: without it every cleared fault would show again.
         fault_journal=path/'.lane-fault-clears'
         if fault_journal.is_symlink():raise ValueError('Lane fault clear journal must not be a symlink')
         for record in fault_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Lane fault clear journal entry must not be a symlink')
-            files['.lane-fault-clears/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
+            files['.lane-fault-clears/'+record.name]=record_json.loads(read_regular_text(record))
         # The delegation journal (kittrial-5bb.407), backed up and restored like the two above:
         # without it every delegation would be inert after a restore.
         delegation_journal=path/'.delegations'
         if delegation_journal.is_symlink():raise ValueError('Delegation journal must not be a symlink')
         for record in delegation_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Delegation journal entry must not be a symlink')
-            files['.delegations/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
+            files['.delegations/'+record.name]=record_json.loads(read_regular_text(record))
         # The per-project claiming setting (kittrial-5bb.352). It lives outside the
         # tracker, so a backup that dropped it would silently open claiming again after
         # a restore. A damaged file is carried byte for byte and reads back restrictive.
@@ -4953,7 +4931,7 @@ def backup_project(root,name):
             if folder.is_symlink():raise ValueError('Record journal %s must not be a symlink'%journal)
             for record in folder.glob('*.json'):
                 if record.is_symlink():raise ValueError('Record journal receipt must not be a symlink')
-                files[journal+'/'+record.name]=json.loads(read_regular_text(record) if journal=='.open-item-requests' else record.read_text(encoding='utf-8'))
+                files[journal+'/'+record.name]=json.loads(read_regular_text(record))
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
@@ -4974,11 +4952,11 @@ def backup_project(root,name):
             if feedback.is_symlink():raise ValueError('Feedback feed must not be a symlink')
             from feedback import FEED_NAME, QUARANTINE_SUFFIX, _read as read_feedback, validate_quarantine_record
             read_feedback(feedback)
-            files['.feedback.jsonl']={'text':feedback.read_text(encoding='utf-8')}
+            files['.feedback.jsonl']={'text':read_regular_text(feedback)}
             for record in sorted(path.glob(FEED_NAME+'.*'+QUARANTINE_SUFFIX)):
                 if record.is_symlink():raise ValueError('Feedback quarantine must not be a symlink')
                 quarantine_name=record.name
-                content=record.read_bytes()
+                content=read_regular_text(record,raw=True)
                 backup={'base64':base64.b64encode(content).decode('ascii')}
                 validate_quarantine_record(quarantine_name,backup)
                 files[quarantine_name]=backup
@@ -5586,7 +5564,7 @@ def read_backup_status(root):
     path=root/'backups'/BACKUP_STATUS_NAME
     if path.is_symlink():raise ValueError('Backup status file must not be a symlink')
     if not path.is_file():raise ValueError('No backup status file; run a backup first')
-    try:record=json.loads(path.read_text(encoding='utf-8'))
+    try:record=json.loads(read_regular_text(path))
     except (OSError,ValueError):raise ValueError('Backup status file is not readable JSON') from None
     validate_backup_status(record)
     return record
@@ -5618,7 +5596,7 @@ def backup_schedule_log(root):
     """
     path=root/'backups'/BACKUP_SCHEDULE_LOG_NAME
     if path.is_symlink() or not path.is_file():return []
-    try:lines=path.read_text(encoding='utf-8').splitlines()
+    try:lines=read_regular_text(path).splitlines()
     except (OSError,ValueError):return []
     entries=[]
     for line in lines[-BACKUP_SCHEDULE_LOG_MAX:]:
@@ -5646,7 +5624,7 @@ def _append_backup_schedule_log(root,entry):
     if path.is_symlink():return None
     lines=[];set_aside=None
     try:
-        if path.is_file():lines=[line for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+        if path.is_file():lines=[line for line in read_regular_text(path).splitlines() if line.strip()]
     except (OSError,ValueError):
         lines=[]
         # The damaged log is kept aside AND said, so an operator is not left wondering why the
@@ -5686,8 +5664,7 @@ def read_backup_schedule_note(root):
     path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
     if path.is_symlink() or not path.is_file():return None
     try:
-        if path.stat().st_size>BACKUP_SCHEDULE_NOTE_FILE_MAX:return None
-        record=record_json.loads(path.read_text(encoding='utf-8'))
+        record=record_json.loads(read_regular_text(path,limit=BACKUP_SCHEDULE_NOTE_FILE_MAX))
     except (OSError,ValueError):return None
     # The version must be the INTEGER 1: True == 1 and 1.0 == 1 in Python, so a hand-made
     # `schema_version: true` or `1.0` passed the plain comparison (kittrial-5bb.251 item 5).
@@ -5887,8 +5864,8 @@ def backup_copy_full_record(path):
     """
     path=Path(path)
     if path.is_symlink() or not path.is_file():return None
-    try:raw=path.read_bytes()
-    except OSError:return None
+    try:raw=read_regular_text(path,raw=True)
+    except (OSError,ValueError):return None
     described={'name':BACKUP_STATUS_NAME,'sha256':hashlib.sha256(raw).hexdigest()}
     # The record guard again: this file sits at an operator's off-machine destination, so
     # it may be hand-made or written by an older kit, and a deeply nested one must be
@@ -6231,9 +6208,9 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
                                      'completeness record already there was left unchanged.'%(
                                          name,detail,destination))
             staged.append((name,staging/name,staging/(name+'.coordination.json'),staged_journal,
-                           backup_copy_generation(entry,(staging/(name+'.coordination.json')).read_bytes(),
-                                                  staged_rooms.read_bytes() if staged_rooms is not None else None,
-                                                  staged_rooms_last.read_bytes() if staged_rooms_last is not None else None),
+                           backup_copy_generation(entry,read_regular_text(staging/(name+'.coordination.json'),raw=True),
+                                                  read_regular_text(staged_rooms,raw=True) if staged_rooms is not None else None,
+                                                  read_regular_text(staged_rooms_last,raw=True) if staged_rooms_last is not None else None),
                            staged_rooms,staged_rooms_last))
         # Every project staged: move each pair into place, replacing (not merging) the
         # destination, then publish the completeness record last.
@@ -6777,11 +6754,11 @@ def rooms_status_entry(root,name):
     if canonical.is_symlink() or not canonical.is_file():
         return None
     entry={'file':canonical.relative_to(root).as_posix(),
-           'sha256':hashlib.sha256(canonical.read_bytes()).hexdigest()}
+           'sha256':hashlib.sha256(read_regular_text(canonical,raw=True)).hexdigest()}
     last=last_complete_rooms_path(root,name)
     if last.is_file() and not last.is_symlink():
         entry['last_complete']={'file':last.relative_to(root).as_posix(),
-                                'sha256':hashlib.sha256(last.read_bytes()).hexdigest()}
+                                'sha256':hashlib.sha256(read_regular_text(last,raw=True)).hexdigest()}
     return entry
 
 def complete_rooms_backup(path):
@@ -6791,7 +6768,7 @@ def complete_rooms_backup(path):
     if not path.is_file():return None,None
     try:
         import rooms
-        data=record_json.loads(path.read_text(encoding='utf-8'))
+        data=record_json.loads(read_regular_text(path))
         rooms.validate_backup(data)
         return data,None
     except (OSError,ValueError,UnicodeDecodeError) as error:
@@ -8445,7 +8422,7 @@ def actor_adoptions(root,project=None):
     """
     path=root/ACTOR_ADOPTIONS_AUDIT
     if not path.is_file():return []
-    try:record=record_json.loads(path.read_text(encoding='utf-8'))
+    try:record=record_json.loads(read_regular_text(path))
     except (OSError,UnicodeError,ValueError) as error:
         raise ValueError('The actor-adoptions audit %s cannot be read: %s'%(path,error)) from None
     entries=record.get('entries') if isinstance(record,dict) and record.get('schema_version')==ACTOR_ADOPTIONS_SCHEMA else None
@@ -8936,22 +8913,14 @@ def read_authority_changes(root,*,max_bytes=None):
         return [],None,('not-a-regular-file','is not a regular file (a directory, a fifo or a symlink)')
     if not path.exists():return [],None,None
     try:
-        if max_bytes is None:
-            text=path.read_text(encoding='utf-8')
-        else:
-            # The host's optional read-only diagnostics use this same validator,
-            # with a byte bound that also holds if a file grows after its stat.
-            if type(max_bytes) is not int or max_bytes<1:raise ValueError('Invalid authority audit byte bound')
-            before=path.lstat()
-            flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
-            with os.fdopen(os.open(str(path),flags),'rb') as source:
-                opened=os.fstat(source.fileno())
-                if (not stat.S_ISREG(opened.st_mode) or
-                        (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)):
-                    raise ValueError('Authority audit changed while opening')
-                raw=source.read(max_bytes+1)
-                if len(raw)>max_bytes:raise ValueError('Authority audit exceeds the read byte bound')
-                text=raw.decode('utf-8')
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes<1):
+            raise ValueError('Invalid authority audit byte bound')
+        try:
+            text=read_regular_text(path,limit=max_bytes)
+        except ValueError as error:
+            if max_bytes is not None and str(error).endswith('exceeds its byte bound'):
+                raise ValueError('Authority audit exceeds the read byte bound') from None
+            raise
         record=record_json.loads(text)
     except (OSError,UnicodeError,ValueError) as error:
         return [],None,('unreadable','cannot be read: %s'%error)
@@ -9076,12 +9045,8 @@ def authority_change_same_bytes(first,second):
     """Whether two regular files hold exactly the same bytes, never following a symlink. Reads only."""
     try:
         if os.lstat(str(first)).st_size!=os.lstat(str(second)).st_size:return False
-        with open(first,'rb') as left,open(second,'rb') as right:
-            while True:
-                chunk=left.read(131072)
-                if chunk!=right.read(131072):return False
-                if not chunk:return True
-    except OSError:
+        return read_regular_text(first,raw=True)==read_regular_text(second,raw=True)
+    except (OSError,ValueError):
         return False
 
 def authority_change_copy_bytes(source,destination):
@@ -9123,8 +9088,8 @@ def authority_change_copy_bytes(source,destination):
             'taken. Nothing was changed. Move the damaged file aside by hand and run the command again.'
             %(source,AUTHORITY_CHANGE_ASIDE_ATTEMPTS,destination.parent))
     try:
-        with os.fdopen(descriptor,'wb') as out, open(source,'rb') as src:
-            shutil.copyfileobj(src,out)
+        with os.fdopen(descriptor,'wb') as out:
+            shutil.copyfileobj(io.BytesIO(read_regular_text(source,raw=True)),out)
         if os.path.lexists(str(destination)):return False
         os.rename(temporary,destination)
         temporary=None
@@ -10243,7 +10208,7 @@ def credential_actors(root,state_path,service_namespace=None):
     from sessions import registered_actors
     source=Path(state_path)
     if not source.is_file():raise ValueError('No web service state at %s'%source)
-    try:state=json.loads(source.read_text(encoding='utf-8'))
+    try:state=json.loads(read_regular_text(source))
     except (ValueError,RecursionError):raise ValueError('The web service state at %s is not readable as JSON'%source) from None
     if not isinstance(state,dict) or not isinstance(state.get('credentials'),dict):
         raise ValueError('The file at %s is not a web service state document'%source)

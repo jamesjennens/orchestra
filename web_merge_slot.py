@@ -7,6 +7,14 @@ from pathlib import Path
 
 import coordination
 import record_json
+from requirements import _unique_object, canonical_bytes
+
+
+def _read_context(path):
+    from admin import read_regular_text
+    value = record_json.loads(read_regular_text(path), object_pairs_hook=_unique_object)
+    canonical_bytes(value)
+    return value
 
 
 class SlotError(ValueError):
@@ -121,7 +129,7 @@ def snapshot(run, project, *, repair=False):
         return result
     path = Path(project) / '.merge-context.json'
     try:
-        context = coordination.load_json(path) if path.exists() else None
+        context = _read_context(path) if path.exists() else None
     except (ValueError, OSError):
         raise SlotError(503, 'Merge-slot context cannot be read; an installation operator must inspect it before retrying.') from None
     if context is not None and (not isinstance(context, dict) or set(context) != {'holder', 'task', 'target'}

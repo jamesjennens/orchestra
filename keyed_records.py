@@ -39,7 +39,8 @@ from pathlib import Path
 import record_json
 from coordination import atomic, identifier
 from recovery import configured_operators
-from requirements import ACCEPTANCE_FIELDS, SHA256_TEXT, content_hash, load_json
+from requirements import (ACCEPTANCE_FIELDS, SHA256_TEXT, ValidationError, _unique_object,
+                          canonical_bytes, content_hash)
 
 ACCEPTANCE_EVIDENCE_FIELDS = tuple(name for name in ACCEPTANCE_FIELDS
                                    if name != 'manifest_sha256')
@@ -50,6 +51,24 @@ STAMP = '%Y-%m-%dT%H:%M:%SZ'
 
 def now():
     return time.strftime(STAMP, time.gmtime())
+
+
+def read_host_json(path):
+    from admin import read_regular_text
+    try:
+        text = read_regular_text(path)
+    except OSError as exc:
+        raise ValidationError('cannot read %s: %s' % (path, exc.strerror or exc)) from None
+    except UnicodeDecodeError:
+        raise ValidationError('cannot read %s: not valid UTF-8' % path) from None
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from None
+    try:
+        value = record_json.loads(text, object_pairs_hook=_unique_object)
+        canonical_bytes(value)
+        return value
+    except json.JSONDecodeError as exc:
+        raise ValidationError('cannot parse %s as JSON: %s' % (path, exc)) from None
 
 
 class RecordSpec:
@@ -86,9 +105,8 @@ class RecordSpec:
         # Optional adapter recovery fields survive both pending and complete
         # writes. The adapter validates them; ordinary record receipts are unchanged.
         self.receipt_metadata = values.pop('receipt_metadata', lambda receipt: {})
-        # Service adapters can require bounded regular-file receipt reads;
-        # ordinary host record adapters retain their existing reader.
-        self.read_receipt = values.pop('read_receipt', load_json)
+        # Service adapters can require bounded regular-file receipt reads.
+        self.read_receipt = values.pop('read_receipt', read_host_json)
         missing = [name for name in self.VALUES + self.HOOKS if name not in values]
         extra = sorted(set(values) - set(self.VALUES + self.HOOKS))
         if missing or extra:

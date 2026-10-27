@@ -1,5 +1,7 @@
 import hashlib
 import json
+import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -23,11 +25,49 @@ def payload(operation_id, *, supersedes=None, body="Observed behavior"):
     }
 
 
+class BlockingReadTimeout(Exception):
+    pass
+
+
+def bounded(call):
+    previous = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(BlockingReadTimeout()))
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def make_fifo(case, path):
+    if not hasattr(os, 'mkfifo'):
+        case.skipTest('mkfifo is unavailable')
+    os.mkfifo(path)
+
+
 class FeedbackTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / feedback.FEED_NAME
+
+    def test_regular_file_feed_missing_damaged_and_valid_classifications(self):
+        self.assertEqual([], feedback._read(self.path))
+        self.path.write_text('{bad\n', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            feedback._read(self.path)
+        self.path.unlink()
+        feedback.add(self.path, 'session-one', payload('op-1'))
+        self.assertEqual([1], [entry['sequence'] for entry in feedback._read(self.path)])
+
+    def test_fifo_and_nonregular_feed_never_block_and_are_unreadable(self):
+        make_fifo(self, self.path)
+        with self.assertRaises(ValueError):
+            bounded(lambda: feedback._read(self.path))
+        self.path.unlink()
+        self.path.mkdir()
+        with self.assertRaises(ValueError):
+            feedback._read(self.path)
 
     def test_add_is_private_append_only_and_retry_is_idempotent(self):
         first = feedback.add(self.path, "session-one", payload("op-1"))

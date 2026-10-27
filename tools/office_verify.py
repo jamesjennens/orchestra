@@ -24,7 +24,8 @@ def bundled_bd(root, kit):
     import subprocess
     found = {'pin': None, 'starts': False, 'says': None}
     try:
-        receipt = json.loads((Path(root)/'bin'/'bd.receipt.json').read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        receipt = json.loads(read_regular_text(Path(root)/'bin'/'bd.receipt.json'))
         lock = json.loads((Path(kit)/'versions.json').read_text(encoding='utf-8'))
         found['pin'] = next((key for key in ('bd', 'bd_static') if isinstance(lock.get(key), dict)
                              and lock[key].get('sha256') == receipt.get('archive_sha256')), None)

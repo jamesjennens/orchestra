@@ -47,9 +47,15 @@ def read_registry(path):
         raise ValueError('Session registry paths must not be symlinks')
     if not file.exists():
         return {'schema_version': 1, 'records': {}}
+    from admin import read_regular_text
     try:
-        return validate(json.loads(file.read_text(encoding='utf-8')))
-    except (OSError, UnicodeDecodeError, RecursionError, json.JSONDecodeError) as error:
+        text = read_regular_text(file)
+    except (OSError, UnicodeError, ValueError):
+        raise ValueError('The session registry cannot be read: it is damaged, unreadable or not JSON; '
+                         'nothing was changed') from None
+    try:
+        return validate(json.loads(text))
+    except (RecursionError, json.JSONDecodeError):
         raise ValueError('The session registry cannot be read: it is damaged, unreadable or not JSON; '
                          'nothing was changed') from None
 

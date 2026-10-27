@@ -32,6 +32,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import admin
+import regular_file
 
 STATES = ('good', 'pending', 'wrong schema', 'not JSON', 'symlink', 'directory', 'unreadable', 'fifo', 'device',
           'absent')
@@ -374,6 +375,143 @@ class RestoreNewOutcomeTests(SidecarAgreementTests):
                 code, output, calls = self.run_restore(root, '--without-coordination', flag)
                 self.assertEqual((code, calls), (1, []), output)
                 self.assertIn('cannot be combined with --without-coordination', output)
+
+
+class RegularFileTests(unittest.TestCase):
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+
+    def bounded(self, call):
+        outcome = []
+        def run():
+            try:
+                outcome.append(call())
+            except BaseException as error:
+                outcome.append(error)
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), 'the regular-file read blocked')
+        return outcome[0]
+
+    def test_text_raw_missing_and_strict_utf8(self):
+        path = self.base / 'record.json'
+        path.write_bytes('snowman: ☃'.encode('utf-8'))
+        self.assertEqual(regular_file.read_regular_text(path), 'snowman: ☃')
+        self.assertEqual(regular_file.read_regular_text(path, raw=True), path.read_bytes())
+        self.assertEqual(admin.read_regular_text(path), path.read_text(encoding='utf-8'))
+        with self.assertRaises(FileNotFoundError):
+            regular_file.read_regular_text(self.base / 'missing')
+        path.write_bytes(b'\xff')
+        self.assertEqual(regular_file.read_regular_text(path, raw=True), b'\xff')
+        with self.assertRaises(UnicodeDecodeError):
+            regular_file.read_regular_text(path)
+
+    def test_total_limit_fstat_growth_and_prefix(self):
+        path = self.base / 'record.json'
+        path.write_bytes(b'abcdef')
+        self.assertEqual(regular_file.read_regular_text(path, limit=6), 'abcdef')
+        with patch.object(regular_file.os, 'fdopen') as stream:
+            with self.assertRaisesRegex(ValueError, 'byte bound'):
+                regular_file.read_regular_text(path, limit=5)
+            stream.assert_not_called()
+        self.assertEqual(regular_file.read_regular_text(path, prefix=4), 'abcd')
+        self.assertEqual(regular_file.read_regular_text(path, prefix=20), 'abcdef')
+        self.assertEqual(regular_file.read_regular_text(path, prefix=0), '')
+        real_fstat = regular_file.os.fstat
+        def growing(descriptor):
+            info = list(real_fstat(descriptor))
+            info[6] = 0
+            return os.stat_result(info)
+        with patch.object(regular_file.os, 'fstat', side_effect=growing):
+            with self.assertRaisesRegex(ValueError, 'byte bound'):
+                regular_file.read_regular_text(path, limit=5)
+
+    def test_validator_and_invalid_arguments(self):
+        path = self.base / 'record.json'
+        path.write_text('{}', encoding='utf-8')
+        opened = []
+        self.assertEqual(regular_file.read_regular_text(path, validate=opened.append), '{}')
+        self.assertEqual((opened[0].st_dev, opened[0].st_ino),
+                         (path.stat().st_dev, path.stat().st_ino))
+        for keyword in ('limit', 'prefix'):
+            for value in (-1, 1.5, True, '1'):
+                with self.subTest(keyword=keyword, value=value), self.assertRaises(ValueError):
+                    regular_file.read_regular_text(path, **{keyword: value})
+        with self.assertRaises(ValueError):
+            regular_file.read_regular_text(path, limit=1, prefix=1)
+
+    def test_nonregular_and_validator_failure_close_the_descriptor(self):
+        directory = self.base / 'directory'
+        directory.mkdir()
+        with self.assertRaises(ValueError) as refused:
+            regular_file.read_regular_text(directory)
+        self.assertEqual(str(refused.exception), '%s is not a regular file' % directory)
+        path = self.base / 'record.json'
+        path.write_text('{}', encoding='utf-8')
+        closed = []
+        real_close = regular_file.os.close
+        def closing(descriptor):
+            closed.append(descriptor)
+            return real_close(descriptor)
+        def refuse(opened):
+            self.assertTrue(stat.S_ISREG(opened.st_mode))
+            raise LookupError('refused')
+        with patch.object(regular_file.os, 'close', side_effect=closing):
+            with self.assertRaisesRegex(LookupError, 'refused'):
+                regular_file.read_regular_text(path, validate=refuse)
+        self.assertEqual(len(closed), 1)
+        with self.assertRaises(OSError):
+            os.fstat(closed[0])
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs are POSIX-only')
+    def test_fifo_and_fifo_swap_answer_at_once(self):
+        fifo = self.base / 'plain-fifo'
+        os.mkfifo(str(fifo))
+        result = self.bounded(lambda: regular_file.read_regular_text(fifo))
+        self.assertIsInstance(result, ValueError)
+
+        path = self.base / 'swapped-fifo'
+        path.write_text('{}', encoding='utf-8')
+        real_lstat = regular_file.os.lstat
+        def swap(path_):
+            before = real_lstat(path_)
+            os.unlink(path_)
+            os.mkfifo(path_)
+            return before
+        with patch.object(regular_file.os, 'lstat', side_effect=swap):
+            result = self.bounded(lambda: regular_file.read_regular_text(path))
+        self.assertIsInstance(result, ValueError)
+
+    def test_inode_swap_is_refused_without_no_follow(self):
+        path = self.base / 'record.json'
+        replacement = self.base / 'replacement.json'
+        path.write_text('original', encoding='utf-8')
+        replacement.write_text('replacement', encoding='utf-8')
+        real_lstat = regular_file.os.lstat
+        def swap(path_):
+            before = real_lstat(path_)
+            os.replace(replacement, path_)
+            return before
+        with patch.object(regular_file.os, 'O_NOFOLLOW', 0, create=True), \
+                patch.object(regular_file.os, 'lstat', side_effect=swap):
+            result = self.bounded(lambda: regular_file.read_regular_text(path))
+        self.assertIsInstance(result, ValueError)
+        self.assertIn('changed while opening', str(result))
+
+    def test_rollback_cleanup_preserves_original_failure(self):
+        backups = self.base / 'backups'
+        backups.mkdir()
+        bundle = backups / 'alpha.coordination.json'
+        bundle.write_text('{"schema_version":1,"status":"complete"}', encoding='utf-8')
+        admin.last_complete_sidecar_path(self.base, 'alpha').write_text('old', encoding='utf-8')
+        with patch.object(admin, '_atomic_copy', side_effect=[None, ValueError('changed while opening')]):
+            with self.assertRaisesRegex(LookupError, 'original failure'):
+                with admin.last_complete_guard(self.base, 'alpha'):
+                    raise LookupError('original failure')
 
 
 class ReadSidecarTests(unittest.TestCase):

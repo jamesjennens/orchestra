@@ -73,10 +73,15 @@ def service_config(path):
     # The file itself is named for every way reading it can fail (kittrial-5bb.168 item 3): a
     # plain JSON error named neither the file nor that the file was the problem.
     try:
-        text = Path(path).read_text(encoding='utf-8')
+        text = admin.read_regular_text(path)
     except OSError as error:
         raise ValueError('Cannot read office service configuration %s: %s'
                          % (path, error.strerror or error)) from None
+    except ValueError as error:
+        if isinstance(error, UnicodeError):
+            raise
+        raise ValueError('Cannot read office service configuration %s: %s'
+                         % (path, error)) from None
     try:
         config = json.loads(text)
     except ValueError:
