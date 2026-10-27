@@ -65,6 +65,15 @@ class AssignmentRecords(unittest.TestCase):
                          assignment.holder_message(notice, 'worker-new'))
         self.assertIsNone(assignment.holder_message(notice, 'unrelated'))
 
+    def test_a_stored_notice_with_a_legacy_invisible_reason_still_reads(self):
+        notice = self.notice()
+        notice['reason'] = 'Stored before the expanded rule\u061c'
+        notice['sha256'] = content_hash(notice)
+        comment = dict(text=assignment.body(notice), author='http/coordinator')
+        self.assertEqual(notice, assignment.parse_comment(comment, project='trial', task='trial-1'))
+        with self.assertRaisesRegex(ValueError, 'plain text'):
+            self.notice(dict(self.request(), reason='New write\u061c'))
+
     def test_mutated_hash_duplicate_fields_and_noncanonical_records_are_not_notices(self):
         notice = self.notice()
         changed = copy.deepcopy(notice);changed['reason'] = 'changed'

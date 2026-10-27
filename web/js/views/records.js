@@ -157,7 +157,7 @@ export async function page(ctx, { pid }) {
       ctx.api.capabilities(pid, { waiting: 1 }),
     ]);
   } catch (error) {
-    return h('div', null, pageHead({ title: 'Records', subtitle: project.name }), errorState(error, () => ctx.render()));
+    return h('div', null, pageHead({ title: 'Records', lede: project.name }), errorState(error, () => ctx.render()));
   }
 
   const canPropose = Boolean(refsResp.can_propose || capsResp.can_propose);
@@ -675,7 +675,7 @@ export async function page(ctx, { pid }) {
   return h('div', { class: 'stack', 'data-records-page': '1' },
     pageHead({
       title: 'Records',
-      subtitle: `${project.name} · Reference catalog & capability registry`,
+      lede: `${project.name} · Reference catalog & capability registry`,
     }),
     summaryStrip,
     waitingPanel,
@@ -694,7 +694,7 @@ export async function referencePage(ctx, { pid, key }) {
     entry = await ctx.api.reference(pid, key);
   } catch (error) {
     return h('div', null,
-      pageHead({ title: key, crumbs: [['Records', `/p/${pid}/records`]] }),
+      pageHead({ title: key, crumbs: [{ label: 'Records', href: `/p/${pid}/records` }] }),
       errorState(error, () => ctx.render()));
   }
 
@@ -924,8 +924,8 @@ export async function referencePage(ctx, { pid, key }) {
   return h('div', { class: 'stack', 'data-reference-page': key },
     pageHead({
       title: entry.key,
-      subtitle: `Reference record · ${entry.state}`,
-      crumbs: [['Records', `/p/${pid}/records`]],
+      lede: `Reference record · ${entry.state}`,
+      crumbs: [{ label: 'Records', href: `/p/${pid}/records` }],
     }),
     detailCard,
     pendingDraftCard,
@@ -939,7 +939,7 @@ export async function capabilityPage(ctx, { pid, key }) {
     entry = await ctx.api.capability(pid, key);
   } catch (error) {
     return h('div', null,
-      pageHead({ title: key, crumbs: [['Records', `/p/${pid}/records`]] }),
+      pageHead({ title: key, crumbs: [{ label: 'Records', href: `/p/${pid}/records` }] }),
       errorState(error, () => ctx.render()));
   }
 
@@ -1284,8 +1284,8 @@ export async function capabilityPage(ctx, { pid, key }) {
   return h('div', { class: 'stack', 'data-capability-page': key },
     pageHead({
       title: entry.key,
-      subtitle: `Capability record · ${entry.state}`,
-      crumbs: [['Records', `/p/${pid}/records`]],
+      lede: `Capability record · ${entry.state}`,
+      crumbs: [{ label: 'Records', href: `/p/${pid}/records` }],
     }),
     detailCard,
     pendingDraftCard,

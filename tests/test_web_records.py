@@ -2358,7 +2358,7 @@ class DeriveAttestedVsTrustedTests(unittest.TestCase):
 class WebRecordsScreenTests(unittest.TestCase):
     """Runs the Node DOM/screen test for web/js/views/records.js."""
 
-    def test_records_view_dom_flows(self):
+    def test_records_pages_show_breadcrumbs_and_dom_flows(self):
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not on PATH')

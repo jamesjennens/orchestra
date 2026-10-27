@@ -276,6 +276,17 @@ class TaskFilesStoreTests(unittest.TestCase):
         self.assertIsNone(task_files.read_entry(self.project, 't2', digest))
         self.assertEqual([], task_files.live(self.project, 't2'))
 
+    def test_a_stored_file_name_with_a_legacy_invisible_character_still_reads(self):
+        rows = {'t1': {'status': 'open', 'assignee': 'worker'}}
+        _, _, digest = self._record('coordinator-record', 'coord', rows)
+        path = self.project / task_files.FOLDER / task_files.RECORDS / task_files.task_key('t1') / (digest + '.json')
+        entry = json.loads(path.read_text(encoding='utf-8'))
+        entry['name'] = 'stored\u061c.txt'
+        path.write_text(json.dumps(entry), encoding='utf-8')
+        self.assertEqual('stored\u061c.txt', task_files.read_entry(self.project, 't1', digest)['name'])
+        with self.assertRaises(task_files.Refusal):
+            task_files.clean_name('new\u061c.txt')
+
     def test_apply_refuses_a_record_whose_stored_bytes_are_missing_or_another_size(self):
         rows = {'t1': {'status': 'open', 'assignee': 'worker'}}
         run, comments = self._run('t1', rows)

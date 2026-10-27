@@ -31,18 +31,18 @@ def _actor(value, field, nullable=False):
         raise ValueError(field + ' must name one exact existing actor')
 
 
-def _reason(value):
+def _reason(value, *, stored=False):
     if not isinstance(value, str) or not value.strip() or len(value) > REASON_MAX:
         raise ValueError('Assignment needs a nonempty reason of at most 1000 characters')
     from review_workflow import plain_text
-    plain_text(value, 'assignment reason')
+    plain_text(value, 'assignment reason', stored=stored)
     try:
         value.encode('utf-8')
     except UnicodeError as exc:
         raise ValueError('Assignment reason must be valid UTF-8 text') from exc
 
 
-def validate_request(payload, task=None):
+def validate_request(payload, task=None, *, stored=False):
     if not isinstance(payload, dict) or set(payload) != REQUEST_FIELDS:
         raise ValueError('Assignment requires its exact closed field set')
     if type(payload['schema_version']) is not int or payload['schema_version'] != 1:
@@ -54,7 +54,7 @@ def validate_request(payload, task=None):
     _actor(payload['operation_id'], 'operation_id')
     _actor(payload['expected_assignee'], 'expected_assignee', nullable=True)
     _actor(payload['assignee'], 'assignee', nullable=True)
-    _reason(payload['reason'])
+    _reason(payload['reason'], stored=stored)
     for key in ('allow_pending_review', 'allow_held_slot'):
         if type(payload[key]) is not bool:
             raise ValueError(key + ' must be an explicit boolean')
@@ -66,7 +66,7 @@ def _validate_notice(notice):
     request = {key: notice[key] for key in REQUEST_FIELDS
                if key not in ('assignee', 'expected_assignee')}
     request.update(assignee=notice['to'], expected_assignee=notice['from'])
-    validate_request(request)
+    validate_request(request, stored=True)
     _actor(notice['assigned_by'], 'assigned_by')
     if not isinstance(notice['project'], str) or PROJECT.fullmatch(notice['project']) is None:
         raise ValueError('Assignment notice needs the actual project')

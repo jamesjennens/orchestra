@@ -114,11 +114,11 @@ def validate(payload, task):
     return payload
 
 
-def check_plain_text(payload):
+def check_plain_text(payload, *, stored=False):
     """The plain-text rule of review records, on the write path and again on every read."""
-    review_workflow.plain_text(payload['summary'], 'summary')
+    review_workflow.plain_text(payload['summary'], 'summary', stored=stored)
     for item in payload['items']:
-        review_workflow.plain_text(item['text'], 'note text')
+        review_workflow.plain_text(item['text'], 'note text', stored=stored)
 
 
 def _records(issue):
@@ -138,10 +138,8 @@ def _records(issue):
             validate(payload, issue.get('id'))
             if raw != PREFIX + canonical_bytes(payload).decode():
                 raise ValueError('not the canonical bytes of the record')
-            # The write path refuses hidden and control characters; a record that reached the
-            # task another way (an older kit's raw path, a native write) is held to the same
-            # rule here, so nothing is displayed that this kit would not have accepted.
-            check_plain_text(payload)
+            # Stored records retain the legacy set: expanding the write rule must not hide them.
+            check_plain_text(payload, stored=True)
             review_workflow.identity(str(comment['id']))
             if not isinstance(comment.get('author'), str) or not comment['author'].strip():
                 raise ValueError('no native author')

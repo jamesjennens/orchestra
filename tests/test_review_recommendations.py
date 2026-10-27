@@ -344,6 +344,14 @@ class ReaderRuleTests(Harness):
         self.recommend(contribution, actor='honest')
         self.assertEqual([entry['author'] for entry in self.view()['recommendations']], ['honest'])
 
+    def test_a_stored_recommendation_with_a_legacy_invisible_character_still_reads(self):
+        contribution = self.contribute()
+        self.stored(contribution, summary='Written before the expanded rule\u061c')
+        self.assertTrue(self.view()['recommended'])
+        self.assertIn('\u061c', self.view()['recommendation']['summary'])
+        with self.assertRaisesRegex(ValueError, 'plain text'):
+            self.recommend(contribution, actor='new-reviewer', summary='New write\u061c')
+
     def test_a_reassignment_does_not_hide_an_honest_recommendation(self):
         """The assignee is refused at write time and not re-checked on read; the author always is."""
         contribution = self.contribute()

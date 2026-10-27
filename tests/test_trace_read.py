@@ -294,8 +294,10 @@ class ViewTests(Fixture):
 
     def test_an_epic_with_no_task_and_a_review_by_past(self):
         self.work = [row for row in self.work if row['id'] != 'trial-3']
+        # The fixture clock TODAY is 2026-10-01 and entry()'s review_by is a year after it (kittrial-5bb.421), so
+        # 'now' must fall after 2027-10-01 for the review date to be past.
         with patch.object(t, 'RECENT_DAYS', 14):
-            snap = t.Snapshot(self.rows(), PROJECT, now=datetime(2028, 6, 1, tzinfo=timezone.utc),  # past the fixture's review_by (patched today + 365 days)
+            snap = t.Snapshot(self.rows(), PROJECT, now=datetime(2027, 11, 1, tzinfo=timezone.utc),
                               operators=OPERATORS, members=MEMBERS)
             row = t.trace(snap, 'designs')['rows'][0]
         self.assertIn('epic-without-task', row['flags'])
