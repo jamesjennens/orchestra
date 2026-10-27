@@ -362,10 +362,10 @@ How the web tests pin the pages today, which decides what each slice may move:
 4. **Records.** The summary that names who acts on waiting drafts; "Review & accept" only for the
    party who acts; one list (waiting, then accepted) instead of two; the propose forms folded; the
    authority cell showing an attestation.
-   - test_web_records.py's `test_records_view_dom_flows` pins "Waiting to be accepted", the
-     "2 waiting" badge, the pending-revision texts and the `data-accept-reference-form` and
-     `data-verify-capability-form` forms. The slice keeps them; nothing asserts on the propose
-     forms.
+   - test_web_records.py's `test_records_pages_show_breadcrumbs_and_dom_flows` pins
+     "Waiting to be accepted", the "2 waiting" badge, pending-revision texts, and the
+     `data-accept-reference-form` and `data-verify-capability-form` forms. The slice keeps them;
+     nothing asserts on the propose forms.
 5. **My work, My agents, rooms and the rest.** The agent card with its next step; My work with one
    line per agent that needs its owner and no empty sections; room moderation on each message;
    the short proposals of section 2.7.

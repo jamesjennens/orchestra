@@ -50,8 +50,14 @@ const assertRecordsBreadcrumb = (dom, page) => {
   assert.ok(link, `${page} should render the Records breadcrumb as a link`);
   assert.equal(link.attributes.href, '/p/pp/records');
 };
+const assertLede = (dom, expected, page) => {
+  const ledes = dom.all((e) => e.tagName === 'P' && e.className === 'lede');
+  assert.equal(ledes.length, 1, `${page} should render one lede`);
+  assert.equal(ledes[0].textContent, expected, `${page} should render the expected lede`);
+};
 const app = {
   navigate: (url) => navigated.push(url),
+  projects: [{ id: 'pp', name: 'Test Project' }],
   api: {
     project: async (pid) => ({ id: pid, name: 'Test Project', role: 'coordinator' }),
     references: async (_pid, query) => {
@@ -128,11 +134,20 @@ const app = {
 };
 
 const recordsDom = await page(app, { pid: 'pp' });
+assertLede(recordsDom, 'Test Project · Reference catalog & capability registry', 'Records page');
 assert.ok(recordsDom.textContent.includes('Waiting to be accepted'));
 assert.ok(recordsDom.textContent.includes('2 waiting'));
 assert.ok(recordsDom.textContent.includes('Accepted rev 2 · Draft rev 3 waiting'));
 assert.ok(recordsDom.textContent.includes('kit.guide'));
 assert.ok(recordsDom.textContent.includes('records.web-sync'));
+
+const recordsErrorApp = {
+  ...app,
+  api: { ...app.api, references: async () => { throw new Error('records unavailable'); } },
+};
+const recordsErrorDom = await page(recordsErrorApp, { pid: 'pp' });
+assertLede(recordsErrorDom, 'Test Project', 'Records error page');
+assert.ok(recordsErrorDom.textContent.includes('records unavailable'));
 
 // 4. Render Reference Detail (`referencePage`) with two-step revise-then-accept & self_accept_blocked
 let acceptedRefPayload = null;
@@ -188,6 +203,7 @@ const refApp = {
 
 const refDom = await referencePage(refApp, { pid: 'pp', key: 'kit.guide' });
 assertRecordsBreadcrumb(refDom, 'reference success page');
+assertLede(refDom, 'Reference record · accepted', 'Reference success page');
 assert.ok(refDom.textContent.includes('Pending draft revision 3 (waiting to be accepted)'));
 assert.ok(refDom.textContent.includes('Two-step revise-then-accept'));
 assert.ok(refDom.textContent.includes('path-syntax-only'));
@@ -259,6 +275,7 @@ const capApp = {
 
 const capDom = await capabilityPage(capApp, { pid: 'pp', key: 'records.web-sync' });
 assertRecordsBreadcrumb(capDom, 'capability success page');
+assertLede(capDom, 'Capability record · accepted', 'Capability success page');
 assert.ok(capDom.textContent.includes('syntax-and-requirements'));
 assert.ok(capDom.textContent.includes('Verify revision 2'));
 
