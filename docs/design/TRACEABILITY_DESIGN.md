@@ -607,6 +607,25 @@ of a kittrial-sized export, as the context index did for find.
    - The task page showing its own tokens resolved.
    - The client `trace` as a convenience.
    - The cost measured on a kittrial-sized export.
+   - **As built, part 1 (kittrial-5bb.425): the server read, the endpoint action, `GET /trace`, the
+     client.** trace_read.py is a library over one snapshot (`Snapshot`): the rows `brief` resolves
+     pointers from (briefing.py `ContextPointers.loaded`), with an `exclude` hook for any per-caller
+     rule. Requirement drafts and owner states are readable by every member today (the requirement
+     reads strip only operation handles, http_service.py `_requirements_state_only`), so no role-based
+     exclusion applies yet. `cites-superseded-revision` is `requirement_impact.analyze`'s first
+     production use, over manifests of the cited and the current accepted revisions. Lines read from
+     comments (the round's publication line, the owner-only decision heuristic) count only from a
+     person owner or coordinator in current membership or a listed operator; the converged design and
+     its decision are read from the `design.<scope>` entry, never from comments. **Measured** on a
+     synthetic kittrial-sized export (3,461 rows, 7,620 comments, 40 requirements, 20 indexed designs;
+     tests/trace_cost.py, Windows, Python 3.11): `analyze` 114 ms; each view's first answer in a fresh
+     interpreter 359-930 ms (`summary`, which builds every view, is the 930), a second answer 64-587 ms;
+     the generation (a digest of the filtered snapshot) 46 ms. **Bounds against planted input (review of
+     part 1):** every list in a row is bounded and the 64 KiB cap holds for one row; each requirement
+     ledger is validated once per answer, so 10 tasks of 1,000 distinct `req:` tokens read in about 0.1 s
+     (8.4-8.9 s before); at most 200 distinct tokens are checked per source (a task or a design section),
+     so a planted source hides only its own extra tokens and the summary says when a count is partial;
+     the views are built after the shared lock is released. Part 2 builds the web.
 5. **Orchestra's system design.** docs/SYSTEM_DESIGN.md rewritten with the front block, uploaded as
    `design.orchestra` and accepted, IMPLEMENTATION_PLAN retired, and trace's first report on
    kittrial attached.
