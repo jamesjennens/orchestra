@@ -1673,6 +1673,12 @@ class InProcessBackend:
         from briefing import ContextPointers
         pointer_rows=[row for row in self.state.get('tasks',{}).values() if row.get('project_id')==project_id]
         pointers=ContextPointers(pointer_rows,project_id,operators=())
+        # kittrial-5bb.425 part 2: the description's req: and design: tokens, first, as the brief resolves them.
+        from briefing import parse_context_pointers
+        described = [x['pointer'] for x in parse_context_pointers(task.get('description'))
+                     if x['kind'] in ('req', 'design')]
+        description = ({'description_pointers': pointers.item_pointers(
+            [{'id': 'description', 'text': ' '.join(described)}], 'text')['description']} if described else {})
         checkpoints = self.state.get('checkpoints', {}).get(task_id) or []
         checkpoint = None
         if checkpoints:
@@ -1690,7 +1696,7 @@ class InProcessBackend:
                           # This backend holds the checkpoint in memory and always reads
                           # every item, so the shown list is the whole list, with no note.
                           'open_items_shown': len(items), 'open_items_total': len(items)}
-        return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
+        return {**description, 'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
                 'carry_open_items': [dict(item) for item in checkpoints[-1].get('open_items') or []
                                      if isinstance(item, dict)] if checkpoints else [],
                 # The disposable backend records no lifecycle evidence, so every fact is
@@ -4019,6 +4025,9 @@ class EndpointBackend:
                        'note': 'The complete text: GET /v1/projects/%s/tasks/%s.' % (project_id, task)}
                       if data.get('read_whole') else None)
         return {**({'assignment_records':data['assignment_records']} if data.get('assignment_records') else {}),
+                # kittrial-5bb.425 part 2: the description's own req: and design: tokens, resolved by the brief.
+                **({'description_pointers': data['description_pointers']}
+                   if isinstance(data.get('description_pointers'), dict) else {}),
                 'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
                            'waiting_for_approval':review.get('waiting_for_approval'),

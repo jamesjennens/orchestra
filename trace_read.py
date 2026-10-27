@@ -28,6 +28,10 @@ CROSS_REVIEWS_MAX = 5
 #: The distinct tokens checked per source, a task or a design section (review b3: a bound per source, so a planted
 #: source hides only its own extra tokens; a global first-come bound let one task blind every later one).
 TOKENS_PER_SOURCE_MAX = 200
+#: A task's token fields, in the order they are read; each is bounded on its own (re-review N1).
+FIELDS = ('description', 'checkpoint', 'contribution')
+FIELD_OF = {'description': 'description', 'checkpoint-source': 'checkpoint', 'checkpoint-evidence': 'checkpoint',
+            'contribution-summary': 'contribution'}
 #: Room kept inside ANSWER_MAX for what is added after the page is cut: the generation and the route's cursor.
 TAIL_RESERVE = 1024
 SCOPE_RE = re.compile(r'[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*')
@@ -235,14 +239,21 @@ class Snapshot:
             from briefing import parse_context_pointers
             self._citations = {}
             for task in sorted(self.items):
-                cited = []
+                # Re-review N1: each field (description, then the current checkpoint, then the current
+                # contribution) is its own source with its own bound, so one cannot leave another unchecked.
+                fields = {}
                 for where, text in self.sources(task):
                     if not isinstance(text, str):
                         continue
+                    field = FIELD_OF.get(where, where)
                     for pointer in parse_context_pointers(text):
                         if pointer['kind'] in ('req', 'design'):
-                            cited.append((where, pointer))
-                self._citations[task] = self.bounded_tokens(('task', task), cited, lambda item: item[1]['pointer'])
+                            fields.setdefault(field, []).append((where, pointer))
+                cited = []
+                for field in FIELDS:
+                    cited += self.bounded_tokens(('task', task, field), fields.get(field, []),
+                                                 lambda item: item[1]['pointer'])
+                self._citations[task] = cited
         return self._citations
 
     # -- designs -----------------------------------------------------------------------------
@@ -449,7 +460,7 @@ def tasks_view(snap):
         rows.append({'id': task, 'title': label(row.get('title')), 'status': row.get('status'),
                      'cites': [dict(pointer=p['pointer'], where=where, state=snap.resolve(p)['state'],
                                     flags=snap.resolve(p).get('flags', [])) for where, p in shown],
-                     'cites_omitted': more, 'tokens_not_checked': snap.truncated.get(('task', task), 0),
+                     'cites_omitted': more, 'tokens_not_checked': sum(snap.truncated.get(('task', task, field), 0) for field in FIELDS),
                      'affected_requirements': affected.get(task, [])[:LIST_MAX],
                      'affected_requirements_omitted': max(0, len(affected.get(task, [])) - LIST_MAX),
                      'flags': flags})
@@ -479,7 +490,7 @@ def tokens_view(snap):
                                  'where': {'design': design['scope'], 'section': heading['anchor']}, 'flags': flags})
     # Review b3: a source over the bound says so in one row; only its own extra tokens go unchecked.
     for source, count in sorted(snap.truncated.items()):
-        where = {'task': source[1]} if source[0] == 'task' else {'design': source[1], 'section': source[2]}
+        where = {'task': source[1], 'field': source[2]} if source[0] == 'task' else {'design': source[1], 'section': source[2]}
         rows.append({'pointer': None, 'where': where, 'flags': ['tokens-not-checked'], 'omitted': count})
     return rows
 

@@ -357,6 +357,9 @@ export async function detail(ctx, { pid, tid }) {
   return h('div', { class: 'stack' },
     pageHead({ crumbs: [{ label: 'Projects', href: ctx.href('/projects') }, { label: project.name, href: ctx.href('/p/' + pid) }, { label: t.id }], title: t.title, actions }),
     summaryStrip,
+    // kittrial-5bb.425 part 2: the task's own req: and design: tokens, resolved by the server (TRACEABILITY_DESIGN §5.2).
+    brief.description_pointers ? h('section', { class: 'panel', 'aria-label': 'What this task cites', 'data-description-pointers': '1' },
+      h('h3', { class: 'small' }, 'Cites'), contextPointers(brief.description_pointers)) : null,
     nextBanner,
     h('div', { class: 'detail' },
       h('div', { class: 'stack' }, editPanel, wantedPanel, briefPanel, reviewPanel, activityPanel, checkpointFold, writer ? commentForm(ctx, pid, tid) : null),

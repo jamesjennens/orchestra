@@ -10,6 +10,7 @@ import { coordinationPanel } from './coordination.js';
 import { delegationsPanel } from './delegations.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { historyPanel } from '../agentHistory.js';
+import { coveragePanel } from './trace.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
@@ -427,6 +428,8 @@ export async function overview(ctx, { pid }) {
     // project.html:44-80), then the fold (project.html:82-89); the overview text is
     // the summary, the strip link, the panel, the fold.
     summary,
+    // kittrial-5bb.425 part 2: one line per trace view with its counts; each opens its view.
+    coveragePanel(ctx, pid),
     tasksPanel(tableHost),
     h('p', { class: 'small muted' }, 'The Lanes board has its own page (',
       h('a', { href: ctx.href(`/p/${pid}/lanes`) }, 'Lanes'), '), where a coordinator reads it.'),

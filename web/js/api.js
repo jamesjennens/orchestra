@@ -614,6 +614,8 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     findReferences: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/references/find`, { params }),
     reference: (pid, key) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/references/${encodeURIComponent(key)}`),
     design: (pid, scope) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/designs/${encodeURIComponent(scope)}`),
+    // the trace read (kittrial-5bb.425): ?view=&scope=&limit=&cursor=
+    trace: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/trace`, { params }),
     proposeReference: (pid, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/references`, body),
     reviseReference: (pid, key, body) => mutate('PATCH', `/v1/projects/${encodeURIComponent(pid)}/references/${encodeURIComponent(key)}`, body),
     acceptReference: (pid, key, body) => mutate('POST', `/v1/projects/${encodeURIComponent(pid)}/references/${encodeURIComponent(key)}/accept`, body),

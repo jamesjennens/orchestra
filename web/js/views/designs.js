@@ -6,6 +6,7 @@ import { h } from '../dom.js';
 import { pageHead, errorState } from '../ui.js';
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
+const href = (ctx, path) => (ctx && typeof ctx.href === 'function' ? ctx.href(path) : '#' + path);
 const BOM = /^﻿/;
 
 // The document as text blocks. The server says which line each of its index's headings is on
@@ -64,13 +65,14 @@ export async function page(ctx, { pid, scope }) {
   try {
     design = await ctx.api.design(pid, scope);
   } catch (error) {
-    return h('div', null, pageHead({ title: 'design.' + scope, crumbs: [['Records', `/p/${pid}/records`]] }),
+    return h('div', null, pageHead({ title: 'design.' + scope, crumbs: [{ label: 'Records', href: href(ctx, `/p/${pid}/records`) }] }),
       errorState(error, () => ctx.render()));
   }
   const front = (design.index && design.index.front) || {};
   const phases = (design.index && design.index.plan_phases) || [];
   return h('div', { class: 'stack', 'data-design-page': design.key },
-    pageHead({ title: design.key, lede: design.title, crumbs: [['Records', `/p/${pid}/records`], [design.key, `/p/${pid}/references/${encodeURIComponent(design.key)}`]] }),
+    pageHead({ title: design.key, lede: design.title, crumbs: [{ label: 'Records', href: href(ctx, `/p/${pid}/records`) },
+      { label: design.key, href: href(ctx, `/p/${pid}/references/${encodeURIComponent(design.key)}`) }] }),
     h('section', { class: 'panel' },
       h('dl', { class: 'kv' },
         h('dt', null, 'Revision'), h('dd', null, String(design.revision), ' (', design.accepted ? 'accepted' : design.acceptance_state, ')'),
