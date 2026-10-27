@@ -42,6 +42,14 @@ assert.equal(calls.length, 15);
 
 // 3. Render the Records page (`page`) and verify waiting queue + two-step badge
 const navigated = [];
+const assertRecordsBreadcrumb = (dom, page) => {
+  const nav = dom.all((e) => e.attributes['aria-label'] === 'Breadcrumb')[0];
+  assert.ok(nav, `${page} should render the breadcrumb navigation`);
+  assert.equal(nav.textContent, 'Records', `${page} should render the Records breadcrumb`);
+  const link = nav.all((e) => e.tagName === 'A')[0];
+  assert.ok(link, `${page} should render the Records breadcrumb as a link`);
+  assert.equal(link.attributes.href, '/p/pp/records');
+};
 const app = {
   navigate: (url) => navigated.push(url),
   api: {
@@ -179,9 +187,17 @@ const refApp = {
 };
 
 const refDom = await referencePage(refApp, { pid: 'pp', key: 'kit.guide' });
+assertRecordsBreadcrumb(refDom, 'reference success page');
 assert.ok(refDom.textContent.includes('Pending draft revision 3 (waiting to be accepted)'));
 assert.ok(refDom.textContent.includes('Two-step revise-then-accept'));
 assert.ok(refDom.textContent.includes('path-syntax-only'));
+
+const refErrorApp = {
+  ...refApp,
+  api: { ...refApp.api, reference: async () => { throw new Error('reference unavailable'); } },
+};
+const refErrorDom = await referencePage(refErrorApp, { pid: 'pp', key: 'kit.guide' });
+assertRecordsBreadcrumb(refErrorDom, 'reference error page');
 
 const acceptForm = refDom.all((e) => e.attributes['data-accept-reference-form'] === '1')[0];
 assert.ok(acceptForm, 'Accept reference form should be present');
@@ -242,8 +258,17 @@ const capApp = {
 };
 
 const capDom = await capabilityPage(capApp, { pid: 'pp', key: 'records.web-sync' });
+assertRecordsBreadcrumb(capDom, 'capability success page');
 assert.ok(capDom.textContent.includes('syntax-and-requirements'));
 assert.ok(capDom.textContent.includes('Verify revision 2'));
+
+const capErrorApp = {
+  ...capApp,
+  api: { ...capApp.api, capability: async () => { throw new Error('capability unavailable'); } },
+};
+const capErrorDom = await capabilityPage(capErrorApp, { pid: 'pp', key: 'records.web-sync' });
+assertRecordsBreadcrumb(capErrorDom, 'capability error page');
+
 const verifyForm = capDom.all((e) => e.attributes['data-verify-capability-form'] === '1')[0];
 assert.ok(verifyForm, 'Verify capability form should be present');
 verifyForm.all((e) => e.attributes.name === 'commit')[0].value = 'f'.repeat(40);

@@ -563,7 +563,7 @@ export async function referencePage(ctx, { pid, key }) {
     entry = await ctx.api.reference(pid, key);
   } catch (error) {
     return h('div', null,
-      pageHead({ title: key, crumbs: [['Records', `/p/${pid}/records`]] }),
+      pageHead({ title: key, crumbs: [{ label: 'Records', href: `/p/${pid}/records` }] }),
       errorState(error, () => ctx.render()));
   }
 
@@ -794,7 +794,7 @@ export async function referencePage(ctx, { pid, key }) {
     pageHead({
       title: entry.key,
       subtitle: `Reference record · ${entry.state}`,
-      crumbs: [['Records', `/p/${pid}/records`]],
+      crumbs: [{ label: 'Records', href: `/p/${pid}/records` }],
     }),
     detailCard,
     pendingDraftCard,
@@ -808,7 +808,7 @@ export async function capabilityPage(ctx, { pid, key }) {
     entry = await ctx.api.capability(pid, key);
   } catch (error) {
     return h('div', null,
-      pageHead({ title: key, crumbs: [['Records', `/p/${pid}/records`]] }),
+      pageHead({ title: key, crumbs: [{ label: 'Records', href: `/p/${pid}/records` }] }),
       errorState(error, () => ctx.render()));
   }
 
@@ -1154,7 +1154,7 @@ export async function capabilityPage(ctx, { pid, key }) {
     pageHead({
       title: entry.key,
       subtitle: `Capability record · ${entry.state}`,
-      crumbs: [['Records', `/p/${pid}/records`]],
+      crumbs: [{ label: 'Records', href: `/p/${pid}/records` }],
     }),
     detailCard,
     pendingDraftCard,
