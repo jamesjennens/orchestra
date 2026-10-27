@@ -259,6 +259,147 @@ class _RecordsScenarioMixin:
                                 token=people['viewer']['token'], key='design-viewer')
         self.assertEqual(small.status, 403, small.data)
 
+    def run_trace_suite(self):
+        """kittrial-5bb.425: GET /v1/projects/{pid}/trace through the endpoint's `trace` action."""
+        from urllib.parse import urlencode
+        harness = self.harness
+        people = self._setup_actors(harness)
+        pid = self.pid
+        refs = f'/v1/projects/{pid}/references'
+        text = '<!-- design-v1\nscope: web-trace\nstatus: candidate\n-->\n# Web trace\n\n## Storage\nSee req:GHOST here.\n'
+        proposed = harness.request('POST', refs, self._design_body(text, key='design.web-trace'),
+                                   token=people['contrib']['token'], key='trace-design-1')
+        self.assertEqual(proposed.status, 201, proposed.data)
+        accepted = harness.request('POST', refs + '/design.web-trace/accept',
+                                   {'expected_revision': 1, 'record_sha256': proposed.data['sha256'],
+                                    'evidence': 'Read the stored design document.'},
+                                   token=people['coord2']['token'], key='trace-design-accept')
+        self.assertEqual(accepted.status, 200, accepted.data)
+        for number in range(3):
+            made = harness.request('POST', f'/v1/projects/{pid}/tasks',
+                                   {'title': 'Trace task %d' % number,
+                                    'description': 'Uses req:MISSING%d and design:web-trace#nowhere' % number},
+                                   token=people['coord1']['token'])
+            self.assertEqual(made.status, 201, made.data)
+
+        def get(token, project=pid, **query):
+            return harness.request('GET', f'/v1/projects/{project}/trace' + ('?' + urlencode(query) if query else ''),
+                                   token=token)
+
+        # Every member reads the same rows and the same counts: no role sees more or less.
+        answers = {name: get(people[name]['token'], view='tokens') for name in ('viewer', 'contrib', 'coord1',
+                                                                                'coord1_agent')}
+        for name, answer in answers.items():
+            self.assertEqual(answer.status, 200, (name, answer.data))
+        bodies = {json.dumps(answer.data, sort_keys=True) for answer in answers.values()}
+        self.assertEqual(len(bodies), 1)
+        tokens = answers['viewer'].data
+        self.assertEqual(sorted(row['pointer'] for row in tokens['rows']),
+                         ['design:web-trace#nowhere'] * 3 + ['req:GHOST', 'req:MISSING0', 'req:MISSING1',
+                                                             'req:MISSING2'])
+        self.assertEqual(tokens['total'], 7)
+        self.assertIsNone(tokens['next_cursor'])
+        # One 404 for a non-member, a superuser outside the project, an agent scoped to another project and an
+        # unknown project: hidden equals absent.
+        harness.create_account(self.owner_token, 'trace-outsider', 'rec-password-1')
+        outsider, _, _ = harness.login('trace-outsider', 'rec-password-1')
+        # An agent whose grant of this project was taken away (a native host holds one project here).
+        elsewhere = harness.request('POST', '/v1/agents', {'name': 'Elsewhere', 'working_directory': '/tmp/elsewhere',
+                                                           'projects': [pid], 'scopes': ['tasks']},
+                                    token=self.owner_token)
+        self.assertEqual(elsewhere.status, 201, elsewhere.data)
+        self.assertEqual(get(elsewhere.data['credential']['secret']).status, 200)
+        ungranted = harness.request('PATCH', '/v1/agents/' + elsewhere.data['agent']['id'], {'projects': []},
+                                    token=self.owner_token)
+        self.assertEqual(ungranted.status, 200, ungranted.data)
+        # A carrier agent's credential (scope `nudges`) meets the service-wide carrier gate before any route
+        # (http_service.py CARRIER_ROUTES): the same 403 as the tasks read. A coexisting gate, not trace's.
+        carrier = harness.request('POST', '/v1/agents', {'name': 'Carrier', 'working_directory': '/tmp/carrier',
+                                                         'projects': [pid], 'scopes': ['nudges']},
+                                  token=self.owner_token)
+        self.assertEqual(carrier.status, 201, carrier.data)
+        for route in ('trace', 'tasks'):
+            self.assertEqual(harness.request('GET', f'/v1/projects/{pid}/{route}',
+                                             token=carrier.data['credential']['secret']).status, 403, route)
+        absent = [get(outsider), get(elsewhere.data['credential']['secret']),
+                  get(people['viewer']['token'], project='no-such-project'), get(outsider, view='tokens')]
+        self.assertEqual({(r.status, r.data['error']['code'], r.data['error']['message']) for r in absent},
+                         {(404, 'not_found', 'Project not found')})
+        self.assertEqual(get(None).status, 401)
+        # The existing read rule decides, never trace: a caller reads the trace exactly when it reads the tasks.
+        for token in (people['nonmember_su']['token'], outsider, people['viewer']['token']):
+            tasks = harness.request('GET', f'/v1/projects/{pid}/tasks', token=token)
+            self.assertEqual(get(token).status, 200 if tasks.status == 200 else 404, tasks.status)
+        # Pages: the cursor is the caller's, for this query, at this generation.
+        viewer = people['viewer']['token']
+        first = get(viewer, view='tokens', limit='3')
+        self.assertEqual((first.status, len(first.data['rows'])), (200, 3), first.data)
+        second = get(viewer, view='tokens', limit='3', cursor=first.data['next_cursor'])
+        self.assertEqual(second.status, 200, second.data)
+        self.assertEqual([row['pointer'] for row in first.data['rows'] + second.data['rows']],
+                         [row['pointer'] for row in tokens['rows']][:6])
+        for token, query in ((people['contrib']['token'], {'view': 'tokens', 'limit': '3'}),
+                             (viewer, {'view': 'tasks', 'limit': '3'})):
+            stolen = get(token, cursor=first.data['next_cursor'], **query)
+            self.assertEqual(stolen.status, 409, stolen.data)
+        made = harness.request('POST', f'/v1/projects/{pid}/tasks', {'title': 'A later task',
+                                                                     'description': 'Cites req:LATER now'},
+                               token=people['coord1']['token'])
+        self.assertEqual(made.status, 201, made.data)
+        # No answer is kept across requests or callers: the next read of anyone sees the write.
+        for name in ('viewer', 'coord1'):
+            self.assertEqual(get(people[name]['token'], view='tokens').data['total'], 8, name)
+        stale = get(viewer, view='tokens', limit='3', cursor=first.data['next_cursor'])
+        self.assertEqual(stale.status, 409, stale.data)
+        self.assertIn('The project changed since this page was read', stale.data['error']['message'])
+        # A credential whose issuer has left the project: the tasks read says 403 (http_authority.py
+        # credential_capabilities); trace answers the one 404, like every caller who may not read the project.
+        agent_secret = people['coord1_agent']['token']
+        self.assertEqual(get(agent_secret).status, 200)
+        removed = harness.request('DELETE', f'/v1/projects/{pid}/members/' + people['coord1']['uid'],
+                                  token=self.owner_token)
+        self.assertIn(removed.status, (200, 204), removed.data)
+        self.assertEqual(harness.request('GET', f'/v1/projects/{pid}/tasks', token=agent_secret).status, 403)
+        left = get(agent_secret)
+        self.assertEqual((left.status, left.data['error']['message']), (404, 'Project not found'))
+        # Bounds and the query's shape.
+        for query in ({'view': 'everything'}, {'view': 'tokens', 'limit': '51'}, {'view': 'tokens', 'sort': 'x'},
+                      {'view': 'round', 'scope': 'Not A Scope'}):
+            refused = get(viewer, **query)
+            self.assertEqual(refused.status, 422, (query, refused.data))
+        # Review note 7: the route refuses what the endpoint refuses, with its sentence.
+        for scope in ('a.', 'a..b', '.a'):
+            refused = get(viewer, view='round', scope=scope)
+            self.assertEqual(refused.status, 422, (scope, refused.data))
+            self.assertTrue(refused.data['error']['message'].startswith('trace VIEW'), refused.data)
+        # The route refuses an over-long page itself, before the endpoint is asked.
+        self.assertEqual(get(viewer, view='tokens', limit='51').data['error']['message'],
+                         'limit must be between 1 and 50')
+        # Review b2: the reviewer's shape, 10 tasks of 1,000 distinct req: tokens, through the route (it took
+        # 8.4-8.9 s per read before; now one ledger validation per answer and 200 distinct tokens checked per source).
+        import time
+        for number in range(10):
+            planted = harness.request('POST', f'/v1/projects/{pid}/tasks',
+                                      {'title': 'Planted %d' % number,
+                                       'description': ' '.join('req:R01@%d' % (number * 1000 + k + 1)
+                                                               for k in range(1000))},
+                                      token=self.owner_token)
+            self.assertEqual(planted.status, 201, planted.data)
+        started = time.perf_counter()
+        heavy = get(viewer, view='tokens')
+        elapsed = time.perf_counter() - started
+        self.assertEqual(heavy.status, 200, heavy.data)
+        self.assertIn('sources carry more than 200 distinct tokens', heavy.data['coverage']['text'])
+        self.assertLess(elapsed, 5.0)
+        # Review r2 note 7: a full page with its cursor still fits the 64 KiB cap on the wire.
+        self.assertIsNotNone(heavy.data['next_cursor'])
+        self.assertLessEqual(len(json.dumps(heavy.data, ensure_ascii=False).encode('utf-8')), 64 * 1024)
+        summary = get(viewer)
+        self.assertEqual(summary.status, 200, summary.data)
+        self.assertEqual([line['view'] for line in summary.data['rows']],
+                         ['requirements', 'tokens', 'tasks', 'decisions', 'designs', 'round'])
+        self.assertTrue(summary.data['designs'])
+
     def _setup_actors(self, harness):
         owner = self.owner_token
         people = {}
@@ -1968,6 +2109,9 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
     def test_design_document_upload_and_its_body_limits(self):
         self.run_design_document_suite()
 
+    def test_trace_read_over_http(self):
+        self.run_trace_suite()
+
     def test_viewer_may_accept_gate(self):
         self.run_viewer_may_accept_suite()
 
@@ -2015,6 +2159,10 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_design_document_upload_and_its_body_limits(self):
         self.deployment(operators=['ops'], coordinator_writes=True)
         self.run_design_document_suite()
+
+    def test_native_trace_read_over_http(self):
+        self.deployment(operators=['ops'], coordinator_writes=True)
+        self.run_trace_suite()
 
     def test_native_viewer_may_accept_gate(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
@@ -2210,7 +2358,7 @@ class DeriveAttestedVsTrustedTests(unittest.TestCase):
 class WebRecordsScreenTests(unittest.TestCase):
     """Runs the Node DOM/screen test for web/js/views/records.js."""
 
-    def test_records_view_dom_flows(self):
+    def test_records_pages_show_breadcrumbs_and_dom_flows(self):
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not on PATH')

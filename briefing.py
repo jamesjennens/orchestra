@@ -616,6 +616,7 @@ class ContextPointers:
         self.catalogs={}
         self.reviews={}
         self.requirements=None
+        self._ledgers={}
     def _load(self):
         # Pure prose and unchecked kinds never build a project-wide index.
         if self.rows is not None:
@@ -632,6 +633,31 @@ class ContextPointers:
             for comment in row.get('comments') or []:
                 if isinstance(comment,dict) and comment.get('id') is not None and not is_record_comment(comment.get('text',comment.get('body'))):
                     self.comments.setdefault(str(comment['id']),[]).append((row,comment))
+
+    def loaded(self):
+        """The caller-readable, project-scoped rows every resolution reads (kittrial-5bb.425: the trace read
+        counts only these, so hidden equals absent in its totals too)."""
+        self._load()
+        return self.rows
+
+    def requirement_keys(self):
+        """Every requirement key a readable row claims (kittrial-5bb.425, the trace read's requirements view)."""
+        self._load()
+        return sorted(self._requirement_index())
+
+    def ledger(self,key):
+        """A requirement's validated ledger (see `_ledger`), for a reader that needs its revisions too."""
+        self._load()
+        return self._ledger(key)
+
+    def requirement(self,key):
+        """`req:KEY` resolved for any key, including one the token grammar cannot spell (kittrial-5bb.425)."""
+        self._load()
+        entry={'pointer':'req:'+key,'kind':'req','state':'unavailable','trust':'data'}
+        label,_=self._requirement(entry,key,None)
+        if entry['state'] in ('live','superseded'):
+            entry['label']=clip_context_label(label)
+        return entry
 
     def _catalog(self,kind):
         if kind not in self.catalogs:
@@ -674,12 +700,18 @@ class ContextPointers:
         from requirement_governance import validate_evidence_files
         validate_evidence_files(self.governance,self.project,evidence)
 
-    def _requirement(self,entry,key,number):
-        """§2.4 `req`: flags unknown-key, unknown-revision, draft, superseded, withdrawn."""
+    def _ledger(self,key):
+        """One requirement's validated ledger, read once per resolver (kittrial-5bb.425 review b2: every token
+        of a key re-validated the whole ledger, so planted tokens cost a full validation each).
+
+        Returns 'unknown' (no single row claims the key), None (the ledger cannot be read), or
+        (row, revisions, accepted revision numbers, terminal owner state or None)."""
+        if key in self._ledgers:
+            return self._ledgers[key]
         rows=self._requirement_index().get(key,[])
         if len(rows)!=1:
-            entry['flags']=['unknown-key']
-            return None,None
+            self._ledgers[key]='unknown'
+            return 'unknown'
         row=rows[0]
         import requirement_records as records
         import requirement_owner_records as owner_records
@@ -699,8 +731,21 @@ class ContextPointers:
                 self._governed(terminal)
         except (ValueError,TypeError,KeyError):
             # The same failures the requirements read shows as unreadable: never promoted.
+            self._ledgers[key]=None
+            return None
+        self._ledgers[key]=(row,revisions,accepted,terminal)
+        return self._ledgers[key]
+
+    def _requirement(self,entry,key,number):
+        """§2.4 `req`: flags unknown-key, unknown-revision, draft, superseded, withdrawn."""
+        ledger=self._ledger(key)
+        if ledger=='unknown':
+            entry['flags']=['unknown-key']
+            return None,None
+        if ledger is None:
             entry['flags']=[]
             return None,None
+        row,revisions,accepted,terminal=ledger
         if number is None:
             number=accepted[-1] if accepted else max(revisions)
         elif number not in revisions:

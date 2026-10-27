@@ -328,6 +328,17 @@ class DelegationTests(unittest.TestCase):
         self.assertIsNone(d.parse_comment({'author': OWNER, 'text': d.body(record)}, project='other', decision='pp-dec'))
         self.assertIsNone(d.parse_comment({'author': OWNER, 'text': d.body(record)}, project=PROJECT, decision='pp-x'))
 
+    def test_a_stored_delegation_with_a_legacy_invisible_reason_still_reads(self):
+        record = d.make_record(request(), project=PROJECT, recorded_by=OWNER,
+                               via='session', account=OWNER, at=AT[1])
+        record['reason'] = 'Stored before the expanded rule\u061c'
+        record['sha256'] = d.content_hash(record)
+        comment = {'author': OWNER, 'text': d.body(record)}
+        self.assertEqual(record, d.parse_comment(comment, project=PROJECT, decision='pp-dec'))
+        with self.assertRaisesRegex(ValueError, 'plain text'):
+            self.write(request(reason='New write\u061c'))
+        self.assertEqual([], self.row()['comments'])
+
     def test_two_grants_on_one_decision_grant_nothing(self):
         self.write(request())
         record = d.make_record(request(operation_id='op-2', grantee=AGENT), project=PROJECT, recorded_by=OWNER,

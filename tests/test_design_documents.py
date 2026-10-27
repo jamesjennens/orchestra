@@ -328,6 +328,11 @@ class UploadTests(DesignCase):
                     self.propose_design(text, authority=authority(text, path=path))
                 self.nothing_written(writes, blobs)
 
+    def test_repo_document_format_refusal_does_not_consult_the_unicode_table(self):
+        with patch('unicodedata.category', return_value='Cf'):
+            self.propose_design()
+        self.assertTrue(self.anchor()['comments'])
+
     def test_a_stored_repo_document_record_with_an_invisible_path_never_parses(self):
         # The read side of b2: plain_text runs inside valid_authority, so a record carrying such a path (planted,
         # or written before this rule) is not a readable revision.
@@ -339,6 +344,16 @@ class UploadTests(DesignCase):
             changed.pop('sha256')
             changed['sha256'] = rr.content_hash(changed)
             self.assertIsNone(rr.parse_entry(rr.ENTRY_V3_PREFIX + rr.canonical_bytes(changed).decode('utf-8')))
+
+    def test_a_stored_repo_document_with_a_legacy_invisible_path_still_parses(self):
+        self.propose_design()
+        body = next(c['text'] for c in self.anchor()['comments'] if c['text'].startswith(rr.ENTRY_V3_PREFIX))
+        record = json.loads(body[len(rr.ENTRY_V3_PREFIX):])
+        changed = dict(record, authority=dict(record['authority'], path='docs/a\u061cb.md'))
+        changed.pop('sha256')
+        changed['sha256'] = rr.content_hash(changed)
+        parsed = rr.parse_entry(rr.ENTRY_V3_PREFIX + rr.canonical_bytes(changed).decode('utf-8'))
+        self.assertEqual('docs/a\u061cb.md', parsed['authority']['path'])
 
     def test_a_repo_path_authority_keeps_its_earlier_rule(self):
         # Only repo-document paths are tightened: a repo-path entry is re-validated on every read.
@@ -1037,10 +1052,23 @@ class TraceVerifyClientTests(unittest.TestCase):
         self.assertEqual((code, summary['checked'], summary['failed']), (4, 0, 0))
         self.assertFalse(summary['results'][0]['checked'])
 
-    def test_trace_without_verify_says_where_trace_is(self):
+    def test_trace_without_verify_is_the_servers_read(self):
+        # kittrial-5bb.425: every view is the endpoint's `trace` action; the client only passes it on.
         import client
-        with self.assertRaisesRegex(ValueError, 'trace --verify'):
-            client._trace_command([], {}, 'p', 'alice', None)
+        calls = []
+
+        def fake(config, project, actor, args, action='bd', path=None):
+            calls.append((action, list(args)))
+            return {'returncode': 0, 'stdout': json.dumps({'schema': 'trace-v1', 'rows': []}), 'stderr': ''}
+        out = Path(self.repo) / 'trace.json'
+        with patch.object(client, 'request', fake):
+            self.assertEqual(client._trace_command(['tokens', '--limit', '5'], {}, 'p', 'alice', str(out)), 0)
+        self.assertEqual(calls, [('trace', ['tokens', '--limit', '5'])])
+        self.assertEqual(json.loads(out.read_text(encoding='utf-8'))['schema'], 'trace-v1')
+        refused = lambda *a, **k: {'returncode': 2, 'stdout': '', 'stderr': 'trace VIEW ...; views: summary'}
+        with patch.object(client, 'request', refused):
+            with self.assertRaisesRegex(ValueError, 'views: summary'):
+                client._trace_command([], {}, 'p', 'alice', None)
 
 
 class DesignPageAnchorTests(unittest.TestCase):

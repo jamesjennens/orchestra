@@ -162,7 +162,7 @@ def limits(root, warnings=None):
 
 
 # -- names ----------------------------------------------------------------------------------------
-def clean_name(name):
+def clean_name(name, *, stored=False):
     """The display name, checked: a basename of 1-128 characters, or :class:`Refusal` 422.
 
     The same rule ``http_service.validate_attachments`` applies (no ``/`` or ``\\``, no control
@@ -178,17 +178,17 @@ def clean_name(name):
             or any(ord(c) < 32 or ord(c) == 127 for c in name):
         raise Refusal(422, 'invalid', 'A file name must be a plain name: no / or \\, no control '
                       'characters, not . or .., and no leading or trailing space.')
-    plain(name, 'A file name')
+    plain(name, 'A file name', stored=stored)
     return name
 
 
-def plain(value, label):
+def plain(value, label, *, stored=False):
     # r2 (review s3): the kit's rule for text other people read (review_workflow.plain_text): no control, bidi,
     # zero-width, C1, tag or variation-selector characters. A name with a right-to-left override that shows as
     # invoiceexe.jpg is refused, and so is a note or a reason that hides text.
     from review_workflow import plain_text
     try:
-        plain_text(value, label)
+        plain_text(value, label, stored=stored)
     except ValueError as refused:
         raise Refusal(422, 'invalid', str(refused) + '.') from None
     return value
@@ -431,7 +431,7 @@ def _valid_entry(entry, task, sha256):
     if entry.get('direction') not in JOURNAL_DIRECTIONS or not isinstance(entry.get('by'), str):
         return False
     try:
-        clean_name(entry.get('name'))
+        clean_name(entry.get('name'), stored=True)
     except Refusal:
         return False
     withdrawn = entry.get('withdrawn')
