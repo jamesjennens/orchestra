@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb432-web-agent-setup-coordinator-role-0002",
+  "key": "web.agent-setup-coordinator-role",
+  "name": "The folder set-up role step explains how to set up a coordinator grant",
+  "aliases": [
+    "folder setup coordinator grant",
+    "agent setup coordinator role step",
+    "set up agent as project coordinator"
+  ],
+  "summary": "On the folder set-up role step, an effective coordinator grant continues to show Coordinator in the Bridge and explains that grants are managed on the project's Members & settings page; without an effective grant, the page tells the person to give the grant there and reopen set-up.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "http_auth.py::Service.agent_coordinates",
+    "http_auth.py::Service.agent_view"
+  ],
+  "tests": [
+    "tests/web_setup_wizard.mjs",
+    "tests/test_http_web.py::AgentSetupDialogCase.test_wizard_one_action_per_screen_under_node"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "web",
+    "agents",
+    "setup"
+  ]
+}
