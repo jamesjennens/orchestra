@@ -73,6 +73,9 @@ class _GapsMixin(records._RecordsScenarioMixin):
         for name in ('contrib', 'viewer', 'coord2_agent', 'contrib_records_agent'):
             refused = self.child(people[name]['token'], parent, body, 'child-refused-' + name)
             self.assertEqual(refused.status, 403, (name, refused.data))
+        # ... and before the parent is read: a contributor learns nothing about which tasks exist.
+        blind = self.child(people['contrib']['token'], 'kittrial-5bb.99999', body, 'child-refused-absent')
+        self.assertEqual(blind.status, 403, blind.data)
         # One 404 for an outsider, an unknown project, a parent that is absent, in another project, or a
         # record anchor; nothing is written for any of them.
         harness.create_account(self.owner_token, 'gaps-outsider', 'rec-password-1')
