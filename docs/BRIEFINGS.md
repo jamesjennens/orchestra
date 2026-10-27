@@ -349,6 +349,12 @@ from `resolved.pointer_items`. HTTP keeps `checkpoint.open_items` raw, with meta
 paging; a first page is not the complete carry list. Web and text views join the maps
 for display without changing raw items.
 
+The task's own description is read the same way (kittrial-5bb.425): its `req:` and
+`design:` tokens, resolved first so the description never loses its budget to items, appear
+as `description_pointers` (`pointers`, `pointers_omitted`) in the brief and on the HTTP
+brief, and the task page shows them under its summary as "Cites". The description is not
+changed and other kinds in it are not resolved.
+
 Resolution uses only loaded, caller-authorized project data, with no new I/O.
 The five states are:
 

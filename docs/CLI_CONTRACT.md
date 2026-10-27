@@ -1642,8 +1642,11 @@ sets `operation`.
       a page asked for at another generation is refused ("The project changed since this page was
       read"). One answer is at most 64 KiB, a hard limit: a page is shortened to fit, and a single row
       still too large is replaced by its identifying fields and `oversized: true` with a plain note.
-    - **Cost.** Each source (a task, or a design section) has at most 200 distinct tokens checked; a
-      source over that has one `tokens-not-checked` row with the count it left out, and only its own
+    - **Cost.** Each source has at most 200 distinct tokens checked. A task's sources are its
+      fields, read in this order: the description first, then the current checkpoint's item sources
+      and evidence, then the current contribution's summary; each field has its own bound. A design
+      section is one source. A source over the bound has one `tokens-not-checked` row with the count
+      it left out (`where` names the task and field, or the design and section), and only its own
       extra tokens go unchecked. A summary line a bound cut short says `partial: true`, and the coverage
       line says why. A requirement's ledger is validated once per answer, however many of its revisions
       are cited. The export, membership and governance are read under the project lock; the views are

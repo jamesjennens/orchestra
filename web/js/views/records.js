@@ -1,6 +1,7 @@
 // Reference and capability records view: waiting queue, find/lookup, propose, revise,
 // coordinator accept/retire/verify, and two-step revise-then-accept (kittrial-5bb.213).
 import { h, mount, toast } from '../dom.js';
+import { designsPanel } from './trace.js';
 import { pageHead, empty, setFieldError, formValues, act, describe, errorState } from '../ui.js';
 
 function field(label, control, hint) {
@@ -681,6 +682,8 @@ export async function page(ctx, { pid }) {
     findPanel,
     acceptedPanel,
     proposeFold,
+    // kittrial-5bb.425 part 2: one row per design.<scope>, its state and coverage.
+    designsPanel(ctx, pid),
     refPanel,
     capPanel);
 }

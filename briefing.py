@@ -1740,18 +1740,26 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                        +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.']
                        +[w for w in integration_warnings if w.startswith(RECONCILIATION_WARNING_PREFIX)]),
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
-    if p is not None:
+    # kittrial-5bb.425 part 2: the task's own req: and design: tokens, resolved where the reader works (the
+    # task page, TRACEABILITY_DESIGN §5.2). Read first, so the description never loses its budget to items.
+    described=[x['pointer'] for x in parse_context_pointers(issue.get('description')) if x['kind'] in ('req','design')]
+    description=[{'id':'description','text':' '.join(described)}] if described else []
+    if p is not None or description:
         governance=None
         # Read the governance snapshot only for a `req:` token: every other brief reads
         # nothing new (TRACEABILITY_DESIGN §2.4; context index §2.1.2 "no new I/O").
-        if journal is not None and needs_requirement_governance((result['unresolved']['items'],'source'),
-                                                                (p['resolved'][:limit],'evidence')):
+        if journal is not None and needs_requirement_governance((result['unresolved']['items'] if p is not None else [],'source'),
+                                                                (p['resolved'][:limit] if p is not None else [],'evidence'),
+                                                                (description,'text')):
             import requirement_governance
             try:
                 governance=requirement_governance.snapshot(journal,project)
             except (ValueError,OSError):
                 governance=None
         pointers=ContextPointers(rows,project,operators,governance=governance)
+        if description:
+            result['description_pointers']=pointers.item_pointers(description,'text')['description']
+    if p is not None:
         result['unresolved']['pointer_items']=pointers.item_pointers(result['unresolved']['items'],'source')
         result['resolved']={'items':p['resolved'][:limit],
                             'pointer_items':pointers.item_pointers(p['resolved'][:limit],'evidence'),

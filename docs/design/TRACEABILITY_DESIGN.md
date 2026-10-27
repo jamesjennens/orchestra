@@ -625,7 +625,15 @@ of a kittrial-sized export, as the context index did for find.
      ledger is validated once per answer, so 10 tasks of 1,000 distinct `req:` tokens read in about 0.1 s
      (8.4-8.9 s before); at most 200 distinct tokens are checked per source (a task or a design section),
      so a planted source hides only its own extra tokens and the summary says when a count is partial;
-     the views are built after the shared lock is released. Part 2 builds the web.
+     the views are built after the shared lock is released.
+   - **As built, part 2 (kittrial-5bb.425): the web.** A Coverage panel on the project page (one
+     line per `summary` line with its counts and "partial" when a bound cut it, each opening the
+     view's page at `/p/{pid}/trace/{view}`, which pages with the server's cursor), a Designs list
+     under Records (each `design.<scope>` with its state and requirement and plan coverage, opening
+     the design page) and, on the task page, the description's own `req:` and `design:` tokens
+     resolved by the brief (`description_pointers`). Everything is built with `h()` as text
+     (web/js/views/trace.js). After the re-review of part 1, each task field (description, current
+     checkpoint, current contribution) is its own 200-token source.
 5. **Orchestra's system design.** docs/SYSTEM_DESIGN.md rewritten with the front block, uploaded as
    `design.orchestra` and accepted, IMPLEMENTATION_PLAN retired, and trace's first report on
    kittrial attached.
