@@ -111,12 +111,13 @@ def read(project_dir):
     its absence (``default``) or a damaged file (``damaged``).
     """
     target = path(project_dir)
+    from admin import read_regular_text
     try:
-        text = target.read_text(encoding='utf-8')
+        text = read_regular_text(target)
     except FileNotFoundError:
         return {'claiming': DEFAULT, 'set_by': None, 'set_at': None, 'set_via': None,
                 'previous': None, 'history': [], 'source': 'default'}
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError, ValueError):
         return {'claiming': DAMAGED, 'set_by': None, 'set_at': None, 'set_via': None,
                 'previous': None, 'history': [], 'source': 'damaged',
                 'warning': ("The claiming setting in %s could not be read, so the restrictive value "
@@ -184,11 +185,12 @@ def backup_record(project_dir):
     a damaged restrictive setting into the permissive default.
     """
     target = path(project_dir)
+    from admin import read_regular_text
     try:
-        raw = target.read_bytes()
+        raw = read_regular_text(target, raw=True)
     except FileNotFoundError:
         return None
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise ValueError('The claiming setting file cannot be read: %s' % error) from None
     try:
         text = raw.decode('utf-8')

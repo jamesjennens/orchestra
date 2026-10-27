@@ -4,6 +4,7 @@ from void_test_helpers import without_void_tracker
 import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import types
@@ -43,10 +44,58 @@ def inject_stale_ack(project, actor, version):
     (project / '.guidance.json').write_text(json.dumps(meta), encoding='utf-8')
 
 
+class BlockingReadTimeout(Exception):
+    pass
+
+
+def bounded(call):
+    previous = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(BlockingReadTimeout()))
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def make_fifo(case, path):
+    if not hasattr(os, 'mkfifo'):
+        case.skipTest('mkfifo is unavailable')
+    os.mkfifo(path)
+
+
 class GuidanceRecordTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name); self.project = self.root / 'project'; self.project.mkdir()
+
+    def test_regular_file_guidance_missing_damaged_and_valid_classifications(self):
+        target = self.project / guidance.GUIDANCE_NAME
+        self.assertIsNone(guidance.read_text(self.project))
+        target.write_bytes(b'\xff')
+        with self.assertRaises(ValueError):
+            guidance.read_text(self.project)
+        target.write_text('Read the design.', encoding='utf-8')
+        self.assertEqual('Read the design.', guidance.read_text(self.project))
+
+    def test_readable_file_regular_control_reads_only_one_byte(self):
+        target = self.project / guidance.GUIDANCE_NAME
+        target.write_text('x', encoding='utf-8')
+        with patch.object(admin, 'read_regular_text', wraps=admin.read_regular_text) as read:
+            self.assertTrue(guidance._readable_file(target))
+        read.assert_called_once_with(target, prefix=1, raw=True)
+
+    def test_fifo_and_nonregular_guidance_never_block_and_stay_unreadable(self):
+        target = self.project / guidance.GUIDANCE_NAME
+        make_fifo(self, target)
+        self.assertFalse(bounded(lambda: guidance._readable_file(target)))
+        with self.assertRaises(ValueError):
+            bounded(lambda: guidance.read_text(self.project))
+        target.unlink()
+        target.mkdir()
+        self.assertFalse(guidance._readable_file(target))
+        with self.assertRaises(ValueError):
+            guidance.read_text(self.project)
 
     def test_absent_guidance_reads_as_absent_not_an_error(self):
         self.assertEqual(guidance.read_text(self.project), None)

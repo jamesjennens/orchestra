@@ -255,13 +255,11 @@ def validate_text(text):
 
 def _readable_file(target):
     """True for a regular file whose bytes can be read (so only its CONTENT is at fault)."""
+    from admin import read_regular_text
     try:
-        if not target.is_file():
-            return False
-        with target.open('rb') as handle:
-            handle.read(1)
+        read_regular_text(target, prefix=1, raw=True)
         return True
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
@@ -286,9 +284,10 @@ def read_text(path):
     text, _ = _paths(path)
     if not text.exists():
         return None
+    from admin import read_regular_text
     try:
-        data = text.read_bytes()
-    except OSError:
+        data = read_regular_text(text, raw=True)
+    except (OSError, ValueError):
         raise ValueError('The guidance file could not be read (a directory in its place, or '
                          'permissions); ask the operator to check the guidance files') from None
     if len(data) > LIMIT * 4:
@@ -322,8 +321,9 @@ def read_meta(path):
     _, meta = _paths(path)
     if not meta.exists():
         return None
+    from admin import read_regular_text
     try:
-        value = record_json.loads(meta.read_text(encoding='utf-8'))
+        value = record_json.loads(read_regular_text(meta))
     except (OSError, UnicodeError, ValueError, RecursionError):
         return None
     return value if _valid_meta(value) else None
@@ -480,11 +480,9 @@ def read_repair(path):
     target = Path(path) / REPAIR_NAME
     if target.is_symlink() or not target.is_file():
         return None
+    from admin import read_regular_text
     try:
-        with target.open('rb') as handle:
-            raw = handle.read(REPAIR_LIMIT + 1)
-        if len(raw) > REPAIR_LIMIT:
-            return None
+        raw = read_regular_text(target, limit=REPAIR_LIMIT, raw=True)
         value = record_json.loads(raw.decode('utf-8'))
     except (OSError, UnicodeError, ValueError, RecursionError):
         return None
@@ -1029,10 +1027,11 @@ def clear_record_state(path):
     target = Path(path) / CLEAR_NAME
     if not (target.exists() or target.is_symlink()):
         return 'absent', None
-    if target.is_symlink() or not target.is_file():
+    if target.is_symlink():
         return 'invalid', None
+    from admin import read_regular_text
     try:
-        value = record_json.loads(target.read_text(encoding='utf-8'))
+        value = record_json.loads(read_regular_text(target))
         return 'ok', validate_clear_record(value)
     except (OSError, UnicodeError, ValueError, RecursionError):
         return 'invalid', None

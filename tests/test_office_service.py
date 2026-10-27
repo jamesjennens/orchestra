@@ -182,6 +182,33 @@ else:
         with self.assertRaisesRegex(ValueError, 'Unknown'):
             service_config(self.config)
 
+    def test_host_configuration_regular_missing_damaged_and_fifo(self):
+        from office_service import service_config
+        self.assertEqual(service_config(self.config)['schema_version'], 1)
+        self.config.unlink()
+        with self.assertRaisesRegex(ValueError, 'Cannot read office service configuration'):
+            service_config(self.config)
+        self.config.write_text('{not json', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'is not JSON'):
+            service_config(self.config)
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        self.config.unlink()
+        os.mkfifo(self.config)
+        result = []
+        def read():
+            try:
+                service_config(self.config)
+            except BaseException as error:
+                result.append(error)
+        worker = threading.Thread(target=read, daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive(), 'a configuration FIFO blocked the read')
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], ValueError)
+        self.assertIn('Cannot read office service configuration', str(result[0]))
+
     def test_password_minimum_is_read_and_forwarded(self):
         # kittrial-5bb.363: the office setting is the web flag; invalid values are refused
         # by the same helper and are never clamped.

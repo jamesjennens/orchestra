@@ -254,22 +254,11 @@ def incomplete_correction(rows, comment_id):
     return None
 
 
-def _read_regular(path, limit=MAX_RECORD_BYTES):
+def _read_regular(path, limit=MAX_RECORD_BYTES, validate=None):
     if path.is_symlink():
         raise ValueError('Lifecycle void journal entry is a symlink')
-    flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
-    fd = os.open(path, flags)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
-            raise ValueError('Lifecycle void journal entry is not a bounded regular file')
-        with os.fdopen(fd, 'rb', closefd=False) as stream:
-            blob = stream.read(limit + 1)
-        if len(blob) > limit:
-            raise ValueError('Lifecycle void journal entry exceeds its byte bound')
-        return blob
-    finally:
-        os.close(fd)
+    from admin import read_regular_text
+    return read_regular_text(path, limit=limit, raw=True, validate=validate)
 
 
 def abandon_document(records):

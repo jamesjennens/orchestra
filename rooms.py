@@ -40,6 +40,7 @@ import secrets
 import shutil
 import tempfile
 import record_json
+from admin import read_regular_text
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -799,8 +800,12 @@ def _quarantine(path, tail):
         quarantine = path.with_name(path.name + '.' + value + '.incomplete')
         _refuse_symlink(quarantine)
         if quarantine.exists():
-            if quarantine.read_bytes() == tail:
-                return
+            from admin import read_regular_text
+            try:
+                if read_regular_text(quarantine, raw=True) == tail:
+                    return
+            except ValueError:
+                raise Refusal(500, 'damaged', 'Room recovery quarantine is unreadable.') from None
             continue
         _atomic_write(quarantine, tail)
         return
@@ -810,8 +815,8 @@ def _quarantine(path, tail):
 def _read_segment(path, first_sequence):
     """Validated lines of one segment, quarantining a torn last line."""
     _refuse_symlink(path)
-    raw = path.read_bytes()
     try:
+        raw = read_regular_text(path, raw=True)
         lines, tail = _parse_lines(raw)
         parsed = []
         expected = first_sequence
@@ -932,7 +937,7 @@ def rebuild_index(project, tolerant=False):
         try:
             all_lines = []
             for number, path in _segments(project, room_id):
-                raw = path.read_bytes()
+                raw = read_regular_text(path, raw=True)
                 parsed, _tail = _parse_lines(raw)
                 for line in parsed:
                     _validate_line(line)
@@ -963,7 +968,7 @@ def read_index(project):
     rebuilt = None
     if path.exists():
         try:
-            value = record_json.loads(path.read_text(encoding='utf-8'))
+            value = record_json.loads(read_regular_text(path))
             if (not isinstance(value, dict) or value.get('schema_version') != SCHEMA_VERSION
                     or not isinstance(value.get('rooms'), dict)):
                 raise ValueError('invalid index')
@@ -1027,7 +1032,7 @@ def read_room(project, room_id):
     if not path.is_file():
         raise Refusal(404, 'not_found', 'Room not found')
     try:
-        room = record_json.loads(path.read_text(encoding='utf-8'))
+        room = record_json.loads(read_regular_text(path))
     except (OSError, ValueError, UnicodeDecodeError):
         raise Refusal(500, 'damaged', 'The room record is unreadable.') from None
     required = {'schema_version', 'id', 'name', 'state', 'created_by', 'created_by_name',
@@ -1795,6 +1800,12 @@ def export_jsonl(project, room_id):
 
 # -- its own backup file (backups/<name>.rooms.json) ----------------------------------------------
 def _backup_files(project):
+    def read(path):
+        try:
+            return read_regular_text(path, raw=True)
+        except ValueError:
+            raise Refusal(500, 'damaged', 'Room backup file %s is unreadable.' % path.name) from None
+
     root = rooms_root(project)
     if not root.exists():
         return None
@@ -1804,20 +1815,20 @@ def _backup_files(project):
     index = root / INDEX
     _refuse_symlink(index)
     if index.is_file():
-        files[INDEX] = index.read_bytes()
+        files[INDEX] = read(index)
     for room_id in _room_ids(project):
         folder = room_dir(project, room_id)
         room = folder / ROOM
         _refuse_symlink(room)
         if not room.is_file():
             raise Refusal(500, 'damaged', 'Room %s has no room record.' % room_id)
-        files[room_id + '/' + ROOM] = room.read_bytes()
+        files[room_id + '/' + ROOM] = read(room)
         for number, path in _segments(project, room_id):
-            files[room_id + '/' + path.name] = path.read_bytes()
+            files[room_id + '/' + path.name] = read(path)
         for item in folder.iterdir():
             if QUARANTINE_NAME.fullmatch(item.name):
                 _refuse_symlink(item)
-                files[room_id + '/' + item.name] = item.read_bytes()
+                files[room_id + '/' + item.name] = read(item)
     return files
 
 

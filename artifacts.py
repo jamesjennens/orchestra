@@ -18,6 +18,9 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
+import record_json
+from requirements import _unique_object, canonical_bytes
+
 
 class ArtifactError(ValueError):
     """Raised when an artifact path or manifest entry is invalid."""
@@ -276,17 +279,19 @@ class ArtifactStore:
             return []
         rows: list[dict[str, Any]] = []
         try:
-            with self.manifest_path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if line.strip():
-                        try:
-                            value = json.loads(line)
-                        except (json.JSONDecodeError, RecursionError, ValueError) as exc:
-                            raise ArtifactError("cannot read artifact manifest") from exc
-                        self._validate_record(value, rows)
-                        rows.append(value)
-        except OSError as exc:
+            from admin import read_regular_text
+            text = read_regular_text(self.manifest_path)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise ArtifactError("cannot read artifact manifest") from exc
+        for line in text.split('\n'):
+            if line.strip():
+                try:
+                    value = record_json.loads(line, object_pairs_hook=_unique_object)
+                    canonical_bytes(value)
+                except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+                    raise ArtifactError("cannot read artifact manifest") from exc
+                self._validate_record(value, rows)
+                rows.append(value)
         return rows
 
     def _validate_record(self, row: Any, rows: list[dict[str, Any]] | None = None) -> str:

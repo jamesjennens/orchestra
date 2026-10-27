@@ -1874,8 +1874,12 @@ def host_revert_journal(project):
                 raise ValueError('symlink')
             if path.stat().st_size > JOURNAL_FILE_LIMIT:
                 raise ValueError('oversized')
-            entry = validate_revert_journal_entry(
-                json.loads(path.read_text(encoding='utf-8')), name)
+            from admin import read_regular_text
+            from requirements import _unique_object
+            entry = record_json.loads(read_regular_text(path, limit=JOURNAL_FILE_LIMIT),
+                                      object_pairs_hook=_unique_object)
+            canonical_bytes(entry)
+            entry = validate_revert_journal_entry(entry, name)
         except (OSError, ValueError, TypeError, KeyError):
             invalid.append(JOURNAL_DIR + '/' + name)
             continue

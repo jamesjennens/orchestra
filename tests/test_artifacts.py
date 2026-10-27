@@ -114,7 +114,7 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertEqual(result["record"]["metadata"]["parameters"]["window"], 20)
 
     def test_symlink_escape_is_rejected_when_supported(self):
-        outside = self.root.parent / "outside-artifact.txt"
+        outside = self.root.parent / (self.root.name + "-outside-artifact.txt")
         outside.write_bytes(b"private")
         link = self.root / "datasets/sample/link.txt"
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -138,6 +138,21 @@ class ArtifactStoreTests(unittest.TestCase):
         self.store.manifest_path.write_text(json.dumps({"path": "bad"}) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(ArtifactError, "invalid fields"):
             self.store.entries(verify=False)
+
+    def test_manifest_host_reader_rejects_invalid_utf8_duplicates_nonfinite_and_unicode(self):
+        for payload in (b'\xff\n', b'{"path":"one","path":"two"}\n', b'{"n":NaN}\n',
+                        b'{"s":"\\ud800"}\n', b'[' * 80 + b'0' + b']' * 80 + b'\n'):
+            with self.subTest(payload=payload[:20]):
+                self.store.manifest_path.write_bytes(payload)
+                with self.assertRaisesRegex(ArtifactError, "cannot read artifact manifest"):
+                    self.store.entries(verify=False)
+                self.assertEqual(self.store.manifest_path.read_bytes(), payload)
+
+    def test_manifest_unicode_line_separators_remain_json_string_data(self):
+        self._write("results/task/output.txt", b"stable")
+        made = self.store.register("results/task/output.txt", kind="result",
+                                   metadata={"note": "first\u2028second\u0085third"})
+        self.assertEqual(self.store.entries(verify=False), [made["record"]])
 
     def test_manifest_checksum_and_size_types_are_validated_without_verify(self):
         self._write("results/task/output.txt", b"stable")

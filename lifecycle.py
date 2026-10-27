@@ -2455,7 +2455,8 @@ def offline_snapshot(rows, project=None):
         if not native:
             metadata = directory / '.beads' / 'metadata.json'
             try:
-                identity = load_json(metadata).get('dolt_database')
+                from admin import read_regular_text
+                identity = json.loads(read_regular_text(metadata)).get('dolt_database')
                 prefixes = {row['id'].split('-', 1)[0] for row in rows
                             if isinstance(row, dict) and isinstance(row.get('id'), str)}
                 consulted = bool(identity and prefixes == {identity})

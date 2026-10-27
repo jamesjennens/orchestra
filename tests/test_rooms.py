@@ -1,6 +1,7 @@
 """Project rooms slice 1: storage, bounds, tombstones, export and the separate backup (kittrial-5bb.385)."""
 import json
 import os
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,26 @@ import rooms
 ACTOR = {'id': 'usr_0123456789abcdef', 'name': 'Alice', 'role': 'contributor'}
 COORD = {'id': 'usr_fedcba9876543210', 'name': 'Carol', 'role': 'coordinator'}
 LIMITS = dict(rooms.LIMIT_DEFAULTS)
+
+
+class BlockingReadTimeout(Exception):
+    pass
+
+
+def bounded(call):
+    previous = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(BlockingReadTimeout()))
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def make_fifo(case, path):
+    if not hasattr(os, 'mkfifo'):
+        case.skipTest('mkfifo is unavailable')
+    os.mkfifo(path)
 
 
 class RoomsTest(unittest.TestCase):
@@ -26,6 +47,67 @@ class RoomsTest(unittest.TestCase):
     def make_room(self, name='Planning', limits=None):
         self.room = rooms.create(self.project, name, COORD, limits or LIMITS)
         return self.room
+
+    def test_regular_file_room_sidecars_missing_damaged_and_valid_classifications(self):
+        with self.assertRaises(rooms.Refusal) as caught:
+            rooms.read_room(self.project, 'r-000000000000')
+        self.assertEqual('not_found', caught.exception.code)
+        with self.assertRaises(FileNotFoundError):
+            rooms._read_segment(self.project / 'missing.jsonl', 1)
+        self.make_room()
+        self.post('regular bytes', 'op-regular')
+        folder = self.project / rooms.FOLDER / self.room['id']
+        segment = folder / 'messages-0001.jsonl'
+        self.assertEqual('regular bytes', rooms._read_segment(segment, 1)[0]['text'])
+        quarantine = folder / 'messages-0001.jsonl.0123456789abcdef.incomplete'
+        quarantine.write_bytes(b'torn')
+        files = rooms._backup_files(self.project)
+        self.assertEqual(b'torn', files[self.room['id'] + '/' + quarantine.name])
+        self.assertIn(rooms.INDEX, files)
+        self.assertIn(self.room['id'] + '/' + rooms.ROOM, files)
+        segment.write_bytes(b'{bad\n')
+        with self.assertRaises(rooms.Refusal) as caught:
+            rooms._read_segment(segment, 1)
+        self.assertEqual('damaged', caught.exception.code)
+
+    def test_fifo_room_sidecars_never_block_and_are_damaged(self):
+        self.make_room()
+        self.post('regular bytes', 'op-regular')
+        root = self.project / rooms.FOLDER
+        folder = root / self.room['id']
+        segment = folder / 'messages-0001.jsonl'
+        index = root / rooms.INDEX
+        index.unlink()
+        make_fifo(self, index)
+        recovered = bounded(lambda: rooms.read_index(self.project))
+        self.assertEqual(rooms.SCHEMA_VERSION, recovered['schema_version'])
+        self.assertIn(self.room['id'], recovered['rooms'])
+        index.unlink()
+        segment.unlink()
+        make_fifo(self, segment)
+        with self.assertRaises(rooms.Refusal) as caught:
+            bounded(lambda: rooms._read_segment(segment, 1))
+        self.assertEqual('damaged', caught.exception.code)
+        segment.unlink()
+        segment.mkdir()
+        with self.assertRaises(rooms.Refusal) as caught:
+            rooms._read_segment(segment, 1)
+        self.assertEqual('damaged', caught.exception.code)
+        segment.rmdir()
+        segment.write_bytes(b'')
+        quarantine = folder / 'messages-0001.jsonl.0123456789abcdef.incomplete'
+        make_fifo(self, quarantine)
+        with self.assertRaises(rooms.Refusal) as caught:
+            bounded(lambda: rooms._backup_files(self.project))
+        self.assertEqual('damaged', caught.exception.code)
+        quarantine.unlink()
+        tail = b'torn'
+        digest = rooms.hashlib.sha256(tail).hexdigest()[:16]
+        quarantine = folder / ('messages-0001.jsonl.%s.incomplete' % digest)
+        make_fifo(self, quarantine)
+        with self.assertRaises(rooms.Refusal) as caught:
+            bounded(lambda: rooms._quarantine(segment, tail))
+        self.assertEqual('damaged', caught.exception.code)
 
     def test_create_list_and_duplicate_name(self):
         room = self.make_room()

@@ -58,7 +58,7 @@ from coordination import atomic, identifier
 from export_requirements import parse_json
 from keyed_entries import CATALOG_SHOW_MAX, AnchoredKind, read_labelled
 from recovery import configured_operators
-from requirements import SHA256_TEXT, canonical_bytes, content_hash, load_json
+from requirements import SHA256_TEXT, _unique_object, canonical_bytes, content_hash
 from reserved_comments import (CONTRIBUTION_SETTINGS_PREFIX as SETTINGS_PREFIX,
                                PROPOSAL_DISPOSITION_PREFIX as DISPOSITION_PREFIX,
                                PROPOSAL_PREFIX as REVISION_PREFIX, is_record_anchor, record_comment_kind)
@@ -722,7 +722,7 @@ def session_names(project):
     if project is None:
         return {}
     try:
-        data = json.loads((Path(project) / '.sessions.json').read_text(encoding='utf-8'))
+        data = core.read_host_json(Path(project) / '.sessions.json')
         return {record['actor']: record['name'] for record in data.get('records', {}).values()
                 if isinstance(record, dict) and isinstance(record.get('actor'), str)
                 and isinstance(record.get('name'), str)}
@@ -1473,7 +1473,13 @@ def feedback_origin(feed, entry_id):
     if feed.is_symlink() or not feed.is_file():
         raise ValueError('This project has no feedback journal to promote from')
     try:
-        entries = feedback.validate_feed_text(feed.read_bytes().decode('utf-8'))
+        from admin import read_regular_text
+        text = read_regular_text(feed)
+        for line in text.split('\n'):
+            if line.strip():
+                value = record_json.loads(line, object_pairs_hook=_unique_object)
+                canonical_bytes(value)
+        entries = feedback.validate_feed_text(text)
     except (UnicodeDecodeError, ValueError):
         raise ValueError('The feedback journal does not validate; run feedback list to repair it, then retry') \
             from None
@@ -1686,7 +1692,7 @@ def dispose(payload, actor, run, project, operators=None, route='review', http=N
     digest = content_hash({'actor': actor, 'payload': payload})
     journal = core.journal_dir(project, JOURNAL)
     receipt = core.receipt_path(journal, identity, 'proposal')
-    prior = load_json(receipt) if receipt.exists() else None
+    prior = core.read_host_json(receipt) if receipt.exists() else None
     state = core.prior_state(prior, digest, actor)
     rows = read_key_and_settings(run, key)
     settings = settings_view(rows, operators)

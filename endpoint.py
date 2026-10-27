@@ -704,7 +704,8 @@ def tracker_actors(root,path,before=None,own=()):
     # missing-slot answer: reading it as "no rows at all" answered 503 merge_slot_missing and
     # advised a merge-create that then fails (kittrial-5bb.202 review of revision 2, F2).
     try:
-        metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        metadata=json.loads(read_regular_text(path/'.beads'/'metadata.json'))
     except (OSError,ValueError,UnicodeError):
         metadata=None
     if server_metadata_fault(metadata) is not None:
@@ -2835,7 +2836,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         target=request.get('path','CURRENT.md')
         viewroot=(path/'views').resolve();view=(viewroot/target).resolve()
         if not view.is_relative_to(viewroot) or view.suffix not in ('.md','.jsonl'):raise ValueError('Invalid view path')
-        return {'returncode':0,'stdout':view.read_text(encoding='utf-8'),'stderr':''}
+        from admin import read_regular_text
+        return {'returncode':0,'stdout':read_regular_text(view),'stderr':''}
     if action=='refresh':
         with (path/'.refresh.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)

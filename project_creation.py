@@ -51,6 +51,9 @@ import os
 import time
 from pathlib import Path
 
+import record_json
+from requirements import _unique_object, canonical_bytes
+
 RECORDS_DIR = 'project-creations'
 LOCK_NAME = '.lock'
 STATES = ('started', 'incomplete', 'created', 'removed')
@@ -108,6 +111,17 @@ def record_path(root, name):
     return records_dir(root) / (name + '.json')
 
 
+def _read_text(path):
+    from admin import read_regular_text
+    return read_regular_text(path)
+
+
+def _read_json(path):
+    value = record_json.loads(_read_text(path), object_pairs_hook=_unique_object)
+    canonical_bytes(value)
+    return value
+
+
 def read_record(root, name):
     """The creation record for a name, or None. A damaged record is an error, not absence."""
     path = record_path(root, name)
@@ -121,13 +135,12 @@ def read_record(root, name):
         raise ValueError('The project creation record for %s is not a file; an operator must look at %s'
                          % (name, path))
     try:
-        text = path.read_text(encoding='utf-8')
+        record = _read_json(path)
     except OSError as error:
         # A file the service account cannot open (owned by another user after a restore, say) is
         # a damaged record too, not a failure of whatever was being done (kittrial-5bb.149).
         raise ValueError('The project creation record for %s cannot be opened (%s); an operator must look '
                          'at %s' % (name, type(error).__name__, path)) from None
-    record = json.loads(text)
     if not isinstance(record, dict) or record.get('project') != name or record.get('state') not in STATES \
             or not isinstance(record.get('by'), str):
         raise ValueError('The project creation record for %s is damaged; an operator must look at %s'
@@ -174,7 +187,7 @@ def running_name(root):
     except TimeoutError:
         pass
     try:
-        name = marker.read_text(encoding='utf-8').strip()
+        name = _read_text(marker).strip()
     except OSError:
         return None
     return name or None
@@ -185,7 +198,7 @@ def _clear_running(root, name):
     directory = records_dir(root)
     marker = directory / RUN_NAME
     try:
-        if marker.is_file() and not marker.is_symlink() and marker.read_text(encoding='utf-8').strip() == name:
+        if marker.is_file() and not marker.is_symlink() and _read_text(marker).strip() == name:
             marker.unlink()
     except OSError:
         pass
@@ -970,7 +983,7 @@ def note_failure(root, name, account, error, step=None):
         path = directory / FAILURE_FILE
         earlier = []
         with contextlib.suppress(Exception):
-            before = json.loads(path.read_text(encoding='utf-8'))
+            before = _read_json(path)
             if isinstance(before, dict):
                 kept = before.pop('earlier', [])
                 earlier = [before] + [item for item in (kept if isinstance(kept, list) else []) if isinstance(item, dict)]
