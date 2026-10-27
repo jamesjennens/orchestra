@@ -233,7 +233,7 @@ def _guard_reserved_labels(root,path,args,actor):
         if carries_record_label(row):
             row['comments']=_native_comments(root,path,actor,canonical)
             if is_record_anchor(row):
-                raise ValueError('Refusing to replace labels on %s: it is a reference/proposal/settings/capability record anchor, whose labels only its record operations may change. --add-label remains available for ordinary labels.'%(canonical,))
+                raise ValueError('Refusing to replace labels on %s: it is a reference/proposal/settings/capability/open-item record anchor, whose labels only its record operations may change. --add-label remains available for ordinary labels.'%(canonical,))
 
 def _native_anchor_rows(root,path,actor,tokens):
     """Resolve every named token to its canonical id and row, in ONE native read.
@@ -420,7 +420,7 @@ def _guard_record_anchor_status(root,path,args,actor):
     for token in targets:
         canonical,row=rows[token]
         if is_record_anchor(row):
-            raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability record anchor, '
+            raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability/open-item record anchor, '
                              'whose status only its record operations may change.'%(command,canonical))
         # The merge slot is held and released only through `coordinate` (kittrial-5bb.113).
         if is_merge_slot(row):
@@ -466,7 +466,7 @@ def _guard_record_anchor_title(root,path,args,actor,rows=None):
     for token in targets:
         canonical,row=read[token]
         if is_record_anchor(row):
-            raise ValueError('Refusing to update the title of %s: it is a reference/proposal/settings/capability record '
+            raise ValueError('Refusing to update the title of %s: it is a reference/proposal/settings/capability/open-item record '
                              'anchor, and its title is how the kit finds it.'%canonical)
 
 #: bd 1.2.2's structured answer when `show ID` resolved to no single row. bd prints it both
@@ -716,9 +716,9 @@ def tracker_actors(root,path,before=None,own=()):
     ``own`` are the lifetimes of earlier credentials of the same name whose rows are not
     held against this one (item 3)."""
     import actor_names
-    from admin import run_bd
+    from admin import run_bd,server_metadata_fault
     # The SAME guard ``admin.project_merge_slot_state`` uses, for the same reason: without the
-    # Dolt server coordinates recorded in ``.beads/metadata.json`` bd falls back to an EMBEDDED
+    # Dolt server coordinates and ``dolt_mode`` server recorded in ``.beads/metadata.json`` bd falls back to an EMBEDDED
     # database, creates ``.beads/embeddeddolt`` and exits 0 having printed nothing. That answer
     # is not this project's tracker at all, so it is the host fault and never the empty-project
     # missing-slot answer: reading it as "no rows at all" answered 503 merge_slot_missing and
@@ -727,8 +727,7 @@ def tracker_actors(root,path,before=None,own=()):
         metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
     except (OSError,ValueError,UnicodeError):
         metadata=None
-    coordinates=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
-    if not isinstance(metadata,dict) or not all(metadata.get(key) for key in coordinates):
+    if server_metadata_fault(metadata) is not None:
         raise actor_names.TrackerUnreadable()
     try:
         text=run_bd(root,path.name,['export','--all'])
@@ -1748,13 +1747,39 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     # the project requires approval by another party (approval_by_another_party or
                     # independent_approval) the agent faces exactly the rule a person faces below.
                     delegation_check(state,decision_id)
-                    if not isinstance(proposer,str) or not proposer:
+                    import record_acceptance as shared_acceptance
+                    head=(actor.split('/',1)[0] if isinstance(actor,str) else None)
+                    caller_parties=set(actor_parties(state,actor,name))
+                    if user_id:caller_parties.add(user_id)
+                    proposer_parties=(set(actor_parties(state,proposer,name))
+                                      if isinstance(proposer,str) and proposer else set())
+                    if isinstance(proposer,str) and proposer:
+                        if proposer.split('/',1)[0]==head:
+                            raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
+                                                     'whatever its delegation says.')
+                    else:
                         raise RecordsRefusal(403,'This draft has no recorded proposer, so no delegation can admit it.')
-                    if proposer.split('/',1)[0]==(actor.split('/',1)[0] if isinstance(actor,str) else actor):
-                        raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
-                                                 'whatever its delegation says.')
+                    same_session_owner=False
+                    if rules.get('independent_approval') and isinstance(proposer,str) and proposer:
+                        try:
+                            owners=approval_owners(owner_loader(path,'independent_approval'))
+                        except CoordinatorRuleRefusal as error:
+                            raise RecordsRefusal(409,str(error)) from None
+                        same_session_owner=same_party(actor,proposer,owners)
                     if not approval_by_another:
                         return
+                    # proposer_known/own_draft are refused above, so decide's
+                    # defaults (True/False) carry the same values (notes tidy-up).
+                    may,reason=shared_acceptance.decide(
+                        can_coordinate=True,approval_by_another_party=approval_by_another,
+                        waiting=True,by_agent=True,agent_head=head,
+                        delegation_covers_kind=True,delegation_missing=False,
+                        caller_parties=caller_parties,draft_parties=proposer_parties,
+                        own_party=bool(caller_parties & proposer_parties),
+                        independent_hold=bool(same_session_owner))
+                    if not may:
+                        raise RecordsRefusal(403,reason)
+                    return
                 elif not approval_by_another:
                     return
                 caller_parties=set(actor_parties(state,actor,name))
@@ -2965,7 +2990,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     # the native write).
     label=reserved_label_in_args(args)
     if label==MERGE_SLOT_LABEL:raise ValueError('The label %s marks the merge slot of a project and is reserved: it is not added, removed or replaced on any task. Only `coordinate` writes it (merge-create restores it on a damaged slot).'%label)
-    if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise)')
+    if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise); `open-item:` labels belong to open item records, which no command writes yet')
     # bd 1.2.2 accepts the undocumented `create --label` alias of --labels, so a
     # table built only from --help missed a whole label-writing spelling. Every
     # accepted alias is now in the table above; an unresolvable create/update

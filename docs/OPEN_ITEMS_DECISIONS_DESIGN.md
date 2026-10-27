@@ -1014,6 +1014,12 @@ path/hash binding, and `restore-new` restores it. Its pending entries are reserv
 `.open-item-requests` is also added to `admin.RESERVATION_JOURNALS` (`admin.py:1489-1490`) and
 `retire-project` counts its pending receipts exactly as it counts every other ledger's.
 
+Restore writes every journal file through `coordination.atomic`, so a restored `.open-item-requests/`
+or `.owner-answers/` entry has the same mode as every other journal file (664 with the default umask),
+not a tighter one; `tests/test_open_items_slice0.py` pins that equality (kittrial-5bb.171). The backup
+reads these two journals, and the metadata guard, with `admin.read_regular_text` (non-blocking,
+regular files only); the older journals still use a plain read and are a separate follow-up.
+
 `.owner-answers/` is **not** a receipt journal and is deliberately not in `RECORD_JOURNALS`,
 `RESERVATION_JOURNALS` or `validate_record_receipt`: it is the host-issued journal that the record
 reader itself validates, exactly like `.integration-reverts/`. The current kit shows the shape:

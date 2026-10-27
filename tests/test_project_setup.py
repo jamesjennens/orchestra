@@ -1668,7 +1668,7 @@ class SetupScreenTests(test_http_agents.AgentHarness):
 class MergeSlotReportTests(unittest.TestCase):
     """kittrial-5bb.202 item 4: a read-only report of projects without a healthy merge slot."""
 
-    SERVER = {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
+    SERVER = {'dolt_mode': 'server', 'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
               'dolt_server_user': 'root', 'dolt_database': 'x'}
 
     def setUp(self):

@@ -1057,6 +1057,8 @@ def get(rows, key, operators, current=None, web_service=False, verifiers=None):
 def _list_item(entry, current=None, web_service=False):
     source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
     waiting = entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')
+    proposed = entry.get('proposed') or {}
+    record = entry.get('record') or {}
     item = {'key': entry['key'], 'title': (source.get('title') or entry.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
             'owner': source.get('owner'), 'review_by': source.get('review_by') if entry['record'] else None,
             'proposed_review_by': (entry['proposed'] or {}).get('review_by'),
@@ -1067,6 +1069,16 @@ def _list_item(entry, current=None, web_service=False):
             # is the accepted record: a draft attestation is never shown unmarked.
             'authority_kind': authority_kind(source) if source else None, 'authority_accepted': entry['record'] is not None}
     if web_service:
+        # The authority object itself rides along ONLY for the web waiting queue
+        # (endpoint.py's ref/capability reads run with web_service=False, so the
+        # CLI ref/capability list payloads keep only the authority_kind and
+        # authority_accepted flags above; review notes, r2). The waiting queue's
+        # authority cell prints an attested draft (kittrial-5bb.420 2.3: the cell
+        # read only rec.authority/item.authority and showed a dash although the
+        # draft's attestation was there).
+        item['authority'] = source.get('authority')
+        item['proposed_authority'] = proposed.get('authority')
+        item['record_authority'] = record.get('authority')
         item.update(
             waiting_acceptance=waiting,
             proposed_revision=(entry['proposed'] or {}).get('revision'),

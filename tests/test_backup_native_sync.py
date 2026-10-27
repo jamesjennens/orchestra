@@ -37,7 +37,7 @@ def make_project(root, name, server=True):
     """A project directory that carries the native marker (and server metadata)."""
     path = root / 'projects' / name
     (path / '.beads').mkdir(parents=True, exist_ok=True)
-    metadata = ({'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
+    metadata = ({'dolt_mode': 'server', 'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
                  'dolt_server_user': 'root', 'dolt_database': name} if server else {})
     (path / '.beads' / 'metadata.json').write_text(json.dumps(metadata), encoding='utf-8')
     if server:
