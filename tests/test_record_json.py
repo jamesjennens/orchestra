@@ -279,7 +279,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             # a host file, but one a damaged or nested copy must refuse, never traceback.
             # The thirteenth (kittrial-5bb.171) is read_sidecar_json: the depth bound, not the
             # interpreter's recursion limit, decides whether a nested sidecar reads.
-            'admin.py': 13,
+            # The fourteenth (kittrial-5bb.426) reads deployment.private.json from the same
+            # checked descriptor, with a damaged or nested document reading as a configuration fault.
+            'admin.py': 14,
             # D2: bounded native history, review VOID and preserved target payload.
             'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored

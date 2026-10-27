@@ -166,6 +166,15 @@ class CurrentPathTests(unittest.TestCase):
             self.assertEqual(admin.office_bundled_python(),
                              self.current / 'python-runtime' / 'bin' / 'python3')
 
+    def test_a_symlinked_manifest_still_finds_the_bundled_interpreter(self):
+        manifest = self.release / 'manifest.json'
+        real = self.release / 'manifest-real.json'
+        manifest.rename(real)
+        manifest.symlink_to(real.name)
+        with patch.object(admin, '__file__', str(self.kit / 'admin.py')):
+            self.assertEqual(admin.office_bundled_python(),
+                             self.current / 'python-runtime' / 'bin' / 'python3')
+
     def test_worker_client_setup_prints_the_current_endpoint_and_interpreter(self):
         text = worker_text(self.root)
         endpoint = self.current / 'kit' / 'endpoint.py'

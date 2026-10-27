@@ -410,6 +410,25 @@ class RegularFileTests(unittest.TestCase):
         with self.assertRaises(UnicodeDecodeError):
             regular_file.read_regular_text(path)
 
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs are POSIX-only')
+    def test_open_regular_streams_and_refuses_a_fifo_swap(self):
+        path = self.base / 'stream.bin'
+        path.write_bytes(b'abcdef')
+        with regular_file.open_regular(path) as stream:
+            self.assertEqual(stream.read(2), b'ab')
+            self.assertEqual(stream.read(), b'cdef')
+        real_lstat = regular_file.os.lstat
+        def swap(path_):
+            before = real_lstat(path_)
+            os.unlink(path_)
+            os.mkfifo(path_)
+            return before
+        with patch.object(regular_file.os, 'lstat', side_effect=swap):
+            result = self.bounded(lambda: regular_file.open_regular(path))
+        if not isinstance(result, ValueError):
+            result.close()
+        self.assertIsInstance(result, ValueError)
+
     def test_total_limit_fstat_growth_and_prefix(self):
         path = self.base / 'record.json'
         path.write_bytes(b'abcdef')

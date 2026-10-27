@@ -39,6 +39,7 @@ import uuid
 from pathlib import Path
 
 import record_json
+import regular_file
 from admin import read_regular_text
 
 FOLDER = '.task-files'
@@ -327,17 +328,14 @@ def open_blob(project, sha256):
     path = blob_path(project, sha256)
     if path is None:
         raise Refusal(409, 'conflict', 'The stored file is missing: its record is here, its bytes are not.')
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
     try:
-        descriptor = os.open(str(path), flags)
+        return regular_file.open_regular(path)
     except FileNotFoundError:
         raise Refusal(409, 'conflict', 'The stored file is missing: its record is here, its bytes are not.') from None
+    except ValueError:
+        raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file is not a regular file')) from None
     except OSError:
         raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file cannot be opened')) from None
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode) or os.path.islink(str(path)):
-        os.close(descriptor)
-        raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file is not a regular file'))
-    return os.fdopen(descriptor, 'rb')
 
 
 def referenced(project):
@@ -974,7 +972,7 @@ def _problems_sentence(problems):
 def _hash_file(path):
     digest = hashlib.sha256()
     count = 0
-    with open(str(path), 'rb') as handle:
+    with regular_file.open_regular(path) as handle:
         while True:
             chunk = handle.read(STEP)
             if not chunk:
@@ -992,7 +990,7 @@ def _copy_hashed(source, target):
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
     descriptor = os.open(str(temp), flags, 0o600)
     try:
-        with os.fdopen(descriptor, 'wb') as out, open(str(source), 'rb') as handle:
+        with os.fdopen(descriptor, 'wb') as out, regular_file.open_regular(source) as handle:
             while True:
                 chunk = handle.read(STEP)
                 if not chunk:

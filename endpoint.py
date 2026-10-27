@@ -2115,8 +2115,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     raise onboarding_directory_refusal(target)
                 if target.is_file() and not target.is_symlink():
                     try:
-                        previous=target.read_text(encoding='utf-8-sig')
-                    except (UnicodeDecodeError,OSError):
+                        from admin import read_regular_text
+                        previous=read_regular_text(target,raw=True).decode('utf-8-sig')
+                    except (OSError,ValueError):
                         # A damaged previous document must not stop the route from replacing it
                         # (review of 6f3007a, finding 1; kittrial-5bb.238 item 1): the host command
                         # replaces it, and a caller with no shell has no other way. The unreadable

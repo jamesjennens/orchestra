@@ -33,6 +33,7 @@ from urllib.request import urlopen
 
 import admin
 import record_json
+import regular_file
 from version import report
 from http_auth import (session_limit_seconds, validate_agent_credential_days,
                        validate_password_min_length)
@@ -73,7 +74,7 @@ def service_config(path):
     # The file itself is named for every way reading it can fail (kittrial-5bb.168 item 3): a
     # plain JSON error named neither the file nor that the file was the problem.
     try:
-        text = admin.read_regular_text(path)
+        text = admin.read_regular_text(os.path.realpath(path))
     except OSError as error:
         raise ValueError('Cannot read office service configuration %s: %s'
                          % (path, error.strerror or error)) from None
@@ -181,8 +182,10 @@ def _readable_file(path):
         # A FIFO, device or socket is opened before it is read, which can block a start forever.
         if not stat.S_ISREG(os.stat(path).st_mode):
             return 'notafile'
-        with open(path, 'rb') as stream:
+        with regular_file.open_regular(os.path.realpath(path)) as stream:
             stream.read(1)
+    except ValueError:
+        return 'notafile'
     except OSError:
         return 'unreadable'
     return None
@@ -191,9 +194,9 @@ def _readable_file(path):
 def _pem_kind(path):
     """'certificate', 'key', 'encrypted-key' or None, from the first bytes of the file only."""
     try:
-        with open(path, 'r', encoding='utf-8', errors='replace') as stream:
-            head = stream.read(4096)
-    except OSError:
+        with regular_file.open_regular(os.path.realpath(path)) as stream:
+            head = stream.read(4096).decode('utf-8', 'replace')
+    except (OSError, ValueError):
         return None
     if '-----BEGIN ENCRYPTED PRIVATE KEY-----' in head or 'Proc-Type: 4,ENCRYPTED' in head:
         return 'encrypted-key'
@@ -291,7 +294,7 @@ def certificate_window(path):
     try:
         from datetime import timezone
         from cryptography import x509
-        with open(path, 'rb') as stream:
+        with regular_file.open_regular(os.path.realpath(path)) as stream:
             parsed = x509.load_pem_x509_certificate(stream.read())
         return (int(parsed.not_valid_before.replace(tzinfo=timezone.utc).timestamp()),
                 int(parsed.not_valid_after.replace(tzinfo=timezone.utc).timestamp()))

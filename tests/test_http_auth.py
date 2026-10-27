@@ -466,6 +466,10 @@ class RegularStateReadTests(unittest.TestCase):
         self.assertEqual(Store(path).state['schema_version'], 1)
         Store(path).save()
         self.assertEqual(Store(path).state['schema_version'], 1)
+        real = self.tmp_path / 'store-real.json'
+        path.rename(real)
+        path.symlink_to(real.name)
+        self.assertEqual(Store(path).state['schema_version'], 1)
         damaged = self.tmp_path / 'damaged.json'
         damaged.write_text('{not json', encoding='utf-8')
         with self.assertRaises(ValueError):
@@ -483,6 +487,11 @@ class RegularStateReadTests(unittest.TestCase):
         state = self.tmp_path / 'authority.json'
         state.write_text(json.dumps({'schema_version': http_authority.SCHEMA_VERSION}),
                          encoding='utf-8')
+        self.assertEqual(http_authority.read_state(state)['schema_version'],
+                         http_authority.SCHEMA_VERSION)
+        real = self.tmp_path / 'authority-real.json'
+        state.rename(real)
+        state.symlink_to(real.name)
         self.assertEqual(http_authority.read_state(state)['schema_version'],
                          http_authority.SCHEMA_VERSION)
         missing = self.tmp_path / 'missing.json'

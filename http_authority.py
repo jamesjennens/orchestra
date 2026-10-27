@@ -1103,7 +1103,7 @@ def read_state(path):
     """Read the durable authority/state document, or raise :class:`AuthorityDenied`."""
     try:
         from admin import read_regular_text
-        text = read_regular_text(path)
+        text = read_regular_text(Path(os.path.realpath(str(path))))
     except OSError:
         raise deny(401, 'unauthenticated', 'Service authority state is unavailable')
     except ValueError as error:

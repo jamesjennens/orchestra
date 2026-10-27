@@ -559,6 +559,12 @@ class RegularRuntimeReadTests(unittest.TestCase):
         path = self.tmp / 'deployment.private.json'
         path.write_text(json.dumps({'operators': ['usr_0123456789abcdef']}), encoding='utf-8')
         self.assertEqual(len(http_service.operator_allowlist_warnings(self.tmp)), 1)
+        real = self.tmp / 'deployment-real.json'
+        path.rename(real)
+        path.symlink_to(real.name)
+        self.assertEqual(len(http_service.operator_allowlist_warnings(self.tmp)), 1)
+        path.unlink()
+        real.rename(path)
         path.unlink()
         self.assertEqual(http_service.operator_allowlist_warnings(self.tmp), [])
         path.write_text('{not json', encoding='utf-8')
@@ -584,6 +590,13 @@ class RegularRuntimeReadTests(unittest.TestCase):
                 path.write_text(json.dumps({key: {}}), encoding='utf-8')
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(http_service.main(['--state', str(path), flag]), 0)
+                real = self.tmp / ('state-real-' + key + '.json')
+                path.rename(real)
+                path.symlink_to(real.name)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(http_service.main(['--state', str(path), flag]), 0)
+                path.unlink()
+                real.rename(path)
                 path.unlink()
                 with self.assertRaises(SystemExit):
                     http_service.main(['--state', str(path), flag])

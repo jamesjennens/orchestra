@@ -97,6 +97,19 @@ class GuidanceRecordTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             guidance.read_text(self.project)
 
+    def test_fifo_metadata_never_blocks_and_reads_as_unreadable(self):
+        make_fifo(self, self.project / '.guidance.json')
+        self.assertIsNone(bounded(lambda: guidance.read_meta(self.project)))
+
+    def test_fifo_repair_after_file_check_never_blocks_and_reads_as_absent(self):
+        make_fifo(self, self.project / guidance.REPAIR_NAME)
+        with patch.object(Path, 'is_file', return_value=True):
+            self.assertIsNone(bounded(lambda: guidance.read_repair(self.project)))
+
+    def test_fifo_clear_record_never_blocks_and_reads_as_invalid(self):
+        make_fifo(self, self.project / guidance.CLEAR_NAME)
+        self.assertEqual(('invalid', None), bounded(lambda: guidance.clear_record_state(self.project)))
+
     def test_absent_guidance_reads_as_absent_not_an_error(self):
         self.assertEqual(guidance.read_text(self.project), None)
         state = guidance.state(self.project, 'worker-1')

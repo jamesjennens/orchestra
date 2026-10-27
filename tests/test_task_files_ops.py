@@ -104,6 +104,52 @@ class TaskFilesOpsTests(unittest.TestCase):
         (self.target / task_files.MANIFEST).unlink()
         self.assertIsNone(task_files._old_manifest(self.target / task_files.MANIFEST))
 
+    def test_open_blob_fifo_and_symlink_are_refused_without_blocking(self):
+        digest = self.store.attach('t1', b'regular')
+        path = self.store.blob(digest)
+        outside = self.store.project / 'outside'
+        outside.write_bytes(b'not the stored blob')
+        for kind in ('fifo', 'symlink'):
+            os.unlink(str(path))
+            if kind == 'fifo':
+                make_fifo(self, path)
+            else:
+                path.symlink_to(outside)
+            with self.subTest(kind=kind), self.assertRaises(task_files.Refusal):
+                bounded(lambda: task_files.open_blob(self.store.project, digest))
+
+    def test_hash_file_fifo_and_symlink_are_refused_without_blocking(self):
+        path = self.store.project / 'hash-source'
+        outside = self.store.project / 'outside'
+        outside.write_bytes(b'not the stored blob')
+        for kind in ('fifo', 'symlink'):
+            if os.path.lexists(str(path)):
+                os.unlink(str(path))
+            if kind == 'fifo':
+                make_fifo(self, path)
+            else:
+                path.symlink_to(outside)
+            with self.subTest(kind=kind), self.assertRaises((OSError, ValueError)):
+                bounded(lambda: task_files._hash_file(path))
+
+    def test_copy_hashed_fifo_and_symlink_are_refused_without_blocking(self):
+        source = self.store.project / 'copy-source'
+        outside = self.store.project / 'outside'
+        outside.write_bytes(b'not the stored blob')
+        self.target.mkdir()
+        target = self.target / 'copy'
+        for kind in ('fifo', 'symlink'):
+            if os.path.lexists(str(source)):
+                os.unlink(str(source))
+            if kind == 'fifo':
+                make_fifo(self, source)
+            else:
+                source.symlink_to(outside)
+            with self.subTest(kind=kind), self.assertRaises((OSError, ValueError)):
+                bounded(lambda: task_files._copy_hashed(source, target))
+            self.assertFalse(target.exists())
+            self.assertEqual([], list(self.target.glob('.t*')))
+
     def test_fifo_live_journal_never_blocks_and_backup_marks_it_unreadable(self):
         digest = self.store.attach('t1', b'regular')
         path = self.store.project / task_files.FOLDER / task_files.RECORDS / task_files.task_key('t1') / (digest + '.json')

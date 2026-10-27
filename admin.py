@@ -597,22 +597,31 @@ def deployment_document(marker):
 
     Only a regular file is read. A FIFO in its place would block the reader until somebody
     wrote to it, and a directory has nothing to parse: both are refused at once, by opening
-    without waiting and looking at what was opened (review of kittrial-5bb.156). A file that
-    is not there, or cannot be opened, keeps its ``OSError``.
+    without waiting and looking at what was opened (review of kittrial-5bb.156). A configured
+    symlink is resolved before that one checked open. A file that is not there, or cannot be
+    opened, keeps its ``OSError``.
     """
-    descriptor=os.open(str(marker),os.O_RDONLY|getattr(os,'O_NONBLOCK',0))
+    configured=marker
     try:
-        import stat
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ConfigurationUnreadable('Deployment configuration %s is not a regular file'%marker)
-    finally:
-        os.close(descriptor)
-    try:
-        document=read_json_file(marker,'Deployment configuration')
+        marker=Path(os.path.realpath(str(marker)))
+        text=read_regular_text(marker)
+    except UnicodeError as error:
+        raise ConfigurationUnreadable('Deployment configuration %s is not readable text: %s'%(configured,error)) from None
     except ValueError as error:
-        raise ConfigurationUnreadable(str(error)) from None
+        message=str(error)
+        if message=='%s is not a regular file'%marker:
+            message='Deployment configuration %s is not a regular file'%configured
+        raise ConfigurationUnreadable(message) from None
+    except OSError as error:
+        if error.filename is None:raise
+        raise type(error)(error.errno,error.strerror,str(configured)) from None
+    try:
+        document=record_json.loads(text)
+    except ValueError as error:
+        if 'nested too deeply' in str(error):raise RecursionError(str(error)) from None
+        raise ConfigurationUnreadable('Deployment configuration %s is not valid JSON: %s'%(configured,error)) from None
     if not isinstance(document,dict):
-        raise ConfigurationUnreadable('Deployment configuration %s is not a JSON object'%marker)
+        raise ConfigurationUnreadable('Deployment configuration %s is not a JSON object'%configured)
     return document
 
 def deployment_password(root):
@@ -3050,7 +3059,7 @@ def office_bundled_python():
     manifest=release/'manifest.json'
     if not manifest.is_file():return None
     try:
-        document=record_json.loads(manifest.read_text(encoding='utf-8'))
+        document=record_json.loads(read_regular_text(Path(os.path.realpath(str(manifest)))))
     except (OSError,UnicodeError,ValueError):
         return None
     relative=document.get('python_executable') if isinstance(document,dict) else None
@@ -3480,7 +3489,7 @@ def project_setup_status(root,name,path=None):
     try:
         entry=path/'ONBOARDING.md'
         if entry.is_symlink():raise ValueError('symlink')
-        present=entry.is_file() and bool(entry.read_text(encoding='utf-8').strip())
+        present=entry.is_file() and bool(read_regular_text(entry).strip())
         result['onboarding']={'state':'set' if present else 'not-set',
                               'updated_at':(datetime.fromtimestamp(entry.stat().st_mtime,timezone.utc)
                                             .strftime('%Y-%m-%dT%H:%M:%SZ') if present else None)}
@@ -10208,7 +10217,7 @@ def credential_actors(root,state_path,service_namespace=None):
     from sessions import registered_actors
     source=Path(state_path)
     if not source.is_file():raise ValueError('No web service state at %s'%source)
-    try:state=json.loads(read_regular_text(source))
+    try:state=json.loads(read_regular_text(Path(os.path.realpath(str(source)))))
     except (ValueError,RecursionError):raise ValueError('The web service state at %s is not readable as JSON'%source) from None
     if not isinstance(state,dict) or not isinstance(state.get('credentials'),dict):
         raise ValueError('The file at %s is not a web service state document'%source)

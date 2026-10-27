@@ -849,7 +849,7 @@ class Store:
     def _load(self):
         try:
             from admin import read_regular_text
-            text = read_regular_text(self.path)
+            text = read_regular_text(Path(os.path.realpath(str(self.path))))
         except FileNotFoundError:
             return _blank_state()
         data = json.loads(text)

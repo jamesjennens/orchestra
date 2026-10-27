@@ -72,6 +72,13 @@ class ConfigurationTests(unittest.TestCase):
                                                       'probe': 'http://127.0.0.1:10000/healthz', 'public_url': None})
         self.assertEqual(office.listener(None, 10000)['shape'], 'loopback')
 
+    def test_a_symlinked_configuration_is_read(self):
+        self.file.write_text('{"schema_version": 1}', encoding='utf-8')
+        real = Path(self.tmp.name) / 'office-real.json'
+        self.file.rename(real)
+        self.file.symlink_to(real.name)
+        self.assertEqual(office.service_config(self.file), {'schema_version': 1})
+
     def test_another_address_needs_a_certificate_or_the_explicit_setting(self):
         for host in ('0.0.0.0', '10.1.2.3', 'office.example.invalid', '::'):
             with self.subTest(host=host):
@@ -333,6 +340,18 @@ class CertificateTests(unittest.TestCase):
     def test_a_good_pair_passes_and_leaves_nothing_behind(self):
         cert, key = self_signed(self.tmp.name)
         office.certificate_preflight({'cert': cert, 'key': key}, self.tmp.name)     # no exception
+
+    @unittest.skipUnless(OPENSSL, 'openssl is not installed; the pairs are made with it')
+    def test_a_symlinked_good_pair_still_passes(self):
+        cert, key = self_signed(self.tmp.name)
+        linked_cert, linked_key = self.base / 'linked.crt', self.base / 'linked.key'
+        try:
+            linked_cert.symlink_to(cert)
+            linked_key.symlink_to(key)
+        except (OSError, NotImplementedError) as failed:
+            self.skipTest('this host cannot make a symlink: %s' % failed)
+        resolved = office.certificate_preflight({'cert': str(linked_cert), 'key': str(linked_key)}, self.base)
+        self.assertEqual(resolved, (str(linked_cert), str(linked_key)))
 
     @unittest.skipUnless(OPENSSL, 'openssl is not installed; the self-signed pair is made with it')
     def test_a_relative_path_is_resolved_against_the_runtime_root(self):
