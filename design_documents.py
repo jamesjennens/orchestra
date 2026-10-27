@@ -209,15 +209,36 @@ def parse_index(body):
                 or type(index['bytes']) is not int or not isinstance(index['path'], str) \
                 or not isinstance(index['commit'], str):
             return None
+        # Every value is checked before any reader uses it (review of part 1: the native author of an index
+        # proves nothing, so a reader that cannot re-derive it from the bytes trusts only a well-formed one).
         front = index['front']
-        if not isinstance(front, dict) or tuple(sorted(front)) != tuple(sorted(FRONT_FIELDS)):
+        if not isinstance(front, dict) or tuple(sorted(front)) != tuple(sorted(FRONT_FIELDS)) \
+                or not isinstance(front['scope'], str) or not SCOPE.fullmatch(front['scope']) \
+                or front['scope'] != scope_of(index['key']) or front['status'] not in FRONT_STATUSES \
+                or any(not _strings(front[name], FRONT_ITEMS_MAX)
+                       or any(not item or len(item) > FRONT_ITEM_MAX for item in front[name])
+                       for name in ('requirements', 'decisions_open', 'alternatives', 'supersedes')):
             return None
         headings = index['headings']
         if not isinstance(headings, list) or len(headings) > HEADINGS_MAX or any(
                 not isinstance(item, dict) or set(item) != {'anchor', 'level', 'title', 'tokens'}
-                or not isinstance(item['anchor'], str) or not _strings(item['tokens']) for item in headings):
+                or not isinstance(item['anchor'], str) or not 0 < len(item['anchor']) <= 1000
+                or type(item['level']) is not int or not 1 <= item['level'] <= 6
+                or not isinstance(item['title'], str) or len(item['title']) > TITLE_MAX
+                or not _strings(item['tokens'], TOKENS_MAX) for item in headings) \
+                or sum(len(item['tokens']) for item in headings) > TOKENS_MAX:
             return None
-        if not isinstance(index['plan_phases'], list):
+        phases = index['plan_phases']
+        if not isinstance(phases, list) or len(phases) > HEADINGS_MAX or any(
+                not isinstance(phase, dict)
+                or set(phase) != {'anchor', 'contract', 'test_oracles', 'requirements', 'epic'}
+                or not isinstance(phase['anchor'], str) or not PLAN_PHASE.fullmatch(phase['anchor'])
+                or any(not _strings(phase[name], PHASE_LINES_MAX)
+                       or any(len(line) > PHASE_LINE_MAX for line in phase[name])
+                       for name in ('contract', 'test_oracles', 'requirements'))
+                or (phase['epic'] is not None and (not isinstance(phase['epic'], str)
+                                                   or not ISSUE_ID.fullmatch(phase['epic'])))
+                for phase in phases):
             return None
     except (ValueError, TypeError, KeyError, UnicodeError):
         return None
@@ -295,3 +316,137 @@ def journal(project, anchor, key, revision, sha256, size, actor, at):
     task_files._write_entry(project, entry)
     return True
 
+
+
+# -- verification (TRACEABILITY_DESIGN §5.1 steps 4-5; kittrial-5bb.418 part 2) ------------------
+#
+# Whether the stored bytes really are the file at the pinned commit is checked where the code is:
+# `trace --verify` reads the file at `<commit>:<path>` and reports. A report is a reserved
+# `Kind: design-verification-v1` record on the anchor. Trust mirrors capability verification
+# (capability_verification.is_trusted): only the host route (`admin.py design-verify`, an actor in
+# the operator allowlist or the verifiers list) writes identity `verified`, and it counts only while
+# its native author is that actor and still listed. Any failing report opens `design-drift`; a drift
+# opened only by untrusted reports says so (`trusted: false`, `reported_by`). A later trusted pass
+# clears it; for a pinned commit the way out is otherwise a revision.
+
+VERIFICATION_PREFIX = 'Kind: design-verification-v1\n'
+VERIFICATION_FIELDS = ('schema_version', 'key', 'doc_sha256', 'path', 'commit', 'observed_sha256', 'result',
+                       'reason', 'submitter', 'identity', 'at', 'sha256')
+PAYLOAD_FIELDS = ('schema_version', 'key', 'doc_sha256', 'path', 'commit', 'observed_sha256', 'result', 'reason')
+REASONS = {'pass': ('match',), 'fail': ('mismatch', 'missing', 'not-a-regular-file', 'not-utf8')}
+ROUTES = ('host', 'endpoint', 'web')
+#: Review of part 2 (N2): untrusted reports are bounded per submitter, passes and fails apart (as capability
+#: verification keeps its pools), so one member cannot fill a document's quota for everybody.
+UNTRUSTED_PASSES_PER_SUBMITTER = 10
+UNTRUSTED_FAILS_PER_SUBMITTER = 5
+
+
+def check_verification_payload(payload):
+    """One `trace --verify` report: the accepted document it checked, and what the checkout holds."""
+    if not isinstance(payload, dict) or set(payload) - set(PAYLOAD_FIELDS) - {'operation_id'} \
+            or not set(PAYLOAD_FIELDS) <= set(payload):
+        raise ValueError('a design verification has exactly: %s' % ', '.join(PAYLOAD_FIELDS))
+    if type(payload['schema_version']) is not int or payload['schema_version'] != 1:
+        raise ValueError('schema_version must be the integer 1')
+    if not is_design_key(payload['key']):
+        raise ValueError('a design verification names a design.<scope> entry')
+    if not isinstance(payload['doc_sha256'], str) or not SHA256.fullmatch(payload['doc_sha256']):
+        raise ValueError('doc_sha256 must be a 64-character lowercase hex sha256')
+    observed = payload['observed_sha256']
+    if observed is not None and (not isinstance(observed, str) or not SHA256.fullmatch(observed)):
+        raise ValueError('observed_sha256 must be a sha256 or null')
+    if not isinstance(payload['path'], str) or not isinstance(payload['commit'], str):
+        raise ValueError("path and commit are the accepted revision's")
+    if payload['result'] not in REASONS or payload['reason'] not in REASONS[payload['result']]:
+        raise ValueError('result is pass (reason match) or fail (mismatch, missing, not-a-regular-file, not-utf8)')
+    if (payload['result'] == 'pass') != (observed == payload['doc_sha256']):
+        raise ValueError("a pass is a checkout file whose sha256 is the stored document's, and only that")
+    return payload
+
+
+def verification_record(payload, actor, route, identity, at):
+    record = {name: payload[name] for name in PAYLOAD_FIELDS}
+    record.update(submitter={'actor': actor, 'route': route}, identity=identity, at=at)
+    record['sha256'] = content_hash(record)
+    return record
+
+
+def verification_body(record):
+    return VERIFICATION_PREFIX + canonical_bytes(record).decode('utf-8')
+
+
+def parse_verification(body):
+    """The verification iff the comment is exactly what the server writes; None otherwise."""
+    if not isinstance(body, str) or not body.startswith(VERIFICATION_PREFIX):
+        return None
+    rest = body[len(VERIFICATION_PREFIX):]
+    try:
+        record = parse_json(rest)
+        if not isinstance(record, dict) or tuple(sorted(record)) != tuple(sorted(VERIFICATION_FIELDS)):
+            return None
+        if canonical_bytes(record).decode('utf-8') != rest or content_hash(record) != record['sha256']:
+            return None
+        check_verification_payload({name: record[name] for name in PAYLOAD_FIELDS})
+        submitter = record['submitter']
+        if not isinstance(submitter, dict) or set(submitter) != {'actor', 'route'} \
+                or not isinstance(submitter['actor'], str) or submitter['route'] not in ROUTES \
+                or record['identity'] not in ('verified', 'unverified') or not isinstance(record['at'], str):
+            return None
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        return None
+    return record
+
+
+def verifications_for(row, key, authority):
+    """[(position, record, native author)] for the document `authority` names, in native order."""
+    found = []
+    for position, comment in enumerate((row or {}).get('comments') or []):
+        if not isinstance(comment, dict):
+            continue
+        record = parse_verification(comment.get('text', comment.get('body')))
+        if record is not None and record['key'] == key and record['doc_sha256'] == authority.get('sha256') \
+                and record['path'] == authority.get('path') and record['commit'] == authority.get('commit'):
+            found.append((position, record, comment.get('author')))
+    return found
+
+
+def is_trusted(record, author, trusted):
+    """capability_verification.is_trusted's rule: host-written, its author the submitter, still listed."""
+    return record['identity'] == 'verified' and record['submitter']['route'] == 'host' \
+        and author == record['submitter']['actor'] and author in trusted
+
+
+def derive_verification(items, trusted):
+    """The `verification` block of an accepted repo-document revision: verified, unverified or design-drift."""
+    block = {'state': 'unverified', 'reports': len(items), 'trusted': None, 'reported_by': [],
+             'verified_by': None, 'verified_at': None}
+    failing = [item for item in items if item[1]['result'] == 'fail']
+    cleared = -1
+    if failing:
+        for position, record, author in reversed(items):
+            if position < failing[0][0]:
+                break
+            if record['result'] == 'pass' and is_trusted(record, author, trusted):
+                cleared = position
+                break
+    open_failing = [item for item in failing if item[0] > cleared]
+    if open_failing:
+        block.update(state='design-drift',
+                     trusted=any(is_trusted(record, author, trusted) for _, record, author in open_failing),
+                     reported_by=sorted({record['submitter']['actor'] for _, record, _ in open_failing}),
+                     reason=open_failing[-1][1]['reason'], observed_sha256=open_failing[-1][1]['observed_sha256'])
+        return block
+    passes = [item for item in items if item[1]['result'] == 'pass' and is_trusted(item[1], item[2], trusted)]
+    if passes:
+        record = passes[-1][1]
+        block.update(state='verified', trusted=True, verified_by=record['submitter']['actor'],
+                     verified_at=record['at'])
+    return block
+
+
+def selected_index(row, key, authority):
+    """The one index the readers use for a document: present and unique (every copy equal), else None."""
+    found = indexes_for(row, key, authority)
+    if not found or any(index != found[0] for index in found):
+        return None
+    return found[0]

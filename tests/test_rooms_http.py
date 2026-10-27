@@ -241,5 +241,74 @@ class RoomsPageTests(unittest.TestCase):
         self.assertEqual(1, seen['list']['forms'])
 
 
+class Slice5PageTests(unittest.TestCase):
+    """Slice 5 page behaviours (kittrial-5bb.427 r2): the Reviews crash, the
+    moderation fold gating, the agent card, My work and the proposal groups.
+
+    Each .mjs runs its view under Node with the shared DOM shim and a stubbed
+    transport — no http_service is needed — and prints one JSON object; the
+    Python side asserts on it."""
+
+    def run_page(self, name, *views):
+        import shutil
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        kit = Path(__file__).resolve().parents[1]
+        args = [(kit / 'tests' / name).as_uri(),
+                (kit / 'tests' / 'web_dom_shim.mjs').as_uri()]
+        if name == 'web_slice5_reviews_page.mjs':
+            args.append((kit / 'web' / 'js' / 'api.js').as_uri())
+        args.extend((kit / ('web/js/views/' + view)).as_uri() for view in views)
+        done = test_http_web.run_node_module(
+            self, node, 'await import(process.argv[1])', *args)
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_reviews_page_survives_the_normal_case_without_an_error_group(self):
+        seen = self.run_page('web_slice5_reviews_page.mjs', 'project.js')
+        # b1: the normal case (no error-state item) renders instead of raising
+        # TypeError on the empty error group's null .rows.
+        for case in ('withoutError', 'withError'):
+            self.assertIn('Awaiting review', seen[case]['text'])
+            self.assertIn('Approved \u00b7 not yet integrated: none.', seen[case]['empty'])
+        # The empty contribution groups stay one line, never a panel.
+        self.assertIn('Submitted: none.', seen['withoutError']['empty'])
+        self.assertIn('Needs operator attention 1', seen['withError']['text'])
+        # The propose form stays folded on the Reviews page.
+        self.assertEqual(['Propose a requirement form'], seen['withoutError']['summaries'])
+
+    def test_moderation_fold_follows_role_and_server_refusals(self):
+        seen = self.run_page('web_slice5_moderation_page.mjs', 'rooms.js')
+        # A viewer and a contributor get no Moderate fold; a coordinator does.
+        self.assertEqual(0, seen['viewerLive'])
+        self.assertEqual(0, seen['contributorLive'])
+        self.assertEqual(1, seen['coordinatorLive'])
+        # Never on a tombstone, an item-event, or a moderated item: the server
+        # answers 404 for non message/item kinds and 409 for an already
+        # moderated line, so the page does not offer it there (rooms.py:1666).
+        self.assertEqual(0, seen['coordinatorTombstone'])
+        self.assertEqual(0, seen['coordinatorEvent'])
+        self.assertEqual(0, seen['coordinatorModeratedItem'])
+
+    def test_agent_card_my_work_and_proposal_groups(self):
+        seen = self.run_page('web_slice5_agents_work_page.mjs', 'agents.js', 'work.js')
+        # Notes item: the Next line says it once, and the agent case keeps the
+        # mock-up's bare wording (agents.html:46) with no who-acts chip.
+        self.assertEqual(['Next: Fix the failing test you'], seen['ownerNext'])
+        self.assertEqual(['you'], seen['ownerWho'])
+        self.assertEqual(['Then this \u2014 Then do the next thing'], seen['ownerRest'])
+        self.assertEqual(['Next: nothing from you. It holds nightly report '], seen['agentNext'])
+        self.assertEqual([], seen['agentWho'])
+        # My work renders the one row that needs its owner and no empty
+        # section; the empty case renders the one-line empties.
+        self.assertIn('1 need you', seen['workFull']['text'])
+        self.assertEqual(1, seen['workFull']['agentSections'])
+        self.assertEqual(['No revisions requested.'], seen['workFull']['empty'])
+        self.assertEqual(['No revisions requested.', 'Nothing to review.', 'Nothing assigned.'],
+                         seen['workEmpty']['empty'])
+
+
 if __name__ == '__main__':
     unittest.main()

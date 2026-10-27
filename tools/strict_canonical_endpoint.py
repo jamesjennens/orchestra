@@ -496,7 +496,7 @@ def dispatch(canonical, request, tmp, run=None):
         verifiers = config_data.get('verifiers') or []
         launched = canonical.authority_config is not None
         by_service = launched and canonical.require_authority
-        base_writes = reference_records.CONTRIBUTOR_OPERATIONS if action == 'ref' else records.WRITE_COMMANDS
+        base_writes = reference_records.CONTRIBUTOR_OPERATIONS + ('verify',) if action == 'ref' else records.WRITE_COMMANDS
         http_writes = getattr(records, 'HTTP_WRITE_COMMANDS', ()) if by_service else ()
         writes = base_writes + http_writes
         if not args or args[0] not in writes:
@@ -525,8 +525,18 @@ def dispatch(canonical, request, tmp, run=None):
                         raise ValueError('no issues found matching the provided IDs')
                     return json.dumps(found)
                 raise ValueError('unsupported native read')
-            if action == 'ref':
-                result = records.read(args, ref_run, operators, web_service=launched)
+            if action == 'ref' and args[:1] == ['design']:
+                # endpoint.py's design page read (kittrial-5bb.418).
+                rest = [token for token in args[1:] if token != '--json']
+                revision = int(rest[2]) if len(rest) == 3 and rest[1] == '--revision' else None
+                try:
+                    rows_of_key = reference_records.read_key_rows(ref_run, 'design.' + rest[0])
+                    result = reference_records.design_page(rows_of_key, rest[0], canonical.path, operators,
+                                                           verifiers, revision)
+                except ValueError:
+                    raise ValueError('Design not found') from None
+            elif action == 'ref':
+                result = records.read(args, ref_run, operators, web_service=launched, verifiers=verifiers)
             else:
                 result = records.read(args, ref_run, operators, verifiers=verifiers, journal=canonical.path,
                                       web_service=launched)
@@ -585,12 +595,48 @@ def dispatch(canonical, request, tmp, run=None):
                                     operators=operators, owners=None)
                             except delegations.DelegationRefusal as error:
                                 raise RecordsRefusal(error.status, '%s. Nothing was written.' % error) from None
-                            if not isinstance(proposer, str) or not proposer:
+                            _missing = not (isinstance(proposer, str) and proposer)
+                            _head = actor.split('/', 1)[0] if isinstance(actor, str) else None
+                            _own = (isinstance(proposer, str) and bool(proposer)
+                                      and isinstance(_head, str)
+                                      and proposer.split('/', 1)[0] == _head)
+                            # Base order (endpoint.py): no-proposer and own-draft
+                            # refuse before approval_by_another_party is read.
+                            if _missing:
                                 raise RecordsRefusal(403, 'This draft has no recorded proposer, so no delegation '
                                                           'can admit it.')
-                            if proposer.split('/', 1)[0] == actor.split('/', 1)[0]:
+                            if _own:
                                 raise RecordsRefusal(403, 'An agent never accepts or verifies a draft it wrote '
                                                           'itself, whatever its delegation says.')
+                            import record_acceptance as _shared_accept
+                            _s_seen = (live.get('settings_seen')
+                                       if isinstance(live.get('settings_seen'), dict) else {})
+                            _s_by_another = bool(
+                                _s_seen.get('approval_by_another_party')
+                                or authority.get('approval_by_another_party')
+                                or rules.get('independent_approval'))
+                            if not _s_by_another:
+                                return
+                            _s_caller = set(http_authority.actor_parties(live, actor, project))
+                            if user_id:
+                                _s_caller.add(user_id)
+                            _s_draft = (set(http_authority.actor_parties(live, proposer, project))
+                                        if isinstance(proposer, str) and proposer else set())
+                            # _missing/_own are refused above, so decide's defaults
+                            # (proposer_known True, own_draft False) carry the
+                            # same values (notes tidy-up).
+                            _may, _reason = _shared_accept.decide(
+                                can_coordinate=True,
+                                approval_by_another_party=_s_by_another,
+                                waiting=True, by_agent=True, agent_head=_head,
+                                delegation_covers_kind=True,
+                                delegation_missing=False,
+                                caller_parties=_s_caller, draft_parties=_s_draft,
+                                own_party=bool(_s_caller & _s_draft),
+                                independent_hold=False)
+                            if not _may:
+                                raise RecordsRefusal(403, _reason)
+                            return
                         settings_seen = live.get('settings_seen') if isinstance(live.get('settings_seen'), dict) else {}
                         approval_by_another = bool(
                             settings_seen.get('approval_by_another_party')
@@ -618,7 +664,12 @@ def dispatch(canonical, request, tmp, run=None):
                                 'A coordinator may not accept or verify a record whose draft was proposed '
                                 'by the same party while approval_by_another_party is enabled.')
                     party_check = _party_check
-            if action == 'ref':
+            if action == 'ref' and args[0] == 'verify':
+                # endpoint.py's `ref verify` (kittrial-5bb.418): always an unverified report here.
+                result = reference_records.write_verification(
+                    reference_records.verification_payload(args, attachments), actor, run, operators=operators,
+                    verifiers=verifiers, route='web' if by_service else 'endpoint')
+            elif action == 'ref':
                 payload, document = reference_records.write_payload_and_document(args, attachments, commands=writes)
                 result = reference_records.apply_native(
                     payload, actor, run, canonical.path, operator=coordinator,

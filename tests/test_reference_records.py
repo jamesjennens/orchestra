@@ -8,6 +8,7 @@ and fails only when every id is missing, `export --all` prints every row with it
 comments, a comment's `author` is the acting `--actor`, and `close` sets the status.
 """
 import copy
+import datetime
 import json
 import sys
 import tempfile
@@ -128,13 +129,18 @@ class RefNative:
                 if call[0] in ('create', 'close', 'comments', 'update') and '--dry-run' not in call]
 
 
+def _review_by():
+    today = datetime.date(*time.gmtime()[:3])
+    return (today + datetime.timedelta(days=365)).isoformat()
+
+
 def entry(**extra):
     payload = {'schema_version': 1, 'operation_id': 'alex-ref-1', 'operation': 'propose',
                'key': 'calendar.trading', 'title': 'Trading calendar authority',
                'statement': 'Charts derive holidays from the pinned calendar module.',
                'authority': {'type': 'repo-path', 'path': 'src/example/calendar.py',
                              'commit': '0' * 40, 'anchor': 'HOLIDAYS'},
-               'owner': 'account:u-0001', 'review_by': '2027-01-15', 'tags': ['calendar', 'data'],
+               'owner': 'account:u-0001', 'review_by': _review_by(), 'tags': ['calendar', 'data'],
                'decisions': [], 'revision': 1, 'expected_sha256': None}
     payload.update(extra)
     return {name: value for name, value in payload.items() if value is not ...}
@@ -687,6 +693,12 @@ class WorkAndBriefIntegrationTests(ReferenceCase):
                          [('calendar.trading', 'due-soon', 'accepted')])
         self.assertNotIn('Charts derive', json.dumps(result['attention']))
         self.assertIn('Reference review [due-soon, accepted]', briefing.format_brief(result))
+
+
+class ReviewByFixtureTests(unittest.TestCase):
+    def test_review_by_is_one_year_after_the_utc_date(self):
+        with patch('time.gmtime', return_value=time.struct_time((2028, 10, 25, 12, 0, 0, 3, 299, 0))):
+            self.assertEqual(_review_by(), '2029-10-25')
 
 
 if __name__ == '__main__':

@@ -183,6 +183,102 @@ def _document_from_git(entry,repo):
         raise ValueError('authority.sha256 is not the sha256 of %s at %s (%s)' % (path,commit[:12],sha256))
     return dict(entry,authority=dict(authority,sha256=sha256)),text
 
+def _git_document(repo,path,commit):
+    """(data, None) for the regular file `path` at `commit`, else (None, reason): a design check's view."""
+    def git(*args):
+        done=subprocess.run(['git','--no-optional-locks','-C',repo,*args],capture_output=True,timeout=30,
+                            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        return done.stdout if done.returncode==0 else None
+    # Review of part 2 (N3): a checkout that does not hold the commit cannot check it: not checked, never a fail.
+    if git('cat-file','-e',commit+'^{commit}') is None:return None,'commit-not-in-checkout'
+    listing=git('ls-tree','-z','--full-tree',commit,'--',path)
+    if listing is None:return None,'missing'
+    found=[]
+    for item in listing.split(b'\0'):
+        meta,_,name=item.partition(b'\t')
+        if item and name.decode('utf-8','replace')==path and len(meta.split())==3:found.append(meta.split())
+    if len(found)!=1:return None,'missing'
+    mode,kind,obj=(part.decode('ascii','replace') for part in found[0])
+    if kind!='blob' or mode not in ('100644','100755'):return None,'not-a-regular-file'
+    data=git('cat-file','blob',obj)
+    if data is None:return None,'missing'
+    return data,None
+
+def _answer(reply):
+    """The JSON an endpoint read or write answered, or its refusal raised as one sentence."""
+    if not isinstance(reply,dict) or reply.get('returncode'):
+        raise ValueError(server_text(str((reply or {}).get('stderr') or 'the endpoint refused'))[:500])
+    return json.loads(reply.get('stdout') or 'null')
+
+def _trace_command(args,config,project,actor,out):
+    """kittrial-5bb.418: `trace --verify [--repo DIR] [--record | --payloads FILE]`.
+
+    The one part of trace that needs a checkout (TRACEABILITY_DESIGN §5.1 step 4): for every accepted
+    design.<scope> entry with a repo-document authority, read the file at its pinned commit from git's own
+    object and compare its sha256 with the stored document's. `--record` files each result as an unverified
+    report (`ref verify`); `--payloads FILE` writes them for `admin.py design-verify`, the trusted host route."""
+    import tempfile
+    if '--verify' not in args:
+        raise ValueError('trace runs on the server (part 4 of the design); the client has trace --verify')
+    repo='.';record=False;payloads=None;i=0;rest=[token for token in args if token!='--verify']
+    while i<len(rest):
+        token=rest[i]
+        if token=='--repo' and i+1<len(rest):repo=rest[i+1];i+=2
+        elif token=='--record':record=True;i+=1
+        elif token=='--payloads' and i+1<len(rest):payloads=rest[i+1];i+=2
+        else:raise ValueError('trace --verify takes [--repo DIR] [--record | --payloads FILE]')
+    if record and payloads:raise ValueError('trace --verify: --record or --payloads, not both')
+    keys=[];offset=0
+    while offset is not None:
+        page=request(config,project,actor,['list','--limit','100','--offset',str(offset)],'ref')
+        page=_answer(page)
+        keys+=[item['key'] for item in page.get('items') or [] if str(item.get('key','')).startswith('design.')]
+        offset=page.get('next_offset')
+    results,items=[],[]
+    for key in keys:
+        entry=request(config,project,actor,['get',key],'ref')
+        entry=_answer(entry)
+        authority=((entry.get('record') or {}).get('authority')) or {}
+        if authority.get('type')!='repo-document':
+            results.append({'key':key,'checked':False,'why':'no accepted repo-document revision'})
+            continue
+        data,reason=_git_document(repo,authority['path'],authority['commit'])
+        if reason=='commit-not-in-checkout':
+            # Fetch the commit and run again; nothing is reported for it. (There is no dirty-checkout refusal:
+            # every read is git's object at the pinned commit, never the working tree.)
+            results.append({'key':key,'checked':False,'why':'commit %s is not in this checkout' % authority['commit'][:12]})
+            continue
+        observed=None
+        if data is not None:
+            observed=hashlib.sha256(data).hexdigest()
+            try:data.decode('utf-8');reason='match' if observed==authority['sha256'] else 'mismatch'
+            except UnicodeDecodeError:reason='not-utf8'
+        payload={'schema_version':1,'key':key,'doc_sha256':authority['sha256'],'path':authority['path'],
+                 'commit':authority['commit'],'observed_sha256':observed,
+                 'result':'pass' if reason=='match' else 'fail','reason':reason}
+        items.append(payload)
+        row={'key':key,'checked':True,'result':payload['result'],'reason':reason}
+        if record:
+            handle=tempfile.NamedTemporaryFile('w',encoding='utf-8',suffix='.json',delete=False)
+            with handle:handle.write(json.dumps(payload))
+            try:
+                answer=request(config,project,actor,['verify','--file',handle.name],'ref')
+                row['recorded']=_answer(answer)
+            finally:
+                Path(handle.name).unlink(missing_ok=True)
+        results.append(row)
+    if payloads:
+        Path(payloads).write_text(json.dumps({'items':items},indent=1)+'\n',encoding='utf-8')
+    summary={'schema':'trace-verify-v1','checked':len(items),'passed':sum(1 for item in items if item['result']=='pass'),
+             'failed':sum(1 for item in items if item['result']=='fail'),'results':results,
+             'payloads':payloads,'recorded':record}
+    text=json.dumps(summary,indent=2)+'\n'
+    if out:Path(out).write_text(text,encoding='utf-8')
+    else:sys.stdout.write(text)
+    # 3: a check failed. 4 (review of part 2, n5): nothing was checked, so a CI step cannot pass silently.
+    if summary['failed']:return 3
+    return 4 if summary['checked']==0 else 0
+
 def _design_document_args(args):
     """kittrial-5bb.418: `ref propose|revise --file entry.json --document-from-git [--repo DIR]`.
 
@@ -1511,6 +1607,8 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
+    ('trace --verify [--repo DIR] [--record | --payloads FILE]',
+     "check each accepted design document against git at its pinned commit (verified, design-drift)"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),
@@ -1901,6 +1999,8 @@ def main():
                              config_path=a.config)
     if args[0]=='files':
         return _files_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor)
+    if args[0]=='trace':
+        return _trace_command(args[1:],config_doc,a.project,a.actor,a.out)
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:

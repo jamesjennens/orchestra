@@ -29,7 +29,7 @@ The rules, and why:
 | Rule | What enforces it |
 | --- | --- |
 | never more than one wake per new fingerprint | the newest fingerprint is written to the state file **before** the wake command runs |
-| one instance at a time | a lock (`wake.lock` a directory on POSIX, a file on Windows) with the process id in it; a stale lock from a dead run is taken over |
+| one instance at a time | a lock (`wake.lock` a directory on POSIX, a file on Windows) with the process id in it, created exclusively (O_EXCL), never by trusting `mkdir`; a stale lock from a dead run is taken over by exactly one run |
 | bounded | `--timeout` is given to `client.py wait` |
 | one log line per wake | `wake.log` gets one line with the time, fingerprint, row count and result; nothing else |
 | no secrets beyond the client config | the scripts read none; the wake command is this lane's own setting |
@@ -56,9 +56,15 @@ file; a directory that holds anything else is refused, not used or deleted.
     linux/crontab.example           a cron line doing the same
     macos/com.orchestra.wake.plist   launchd agent at login and every N minutes
 
-The core script is shared by Linux and macOS: POSIX sh, `mkdir` for the lock,
+The core script is shared by Linux and macOS: POSIX sh, the shell's own
+noclobber (`set -C`, an `O_EXCL` create) of `"$LOCK/pid"` as the lock step,
 `kill -0` for the pid check, and `rm -f "$LOCK/pid"` then `rmdir "$LOCK"` to
-release the lock - never a recursive removal of a configured path. The scheduler
+release the lock - never a recursive removal of a configured path. `mkdir` only
+makes the directory the pid file lives in; it is not the lock, because some
+coreutils (uutils 0.10 on Ubuntu 26.04) let two concurrent `mkdir` of one path
+both succeed. A stale lock is taken over by the one run that
+first creates `"$LOCK/stale.PID"` exclusively (PID is the dead holder); the others
+exit. An existing lock directory from an older waker needs no migration. The scheduler
 wiring differs, so it is in `linux/` and `macos/`.
 
 ## Settings
@@ -222,7 +228,10 @@ string. The script requires PowerShell 5.1 or newer.
 - A run died hard and left `wake.lock` (POSIX) or `wake.lock` (Windows): the
   next run takes it over when the process id inside is gone. On POSIX it removes
   only the pid file and then the empty directory with `rmdir`; a lock directory
-  that holds anything else is refused for you to check by hand. Remove a lock by
+  that holds anything else is refused for you to check by hand. If a run was
+  killed (SIGKILL) while taking a stale lock over, it leaves `wake.lock/stale.PID`;
+  the next run says so, names that file and prints the one command to remove it
+  (`rm -f 'wake.lock/stale.PID'`), exits 1, and the run after that takes the lock. Remove a lock by
   hand only if you are sure no waker is running.
 - The wake command fails every time: it is attempted once per new fingerprint.
   Fix it, then wake the lane by hand or wait for the next new fingerprint; the

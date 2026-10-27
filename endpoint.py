@@ -121,6 +121,26 @@ ALLOWED={'list','show','ready','search','count','create','update','close','reope
 # spelling-aware reserved_comments.operator_only_in_args() below.
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
+from field_limits import DESCRIPTION_MAX,DESCRIPTION_TOO_LONG
+
+
+def _description_over_limit(args,attachments):
+    # create/update only: an inline --description/-d value, or an attached --body-file text, over the bound.
+    if not args or args[0] not in ('create','update'):return False
+    n=len(args)
+    for i,a in enumerate(args[1:],1):
+        if a=='--':break
+        if a.startswith('@attachment:'):
+            item=(attachments or {}).get(a.partition(':')[2])
+            if isinstance(item,dict) and item.get('flag')=='--body-file' and isinstance(item.get('text'),str) and len(item['text'])>DESCRIPTION_MAX:return True
+        elif a in ('--description','-d') and i+1<n and not args[i+1].startswith('@attachment:') and len(args[i+1])>DESCRIPTION_MAX:return True
+        else:
+            # pflag spellings with the value joined: --description=V, -d=V and -dV.
+            for lead in ('--description=','-d=','-d'):
+                if a.startswith(lead):
+                    if len(a)-len(lead)>DESCRIPTION_MAX:return True
+                    break
+    return False
 
 def _guidance_ack_version(args):
     """The version named by `guidance ack --version VERSION` (kittrial-5bb.99).
@@ -1695,13 +1715,39 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     # the project requires approval by another party (approval_by_another_party or
                     # independent_approval) the agent faces exactly the rule a person faces below.
                     delegation_check(state,decision_id)
-                    if not isinstance(proposer,str) or not proposer:
+                    import record_acceptance as shared_acceptance
+                    head=(actor.split('/',1)[0] if isinstance(actor,str) else None)
+                    caller_parties=set(actor_parties(state,actor,name))
+                    if user_id:caller_parties.add(user_id)
+                    proposer_parties=(set(actor_parties(state,proposer,name))
+                                      if isinstance(proposer,str) and proposer else set())
+                    if isinstance(proposer,str) and proposer:
+                        if proposer.split('/',1)[0]==head:
+                            raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
+                                                     'whatever its delegation says.')
+                    else:
                         raise RecordsRefusal(403,'This draft has no recorded proposer, so no delegation can admit it.')
-                    if proposer.split('/',1)[0]==(actor.split('/',1)[0] if isinstance(actor,str) else actor):
-                        raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
-                                                 'whatever its delegation says.')
+                    same_session_owner=False
+                    if rules.get('independent_approval') and isinstance(proposer,str) and proposer:
+                        try:
+                            owners=approval_owners(owner_loader(path,'independent_approval'))
+                        except CoordinatorRuleRefusal as error:
+                            raise RecordsRefusal(409,str(error)) from None
+                        same_session_owner=same_party(actor,proposer,owners)
                     if not approval_by_another:
                         return
+                    # proposer_known/own_draft are refused above, so decide's
+                    # defaults (True/False) carry the same values (notes tidy-up).
+                    may,reason=shared_acceptance.decide(
+                        can_coordinate=True,approval_by_another_party=approval_by_another,
+                        waiting=True,by_agent=True,agent_head=head,
+                        delegation_covers_kind=True,delegation_missing=False,
+                        caller_parties=caller_parties,draft_parties=proposer_parties,
+                        own_party=bool(caller_parties & proposer_parties),
+                        independent_hold=bool(same_session_owner))
+                    if not may:
+                        raise RecordsRefusal(403,reason)
+                    return
                 elif not approval_by_another:
                     return
                 caller_parties=set(actor_parties(state,actor,name))
@@ -1738,7 +1784,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if warnings:run_warnings.append(warnings)
             return stdout
         by_service=authority_config is not None and require_authority
-        writes=reference_records.CONTRIBUTOR_OPERATIONS+(reference_records.HTTP_WRITE_COMMANDS if by_service else ())
+        if args[:1]==['design']:
+            # kittrial-5bb.418: the design page read (the stored document as text, its index and state).
+            # Read-only, no lock; it reads one key's rows and that revision's stored bytes.
+            rest=[token for token in args[1:] if token!='--json']
+            revision=None
+            if len(rest)==3 and rest[1]=='--revision' and re.fullmatch(r'[1-9][0-9]{0,8}',rest[2]):
+                revision=int(rest[2]);rest=rest[:1]
+            if len(rest)!=1 or not isinstance(rest[0],str):raise ValueError('ref design takes SCOPE [--revision N]')
+            key='design.'+rest[0]
+            try:reference_records.valid_key(key)
+            except ValueError:raise ValueError('Design not found') from None
+            result=reference_records.design_page(reference_records.read_key_rows(run,key),rest[0],path,
+                                                 configured_operators(root),configured_verifiers(root),revision)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        writes=reference_records.CONTRIBUTOR_OPERATIONS+('verify',)+(reference_records.HTTP_WRITE_COMMANDS if by_service else ())
         if not args or args[0] not in writes:
             import capability_misses
             log=capability_misses.REFERENCE
@@ -1755,7 +1815,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=capability_misses.report(path,lambda:reference_records.NowAnswered(reference_records.read_rows(run),configured_operators(root)),limit,log)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
             looked_up=reference_records.miss_phrase(args)
-            try:result=reference_records.read(args,run,configured_operators(root),web_service=authority_config is not None)
+            try:result=reference_records.read(args,run,configured_operators(root),web_service=authority_config is not None,
+                                              verifiers=configured_verifiers(root))
             except ValueError as error:
                 # `ref get` of a key nobody has recorded is a lookup that missed.
                 if looked_up is not None and str(error).startswith('Unknown reference key'):counted(looked_up,False)
@@ -1768,6 +1829,22 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         identity_check,party_check,_=_records_http_context(coordinator,run_warnings,run,'references')
         # kittrial-5bb.418: a design.<scope> propose or revise carries its document as a second
         # attachment (flag --document), checked, stored and indexed by reference_records.
+        if args[0]=='verify':
+            # kittrial-5bb.418 (Q4): a `trace --verify` report through the endpoint is written unverified;
+            # only admin.py design-verify on the host writes a trusted one. Contributor-level, like propose.
+            payload=reference_records.verification_payload(args,request.get('attachments',{}))
+            runner=NativeRunner(run, project=path)
+            def verify_effect():
+                result=reference_records.write_verification(payload,actor,runner,operators=configured_operators(root),
+                                                            verifiers=configured_verifiers(root),
+                                                            route='web' if by_service else 'endpoint')
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                return guarded_write(root,request,journal_path(path),verify_effect,
+                                     authority_config=authority_config,
+                                     require_authority=require_authority,runner=runner,
+                                     identity_check=identity_check)
         payload,document=reference_records.write_payload_and_document(args,request.get('attachments',{}),commands=writes)
         runner=NativeRunner(run, project=path)
         def ref_effect():
@@ -2903,6 +2980,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     # actual request target; unresolvable targets fail closed.
     check_raw_request(args, request.get('attachments', {}),
                       actor=actor, task=comment_target(args))
+    if _description_over_limit(args,request.get('attachments',{})):raise ValueError(DESCRIPTION_TOO_LONG)
     with tempfile.TemporaryDirectory(prefix='request-',dir=root) as tmp:
         attachments=request.get('attachments',{})
         final=[]
@@ -3048,6 +3126,8 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
+    ('trace --verify [--repo DIR] [--record | --payloads FILE]',
+     "check each accepted design document against git at its pinned commit (verified, design-drift)"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),

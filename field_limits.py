@@ -27,3 +27,9 @@ def check_text(value, name, limit, empty=False, nul=True):
 def describe(limits):
     """{field: '<= N characters'} for a help payload, from the validators' own numbers."""
     return {name: '<= %d characters' % limit for name, limit in limits.items()}
+
+
+# One bound for a task description on every route that writes one (kittrial-5bb.316).
+DESCRIPTION_MAX = 20000
+DESCRIPTION_TOO_LONG = ('Task description is too long: at most %d characters. Keep the description short and '
+                        'link a longer repository document from it.' % DESCRIPTION_MAX)

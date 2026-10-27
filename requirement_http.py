@@ -5,6 +5,7 @@ own validated hooks to the same native mutation engine; operator=True is never
 used to impersonate host authority.
 """
 import json
+from field_limits import DESCRIPTION_MAX
 import hashlib
 import os
 import re
@@ -384,7 +385,7 @@ def checked_body(body, action):
         if (not isinstance(pointer, str)
                 or not re.fullmatch(r'orchestra:room/r-[0-9a-f]{12}#[0-9]{1,12}\Z', pointer)):
             raise ValueError('Invalid room evidence pointer')
-    for field, limit in (('title', 200), ('description', 20000)):
+    for field, limit in (('title', 200), ('description', DESCRIPTION_MAX)):
         if field in body and (not isinstance(body[field], str) or not body[field].strip()
                               or len(body[field]) > limit or '\0' in body[field]):
             raise ValueError('Requirement %s must contain 1 to %d characters' % (field, limit))

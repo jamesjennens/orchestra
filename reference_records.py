@@ -1015,7 +1015,7 @@ def _record_view(record, accepted=False, current=None):
     return view
 
 
-def get(rows, key, operators, current=None, web_service=False):
+def get(rows, key, operators, current=None, web_service=False, verifiers=None):
     """`ref get KEY`: found through the lookup label, then the record's own key must match.
 
     A malformed or unsupported entry is returned with that state (its key is known only
@@ -1036,6 +1036,10 @@ def get(rows, key, operators, current=None, web_service=False):
               'anchors': entry.get('duplicate_anchors', []),
               'coverage': 'newest accepted revision and its acceptance evidence; unresolved drafts are returned '
                           'in proposed'}
+    verification = document_verification(rows, entry, operators, verifiers)
+    if verification is not None:
+        # kittrial-5bb.418: verified, unverified or design-drift (TRACEABILITY_DESIGN §5.1 step 4).
+        result['verification'] = verification
     if web_service:
         result.update(
             proposer=entry.get('proposer'), acceptor=entry.get('acceptor'),
@@ -1053,6 +1057,8 @@ def get(rows, key, operators, current=None, web_service=False):
 def _list_item(entry, current=None, web_service=False):
     source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
     waiting = entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')
+    proposed = entry.get('proposed') or {}
+    record = entry.get('record') or {}
     item = {'key': entry['key'], 'title': (source.get('title') or entry.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
             'owner': source.get('owner'), 'review_by': source.get('review_by') if entry['record'] else None,
             'proposed_review_by': (entry['proposed'] or {}).get('review_by'),
@@ -1063,6 +1069,16 @@ def _list_item(entry, current=None, web_service=False):
             # is the accepted record: a draft attestation is never shown unmarked.
             'authority_kind': authority_kind(source) if source else None, 'authority_accepted': entry['record'] is not None}
     if web_service:
+        # The authority object itself rides along ONLY for the web waiting queue
+        # (endpoint.py's ref/capability reads run with web_service=False, so the
+        # CLI ref/capability list payloads keep only the authority_kind and
+        # authority_accepted flags above; review notes, r2). The waiting queue's
+        # authority cell prints an attested draft (kittrial-5bb.420 2.3: the cell
+        # read only rec.authority/item.authority and showed a dash although the
+        # draft's attestation was there).
+        item['authority'] = source.get('authority')
+        item['proposed_authority'] = proposed.get('authority')
+        item['record_authority'] = record.get('authority')
         item.update(
             waiting_acceptance=waiting,
             proposed_revision=(entry['proposed'] or {}).get('revision'),
@@ -1556,7 +1572,7 @@ def parse_list_options(args, web_service=False):
 HTTP_WRITE_COMMANDS = ('accept', 'retire')
 
 
-def read(args, run, operators, web_service=False):
+def read(args, run, operators, web_service=False, verifiers=None):
     """`ref get KEY` / `ref list ...` / `ref find PHRASE` / `ref --help`: read-only. `get`
     reads only its key (`read_key_rows`); `list` and `find` read the catalog (`read_rows`).
     `ref misses` is answered by the endpoint itself (it needs the project directory)."""
@@ -1568,7 +1584,7 @@ def read(args, run, operators, web_service=False):
         if len(rest) != 1:
             raise ValueError('ref get takes exactly one KEY')
         valid_key(rest[0])
-        return get(read_key_rows(run, rest[0]), rest[0], operators, web_service=web_service)
+        return get(read_key_rows(run, rest[0]), rest[0], operators, web_service=web_service, verifiers=verifiers)
     if command == 'list':
         return list_entries(read_rows(run), parse_list_options(rest, web_service=web_service), operators,
                             web_service=web_service)
@@ -1600,3 +1616,138 @@ def parse_find_options(args):
     if not FIND_LIMIT[0] <= limit <= FIND_LIMIT[1]:
         raise ValueError('ref find: --limit must be %d..%d' % FIND_LIMIT)
     return phrases[0], limit
+
+
+# -- design documents, part 2 (kittrial-5bb.418): verification, the verification block, the page ---
+
+def _anchor_row(rows, native_id):
+    return next((row for row in rows if isinstance(row, dict) and row.get('id') == native_id), None)
+
+
+def _trusted(operators, verifiers):
+    from capability_verification import trusted_actors
+    return trusted_actors(operators, verifiers)
+
+
+def document_verification(rows, entry, operators, verifiers=None, record=None):
+    """The `verification` block of an entry's accepted repo-document revision, or None."""
+    record = record if record is not None else entry.get('record')
+    if not record or not documented(record):
+        return None
+    row = _anchor_row(rows, entry.get('native_id'))
+    items = design_documents.verifications_for(row, record['key'], record['authority'])
+    return design_documents.derive_verification(items, _trusted(operators, verifiers))
+
+
+def verification_payload(args, attachments):
+    """`ref verify --file payload.json`: one `trace --verify` report."""
+    rest = [token for token in args[1:] if token != '--json']
+    if len(rest) != 1 or not rest[0].startswith('@attachment:'):
+        raise ValueError('ref verify takes --file payload.json')
+    item = (attachments or {}).get(rest[0].partition(':')[2])
+    if not isinstance(item, dict) or item.get('flag') not in ('--file', '-f') or not isinstance(item.get('text'), str):
+        raise ValueError('ref verify takes --file payload.json')
+    payload = parse_json(item['text'])
+    if isinstance(payload, dict):
+        payload = {name: value for name, value in payload.items() if name not in ('operation', 'operation_id')}
+    return design_documents.check_verification_payload(payload)
+
+
+def write_verification(payload, actor, run, operators=None, verifiers=None, route='endpoint'):
+    """Record one report on the accepted repo-document revision it names (§5.1 step 4; Q4).
+
+    `route` is `host` only for `admin.py design-verify`, which requires an actor on the operator
+    allowlist or the verifiers list and writes identity `verified`. Every other route writes an
+    `unverified` report: it can open design-drift (trusted: false, reported_by) and never verify. A
+    report must name the accepted revision's own document, path and commit. A repeat of the same
+    report by the same actor is answered without a write; untrusted reports on one document are
+    bounded."""
+    design_documents.check_verification_payload(payload)
+    key = payload['key']
+    trusted = route == 'host'
+    if trusted and actor not in _trusted(operators, verifiers):
+        raise ValueError('only an actor on the operator allowlist or the verifiers list records a trusted design '
+                         'verification')
+    row, _ = KIND.anchor_for(KIND.read_key_rows(run, key), key)
+    if row is None:
+        raise ValueError('Unknown reference key %s' % key)
+    record = KIND.entry_view(row, operators).get('record')
+    if not record or not documented(record):
+        raise ValueError('%s has no accepted design document to verify' % key)
+    authority = record['authority']
+    if (payload['doc_sha256'], payload['path'], payload['commit']) != \
+            (authority['sha256'], authority['path'], authority['commit']):
+        raise ValueError('the report names a document that is not the accepted revision of %s' % key)
+    existing = design_documents.verifications_for(row, key, authority)
+    if existing:
+        # Review of part 2 (B1): a report is a repeat only when it is the newest one on this document. With a
+        # pinned commit an honest re-check is always identical, so a re-check after a newer report (a fail
+        # filed since) is written and counts.
+        _, item, author = existing[-1]
+        if item['submitter'] == {'actor': actor, 'route': route} and item['result'] == payload['result'] \
+                and item['observed_sha256'] == payload['observed_sha256'] and author == actor:
+            return {'key': key, 'recorded': False, 'result': item['result'], 'identity': item['identity']}
+    if not trusted:
+        # N2: bounded per submitter, passes and fails apart.
+        limit = design_documents.UNTRUSTED_PASSES_PER_SUBMITTER if payload['result'] == 'pass' \
+            else design_documents.UNTRUSTED_FAILS_PER_SUBMITTER
+        mine = sum(1 for _, item, author in existing if item['identity'] != 'verified' and author == actor
+                   and item['result'] == payload['result'])
+        if mine >= limit:
+            raise ValueError('%s already holds %d %s reports by %s for this document; an operator or a listed '
+                             'verifier records the next check' % (key, limit, payload['result'], actor))
+    at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    entry = design_documents.verification_record(payload, actor, route, 'verified' if trusted else 'unverified', at)
+    run(['comments', 'add', row['id'], design_documents.verification_body(entry), '--json'])
+    return {'key': key, 'recorded': True, 'result': entry['result'], 'identity': entry['identity']}
+
+
+def design_page(rows, scope, project, operators, verifiers=None, revision=None):
+    """`ref design SCOPE [--revision N]`: the stored document of design.SCOPE as text, its index and state.
+
+    The accepted revision by default (else the newest draft); `revision` names another. Anything that
+    is not a readable repo-document revision of that key answers the same refusal, so a reader learns
+    nothing from it (hidden equals absent; the HTTP route answers one 404 for all of them)."""
+    missing = ValueError('Design not found')
+    key = design_documents.DESIGN_KEY_PREFIX + scope
+    try:
+        valid_key(key)
+        entry = KIND.find_entry(rows, key, operators, view=lambda row, operators: entry_view(row, operators))
+    except ValueError:
+        raise missing from None
+    row = _anchor_row(rows, entry.get('native_id'))
+    if row is None:
+        raise missing
+    try:
+        revisions = KIND.existing_revisions(KIND.live_row(row, operators)[0])
+    except ValueError:
+        raise missing from None
+    if revision is not None:
+        record = revisions.get(revision)
+    else:
+        record = entry.get('record') or entry.get('proposed')
+    if not record or not documented(record):
+        raise missing
+    authority = record['authority']
+    try:
+        data = design_documents.read_document(project, authority['sha256'])
+        text = data.decode('utf-8')
+        derived = design_documents.derive_index(text, key, authority['path'], authority['commit'])
+    except ValueError:
+        raise missing from None
+    stored = design_documents.indexes_for(row, key, authority)
+    index_state = 'missing' if not stored else 'matches' if all(index == derived for index in stored) else 'differs'
+    # Review of part 2 (N4): the page places the server's anchors by line, so a reader never re-implements the
+    # heading rule (capabilities.markdown_headings: 1-based line numbers, in the index's order).
+    from capabilities import markdown_headings
+    heading_lines = [item[0] for item in markdown_headings(data)][:len(derived['headings'])]
+    accepted = entry.get('record') is not None and entry['record'].get('sha256') == record.get('sha256')
+    return {'schema_version': 1, 'key': key, 'scope': scope, 'revision': record['revision'],
+            'acceptance_state': record['acceptance_state'], 'accepted': accepted,
+            'record_sha256': record['sha256'], 'title': record['title'], 'authority': dict(authority),
+            'verification': design_documents.derive_verification(
+                design_documents.verifications_for(row, key, authority), _trusted(operators, verifiers))
+            if record['acceptance_state'] != 'draft' else None,
+            'index': derived, 'index_state': index_state, 'heading_lines': heading_lines, 'document': text,
+            'trust': 'data',
+            'revisions': sorted(number for number, item in revisions.items() if documented(item))}

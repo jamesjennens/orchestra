@@ -49,6 +49,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 import actor_names
 import agent_prompts
 import bd_refusals
+from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
 import claim_limit
 import project_setup
 import project_coordination
@@ -1043,8 +1044,8 @@ class InProcessBackend:
         if not isinstance(title, str) or not title.strip() or len(title) > 200:
             raise invalid('Task title must be 1-200 characters')
         description = payload.get('description') or ''
-        if not isinstance(description, str) or len(description) > 20000:
-            raise invalid('Task description is too long')
+        if not isinstance(description, str) or len(description) > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
         # A null priority is absent, not a value (kittrial-5bb.183 review item 4): the route
         # guard and the endpoint backend already read it that way, and every released client
         # sends null where it has no value, so bd's default 2 applies on both backends.
@@ -1078,8 +1079,8 @@ class InProcessBackend:
                 value = payload[field]
                 if field == 'title' and (not isinstance(value, str) or not value.strip() or len(value) > 200):
                     raise invalid('Task title must be 1-200 characters')
-                if field == 'description' and (not isinstance(value, str) or len(value) > 20000):
-                    raise invalid('Task description is too long')
+                if field == 'description' and (not isinstance(value, str) or len(value) > DESCRIPTION_MAX):
+                    raise invalid(DESCRIPTION_TOO_LONG)
                 if field == 'status' and value not in ('open', 'closed'):
                     raise invalid('Task status must be open or closed')
                 if field == 'priority' and (type(value) is not int or not 0 <= value <= 4):
@@ -2272,6 +2273,7 @@ class EndpointBackend:
         # Files attached to a task (kittrial-5bb.370): the canonical `task-file` action.
         'files.record', 'files.withdraw',
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
+        'references.verify',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
         'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
         # Delegated decision rights (kittrial-5bb.407): the canonical `delegation` action.
@@ -3335,6 +3337,17 @@ class EndpointBackend:
 
     def references_find(self, project_id, phrase, limit=5):
         return self._ref_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
+
+    def design(self, project_id, scope, revision=None):
+        """kittrial-5bb.418: the design page through `ref design SCOPE`; anything not there is a 404."""
+        args = ['design', caller_arg(scope, 'scope')] + (['--revision', revision] if revision else [])
+        reply = self._endpoint('ref', project_id, self.actor_namespace + '/read', args)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and 'Design not found' in (reply.get('stderr') or ''):
+            raise not_found('Design not found')
+        payload = self._checked(reply, 'ref', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical design read returned an unexpected shape')
+        return payload
 
     def capabilities(self, project_id, options):
         """One page of the capability catalog through the endpoint's read-only `capability list`."""
@@ -4956,7 +4969,7 @@ def task_matches(task, filters):
 class RouteContext:
     __slots__ = ('principal', 'payload', 'query', 'params', 'request_id',
                  'idempotency_key', 'body_hash', 'auth_source', 'secure',
-                 'route_target', 'authorize')
+                 'route_target', 'authorize', '_records_delegation_cache')
 
     def __init__(self, principal, payload, query, params, request_id, idempotency_key,
                  body_hash, auth_source, secure, route_target):
@@ -6374,6 +6387,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._task_title(title)
         if description is not None and not isinstance(description, str):
             raise invalid('Task description must be text')
+        if description is not None and len(description) > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
         if status is not None and status not in ('open', 'closed'):
             raise invalid('Task status must be open or closed')
         if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
@@ -10588,6 +10603,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._task_title(payload.get('title'))
         if payload.get('description') is not None and not isinstance(payload['description'], str):
             raise invalid('Task description must be text')
+        if len(payload.get('description') or '') > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
         self._bind_task_actor(ctx, payload)
 
         def create():
@@ -10952,6 +10969,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                           'owner', 'review_by', 'tags', 'decisions', 'document')
     REF_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'title', 'statement',
                          'authority', 'owner', 'review_by', 'tags', 'decisions', 'document')
+    REF_VERIFY_FIELDS = ('key', 'doc_sha256', 'path', 'commit', 'observed_sha256', 'result', 'reason')
     REF_ACCEPT_FIELDS = ('key', 'revision', 'expected_revision', 'record_sha256', 'expected_sha256',
                          'acceptance_state', 'acceptance', 'decision', 'evidence', 'decision_id',
                          'owners', 'approvers', 'policy', 'unverified_pointer_reason')
@@ -11003,7 +11021,197 @@ class ApiHandler(BaseHTTPRequestHandler):
         can_coordinate = role in ('coordinator', 'owner') and holds(CAP_COORDINATE)
         return can_propose, can_coordinate
 
-    def _enrich_record_view(self, ctx, pid, capabilities, item):
+    def _viewer_may_accept(self, ctx, pid, item, can_coordinate, record_kind=None):
+        """(may_accept, reason): the ONE server field gating 'Review & accept'.
+
+        Never combined in the page: the page shows 'Review & accept' only when
+        ``may_accept`` is true, else 'View'. The decision is the shared
+        ``record_acceptance.decide`` predicate (kittrial-5bb.420 r2, review
+        item b1), the SAME rule the accept route enforces through endpoint.py
+        ``party_check``/``delegation_check``. The accept route still enforces
+        on its own. ``reason`` is a short plain sentence for display only.
+
+        ``record_kind`` is the record family the route handler already knows
+        (``'references'`` or ``'capabilities'``) and MUST pass explicitly: every
+        caller does (the default is fail-closed, never a guess), so a
+        references-only delegation is never asked about capabilities (review
+        item r2-field-references).
+        """
+        import record_acceptance
+        if record_kind not in ('references', 'capabilities'):
+            return False, 'The record family could not be read.'
+        by_agent = getattr(ctx.principal, 'via', None) == 'credential'
+        entry_state = item.get('state')
+        proposed = item.get('proposed')
+        has_proposed_block = isinstance(proposed, dict) and bool(proposed)
+        # An r1-shaped waiting row carries NO proposed block (the block rides
+        # only on get/detail): fall back to proposed_revision/proposed_sha256,
+        # which list_entries sets from entry['proposed'] (both None when no
+        # draft waits). A full-catalog settled row has neither (both None) and
+        # stays not-waiting (review b2).
+        waiting = bool(
+            (has_proposed_block
+             or item.get('proposed_revision') is not None
+             or item.get('proposed_sha256') is not None)
+            and (entry_state in ('draft-only', 'draft', 'proposed')
+                 or (bool(item.get('waiting_acceptance')) and entry_state == 'accepted')))
+        with self.service.store.lock:
+            seen = self.service.state.get('settings_seen')
+            seen_flag = bool(isinstance(seen, dict) and seen.get('approval_by_another_party'))
+            service_flag = bool(self.service.approval_by_another_party)
+        # The installation's independent_approval rule (endpoint.py reads it as
+        # rules['independent_approval'] under the write's lock; review b1): the
+        # web-service state has no deployment root, so this enrichment reads
+        # the SAME canonical root the endpoint subprocess was launched with
+        # (self.backend.root). Read per request, never cached: a rule flip
+        # applies to the next read. (No fcntl/module import at module level;
+        # coordinator_rule is a plain JSON read — POSIX-safe by construction.)
+        try:
+            from admin import coordinator_rule
+            from pathlib import Path
+            backend_root = getattr(self.backend, 'root', None)
+            if backend_root:
+                try:
+                    independent = bool(coordinator_rule(Path(backend_root), 'independent_approval'))
+                except Exception:
+                    independent = False
+            else:
+                independent = False
+        except Exception:
+            independent = False
+        approval_by_another = bool(service_flag or seen_flag or independent)
+        caller_names = [getattr(ctx.principal, 'actor', None) or ctx.principal.user_id,
+                        ctx.principal.user_id]
+        draft_proposer = (
+            item.get('proposed_by')
+            or (item.get('draft') or {}).get('proposer')
+            or (item.get('proposer')
+                if item.get('state') in ('draft-only', 'draft', 'proposed')
+                or item.get('waiting_acceptance') or item.get('has_pending_draft')
+                else None)
+        )
+        draft_authors = [a for a in (item.get('draft_authors') or []) if isinstance(a, str) and a]
+        if not draft_authors and isinstance(draft_proposer, str) and draft_proposer:
+            draft_authors = [draft_proposer]
+        caller_parties = set()
+        draft_parties = set()
+        for name in caller_names:
+            if isinstance(name, str) and name:
+                caller_parties |= self.service.actor_parties(name, pid, by_agent)
+        for name in draft_authors:
+            if isinstance(name, str) and name:
+                draft_parties |= self.service.actor_parties(name, pid, by_agent)
+        actor = getattr(ctx.principal, 'actor', '') or ''
+        head = actor.split('/', 1)[0] if isinstance(actor, str) else ''
+        own_draft = bool(head) and any(
+            isinstance(a, str) and a.split('/', 1)[0] == head for a in draft_authors)
+        # The route's session-owner sameness (endpoint.py party_check reads the
+        # project's .sessions.json owners map via owner_loader, review t1): the
+        # field reads the same project directory the endpoint backend was
+        # launched with (self.backend.root). sessions/review_workflow import no
+        # POSIX-only module at module level, so this lazy read keeps the
+        # no-fcntl pin green. An unreadable-or-missing registry fails closed:
+        # the field refuses exactly where the route answers 409/403.
+        independent_hold = False
+        if independent and waiting and approval_by_another and can_coordinate:
+            try:
+                from pathlib import Path as _Path
+                import admin as _admin
+                import sessions as _sessions
+                from review_workflow import same_party as _same_party
+                _project_dir = _admin.project_dir(_Path(backend_root), pid)
+                _owners = _sessions.owners(_project_dir)
+                _actor = getattr(ctx.principal, 'actor', '') or ctx.principal.user_id
+                for _prop in draft_authors:
+                    if isinstance(_actor, str) and _actor and _same_party(_actor, _prop, _owners):
+                        independent_hold = True
+                        break
+            except Exception:
+                if by_agent:
+                    return False, 'Whether a delegation covers this agent could not be read.'
+                return False, ('A coordinator may not accept or verify a record whose draft was proposed '
+                               'by the same party while approval_by_another_party is enabled.')
+        covered = None
+        unreadable = False
+        refused = False
+        if by_agent:
+            covered = self._coverage_for(ctx, pid, record_kind)
+            if covered is None:
+                unreadable = True
+            elif covered is not True:
+                refused = True
+        return record_acceptance.decide(
+            can_coordinate=can_coordinate,
+            approval_by_another_party=approval_by_another,
+            waiting=waiting,
+            by_agent=by_agent,
+            agent_head=head or None,
+            delegation_covers_kind=covered,
+            delegation_refused=refused,
+            delegation_missing=False,
+            proposer_known=True,
+            delegation_unreadable=unreadable,
+            caller_parties=caller_parties,
+            draft_parties=draft_parties,
+            own_draft=own_draft,
+            own_party=bool(caller_parties & draft_parties),
+            independent_hold=independent_hold)
+
+    def _coverage_for(self, ctx, pid, kind):
+        """Whether a delegation in force covers the caller's agent FOR KIND.
+
+        ``kind`` is ``'references'`` or ``'capabilities'`` (review item b1):
+        a delegation narrowed to references never admits a capability draft.
+        Returns ``True`` (covered), ``False`` (a readable answer covering
+        nothing for this kind), or ``None`` (the delegations read refused or
+        this backend has no delegation signal, so the agent is uncovered,
+        the same refusal the accept route would give). Cached per (pid, kind).
+        """
+        cache = getattr(ctx, '_records_delegation_cache', None)
+        if cache is None:
+            cache = {}
+            ctx._records_delegation_cache = cache
+        key = (pid, kind)
+        if key in cache:
+            return cache[key]
+        covered = None
+        try:
+            read = getattr(self.backend, 'delegations_read', None)
+            if read is not None and getattr(ctx.principal, 'via', None) == 'credential':
+                actor = getattr(ctx.principal, 'actor', '') or ''
+                head = actor.split('/', 1)[0]
+                payload = read(pid, ctx.principal)
+                for entry in (payload.get('granted_agents') or []):
+                    if isinstance(entry, dict) and entry.get('agent') == head:
+                        covered = bool(entry.get('covered'))
+                        break
+                else:
+                    covered = False
+                if covered and kind is not None:
+                    kinds = set()
+                    for row in (payload.get('items') or []):
+                        if not isinstance(row, dict):
+                            continue
+                        delegation = row.get('delegation')
+                        if not isinstance(delegation, dict):
+                            continue
+                        if delegation.get('grantee') not in (head, 'coordinator-grant'):
+                            continue
+                        if delegation.get('right') != 'record-acceptance':
+                            continue
+                        scope = delegation.get('scope') or []
+                        if not isinstance(scope, list) or not scope:
+                            continue
+                        kinds |= {part for part in scope if isinstance(part, str)}
+                    covered = kind in kinds
+            elif getattr(ctx.principal, 'via', None) == 'credential':
+                covered = False
+        except HttpError:
+            covered = None
+        cache[key] = covered
+        return covered
+
+    def _enrich_record_view(self, ctx, pid, capabilities, item, record_kind=None):
         if not isinstance(item, dict):
             return item
         item = dict(item)
@@ -11104,15 +11312,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
+        may_accept, may_reason = self._viewer_may_accept(ctx, pid, item, can_coordinate,
+                                                        record_kind=record_kind)
+        item['viewer_may_accept'] = bool(may_accept)
+        item['viewer_may_accept_reason'] = may_reason
         return item
 
-    def _enrich_records_list(self, ctx, pid, result):
+    def _enrich_records_list(self, ctx, pid, result, record_kind=None):
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         can_propose, can_coordinate = self._records_standing(ctx, pid, capabilities)
         result = dict(result)
         for list_key in ('items', 'records', 'candidates'):
             if isinstance(result.get(list_key), list):
-                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item)
+                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item,
+                                                             record_kind=record_kind)
                                     for item in result[list_key]]
         if 'items' not in result and isinstance(result.get('records'), list):
             seen = {r.get('key') for r in result['records'] if isinstance(r, dict)}
@@ -11254,7 +11467,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                          capability=needed)
             capabilities = self.service.capabilities_for(ctx.principal, pid)
             if isinstance(result, dict):
-                result = self._enrich_record_view(ctx, pid, capabilities, result)
+                result = self._enrich_record_view(ctx, pid, capabilities, result,
+                                                  record_kind=route_name.split('.')[0])
             return result, result
         return self._mutate(ctx, route_name, pid, mutate_record, status=status,
                             capability=needed, serialize=False, canonical=True,
@@ -11350,7 +11564,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             options = reference_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('ref list: ', ''))
-        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options))
+        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options),
+                                             record_kind='references')
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
@@ -11375,7 +11590,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             raise invalid(str(error).replace('ref find: ', ''))
         result = self.backend.references_find(pid, phrase, parsed_limit)
-        return 200, self._enrich_records_list(ctx, pid, result)
+        return 200, self._enrich_records_list(ctx, pid, result, record_kind='references')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')')
     def references_get(self, ctx):
@@ -11383,7 +11598,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         return 200, self._enrich_record_view(
-            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']))
+            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']),
+            record_kind='references')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_propose(self, ctx):
@@ -11397,6 +11613,38 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._records_write(ctx, 'references.revise', 'revise',
                                    self.REF_REVISE_FIELDS, 'A reference revision',
                                    coordinator=False, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/verifications')
+    def references_verify(self, ctx):
+        # kittrial-5bb.418 (Q4): a design-document report from a member who may propose (records capability,
+        # role contributor, coordinator or owner); never a viewer or an outsider. Written unverified: it can
+        # open design-drift (trusted: false, reported_by) and never marks a document verified.
+        return self._records_write(ctx, 'references.verify', 'verify',
+                                   self.REF_VERIFY_FIELDS, 'A design verification',
+                                   coordinator=False, key_param=True, status=201)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/designs/(?P<scope>[a-z0-9][a-z0-9.-]{0,72})')
+    def design_get(self, ctx):
+        """kittrial-5bb.418: the design page read: a design.<scope> entry's stored document as text, its index
+        and state. One 404 for every caller who may not read it and every scope that is not there."""
+        absent = not_found('Design not found')
+        try:
+            self._project(ctx, CAP_READ)
+            self._records_backend()
+        except HttpError:
+            raise absent from None
+        revision = ctx.query.get('revision')
+        if revision is not None and not re.fullmatch(r'[1-9][0-9]{0,8}', revision):
+            raise absent
+        reader = getattr(self.backend, 'design', None)
+        if reader is None:
+            raise absent
+        try:
+            return 200, reader(ctx.params['pid'], ctx.params['scope'], revision)
+        except HttpError as error:
+            if error.status in (400, 404, 422):
+                raise absent from None
+            raise
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/accept')
     def references_accept(self, ctx):
@@ -11437,7 +11685,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             options = capability_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('capability list: ', ''))
-        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options))
+        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options),
+                                             record_kind='capabilities')
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
@@ -11462,7 +11711,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             raise invalid(str(error).replace('capability find: ', ''))
         result = self.backend.capabilities_find(pid, phrase, parsed_limit)
-        return 200, self._enrich_records_list(ctx, pid, result)
+        return 200, self._enrich_records_list(ctx, pid, result, record_kind='capabilities')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')')
     def capabilities_get(self, ctx):
@@ -11470,7 +11719,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         return 200, self._enrich_record_view(
-            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']))
+            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']),
+            record_kind='capabilities')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
     def capabilities_propose(self, ctx):

@@ -244,6 +244,9 @@ DELEGATION_PREFIX = 'Kind: delegation-v1\n'
 # reference entry (design_documents). Reserved, every version, so no raw `comments add` can plant
 # one; acceptance re-derives it from the bytes and refuses when a differing one is on the anchor.
 DESIGN_INDEX_PREFIX = 'Kind: design-index-v1\n'
+# kittrial-5bb.418 part 2. A `trace --verify` report on a design document (design_documents). Written
+# only by `ref verify` (unverified) or `admin.py design-verify` (trusted); reserved in every version.
+DESIGN_VERIFICATION_PREFIX = 'Kind: design-verification-v1\n'
 
 RESERVED = (
     (TASK_ASSIGNMENT_PREFIX, 'task assignment notice', 'the dedicated coordinate assignment operation'),
@@ -289,6 +292,8 @@ RESERVED = (
      'coordination host'),
     (DESIGN_INDEX_PREFIX, 'design document index',
      'ref propose|revise of a design.<scope> entry with its document (the server writes the index)'),
+    (DESIGN_VERIFICATION_PREFIX, 'design document verification',
+     'trace --verify --record (ref verify) or admin.py design-verify on the coordination host'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
@@ -949,7 +954,8 @@ RECORD_ANCHOR_LABELS = frozenset(RECORD_ANCHOR_FAMILIES)
 RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: proposal-disposition-', 'Kind: contribution-settings-',
                            'Kind: capability-', 'Kind: open-item-', 'Kind: item-resolution-',
-                           'Kind: owner-answer-', 'Kind: coordinator-decision-', 'Kind: design-index-')
+                           'Kind: owner-answer-', 'Kind: coordinator-decision-', 'Kind: design-index-',
+                           'Kind: design-verification-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
 SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3)})
