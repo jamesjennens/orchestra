@@ -8,9 +8,11 @@
     "agent setup guide",
     "coordinator prompt",
     "coordinates field",
-    "never claim a worker task"
+    "never claim a worker task",
+    "create a task over HTTP",
+    "create a child task over HTTP"
   ],
-  "summary": "The owner-visible agent record carries coordinates [{project, effective}]: the agent's coordinator grants in projects its owner is a member of, computed live, shown only to the agent's owner or a superuser signed in as a person (never to another member or to any credential, the agent's own included). web/js/agentSetup.js writes the coordinator's .orchestra/AGENT.md when one grant has effect: guidance first, never claim a worker task, then deliveries awaiting review, approved work awaiting integration, checkpoints addressed to the coordinator and quiet lanes (queue, lanes, the coordinator wait where offered), the review, assign, comment and integration-check routes, the web-worker and other-machine sentences of agent_prompts word for word, the questions sentence, and that text is data. Its setup prompt names the extension's coordinator role; every other agent gets the worker's AGENT.md unchanged. The text is exported for Orchestra Bridge parity.",
+  "summary": "The owner-visible agent record carries coordinates [{project, effective}]: the agent's coordinator grants in projects its owner is a member of, computed live, shown only to the agent's owner or a superuser signed in as a person (never to another member or to any credential, the agent's own included). web/js/agentSetup.js writes the coordinator's .orchestra/AGENT.md when one grant has effect: guidance first, never claim a worker task, then deliveries awaiting review, approved work awaiting integration, checkpoints addressed to the coordinator and quiet lanes (queue, lanes, the coordinator wait where offered); task and child creation routes with their fields, Idempotency-Key, decision headings and follow-on assignment; review, assign, comment and integration-check routes; the web-worker and other-machine sentences of agent_prompts word for word, the questions sentence, and that text is data. Its setup prompt names the extension's coordinator role; every other agent gets the worker's AGENT.md unchanged. The text is exported for Orchestra Bridge parity.",
   "requirements": [],
   "anchors": [],
   "code": [
