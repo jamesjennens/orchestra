@@ -646,7 +646,7 @@ class EndpointAttentionTests(fixes.EndpointCase):
             # redelivered (kittrial-5bb.253 item 1).
             'redelivered': None,
             # The same older page carries no open review items: unknown (kittrial-5bb.431).
-            'open_review_items': None,
+            'open_review_items': None, 'open_review_items_total': None,
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True,
             # This page is an older endpoint's canonical row: it omits the stable
             # marker and its counts, which honestly read unknown (kittrial-5bb.351).

@@ -71,6 +71,8 @@ ITEM_FIELDS = {
     # Additive (kittrial-5bb.431): the open blocking review items, [{request, item}],
     # [] once each is answered by a respond record.
     'open_review_items',
+    # Additive (kittrial-5bb.435): their true count, taken before the list's cut to 20.
+    'open_review_items_total',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',
