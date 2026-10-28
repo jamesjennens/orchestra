@@ -398,15 +398,28 @@ d = await openWizard();
 await d.wizard.next();
 out.coordinatorRoleScreen = screenOf(d) === 'role' && attr(d, 'data-role-coordinator', 'true').length === 1
   && /Kestrel holds the coordinator grant for p1: it is set up as a coordinator\./.test(shownText(d));
+const coordinatorRoleText = d.all(() => true).map((e) => e.textContent).join('\n');
+out.coordinatorRoleKeepsGrantLocation = coordinatorRoleText.includes('The grant is given and removed on the project’s Members & settings page.')
+  && coordinatorRoleText.includes('Without a grant that has effect, this screen offers worker and reviewer, and AGENT.md is the worker’s.');
+out.coordinatorSetupHintAbsentWithGrant = attr(d, 'data-role-coordinator-help', 'true').length === 0;
 out.coordinatorHasNoRoleChoice = !windowsChoice(d, 'setup-role', 'worker') && !windowsChoice(d, 'setup-role', 'reviewer');
 await d.wizard.next();
 out.coordinatorRoleNotSaved = server.roles.length === rolesBefore;
-// A grant without effect: the worker's screen, as before.
+// Without an effective grant, the worker/reviewer screen explains where to grant coordinator access.
+store.clear();
+server.coordinates = undefined;
+d = await openWizard();
+await d.wizard.next();
+out.coordinatorSetupHintPresentWithoutGrant = attr(d, 'data-role-coordinator-help', 'true').length === 1
+  && attr(d, 'data-role-coordinator-help', 'true')[0].textContent
+    === "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again.";
+// A grant without effect still uses the non-coordinator screen and its grant hint.
 store.clear();
 server.coordinates = [{ project: 'p1', effective: false }];
 d = await openWizard();
 await d.wizard.next();
 out.noEffectGrantIsAWorker = attr(d, 'data-role-coordinator', 'true').length === 0 && windowsChoice(d, 'setup-role', 'worker').checked === true;
+out.noEffectGrantShowsCoordinatorHint = attr(d, 'data-role-coordinator-help', 'true').length === 1;
 server.coordinates = undefined;
 for (const open of openDialogs()) await open.close();   // a dialog left open keeps its online check going
 

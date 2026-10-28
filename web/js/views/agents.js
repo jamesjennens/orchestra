@@ -790,6 +790,8 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
       more(h('p', { class: 'small muted' }, 'The grant is given and removed on the project’s Members & settings page. Without a grant that has effect, this screen offers worker and reviewer, and AGENT.md is the worker’s.')),
     ] : [
       h('p', { class: 'small' }, 'Most agents work on tasks. A reviewer is also offered other people’s deliveries to review.'),
+      h('p', { class: 'small', 'data-role-coordinator-help': 'true' },
+        "To set this agent up as a project's coordinator, give it the coordinator grant on that project's Members & settings page first, then open this set-up again."),
       h('div', { class: 'copy-row', 'data-role-choice': 'true' },
         choice('setup-role', 'worker', 'Works on tasks', state.role === 'worker', () => saveRole('worker')),
         choice('setup-role', 'reviewer', 'Reviews deliveries', state.role === 'reviewer', () => saveRole('reviewer'))),
