@@ -267,7 +267,8 @@ def _quarantine(path, tail):
         if quarantine.is_symlink():
             raise ValueError("Feedback recovery quarantine path is a symlink")
         if quarantine.exists():
-            if quarantine.read_bytes() == tail:
+            from admin import read_regular_text
+            if read_regular_text(quarantine, raw=True) == tail:
                 return
             continue
         fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".quarantine", dir=str(path.parent))
@@ -287,7 +288,8 @@ def _read(path):
     _cleanup_temporary_recovery_files(path)
     if not path.exists():
         return []
-    raw = path.read_bytes()
+    from admin import read_regular_text
+    raw = read_regular_text(path, raw=True)
     if not raw:
         return []
     if raw.endswith(b"\n"):

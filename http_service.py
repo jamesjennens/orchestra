@@ -34,6 +34,7 @@ import json
 import os
 from server_address import ps_quote, sh_quote
 import record_json
+import regular_file
 import re
 import secrets
 import socket
@@ -5021,7 +5022,8 @@ def operator_allowlist_warnings(root):
     if not root:
         return []
     try:
-        document = json.loads((Path(root) / 'deployment.private.json').read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        document = json.loads(read_regular_text(Path(os.path.realpath(str(Path(root) / 'deployment.private.json')))))
         names = document.get('operators')
         names = [names] if isinstance(names, str) else names
     except (OSError, ValueError, AttributeError):
@@ -14267,9 +14269,9 @@ def key_needs_a_passphrase(keyfile):
     error is what the refusal reports (kittrial-5bb.168 review item 3).
     """
     try:
-        with open(keyfile, 'rb') as stream:
+        with regular_file.open_regular(os.path.realpath(keyfile)) as stream:
             return b'ENCRYPTED' in stream.read(4096)
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 #: How long a client may take over each thing the service waits for from it: completing the
@@ -14894,7 +14896,8 @@ def main(argv=None):
         # creates a state file from a mistyped path.
         if not Path(args.state).is_file():
             parser.error('--list-unconfirmed-projects needs an existing --state file')
-        document = json.loads(Path(args.state).read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        document = json.loads(read_regular_text(Path(os.path.realpath(args.state))))
         if not isinstance(document, dict) or not isinstance(document.get('projects'), dict):
             parser.error('--state is not a service state document')
         import types
@@ -14905,7 +14908,8 @@ def main(argv=None):
         # Read-only, like --list-unconfirmed-projects: the document is read as JSON, no store is opened.
         if not Path(args.state).is_file():
             parser.error('--list-dormant-grants needs an existing --state file')
-        document = record_json.loads(Path(args.state).read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        document = record_json.loads(read_regular_text(Path(os.path.realpath(args.state))))
         if not isinstance(document, dict) or not isinstance(document.get('users'), dict):
             parser.error('--state is not a service state document')
         from http_authority import dormant_grants

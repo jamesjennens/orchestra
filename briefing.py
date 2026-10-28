@@ -10,7 +10,15 @@ from activity import build_entries, parse_moment, utc_text
 from field_limits import check_text
 from claim_limit import actor_holds
 from lifecycle import project_facts
-from requirements import canonical_bytes, content_hash
+from requirements import _unique_object, canonical_bytes, content_hash
+
+
+def _read_history_snapshot(path):
+    from admin import read_regular_text
+    value = record_json.loads(read_regular_text(path), object_pairs_hook=_unique_object)
+    canonical_bytes(value)
+    return value
+
 
 PREFIX='Kind: task-checkpoint-v1\n'
 KINDS={'blocker','question','decision','correction','dependency'}
@@ -2883,7 +2891,7 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         file=cache/(digest+'.json')
         if file.is_symlink():raise ValueError('Invalid snapshot path')
         if not file.exists():raise ValueError('History snapshot unavailable/expired; restart history without a cursor')
-        saved=json.loads(file.read_text(encoding='utf-8'));data=saved['data']
+        saved=_read_history_snapshot(file);data=saved['data']
         if content_hash(data)!=digest:raise ValueError('History cache integrity mismatch')
     else:
         rows=exported_rows(run)
@@ -2922,7 +2930,7 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         if not file.exists():
             from coordination import atomic
             atomic(file,{'captured_at':datetime.now(timezone.utc).isoformat(),'data':data})
-        saved=json.loads(file.read_text(encoding='utf-8'))
+        saved=_read_history_snapshot(file)
     result=history_page(data,project,a.task,a.limit,a.since,a.cursor,a.body_budget,a.recent,a.kind,a.since_checkpoint,
                         actor=actor,since_my_checkpoint=a.since_my_checkpoint)
     result['captured_at']=saved['captured_at']

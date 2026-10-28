@@ -929,11 +929,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         if len(request_files)>1000:raise ValueError('Handoff request journal exceeds bounded queue coverage')
         for request_file in request_files:
             try:
-                request=json.loads(request_file.read_text(encoding='utf-8'))
-                from handoff import validate_request_record
+                from handoff import read_journal_json, validate_request_record
+                request=read_journal_json(request_file)
                 validate_request_record(request)
                 journal_requests.append(request)
-            except (OSError,json.JSONDecodeError,ValueError) as exc:
+            except (OSError,json.JSONDecodeError,ValueError,TypeError) as exc:
                 journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
     # kittrial-5bb.339: the classified-events walk is computed ONCE for the whole
     # page and shared by every lifecycle reader (it was paid four times per read on

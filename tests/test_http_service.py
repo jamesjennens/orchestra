@@ -532,5 +532,85 @@ class TlsPolicyCase(unittest.TestCase):
         server.server_close()
 
 
+class RegularRuntimeReadTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = unique_dir('regular-runtime-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def bounded(self, call):
+        import threading
+        result = []
+        def run():
+            try:
+                result.append((True, call()))
+            except BaseException as error:
+                result.append((False, error))
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive(), 'a runtime FIFO blocked the read')
+        self.assertTrue(result)
+        if result[0][0]:
+            return result[0][1]
+        raise result[0][1]
+
+    def test_operator_warning_regular_missing_damaged_and_fifo(self):
+        import http_service
+        path = self.tmp / 'deployment.private.json'
+        path.write_text(json.dumps({'operators': ['usr_0123456789abcdef']}), encoding='utf-8')
+        self.assertEqual(len(http_service.operator_allowlist_warnings(self.tmp)), 1)
+        real = self.tmp / 'deployment-real.json'
+        path.rename(real)
+        path.symlink_to(real.name)
+        self.assertEqual(len(http_service.operator_allowlist_warnings(self.tmp)), 1)
+        path.unlink()
+        real.rename(path)
+        path.unlink()
+        self.assertEqual(http_service.operator_allowlist_warnings(self.tmp), [])
+        path.write_text('{not json', encoding='utf-8')
+        self.assertEqual(http_service.operator_allowlist_warnings(self.tmp), [])
+        import os
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        path.unlink()
+        os.mkfifo(path)
+        self.assertEqual(self.bounded(
+            lambda: http_service.operator_allowlist_warnings(self.tmp)), [])
+
+    def test_read_only_state_listings_regular_missing_damaged_and_fifo(self):
+        import contextlib
+        import http_service
+        import io
+        import os
+        path = self.tmp / 'state.json'
+        cases = (('--list-unconfirmed-projects', 'projects'),
+                 ('--list-dormant-grants', 'users'))
+        for flag, key in cases:
+            with self.subTest(flag=flag):
+                path.write_text(json.dumps({key: {}}), encoding='utf-8')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(http_service.main(['--state', str(path), flag]), 0)
+                real = self.tmp / ('state-real-' + key + '.json')
+                path.rename(real)
+                path.symlink_to(real.name)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(http_service.main(['--state', str(path), flag]), 0)
+                path.unlink()
+                real.rename(path)
+                path.unlink()
+                with self.assertRaises(SystemExit):
+                    http_service.main(['--state', str(path), flag])
+                path.write_text('{not json', encoding='utf-8')
+                with self.assertRaises(ValueError):
+                    http_service.main(['--state', str(path), flag])
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        path.unlink()
+        os.mkfifo(path)
+        with self.assertRaises(SystemExit):
+            self.bounded(lambda: http_service.main(
+                ['--state', str(path), '--list-unconfirmed-projects']))
+
+
 if __name__ == '__main__':
     unittest.main()

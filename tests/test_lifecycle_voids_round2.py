@@ -95,6 +95,27 @@ class OfflineRoundTwoTests(unittest.TestCase):
         got,_=self.cli('list','--journal',str(self.project))
         self.assertFalse(got[0].get('corrections_consulted',True))
 
+    def test_host_metadata_missing_damaged_and_fifo_do_not_establish_consultation(self):
+        import os
+        import threading
+        metadata=self.project/'.beads'/'metadata.json'
+        metadata.parent.mkdir()
+        for content in (None, '{not json'):
+            if content is not None:
+                metadata.write_text(content)
+            self.assertFalse(lifecycle.offline_snapshot(
+                self.rows,self.project).offline_corrections_consulted)
+        if not hasattr(os,'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        metadata.unlink()
+        os.mkfifo(metadata)
+        result=[]
+        worker=threading.Thread(target=lambda:result.append(lifecycle.offline_snapshot(
+            self.rows,self.project).offline_corrections_consulted),daemon=True)
+        worker.start();worker.join(3)
+        self.assertFalse(worker.is_alive(),'a metadata FIFO blocked the offline read')
+        self.assertEqual(result,[False])
+
     def test_matching_metadata_cannot_establish_absence_with_exported_correction(self):
         self.apply(self.payload())
         folder=self.project/'missing-family';folder.mkdir();metadata=folder/'.beads';metadata.mkdir()

@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from coordination import atomic, identifier
-from requirements import content_hash, load_json
+import record_json
+from requirements import _unique_object, canonical_bytes, content_hash
 
 FILE = '.requirements-governance.json'
 SOURCE_FILE = '.requirements-governance-source.json'
@@ -138,13 +139,20 @@ def safe_path(directory, name):
     return path
 
 
+def _read_json(path):
+    from admin import read_regular_text
+    value = record_json.loads(read_regular_text(path), object_pairs_hook=_unique_object)
+    canonical_bytes(value)
+    return value
+
+
 def snapshot(directory, project):
     files = {}
     for name in (FILE, SOURCE_FILE):
         path = safe_path(directory, name)
         if path.exists():
             try:
-                files[name] = load_json(path)
+                files[name] = _read_json(path)
             except (ValueError, OSError):
                 raise ValueError('Requirements governance cannot be read; ask the host operator to repair it') from None
     validate_files(files, project)

@@ -354,6 +354,19 @@ class EndpointTests(unittest.TestCase):
             marker.symlink_to(root / 'real.json')
             self.assertEqual(admin.config(root), {'password': 's3'})
 
+    def test_a_cyclic_configuration_link_is_an_os_error_naming_the_configured_path(self):
+        import tempfile
+        import admin
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.project(tmp, '{}')
+            marker = root / 'deployment.private.json'
+            marker.unlink()
+            marker.symlink_to(marker)
+            with self.assertRaises(OSError) as refused:
+                admin.config(root)
+            self.assertEqual(Path(refused.exception.filename), marker)
+            self.assertTrue(endpoint.configuration_fault(root, refused.exception))
+
     def test_a_creation_under_a_configuration_that_cannot_be_read_is_the_servers_fault(self):
         """It was answered "could not be created; try again", which is the wrong advice (review of revision 2)."""
         import tempfile

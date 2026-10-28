@@ -7,6 +7,7 @@ sentence, and the backup entry shape. The real-bd end-to-end tests are in
 """
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -23,6 +24,26 @@ try:
 except ImportError:  # endpoint imports fcntl (POSIX-only); the kit itself runs on Windows too
     endpoint = None
 import http_service
+
+
+class BlockingReadTimeout(Exception):
+    pass
+
+
+def bounded(call):
+    previous = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(BlockingReadTimeout()))
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def make_fifo(case, path):
+    if not hasattr(os, 'mkfifo'):
+        case.skipTest('mkfifo is unavailable')
+    os.mkfifo(path)
 
 
 def free_row(task_id='p-1', **extra):
@@ -47,6 +68,41 @@ class ProjectCase(unittest.TestCase):
 
 
 class RecordTests(ProjectCase):
+    def test_regular_file_setting_missing_damaged_and_valid_classifications(self):
+        target = self.project / claiming.FILENAME
+        self.assertEqual('default', claiming.read(self.project)['source'])
+        self.assertIsNone(claiming.backup_record(self.project))
+        target.write_bytes(b'\xff')
+        self.assertEqual('damaged', claiming.read(self.project)['source'])
+        self.assertEqual({'base64': '/w=='}, claiming.backup_record(self.project))
+        claiming.write(self.project, 'assigned', 'owner-1')
+        self.assertEqual('assigned', claiming.read(self.project)['claiming'])
+        self.assertEqual('assigned', claiming.backup_record(self.project)['claiming'])
+
+    def test_fifo_and_nonregular_setting_never_block_and_stay_damaged(self):
+        target = self.project / claiming.FILENAME
+        make_fifo(self, target)
+        self.assertEqual('damaged', bounded(lambda: claiming.read(self.project))['source'])
+        with self.assertRaises(ValueError):
+            bounded(lambda: claiming.backup_record(self.project))
+        target.unlink()
+        target.mkdir()
+        self.assertEqual('damaged', claiming.read(self.project)['source'])
+        with self.assertRaises(ValueError):
+            claiming.backup_record(self.project)
+
+    def test_symlinked_setting_is_damaged_and_not_backed_up(self):
+        target = self.project / claiming.FILENAME
+        outside = Path(self.tmp.name) / 'outside.json'
+        outside.write_text('{"schema_version":1,"claiming":"open"}', encoding='utf-8')
+        try:
+            target.symlink_to(outside)
+        except OSError as error:
+            self.skipTest('symlink privilege unavailable: %s' % error)
+        self.assertEqual('damaged', claiming.read(self.project)['source'])
+        with self.assertRaises(ValueError):
+            claiming.backup_record(self.project)
+
     def test_absent_means_open_today_behaviour(self):
         state = claiming.read(self.project)
         self.assertEqual(('open', 'default'), (state['claiming'], state['source']))

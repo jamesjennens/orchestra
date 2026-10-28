@@ -82,7 +82,7 @@ from export_requirements import (ACCEPTANCE_PREFIX, REVISION_PREFIX, parse_json,
                                  revision_comment)
 from keyed_records import (ACCEPTANCE_EVIDENCE_FIELDS, RECEIPT_STATUSES,
                            RECONCILE_RELEASABLE, bind_acceptance, bound_acceptance,
-                           find, latest_revision, read_rows, validate_receipt)
+                           find, latest_revision, read_host_json, read_rows, validate_receipt)
 from requirements import canonical_bytes, content_hash, load_json
 
 OPERATIONS = ('draft', 'revise')
@@ -775,7 +775,7 @@ def backfill(payload, actor, run, project, operators=None):
     digest = content_hash({'actor': actor, 'payload': payload})
     journal = _journal(project, BACKFILL_JOURNAL)
     receipt = _receipt_path(journal, identity)
-    prior = load_json(receipt) if receipt.exists() else None
+    prior = read_host_json(receipt) if receipt.exists() else None
     if prior is not None and prior.get('sha256') != digest:
         raise ValueError('Operation ID already used for different content or actor')
     rows = read_rows(run)

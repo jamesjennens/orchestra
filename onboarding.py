@@ -1,6 +1,7 @@
 """Read-only, fixed-catalog onboarding from the installed kit and project."""
 import re
 from pathlib import Path
+import regular_file
 from version import line, report
 
 DOCUMENTS = {
@@ -263,9 +264,9 @@ def read_document(base, relative, limit, kit_document=None):
     except OSError as error:
         raise _document_unreadable(relative, error) from None
     try:
-        with path.open('rb') as f:
+        with regular_file.open_regular(path) as f:
             data = f.read(limit + 1)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         # Never the absolute path of a host file (review 01a12be9).
         raise _document_unreadable(relative, error) from None
     if len(data) > limit and kit_document is not None:

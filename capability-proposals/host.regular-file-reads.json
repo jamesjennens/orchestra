@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb426-host-regular-file-reads-0001",
+  "key": "host.regular-file-reads",
+  "name": "Non-blocking regular-file reads for host journals and sidecars",
+  "aliases": [
+    "host journal reads",
+    "host sidecar reads",
+    "regular file reader",
+    "read_regular_text"
+  ],
+  "summary": "regular_file.open_regular and read_regular_text, behind the admin.read_regular_text facade, open or read one host-owned regular file without following links or blocking on a FIFO. They check the opened descriptor's type and identity, support streaming bytes, strict UTF-8 text or raw bytes, total byte bounds, prefix reads and opened-descriptor validation. Host journal, sidecar, operation-receipt and task-file blob readers delegate to this shared guard while retaining their family-specific missing, damaged and unreadable classifications.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#backups"
+  ],
+  "code": [
+    "regular_file.py::open_regular",
+    "regular_file.py::read_regular_text",
+    "admin.py::read_regular_text",
+    "admin.py::read_sidecar_json",
+    "keyed_records.py::read_host_json",
+    "task_files.py::open_blob",
+    "task_files.py::_hash_file",
+    "task_files.py::_copy_hashed"
+  ],
+  "tests": [
+    "tests/test_sidecar_agreement.py",
+    "tests/test_keyed_records.py",
+    "tests/test_requirement_baselines.py",
+    "tests/test_owner_recovery_second.py",
+    "tests/test_task_files_ops.py",
+    "tests/test_guidance.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "host",
+    "journals",
+    "sidecars",
+    "backup",
+    "security"
+  ]
+}

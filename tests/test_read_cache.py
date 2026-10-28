@@ -564,6 +564,25 @@ class ReadCacheTests(unittest.TestCase):
         self.cached_file().unlink()
         self.assertIsNone(read_cache._header_key(self.cache))
 
+    def test_export_and_header_fifo_reads_fail_open_without_blocking(self):
+        import threading
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        self.cache.mkdir()
+        os.mkfifo(self.cached_file())
+        for call in (lambda: read_cache._cached_rows(self.cache, 'a' * 32),
+                     lambda: read_cache._header_key(self.cache)):
+            result = []
+            worker = threading.Thread(target=lambda: result.append(call()), daemon=True)
+            worker.start()
+            worker.join(3)
+            self.assertFalse(worker.is_alive(), 'a cache FIFO blocked the read')
+            self.assertEqual(result, [None])
+        self.cached_file().unlink()
+        self.assertIsNone(read_cache._cached_rows(self.cache, 'a' * 32))
+        self.cached_file().write_bytes(b'\xff damaged')
+        self.assertIsNone(read_cache._cached_rows(self.cache, 'a' * 32))
+
     @unittest.skipIf(fcntl is None, 'the lock tracking needs the POSIX lock path')
     def test_waiters_parse_the_payload_outside_the_lock(self):
         # kittrial-5bb.347 S2: nothing pinned WHERE the served payload parses.

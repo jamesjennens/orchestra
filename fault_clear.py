@@ -205,12 +205,13 @@ def host_journal(project):
         names = sorted(path.name for path in directory.glob('*.json'))
     except OSError:
         return entries, invalid
+    from admin import read_regular_text
     for name in names:
         path = directory / name
         try:
-            if path.is_symlink() or path.stat().st_size > JOURNAL_FILE_LIMIT:
+            if path.is_symlink():
                 raise ValueError('unusable')
-            entry = validate_entry(record_json.loads(path.read_text(encoding='utf-8')), name)
+            entry = validate_entry(record_json.loads(read_regular_text(path, limit=JOURNAL_FILE_LIMIT)), name)
         except (OSError, ValueError, TypeError, KeyError):
             invalid.append(JOURNAL_DIR + '/' + name)
             continue

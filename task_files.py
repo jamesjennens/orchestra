@@ -39,6 +39,8 @@ import uuid
 from pathlib import Path
 
 import record_json
+import regular_file
+from admin import read_regular_text
 
 FOLDER = '.task-files'
 TMP = 'tmp'
@@ -326,17 +328,14 @@ def open_blob(project, sha256):
     path = blob_path(project, sha256)
     if path is None:
         raise Refusal(409, 'conflict', 'The stored file is missing: its record is here, its bytes are not.')
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
     try:
-        descriptor = os.open(str(path), flags)
+        return regular_file.open_regular(path)
     except FileNotFoundError:
         raise Refusal(409, 'conflict', 'The stored file is missing: its record is here, its bytes are not.') from None
+    except ValueError:
+        raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file is not a regular file')) from None
     except OSError:
         raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file cannot be opened')) from None
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode) or os.path.islink(str(path)):
-        os.close(descriptor)
-        raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file is not a regular file'))
-    return os.fdopen(descriptor, 'rb')
 
 
 def referenced(project):
@@ -361,8 +360,9 @@ def referenced(project):
 
 
 def _purged_file(path):
+    from admin import read_regular_text
     try:
-        entry = record_json.loads(Path(path).read_text(encoding='utf-8'))
+        entry = record_json.loads(read_regular_text(path))
     except (OSError, ValueError, UnicodeError):
         return False
     return isinstance(entry, dict) and bool(entry.get('purged'))
@@ -451,13 +451,7 @@ def read_entry(project, task, sha256):
     if path is None:
         return None
     try:
-        info = os.lstat(str(path))
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(info.st_mode):
-        return None
-    try:
-        entry = record_json.loads(path.read_text(encoding='utf-8'))
+        entry = record_json.loads(read_regular_text(path))
     except (OSError, ValueError, UnicodeError):
         return None
     return entry if _valid_entry(entry, task, sha256) else None
@@ -957,7 +951,7 @@ def all_entries(project, problems=None):
                         bad(relative, sha256, 'a symlink or not a regular file')
                         continue
                     try:
-                        entry = record_json.loads(Path(item.path).read_text(encoding='utf-8'))
+                        entry = record_json.loads(read_regular_text(item.path))
                     except (OSError, ValueError, UnicodeError):
                         bad(relative, sha256, 'not readable as JSON')
                         continue
@@ -978,7 +972,7 @@ def _problems_sentence(problems):
 def _hash_file(path):
     digest = hashlib.sha256()
     count = 0
-    with open(str(path), 'rb') as handle:
+    with regular_file.open_regular(path) as handle:
         while True:
             chunk = handle.read(STEP)
             if not chunk:
@@ -996,7 +990,7 @@ def _copy_hashed(source, target):
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
     descriptor = os.open(str(temp), flags, 0o600)
     try:
-        with os.fdopen(descriptor, 'wb') as out, open(str(source), 'rb') as handle:
+        with os.fdopen(descriptor, 'wb') as out, regular_file.open_regular(source) as handle:
             while True:
                 chunk = handle.read(STEP)
                 if not chunk:
@@ -1051,7 +1045,7 @@ def _old_manifest(path):
     try:
         if not stat.S_ISREG(os.lstat(str(path)).st_mode):
             return None
-        manifest = record_json.loads(path.read_text(encoding='utf-8'))
+        manifest = record_json.loads(read_regular_text(path))
     except (OSError, ValueError, UnicodeError):
         return None
     return manifest if isinstance(manifest, dict) else None
@@ -1138,7 +1132,7 @@ def backup_folder(project, target, now=None, lock=None):
         for relative, entry in entries_now:
             parts = relative.split('/')
             task_dir = _plain_dir(target / RECORDS / parts[1], True, 'A task-files backup records folder')
-            data = (Path(source) / relative).read_bytes()
+            data = read_regular_text(Path(source) / relative, raw=True)
             dest = task_dir / parts[2]
             temp = dest.with_name('.t' + uuid.uuid4().hex[:16])
             with open(str(temp), 'xb') as handle:
@@ -1152,7 +1146,7 @@ def backup_folder(project, target, now=None, lock=None):
             digest = kept_before.get(item['path'])
             copy = target / item['path']
             if digest and os.path.isfile(str(copy)) and not os.path.islink(str(copy)):
-                if hashlib.sha256(copy.read_bytes()).hexdigest() == digest:
+                if hashlib.sha256(read_regular_text(copy, raw=True)).hexdigest() == digest:
                     carried = {'path': item['path'], 'sha256': digest}
                     records.append(carried)
             problems.append({'sha256': item['sha256'] or '-', 'path': item['path'],
@@ -1194,7 +1188,7 @@ def restore_folder(source, project):
     try:
         if not stat.S_ISREG(os.lstat(str(manifest_path)).st_mode):
             raise ValueError('not a file')
-        manifest = record_json.loads(manifest_path.read_text(encoding='utf-8'))
+        manifest = record_json.loads(read_regular_text(manifest_path))
         blobs = manifest['blobs']
         records = manifest['record_files']
         assert isinstance(blobs, list) and isinstance(records, list)
@@ -1221,8 +1215,8 @@ def restore_folder(source, project):
             continue
         path = source / relative
         try:
-            data = path.read_bytes() if not os.path.islink(str(path)) else None
-        except OSError:
+            data = read_regular_text(path, raw=True) if not os.path.islink(str(path)) else None
+        except (OSError, ValueError):
             data = None
         if data is None or hashlib.sha256(data).hexdigest() != record.get('sha256'):
             problems.append('the record %s is missing or changed in the backup' % relative)
@@ -1245,7 +1239,7 @@ def restore_folder(source, project):
         dest = task_dir / parts[2]
         temp = dest.with_name('.t' + uuid.uuid4().hex[:16])
         with open(str(temp), 'xb') as handle:
-            handle.write((source / relative).read_bytes())
+            handle.write(read_regular_text(source / relative, raw=True))
         os.replace(str(temp), str(dest))
     return {'status': 'restored', 'files': len(blobs), 'bytes': total, 'records': len(records), 'problems': []}
 

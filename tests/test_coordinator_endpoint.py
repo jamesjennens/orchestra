@@ -26,6 +26,7 @@ from unittest import mock
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
+import admin
 import client
 import sessions
 
@@ -259,6 +260,23 @@ class GuidanceAndOnboardingTests(unittest.TestCase):
         self.assertEqual(again['returncode'], 0, again['stderr'])
         self.assertIs(json.loads(again['stdout'])['changed'], False)
         self.assertNotIn('could not be read', again['stderr'])
+
+    def test_set_onboarding_uses_the_regular_file_reader_for_the_previous_document(self):
+        import errno
+        target = self.project/'ONBOARDING.md'
+        target.write_text('Old onboarding.\n', encoding='utf-8')
+        damaged = OSError(errno.ELOOP, 'Too many levels of symbolic links', str(target))
+        real_reader = admin.read_regular_text
+        def read_previous(path, *args, **kwargs):
+            if Path(path) == target:
+                raise damaged
+            return real_reader(path, *args, **kwargs)
+        with mock.patch.object(admin, 'read_regular_text', side_effect=read_previous) as reader:
+            answer = self.ask('set-onboarding', text='Fresh onboarding for alpha.\n')
+        reader.assert_any_call(target, raw=True)
+        self.assertEqual(answer['returncode'], 0, answer['stderr'])
+        self.assertIn('could not be read', answer['stderr'])
+        self.assertEqual(target.read_text(encoding='utf-8'), 'Fresh onboarding for alpha.\n')
 
     def test_the_damaged_previous_sentence_ends_its_own_line(self):
         # kittrial-5bb.242 item 4: the route joins its warnings with '', and the shipped client

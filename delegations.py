@@ -252,12 +252,11 @@ def journaled(project, record):
         return False
     directory = Path(project) / JOURNAL_DIR
     path = directory / (record['sha256'] + '.json')
+    from admin import read_regular_text
     try:
-        if directory.is_symlink() or not directory.is_dir() or path.is_symlink() or not path.is_file():
+        if directory.is_symlink() or not directory.is_dir() or path.is_symlink():
             return False
-        if path.stat().st_size > JOURNAL_FILE_LIMIT:
-            return False
-        stored = record_json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=_unique)
+        stored = record_json.loads(read_regular_text(path, limit=JOURNAL_FILE_LIMIT), object_pairs_hook=_unique)
         _validate_record(stored)
     except (OSError, ValueError, TypeError, KeyError, UnicodeError):
         return False

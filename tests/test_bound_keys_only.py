@@ -258,6 +258,25 @@ class ReaderTests(unittest.TestCase):
             admin.bound_keys_only(self.root)
         self.assertIn('not a regular file', str(refused.exception))
 
+    def test_a_settings_fifo_is_refused_without_blocking(self):
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        os.mkfifo(self.root/'deployment.private.json')
+        result = []
+        import threading
+        def read():
+            try:
+                forced.bound_keys_only(self.root)
+            except BaseException as error:
+                result.append(error)
+        worker = threading.Thread(target=read, daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive(), 'the installation setting FIFO blocked the wrapper')
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], ValueError)
+        self.assertIn('not a regular file', str(result[0]))
+
     def test_an_open_error_refuses_without_naming_the_path(self):
         """N09c: the open-error message must keep the strerror, never the OSError with its path."""
         write_settings(self.root, True)

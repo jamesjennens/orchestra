@@ -199,19 +199,6 @@ def _open_fd(path, flags, mode=0o600):
     return descriptor
 
 
-def _read_regular(path, limit):
-    """At most ``limit`` bytes of a regular lane file; refuses symlinks and specials."""
-    _refuse_symlink(path)
-    descriptor = _open_fd(path, os.O_RDONLY)
-    try:
-        with os.fdopen(descriptor, 'rb') as handle:
-            descriptor = -1
-            return handle.read(limit)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
 def _read_audit(audit, now):
     """The stored entries inside the window, oldest first; malformed lines are skipped.
 
@@ -220,7 +207,8 @@ def _read_audit(audit, now):
     """
     _refuse_symlink(audit)
     try:
-        raw = _read_regular(audit, MAX_BYTES * 8)
+        from admin import read_regular_text
+        raw = read_regular_text(audit, prefix=MAX_BYTES * 8, raw=True)
     except FileNotFoundError:
         return []
     entries = []
@@ -613,11 +601,14 @@ def _read_snapshot(snapshot):
     """
     _refuse_symlink(snapshot)
     try:
-        raw = _read_regular(snapshot, waiting.MAX_STATE_BYTES + 1)
+        from admin import read_regular_text
+        raw = read_regular_text(snapshot, limit=waiting.MAX_STATE_BYTES, raw=True)
     except FileNotFoundError:
         return None
-    if len(raw) > waiting.MAX_STATE_BYTES:
-        return None
+    except ValueError as error:
+        if 'exceeds its byte bound' in str(error):
+            return None
+        raise
     try:
         value = json.loads(raw.decode('utf-8'))
     except (ValueError, UnicodeError):

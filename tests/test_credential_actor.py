@@ -1741,6 +1741,14 @@ class RealEndpointCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             admin.credential_actors(self.root, path)
 
+    def test_the_host_command_reads_a_symlinked_state(self):
+        import admin
+        real = self.tmp / 'credential-state-real.json'
+        real.write_text(json.dumps({'users': {}, 'credentials': {}}), encoding='utf-8')
+        path = self.tmp / 'credential-state.json'
+        path.symlink_to(real.name)
+        self.assertEqual(admin.credential_actors(self.root, path)['credentials'], [])
+
     def test_an_empty_export_is_tracker_rows_null_and_not_false(self):
         """kittrial-5bb.202 rev-3 item 3(a) (review F3): main's answer, restored.
 

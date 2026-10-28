@@ -1102,8 +1102,13 @@ def file_lock(path, timeout=60.0, poll=0.02, shared=False):
 def read_state(path):
     """Read the durable authority/state document, or raise :class:`AuthorityDenied`."""
     try:
-        text = Path(path).read_text(encoding='utf-8')
+        from admin import read_regular_text
+        text = read_regular_text(Path(os.path.realpath(str(path))))
     except OSError:
+        raise deny(401, 'unauthenticated', 'Service authority state is unavailable')
+    except ValueError as error:
+        if isinstance(error, UnicodeError):
+            raise
         raise deny(401, 'unauthenticated', 'Service authority state is unavailable')
     try:
         state = json.loads(text)
@@ -1433,7 +1438,8 @@ def read_legacy_journal(path):
     by both the automatic migration and an explicit operator restore.
     """
     try:
-        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        data = json.loads(read_regular_text(path))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):

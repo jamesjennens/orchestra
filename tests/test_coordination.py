@@ -1,7 +1,9 @@
 import copy
 import json
+import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -153,6 +155,30 @@ class CoordinationTests(unittest.TestCase):
 
     def apply(self, payload, actor='alice'):
         return coordination.apply_native(copy.deepcopy(payload), actor, self.native, self.project)
+
+    def test_same_bytes_accepts_only_identical_undamaged_text(self):
+        target = self.project / 'target.json'
+        target.write_text('payload', encoding='utf-8')
+        self.assertTrue(coordination._same_bytes(target, 'payload'))
+        self.assertFalse(coordination._same_bytes(target, 'different'))
+        self.assertFalse(coordination._same_bytes(self.project / 'missing.json', 'payload'))
+        target.write_bytes(b'\xff')
+        self.assertFalse(coordination._same_bytes(target, 'payload'))
+        directory = self.project / 'directory.json'
+        directory.mkdir()
+        self.assertFalse(coordination._same_bytes(directory, 'payload'))
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs are POSIX-only')
+    def test_same_bytes_fifo_answers_at_once(self):
+        target = self.project / 'target.json'
+        os.mkfifo(str(target))
+        outcome = []
+        worker = threading.Thread(target=lambda: outcome.append(coordination._same_bytes(target, 'payload')),
+                                  daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), 'the coordination comparison blocked')
+        self.assertEqual(outcome, [False])
 
     def test_child_repeat_uses_returned_native_id_without_second_create(self):
         self.assertEqual(self.apply(CHILD), {'id': 'sample-job.7', 'reconciled': False})
