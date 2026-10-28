@@ -1240,6 +1240,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # from the same labels, so the Tasks page and work list can mark it plainly.
                       # It stays a visible row; only claimability (above) changes.
                       'requirement_record':requirement_record(row.get('labels')),
+                      # Additive (kittrial-5bb.433): what an assigned requirement record asks of its
+                      # assignee, from the record's own ledger (requirement_records.assigned_state):
+                      # accepted with nothing pending is not work, so My work leaves it out.
+                      'requirement_state':(__import__('requirement_records').assigned_state(row,operators)
+                                           if requirement_record(row.get('labels')) else None),
                       # Additive (kittrial-5bb.253 item 1): the same fact the sentence above
                       # used, carried on the row so the HTTP agent builders can hand it to
                       # the one helper instead of re-deriving it without it.
