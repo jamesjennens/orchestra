@@ -3443,7 +3443,8 @@ line separately and unconfined.
   request is open. The canonical brief lists at most five open requests; the page
   says how many more there are, and they appear once the first ones are answered.
   A `contribute` through the same route answers `open_items` (the blocking items still
-  open after it, `[{request, item, contribution}]`). While any is open, it also answers one
+  open after it, `[{request, item, contribution}]`, cut to at most 20) and `open_items_total`
+  (all of them, counted before the cut, kittrial-5bb.435). While any is open, it also answers one
   `warnings` sentence per request naming the item ids and the respond record (POST
   `/v1/projects/{id}/tasks/{task}/reviews`, operation respond), never the client command.
   This is advice only, and the revision is recorded (kittrial-5bb.431). The agent

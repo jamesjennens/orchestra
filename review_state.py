@@ -163,7 +163,8 @@ def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=No
 
 #: Open review items a sentence names before "and N more" (kittrial-5bb.431).
 OPEN_ITEM_IDS_SHOWN = 5
-#: Open review items a structured list carries: the record's own ceiling (review_workflow, 20).
+#: Open review items a structured list carries: the record's own ceiling (review_workflow, 20). The lists
+#: are cut here; every count is taken before the cut (kittrial-5bb.435).
 OPEN_ITEMS_MAX = 20
 
 
@@ -172,8 +173,8 @@ def open_review_items(pending):
 
     ``pending`` is the projection's ``pending_requests``. Only a ``respond`` record answers one: a new
     revision or a plain comment leaves it open (kittrial-5bb.431). A note is never in it (the projection
-    keeps notes apart, review_workflow.py ``notes``), so it is never listed. Bounded to
-    :data:`OPEN_ITEMS_MAX`.
+    keeps notes apart, review_workflow.py ``notes``), so it is never listed. Every open item is returned:
+    callers count the whole list and cut only what they print to :data:`OPEN_ITEMS_MAX` (kittrial-5bb.435).
     """
     found = []
     for entry in pending or []:
@@ -181,7 +182,7 @@ def open_review_items(pending):
             continue
         found.append({'request': str(entry.get('request')), 'item': str(entry.get('item')),
                       'contribution': entry.get('contribution')})
-    return found[:OPEN_ITEMS_MAX]
+    return found
 
 
 def respond_way(task, route=None):
@@ -210,13 +211,18 @@ def open_items_warnings(items, task, route=None):
     return warnings
 
 
-def open_items_sentence(items, task, route=None):
-    """The open item ids and how to answer them, for the work row's and the brief's next step ('' if none)."""
+def open_items_sentence(items, task, route=None, total=None):
+    """The open item ids and how to answer them, for the work row's and the brief's next step ('' if none).
+
+    ``total`` is the true number open when ``items`` is a list already cut to :data:`OPEN_ITEMS_MAX` (an
+    HTTP row); "and N more" counts from it, never from the cut list (kittrial-5bb.435).
+    """
     if not items:
         return ''
     shown = _by_request(items[:OPEN_ITEM_IDS_SHOWN])
     named = '; '.join('%s of request %s' % (', '.join(ids), request) for request, ids in shown.items())
-    more = len(items) - min(len(items), OPEN_ITEM_IDS_SHOWN)
+    count = total if type(total) is int and total >= len(items) else len(items)
+    more = count - min(len(items), OPEN_ITEM_IDS_SHOWN)
     return 'Open: %s%s. Answer each with %s.' % (named, ' and %d more' % more if more else '',
                                                   respond_way(task, route))
 

@@ -96,10 +96,13 @@ carries the facts it needs, and this is the table per view:
   `work` projection and by the in-process backend alike (kittrial-5bb.264 item 2/4).
   A malformed row carries it as `false`.
 - **`open_review_items`** (list) names the blocking review items still open, `[{request,
-  item}]` in filing order and at most 20, until a `respond` record answers each
+  item}]` in filing order, cut to at most 20, until a `respond` record answers each
   (kittrial-5bb.431). A new revision or a plain comment answers none. While changes are
   requested, `next` names them too: at most 5, then "and N more", with the respond record
   that answers them. A malformed row carries `[]`.
+- **`open_review_items_total`** (integer) is how many blocking review items are open,
+  counted before the list's cut (kittrial-5bb.435); "and N more" counts from it. A
+  malformed row carries `0`.
 - **`claimable`** is the one bounded claimability rule: open, unassigned, no contribution,
   and neither a record anchor nor an epic, decision, gate or job — by issue TYPE or by the
   `decision` LABEL (`reference_records.py` treats that label as a decision whatever the

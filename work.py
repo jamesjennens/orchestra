@@ -247,7 +247,8 @@ def move_subject(caller, owner=None):
 
 
 def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                 way_back=None, followon=None, checkpoint_available=True, open_items=None, respond_route=None):
+                 way_back=None, followon=None, checkpoint_available=True, open_items=None, respond_route=None,
+                 open_items_total=None):
     """`(whose_move, next)`: the caller-relative half of the one whose-move decision.
 
     Derived only from the review state the
@@ -273,7 +274,7 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
     ``open_items`` are the blocking items still open (``review_state.open_review_items``). While
     changes are requested the sentence names them and the respond record that answers them
     (kittrial-5bb.431); ``respond_route`` is the task's HTTP route, so a web agent is never told the
-    client command.
+    client command. ``open_items_total`` is their true count when ``open_items`` is a cut list (kittrial-5bb.435).
     """
     name = str(task or 'the task')
     try:
@@ -293,7 +294,7 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
         return 'you', next_text(followon, checkpoint_available=checkpoint_available)
     if state == 'changes-requested':
         from review_state import open_items_sentence
-        named = open_items_sentence(open_items, name, respond_route)
+        named = open_items_sentence(open_items, name, respond_route, total=open_items_total)
         named = ' ' + named if named else ''
         if redelivered:
             # A revision that supersedes the one the items were filed on is already
@@ -350,7 +351,8 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
 
 def move_decision(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
                   assignee=None, closed=False, claimable=None, way_back=None, followon=None,
-                  checkpoint_available=True, comment_pending=False, open_items=None, respond_route=None):
+                  checkpoint_available=True, comment_pending=False, open_items=None, respond_route=None,
+                  open_items_total=None):
     """THE one whose-move decision (kittrial-5bb.6 review item 2): `(move, next, next_actor)`.
 
     One function gives all three answers, so no reader can be told one mover by
@@ -390,7 +392,8 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
     move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered,
                              way_back=way_back, followon=followon,
                              checkpoint_available=checkpoint_available,
-                             open_items=open_items, respond_route=respond_route)
+                             open_items=open_items, respond_route=respond_route,
+                             open_items_total=open_items_total)
     if applied:
         return move, text, 'assignee'
     return move, text, next_actor(state, assignee, closed, pending_items=pending_items,
@@ -399,7 +402,7 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
 
 def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
                 way_back=None, followon=None, checkpoint_available=True, comment_pending=False, assignee=None,
-                open_items=None, respond_route=None):
+                open_items=None, respond_route=None, open_items_total=None):
     """`(whose_move, next)`: one plain sentence from the shared move decision.
 
     The public two-answer shape (kittrial-5bb.249), unchanged. The decision it comes
@@ -408,7 +411,8 @@ def review_move(state, task, owned, named_reviewer=False, pending_items=0, redel
     move, text, _ = move_decision(state, task, owned, named_reviewer, pending_items, redelivered,
                                   way_back=way_back, followon=followon,
                                   checkpoint_available=checkpoint_available, comment_pending=comment_pending,
-                                  assignee=assignee, open_items=open_items, respond_route=respond_route)
+                                  assignee=assignee, open_items=open_items, respond_route=respond_route,
+                                  open_items_total=open_items_total)
     return move, text
 
 
@@ -626,6 +630,7 @@ def help_payload(action='work'):
             'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'whose_move', 'next',
                             'next_actor', 'work_state', 'reconciliation_needed', 'reconciliation_reasons',
                             'claimable', 'requirement_record', 'redelivered', 'open_review_items',
+                            'open_review_items_total',
                             'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
                             'blocking_items', 'checkpoint_at', 'newer_activity', 'checkpoint_wait',
@@ -1007,7 +1012,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'claimable':False,'requirement_record':False,'work_state':'error','next_actor':'operator',
                           # A malformed row has no validated contribution, so it is never
                           # a redelivery (kittrial-5bb.264 item 2).
-                          'redelivered':False,'open_review_items':[],
+                          'redelivered':False,'open_review_items':[],'open_review_items_total':0,
                           'reconciliation_needed':False,'reconciliation_reasons':[]})
             continue
         # The merge slot is an internal record (kittrial-5bb.113): on real bd it is a
@@ -1178,8 +1183,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         redelivered=is_redelivery(contribution_id, pending_requests)
         # The blocking items still open, named by the row and its sentence until a respond answers
         # each (kittrial-5bb.431): a revision or a plain comment leaves them open.
-        from review_state import open_review_items
-        review_items_open=open_review_items(pending_requests)
+        from review_state import OPEN_ITEMS_MAX, open_review_items
+        review_items_open=open_review_items(pending_requests)        # every one: the sentence counts them all
         # The one bounded claimability answer for this row (kittrial-5bb.6 deliverable b).
         # It is computed before the move because next_actor needs it: an unassigned,
         # undelivered row may name `anyone` only when somebody could actually take it.
@@ -1265,8 +1270,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # the one helper instead of re-deriving it without it.
                       'redelivered':redelivered,
                       # Additive (kittrial-5bb.431): the open blocking items, [{request, item}]
-                      # in filing order, bounded to 20; [] once each is answered.
-                      'open_review_items':[{'request':i['request'],'item':i['item']} for i in review_items_open],
+                      # in filing order, cut to 20; [] once each is answered. The total is taken
+                      # before the cut (kittrial-5bb.435).
+                      'open_review_items':[{'request':i['request'],'item':i['item']} for i in review_items_open[:OPEN_ITEMS_MAX]],
+                      'open_review_items_total':len(review_items_open),
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':pending_items,
                       'pending_handoff_requests':handoff_requests,
                       'pending_handoff_total':handoff_total,

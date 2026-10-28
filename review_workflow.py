@@ -3225,15 +3225,18 @@ def open_items_advice(answer, operation, projected, task):
     """Tell a lane that its revision left review items open (kittrial-5bb.431). Advice, never a refusal.
 
     A ``contribute`` answer gains ``open_items`` (the blocking items still open after it, from the same
-    projection the write was validated on) and, while any are open, one warning per request naming its
-    item ids and the respond record that answers them. Only a respond answers an item; a revision or a
-    plain comment does not. Any other operation's answer is unchanged.
+    projection the write was validated on, cut to 20), ``open_items_total`` (all of them, counted before
+    the cut; kittrial-5bb.435) and, while any are open, one warning per request naming its item ids and
+    the respond record that answers them. Only a respond answers an item; a revision or a plain comment
+    does not. Any other operation's answer is unchanged.
     """
     if operation != 'contribute':
         return answer
-    from review_state import open_items_warnings, open_review_items
+    from review_state import OPEN_ITEMS_MAX, open_items_warnings, open_review_items
     items = open_review_items(projected.get('pending_requests'))
-    answer['open_items'] = items
+    # The list is cut to the ceiling; the count and the warnings are taken before the cut (kittrial-5bb.435).
+    answer['open_items'] = items[:OPEN_ITEMS_MAX]
+    answer['open_items_total'] = len(items)
     if items:
         answer['warnings'] = list(answer.get('warnings') or []) + open_items_warnings(items, task)
     return answer

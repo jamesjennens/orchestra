@@ -1216,10 +1216,19 @@ class InProcessBackend:
             task['review_state'] = 'changes-requested' if still_open else 'awaiting-review'
             task['version'] += 1
             self._event(project_id, task['id'], 'contribution', principal, record['actor'])
-            # The canonical answer's additive `open_items` (kittrial-5bb.431); the route words its warning.
-            return {'contribution': record, 'task_version': task['version'],
-                    'open_items': [{'request': r['request'], 'item': r['id'], 'contribution': r['contribution']}
-                                   for r in still_open][:20]}
+            # The canonical answer's additive `open_items` and `open_items_total` (kittrial-5bb.431,
+            # .435). This backend caps each request at 20 items but not their sum, so more than 20 can be
+            # open: it counts and words the warning from every one, with this task's route, and cuts only
+            # the list.
+            from review_state import OPEN_ITEMS_MAX, open_items_warnings
+            every = [{'request': r['request'], 'item': r['id'], 'contribution': r['contribution']}
+                     for r in still_open]
+            answer = {'contribution': record, 'task_version': task['version'],
+                      'open_items': every[:OPEN_ITEMS_MAX], 'open_items_total': len(every)}
+            if every:
+                answer['warnings'] = open_items_warnings(
+                    every, task['id'], '/v1/projects/%s/tasks/%s' % (project_id, task['id']))
+            return answer
         current = [r for r in contributions if r['kind'] == 'contribution']
         if not current:
             raise conflict('There is no contribution to review')
@@ -2242,6 +2251,7 @@ def own_queue_tasks(queue, actor=None):
                       # The open blocking items (kittrial-5bb.431), which the next-actions
                       # sentence names with this task's route.
                       'open_review_items':fields.get('open_review_items'),
+                      'open_review_items_total':fields.get('open_review_items_total'),
                       'checkpoint_at':fields.get('checkpoint_at'),
                       'newer_activity':fields.get('newer_activity'),
                       # The stable marker and its counts (kittrial-5bb.351): a wait row
@@ -4533,6 +4543,9 @@ class EndpointBackend:
                 'redelivered': redelivered if type(redelivered) is bool else None,
                 # The open blocking items (kittrial-5bb.431); None from an older endpoint.
                 'open_review_items': open_review_rows(row.get('open_review_items')),
+                # Their true count, taken before the list's cut (kittrial-5bb.435); None from an older endpoint.
+                'open_review_items_total': row.get('open_review_items_total')
+                if type(row.get('open_review_items_total')) is int and row['open_review_items_total'] >= 0 else None,
                 'checkpoint_at': row.get('checkpoint_at') if isinstance(row.get('checkpoint_at'), str) else None,
                 'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None,
                 # The stable marker and the counts it was computed with (kittrial-5bb.351):
@@ -4598,6 +4611,7 @@ class EndpointBackend:
                              # The superseding-redelivery fact (kittrial-5bb.253 item 1).
                              'redelivered': attention.get('redelivered'),
                              'open_review_items': attention.get('open_review_items'),
+                             'open_review_items_total': attention.get('open_review_items_total'),
                              'checkpoint_at': attention.get('checkpoint_at'),
                              'newer_activity': attention.get('newer_activity'),
                              # The stable newer-activity marker and its counts
@@ -4927,10 +4941,12 @@ def http_open_items_advice(answer, project_id, task_id):
     items = open_review_rows((answer or {}).get('open_items')) if isinstance(answer, dict) else None
     if not items:
         return answer
-    client = set(open_items_warnings(items, task_id))
+    # Each client-worded sentence becomes its route-worded twin, built from the same items; every other
+    # warning (and one a backend already worded for the web) is kept as it came. The canonical list is
+    # never cut (the record ceiling keeps it at 20 or fewer), so the twins are exact (kittrial-5bb.435).
     route = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
-    kept = [w for w in answer.get('warnings') or [] if w not in client]
-    return dict(answer, warnings=kept + open_items_warnings(items, task_id, route))
+    twin = dict(zip(open_items_warnings(items, task_id), open_items_warnings(items, task_id, route)))
+    return dict(answer, warnings=[twin.get(w, w) for w in answer.get('warnings') or []])
 
 
 def next_action(task, claiming='open'):
@@ -10419,6 +10435,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                                               way_back='`%s`' % (task_base + '/brief'),
                                               comment_pending=comment_pending, assignee=task.get('assignee'),
                                               open_items=open_review_rows(task.get('open_review_items')),
+                                              open_items_total=task.get('open_review_items_total'),
                                               respond_route=task_base)
                 details['whose_move'], details['next'] = move, move_text
                 if review != 'changes-requested' and not in_progress and not comment_pending:
