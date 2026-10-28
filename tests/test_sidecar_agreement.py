@@ -449,6 +449,11 @@ class RegularFileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'byte bound'):
                 regular_file.read_regular_text(path, limit=5)
 
+    def test_none_windows_file_attributes_are_not_reparse_points(self):
+        info = type('WindowsStat', (), {'st_file_attributes': None})()
+        with patch.object(regular_file.stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 1024, create=True):
+            self.assertFalse(regular_file._is_reparse_point(info))
+
     def test_validator_and_invalid_arguments(self):
         path = self.base / 'record.json'
         path.write_text('{}', encoding='utf-8')

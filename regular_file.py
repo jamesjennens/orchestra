@@ -5,7 +5,7 @@ import stat
 
 def _is_reparse_point(info):
     attribute = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0)
-    return bool(attribute and getattr(info, 'st_file_attributes', 0) & attribute)
+    return bool(attribute and (getattr(info, 'st_file_attributes', 0) or 0) & attribute)
 
 
 def _not_regular(path):

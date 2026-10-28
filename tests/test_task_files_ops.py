@@ -954,6 +954,31 @@ class AdminTaskFilesTests(unittest.TestCase):
         code, out, err = self.run_admin('purge', 'p1', '--closed-before', '2026-02-01', '--actor', 'op', '--dry-run')
         self.assertNotEqual(0, code)
 
+    def test_regular_file_races_are_classified_by_backup_verify_and_restore(self):
+        import errno
+        self.store.attach('t1', b'abc')
+        (self.root/'backups').mkdir()
+        damaged = OSError(errno.ELOOP, 'Too many levels of symbolic links', 'host-record.json')
+        with mock.patch.object(task_files, 'backup_folder', side_effect=damaged):
+            with self.assertRaises(ValueError) as backup:
+                admin.backup_task_files(self.root, 'p1')
+        self.assertIn('host-record.json', str(backup.exception))
+
+        with mock.patch.object(task_files, 'verify', side_effect=damaged):
+            code, _, err = self.run_admin('verify', 'p1')
+        self.assertNotEqual(0, code)
+        self.assertIn('host-record.json', str(code))
+
+        backup = self.root/'backups'/'p1.task-files'
+        backup.mkdir(parents=True)
+        (self.root/'projects'/'p2').mkdir()
+        for failure in (ValueError('host-record.json changed while opening'), damaged):
+            with self.subTest(failure=type(failure).__name__):
+                with mock.patch.object(task_files, 'restore_folder', side_effect=failure):
+                    warning = admin.restore_task_files(self.root, 'p1', 'p2')
+                self.assertIn('Task files NOT restored', warning)
+                self.assertIn('host-record.json', warning)
+
     def test_r2_proxy_check_bytes_is_bounded(self):
         for bad in ('0', '-5', str(task_files.LIMIT_DEFAULTS['max_file_bytes'] + 1)):
             with mock.patch.object(task_files, 'proxy_check') as check:

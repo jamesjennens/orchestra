@@ -6505,6 +6505,10 @@ def task_files_backup_path(root,name):
     """Where a project's task files are backed up: ``backups/<name>.task-files`` (kittrial-5bb.380)."""
     return root/'backups'/(name+'.task-files')
 
+def _task_files_read_error(error):
+    import errno
+    return isinstance(error,ValueError) or (isinstance(error,OSError) and error.errno==errno.ELOOP)
+
 def coordination_lock(path,shared=False):
     """A factory of context managers holding ``path/.coordination.lock`` (shared or exclusive), for the
     task-files functions that take the lock only around their short steps (kittrial-5bb.380 r2, s5)."""
@@ -6536,7 +6540,8 @@ def backup_task_files(root,name):
     with backup_lock(root,name):
         try:
             return task_files.backup_folder(path,target,now=utc_stamp,lock=coordination_lock(path))
-        except task_files.Refusal as refused:
+        except (OSError,ValueError) as refused:
+            if not _task_files_read_error(refused):raise
             raise ValueError(str(refused)) from None
 
 def backup_projects(root,names,all_projects=False,named_http_state=None):
@@ -12005,7 +12010,8 @@ def restore_task_files(root,source,destination):
             fcntl.flock(lock,fcntl.LOCK_EX)
             try:
                 outcome=task_files.restore_folder(backup,path)
-            except task_files.Refusal as refused:
+            except (OSError,ValueError) as refused:
+                if not _task_files_read_error(refused):raise
                 outcome={'status':'refused','problems':[str(refused)]}
     if outcome['status']=='absent':
         print('This backup has no task files (backups/%s.task-files): any file records the task history '
@@ -12127,7 +12133,8 @@ def task_files_command(root,args):
         try:
             # kittrial-5bb.380 r2 (s5): the shared lock only to read and to confirm, never while hashing.
             result=task_files.verify(path,lock=coordination_lock(path,shared=True))
-        except task_files.Refusal as refused:
+        except (OSError,ValueError) as refused:
+            if not _task_files_read_error(refused):raise
             raise ValueError(str(refused)) from None
         for key,label in (('mismatched','does not match its name'),('wrong_size','has another size than its record'),
                           ('missing','is missing (a live record names it)')):
