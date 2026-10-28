@@ -1937,6 +1937,30 @@ nothing is sent to the endpoint, nothing is audited as uncertain, and **the same
 key serves the corrected request**. An assignee other than the caller and a label
 still have no web route today; a priority now does.
 
+**A child task by a coordinator (kittrial-5bb.434).** `POST /v1/projects/{id}/tasks/{task}/children` files
+a child task or a decision under `{task}` through the host's own `coordinate create-child`
+([CLI contract](CLI_CONTRACT.md#create-child-version-difference)).
+- It needs `coordinate`: a signed-in coordinator or owner, or an agent holding the project's coordinator
+  grant. A contributor, a viewer or a worker credential gets 403.
+- One 404, "Task not found", answers a parent that is absent, in another project or a record anchor
+  (the merge slot included), and a project the caller may not read; nothing is written.
+- The body takes `title`, `description`, `type` (task, bug, feature, chore or decision; no epic), and
+  optionally `assignee` and `priority` (0-4). Any other field is 422. The Idempotency-Key is required.
+  An exact retry returns the same child.
+- A decision without its required headings is refused (422) with create-child's sentence naming them.
+- The in-process backend answers 501. The task page shows an "Add a child task" form when the project
+  read says `can_coordinate`.
+
+**The installation switches, for a coordinator (kittrial-5bb.434).** `GET /v1/projects/{id}/switches`
+(`coordinate`) answers `{"schema_version": 1, "items": [{name, state, unlocks, command}]}`.
+- The items are `review_workflow_writes`, `checkpoint_provenance_writes` and
+  `web_lifecycle_mark_writes`.
+- `state` is `on`, `off` or `unreadable`, as each switch's own writers read it. A malformed
+  `web_lifecycle_mark_writes` is `unreadable`; the other two read a malformed value as off.
+- `command` is the operator's `admin.py ... on --actor OPERATOR`.
+- It changes nothing and returns no path, configured value or actor. A contributor or viewer gets 403;
+  a non-member gets 404. Members & settings shows it to a coordinator.
+
 **Task create takes a priority too.** `POST /v1/projects/{id}/tasks` takes `title`,
 `description`, `priority` (an integer 0 to 4; bd's default 2 applies when it is absent) and the
 optional `attachments` and `actor`, which is what the new-task form sends

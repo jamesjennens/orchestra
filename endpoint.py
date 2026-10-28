@@ -960,10 +960,12 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: The actions that exist only for the web service: they name no existing project.
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
-#: which a bound key is not told.
+#: which a bound key is not told. ``web-switches`` (kittrial-5bb.434) is the installation switches
+#: read the HTTP route serves under CAP_COORDINATE; it checks no capability itself, so no bound key
+#: may name it.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
-                      'task-file','room-decision','delegation')
+                      'task-file','room-decision','delegation','web-switches')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -1208,6 +1210,7 @@ READ_ONLY_ACTIONS={
     'history':_read_only_always,
     'requirements':_read_only_always,
     'trace':_read_only_always,
+    'web-switches':_read_only_always,
     'work':_read_only_always,
     'review':_review_rounds_read_only,
     # kittrial-5bb.285: the blocking wait's per-poll read. It is one work read (one export)
@@ -1478,6 +1481,14 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         with held_coordination_lock(path,shared=coordination_lock_shared(request,'requirements',request.get('args',[]))):
             result=read_requirements(path,name,request.get('args',[]),run,configured_operators(root))
         return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+    if action=='web-switches':
+        # kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator on the web:
+        # each name, its state as its own writers read it, what it unlocks and the operator command. A read
+        # of the host's own settings; it takes no lock and writes nothing, and it returns no path or actor.
+        from admin import installation_switches
+        if request.get('args',[]) not in ([],['--json']):raise ValueError('web-switches takes no arguments')
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'items':installation_switches(root)},
+                                                   ensure_ascii=False)+'\n','stderr':''}
     if action=='trace':
         # kittrial-5bb.425: the trace read (TRACEABILITY_DESIGN §5.2-§5.4), answered from records alone.
         # Read-only: a shared lock and no guarded write. One export from the read cache; the generation it

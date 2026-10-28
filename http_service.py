@@ -2273,6 +2273,8 @@ class EndpointBackend:
     """
 
     ROUTES = InProcessBackend.ROUTES + (
+        # A child task by a coordinator (kittrial-5bb.434): the canonical `coordinate create-child`.
+        'tasks.create-child',
         'tasks.assign', 'tasks.release', 'merge-slot.acquire',
         'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create',
         # The release routes (kittrial-5bb.378): one canonical release-query or one
@@ -3100,6 +3102,17 @@ class EndpointBackend:
             if payload.get('expected_assignee') is not None:
                 body['expected_assignee'] = payload['expected_assignee']
             return 'task-release', project_id, [json.dumps(body, ensure_ascii=False)], {}
+        if route == 'tasks.create-child':
+            # kittrial-5bb.434: exactly the host's `coordinate create-child` request. Every rule is the
+            # canonical one (coordination.apply_native); the request id is this route's durable operation
+            # identity, so an exact retry is reconciled by create-child's own receipt.
+            body = {'operation': 'create-child', 'request_id': 'web-' + operation_id,
+                    'parent': payload['task_id'], 'title': payload['title'],
+                    'description': payload.get('description') or '', 'type': payload['type']}
+            for name in ('assignee', 'priority'):
+                if payload.get(name) is not None:
+                    body[name] = payload[name]
+            return 'coordinate', project_id, [json.dumps(body, ensure_ascii=False)], {}
         if route == 'tasks.assign':
             from task_assignment import REQUEST_FIELDS
             fields={k:payload[k] for k in REQUEST_FIELDS if k not in ('operation_id','task','schema_version')}
@@ -3359,6 +3372,15 @@ class EndpointBackend:
         payload = self._checked(reply, 'ref', reading=True)
         if not isinstance(payload, dict):
             raise uncertain('Canonical design read returned an unexpected shape')
+        return payload
+
+    def switches(self, project_id):
+        """kittrial-5bb.434: the installation switches that refuse a web write, through the read-only
+        `web-switches` action: names, states, what each unlocks and the operator command."""
+        reply = self._endpoint('web-switches', project_id, self.actor_namespace + '/read', [])
+        payload = self._checked(reply, 'web-switches', reading=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+            raise uncertain('Canonical switch read returned an unexpected shape')
         return payload
 
     def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None):
@@ -10709,6 +10731,85 @@ class ApiHandler(BaseHTTPRequestHandler):
             return write()
         return self._mutate(ctx,'tasks.assign',ctx.params['pid'],assign,capability=CAP_COORDINATE,
                             serialize=False,canonical=True,audit_metadata={'task':ctx.params['tid']})
+
+    TASK_CHILD_FIELDS = ('title', 'description', 'type', 'assignee', 'priority')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/children')
+    def task_children(self, ctx):
+        """kittrial-5bb.434: a child task (or a decision) under `{tid}`, by a coordinator on the web.
+
+        CAP_COORDINATE, the capability the endpoint's own table gives `coordinate create-child`
+        (http_authority.py). The route reads the parent first: a parent that is absent, in another
+        project or a record anchor, and a project the caller may not read, all answer the same 404 and
+        nothing is written. Every other rule is the host's own `coordinate create-child`
+        (coordination.apply_native): the merge slot takes no child, the type list, the description bound,
+        a decision's required headings (native validation), assignee names and the claiming guard, and
+        the request receipt. An Idempotency-Key is required; an exact retry returns the same child."""
+        absent = not_found('Task not found')
+        try:
+            self._project(ctx, CAP_COORDINATE)
+        except HttpError as error:
+            if error.status == 404:
+                raise absent from None
+            raise
+        if 'tasks.create-child' not in self.backend.ROUTES:
+            raise not_implemented('Creating a child task is unavailable on this server')
+        if ctx.idempotency_key is None:
+            raise invalid('Send an Idempotency-Key and reuse it with the identical child after an uncertain outcome')
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, self.TASK_CHILD_FIELDS, 'A child task')
+        from coordination import CHILD_TYPES
+        self._task_title(payload.get('title'))
+        if payload.get('type') not in CHILD_TYPES:
+            raise invalid('type must be one of %s' % ', '.join(CHILD_TYPES))
+        description = payload.get('description')
+        if description is not None and not isinstance(description, str):
+            raise invalid('Task description must be text')
+        if len(description or '') > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
+        if payload.get('assignee') is not None and not isinstance(payload['assignee'], str):
+            raise invalid('assignee must be text')
+        priority = payload.get('priority')
+        if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
+            raise invalid('Task priority must be an integer 0-4')
+        try:
+            parent = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+            self._refuse_record_anchor(parent)
+        except HttpError as error:
+            if error.status == 404:
+                raise absent from None
+            raise
+        payload['task_id'] = ctx.params['tid']
+
+        def create():
+            result = self.backend.invoke('tasks.create-child', ctx.principal, ctx.params['pid'], payload,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_COORDINATE)
+            return result, result
+        try:
+            return self._mutate(ctx, 'tasks.create-child', ctx.params['pid'], create, status=201,
+                                capability=CAP_COORDINATE, serialize=False, canonical=True,
+                                audit_metadata={'task': ctx.params['tid']})
+        except HttpError as error:
+            # create-child's refusal names the required headings (coordination.validation_hint), but the
+            # endpoint's detail bound can cut that sentence off. The same sentence goes in `problems`, on
+            # the same gate validation_hint uses: a refusal about sections, for a type that has them.
+            from coordination import template_requirement
+            hint = template_requirement(payload['type'])
+            if error.status == 422 and hint and 'section' in str(error.detail or '').lower():
+                error.problems = [hint]
+            raise
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/switches')
+    def project_switches(self, ctx):
+        """kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator: each
+        switch's name, state (`on`, `off`, `unreadable`), what it unlocks and the operator command. Read
+        only; CAP_COORDINATE; no path, value or actor is returned."""
+        self._project(ctx, CAP_COORDINATE)
+        reader = getattr(self.backend, 'switches', None)
+        if reader is None:
+            raise not_implemented('This server has no installation switches to read')
+        return 200, reader(ctx.params['pid'])
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/release')
     def task_release(self, ctx):

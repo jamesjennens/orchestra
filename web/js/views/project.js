@@ -10,6 +10,7 @@ import { coordinationPanel } from './coordination.js';
 import { delegationsPanel } from './delegations.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { historyPanel } from '../agentHistory.js';
+import { switchesPanel } from './switches.js';
 import { coveragePanel } from './trace.js';
 
 const PAGE = 10;
@@ -759,5 +760,8 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
-    membersHost, claimingPanel(ctx, project), coordination.node, delegated.node, agentsHost, credsHost, auditHost, danger);
+    membersHost, claimingPanel(ctx, project), coordination.node,
+    // kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator.
+    switchesPanel(ctx, project),
+    delegated.node, agentsHost, credsHost, auditHost, danger);
 }

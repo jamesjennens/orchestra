@@ -2295,6 +2295,18 @@ The native `create` call uses `--no-inherit-labels` and, for
 and content hashes are durable, so an uncertain create is reconciled with the same
 request ID instead of creating a duplicate.
 
+**Over the web (kittrial-5bb.434):** `POST /v1/projects/{id}/tasks/{task}/children` sends exactly this
+`coordinate create-child` request.
+- The parent is `{task}`; the body takes `title`, `description`, `type`, and optionally `assignee` and
+  `priority` (0-4).
+- It needs `coordinate`.
+- The request ID is the route's durable operation identity from the Idempotency-Key, so an exact retry
+  returns the same child. The route reads the parent first, so a parent that is absent, in another
+  project or a record anchor, and a project the caller may not read, all answer one 404 "Task not found".
+- Every other rule is the endpoint's own, unchanged: the type list (task, bug, feature, chore, decision;
+  no epic), the merge slot taking no child, the description bound, a decision's required headings (`##
+  Decision`, `## Rationale`, `## Alternatives Considered`, named in the refusal), and assignee names.
+
 ## Backward compatibility
 
 Unreadable native reference, capability and proposal rows are classified by their

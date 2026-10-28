@@ -128,14 +128,23 @@ class Canonical:
                 # bd's own preflight (the record core runs it before a real create): no row.
                 return 0, json.dumps({'dry_run': True}), ''
 
+            parent = option('--parent', None)
+            assignee = option('--assignee', None)
+            if parent is not None and not any(r.get('id') == parent for r in self.rows()):
+                # As bd refuses a create under a parent it cannot find (create-child's preflight sees it).
+                return 1, '', 'Error: parent issue %s not found\n' % parent
+
             def change(state):
                 state['seq'] += 1
                 task_id = 'kittrial-5bb.%d' % state['seq']
                 state['rows'].append({
                     'id': task_id, 'title': title, 'description': description, 'status': 'open',
-                    'assignee': None, 'issue_type': issue_type, 'comments': [],
+                    'assignee': assignee, 'issue_type': issue_type, 'comments': [],
                     'priority': int(priority),
-                    'labels': labels, 'dependencies': [], 'created_at': '2026-01-01T00:00:00Z',
+                    'labels': labels, 'created_at': '2026-01-01T00:00:00Z',
+                    # kittrial-5bb.434: a child records its parent as bd does, a parent-child dependency.
+                    'dependencies': [{'issue_id': task_id, 'depends_on_id': parent, 'type': 'parent-child'}]
+                    if parent is not None else [],
                     # As bd does: the row says under which actor it was made.
                     'created_by': self.actor or 'emulated',
                 })
@@ -412,6 +421,14 @@ def dispatch(canonical, request, tmp, run=None):
         payload = json.loads(args[0]) if args and isinstance(args[0], str) else None
         result = apply_native(payload, actor, run)
         return envelope(0, json.dumps(result, ensure_ascii=False) + '\n')
+    if action == 'web-switches':
+        # endpoint.py's read of the installation switches (kittrial-5bb.434).
+        try:
+            from admin import installation_switches
+        except ImportError:  # a revision that predates the read
+            raise ValueError('Unknown action')
+        return envelope(0, json.dumps({'schema_version': 1, 'items': installation_switches(canonical.root)},
+                                      ensure_ascii=False) + '\n')
     if action == 'coordinate':
         from coordination import apply_native as coordinate
         payload = json.loads(args[0]) if args and isinstance(args[0], str) else None
