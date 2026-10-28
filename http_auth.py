@@ -3489,6 +3489,70 @@ class Service:
                 self.store.save()
             return self.project_agent_view(agent, project_id)
 
+    #: How an agent holding the coordinator grant is judged when it approves (kittrial-5bb.438).
+    #: ``by-agent``, the default: it may approve the work of ANOTHER personal agent of the same
+    #: person; its own work, its person's own work and its person's worker credentials stay refused.
+    #: ``by-person``: the strict rule of kittrial-5bb.209, every agent of a person is one party.
+    AGENT_APPROVAL_MODES = ('by-agent', 'by-person')
+    AGENT_APPROVAL_DEFAULT = 'by-agent'
+
+    def agent_approval(self, project_id):
+        """The project's agent-approval setting: ``{'mode', 'set_by', 'set_at', 'set_by_display_name'}``.
+
+        Absent is the default (``by-agent``, nobody set it). A record of any other shape reads as the
+        strict ``by-person`` with ``damaged`` true: a damaged setting never lets more through.
+        """
+        with self.store.lock:
+            stored = self.state.get('agent_approval')
+            entry = stored.get(project_id) if isinstance(stored, dict) else None
+            if 'agent_approval' not in self.state or (isinstance(stored, dict) and project_id not in stored):
+                return {'mode': self.AGENT_APPROVAL_DEFAULT, 'set_by': None, 'set_at': None,
+                        'set_by_display_name': None}
+            if not isinstance(entry, dict) or entry.get('mode') not in self.AGENT_APPROVAL_MODES:
+                return {'mode': 'by-person', 'set_by': None, 'set_at': None, 'set_by_display_name': None,
+                        'damaged': True}
+            set_by = entry.get('set_by') if isinstance(entry.get('set_by'), str) else None
+            return {'mode': entry['mode'], 'set_by': set_by,
+                    'set_at': entry.get('set_at') if isinstance(entry.get('set_at'), str) else None,
+                    'set_by_display_name': self._owner_name(set_by) if set_by else None}
+
+    def set_agent_approval(self, principal, project_id, mode):
+        """Record the project's agent-approval setting (kittrial-5bb.438): who set it and when.
+
+        The route holds the ``CAP_PROJECT_ADMIN`` boundary (an owner of the project or a superuser);
+        a credential never changes it, so an agent cannot set the rule that judges its own approvals.
+        """
+        if principal is None or principal.via == 'credential':
+            raise forbidden('Session authority required to change how agents are judged when they approve')
+        if mode not in self.AGENT_APPROVAL_MODES:
+            raise invalid("agent_approval must be 'by-agent' or 'by-person'")
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if 'agent_approval' in self.state and not isinstance(self.state.get('agent_approval'), dict):
+                raise HttpError(503, 'unavailable',
+                                'The record of agent-approval settings in the service state is damaged (it is not '
+                                'an object), so nothing was written. An operator must repair the state file')
+            self.state.setdefault('agent_approval', {})[project_id] = {
+                'mode': mode, 'set_by': principal.user_id, 'set_at': now_iso(self._now())}
+            self.store.save()
+        return self.agent_approval(project_id)
+
+    def other_agent_of_same_person(self, agent_id, name):
+        """Whether ``name`` was written by ANOTHER personal agent of the account that owns ``agent_id``.
+
+        A name belongs to an agent when its first segment is that agent's id (``agent`` and ``agent/x``
+        are one actor). The approving agent itself, its account, a worker credential's name and any
+        name of no agent record are not another agent: they answer False, and stay judged by party.
+        """
+        if not isinstance(name, str) or not name or not isinstance(agent_id, str) or not agent_id:
+            return False
+        head = name.split('/', 1)[0]
+        with self.store.lock:
+            agents = self.state.get('agents') if isinstance(self.state.get('agents'), dict) else {}
+            mine, other = agents.get(agent_id), agents.get(head)
+            return (head.casefold() != agent_id.casefold() and isinstance(mine, dict) and isinstance(other, dict)
+                    and isinstance(mine.get('owner'), str) and other.get('owner') == mine['owner'])
+
     def _end_coordinator_grants(self, agent, project_ids, principal, request_id, reason):
         """Delete the agent's coordinator AND release grants in each of ``project_ids``.
 

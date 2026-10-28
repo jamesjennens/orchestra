@@ -588,6 +588,46 @@ export function claimingPanel(ctx, project) {
   return host;
 }
 
+// How a coordinator agent is judged when it approves (kittrial-5bb.438). The server says whether this
+// caller may change it (can_set_agent_approval, the PUT route's own CAP_PROJECT_ADMIN check); every
+// member sees the value and who set it. Text only.
+export function agentApprovalPanel(ctx, project) {
+  const host = h('section', { class: 'panel', 'data-panel': 'agent-approval' });
+  const block = Object.assign({ mode: 'by-agent', set_by: null, set_at: null, set_by_display_name: null },
+    project.agent_approval || {});
+  const canSet = Boolean(project.can_set_agent_approval) && !project.archived && project.usable !== false;
+  function draw() {
+    const chosen = block.mode === 'by-person' ? 'by-person' : 'by-agent';
+    const select = h('select', { id: 'agent-approval-value', 'aria-label': 'How a coordinator agent is judged when it approves' },
+      h('option', { value: 'by-agent', selected: chosen === 'by-agent' }, 'A coordinator agent may approve another agent of the same person'),
+      h('option', { value: 'by-person', selected: chosen === 'by-person' }, 'Strict: all agents of a person count as one party'));
+    const save = h('button', { type: 'button', class: 'primary', onclick: async (e) => {
+      try {
+        const result = await act(e.currentTarget, () => ctx.api.setAgentApproval(project.id, select.value),
+          { success: 'Agent approval setting saved' });
+        if (result && result.mode) Object.assign(block, result, { damaged: false });
+        draw();
+      } catch { /* the refusal is shown beside the control */ }
+    } }, 'Save');
+    host.replaceChildren(
+      h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Approvals by coordinator agents')),
+      h('div', { class: 'panel-body' },
+        h('p', { class: 'muted' }, chosen === 'by-person'
+          ? 'Strict: an agent holding the coordinator grant never approves work by its own person or by any agent of that person.'
+          : 'An agent holding the coordinator grant may approve work delivered by another agent of the same person. It never approves its own work, its person’s own work, or work under that person’s worker credentials. That is the default.'),
+        canSet ? h('div', { class: 'toolbar' }, h('label', { class: 'check', for: 'agent-approval-value' }, 'Agent approvals'), select, save) : null,
+        h('p', { class: 'small muted' },
+          chosen === 'by-person' ? 'Set to strict' : 'Set to “another agent of the same person may be approved”',
+          block.set_by ? [' by ', h('span', { class: 'mono' }, block.set_by_display_name || block.set_by)] : null,
+          block.set_at ? [' ', time(block.set_at)] : null,
+          block.set_by ? '.' : ' — the default; nobody has changed it.'),
+        block.damaged ? h('p', { class: 'small', role: 'status' }, 'The stored setting could not be read, so the strict rule applies until an owner saves it again.') : null,
+        h('p', { class: 'small muted' }, 'People are not affected: whether a person may approve their own agent’s work is the server’s own setting.')));
+  }
+  draw();
+  return host;
+}
+
 export async function settings(ctx, { pid }) {
   const project = await load(ctx, pid);
   const owner = isOwner(project);
@@ -760,7 +800,7 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
-    membersHost, claimingPanel(ctx, project), coordination.node,
+    membersHost, claimingPanel(ctx, project), agentApprovalPanel(ctx, project), coordination.node,
     // kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator.
     switchesPanel(ctx, project),
     delegated.node, agentsHost, credsHost, auditHost, danger);

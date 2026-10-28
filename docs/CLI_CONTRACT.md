@@ -22,6 +22,19 @@ caller, also honoring the service's `approval_by_another_party` rule. These addi
 reader fields and corrected text mean all-off stdout is not byte-identical to older
 kits; all-off native write effects remain compatible.
 
+**Approvals by a coordinator agent: web and ssh** (kittrial-5bb.438):
+- **The host route** (`review TASK --file` over ssh) compares actor names. One person's agents
+  are different names there, so it never refused an agent's approval of another agent of the
+  same person.
+- **The web route** judges an agent holding the coordinator grant by person. By default it now
+  agrees with the host route for another personal agent of the same person (the project setting
+  `agent_approval: by-agent`).
+- **What both routes still refuse on the web:** the agent's own work, its person's own work and
+  work under that person's worker credentials.
+- **Strict projects:** a project an owner set to `by-person` is strict on the web route only.
+- **The record:** an approval written that way carries a fixed sentence at the end of its
+  `summary`. The record's field set is unchanged.
+
 The endpoint is the program that runs beside the canonical Beads service
 (`endpoint.py` for SSH/local transport). Clients talk to it through one JSON envelope
 and never run the native `bd` binary directly.
