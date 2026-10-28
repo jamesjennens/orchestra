@@ -3060,7 +3060,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
                 answer = dict(comment_id=str(c['id']), reconciled=True, **receipt(state, rows, task))
                 if party_problem:
                     answer['warnings'] = list(answer.get('warnings') or []) + [party_problem]
-                return answer
+                return open_items_advice(answer, p['operation'], state, task)
             raise ValueError('Operation ID already used with different payload or actor')
     # Staged rollout (item 3): a new-shaped write is refused unless this
     # installation turned the switch on. Reads are unaffected.
@@ -3214,6 +3214,24 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     answer = dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
     if party_problem:
         answer['warnings'] = list(answer.get('warnings') or []) + [party_problem]
+    return open_items_advice(answer, payload['operation'], preview, task)
+
+
+def open_items_advice(answer, operation, projected, task):
+    """Tell a lane that its revision left review items open (kittrial-5bb.431). Advice, never a refusal.
+
+    A ``contribute`` answer gains ``open_items`` (the blocking items still open after it, from the same
+    projection the write was validated on) and, while any are open, one warning per request naming its
+    item ids and the respond record that answers them. Only a respond answers an item; a revision or a
+    plain comment does not. Any other operation's answer is unchanged.
+    """
+    if operation != 'contribute':
+        return answer
+    from review_state import open_items_warnings, open_review_items
+    items = open_review_items(projected.get('pending_requests'))
+    answer['open_items'] = items
+    if items:
+        answer['warnings'] = list(answer.get('warnings') or []) + open_items_warnings(items, task)
     return answer
 
 

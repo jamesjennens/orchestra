@@ -65,6 +65,9 @@ ITEM_FIELDS = {
     # Additive requirement-record marker (kittrial-5bb.277): the row stays visible
     # but is never claimable work.
     'requirement_record',
+    # Additive (kittrial-5bb.431): the open blocking review items, [{request, item}],
+    # [] once each is answered by a respond record.
+    'open_review_items',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',
