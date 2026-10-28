@@ -2089,7 +2089,7 @@ def queue_order(item):
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
                integration_warnings=None, attention=None, recommended_by=None, contribution_author=None,
-               claimable=None, followon=None):
+               claimable=None, followon=None, requirement_record=False, requirement_state=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -2136,7 +2136,12 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'recommended_by': list(recommended_by or []),
             # Additive (kittrial-5bb.115 review): who delivered the current contribution, so
             # the person rule can be applied to a row as it is to a brief.
-            'contribution_author': contribution_author}
+            'contribution_author': contribution_author,
+            # Additive (kittrial-5bb.433): whether the row is a requirement record and, if so,
+            # what it asks of its assignee (requirement_records.assigned_state), from the
+            # canonical `work` row. None where the backend does not say.
+            'requirement_record': bool(requirement_record),
+            'requirement_state': requirement_state}
 
 
 def claimable_task(task, review, claiming='open'):
@@ -4650,7 +4655,10 @@ class EndpointBackend:
                                         claimable=row.get('claimable')
                                         if isinstance(row.get('claimable'), bool) else None,
                                         followon=row.get('followon')
-                                        if isinstance(row.get('followon'), dict) else None))
+                                        if isinstance(row.get('followon'), dict) else None,
+                                        requirement_record=row.get('requirement_record') is True,
+                                        requirement_state=row.get('requirement_state')
+                                        if isinstance(row.get('requirement_state'), str) else None))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -4893,6 +4901,14 @@ def next_action(task, claiming='open'):
         return {'who': 'coordinator', 'text': 'Release the integration hold or record a corrected verification'}
     if state == 'error':
         return {'who': 'owner', 'text': 'Needs operator attention'}
+    # kittrial-5bb.433: a requirement record is never work to deliver. One waiting for acceptance says
+    # where it is accepted; any other says where it is edited (the label, or the queue's own fact).
+    from work import requirement_record
+    if task.get('requirement_record') is True or requirement_record(task.get('labels')):
+        if task.get('requirement_state') == 'awaiting-acceptance':
+            return {'who': 'owner',
+                    'text': "Requirement waiting for acceptance: accept it on the project's Requirements page"}
+        return {'who': 'owner', 'text': "Requirement record: edit it on the project's Requirements page"}
     if task.get('assignee'):
         return {'who': 'assignee', 'text': 'Deliver a contribution'}
     # The last offer is a claim, so it follows the same claimability predicate the
@@ -6483,7 +6499,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         assignee = view.get('assignee')
         view['assignee_name'] = names.get(assignee, assignee) if assignee else None
         view['next_action'] = next_action(view, claiming=claiming)
-        view['requirement_record'] = requirement_record(view.get('labels'))
+        # A queue row carries no labels but says so itself (kittrial-5bb.433); keep that.
+        view['requirement_record'] = requirement_record(view.get('labels')) or view.get('requirement_record') is True
         from work import dependency_index, open_dependency_ids
         # A list view passes its snapshot; a single-task view passes none, and the
         # dependency entries themselves carry the other end's status (bd show),
@@ -13873,7 +13890,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 row = dict(item, project_name=project['name'])
                 if item.get('id') in blocked and item.get('status') != 'closed':
                     row['blocked'] = True
-                if item.get('assignee') == actor and item.get('status') != 'closed':
+                # kittrial-5bb.433: a requirement record accepted with nothing pending, or ended by its
+                # owner, is not work: it stays on the Requirements page, not on My work. One waiting
+                # for acceptance, and one whose ledger cannot be read, stay.
+                settled = item.get('requirement_record') and item.get('requirement_state') in (
+                    'accepted', 'withdrawn', 'superseded')
+                if item.get('assignee') == actor and item.get('status') != 'closed' and not settled:
                     assigned.append(row)
                 if CAP_APPROVE in capabilities and item['review_state'] in (
                         'awaiting-review', 'legacy-review-ready', 'awaiting-integration',

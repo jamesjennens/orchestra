@@ -3285,6 +3285,15 @@ line separately and unconfined.
     body or an audit record.
   - **No web view yet:** when one is added, it must render statements as plain text,
     never through `markdown()`.
+- **Requirement records on My work.** A requirement record assigned to the caller is
+  left out of `assigned` once it no longer asks anything of them: its newest revision is
+  accepted with nothing pending, or its owner withdrew or superseded it
+  (`requirement_records.assigned_state`, carried as `requirement_state` on the `work`
+  queue row). A first draft, or an accepted record with a newer draft waiting, stays,
+  with the Next action "Requirement waiting for acceptance: accept it on the project's
+  Requirements page". A record whose ledger cannot be read stays too. The state is read
+  from the rows the project's one `work` walk already holds, so it adds no read per row.
+  The accepted record is still on the Requirements page and in the task list.
 - **`GET /v1/me/work` cost.** On the canonical binding each project costs one bounded
   `work` walk (up to 10 subprocess reads of 100 rows), for at most 50 of the caller's
   projects. The same principal's read of a project is reused for 20 seconds
