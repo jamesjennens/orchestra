@@ -174,6 +174,11 @@ class Harness(unittest.TestCase):
         self.service = Service(self.store)
         self.backend = self.make_backend()
         self._start_server(self.service, self.backend)
+        # Stop whichever server is current when the test ends (kittrial-5bb.430): without it every test
+        # left a listening socket and its serve_forever thread behind for the rest of the run. Registered
+        # after the temporary directory, so it runs before that is removed and after the test's own
+        # cleanups. `_stop_server` is idempotent, so a test that stops or restarts the server is unchanged.
+        self.addCleanup(self._stop_server)
 
     def make_backend(self):
         return InProcessBackend(self.service)
