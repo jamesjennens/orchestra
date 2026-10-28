@@ -1513,7 +1513,11 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # two keys so a long chain does not grow past 6000 bytes.
     for entry in bounded_priors:
         entry['integration']=compact_integration(entry.get('integration'))
-    review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
+    # The open item ids and the respond record that answers them, in the work row's words
+    # (review_state.open_items_sentence, kittrial-5bb.431): a revision does not answer them.
+    from review_state import open_items_sentence, open_review_items
+    named_items=open_items_sentence(open_review_items(pending),task)
+    review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.'+(' '+named_items if named_items else ''),
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record a review request or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
                  'held':'The contribution is held; read review '+task+' for the record.',

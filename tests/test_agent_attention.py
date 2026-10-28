@@ -22,6 +22,7 @@ import http_service
 import test_http_agents
 import test_http_proposals
 import test_http_review_fixes as fixes
+import review_state
 import work
 
 COMMIT2 = 'd' * 40
@@ -138,7 +139,9 @@ class EndpointAttentionTests(fixes.EndpointCase):
         route = '/v1/projects/%s/tasks/%s/brief' % (self.project, first)
         self.assertEqual(action['next'],
                          'This is your work now: 2 outstanding review items. Read `%s`, deliver '
-                         'a revision that supersedes this contribution and respond to each item.' % route)
+                         'a revision that supersedes this contribution and respond to each item. '
+                         'Open: tests, docs of request %s. Answer each with a respond record '
+                         '(POST `%s/reviews`, operation respond).' % (route, request, route[:-len('/brief')]))
         self.assertEqual((data['attention']['state'], data['attention']['counts']['changes_requested'],
                           data['attention']['counts']['awaiting_review']), ('changes-requested', 1, 0))
         self.assertIn('1 contribution(s) have changes requested', data['attention']['summary'])
@@ -252,7 +255,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
                    if r['task'] == first)
         route = '/v1/projects/%s/tasks/%s/brief' % (self.project, first)
         self.assertEqual(action['whose_move'], row['whose_move'])
-        self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % first), row['next'])
+        # The second deliberate difference (kittrial-5bb.431): an open item is answered by
+        # the respond record at this task's route, never the client command.
+        web_way = review_state.respond_way(first, route[:-len('/brief')])
+        self.assertIn(web_way, action['next'])
+        self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % first)
+                         .replace(web_way, review_state.respond_way(first)), row['next'])
         for other in data['next_actions']:
             if other['kind'] not in ('changes-requested', 'in-progress'):
                 with self.subTest(kind=other['kind']):
@@ -280,7 +288,12 @@ class EndpointAttentionTests(fixes.EndpointCase):
         self.assertTrue(row['redelivered'])
         route = '/v1/projects/%s/tasks/%s/brief' % (self.project, first)
         self.assertEqual(action['whose_move'], row['whose_move'])
-        self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % first), row['next'])
+        # The second deliberate difference (kittrial-5bb.431): an open item is answered by
+        # the respond record at this task's route, never the client command.
+        web_way = review_state.respond_way(first, route[:-len('/brief')])
+        self.assertIn(web_way, action['next'])
+        self.assertEqual(action['next'].replace('`%s`' % route, '`review %s`' % first)
+                         .replace(web_way, review_state.respond_way(first)), row['next'])
         for sentence in (action['next'], row['next']):
             with self.subTest(sentence=sentence):
                 self.assertIn('has already been delivered', sentence)
@@ -632,6 +645,8 @@ class EndpointAttentionTests(fixes.EndpointCase):
             # An older/omitted field reads unknown, which `review_move` treats as not
             # redelivered (kittrial-5bb.253 item 1).
             'redelivered': None,
+            # The same older page carries no open review items: unknown (kittrial-5bb.431).
+            'open_review_items': None,
             'checkpoint_at': '2026-10-04T10:00:00Z', 'newer_activity': True,
             # This page is an older endpoint's canonical row: it omits the stable
             # marker and its counts, which honestly read unknown (kittrial-5bb.351).

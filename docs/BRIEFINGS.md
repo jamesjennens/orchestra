@@ -95,6 +95,11 @@ carries the facts it needs, and this is the table per view:
   responses are owed. It is the one rule from `work.is_redelivery`, used by the
   `work` projection and by the in-process backend alike (kittrial-5bb.264 item 2/4).
   A malformed row carries it as `false`.
+- **`open_review_items`** (list) names the blocking review items still open, `[{request,
+  item}]` in filing order and at most 20, until a `respond` record answers each
+  (kittrial-5bb.431). A new revision or a plain comment answers none. While changes are
+  requested, `next` names them too: at most 5, then "and N more", with the respond record
+  that answers them. A malformed row carries `[]`.
 - **`claimable`** is the one bounded claimability rule: open, unassigned, no contribution,
   and neither a record anchor nor an epic, decision, gate or job — by issue TYPE or by the
   `decision` LABEL (`reference_records.py` treats that label as a decision whatever the

@@ -2036,6 +2036,32 @@ catalogued document as served with its size or refused with its sentence; whoeve
 and the project entry point together. A document that cannot be read is refused without
 printing a host path, and the sentence names the document.
 
+## A revision with review items still open (kittrial-5bb.431)
+
+Only a `respond` record answers a review item. A new revision does not, and neither does a
+plain comment. So a `contribute` answer (`review TASK --file`) carries two additive fields:
+
+- **`open_items`:** the blocking items still open after the write, `[{request, item,
+  contribution}]` in filing order, at most 20. It is `[]` when every item is answered. A note
+  never blocks, so it is never listed.
+- **`warnings`:** while any item is open, the list gains one sentence per request: "N items of
+  request R are still open (I1, I2): a new revision does not answer them; answer each with a
+  respond record (`review TASK --file respond.json`, operation respond)."
+
+The contribution is recorded either way: this is advice, never a refusal. An exact replay
+answers the same advice, and any other operation's answer is unchanged.
+
+While changes are requested, the `work` row says the same thing until each item is answered:
+- `items[].open_review_items` (`[{request, item}]`);
+- the `next` sentence, which ends "Open: I1, I2 of request R. Answer each with a respond
+  record (...)." It names at most 5 ids, then "and N more".
+
+The brief's `next_action` ends with the same words.
+
+Over HTTP, the route `POST /v1/projects/{pid}/tasks/{tid}/reviews` answers the same
+`open_items`. Its warning, and the agent next-actions sentence, name the respond record as
+"POST `/v1/projects/{pid}/tasks/{tid}/reviews`, operation respond" and never the client command.
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,

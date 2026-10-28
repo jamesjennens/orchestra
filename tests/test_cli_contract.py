@@ -68,6 +68,9 @@ ITEM_FIELDS = {
     # Additive (kittrial-5bb.433): what an assigned requirement record asks of its
     # assignee (requirement_records.assigned_state); null on any other row.
     'requirement_state',
+    # Additive (kittrial-5bb.431): the open blocking review items, [{request, item}],
+    # [] once each is answered by a respond record.
+    'open_review_items',
 }
 BRIEF_FIELDS = {
     'task', 'title', 'owner', 'status', 'activity_cursor', 'checkpoint', 'intent',
