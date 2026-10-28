@@ -960,10 +960,12 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: The actions that exist only for the web service: they name no existing project.
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
-#: which a bound key is not told.
+#: which a bound key is not told. ``web-switches`` (kittrial-5bb.434) is the installation switches
+#: read the HTTP route serves under CAP_COORDINATE; it checks no capability itself, so no bound key
+#: may name it.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
-                      'task-file','room-decision','delegation')
+                      'task-file','room-decision','delegation','web-switches')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.

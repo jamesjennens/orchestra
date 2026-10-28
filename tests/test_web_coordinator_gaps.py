@@ -270,6 +270,23 @@ class NativeWebCoordinatorGapsTests(_GapsMixin, RulesHelpers, unittest.TestCase)
     def test_native_the_switches_read_names_states_and_commands_only(self):
         self.run_switches_suite()
 
+    def test_native_a_key_bound_to_the_project_cannot_read_the_switches(self):
+        # Review 01a18018 b1: `web-switches` checks no capability itself, so it is service-only. A key bound to
+        # this very project (a viewer's or contributor's agent key) is refused before anything is read...
+        endpoint = fixture.endpoint
+        self.assertIn('web-switches', endpoint.SERVICE_ONLY_ACTIONS)
+        people = self.people()
+        self.set_switches(review_workflow_writes=True)
+        for actor in ('viewer-agent', 'ops'):
+            with self.subTest(actor=actor), self.assertRaises(ValueError) as refusal:
+                endpoint.execute(self.root, {'project': self.pid, 'actor': actor, 'action': 'web-switches',
+                                             'args': [], 'payload': {}}, key_projects=frozenset({self.pid}))
+            self.assertEqual(str(refusal.exception), 'web-switches is available only to the web service')
+        # ...while the HTTP route, which holds CAP_COORDINATE, still answers a coordinator.
+        read = self.harness.request('GET', f'/v1/projects/{self.pid}/switches', token=people['coord1']['token'])
+        self.assertEqual(read.status, 200, read.data)
+        self.assertEqual(read.data['items'][0], dict(read.data['items'][0], name='review_workflow_writes', state='on'))
+
 
 class WebGapsTests(unittest.TestCase):
     """The task page's child form and the settings switches panel: shown on the server's word only, text only."""
