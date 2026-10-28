@@ -127,7 +127,7 @@ routes of `http_service.py`. The last column is this design, with its slice.
 | Contribute, respond | `review` | `POST .../reviews` (5833) | as today |
 | Request changes | `review` | there, for a contributor and for a credential | as today |
 | Recommend | `review` | there; refused from the author's own account | as today |
-| Approve | `review`, any name | a signed-in owner or superuser only; **never an agent**; their own work included | a coordinator, person or granted agent; never their own party's work (1a, 1b) |
+| Approve | `review`, any name | a signed-in owner or superuser only; **never an agent**; their own work included | a coordinator, person or granted agent; never their own party's work (1a, 1b), except that a granted agent may approve ANOTHER agent of its person unless the project is set to `agent_approval: by-person` (kittrial-5bb.438) |
 | Withdraw, request a review | `review` (behind the installation's `review-writes` switch) | there, behind the same switch | as today |
 | Record a verifier attestation (`attest`; `admin.py attest-delivery` reads the bundle) | `review` / the host command; a listed verifier or listed operator only, never the author's party | **refused with a sentence**: the three operations are host-only (kittrial-5bb.10 item 6) | stays on the host, by decision (see "Which actions get routes") |
 | Set or release an integration hold (`hold`, `release-hold`) | `review`; a listed operator only | **refused with the same sentence** | stays on the host, by decision (see "Which actions get routes") |

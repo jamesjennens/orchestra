@@ -108,17 +108,31 @@ class GrantTests(Grants):
         approved = self.approve(self.agent, task, contribution)
         self.assertEqual(201, approved.status, approved.data)
         self.assertEqual(self.state_of(task), 'approved')
-        # Its own party's work, with the installation's setting OFF and with it ON.
-        for setting in (False, True):
-            self.service.approval_by_another_party = setting
-            for label, token in (('the agent itself', self.agent), ('its owner', self.tokens['cora']),
-                                 ('another agent of its account', self.agent_with_id('cora', 'Egret-%s' % setting)[0])):
-                with self.subTest(setting=setting, delivered_by=label):
-                    own, mine = self.deliver(token)
-                    answer = self.approve(self.agent, own, mine)
-                    self.assertEqual(403, answer.status, answer.data)
-                    self.assertEqual(answer.data['error']['message'], OWN_PARTY_AGENT)
-                    self.assertEqual(self.state_of(own), 'awaiting-review')
+        # Its own party's work, with the installation's setting OFF and with it ON. kittrial-5bb.438: under the
+        # project's default (agent approvals by agent) ANOTHER agent of its account may be approved, never the
+        # agent itself or its account; under the strict by-person setting none of the three.
+        api = http_service.ApiHandler
+        for mode in ('by-agent', 'by-person'):
+            self.assertEqual(200, self.request('PUT', '/v1/projects/%s/agent-approval' % self.project,
+                                               {'agent_approval': mode}, token=self.tokens['olive']).status)
+            for setting in (False, True):
+                self.service.approval_by_another_party = setting
+                for label, token, sentence in (
+                        ('the agent itself', self.agent, api.SAME_AGENT[0] + api.BY_AGENT_NEXT),
+                        ('its owner', self.tokens['cora'], api.OWN_PARTY_AGENT[0] + api.BY_AGENT_NEXT),
+                        ('another agent of its account', self.agent_with_id('cora', 'Egret-%s-%s' % (mode, setting))[0],
+                         None)):
+                    if mode == 'by-person':
+                        sentence = OWN_PARTY_AGENT
+                    with self.subTest(mode=mode, setting=setting, delivered_by=label):
+                        own, mine = self.deliver(token)
+                        answer = self.approve(self.agent, own, mine)
+                        if sentence is None:
+                            self.assertEqual(201, answer.status, answer.data)
+                            continue
+                        self.assertEqual(403, answer.status, answer.data)
+                        self.assertEqual(answer.data['error']['message'], sentence)
+                        self.assertEqual(self.state_of(own), 'awaiting-review')
         self.service.approval_by_another_party = False
         # Removed: refused again at the very next request.
         other, second = self.deliver(self.tokens['carl'])
@@ -324,7 +338,8 @@ class GrantTests(Grants):
         self.backend._task(self.project, task)['assignee'] = self.ids['cora']
         refused = self.approve(self.agent, task, contribution)
         api = http_service.ApiHandler
-        self.assertEqual((403, api.OWN_PARTY_AGENT[2] + api.OWN_PARTY_AGENT[3]),
+        # Under the default agent-approval setting (kittrial-5bb.438) the account's own task still refuses.
+        self.assertEqual((403, api.OWN_PARTY_AGENT[2] + api.BY_AGENT_NEXT),
                          (refused.status, refused.data['error']['message']), refused.data)
         self.assertEqual(self.state_of(task), 'awaiting-review')
         self.backend._task(self.project, task)['assignee'] = self.ids['carl']
@@ -501,7 +516,9 @@ class GrantTests(Grants):
         worker, _ = self.worker_of('cora', 'lane-c')
         task, contribution = self.deliver(worker)
         answer = self.approve(self.agent, task, contribution)
-        self.assertEqual((answer.status, answer.data['error']['message']), (403, OWN_PARTY_AGENT))
+        # A worker credential is not another agent (kittrial-5bb.438): still the agent's party, by default too.
+        self.assertEqual((answer.status, answer.data['error']['message']),
+                         (403, http_service.ApiHandler.OWN_PARTY_AGENT[0] + http_service.ApiHandler.BY_AGENT_NEXT))
         self.assertIs(self.service.approval_by_another_party, False)
         # The person, with the setting off, still may: that is slice 1a's setting, and it is off.
         self.assertEqual(201, self.approve(self.tokens['cora'], task, contribution).status)

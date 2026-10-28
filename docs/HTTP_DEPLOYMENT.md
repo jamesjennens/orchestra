@@ -2219,16 +2219,50 @@ credential approved anything; this is the one place where that is lifted.
   grant itself stay refused, and so does the triage of requirement proposals (no
   credential records a disposition; the proposal reads keep answering `can_triage:
   false` to a granted agent).
-- **A granted agent never approves work of its own party, whatever the setting of the
-  section above says.** The party is the full one of that section: its account, that
-  account's other agents, and every name a worker credential of that account holds or has
-  held. `403`, with the sentences of that section said of the agent: "This contribution
-  was delivered by this agent's own party: its account, one of that account's agents, or
-  a name that a worker credential of that account holds or has held. An agent never
-  approves work of its own party, whatever this server's setting for people says:
-  somebody of another party who may approve here must approve it (another coordinator or
-  owner of this project, or a superuser)." A person's approval follows the setting as
+- **A granted agent never approves its own work, its account's own work, or work under a
+  worker credential of its account, whatever the setting of the section above says.**
+- **By default it MAY approve the work of ANOTHER personal agent of the same account**
+  (kittrial-5bb.438, at James's direction: "the coordinator is different from the worker").
+  - That is the project's setting `agent_approval: by-agent`.
+  - An owner may switch a project to the strict `by-person`. There, the party is the full one
+    of the section above: its account, that account's other agents, and every name a worker
+    credential of that account holds or has held.
+- **What a refusal says:**
+  - `403`, by default: "This contribution was delivered by this agent itself." (or "This task
+    is assigned to this agent itself.", or the own-party sentences below for its account or a
+    worker credential), followed by: "On this project a coordinator agent may approve the work
+    of another agent of the same person (agent approvals: by agent), but never its own work,
+    its person's own work, or work under a worker credential of that person: somebody of
+    another party who may approve here must approve it (another coordinator or owner of this
+    project, or a superuser)."
+  - `403`, under `by-person`, the sentences of that section said of the agent: "This
+    contribution was delivered by this agent's own party: its account, one of that account's
+    agents, or a name that a worker credential of that account holds or has held. An agent
+    never approves work of its own party, whatever this server's setting for people says:
+    somebody of another party who may approve here must approve it (another coordinator or
+    owner of this project, or a superuser)."
+- **People are not affected:** a person's approval follows the installation's setting as
   before.
+- **The setting:** `PUT /v1/projects/{id}/agent-approval` with
+  `{"agent_approval": "by-agent" | "by-person"}`.
+  - Who may change it: an owner of the project or a superuser, by session. Anybody else gets
+    `403`, and a credential never may, so no agent sets the rule that judges it.
+  - What is recorded: who set it and when, audited as `projects.agent_approval`.
+  - Where it shows: `GET /v1/projects/{id}` answers `agent_approval` (`mode`, `set_by`,
+    `set_by_display_name`, `set_at`) and `can_set_agent_approval`, and Members & settings has
+    an "Approvals by coordinator agents" panel.
+  - Damage: a damaged stored value reads as the strict `by-person` (with `damaged: true`), never
+    as the default.
+  - Storage: it lives in this service's state and only the web route applies it. The host route
+    compares actor names, so over ssh an agent of the same person was never refused, and a
+    project set to `by-person` here is not strict over ssh.
+- **An approval only this setting let through says so.**
+  - The web service appends to its summary: "Approved by a coordinator agent of the same person
+    as the agent that delivered it (project setting agent_approval: by-agent)."
+  - The audit event of the review write carries `same_person_coordinator: true`, the author,
+    the assignee, the mode, and who set it (or `default`) and when.
+  - If the caller's summary leaves no room for that sentence within the 1200-character bound,
+    the route answers `422` and says how many characters to cut. Nothing is written.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
   the grant is removed; the account is made a contributor or a viewer; the account is
@@ -2306,7 +2340,10 @@ project's settings page lists "Agents in this project" for an owner with a "Make
 coordinator" or "Remove grant" button on each row, and shows the server's sentence when a
 grant is refused. `GET /v1/agents/me/next` tells a granted agent of a contribution by
 another account "You hold the coordinator grant in this project: review it, then approve
-it or request changes", and never lists its own party's work for approval.
+it or request changes". It never lists its own party's work for approval, except the work of
+another agent of its account under the project's default `agent_approval: by-agent`
+(kittrial-5bb.438), which it lists as "A contribution by another agent of your person awaits
+review.".
 
 Like the setting above, this is the web route's: an approval on the host route
 (`endpoint.py` over SSH, or run on the server) knows no accounts and no grants.

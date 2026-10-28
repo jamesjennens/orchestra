@@ -6662,6 +6662,60 @@ class ApiHandler(BaseHTTPRequestHandler):
         'another party who may approve here must approve it (another coordinator or owner of this project, or a '
         'superuser).')
 
+    #: An agent approving under the project's default ``by-agent`` setting (kittrial-5bb.438): it may approve
+    #: another agent of its person, never itself, its person or its person's worker credentials.
+    SAME_AGENT = ('This contribution was delivered by this agent itself.',
+                  'This task is assigned to this agent itself.')
+    BY_AGENT_NEXT = (' On this project a coordinator agent may approve the work of another agent of the same person '
+                     '(agent approvals: by agent), but never its own work, its person\'s own work, or work under a '
+                     'worker credential of that person: somebody of another party who may approve here must approve '
+                     'it (another coordinator or owner of this project, or a superuser).')
+    #: Added to the summary of an approval that only this setting let through, so the record says so.
+    SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
+                            '(project setting agent_approval: by-agent).')
+    SUMMARY_MAX = 1200                 # review_workflow.TEXT_LIMITS['summary']
+
+    def _another_agent_only(self, agent_id, names, parties, project):
+        """Whether every one of ``parties`` of the approver's party is ANOTHER agent of its person (kittrial-5bb.438).
+
+        True when nothing of its party is there at all, or only other personal agents of the same account;
+        False as soon as one is the agent itself, its account, or a worker credential's name of that account.
+        """
+        for target in parties:
+            if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
+                continue
+            if not self.service.other_agent_of_same_person(agent_id, target):
+                return False
+        return True
+
+    def _agent_approval_refusal(self, principal, names, assignee, author, project):
+        """``(refusal or None, setting)`` for an agent approver the party rule refused (kittrial-5bb.438).
+
+        Only asked once :meth:`_own_party_refusal` has refused an AGENT, which holds an effective
+        coordinator grant (a credential has ``approve`` through nothing else). Under the project's
+        ``by-person`` setting that refusal stands. Under ``by-agent``, the default, each of the author and
+        the assignee that is of the agent's party is let through only when it is ANOTHER personal agent of
+        the same person; the agent itself, its person and its person's worker credentials still refuse.
+        """
+        setting = self.service.agent_approval(project)
+        if setting['mode'] != 'by-agent':
+            return self._own_party_refusal(names, assignee, author, project, True), setting
+        own, shared_name, held, _ = self.OWN_PARTY_AGENT
+        agent_id = principal.agent_id if isinstance(principal.agent_id, str) else ''
+        for target, is_author in ((author, True), (assignee, False)):
+            if not isinstance(target, str) or not target or self._independent_all(names, [target], project, True):
+                continue
+            if self.service.other_agent_of_same_person(agent_id, target):
+                continue
+            if agent_id and target.split('/', 1)[0].casefold() == agent_id.casefold():
+                first = self.SAME_AGENT[0 if is_author else 1]
+            elif is_author:
+                first = shared_name % target if len(self.service.actor_parties(target, project, True)) > 1 else own
+            else:
+                first = held
+            return first + self.BY_AGENT_NEXT, setting
+        return None, setting
+
     def _own_party_refusal(self, names, assignee, author, project, agent=False):
         """The sentence for an approver whose party the work is, or None when it is not.
 
@@ -8806,7 +8860,42 @@ class ApiHandler(BaseHTTPRequestHandler):
         # Settings page also learns whether this caller may change it.
         result['claiming'] = self._claiming_state(ctx.params['pid'])
         result['can_coordinate'] = self._guidance_can_coordinate(ctx)
+        # How a coordinator agent is judged when it approves (kittrial-5bb.438), and whether this
+        # caller may change it: the same live CAP_PROJECT_ADMIN check the PUT route makes.
+        result['agent_approval'] = self.service.agent_approval(ctx.params['pid'])
+        result['can_set_agent_approval'] = self._may_set_agent_approval(ctx)
         return 200, result
+
+    def _may_set_agent_approval(self, ctx):
+        if ctx.principal is None or ctx.principal.via == 'credential':
+            return False
+        try:
+            self.service.check_authority(ctx.principal, ctx.params['pid'], CAP_PROJECT_ADMIN)
+            return True
+        except HttpError:
+            return False
+
+    @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/agent-approval')
+    def project_agent_approval(self, ctx):
+        """Set how a coordinator agent is judged when it approves (kittrial-5bb.438).
+
+        ``by-agent`` (the default) lets an agent holding the coordinator grant approve the work of
+        ANOTHER agent of the same person; ``by-person`` is the strict rule (every agent of a person is
+        one party). An owner of the project or a superuser, by session: never a credential, so no agent
+        sets the rule that judges it. The write records who set it and when, and is audited.
+        """
+        payload = ctx.payload if isinstance(ctx.payload, dict) else {}
+        if set(payload) != {'agent_approval'}:
+            raise invalid('Send exactly the field to change: agent_approval')
+        value = payload['agent_approval']
+        if value not in ('by-agent', 'by-person'):
+            raise invalid("agent_approval must be 'by-agent' or 'by-person'")
+
+        def update():
+            result = self.service.set_agent_approval(ctx.principal, ctx.params['pid'], value)
+            return result, result
+        return self._mutate(ctx, 'projects.agent_approval', ctx.params['pid'], update,
+                            capability=CAP_PROJECT_ADMIN, audit_metadata={'agent_approval': value})
 
     @route('PUT', r'/v1/projects/(?P<pid>' + ID + r')/claiming')
     def project_claiming(self, ctx):
@@ -10031,20 +10120,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         approves = self.service.agent_approves(agent_id, project_id)
         if not may_review and not approves:
             return []
+        # kittrial-5bb.438: under the project's default agent-approval setting a granted agent may approve the
+        # work of ANOTHER agent of its person, so that work is offered to it too (and only to it, for approval).
+        by_agent = approves and self.service.agent_approval(project_id)['mode'] == 'by-agent'
         actions = []
         for row in rows:
             if row.get('review_state') != 'awaiting-review' or row.get('status') == 'closed':
                 continue
-            if not self._independent([actor], [row.get('assignee'), row.get('contribution_author')], project_id):
+            parties = [row.get('assignee'), row.get('contribution_author')]
+            same_person = by_agent and self._another_agent_only(agent_id, [actor], parties, project_id)
+            if not same_person and not self._independent([actor], parties, project_id):
                 continue
             recommended_by = [name for name in row.get('recommended_by') or [] if isinstance(name, str)]
             if approves:
                 # It holds the coordinator grant here (kittrial-5bb.209): the decision is its own. It is
-                # never shown its own party's work for it: that approval would be refused.
-                if not self._independent([actor], [row.get('assignee'), row.get('contribution_author')], project_id, True):
+                # never shown its own party's work for it, that approval would be refused, except the work
+                # of another agent of its person under the default agent-approval setting (kittrial-5bb.438).
+                if not same_person and not self._independent([actor], parties, project_id, True):
                     continue
                 kind, count, who = 'to-review', 'to_review', 'agent'
                 reason = (('A reviewer recommends approving this contribution. ' if recommended_by else
+                           'A contribution by another agent of your person awaits review. ' if same_person and
+                           not self._independent([actor], parties, project_id, True) else
                            'A contribution by another account awaits review. ')
                           + 'You hold the coordinator grant in this project: review it, then approve it or request '
                             'changes.')
@@ -13146,6 +13243,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise invalid('Unsupported review payload field(s) for %s: %s'
                               % (operation, unsupported_fields_text(unknown)))
 
+        same_person = {}                   # filled when only the agent-approval setting let it through
+
         def add():
             delivered = (current.get('review') or {}).get('contribution') or {} if current else {}
             pid = ctx.params['pid']
@@ -13154,8 +13253,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # account behind the contribution's author and behind the task's assignee. A
                 # superuser is bound like anybody else for their own party's work.
                 actor = payload.get('actor') or ctx.principal.actor or ctx.principal.user_id
-                refusal = self._own_party_refusal([actor, ctx.principal.user_id], (current.get('task') or {}).get('assignee'),
-                                                  delivered.get('author'), pid, by_agent)
+                names = [actor, ctx.principal.user_id]
+                assignee = (current.get('task') or {}).get('assignee')
+                refusal = self._own_party_refusal(names, assignee, delivered.get('author'), pid, by_agent)
+                if refusal and by_agent:
+                    # kittrial-5bb.438: a coordinator agent may approve ANOTHER agent of its person unless the
+                    # project's owner chose the strict rule. Read here, inside the mutation, every time.
+                    refusal, setting = self._agent_approval_refusal(ctx.principal, names, assignee,
+                                                                    delivered.get('author'), pid)
+                    if refusal is None:
+                        summary = payload.get('summary')
+                        if isinstance(summary, str):
+                            joined = (summary.rstrip() + ' ' if summary.strip() else '') + self.SAME_PERSON_APPROVAL
+                            over = len(joined) - self.SUMMARY_MAX
+                            if over > 0:
+                                raise invalid('This approval is allowed by the project\'s agent-approval setting, and '
+                                              'its summary must then say so in a sentence of %d characters; shorten '
+                                              'the summary by %d characters and send it again'
+                                              % (len(self.SAME_PERSON_APPROVAL), over))
+                            payload['summary'] = joined
+                        same_person.update(same_person_coordinator=True, author=delivered.get('author'),
+                                           assignee=assignee, agent_approval=setting['mode'],
+                                           agent_approval_set_by=setting.get('set_by') or 'default',
+                                           agent_approval_set_at=setting.get('set_at'))
                 if refusal:
                     raise forbidden(refusal)
             if recommending:
@@ -13226,7 +13346,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = http_open_items_advice(result, ctx.params['pid'], ctx.params['tid'])
             return result, result
         return self._mutate(ctx, 'reviews.add', ctx.params['pid'], add, status=201,
-                            capability=capability, serialize=False, canonical=True)
+                            capability=capability, serialize=False, canonical=True,
+                            audit_metadata=same_person)
 
     #: Said to somebody whose own party (themselves, their owner, their owner's other agent)
     #: has a standing recommendation for the contribution. It names the two ways on from there.

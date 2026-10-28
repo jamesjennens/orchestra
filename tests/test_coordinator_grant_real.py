@@ -96,13 +96,40 @@ class RealStackTests(held.RealStackTests):
         self.assertEqual([self.agent_actor], [author for author, _ in written], written)
         self.assertIn('"operation":"approve"', written[0][1].replace(' ', ''))
 
+    def test_another_agent_of_its_person_is_approved_and_bd_holds_the_basis(self):
+        """kittrial-5bb.438 through the real endpoint: by default cora's coordinator agent approves the work of
+        her other agent, written under its own name with the basis in the summary; strict, it writes nothing."""
+        self.assertEqual(200, self.grant().status)
+        made = self.request('POST', '/v1/agents', {'name': 'Egret', 'working_directory': '/home/x/egret', 'projects': ['pp']},
+                            token=self.tokens['cora'])
+        self.assertEqual(201, made.status, made.data)
+        self.tokens['egret'] = made.data['credential']['secret']
+        task, contribution = self.deliver('egret')
+        before = self.comments(task)
+        approved = self.approve(self.agent, task, contribution)
+        self.assertEqual(201, approved.status, approved.data)
+        self.assertEqual('awaiting-integration', self.review(task)['state'])
+        written = self.comments(task)[len(before):]
+        self.assertEqual([self.agent_actor], [author for author, _ in written], written)
+        self.assertIn(http_service.ApiHandler.SAME_PERSON_APPROVAL, written[0][1])
+        strict = self.request('PUT', '/v1/projects/pp/agent-approval', {'agent_approval': 'by-person'},
+                              token=self.tokens['alex'])
+        self.assertEqual(200, strict.status, strict.data)
+        task, contribution = self.deliver('egret')
+        before = self.comments(task)
+        refused = self.approve(self.agent, task, contribution)
+        self.assertEqual((403, OWN_PARTY_AGENT), (refused.status, held.message(refused)), refused.data)
+        self.assertEqual(before, self.comments(task))
+
     def test_its_own_accounts_work_and_the_grant_removed(self):
         self.assertEqual(200, self.grant().status)
         # cora's own contribution: her agent is refused though the installation's setting is off.
         self.assertFalse(self.service.approval_by_another_party)
         own, mine = self.deliver('cora')
         refused = self.approve(self.agent, own, mine)
-        self.assertEqual((403, OWN_PARTY_AGENT), (refused.status, held.message(refused)), refused.data)
+        # kittrial-5bb.438: the person's own work stays the agent's party under the default setting too.
+        self.assertEqual((403, http_service.ApiHandler.OWN_PARTY_AGENT[0] + http_service.ApiHandler.BY_AGENT_NEXT),
+                         (refused.status, held.message(refused)), refused.data)
         self.assertEqual('awaiting-review', self.review(own)['state'])
         # cora herself, signed in, approves it as before: the setting is off.
         self.assertEqual(201, self.approve(self.tokens['cora'], own, mine).status)

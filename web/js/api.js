@@ -502,6 +502,8 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     setRepository: (pid, repository) => mutate('PATCH', `/v1/projects/${pid}`, { repository }),
     // The per-project claiming setting (kittrial-5bb.352): owners and coordinators set it.
     setProjectClaiming: (pid, claiming) => mutate('PUT', `/v1/projects/${pid}/claiming`, { claiming }),
+    // kittrial-5bb.438: how a coordinator agent is judged when it approves. An owner only.
+    setAgentApproval: (pid, mode) => mutate('PUT', `/v1/projects/${pid}/agent-approval`, { agent_approval: mode }),
     // Superuser only: the records this server will not serve, to confirm or archive.
     unconfirmedProjects: () => call('GET', '/v1/projects/unconfirmed'),
     confirmProject: (pid) => mutate('POST', `/v1/projects/${pid}/confirm`, {}),
