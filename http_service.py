@@ -10786,11 +10786,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                                          ctx.idempotency_key, target=ctx.route_target,
                                          authorize=ctx.authorize, capability=CAP_COORDINATE)
             return result, result
-        # A decision refused by native validation is answered with create-child's own sentence, which names
-        # the required headings (coordination.validation_hint).
-        return self._mutate(ctx, 'tasks.create-child', ctx.params['pid'], create, status=201,
-                            capability=CAP_COORDINATE, serialize=False, canonical=True,
-                            audit_metadata={'task': ctx.params['tid']})
+        try:
+            return self._mutate(ctx, 'tasks.create-child', ctx.params['pid'], create, status=201,
+                                capability=CAP_COORDINATE, serialize=False, canonical=True,
+                                audit_metadata={'task': ctx.params['tid']})
+        except HttpError as error:
+            # create-child's refusal names the required headings (coordination.validation_hint), but the
+            # endpoint's detail bound can cut that sentence off. The same sentence goes in `problems`, on
+            # the same gate validation_hint uses: a refusal about sections, for a type that has them.
+            from coordination import template_requirement
+            hint = template_requirement(payload['type'])
+            if error.status == 422 and hint and 'section' in str(error.detail or '').lower():
+                error.problems = [hint]
+            raise
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/switches')
     def project_switches(self, ctx):

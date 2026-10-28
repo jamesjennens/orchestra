@@ -257,7 +257,11 @@ class NativeWebCoordinatorGapsTests(_GapsMixin, RulesHelpers, unittest.TestCase)
         bare = self.child(coordinator, parent, {'title': 'Pick one', 'description': 'No headings.', 'type': 'decision'},
                           'child-decision-bare')
         self.assertEqual(bare.status, 422, bare.data)
-        self.assertIn('## Decision', json.dumps(bare.data))
+        self.assertIn('missing required sections', bare.data['error']['detail'])
+        # The endpoint's detail bound can cut the kit's heading sentence off (real bd, 8f7f085), so it is
+        # given whole in `problems`.
+        self.assertEqual(bare.data['error']['problems'],
+                         ['Required decision section headers: ## Decision, ## Rationale, ## Alternatives Considered.'])
         full = self.child(coordinator, parent, {'title': 'Pick one', 'type': 'decision', 'description':
                           '## Decision\nB.\n\n## Rationale\nCheaper.\n\n## Alternatives Considered\nA.\n'},
                           'child-decision-full')
