@@ -108,7 +108,8 @@ A link counts only when **both** sides have accepted their record:
   the side counting. The web accept and retire routes refuse anyone else for a `program.` key.
 - **Follow-up, not in this slice:** letting an owner delegate the acceptance through a `delegation-v1` record, as
   record acceptance is delegated today (delegations.py).
-- **The statement's lines:** `Area: <area>` or `Program: <program>`, then `State: in` or `State: left`. A
+- **The statement's lines:** exactly `Area: <area>` or `Program: <program>`, then `State: in` or `State: left`,
+  with no second State line and nothing beyond (review N3). A
   `program.` key is written only as one of the two links, with these lines and a `decision` authority.
 - **States:** `linked`, `one-sided`, `left` and `proposed`.
   - `left` is the program side saying so, or its record superseded.

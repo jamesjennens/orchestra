@@ -68,10 +68,10 @@ PROGRAM_LINKS = (
     'If this project is in a program: a program link grants nothing. You read an area, or the program, '
     'only as its member, through the usual routes; a program coordinator who is not a member of an area '
     'reads nothing in it. A link is two reference entries with a decision authority: program.area.AREA in '
-    'the program project and program.member-of in the area project, each opening with an "Area: AREA" or '
-    '"Program: PROGRAM" line and a "State: in" or "State: left" line. Propose or revise them; only a '
-    "person owner of each project accepts them, because joining or leaving is the owner's decision. Read "
-    'them with GET /v1/projects/PROJECT/program-links.')
+    'the program project and program.member-of in the area project, each exactly two lines: "Area: AREA" '
+    'or "Program: PROGRAM", then "State: in" or "State: left". Propose or revise them; only a person '
+    "owner of each project accepts them, because joining or leaving is the owner's decision. Read them "
+    'with GET /v1/projects/PROJECT/program-links.')
 #: The coordinator-only paragraph on notes between coordinators (kittrial-5bb.447), with the wait loop for an
 #: agent without the Bridge. Word for word with web/js/agentSetup.js COORDINATOR_NOTES (pinned by
 #: tests/test_coordinator_notes.py).

@@ -26,8 +26,8 @@ from test_reference_records import OPERATOR
 AT = '2026-01-01T00:00:00Z'      # a stored acceptance time, passed through; never compared with a clock
 
 
-def statement(label, project, state='in', rest='Joined by the owner.'):
-    return '%s: %s\nState: %s\n\n%s' % (label, project, state, rest)
+def statement(label, project, state='in'):
+    return '%s: %s\nState: %s' % (label, project, state)
 
 
 def item(key, text, by, state='accepted', authority=True, proposed=None):
@@ -52,11 +52,11 @@ class WriteRuleTests(unittest.TestCase):
             (self.payload('program.lead', statement('Area', 'north')), pl.KEYS_SENTENCE),
             (self.payload('program.area.n', statement('Area', 'n')), pl.KEYS_SENTENCE),          # not a host name
             (self.payload('program.area.north', statement('Area', 'north'), authority=False), pl.AUTHORITY_SENTENCE),
-            (self.payload('program.area.north', 'Area: north'), 'opens with two lines'),
+            (self.payload('program.area.north', 'Area: north'), 'is exactly two lines'),
             (self.payload('program.area.north', statement('Area', 'south')), 'must name the area of the key, north'),
-            (self.payload('program.area.north', statement('Area', 'north', state='maybe')), 'opens with two lines'),
-            (self.payload('program.member-of', statement('Area', 'prog')), 'opens with two lines: "Program:'),
-            (self.payload('program.member-of', 'State: in\nProgram: prog'), 'opens with two lines'),
+            (self.payload('program.area.north', statement('Area', 'north', state='maybe')), 'is exactly two lines'),
+            (self.payload('program.member-of', statement('Area', 'prog')), 'is exactly two lines: "Program:'),
+            (self.payload('program.member-of', 'State: in\nProgram: prog'), 'is exactly two lines'),
         ]
         for payload, words in cases:
             problem = pl.write_problem(payload)
@@ -70,6 +70,14 @@ class WriteRuleTests(unittest.TestCase):
         self.assertEqual(pl.SELF_SENTENCE, pl.write_problem(self.payload('program.member-of', statement('Program', 'north')),
                                                             project_id='north'))
         self.assertIsNone(pl.write_problem(self.payload('program.area.north', statement('Area', 'north')), project_id='prog'))
+
+    def test_a_statement_is_exactly_its_two_lines(self):
+        # Review of kittrial-5bb.446, N3: no second State line and nothing beyond the fixed lines, at write and read.
+        for text in ('Area: north\nState: in\nState: left', 'Area: north\nState: in\n\nAdmitted by the owner.',
+                     'Area: north\nState: in\n', 'Area: north\nArea: south\nState: in'):
+            self.assertIn('is exactly two lines', pl.write_problem(self.payload('program.area.north', text)), repr(text))
+            stored = item('program.area.north', text, 'ops-james')
+            self.assertEqual((None, 'statement'), pl.side_status(stored, 'prog', 'north', {}, {}), repr(text))
 
     def test_good_links_other_keys_and_accept_or_retire_pass(self):
         for payload in (self.payload('program.area.north', statement('Area', 'north')),
@@ -141,7 +149,7 @@ class RecordTests(DecisionCase):
         self.assertIn(pl.KEYS_SENTENCE, str(refused.exception))
         with self.assertRaises(ValueError) as refused:
             self.link('program.area.north', 'no lines here', 'prog-bad-2')
-        self.assertIn('opens with two lines', str(refused.exception))
+        self.assertIn('is exactly two lines', str(refused.exception))
         if before is not None:
             self.assertEqual(before, len(self.native.rows))
 
@@ -458,7 +466,7 @@ class NativeLinkTests(RulesHelpers, unittest.TestCase):
         refused = h.request('POST', refs, body, token=coord, key='pl-bad-1')
         self.assertEqual(422, refused.status, refused.data)
         self.assertIn('kept for program links', refused.data['error']['message'])
-        body.update(key='program.area.north', statement='Area: north\nState: in\n\nAdmitted by the owner.')
+        body.update(key='program.area.north', statement='Area: north\nState: in')
         proposed = h.request('POST', refs, body, token=coord, key='pl-propose-1')
         self.assertEqual(201, proposed.status, proposed.data)
         read = h.request('GET', '/v1/projects/pp/program-links', token=coord)

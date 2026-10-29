@@ -3,9 +3,9 @@
 Slice 1 of docs/design/PROGRAM_DESIGN.md (sections 2 and 9.1). A program is an ordinary project. An area
 project joins it through two reference entries with a ``decision`` authority, one on each side:
 
-* ``program.area.<area>`` in the program project, whose statement opens with ``Area: <area>`` and
+* ``program.area.<area>`` in the program project, whose statement is exactly ``Area: <area>`` and
   ``State: in`` (or ``State: left``);
-* ``program.member-of`` in the area project, whose statement opens with ``Program: <program>`` and the same
+* ``program.member-of`` in the area project, whose statement is exactly ``Program: <program>`` and the same
   ``State:`` line.
 
 Joining or leaving is the project owner's decision (design section 2.2), so a side counts only when the live
@@ -49,12 +49,13 @@ def side_of(key):
 
 
 def statement_lines(statement, label):
-    """``(named project, 'in' or 'left')`` from a link statement's first two lines, or a ValueError."""
+    """``(named project, 'in' or 'left')`` from a link statement, which is exactly its two lines: no second State
+    line and nothing beyond them (review of kittrial-5bb.446, N3). Anything else is a ValueError."""
     lines = statement.split('\n') if isinstance(statement, str) else []
     named = re.fullmatch(r'%s: (%s)' % (label, PROJECT), lines[0]) if lines else None
     state = STATE_LINE.fullmatch(lines[1]) if len(lines) > 1 else None
-    if not named or not state:
-        raise ValueError('A program link statement opens with two lines: "%s: <project>" and "State: in" or '
+    if not named or not state or len(lines) != 2:
+        raise ValueError('A program link statement is exactly two lines: "%s: <project>" and "State: in" or '
                          '"State: left"' % label)
     return named.group(1), state.group(1)
 

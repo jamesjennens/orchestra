@@ -396,8 +396,10 @@ program; nothing yet reads across it.
   - an area coordinator usually joins the program project as a contributor;
   - the program coordinator usually joins each area as a viewer, or as a coordinator where its owner delegates.
 - **A link is two reference entries with a `decision` authority:**
-  - in the program project, `program.area.AREA`, whose statement opens with `Area: AREA` and `State: in`;
-  - in the area project, `program.member-of`, whose statement opens with `Program: PROGRAM` and `State: in`.
+  - in the program project, `program.area.AREA`, whose statement is exactly two lines, `Area: AREA` and
+    `State: in`;
+  - in the area project, `program.member-of`, whose statement is exactly two lines, `Program: PROGRAM` and
+    `State: in`.
   - `AREA` and `PROGRAM` are host project names. Each authority names the decision issue in which that
     project's owner decided.
   - Any other `program.` key is refused, and so is a link without these lines or without a decision authority.
