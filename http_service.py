@@ -9173,7 +9173,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                      # Whether this reader may read another member's walkthrough (an owner or a coordinator, by
                      # session): the page offers its member picker only then (review of kittrial-5bb.442, note 2).
                      'can_choose_person': principal.via != 'credential' and holds(CAP_COORDINATE),
-                     'can_acknowledge_note': bool(note) and not note['acknowledged'] and tier in ('self', 'agent'),
+                     # The acknowledge route's own rule (review of kittrial-5bb.443, B2): an agent without an effective
+                     # grant here is not offered what the route would refuse.
+                     'can_acknowledge_note': (bool(note) and tier in ('self', 'agent')
+                                              and self.service.may_acknowledge_handover_note(principal, pid)),
                      'generated_at': now_iso(self.service._now())}
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/handover/note')

@@ -817,7 +817,7 @@ page or route that fixes it. It writes nothing, and the page changes nothing its
   - `GET .../handover/note`: any member. Answers the current version and the older ones by number.
   - `POST .../handover/note/acknowledge` with `{version}`: the person it is for, or their agent holding an effective grant. Only the current version: an older one is `409`.
 - **Bounds:**
-  - text is 1-8,000 characters, by the kit's shared plain-text rule;
+  - text is 1-8,000 characters (code points: the page counts them the same way), by the kit's shared plain-text rule;
   - `for_person` must be a member;
   - the last 20 versions are kept, and drops are counted and audited.
 - **Where it shows:**
