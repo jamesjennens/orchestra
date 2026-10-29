@@ -93,6 +93,11 @@ class SendTests(NoteCase):
     def test_two_areas_of_one_program_write_to_each_other(self):
         self.assertEqual(201, self.send(self.tokens['nora'], 'north', 'south').status)
         self.assertEqual(201, self.send(self.tokens['sam'], 'south', 'north').status)
+        # An area that joined but that the program never admitted is no sibling, and no area writes to itself.
+        from test_reference_records import OPERATOR
+        self.links['east'] = [item(pl.MEMBER_OF, statement('Program', 'prog'), OPERATOR)]
+        for to in ('east', 'north'):
+            self.assertEqual(404, self.send(self.tokens['nora'], 'north', to).status, to)
 
     def test_every_refusal_of_the_address_is_the_same_404_whatever_the_sender_can_read(self):
         for pid in ('east', 'west'):
@@ -188,6 +193,7 @@ class ReadTests(NoteCase):
         # read, for everyone who is not a coordinator (owners included) of prog or north.
         secret = 'only-for-the-coordinators-of-prog-and-north'
         self.assertEqual(201, self.send(self.tokens['cleo'], text=secret).status)
+        self.assertEqual(201, self.send(self.tokens['nora'], 'north', 'prog', text=secret).status)
         program_isolation.assert_text_hidden(
             self, self.request, secret,
             {'prog contributor': self.tokens['carl'], 'prog contributor, north viewer': self.tokens['vera'],
@@ -273,8 +279,15 @@ class WakeTests(NoteCase):
                                  self.wait(self.tokens['kite'], 'coordinator')['fingerprint']))
 
     def test_no_other_agent_is_woken(self):
+        # A note to north wakes nobody of prog's; a note to prog wakes Rook (granted there) and never Wren, who is
+        # in prog without a grant.
         self.send(self.tokens['cleo'])
         for name in ('rook', 'wren'):
+            body = self.next_(self.tokens[name])
+            self.assertIsNone(body['coordinator_notes_marker'], name)
+        self.send(self.tokens['nora'], 'north', 'prog')
+        self.assertIsNotNone(self.next_(self.tokens['rook'])['coordinator_notes_marker'])
+        for name in ('wren',):
             body = self.next_(self.tokens[name])
             self.assertIsNone(body['coordinator_notes_marker'], name)
             self.assertNotIn('coordinator-note', [a['kind'] for a in body['next_actions']], name)
