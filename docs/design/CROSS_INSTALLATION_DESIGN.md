@@ -4,7 +4,9 @@ Status: **design only**, kittrial-5bb.448. No cross-installation transport, key 
 importer or permission change is implemented by this note. Plan VERIFIED in coordinator
 comment `01a189cf-ab8a-75b1-ae74-b2f12f5abd7b` (2026-10-29), including Q1–Q3,
 the private GitHub mailbox option and the two ownership cases. An independent security
-review and separate implementation authorization remain prerequisites.
+review and separate implementation authorization remain prerequisites. R2 addresses review
+`01a189df-722f-75c4-a2ee-99a74b57a943`: the route is retained; crypto, credential
+custody, note projection and manual freshness are made explicit.
 
 ## 1. One-page decision summary
 
@@ -14,6 +16,8 @@ outgoing files and pulls incoming ones over its approved outbound connection; ne
 exposes an Orchestra service to the other. Start with person-approved transfers, then
 add scheduled collection only after the same verifier and recovery rules pass review.
 Manual carriage is the recovery path for the same files, not a second authority model.
+Each manual exchange requires the owner's recorded live-contact approval for that
+exchange on both sides; a slowly carried file cannot pass the normal ten-minute check.
 This changes the provisional human-carried recommendation because the coordinator
 confirms the office already downloads private release assets with `gh` (§2, E1).
 It does **not** establish permission or connectivity for uploads, unattended credentials,
@@ -44,7 +48,8 @@ small, intentionally shared payload; signing is not permission to disclose it (�
 Signatures prove possession of a pinned installation key. They do not prove the sender
 still has a remote coordinator grant, or that a snapshot is complete or current. Both
 sides check local authority, sharing consent and known revocations on every new action.
-A fresh, receiver-challenged peer status bounds remote evidence; stale, unknown or
+A recent reply to a one-use check sent by the receiving installation limits how long
+remote evidence may be treated as current; stale, unknown or
 unreliable freshness means **no new actionable import**. Disconnection cannot promise
 instant revocation. Historical material remains labelled historical, never silently live (§7).
 
@@ -57,8 +62,7 @@ decision. Wake local coordinators by pointer only (§§7–9).
 Build in five reviewable slices: trust and verifier; manual note exchange; restricted
 private-release transport; remote program declarations; selected interface snapshots.
 No slice may relax local access checks. The future adversarial matrix in §11 is a design
-acceptance specification, not tests run for this note. Existing seven pins are delivery
-checks only. No runtime implementation or deployment is authorized here (§10).
+acceptance specification, not tests run for this note. The seven existing regression-test modules are delivery checks only. No runtime implementation or deployment is authorized here (§10).
 
 ## 2. Evidence, scope and present boundaries
 
@@ -90,7 +94,11 @@ supply arbitrary collaborator read-only roles; and
 [`gh release download`](https://cli.github.com/manual/gh_release_download) downloads assets.
 These establish tool/access concepts, not the office's complete network allowlist.
 Use owner-reviewed organization repository roles when reader/writer separation is needed;
-verify the actual account and token configuration before deployment.
+verify the actual account and token configuration before deployment. GitHub also offers
+[immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases),
+which protect published assets and tags against modification. They are an option for
+mailbox integrity, not sender authentication, freshness, delivery or permission to retain
+private files indefinitely. Evaluate their retention/deletion constraints before enabling.
 
 Search basis: inspected M's `docs/design/PROGRAM_DESIGN.md`, authority modules and
 repository searches for `installation_id`, `federation`, `mailbox`, `ed25519`, `signature`
@@ -112,16 +120,30 @@ connection does not supply that permission. No option may tunnel around office p
 | Dedicated relay/mailbox service | Both sides can use outbound TLS to an agreed service; no inbound peer port. Requires a new reachable endpoint, identities, storage and support. | Relay sees routing/size/timing and plaintext unless envelopes are encrypted. Scoped mailboxes still need application verification. | Can delay/drop/replay; availability and cleanup become a new service obligation. Not justified as the first additional service when GitHub delivery is already used. |
 | Signed exports/imports carried by people | No service-to-service connection; an approved removable-file or document-transfer route must exist. Offline works only as far as freshness checks allow. | The carrier and file copies see metadata; encryption still required for private payloads. Copying an entire backup is forbidden. | High manual approval, receipt and reconciliation cost; delayed revocation and human mistakes. Useful first verifier exercise and outage recovery, unsuitable as the normal recurring conversation mechanism if the private mailbox passes policy checks. |
 | Pull of a published read-only view | Reader reaches an approved publisher; no sender writes to the reader. Public GitHub can carry expressly public snapshots only. A private publisher needs approved authenticated access. | Publication exposes the selected view to every permitted reader; public publication is irrevocably public. A view is not a conversation or acceptance authority. | Need signed version/freshness metadata; rollback/withholding remain possible. Low reader burden; no acknowledgement/reply without adding another channel. Good later distribution pattern for intentionally public interfaces. |
-| **Private GitHub repository/releases as signed-envelope mailbox** | Existing private download path is evidence for one direction only. Test approved upload, listing, API/asset redirects, authentication and proxy/CA handling with synthetic files on the actual office host. No inbound Orchestra listener. | Named people only; repository roles are not per-project Orchestra roles. Provider/admins and authorized repository parties see metadata. Opaque filenames plus recipient encryption reduce content exposure, not traffic analysis. | Repository/token access can be removed; copies and earlier reads cannot be recalled. Writers may replace/delete assets, so verification and durable local receipts are essential. Avoid source-history retention of envelopes; release assets still require explicit retention/backup review. Reuses a familiar artifact route but adds credential, quota, queue and recovery operations. **Recommended, conditional on the checks below.** |
+| **Private GitHub repository/releases as signed-envelope mailbox** | Existing private download path is evidence for one direction only. Test approved upload, listing, API/asset redirects, authentication and proxy/CA handling with synthetic files on the actual office host. No inbound Orchestra listener. | Named people only; repository roles are not per-project Orchestra roles. Provider/admins and authorized repository parties see metadata. Opaque filenames plus recipient encryption reduce content exposure, not traffic analysis. | Repository/token access can be removed; copies and earlier reads cannot be recalled. Mutable releases allow writers to replace/delete assets; immutable releases are an optional stronger publication boundary. In either mode verification and durable local receipts are essential. Avoid source-history retention of envelopes; release assets still require explicit retention/backup review. Reuses a familiar artifact route but adds credential, quota, queue and recovery operations. **Recommended, conditional on the checks below.** |
 
 Prefer a dedicated mailbox per owner pair and sensitivity boundary, not the public kit
 repository, a general shared engineering repository, or one global mailbox for all peers.
 More than two owners need separate approved channels; never relay another pair's material.
-Transport credentials belong to individually accountable people or separately approved
-installation identities, with narrowly scoped rights where supported. No shared PAT,
-password, private key or secret in any repository, release asset, command transcript or note.
-A machine may use only credentials its operator is authorized to provision; this design
-neither provisions nor reuses the office's existing release credential.
+Use a fine-grained token or GitHub App token limited to the one mailbox repository,
+Contents read/write only, with an expiry; mode 0600, readable only by the transport
+service user. Agent and coordinator processes cannot read it or the signing/encryption
+keys; never use the owner's general token. Separate service identities and filesystem
+permissions must enforce this even when an agent can run local commands; a naming
+convention or mode 0600 under the same user is not separation. The signing service keeps
+its keys separate from transport credentials and exposes only authorized signing/import
+operations. Private keys and credentials never enter a repository, release asset, command
+transcript or note. This design neither provisions nor reuses the office release credential.
+
+On the mailbox repository: Actions, Pages, webhooks, deploy keys and forking off;
+two-factor authentication required for every named person; owners review collaborator changes. Use an
+owner-approved organization configuration that can enforce these controls; inability to
+enforce them is a stop condition, not permission to weaken them. In the two-owner case,
+the office-side person owner administers the dedicated repository under this agreement;
+the other owner approves its access list/changes and treats that repository and its
+administrator as an untrusted transport. Each side keeps its own credentials and trust
+pins. A compromised repository administrator still cannot create a valid peer signature.
+One owner of home and office administers it in the same separate transport role.
 
 **Deployment gate:** owners approve data classification, named repository access and
 retention; office operator approves outbound writes, credential storage, proxy/CA and all
@@ -181,8 +203,10 @@ pointer resolution. A deliberate snapshot read is the remote interface-register 
 
 N's `to.installation: null` continues to mean **local to the source installation**.
 A remote envelope requires an explicit non-null source and destination installation;
-never infer “local” at the receiver from null. Preserve the original N record and local id
-inside a versioned carrier; remote dedup/thread ids use `(source installation, note id)`.
+never infer “local” at the receiver from null. Export only: note id, thread id, sender role, an owner-approved display label, created
+time, and text. Local account ids, agent ids and any other N fields are omitted. The
+receiver stores the carrier beside a local reference. Remote dedup/thread ids use
+`(source installation, note id)`.
 A reply binds the original source/destination pair and thread. It cannot redirect a thread
 or add a third party; forwarding needs a new approved exchange and explicit disclosure.
 Remote display names/user labels are source assertions, not local account lookups.
@@ -196,13 +220,17 @@ compromised trusted installation is beyond what its own signature can distinguis
 blast radius with per-peer/project consent, encryption, revocation and human review.
 
 Each installation has a dedicated signing key and separate recipient-encryption key,
-never reused SSH/login keys or a shared HMAC secret. Propose Ed25519 signatures with a
-standard reviewed container and authenticated recipient encryption from a maintained,
-reviewed implementation. Do not implement signature/encryption arithmetic, invent a new
-cipher combination or assume Python's standard library supplies the required primitives.
-Exact library/container versions, strict wire encoding, algorithm identifiers and portable
-packaging are a **blocking slice-1 security decision**, with cross-platform vectors before
-implementation is accepted. No runtime dependency is added by this note.
+never reused SSH/login keys or a shared HMAC secret. Use libsodium through PyNaCl: crypto_sign (Ed25519) detached signatures and
+crypto_box_seal (X25519 sealed box) to the pinned recipient key. Slice 1 must prove it
+packages for Python 3.6 on RHEL 8 (the office cannot pip from the internet) and for every
+client, or choose another named, reviewed format (age plus minisign) by a reviewed
+decision. No other primitive and no custom combination. The detached signature is needed
+for sender authentication: a sealed box alone does not identify its sender (see libsodium's
+[sealed-box documentation](https://libsodium.gitbook.io/doc/public-key_cryptography/sealed_boxes)).
+Do not assume a currently published PyNaCl release supports that old interpreter; portable,
+offline installation and maintained-version suitability must be demonstrated, not inferred.
+Exact dependency versions, byte encoding and cross-platform vectors remain a blocking
+slice-1 qualification of this named choice. No runtime dependency is added by this note.
 
 A person owner on each side checks the other's installation id and public-key fingerprints
 through an independently authenticated channel, not a file supplied by the mailbox alone.
@@ -237,15 +265,18 @@ Intentional text can still contain a secret: show an exact preview and require l
 approval for first contacts and sensitive content; no scanner can promise to identify all
 secrets. The sender is responsible for classification; the receiver cannot undo disclosure.
 
-A proposed envelope signs a closed versioned manifest and its payload digest, under a
+The named signature signs exact bytes containing a closed versioned manifest and payload
+digest, under a
 domain separator specific to this protocol. Manifest fields: version/kind; random message
 id; explicit source/destination installation+project; agreement id/epoch; signing and
 recipient key ids; per-direction stream epoch and sequence; original note/thread ids when
 applicable; creation/expiry; receiver status-challenge reference; payload byte length and
 SHA-256. All fields affecting routing, expiry, identity, content or authority are signed.
-Unknown fields/kinds/algorithms, duplicate JSON keys, noncanonical bytes, invalid UTF-8,
+After signature verification, unknown fields/kinds/algorithms, duplicate JSON keys,
+noncanonical bytes, invalid UTF-8,
 nonfinite numbers or inconsistent digests are refused, not normalized and then trusted.
-Use the existing strict JSON discipline as precedent (M `record_json.py:1`), not a claim
+Verify the signature over the exact received bytes, then parse them; never re-serialise
+or canonicalise before verifying. Use the existing strict JSON discipline as precedent (M `record_json.py:1`), not a claim
 that it is already a signature container.
 
 Sign the canonical plaintext manifest+payload binding; place that signed object wholly
@@ -254,8 +285,10 @@ wrapper has only a random opaque id, bounded format/version and ciphertext lengt
 Sender/project ids, subject, note text and filenames from users do not go in release
 titles, tags or asset filenames. Verify bounded container/recipient integrity and signature
 before trusting inner fields. No raw key/algorithm negotiation from an incoming file.
-Actual wire bytes and canonicalization must be frozen with cross-implementation vectors
-in slice 1; this outline is not an interoperable crypto specification yet.
+The sender emits the canonical signed bytes; the receiver verifies those bytes before
+parsing and then validates their canonical encoding without trusting a re-serialized copy.
+Actual byte framing (detached signature plus signed bytes within the sealed box) must be
+frozen with cross-implementation vectors in slice 1; no alternative primitive is implicit.
 
 Proposed initial bounds: one object per file, at most 1 MiB encrypted and 512 KiB decoded,
 no compression, archives, attachments or executable content; note text at most 4,000
@@ -301,11 +334,19 @@ a reliable UTC clock (allowed skew two minutes). Forward or backward clock anoma
 unknown time, expired status or missing status suspend new actionable imports/exports.
 Owner policy may shorten these bounds; removing them is not an offline fallback.
 
+Export is symmetric: A must also obtain a fresh one-use check of B's current trust,
+recipient key and scoped consent before signing/releasing new actionable material. A
+recent status A issued about itself is not evidence that B is ready or still consents.
 A carrier may transport challenge and response files too, but a long offline round trip
 cannot pass those bounds: import only into labelled non-actionable quarantine. A receiving
 owner can establish fresh trust through a separately authenticated live contact and record
-a new scoped epoch/challenge approval; this is a new audited act, not a waiver that turns
-an old file fresh. Public read-only snapshots may be displayed as historical without this
+a new scoped epoch/challenge approval. **Every manual note exchange requires this
+recorded live-contact epoch on both sides**, binding the exact sender/recipient, selected
+file digests, current keys/consent and a one-use authorization. Both local owners record
+that fresh live contact before release/import; the approval expires within the same
+one-hour bound, and a delayed file needs a new contact. It does not waive scope, replay
+or revoked-key checks, and does not turn other old files fresh. With two owners each
+records their own side; one person owning both records both sides independently. Public read-only snapshots may be displayed as historical without this
 handshake, but never drive a new acceptance, wake or actionable program state. Historical
 private material still requires valid local read permission and is withheld if known
 compromised; quarantine is not an inbox or an agent prompt.
@@ -337,8 +378,9 @@ imported, and settled. Receiver states: quarantined/refused, imported/unsettled,
 or noted. A signed import receipt identifies message digest and outcome; a signed semantic
 reply or noted receipt is separate. Lost receipt means “unknown, retry exact bytes,” not
 “send a new note” or “assume read.” A status response covers challenges; a receipt cannot
-serve as a status response or another project's acknowledgement. Replies settle only the
-matching note under local coordinator authority. Only successfully imported new notes
+serve as a status response or another project's acknowledgement. A remote reply is displayed as incoming data; it does not settle even the matching local
+note automatically. Settlement needs an explicit local coordinator action on that note
+after reviewing the reply or noted receipt. Only successfully imported new notes
 wake authorized local coordinator agents, once, by local pointer; text never enters next,
 wait fingerprints, audit reasons or prompts automatically (N).
 
@@ -370,8 +412,9 @@ a deliberate fork gets new id/keys and new approvals. Remote replay state cannot
 for a missing local record of revoked consent. Test restore from before an already imported
 message and from before a key revocation (§11).
 
-Both owners approve retention before publication: working mailbox files removed only
-after receipt plus the agreed recovery interval, with bounded unsettled backlog alerts;
+Both owners approve retention before publication: working mailbox files scheduled for removal only
+after receipt plus the agreed recovery interval (immutable-release retention constraints
+must fit this policy or that option is not enabled), with bounded unsettled backlog alerts;
 settled local text pruned on schedule without losing replay tombstones. Asset removal is
 not proof that provider backups or a former reader's copy are erased. Policy requiring
 stronger guarantees can rule out the GitHub route. No private content in public repositories
@@ -394,7 +437,8 @@ Program suggestions and notes need ordinary local review to become tasks or deci
 remote settlement cannot accept a local requirement or change an agent's authority.
 
 A note's original N shape is not mutated to pretend that a remote user id exists locally.
-The carrier supplies signed remote provenance and a local imported-record reference.
+The carrier supplies only the §4 allowlisted note projection, signed transport provenance
+and a local imported-record reference; no full local N record or account/agent id crosses.
 Local N's settle/read/wake rules are dependencies to reconcile before slice 2, not code
 that this task modifies. A person/agent losing local coordinator authority immediately
 loses the remote inbox read and wake, even if their old session cached a pointer. Pending
@@ -408,13 +452,14 @@ security review and exact-source evidence. This note authorizes none of those bu
 
 | Slice | Bounded result / dependencies | Exit gate |
 | --- | --- | --- |
-| 1. Identity, agreement and strict file verifier | Private local identity/pin storage, owner approval records, fixed reviewed signature/encryption container, strict versioned schemas, challenge/freshness and durable replay ledger. No network. | Portable supported-client vectors, negative/fuzz bounds, key/restore drills and crypto packaging review; no home-grown primitives. |
-| 2. Manual note exchange | Explicit preview/export/import/receipt, local inbox pointers and settlement; manual challenge/status exchange. Depends on 1 and completed/reviewed .447 semantics; .446 local owner links remain unchanged. | Both one-owner/two-owner scenarios, all local isolation/read/wake checks, no authority transfer, stale files quarantined. Useful even if automated transport never gets approved. |
+| 1. Identity, agreement and strict file verifier | Private local identity/pin storage, owner approval records, named PyNaCl/libsodium signature and sealed-box container, strict versioned schemas, challenge/freshness and durable replay ledger. No network. | Portable supported-client vectors, negative/fuzz bounds, key/restore drills and crypto packaging review; no home-grown primitives. |
+| 2. Manual note exchange | Explicit preview/export/import/receipt, local inbox pointers and settlement; bilateral declaration format (project pair, relationship, owner approvals/hashes, keys and consent epoch) and manual exchange with each owner's recorded live-contact epoch for every exchange. Depends on 1 and completed/reviewed .447 semantics; .446 local owner links remain unchanged. | Both one-owner/two-owner scenarios, all local isolation/read/wake checks, no authority transfer, stale files quarantined. Useful even if automated transport never gets approved. |
 | 3. Private-release mailbox | Allowlisted repository, opaque files, approved individual credentials, bounded upload/collect/retry, no inbound service; same slice-1 verifier. | Synthetic office UAT for upload/download/list/redirect/credential revocation and restore; owner data/retention decision. Human approves initial sends; automation is separately enabled only after those gates. This completes the recommended normal route. |
 | 4. Remote program evidence | Versioned qualified declarations, exact acceptance/hash/epoch binding; local remote-area view labelled snapshot/stale. Depends on 1–3 and .446; no extension of its local key grammar in place. | Either owner's withdrawal or freshness loss suspends action; no unrelated project visibility, no “live” claim from snapshots. |
 | 5. Interface projections | Selected versioned interface snapshots, hash checks, explicit publisher/read policy and incomplete-coverage flags. Depends on interface-register implementation described in PROGRAM_DESIGN and 1–4, not merely that design's existence. | No automatic remote fetch/import acceptance, no retirement on incomplete data, public publication opt-in with separate owner approval. |
 
-Decisions before runtime work: reviewed crypto container/dependency/portable packaging;
+Decisions before runtime work: qualification of the named PyNaCl/libsodium format and
+its offline portable packaging (or a reviewed age-plus-minisign replacement decision);
 actual approved mailbox host/repository/roles and both transfer directions; data classification
 and recipient-encryption custody; the owners' freshness/retention policy and emergency
 contacts; exact remote-link/interface projection schemas after .446/.447 settle. Defaults
@@ -433,11 +478,14 @@ POSIX-only import. Existing pins do not prove these security properties.
 
 | Proposed test name | Break the rule / required observable failure |
 | --- | --- |
-| `test_both_owners_pin_exact_peer_and_scope` | One absent approval, swapped installation id/key or different project pair: cannot export/import. Same owner still records two local approvals; two owners cannot impersonate each other. |
+| `test_both_owners_pin_exact_peer_and_scope` | One absent approval, swapped installation id/key or different project pair: cannot export/import. Same owner still records two local approvals; two owners cannot impersonate each other. Every manual exchange needs both recorded live-contact approvals; expired/different-file approvals fail. |
 | `test_no_first_message_trust_or_shared_secret` | Incoming key, transport credential or old-key-only rotation attempts to establish trust: refused, no pin/grant write. Secrets absent from serialized files/logs/fixtures. |
-| `test_signature_binds_recipient_kind_and_all_payload_bytes` | Change each signed field, payload byte, destination or purpose; wrong/unknown signer/container algorithm: refused before inbox/wake. Re-encrypting for another recipient does not redirect the signed message. |
+| `test_signature_binds_recipient_kind_and_all_payload_bytes` | Change each signed field, payload byte, destination or purpose; wrong/unknown signer/container algorithm: refused before inbox/wake. Destination must be this installation and source the pinned peer, so reflecting an outbound message back to its sender fails. Re-encrypting for another recipient does not redirect the signed message. |
 | `test_strict_bounded_container_and_safe_staging` | Duplicate keys, unknown fields, noncanonical/invalid UTF-8, oversize nested data, archives, hostile path/symlink: bounded refusal, no arbitrary read/write/execute or URL fetch. |
-| `test_export_selection_rechecks_live_local_authority` | Remove sender grant, owner consent or permitted field after preview/queue: no release/signature. No member/private-record/third-project material in emitted bytes. |
+| `test_agents_cannot_read_transport_credential_or_keys` | An agent/coordinator, including one able to run local commands, tries to read the mode-0600 transport credential or signer/decryption files: denied by separate service identities. A general-owner token, nonexpiring/wrong-repo token or broader permission scope is refused by provisioning checks. |
+| `test_sender_checks_receiver_freshness_before_export` | Stale/missing/revoked B status or receiver-consent/key change after preview: A releases no actionable envelope, even if A's own status is fresh. |
+| `test_status_response_cannot_be_presented_as_note` | Valid signed status bytes relabelled/reflected as note: closed kind/domain/destination checks refuse it; no inbox record, wake or settlement. |
+| `test_export_selection_rechecks_live_local_authority` | Remove sender grant, owner consent or permitted field after preview/queue: no release/signature. No local account/agent ids or other N fields beyond the §4 allowlist, and no member/private-record/third-project material in emitted bytes. |
 | `test_peer_assertion_never_grants_local_authority` | Valid signed text requests a task, grant, acceptance or remote read: only inert note data appears, no such mutation or data disclosure. Sender does not need read access in B. |
 | `test_import_isolation_matches_missing_project` | A third-project user, stale-grant agent or excluded host key reads each route/count/thread/wake: indistinguishable unauthorized/missing answer and no payload; authorized two-project coordinators can read. Extend L isolation harness. |
 | `test_exact_retry_once_conflicting_id_or_sequence_refused` | Duplicate upload/restart/lost receipt creates one import/wake; same id/sequence with changed bytes conflicts. Reordering is held until explicit gap resolution, never silently advanced. |
