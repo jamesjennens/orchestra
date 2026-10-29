@@ -782,6 +782,67 @@ commands of that text.
   routes return the record as it is stored, so the field still appears in them, and
   that kit has no route that changes it and no page that shows it.
 
+### Handing a project to a coordinator
+
+**The page and the route** (kittrial-5bb.442; docs/design/COORDINATOR_ONBOARDING_DESIGN.md §3): the page
+**Hand this project to a coordinator** (`#/p/NAME/handover`, linked from Members & settings and from Set up)
+reads `GET /v1/projects/{id}/handover[?person=USER&agent=AGENT]`. It answers the steps for one member, each
+with a state (`done`, `todo`, `waiting`, `failed`, `hidden`), a plain sentence, who does it, and the existing
+page or route that fixes it. It writes nothing, and the page changes nothing itself.
+
+| Step | Read from | Who fixes it |
+| --- | --- | --- |
+| Coordinator role | the member's role | an owner (Members) |
+| Their agent has this project (only after the role, so no agent is made first) | the agents that have the project | the member, under My agents |
+| Coordinator grant | the grant and, when it has no effect, why: agent switched off, account disabled, no longer a coordinator, granting owner no longer an owner | an owner (Members & settings) |
+| Installation switches | `GET /v1/projects/{id}/switches`; an endpoint that cannot answer makes only this step say so | the operator, with the command shown |
+| Agent approvals | the project's `agent_approval` setting | an owner |
+| Set up after the grant | the agent has reached the server since the grant (`last_seen_at` later than `granted_at`) | the member, by opening the agent's set-up again |
+| The agent's own first check | the agent's newest report about this project made after the grant: certificate, project listed, whose AGENT.md (kittrial-5bb.444) | the agent reports it; a failure is fixed by opening its set-up again |
+
+**Who reads what:**
+- **Any member:** their own walkthrough, with their own agents. An agent made before they were a member is named, so they know to tick the project on it.
+- **An owner or superuser:** any member's (`person=`), seeing only the agents that already have the project. A missing agent is then said without naming any.
+- **A coordinator:** any member's, without their agents, a grant's reasons, the set-up step or the agent's own check (`hidden`). An effective grant is shown, as the coordination panel shows it to any reader.
+- **An agent:** its own steps only.
+- **Refusals:**
+  - anyone else asking for another member gets one `403` sentence, the same whoever the person is;
+  - a `person` who is not a member is `404` for an owner or coordinator;
+  - outsiders get `404`;
+  - nobody signed in gets `401`.
+
+**The hand-over note** (kittrial-5bb.443): a versioned plain-text note about the project, written for one member.
+- **Routes:**
+  - `PUT /v1/projects/{id}/handover/note` with `{text, for_person}` and an Idempotency-Key: an owner, or the current coordinator (a coordinator person, or an agent holding an effective grant). Answers `201`.
+  - `GET .../handover/note`: any member. Answers the current version and the older ones by number.
+  - `POST .../handover/note/acknowledge` with `{version}`: the person it is for, or their agent holding an effective grant. Only the current version: an older one is `409`.
+- **Bounds:**
+  - text is 1-8,000 characters (code points: the page counts them the same way), by the kit's shared plain-text rule;
+  - `for_person` must be a member;
+  - the last 20 versions are kept, and drops are counted and audited.
+- **Where it shows:**
+  - an unacknowledged note is the first entry of that agent's `GET /v1/agents/me/next` (`kind: handover-note`);
+  - task briefs carry `handover`, a pointer: version, for whom, by whom, when, acknowledged;
+  - the walkthrough shows it as two steps: the note was written, and it was acknowledged;
+  - none of these carries the text.
+- **It is data, not instructions:** a colleague's notes, shown as text.
+- **Storage and backup:** it lives in the web service's state, so the coordination backup's HTTP-state pair carries it, and an older kit restoring that pair ignores it.
+
+**The agent's own first check** (kittrial-5bb.444): the agent reports what it checked on its own PC, which the server cannot see.
+- **Route:** `POST /v1/agents/me/checks`, with the agent's own credential only. The body is `{project, certificate: {sha256_matches}, first_read: {project_listed}, agent_md: {role}}`:
+  - `sha256_matches` is true or false where the server serves its own certificate, and null (only null) where it serves none;
+  - `project_listed` is true or false;
+  - `role` is `coordinator`, `worker` or `unknown`.
+  The answer is `201` with the report.
+- **Bounds:**
+  - every field is checked, and an unknown one is refused, `at` included: the time is the server's own `reported_at`;
+  - at most 10 reports per agent a minute, then `429` with Retry-After (never more than 60 s); a 429 is not counted, and only the first one in a minute is audited;
+  - the newest 5 are kept, on the agent's record;
+  - one audit event per kept report.
+- **Where it shows:** only as the walkthrough's step "The agent's own first check" (C2), and only for a report made after the grant, labelled "Reported by {agent} at {time}". No agent read shows it.
+- **It is the agent's claim:** it grants nothing, no authority check reads it, and no other step changes with it.
+- **The coordinator AGENT.md** has a "Your first check" section with the call that reports it, using `curl -K` like every other call.
+
 ### Creating a project from the web interface
 
 An operator creates a project on the host (`admin.py add-project NAME`) and a superuser

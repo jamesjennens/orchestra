@@ -107,6 +107,8 @@ class RecordSpec:
         self.receipt_metadata = values.pop('receipt_metadata', lambda receipt: {})
         # Service adapters can require bounded regular-file receipt reads.
         self.read_receipt = values.pop('read_receipt', read_host_json)
+        # Optional kind-specific check with the existing operation's replay context.
+        self.check_accept_request = values.pop('check_accept_request', lambda *args: None)
         missing = [name for name in self.VALUES + self.HOOKS if name not in values]
         extra = sorted(set(values) - set(self.VALUES + self.HOOKS))
         if missing or extra:
@@ -542,6 +544,7 @@ def apply_native(payload, actor, run, project, spec, operator=False, operators=N
     revision, record = spec.build_record(payload, task, existing)
     spec.require_bound_key(task, payload, existing)
     spec.check_revision(payload, revision, existing, record, task)
+    spec.check_accept_request(payload, task, revision, existing, record, journal, prior, reconciled, row)
     bound = spec.check_acceptance(payload, existing, record, operator, row)
     # Durable F3 acceptance evidence: a second reserved machine record bound to the
     # revision hash. Planned before any write so a conflicting decision is refused

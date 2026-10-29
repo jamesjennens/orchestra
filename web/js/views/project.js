@@ -356,18 +356,20 @@ export async function overview(ctx, { pid }) {
     tableHost.replaceChildren(
       ...(unreadable ? [unreadable] : []),
       leftOut,
-      rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'stack-narrow' },
+      rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'stack-narrow task-list-project' },
         h('caption', { class: 'visually-hidden' }, 'Tasks in ' + project.name),
         // Slice 3 (kittrial-5bb.416): the task list leads with STATE and WHO ACTS NEXT,
         // the assignee display name plus the next_action text, both straight server text.
-        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'State'),
-          h('th', { scope: 'col' }, 'Who acts next'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Updated'))),
+        h('thead', null, h('tr', null, h('th', { scope: 'col', class: 'task-title-column' }, 'Task'),
+          h('th', { scope: 'col', class: 'task-state-column' }, 'State'),
+          h('th', { scope: 'col', class: 'task-next-column' }, 'Who acts next'),
+          h('th', { scope: 'col', class: 'hide-narrow task-updated-column' }, 'Updated'))),
         h('tbody', null, rows.map((t) => h('tr', { class: 'row-link task-row', 'data-requirement': t.requirement_record ? 'true' : null, onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
-          h('td', null,
+          h('td', { class: 'task-title-cell' },
             // A requirement record is marked plainly and points at the Requirements page,
             // never offered as ordinary work (kittrial-5bb.277).
             t.requirement_record ? h('span', { class: 'chip', title: 'A requirement record, not claimable work' }, 'Requirement') : null,
-            h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title || t.id),
+            h('a', { class: 'title task-list-title', href: ctx.href(`/p/${pid}/t/${t.id}`), title: t.title || t.id }, t.title || t.id),
             h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id),
               t.requirement_record ? [' · ', h('a', { href: ctx.href(`/p/${pid}/requirements`) }, 'Edit on Requirements')] : null)),
           // A row the server could not read is listed, and says so (kittrial-5bb.169).
@@ -378,13 +380,13 @@ export async function overview(ctx, { pid }) {
           // absent), so the fallback here is the server id only when a stale row
           // carries an assignee with no name yet, and otherwise 'anyone'.
           // Stays textContent: untrusted text stays text.
-          h('td', null, t.unreadable ? h('span', { class: 'chip crit' }, 'Cannot be read') : t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
-          h('td', { class: 'who-acts-cell', 'data-who-acts': t.assignee_name || (t.assignee ? t.assignee : 'anyone') },
+          h('td', { class: 'task-state-column' }, t.unreadable ? h('span', { class: 'chip crit' }, 'Cannot be read') : t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
+          h('td', { class: 'who-acts-cell task-next-column', 'data-who-acts': t.assignee_name || (t.assignee ? t.assignee : 'anyone') },
             h('span', { class: 'who-acts' + (t.assignee ? '' : ' none') },
               (t.assignee_name || (t.assignee ? t.assignee : 'anyone')),
               ' · ',
               (t.next_action ? t.next_action.text : '—'))),
-          h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : '')))))) :
+          h('td', { class: 'hide-narrow muted task-updated-column' }, t.updated_at ? time(t.updated_at) : '')))))) :
         empty(state.q || state.review ? 'No matching tasks' : 'No tasks yet', state.q || state.review ? 'Try a different search or filter.' : canWrite(project) && !project.archived ? 'Define the first task for this project.' : null),
       partial,
       h('div', { class: 'pager' },
@@ -800,6 +802,8 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
+    // kittrial-5bb.442: the hand-over walkthrough, checked live (each member reads their own).
+    h('p', null, h('a', { href: ctx.href(`/p/${pid}/handover`), 'data-link': 'handover' }, 'Hand this project to a coordinator')),
     membersHost, claimingPanel(ctx, project), agentApprovalPanel(ctx, project), coordination.node,
     // kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator.
     switchesPanel(ctx, project),
