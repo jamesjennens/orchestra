@@ -1107,6 +1107,8 @@ class Service:
         self.lookup_max = lookup_max
         self.lookup_window = lookup_window
         self._lookups = {}
+        self._self_check_times = {}      # agent id -> times of its recent first-check reports (kittrial-5bb.444)
+        self._self_check_throttle_audited = {}   # agent id -> time of its last audited 429 (at most one a window)
 
     # -- helpers ---------------------------------------------------------------
     def claim_gate(self, agent_id):
@@ -3441,6 +3443,280 @@ class Service:
                                'granted_by_display_name': self._owner_name(grant['granted_by']),
                                'granted_at': grant.get('granted_at')})
             return {'people': people, 'agents': agents}
+
+    def handover_facts(self, project_id, person_id, viewer_agent=None):
+        """The raw facts of handing ``project_id`` to ``person_id`` (kittrial-5bb.442). Changes nothing.
+
+        Read in one lock: the person's membership role, every personal agent they own (whether it has the
+        project, whether it is switched on, when it last reached the server, its coordinator grant here as
+        :meth:`coordinator_view` says it, and its newest report of its own first check here, kittrial-5bb.444),
+        and the name of one of their agents whose grant has effect (what
+        :meth:`coordinators_of` shows any reader). The route authorizes the reader and ``handover_steps``
+        masks these per reader; nothing here is returned to anyone as it is.
+        """
+        with self.store.lock:
+            role = (self.state.get('memberships') or {}).get(project_id, {}).get(person_id)
+            agents = []
+            for agent in sorted(self.state['agents'].values(), key=lambda a: a['id']):
+                if agent.get('owner') != person_id:
+                    continue
+                has = project_id in (agent.get('projects') or [])
+                agents.append({'id': agent['id'], 'name': agent['name'], 'has_project': has,
+                               'enabled': bool(agent.get('enabled')), 'last_seen_at': agent.get('last_seen_at'),
+                               'coordinator': self.coordinator_view(project_id, agent) if has else None,
+                               # Its newest report of its own first check here (kittrial-5bb.444), for step C2.
+                               'self_check': self._self_check_for(agent, project_id)})
+            effective = next((a['name'] for a in agents if a['coordinator'] and a['coordinator']['effective']), None)
+            note = self._handover_current(project_id)
+            note_view = None
+            if note is not None and note.get('for_person') == person_id:
+                note_view = {'version': note['version'], 'written_by_name': self._owner_name(note['written_by']),
+                             'written_at': note['written_at'], 'acknowledged': bool(note['acknowledged'])}
+            return {'person': person_id, 'name': self._owner_name(person_id), 'member': role is not None,
+                    'role': role, 'agents': agents, 'effective_agent': effective, 'viewer_agent': viewer_agent,
+                    'note': note_view}
+
+    # -- the hand-over note (kittrial-5bb.443; design COORDINATOR_ONBOARDING_DESIGN §5.2) ---------------------
+    #: A project's hand-over note lives in this service's state, ``handover_notes[project] = {versions: [...],
+    #: dropped}``. The state is copied whole by the coordination backup's HTTP-state pair and put back whole by
+    #: ``admin.py restore-new --restore-http-state``; a kit that does not know the key reads and writes the
+    #: state as before and never looks at it.
+    HANDOVER_TEXT_MAX = 8000
+    HANDOVER_VERSIONS_KEPT = 20
+
+    def _handover_record(self, project_id):
+        """The project's note record, or None; damage reads as None (no readable note), never as a note."""
+        notes = self.state.get('handover_notes')
+        record = notes.get(project_id) if isinstance(notes, dict) else None
+        if not isinstance(record, dict) or not isinstance(record.get('versions'), list):
+            return None
+        # A version is kept only with every field a reader of it uses (the walkthrough, the pointer, the next
+        # action, the read and the acknowledgement), so no reader meets a half-valid one (review of
+        # kittrial-5bb.443, B1). The versions are the stored dicts themselves: an acknowledgement appends to one.
+        good = [v for v in record['versions'] if isinstance(v, dict) and type(v.get('version')) is int
+                and isinstance(v.get('text'), str) and isinstance(v.get('for_person'), str)
+                and isinstance(v.get('written_by'), str) and isinstance(v.get('written_at'), str)
+                and isinstance(v.get('acknowledged'), list) and all(isinstance(a, dict) for a in v['acknowledged'])]
+        return dict(record, versions=good) if good else None
+
+    def _handover_current(self, project_id):
+        record = self._handover_record(project_id)
+        return max(record['versions'], key=lambda v: v['version']) if record else None
+
+    def handover_note(self, project_id):
+        """The project's current note with the list of older versions (number, writer, time; no older text)."""
+        with self.store.lock:
+            record = self._handover_record(project_id)
+            if record is None:
+                return {'project': project_id, 'note': None, 'older': [], 'dropped': 0}
+            current = max(record['versions'], key=lambda v: v['version'])
+            return {'project': project_id, 'note': self._handover_view(current),
+                    'older': [{'version': v['version'], 'written_by_name': self._owner_name(v['written_by']),
+                               'written_at': v.get('written_at')}
+                              for v in sorted(record['versions'], key=lambda v: -v['version']) if v is not current],
+                    'dropped': record.get('dropped') if type(record.get('dropped')) is int else 0}
+
+    def _handover_view(self, version):
+        return {'version': version['version'], 'text': version['text'], 'for_person': version['for_person'],
+                'for_person_name': self._owner_name(version['for_person']),
+                'written_by': version['written_by'], 'written_by_name': self._owner_name(version['written_by']),
+                'written_by_actor': version.get('written_by_actor'), 'written_at': version.get('written_at'),
+                'acknowledged': [dict(a) for a in version['acknowledged'] if isinstance(a, dict)]}
+
+    def handover_pointer(self, project_id):
+        """What a brief or a next action carries: the note's identity and state, never its text."""
+        with self.store.lock:
+            current = self._handover_current(project_id)
+            if current is None:
+                return None
+            return {'version': current['version'], 'for_person': current['for_person'],
+                    'written_by_name': self._owner_name(current['written_by']), 'written_at': current.get('written_at'),
+                    'acknowledged': bool(current['acknowledged'])}
+
+    def handover_notes_to_acknowledge(self, agent_id):
+        """``[(project, pointer)]``: the current notes this agent may acknowledge and has not: notes for its own
+        person, in projects it has, where it holds an effective coordinator grant (the acknowledge rule)."""
+        with self.store.lock:
+            agent = self.state['agents'].get(agent_id) if agent_id else None
+            if not isinstance(agent, dict):
+                return []
+            found = []
+            for project_id in sorted(agent.get('projects') or []):
+                current = self._handover_current(project_id)
+                if current is None or current['for_person'] != agent.get('owner') or current['acknowledged']:
+                    continue
+                grant = self.coordinator_view(project_id, agent)
+                if not (grant and grant['effective']):
+                    continue
+                found.append((project_id, {'version': current['version'], 'for_person': current['for_person'],
+                                           'written_by_name': self._owner_name(current['written_by']),
+                                           'written_at': current.get('written_at'), 'acknowledged': False}))
+            return found
+
+    def write_handover_note(self, principal, project_id, text, for_person):
+        """Write a new version (the route holds CAP_COORDINATE). Returns ``(note view, dropped now)``.
+
+        ``text`` is plain text, 1-8000 characters, by the kit's shared rule; it never starts with a reserved
+        machine-record prefix. ``for_person`` must be a member. Only the last 20 versions are kept: an older
+        one drops off and the record counts how many were dropped (the route audits the count).
+        """
+        from review_workflow import plain_text
+        from reserved_comments import reserved_match
+        if not isinstance(text, str) or not text.strip():
+            raise invalid('A hand-over note must be 1-%d characters of text' % self.HANDOVER_TEXT_MAX)
+        if len(text) > self.HANDOVER_TEXT_MAX:
+            raise invalid('A hand-over note is at most %d characters; this one is %d.'
+                          % (self.HANDOVER_TEXT_MAX, len(text)))
+        try:
+            plain_text(text, 'A hand-over note')
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        if reserved_match(text) is not None:
+            raise invalid('A hand-over note cannot start with a reserved machine-record prefix')
+        if not isinstance(for_person, str) or not for_person:
+            raise invalid('for_person must name a member of this project')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if (self.state.get('memberships') or {}).get(project_id, {}).get(for_person) is None:
+                raise invalid('for_person must name a member of this project')
+            if 'handover_notes' in self.state and not isinstance(self.state.get('handover_notes'), dict):
+                raise HttpError(503, 'unavailable', 'The record of hand-over notes in the service state is damaged '
+                                '(it is not an object), so nothing was written. An operator must repair the state file')
+            record = self._handover_record(project_id) or {'versions': [], 'dropped': 0}
+            number = max((v['version'] for v in record['versions']), default=0) + 1
+            version = {'version': number, 'text': text, 'for_person': for_person,
+                       'written_by': principal.user_id, 'written_by_actor': principal.actor,
+                       'written_at': now_iso(self._now()), 'acknowledged': []}
+            versions = sorted(record['versions'], key=lambda v: v['version']) + [version]
+            dropped_now = max(0, len(versions) - self.HANDOVER_VERSIONS_KEPT)
+            kept = versions[dropped_now:]
+            dropped = (record.get('dropped') if type(record.get('dropped')) is int else 0) + dropped_now
+            self.state.setdefault('handover_notes', {})[project_id] = {'versions': kept, 'dropped': dropped}
+            self.store.save()
+            return self._handover_view(version), dropped_now
+
+    def _may_acknowledge(self, principal, project_id, person):
+        """Whether ``principal`` acknowledges a note for ``person``: that person by session, or their agent that has
+        the project and holds an effective coordinator grant here. The caller holds the store lock."""
+        if principal is None:
+            return False
+        if principal.via == 'credential':
+            agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
+            grant = self.coordinator_view(project_id, agent) if isinstance(agent, dict) else None
+            return (isinstance(agent, dict) and agent.get('owner') == person
+                    and project_id in (agent.get('projects') or []) and bool(grant and grant['effective']))
+        return principal.user_id == person
+
+    def may_acknowledge_handover_note(self, principal, project_id):
+        """Whether the current note waits for ``principal``'s acknowledgement: the walkthrough's flag, by the same
+        rule the acknowledge route applies (review of kittrial-5bb.443, B2), so the page never offers a refusal."""
+        with self.store.lock:
+            current = self._handover_current(project_id)
+            return (current is not None and not current['acknowledged']
+                    and self._may_acknowledge(principal, project_id, current['for_person']))
+
+    def acknowledge_handover_note(self, principal, project_id, version):
+        """Acknowledge the CURRENT version: by its person, or by their agent holding an effective grant here.
+
+        An older version is refused (409, naming the current one), so an acknowledgement never lands on text
+        its reader did not see.
+        """
+        if type(version) is not int:
+            raise invalid('version must be the number of the note being acknowledged')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            current = self._handover_current(project_id)
+            if current is None:
+                raise not_found('There is no hand-over note in this project')
+            if not self._may_acknowledge(principal, project_id, current['for_person']):
+                raise forbidden('Only the person this hand-over note is for, or their agent holding the '
+                                'coordinator grant here, acknowledges it')
+            if version != current['version']:
+                raise conflict('Version %d is not the current hand-over note; version %d is. Read it, then '
+                               'acknowledge that one.' % (version, current['version']),
+                               {'current_version': current['version']})
+            if not any(a.get('by') == principal.user_id and a.get('actor') == principal.actor
+                       for a in current['acknowledged'] if isinstance(a, dict)):
+                current['acknowledged'].append({'by': principal.user_id, 'actor': principal.actor,
+                                                'at': now_iso(self._now())})
+                self.store.save()
+            return self._handover_view(current)
+
+    # -- the agent's own first check (kittrial-5bb.444; design COORDINATOR_ONBOARDING_DESIGN §5.3) ------------
+    #: An agent's reports of its own first check live on its record, ``agent['self_checks']``, newest first. Each
+    #: is the agent's claim, labelled with who said it and when: no authority check reads it, no agent read
+    #: (``agent_view``) shows it, and only step C2 of the hand-over walkthrough does. The agent records are in this
+    #: service's state, so the coordination backup's HTTP-state pair carries them.
+    SELF_CHECKS_KEPT = 5
+    SELF_CHECK_ROLES = ('coordinator', 'worker', 'unknown')
+    #: At most SELF_CHECK_RATE reports per agent in SELF_CHECK_WINDOW seconds; the next is 429 with Retry-After.
+    #: Counted in memory, like the account lookups, so a restart starts the count again.
+    SELF_CHECK_RATE = 10
+    SELF_CHECK_WINDOW = 60
+
+    def _self_check_entry(self, entry):
+        """A stored report as written, or None when it is damaged (a damaged one is never shown)."""
+        if not (isinstance(entry, dict) and isinstance(entry.get('project'), str)
+                and entry.get('sha256_matches') in (True, False, None) and type(entry.get('project_listed')) is bool
+                and entry.get('role') in self.SELF_CHECK_ROLES and isinstance(entry.get('reported_at'), str)):
+            return None
+        return {key: entry[key] for key in ('project', 'sha256_matches', 'project_listed', 'role', 'reported_at')}
+
+    def _self_checks(self, agent):
+        kept = agent.get('self_checks')
+        return [e for e in map(self._self_check_entry, kept if isinstance(kept, list) else []) if e is not None]
+
+    def self_check_admit(self, principal):
+        """Count one report of ``principal``'s agent against the limit, or refuse it with 429.
+
+        Every authorized attempt counts, a refused body too, so a flood of any kind is bounded. A 429 does not
+        count, so refusals never extend the window. Only the first 429 of an agent in a window is audited (the
+        route's refusal audit skips the rest), so a flood cannot push older history out of the audit trail
+        (review of kittrial-5bb.444, B2). The caller holds the store lock across this and
+        :meth:`keep_self_check`.
+        """
+        if principal is None or principal.via != 'credential' or not principal.agent_id:
+            raise forbidden('Only an agent reports its own first check, with its own credential')
+        with self.store.lock:
+            now = self._now()
+            recent = [t for t in self._self_check_times.get(principal.agent_id, [])
+                      if t > now - self.SELF_CHECK_WINDOW]
+            if len(recent) >= self.SELF_CHECK_RATE:
+                self._self_check_times[principal.agent_id] = recent
+                # Never longer than the window, even when the clock has stepped back.
+                wait = min(self.SELF_CHECK_WINDOW, max(1, int(math.ceil(recent[0] + self.SELF_CHECK_WINDOW - now))))
+                error = throttled('Too many first-check reports: at most %d a minute. Send it again in %d '
+                                  'seconds.' % (self.SELF_CHECK_RATE, wait))
+                error.retry_after = wait
+                audited = self._self_check_throttle_audited.get(principal.agent_id)
+                if audited is not None and now - self.SELF_CHECK_WINDOW < audited <= now:
+                    error.quiet_audit = True
+                else:
+                    self._self_check_throttle_audited[principal.agent_id] = now
+                raise error
+            recent.append(now)
+            self._self_check_times[principal.agent_id] = recent
+
+    def keep_self_check(self, principal, report):
+        """Keep one report of the credential's own agent, newest first, at most SELF_CHECKS_KEPT across projects.
+
+        ``report`` is ``{project, sha256_matches, project_listed, role}``, already checked by the route; the time
+        is this service's own (``reported_at``), never one the agent sends. The project need not be one the agent
+        has: "not listed" is what the report is for, and a report about a project that does not exist is kept and
+        shown nowhere, so the answer never says whether a project exists.
+        """
+        if not AGENT_PROJECT_ID.fullmatch(report['project']):
+            raise invalid('project must be a project id')
+        with self.store.lock:
+            agent = self._agent(principal.agent_id)
+            entry = dict(report, reported_at=now_iso(self._now()))
+            agent['self_checks'] = [entry] + self._self_checks(agent)[:self.SELF_CHECKS_KEPT - 1]
+            self.store.save()
+            return entry
+
+    def _self_check_for(self, agent, project_id):
+        """The newest report of ``agent`` about ``project_id``, or None."""
+        return next((e for e in self._self_checks(agent) if e['project'] == project_id), None)
 
     def _may_coordinate(self, project_id, agent):
         """Whether the agent's account holds the coordinator's capabilities in the project now."""
