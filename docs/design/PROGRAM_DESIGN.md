@@ -411,6 +411,20 @@ is conventions over records that exist.
 | cross-project reads cost too much | one warm export per distinct project, at most 50; check first | a trace citing 3 projects makes 3 reads; a token to an unreadable project makes none |
 | untrusted text from another project | it is shown as text (the context index's escaping) and never put into prompts; pointers only | an interface `meaning` with HTML and bidi controls renders escaped |
 
+**The program-links read's timing (review of kittrial-5bb.446, N1).** The read answers alike for an admitted
+area that does not exist and for one that exists but has not joined: both read "does not count". Its time does not.
+The service's read of a missing project fails at once (about 1.6 s measured for the whole read in the review), while
+an existing one reads its records (about 2.5 s). So a program member can tell, from the time alone, whether a project
+with an admitted area's name exists on this installation. This is accepted, not padded:
+- It concerns only names that the program's own owner wrote into accepted `program.area.<area>` records, and only
+  readers of the program project.
+- It says nothing about what is inside the area: the answer itself carries one fact, the same for every reader.
+- The same difference exists wherever a read touches a project's records only when the project exists.
+- Padding every area read to the slower path would cost every reader up to 50 slow reads a page.
+
+If an installation needs the names hidden, the read can pad each area to a fixed floor. That is one change in the
+web service's read (`program_links_read`), with no change to the records.
+
 ## 9. Slices (five, each deliverable alone)
 
 1. **Program links, the "nothing granted" rule, and the conventions.**
