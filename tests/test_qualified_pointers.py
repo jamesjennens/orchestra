@@ -303,6 +303,22 @@ class NativeTraceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.cites(['--readable', 'qq'], key_projects=frozenset({'pp'}), by_service=False)
 
+    def test_native_the_dispatch_honours_the_set_from_the_service_launch_alone(self):
+        # Through the endpoint's own dispatch. The web service launches its reads with --authority-store and without
+        # --require-authority; that launch is the service, and its set decides. A host key's request is refused.
+        theirs = self.created('qq', 'Pick the queue', '--type', 'decision')
+        token = 'decision:qq/' + theirs
+        self.created('pp', 'Cites the queue', '--description', token)
+        request = {'action': 'trace', 'project': 'pp', 'actor': 'http/read', 'args': ['tasks', '--readable', 'qq']}
+        config = fixture.endpoint.AuthorityConfig(str(self.root / 'unread-authority.json'))
+        answer = fixture.endpoint.execute(self.root, request, authority_config=config, require_authority=False)
+        cites = {c['pointer']: c for row in json.loads(answer['stdout'])['rows'] for c in row['cites']}
+        self.assertEqual('live', cites[token]['state'])
+        for key_projects in (frozenset({'pp'}), None):           # a bound key, and an operator's unbound key
+            with self.assertRaises(ValueError) as refused:
+                fixture.endpoint.execute(self.root, dict(request, actor='op'), key_projects=key_projects)
+            self.assertEqual(trace_read.READABLE_REFUSED, str(refused.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

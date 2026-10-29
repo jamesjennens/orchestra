@@ -1518,8 +1518,11 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # kittrial-5bb.425: the trace read (TRACEABILITY_DESIGN §5.2-§5.4), answered from records alone.
         # Read-only: a shared lock and no guarded write. One export from the read cache; the generation it
         # was read at goes back with the answer, and a page asked for at another generation is refused.
+        # kittrial-5bb.449: the web service is the launch with --authority-store, which only the service passes
+        # (an SSH key line cannot: see main()); its reads go without --require-authority, as the reference read's
+        # web_service does below. Only that launch's --readable is honoured.
         result=trace_answer(root,path,name,request.get('args',[]),actor,authority_config,key_projects=key_projects,
-                            by_service=authority_config is not None and require_authority)
+                            by_service=authority_config is not None)
         return {'returncode':0,'stdout':json.dumps(result[0],ensure_ascii=False)+'\n','stderr':result[1]}
     if action=='owner-requirements':
         from requirement_http import web_action
