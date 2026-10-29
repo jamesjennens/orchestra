@@ -516,6 +516,8 @@ export function coordinatorSteps(server, file) {
 
 //: The body of the first-check report (kittrial-5bb.444, POST /v1/agents/me/checks), as the agent fills it in.
 export const FIRST_CHECK_BODY = '{"project":"PROJECT","certificate":{"sha256_matches":true},"first_read":{"project_listed":true},"agent_md":{"role":"coordinator"}}';
+//: The same for a server with no certificate of its own: null, the only value it takes then (review of .444, B1).
+export const FIRST_CHECK_BODY_NO_CERTIFICATE = '{"project":"PROJECT","certificate":{"sha256_matches":null},"first_read":{"project_listed":true},"agent_md":{"role":"coordinator"}}';
 
 // The coordinator's first check, reported (kittrial-5bb.444; design COORDINATOR_ONBOARDING_DESIGN §3.2 C2):
 // what to check, and the one call that reports it. The credential is read with -K as in every call; the body is
@@ -523,15 +525,16 @@ export const FIRST_CHECK_BODY = '{"project":"PROJECT","certificate":{"sha256_mat
 export function firstCheckSection(server, file, { hasCertificate = false } = {}) {
   const flags = curlFlags(server, AGENT_CURL_MAX_TIME);
   const url = server + '/v1/agents/me/checks';
+  const body = hasCertificate ? FIRST_CHECK_BODY : FIRST_CHECK_BODY_NO_CERTIFICATE;
   const certificate = hasCertificate
     ? `whether the sha256 of your saved certificate file matches the sha256 that GET ${server}/v1/service/certificate serves (sha256_matches true or false)`
-    : 'nothing about the certificate: this server has no certificate of its own, so send sha256_matches null';
+    : 'nothing about the certificate: this server has no certificate of its own, so send sha256_matches null (the only value it takes)';
   return [
     '## Your first check',
     '',
     `Once after each set-up, before the steps below, check and report three things: ${certificate}; whether PROJECT is in your own GET ${server}/v1/projects (project_listed true or false); and whether this AGENT.md is a coordinator's, which it is when it has the heading "You coordinate" (role coordinator, else worker, or unknown). Report them in one call, with the values you found in place of the example's:`,
-    `- Windows (PowerShell): '${FIRST_CHECK_BODY}' | curl.exe -fsS ${flags} -K "${file.powershell}" -X POST -H "Content-Type: application/json" --data-binary '@-' ${psQuote(url)}`,
-    `- macOS/Linux: printf '%s' '${FIRST_CHECK_BODY}' | curl -fsS ${flags} -K ${file.posix} -X POST -H 'Content-Type: application/json' --data-binary @- ${shQuote(url)}`,
+    `- Windows (PowerShell): '${body}' | curl.exe -fsS ${flags} -K "${file.powershell}" -X POST -H "Content-Type: application/json" --data-binary '@-' ${psQuote(url)}`,
+    `- macOS/Linux: printf '%s' '${body}' | curl -fsS ${flags} -K ${file.posix} -X POST -H 'Content-Type: application/json' --data-binary @- ${shQuote(url)}`,
     'The report is your own claim: your person sees it, with your name and the time, on the hand-over walkthrough, and it unlocks nothing.',
     '',
   ];

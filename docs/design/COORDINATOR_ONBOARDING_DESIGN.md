@@ -183,9 +183,14 @@ These moved under `/handover/note` in slice 3: `GET /v1/projects/{pid}/handover`
 
 **As built (kittrial-5bb.444):**
 - **The time:** the service stamps `reported_at` itself. The body has no `at`; one sent is refused as an unknown field, so "at {time}" is never a clock the agent chose.
-- **No certificate of its own:** `sha256_matches` is `null` when the server has no certificate of its own (plain http, or the first-install tunnel: GET /v1/service/certificate answers 404). There is nothing to compare, so C2 says that and does not fail.
+- **No certificate of its own:** `sha256_matches` is `null` exactly when the server has no certificate of its own (plain http, or the first-install tunnel: GET /v1/service/certificate answers 404).
+  - Where the server serves one, null is refused with 422, so a report cannot dodge a failed comparison.
+  - Where it serves none, true and false are refused, and C2 reads `todo`, "nothing to compare", never `done` (review of kittrial-5bb.444, B1).
 - **The project:** it need not be one the agent has, because "not listed" is what the report is for. A report about a project that does not exist is kept and shown nowhere, so the answer never says whether a project exists.
-- **Bound:** at most 10 reports per agent a minute. The next is `429` with Retry-After. Every authorized attempt counts, a refused body too; the count is kept in memory, like the account lookups. Each kept report is one committed audit event, with the agent, the project and the three results.
+- **Bound:** at most 10 reports per agent a minute. The next is `429` with Retry-After, which is never longer than the minute.
+  - Every authorized attempt counts, a refused body too. A 429 does not count, so refusals never extend the window.
+  - The count is kept in memory, like the account lookups.
+  - Each kept report is one committed audit event, with the agent, the project and the three results. Only the first 429 of an agent in a minute is audited, so a flood cannot push older history out of the audit trail (review of kittrial-5bb.444, B2).
 - **Hidden from agent reads:** the reports are on the agent record (`self_checks`), which no agent read lists field by field (`agent_view`).
 - **Backup:** the agent records are in the web service's state, which the coordination backup's HTTP-state pair carries. An older kit restoring that pair keeps them untouched.
 - **C2 counts a report only after the grant:** only a report strictly after the grant's `granted_at` counts (the comparison of C1); an older one is `todo`.

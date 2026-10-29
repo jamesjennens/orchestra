@@ -6000,11 +6000,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         except HttpError as error:
             self.service.idempotency_release(digest)
             # ``refused_reason`` lets a route whose target is not a registered project (a
-            # creation) say what was refused; the error code stays first.
-            self.service.audit(ctx.request_id, ctx.principal, route_name,
-                               'denied' if error.status in (401, 403) else 'rejected',
-                               project_id=project_id,
-                               reason=error.code if refused_reason is None else '%s: %s' % (error.code, refused_reason))
+            # creation) say what was refused; the error code stays first. A refusal marked
+            # ``quiet_audit`` is a repeat its route has already audited once in this window (the
+            # first-check report's 429s, kittrial-5bb.444 review B2): it is answered, not logged again.
+            if not getattr(error, 'quiet_audit', False):
+                self.service.audit(ctx.request_id, ctx.principal, route_name,
+                                   'denied' if error.status in (401, 403) else 'rejected',
+                                   project_id=project_id,
+                                   reason=error.code if refused_reason is None else '%s: %s' % (error.code, refused_reason))
             if not audit_success:
                 self._audited_refusal = True
             # The refusal is the answer whether or not its audit entry can be saved now
@@ -9499,7 +9502,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         """The agent reports its own first check (kittrial-5bb.444; design COORDINATOR_ONBOARDING_DESIGN §5.3).
 
         From its own credential only: whether its saved certificate's sha256 matches the one this server serves
-        (null when the server has no certificate of its own, so there is nothing to compare), whether the project
+        (true or false where it serves one; null, and only null, where it has no certificate of its own, so there is
+        nothing to compare), whether the project
         is in its own GET /v1/projects, and whose AGENT.md it has (``coordinator``, ``worker`` or ``unknown``).
         Kept on its record, the newest 5, and shown as step C2 of the hand-over walkthrough labelled with the
         agent and the time. It is the agent's claim: it grants nothing and no authority check reads it. At most
@@ -9507,6 +9511,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         """
         payload = ctx.payload
         metadata = {}
+
+        serves_certificate = bool(getattr(self.server, 'tls_certificate_pem', None))
 
         def report():
             self.service.self_check_admit(ctx.principal)
@@ -9528,9 +9534,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                     if value not in self.service.SELF_CHECK_ROLES:
                         raise invalid('agent_md.role must be one of: %s' % ', '.join(self.service.SELF_CHECK_ROLES))
                 elif field == 'sha256_matches':
-                    if not (value is None or type(value) is bool):
-                        raise invalid('certificate.sha256_matches must be true, false, or null when this server '
-                                      'has no certificate of its own')
+                    # Review of kittrial-5bb.444, B1: the service knows whether it serves a certificate of its own
+                    # (GET /v1/service/certificate), so null is the answer exactly when there is nothing to compare.
+                    if serves_certificate and type(value) is not bool:
+                        raise invalid('certificate.sha256_matches must be true or false: this server serves its own '
+                                      'certificate, so compare it with your saved file')
+                    if not serves_certificate and value is not None:
+                        raise invalid('certificate.sha256_matches must be null: this server has no certificate of its '
+                                      'own, so there is nothing to compare')
                 elif type(value) is not bool:
                     raise invalid('first_read.project_listed must be true or false')
                 fields[field] = value

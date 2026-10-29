@@ -830,13 +830,13 @@ page or route that fixes it. It writes nothing, and the page changes nothing its
 
 **The agent's own first check** (kittrial-5bb.444): the agent reports what it checked on its own PC, which the server cannot see.
 - **Route:** `POST /v1/agents/me/checks`, with the agent's own credential only. The body is `{project, certificate: {sha256_matches}, first_read: {project_listed}, agent_md: {role}}`:
-  - `sha256_matches` is true or false, or null when the server has no certificate of its own;
+  - `sha256_matches` is true or false where the server serves its own certificate, and null (only null) where it serves none;
   - `project_listed` is true or false;
   - `role` is `coordinator`, `worker` or `unknown`.
   The answer is `201` with the report.
 - **Bounds:**
   - every field is checked, and an unknown one is refused, `at` included: the time is the server's own `reported_at`;
-  - at most 10 reports per agent a minute, then `429` with Retry-After;
+  - at most 10 reports per agent a minute, then `429` with Retry-After (never more than 60 s); a 429 is not counted, and only the first one in a minute is audited;
   - the newest 5 are kept, on the agent's record;
   - one audit event per kept report.
 - **Where it shows:** only as the walkthrough's step "The agent's own first check" (C2), and only for a report made after the grant, labelled "Reported by {agent} at {time}". No agent read shows it.

@@ -260,11 +260,14 @@ def self_check_step(agent, report, granted_at):
     if failing:
         return step('self-check', title, 'failed', 'It found: %s. %s' % ('; '.join(failing), label), who='person',
                     fix={'page': 'agent-setup', 'route': None})
-    certificate = ('the certificate matches' if report['sha256_matches']
-                   else 'this server has no certificate of its own to compare')
+    if report['sha256_matches'] is None:
+        # Review of kittrial-5bb.444, B1: with no certificate to compare the check is never complete, so never done.
+        return step('self-check', title, 'todo',
+                    "It found this project in its list and a coordinator's AGENT.md; nothing to compare: this server "
+                    'has no certificate of its own. %s' % label)
     return step('self-check', title, 'done',
-                "It found: %s, this project is in its list and its AGENT.md is a coordinator's. %s"
-                % (certificate, label))
+                "It found: the certificate matches, this project is in its list and its AGENT.md is a coordinator's. "
+                '%s' % label)
 
 
 def reached_since(last_seen, granted_at):

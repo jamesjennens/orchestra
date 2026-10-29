@@ -25,6 +25,10 @@ from http_auth import HttpError, Service, Store, now_iso
 from test_coordinator_agent_md import BUNDLE, node_json
 
 
+#: Only its presence matters to the route: it reads whether the listener serves a certificate of its own.
+SERVED_CERTIFICATE = '-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n'
+
+
 def body(project, matches=True, listed=True, role='coordinator'):
     return {'project': project, 'certificate': {'sha256_matches': matches}, 'first_read': {'project_listed': listed},
             'agent_md': {'role': role}}
@@ -37,6 +41,12 @@ class CheckCase(test_coordinator_grant.Grants):
         super().setUp()
         self.clock = [time.time()]
         self.service._now = lambda: self.clock[0]
+        # The service serves a certificate of its own (what GET /v1/service/certificate reads), so true or false
+        # is what a report says; a test of a server without one sets this to None (review of .444, B1).
+        self.httpd.tls_certificate_pem = SERVED_CERTIFICATE
+
+    def without_a_certificate(self):
+        self.httpd.tls_certificate_pem = None
 
     def later(self, seconds=61):
         self.clock[0] += seconds
@@ -119,7 +129,21 @@ class RouteTests(CheckCase):
         self.later(5)
         self.assertEqual(now_iso(self.clock[0]), self.report().data['report']['reported_at'])
 
-    def test_null_says_the_server_has_no_certificate_of_its_own(self):
+    def test_null_is_refused_where_the_server_serves_a_certificate(self):
+        # Review of .444, B1: null would dodge 'failed' where there is a certificate to compare.
+        refused = self.report(matches=None)
+        self.assertEqual(422, refused.status)
+        self.assertIn('this server serves its own certificate', refused.data['error']['message'])
+        for value in (True, False):
+            self.later()
+            self.assertEqual(201, self.report(matches=value).status)
+
+    def test_null_is_the_only_value_where_the_server_has_no_certificate(self):
+        self.without_a_certificate()
+        for value in (True, False):
+            refused = self.report(matches=value)
+            self.assertEqual(422, refused.status, value)
+            self.assertIn('this server has no certificate of its own', refused.data['error']['message'])
         made = self.report(matches=None)
         self.assertEqual((201, None), (made.status, made.data['report']['sha256_matches']))
 
@@ -149,6 +173,44 @@ class RouteTests(CheckCase):
         self.assertEqual('30', self.report().headers.get('retry-after'))
         self.later(31)
         self.assertEqual(201, self.report().status)
+
+    def test_a_429_does_not_extend_the_window(self):
+        # Review of .444, B2: refusals are not counted, so the window ends a minute after the reports themselves.
+        for _ in range(10):
+            self.assertEqual(201, self.report().status)
+        self.later(30)
+        for _ in range(10):
+            self.assertEqual(429, self.report().status)
+        self.later(31)                                          # a minute after the reports, 31 s after the 429s
+        self.assertEqual(201, self.report().status)
+
+    def test_retry_after_is_never_longer_than_the_window(self):
+        for _ in range(10):
+            self.assertEqual(201, self.report().status)
+        self.clock[0] -= 3600                                  # the clock steps back an hour
+        refused = self.report()
+        self.assertEqual((429, '60'), (refused.status, refused.headers.get('retry-after')))
+
+    def test_a_flood_adds_a_bounded_number_of_audit_events(self):
+        # Review of .444, B2: one event per kept report or refused body (at most 10 a window, the bound), and one
+        # rate-limited event a window, so a flood of 100 cannot push older history out of the audit trail.
+        def all_events():
+            with self.service.store.lock:
+                return [e for e in self.service.state['audit'] if e['action'] == 'agents.self_check']
+        before = len(all_events())
+        for _ in range(100):
+            self.report()
+        added = all_events()[before:]
+        self.assertEqual(sorted((e['outcome'], e['reason'] or '') for e in added),
+                         [('committed', '')] * 10 + [('rejected', 'rate_limited')])
+        self.later()                                            # a new window, and a flood of refused bodies
+        before = len(all_events())
+        for _ in range(100):
+            self.report(payload={'nonsense': True})
+        added = all_events()[before:]
+        self.assertEqual(11, len(added))
+        self.assertEqual(['rejected'] * 11, [e['outcome'] for e in added])
+        self.assertEqual(1, sum(1 for e in added if e['reason'] == 'rate_limited'))
 
     def test_refused_bodies_count_too_and_each_agent_has_its_own_count(self):
         for _ in range(10):
@@ -226,13 +288,19 @@ class StepTests(CheckCase):
             self.assertIn(words, got['detail'])
             self.assertIn('Reported by Heron at', got['detail'])
 
-    def test_no_certificate_of_its_own_is_not_a_failure(self):
+    def test_no_certificate_of_its_own_is_todo_never_done(self):
+        # Review of .444, B1: with nothing to compare the check is not complete, so C2 is never done.
+        self.without_a_certificate()
         self.assertEqual(200, self.grant().status)
         self.later()
         self.assertEqual(201, self.report(matches=None).status)
         got = self.c2()
-        self.assertEqual('done', got['state'])
-        self.assertIn('this server has no certificate of its own to compare', got['detail'])
+        self.assertEqual('todo', got['state'])
+        self.assertIn('nothing to compare: this server has no certificate of its own', got['detail'])
+        self.assertIn('Reported by Heron at', got['detail'])
+        self.later()
+        self.assertEqual(201, self.report(matches=None, listed=False).status)
+        self.assertEqual('failed', self.c2()['state'])          # a real failure is still said
 
     def test_a_report_about_another_project_is_not_shown_here(self):
         self.assertEqual(200, self.grant().status)
@@ -343,7 +411,8 @@ class AgentGuideTests(unittest.TestCase):
     def guide(self, coordinates):
         return node_json(self, ("const p = m.secretlessPayload(%s, 'https://office.example:7443');"
                                 "console.log(JSON.stringify({guide: m.agentGuide(p), cert: m.agentGuide(p, { hasCertificate: true }),"
-                                " file: p.secretFile, body: m.FIRST_CHECK_BODY}))") % (BUNDLE % coordinates))
+                                " file: p.secretFile, body: m.FIRST_CHECK_BODY, bare: m.FIRST_CHECK_BODY_NO_CERTIFICATE}))")
+                         % (BUNDLE % coordinates))
 
     def test_the_coordinator_agent_md_reports_its_first_check_with_curl_k_and_no_secret(self):
         got = self.guide("[{ project: 'alpha', effective: true }]")
@@ -361,7 +430,13 @@ class AgentGuideTests(unittest.TestCase):
                 self.assertNotIn('Bearer', line)
         self.assertIn('so send sha256_matches null', got['guide'])
         self.assertIn('/v1/service/certificate serves (sha256_matches true or false)', got['cert'])
-        self.assertNotIn("'", got['body'])                     # it sits inside single quotes in both shells
+        # The example body follows the server: null without a certificate of its own, true with one (B1).
+        self.assertIn(got['bare'], got['guide'])
+        self.assertNotIn(got['body'], got['guide'])
+        self.assertIn(got['body'], got['cert'])
+        self.assertNotIn(got['bare'], got['cert'])
+        for example in (got['body'], got['bare']):
+            self.assertNotIn("'", example)                     # it sits inside single quotes in both shells
 
     def test_a_worker_agent_md_has_no_first_check(self):
         got = self.guide('[]')
@@ -372,9 +447,15 @@ class AgentGuideTests(unittest.TestCase):
 class ExampleBodyTests(CheckCase):
 
     def test_the_example_body_in_the_agent_md_is_what_the_route_takes(self):
-        example = node_json(self, 'console.log(JSON.stringify({body: m.FIRST_CHECK_BODY}))')['body']
-        made = self.report(payload=json.loads(example.replace('PROJECT', self.project)))
-        self.assertEqual(201, made.status, made.data)
+        examples = node_json(self, 'console.log(JSON.stringify({body: m.FIRST_CHECK_BODY, '
+                                   'bare: m.FIRST_CHECK_BODY_NO_CERTIFICATE}))')
+        served, bare = (json.loads(examples[name].replace('PROJECT', self.project)) for name in ('body', 'bare'))
+        self.assertEqual(201, self.report(payload=served).status)
+        self.later()
+        self.assertEqual(422, self.report(payload=bare).status)
+        self.without_a_certificate()
+        self.assertEqual(201, self.report(payload=bare).status)
+        self.assertEqual(422, self.report(payload=served).status)
 
 
 if __name__ == '__main__':

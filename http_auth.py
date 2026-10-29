@@ -1108,6 +1108,7 @@ class Service:
         self.lookup_window = lookup_window
         self._lookups = {}
         self._self_check_times = {}      # agent id -> times of its recent first-check reports (kittrial-5bb.444)
+        self._self_check_throttle_audited = {}   # agent id -> time of its last audited 429 (at most one a window)
 
     # -- helpers ---------------------------------------------------------------
     def claim_gate(self, agent_id):
@@ -3668,8 +3669,11 @@ class Service:
     def self_check_admit(self, principal):
         """Count one report of ``principal``'s agent against the limit, or refuse it with 429.
 
-        Every authorized attempt counts, a refused body too, so a flood of any kind is bounded; a 429 does not
-        count. The caller holds the store lock across this and :meth:`keep_self_check`.
+        Every authorized attempt counts, a refused body too, so a flood of any kind is bounded. A 429 does not
+        count, so refusals never extend the window. Only the first 429 of an agent in a window is audited (the
+        route's refusal audit skips the rest), so a flood cannot push older history out of the audit trail
+        (review of kittrial-5bb.444, B2). The caller holds the store lock across this and
+        :meth:`keep_self_check`.
         """
         if principal is None or principal.via != 'credential' or not principal.agent_id:
             raise forbidden('Only an agent reports its own first check, with its own credential')
@@ -3679,10 +3683,16 @@ class Service:
                       if t > now - self.SELF_CHECK_WINDOW]
             if len(recent) >= self.SELF_CHECK_RATE:
                 self._self_check_times[principal.agent_id] = recent
-                wait = max(1, int(math.ceil(recent[0] + self.SELF_CHECK_WINDOW - now)))
+                # Never longer than the window, even when the clock has stepped back.
+                wait = min(self.SELF_CHECK_WINDOW, max(1, int(math.ceil(recent[0] + self.SELF_CHECK_WINDOW - now))))
                 error = throttled('Too many first-check reports: at most %d a minute. Send it again in %d '
                                   'seconds.' % (self.SELF_CHECK_RATE, wait))
                 error.retry_after = wait
+                audited = self._self_check_throttle_audited.get(principal.agent_id)
+                if audited is not None and now - self.SELF_CHECK_WINDOW < audited <= now:
+                    error.quiet_audit = True
+                else:
+                    self._self_check_throttle_audited[principal.agent_id] = now
                 raise error
             recent.append(now)
             self._self_check_times[principal.agent_id] = recent
