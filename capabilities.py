@@ -1797,6 +1797,8 @@ def js_tokens(text):
         if c == '/':
             prev = out[-1][0] if out else None
             regex_start = prev is None or prev in ('(', '[', '{', ';', ',', '=', ':', '!', '?', '&', '|', '+', '-', '*', '%', '^', '~', '<', '>', 'return', 'throw', 'case', 'typeof', 'void', 'delete', 'yield', 'await')
+            if prev in ('+', '-') and len(out) > 1 and out[-2][0] == prev:
+                regex_start = False
             if regex_start:
                 i += 1
                 in_class = False
@@ -1827,7 +1829,7 @@ def js_tokens(text):
             continue
         if c == '<' and i + 1 < n and (text[i + 1].isalpha() or text[i + 1] == '>'):
             prev = out[-1][0] if out else None
-            if prev in ('=', '(', '[', '{', ',', ':', 'return') or (prev == '>' and len(out) > 1 and out[-2][0] == '='):
+            if (prev in ('=', '(', '[', '{', ',', ':', 'return', '&', '|') or (prev == '>' and len(out) > 1 and out[-2][0] == '=')) and not re.match(r'<[A-Za-z_$][A-Za-z0-9_$]*\s*,', text[i:]):
                 start = i
                 i = js_skip_jsx(text, i, deadline)
                 line += text.count('\n', start, i)
@@ -1930,12 +1932,38 @@ def js_definitions(text):
                 raise JSUnreadable('unsupported-syntax')
             j += 1
 
+    def declaration_position(i):
+        p = i - 1
+        while p >= 0:
+            if values[p] in ('export', 'default', 'declare', 'async', 'abstract', 'const'):
+                p -= 1
+            elif p > 0 and identifier(values[p]) and values[p - 1] == '@':
+                p -= 2
+            else:
+                break
+        if p < 0:
+            return True
+        v = values[p]
+        if v == ':' and p > 0 and identifier(values[p - 1]):
+            return p == 1 or values[p - 2] in (';', '}')
+        if v in ('+', '-') and p > 0 and values[p - 1] == v:
+            return True
+        return v not in ('=', '.', '(', '[', ',', '?', ':', '+', '-', '*', '/', '%', '!', '~', '&', '|', '^', '<', '>', 'return', 'typeof', 'void', 'delete', 'new', 'await', 'yield', 'in', 'of', 'extends', 'throw')
+
     i = 0
     while i < n:
         check_time()
         v = values[i]
         if v == 'export' and i + 1 < n:
             j = i + 1
+            if values[j] == '*' and j + 2 < n and values[j + 1] == 'as' and identifier(values[j + 2]):
+                put(values[j + 2], 'export', j + 2)
+                i = j + 3
+                continue
+            if values[j] == 'import' and j + 1 < n and identifier(values[j + 1]):
+                put(values[j + 1], 'export', j + 1)
+                i = j + 2
+                continue
             if values[j] == 'type' and j + 1 < n and values[j + 1] == '{':
                 i = pairs[j + 1] + 1
                 continue
@@ -1970,19 +1998,12 @@ def js_definitions(text):
                 put('default', 'export', j)
                 i = j + 1
                 continue
-        if v in ('function', 'class'):
-            p = i - 1
-            while p >= 0 and values[p] in ('export', 'default', 'declare', 'async'):
-                p -= 1
-            statement = p < 0 or values[p] in (';', '}')
-            if p >= 0 and t[p][1] < t[i][1] and values[p] in (')', ']'):
-                statement = True
-            if not statement:
-                body = find_body(i + 1, n)
-                if body is None:
-                    raise JSUnreadable('unsupported-syntax')
-                i = pairs[body] + 1
-                continue
+        if v in ('function', 'class') and not declaration_position(i):
+            body = find_body(i + 1, n)
+            if body is None:
+                raise JSUnreadable('unsupported-syntax')
+            i = pairs[body] + 1
+            continue
         if v in ('function', 'class'):
             j = i + 1
             if j < n and values[j] == '*':
@@ -1992,22 +2013,33 @@ def js_definitions(text):
                 put(name, v, j)
                 body = find_body(j + 1, n)
                 if body is None:
-                    if i > 0 and values[i - 1] == 'declare':
-                        i = j + 1
-                        continue
-                    raise JSUnreadable('unsupported-syntax')
+                    k = j + 1
+                    while k < n and values[k] != ';':
+                        if values[k] in ('(', '['):
+                            k = pairs[k] + 1
+                        else:
+                            k += 1
+                    if k == n:
+                        raise JSUnreadable('unsupported-syntax')
+                    i = k + 1
+                    continue
                 if v == 'class':
                     class_methods(name, body, pairs[body])
                 i = pairs[body] + 1
                 continue
-        if v in ('interface', 'type', 'enum') and i + 1 < n and identifier(values[i + 1]):
-            p = i - 1
-            while p >= 0 and values[p] in ('export', 'declare', 'const'):
-                p -= 1
-            if p < 0 or values[p] in (';', '}'):
-                put(values[i + 1], v, i + 1)
-                i += 2
+        if v in ('interface', 'type', 'enum', 'namespace', 'module', 'global') and declaration_position(i):
+            if v == 'global' and i > 0 and values[i - 1] == 'declare':
+                put('global', 'namespace', i)
+                i += 1
                 continue
+            if i + 1 < n:
+                name = values[i + 1]
+                if name.startswith('<string:') and name.endswith('>'):
+                    name = name[8:-1]
+                if identifier(name) or (v == 'module' and values[i + 1].startswith('<string:')):
+                    put(name, v, i + 1)
+                    i += 2
+                    continue
         if v == 'const' and i + 1 < n and values[i + 1] == 'enum':
             i += 1
             continue
@@ -2230,7 +2262,7 @@ def verify_matches(index, views):
     for item in views:
         if item['source'] != 'graphify':
             continue
-        if not item['file'].endswith(('.py', '.js', '.mjs', '.cjs', '.ts', '.tsx')):
+        if not item['file'].endswith(('.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')):
             item['verified'] = None
             continue
         check = resolve_pointer(index.repo, item['id'])

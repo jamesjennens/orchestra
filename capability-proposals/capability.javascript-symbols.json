@@ -7,7 +7,7 @@
     "capability pointer symbol verification",
     "JavaScript TypeScript symbol resolution"
   ],
-  "summary": "Resolve JS, JSX, TS and TSX pointers with a bounded lexical reader. Unsupported examples include private names, hashbangs, destructured exports, overloads, fields without semicolons, static blocks, escaped export aliases and nested template interpolation in JSX expressions.",
+  "summary": "Resolve JS, JSX, TS and TSX declaration pointers with a bounded lexical reader. Namespace members are not indexed. Unsupported examples include private names, hashbangs, destructured exports, some overload forms, fields without semicolons, static blocks, escaped export aliases and nested template interpolation inside JSX expressions.",
   "requirements": [],
   "anchors": [],
   "code": [
