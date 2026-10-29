@@ -3707,6 +3707,12 @@ class Service:
                 self.check_authority(principal, project, CAP_COORDINATE)
             except HttpError:
                 continue
+            # Review of .447, B2: the account's own role, as the records routes require; a superuser who is only a
+            # viewer, or their agent, coordinates nothing here.
+            with self.store.lock:
+                role = ((self.state.get('memberships') or {}).get(project) or {}).get(principal.user_id)
+            if role not in ('owner', 'coordinator'):
+                continue
             found.append(project)
         return found[:50], len(found) > 50
 

@@ -124,6 +124,15 @@ A link counts only when **both** sides have accepted their record:
   projects (and of two areas of one program) write to each other. The link is checked live, the sender needs no
   right in the other project, and a note's text reaches only the coordinators of its two projects. The harness
   covers the note reads, and its route test now catches any route mentioning "program" or "notes".
+  - **Revision 2 (review 01a18a03):** the sender, the reader and the one who marks a note noted must really
+    coordinate the project: an owner or a coordinator, or their agent holding the grant. A web superuser who is
+    only a viewer is refused like any viewer; "operators" means the host's operator list.
+  - **The sender's own records first:** a target that A's own records do not name is refused, with the one 404,
+    before B is read at all. A names B as its area, as its program, or as an area its own program lists.
+  - **Siblings:** each area's own program is read, and they must be the same program.
+  - **Wakes** name the sending project and "its coordinators", never a person or an agent.
+  - **Refusals of A's own right** may stay 403 or 404 (review F1). Only the refusal of the address must be the
+    one 404.
 
 ### 2.3 What being in a program grants: nothing
 
@@ -422,7 +431,13 @@ with an admitted area's name exists on this installation. This is accepted, not 
 - The same difference exists wherever a read touches a project's records only when the project exists.
 - Padding every area read to the slower path would cost every reader up to 50 slow reads a page.
 
-If an installation needs the names hidden, the read can pad each area to a fixed floor. That is one change in the
+If an installation needs the names hidden, the read can pad each area to a fixed floor.
+
+**Notes between coordinators: timing (review of kittrial-5bb.447, B3).** A note's address is checked from the
+sender's own records first. A target the sending project does not itself name (as its area, as its program, or as an
+area its program lists) is refused before the target's records are read. So any project the sender has not named
+costs the same as one that does not exist. Only projects the sender's own owner-accepted records already name are
+read, and they are the projects it may write to. That is one change in the
 web service's read (`program_links_read`), with no change to the records.
 
 ## 9. Slices (five, each deliverable alone)

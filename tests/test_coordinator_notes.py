@@ -21,6 +21,7 @@ sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import admin
 import agent_prompts
+import http_service
 import program_isolation
 from http_auth import Service, Store
 from test_coordinator_agent_md import BUNDLE, node_json
@@ -317,6 +318,93 @@ class StoreTests(NoteCase):
             self.service.state['coordinator_notes'] = 'not a record'
         self.assertEqual([], self.box(self.tokens['nora'])['items'])
         self.assertEqual(503, self.send(self.tokens['cleo']).status)
+
+
+class ReviewR1Tests(NoteCase):
+    """The items of the .447 review (01a18a03): B1's surviving mutants, B2's superuser, B3's timing and labels."""
+
+    def test_a_reply_needs_the_link_too(self):
+        # B1, N5b: a reply is a note like any other; when the link has ended it is refused with the one 404.
+        note = self.send(self.tokens['cleo']).data
+        self.links['prog'] = [item('program.area.north', statement('Area', 'north', state='left'), self.ids['pat']),
+                              item('program.area.south', statement('Area', 'south'), self.ids['pat'])]
+        refused = self.send(self.tokens['nora'], 'north', 'prog', text='Too late.', reply_to=note['id'])
+        self.assertEqual(404, refused.status, refused.data)
+        self.assertIsNone(self.box(self.tokens['nora'])['items'][0]['settled'])
+
+    def test_the_sender_cannot_mark_its_own_note_noted(self):
+        # B1, N6: only the addressed project settles a note; the sender's project gets the note's 404.
+        note = self.send(self.tokens['cleo']).data
+        for token in (self.tokens['cleo'], self.tokens['rook'], self.tokens['pat']):
+            refused = self.request('POST', '/v1/projects/prog/notes/%s/noted' % note['id'], {}, token=token,
+                                   key='noted-key-%06d' % next(KEYS))
+            self.assertEqual(404, refused.status, refused.data)
+        self.assertIsNone(self.box(self.tokens['nora'])['items'][0]['settled'])
+
+    def test_areas_of_two_different_programs_are_no_siblings(self):
+        # B1, N7: west is fully linked, but to another program; north's program does not list it.
+        from test_reference_records import OPERATOR
+        self.links['other'] = [item('program.area.west', statement('Area', 'west'), OPERATOR)]
+        self.links['west'] = [item(pl.MEMBER_OF, statement('Program', 'other'), OPERATOR)]
+        self.links['prog'] = list(self.links['prog']) + [item('program.area.west', statement('Area', 'west'),
+                                                             self.ids['pat'])]
+        refused = self.send(self.tokens['nora'], 'north', 'west')
+        self.assertEqual(404, refused.status, refused.data)
+
+    def test_a_superuser_who_is_only_a_viewer_is_refused_like_any_viewer(self):
+        # B2: send, read, noted and notes to me, against an ordinary viewer of the same project.
+        note = self.send(self.tokens['cleo']).data
+        self.ids['vic'] = self.create_account(self.admin, 'vic', 'vic-password-1')
+        with self.service.store.lock:
+            self.service.state['users'][self.ids['vic']]['superuser'] = True
+        for name in ('vic',):
+            self.assertEqual(200, self.request('PUT', '/v1/projects/north/members/%s' % self.ids[name],
+                                               {'role': 'viewer'}, token=self.admin).status)
+        self.tokens['vic'] = self.login('vic', 'vic-password-1')[0]
+        for name in ('vic', 'vera'):                                   # vera is an ordinary viewer of north
+            token = self.tokens[name]
+            sent = self.send(token, 'north', 'prog')
+            read = self.request('GET', '/v1/projects/north/notes', token=token)
+            noted = self.request('POST', '/v1/projects/north/notes/%s/noted' % note['id'], {}, token=token,
+                                 key='noted-key-%06d' % next(KEYS))
+            self.assertEqual([403, 403, 403], [sent.status, read.status, noted.status], name)
+            self.assertEqual(http_service.ApiHandler.NOTE_COORDINATORS_ONLY, read.data['error']['message'], name)
+            self.assertNotIn('billing', json.dumps([sent.data, read.data, noted.data]), name)
+            mine = self.request('GET', '/v1/me/notes', token=token).data
+            self.assertEqual(([], 0), (mine['projects'], mine['unsettled']), name)
+
+    def test_a_target_the_sender_does_not_name_is_refused_before_it_is_read(self):
+        # B3 (1): a counting backend; a project prog's records never name is never read, existing or not.
+        reads = []
+        inner = self.backend.reference_links
+
+        def counted(project_id):
+            reads.append(project_id)
+            return inner(project_id)
+        self.backend.reference_links = counted
+        for pid in ('east',):
+            self.assertEqual(201, self.request('POST', '/v1/projects', {'project_id': pid, 'name': pid.title()},
+                                               token=self.admin).status)
+        self.links['east'] = [item(pl.MEMBER_OF, statement('Program', 'prog'), 'ops-james')]
+        for to in ('east', 'ghost'):
+            reads.clear()
+            refused = self.send(self.tokens['cleo'], 'prog', to)
+            self.assertEqual(404, refused.status, to)
+            self.assertEqual(['prog'], reads, to)                       # prog's own records, nothing of the target
+        reads.clear()
+        self.assertEqual(201, self.send(self.tokens['cleo'], 'prog', 'north').status)
+        self.assertIn('north', reads)
+
+    def test_no_wake_names_the_sending_person_or_agent(self):
+        # B3 (2): next, both waits and the pointer name the sending project and its coordinators only.
+        self.send(self.tokens['cleo'])
+        self.send(self.tokens['rook'])
+        answers = [self.request('GET', path, token=self.tokens['kite']).data
+                   for path in ('/v1/agents/me/next', '/v1/agents/me/wait', '/v1/agents/me/wait?form=coordinator')]
+        text = json.dumps(answers)
+        for label in ('cleo', 'Rook', self.ids['cleo']):
+            self.assertNotIn(label, text, label)
+        self.assertIn('The coordinators of prog sent', answers[0]['next_action']['reason'])
 
 
 class BackupTests(unittest.TestCase):
