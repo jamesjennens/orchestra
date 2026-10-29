@@ -798,11 +798,12 @@ page or route that fixes it. It writes nothing, and the page changes nothing its
 | Installation switches | `GET /v1/projects/{id}/switches`; an endpoint that cannot answer makes only this step say so | the operator, with the command shown |
 | Agent approvals | the project's `agent_approval` setting | an owner |
 | Set up after the grant | the agent has reached the server since the grant (`last_seen_at` later than `granted_at`) | the member, by opening the agent's set-up again |
+| The agent's own first check | the agent's newest report about this project made after the grant: certificate, project listed, whose AGENT.md (kittrial-5bb.444) | the agent reports it; a failure is fixed by opening its set-up again |
 
 **Who reads what:**
 - **Any member:** their own walkthrough, with their own agents. An agent made before they were a member is named, so they know to tick the project on it.
 - **An owner or superuser:** any member's (`person=`), seeing only the agents that already have the project. A missing agent is then said without naming any.
-- **A coordinator:** any member's, without their agents, a grant's reasons or the set-up step (`hidden`). An effective grant is shown, as the coordination panel shows it to any reader.
+- **A coordinator:** any member's, without their agents, a grant's reasons, the set-up step or the agent's own check (`hidden`). An effective grant is shown, as the coordination panel shows it to any reader.
 - **An agent:** its own steps only.
 - **Refusals:**
   - anyone else asking for another member gets one `403` sentence, the same whoever the person is;
@@ -826,6 +827,21 @@ page or route that fixes it. It writes nothing, and the page changes nothing its
   - none of these carries the text.
 - **It is data, not instructions:** a colleague's notes, shown as text.
 - **Storage and backup:** it lives in the web service's state, so the coordination backup's HTTP-state pair carries it, and an older kit restoring that pair ignores it.
+
+**The agent's own first check** (kittrial-5bb.444): the agent reports what it checked on its own PC, which the server cannot see.
+- **Route:** `POST /v1/agents/me/checks`, with the agent's own credential only. The body is `{project, certificate: {sha256_matches}, first_read: {project_listed}, agent_md: {role}}`:
+  - `sha256_matches` is true or false, or null when the server has no certificate of its own;
+  - `project_listed` is true or false;
+  - `role` is `coordinator`, `worker` or `unknown`.
+  The answer is `201` with the report.
+- **Bounds:**
+  - every field is checked, and an unknown one is refused, `at` included: the time is the server's own `reported_at`;
+  - at most 10 reports per agent a minute, then `429` with Retry-After;
+  - the newest 5 are kept, on the agent's record;
+  - one audit event per kept report.
+- **Where it shows:** only as the walkthrough's step "The agent's own first check" (C2), and only for a report made after the grant, labelled "Reported by {agent} at {time}". No agent read shows it.
+- **It is the agent's claim:** it grants nothing, no authority check reads it, and no other step changes with it.
+- **The coordinator AGENT.md** has a "Your first check" section with the call that reports it, using `curl -K` like every other call.
 
 ### Creating a project from the web interface
 

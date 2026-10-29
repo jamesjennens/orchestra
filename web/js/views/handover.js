@@ -1,7 +1,8 @@
 // "Hand this project to a coordinator" (kittrial-5bb.442; docs/design/COORDINATOR_ONBOARDING_DESIGN.md §3).
-// Steps O1-O5 and C1, read from GET /v1/projects/{id}/handover, each checked by the server from what it
-// already holds. Each step says who does it and links to the existing page where it is done; this page
-// never changes anything itself. An owner (or a coordinator) picks the member; anyone else sees their own.
+// Steps O1-O6 and C1-C3 (C2, the agent's own first check, from kittrial-5bb.444), read from
+// GET /v1/projects/{id}/handover, each checked by the server from what it already holds. Each step says
+// who does it and links to the existing page where it is done; this page never changes anything itself.
+// An owner (or a coordinator) picks the member; anyone else sees their own.
 import { h, copyButton } from '../dom.js';
 import { pageHead, errorState, act } from '../ui.js';
 

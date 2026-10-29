@@ -172,14 +172,25 @@ These moved under `/handover/note` in slice 3: `GET /v1/projects/{pid}/handover`
 `POST /v1/agents/me/checks` from the agent itself (its own credential). The body is:
 
 ```
-{project, certificate: {sha256_matches: bool}, first_read: {project_listed: bool},
- agent_md: {role: 'coordinator'|'worker'|'unknown'}, at}
+{project, certificate: {sha256_matches: bool | null}, first_read: {project_listed: bool},
+ agent_md: {role: 'coordinator'|'worker'|'unknown'}}
 ```
 
 - **Storage:** with the agent, newest first, at most 5 kept.
 - **Display:** shown in C2 as "reported by {agent} at {time}".
 - **A labelled claim, never authority:** it grants nothing, unlocks nothing and is never read by any authority check (Q3). A false report can only mislead the walkthrough's display, which is why it is labelled with who said it and when.
 - **Relation to existing designs:** it overlaps the planned `POST /v1/agents/me/report` of docs/WEB_ONBOARDING_DESIGN.md §4.3, which is not built. If that is built first, these three fields go there instead of into a route of their own.
+
+**As built (kittrial-5bb.444):**
+- **The time:** the service stamps `reported_at` itself. The body has no `at`; one sent is refused as an unknown field, so "at {time}" is never a clock the agent chose.
+- **No certificate of its own:** `sha256_matches` is `null` when the server has no certificate of its own (plain http, or the first-install tunnel: GET /v1/service/certificate answers 404). There is nothing to compare, so C2 says that and does not fail.
+- **The project:** it need not be one the agent has, because "not listed" is what the report is for. A report about a project that does not exist is kept and shown nowhere, so the answer never says whether a project exists.
+- **Bound:** at most 10 reports per agent a minute. The next is `429` with Retry-After. Every authorized attempt counts, a refused body too; the count is kept in memory, like the account lookups. Each kept report is one committed audit event, with the agent, the project and the three results.
+- **Hidden from agent reads:** the reports are on the agent record (`self_checks`), which no agent read lists field by field (`agent_view`).
+- **Backup:** the agent records are in the web service's state, which the coordination backup's HTTP-state pair carries. An older kit restoring that pair keeps them untouched.
+- **C2 counts a report only after the grant:** only a report strictly after the grant's `granted_at` counts (the comparison of C1); an older one is `todo`.
+- **No report changes another step:** C1 still reads only `last_seen_at`, and the advice to open the set-up again for a worker's AGENT.md is in C2's `failed` state.
+- **The coordinator AGENT.md:** it has a "Your first check" section before its steps. The section says what to check and gives the one call that reports it, in PowerShell and POSIX forms. The credential is read with `-K` as in every call, and the body is piped in.
 
 ### 5.4 Text-only changes
 

@@ -29,9 +29,14 @@ def grant(effective=True, why=None, at=T0):
             'effective': effective, 'no_effect_because': why}
 
 
-def agent(ident='agt_1', name='Heron', has=True, last_seen=None, coordinator=None):
+def agent(ident='agt_1', name='Heron', has=True, last_seen=None, coordinator=None, self_check=None):
     return {'id': ident, 'name': name, 'has_project': has, 'enabled': True, 'last_seen_at': last_seen,
-            'coordinator': coordinator}
+            'coordinator': coordinator, 'self_check': self_check}
+
+
+def report(at=T1, matches=True, listed=True, role='coordinator'):
+    """An agent's report of its own first check, as ``Service.handover_facts`` gives it (kittrial-5bb.444)."""
+    return {'project': 'alpha', 'sha256_matches': matches, 'project_listed': listed, 'role': role, 'reported_at': at}
 
 
 def facts(role='coordinator', agents=(), effective_agent=None, viewer_agent=None, note=None):
@@ -55,11 +60,12 @@ class StepRuleTests(unittest.TestCase):
         return by_id(hs.steps(f, tier=tier, agent_id=agent_id, switches=switches, approval=approval))
 
     def test_the_steps_come_in_order_and_use_only_the_five_states(self):
-        steps = hs.steps(facts(agents=[agent(coordinator=grant(), last_seen=T1)], note=NOTE), tier='owner',
-                         switches=ON)
-        # O6 and C3 (the hand-over note) arrived with kittrial-5bb.443.
+        steps = hs.steps(facts(agents=[agent(coordinator=grant(), last_seen=T1, self_check=report())], note=NOTE),
+                         tier='owner', switches=ON)
+        # O6 and C3 (the hand-over note) arrived with kittrial-5bb.443, C2 (the agent's own check) with .444.
         self.assertEqual([s['id'] for s in steps], ['role', 'agent', 'grant', 'switches', 'agent-approval',
-                                                     'handover-note', 'setup-after-grant', 'acknowledge-note'])
+                                                     'handover-note', 'setup-after-grant', 'self-check',
+                                                     'acknowledge-note'])
         self.assertTrue(all(s['state'] in hs.STATES for s in steps))
         self.assertEqual({s['state'] for s in steps}, {'done'})
 

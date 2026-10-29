@@ -9487,6 +9487,60 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, action, None, update_self,
                             capability=CAP_AGENT_SELF, audit_metadata=metadata)
 
+    #: The parts of an agent's report of its own first check (kittrial-5bb.444; design §5.3), each an object with
+    #: exactly its one field. There is no time field: the service stamps ``reported_at`` itself.
+    SELF_CHECK_PARTS = (('certificate', 'sha256_matches'), ('first_read', 'project_listed'), ('agent_md', 'role'))
+
+    @route('POST', r'/v1/agents/me/checks')
+    def agents_me_checks(self, ctx):
+        """The agent reports its own first check (kittrial-5bb.444; design COORDINATOR_ONBOARDING_DESIGN §5.3).
+
+        From its own credential only: whether its saved certificate's sha256 matches the one this server serves
+        (null when the server has no certificate of its own, so there is nothing to compare), whether the project
+        is in its own GET /v1/projects, and whose AGENT.md it has (``coordinator``, ``worker`` or ``unknown``).
+        Kept on its record, the newest 5, and shown as step C2 of the hand-over walkthrough labelled with the
+        agent and the time. It is the agent's claim: it grants nothing and no authority check reads it. At most
+        10 a minute per agent (429 with Retry-After beyond); one committed audit event per kept report.
+        """
+        payload = ctx.payload
+        metadata = {}
+
+        def report():
+            self.service.self_check_admit(ctx.principal)
+            refuse_unknown_fields(payload, ('project',) + tuple(part for part, _ in self.SELF_CHECK_PARTS),
+                                  'A first-check report')
+            missing = [name for name in ('project',) + tuple(part for part, _ in self.SELF_CHECK_PARTS)
+                       if name not in payload]
+            if missing:
+                raise invalid('A first-check report needs: %s' % ', '.join(missing))
+            if not isinstance(payload['project'], str):
+                raise invalid('project must be a project id')
+            fields = {'project': payload['project']}
+            for part, field in self.SELF_CHECK_PARTS:
+                refuse_unknown_fields(payload[part], (field,), 'A first-check report\'s %s' % part)
+                if field not in payload[part]:
+                    raise invalid('%s needs %s' % (part, field))
+                value = payload[part][field]
+                if field == 'role':
+                    if value not in self.service.SELF_CHECK_ROLES:
+                        raise invalid('agent_md.role must be one of: %s' % ', '.join(self.service.SELF_CHECK_ROLES))
+                elif field == 'sha256_matches':
+                    if not (value is None or type(value) is bool):
+                        raise invalid('certificate.sha256_matches must be true, false, or null when this server '
+                                      'has no certificate of its own')
+                elif type(value) is not bool:
+                    raise invalid('first_read.project_listed must be true or false')
+                fields[field] = value
+            kept = self.service.keep_self_check(ctx.principal, fields)
+            # One committed event per kept report: the agent, the project and the three results; no free text.
+            metadata.update({'agent': ctx.principal.agent_id, 'project': kept['project'],
+                             'sha256_matches': kept['sha256_matches'], 'project_listed': kept['project_listed'],
+                             'role': kept['role']})
+            answer = {'report': kept, 'links': {'self': '/v1/agents/me'}}
+            return answer, answer
+        return self._mutate(ctx, 'agents.self_check', None, report, status=201,
+                            capability=CAP_AGENT_SELF, audit_metadata=metadata)
+
     @route('GET', r'/v1/agents/me/next')
     def agents_me_next(self, ctx):
         role_override = validate_agent_role(ctx.query['role']) if 'role' in ctx.query else None

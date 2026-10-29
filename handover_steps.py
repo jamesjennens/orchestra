@@ -1,7 +1,9 @@
 """The steps of handing a project to a coordinator (kittrial-5bb.442).
 
-Slices 2 and 3 of docs/design/COORDINATOR_ONBOARDING_DESIGN.md: steps O1-O6, C1 and C3 (O6 and C3, the
-hand-over note, from kittrial-5bb.443), each checked from facts the web service already holds and said in one plain sentence, with the existing page or route that fixes it.
+Slices 2 to 4 of docs/design/COORDINATOR_ONBOARDING_DESIGN.md: steps O1-O6 and C1-C3 (O6 and C3, the
+hand-over note, from kittrial-5bb.443; C2, the agent's own first check as it reported it, from kittrial-5bb.444),
+each checked from facts the web service already holds and said in one plain sentence, with the existing page or
+route that fixes it.
 Nothing here reads or writes state: the route gathers the facts (``Service.handover_facts`` and the
 switches read) and this module only turns them into steps, masked for the viewer:
 
@@ -61,7 +63,7 @@ def visible_agents(facts, tier):
 
 
 def steps(facts, *, tier, agent_id=None, switches=None, approval=None):
-    """Steps O1-O5 and C1 for ``facts`` as ``tier`` may see them.
+    """Steps O1-O6 and C1-C3 for ``facts`` as ``tier`` may see them.
 
     ``switches`` is ``{'items': [...]}`` from the switches read, or ``{'refused': True}`` when the viewer may
     not read them, or ``{'unavailable': True}`` where this server has none. ``approval`` is the project's
@@ -205,6 +207,18 @@ def steps(facts, *, tier, agent_id=None, switches=None, approval=None):
                   % agent['name'], who='person', fix={'page': 'agent-setup', 'route': None})
     out.append(c1)
 
+    # C2: the agent's own first check, as it reported it (kittrial-5bb.444). Hidden by C1's rule; only a report
+    # made after the grant counts. It is the agent's claim, labelled with who said it and when, and no other step
+    # reads it.
+    if tier == 'coordinator' or (o3['state'] == 'done' and agent is None):
+        out.append(step('self-check', "The agent's own first check", 'hidden',
+                        'Only an owner of this project, or %s, sees what their agent reported.' % name, who='person'))
+    elif o3['state'] != 'done':
+        out.append(step('self-check', "The agent's own first check", 'waiting',
+                        'Waits for an effective grant (step 3).', who='agent'))
+    else:
+        out.append(self_check_step(agent, agent.get('self_check'), grant.get('granted_at')))
+
     # C3: the hand-over note acknowledged by its person or their granted agent (kittrial-5bb.443).
     if not note:
         out.append(step('acknowledge-note', 'Acknowledge the hand-over note', 'done',
@@ -219,6 +233,38 @@ def steps(facts, *, tier, agent_id=None, switches=None, approval=None):
                         who='person', fix={'page': 'handover-note',
                                            'route': 'POST /v1/projects/{pid}/handover/note/acknowledge'}))
     return out
+
+
+def self_check_step(agent, report, granted_at):
+    """Step C2 from the agent's newest report about this project (design §3.2 C2, §5.3)."""
+    title = "The agent's own first check"
+    if report is None:
+        return step('self-check', title, 'todo',
+                    'Ask %s to run its first check (it is the first step in its AGENT.md).' % agent['name'], who='agent')
+    if not reached_since(report['reported_at'], granted_at):
+        return step('self-check', title, 'todo',
+                    "%s's last check was before the grant: ask it to run its first check again." % agent['name'],
+                    who='agent')
+    label = ("Reported by %s at %s. This is the agent's own report; it unlocks nothing."
+             % (agent['name'], report['reported_at']))
+    failing = []
+    if report['sha256_matches'] is False:
+        failing.append("the certificate file does not match this server's: save it from the set-up again")
+    if not report['project_listed']:
+        failing.append("this project is not in %s's own list of projects" % agent['name'])
+    if report['role'] == 'worker':
+        failing.append("its AGENT.md is a worker's: open the set-up for %s again and replace it" % agent['name'])
+    elif report['role'] != 'coordinator':
+        failing.append("it could not tell whose AGENT.md it has: open the set-up for %s again and replace it"
+                       % agent['name'])
+    if failing:
+        return step('self-check', title, 'failed', 'It found: %s. %s' % ('; '.join(failing), label), who='person',
+                    fix={'page': 'agent-setup', 'route': None})
+    certificate = ('the certificate matches' if report['sha256_matches']
+                   else 'this server has no certificate of its own to compare')
+    return step('self-check', title, 'done',
+                "It found: %s, this project is in its list and its AGENT.md is a coordinator's. %s"
+                % (certificate, label))
 
 
 def reached_since(last_seen, granted_at):

@@ -1107,6 +1107,7 @@ class Service:
         self.lookup_max = lookup_max
         self.lookup_window = lookup_window
         self._lookups = {}
+        self._self_check_times = {}      # agent id -> times of its recent first-check reports (kittrial-5bb.444)
 
     # -- helpers ---------------------------------------------------------------
     def claim_gate(self, agent_id):
@@ -3446,8 +3447,9 @@ class Service:
         """The raw facts of handing ``project_id`` to ``person_id`` (kittrial-5bb.442). Changes nothing.
 
         Read in one lock: the person's membership role, every personal agent they own (whether it has the
-        project, whether it is switched on, when it last reached the server, and its coordinator grant here as
-        :meth:`coordinator_view` says it), and the name of one of their agents whose grant has effect (what
+        project, whether it is switched on, when it last reached the server, its coordinator grant here as
+        :meth:`coordinator_view` says it, and its newest report of its own first check here, kittrial-5bb.444),
+        and the name of one of their agents whose grant has effect (what
         :meth:`coordinators_of` shows any reader). The route authorizes the reader and ``handover_steps``
         masks these per reader; nothing here is returned to anyone as it is.
         """
@@ -3460,7 +3462,9 @@ class Service:
                 has = project_id in (agent.get('projects') or [])
                 agents.append({'id': agent['id'], 'name': agent['name'], 'has_project': has,
                                'enabled': bool(agent.get('enabled')), 'last_seen_at': agent.get('last_seen_at'),
-                               'coordinator': self.coordinator_view(project_id, agent) if has else None})
+                               'coordinator': self.coordinator_view(project_id, agent) if has else None,
+                               # Its newest report of its own first check here (kittrial-5bb.444), for step C2.
+                               'self_check': self._self_check_for(agent, project_id)})
             effective = next((a['name'] for a in agents if a['coordinator'] and a['coordinator']['effective']), None)
             note = self._handover_current(project_id)
             note_view = None
@@ -3620,6 +3624,73 @@ class Service:
                                                 'at': now_iso(self._now())})
                 self.store.save()
             return self._handover_view(current)
+
+    # -- the agent's own first check (kittrial-5bb.444; design COORDINATOR_ONBOARDING_DESIGN §5.3) ------------
+    #: An agent's reports of its own first check live on its record, ``agent['self_checks']``, newest first. Each
+    #: is the agent's claim, labelled with who said it and when: no authority check reads it, no agent read
+    #: (``agent_view``) shows it, and only step C2 of the hand-over walkthrough does. The agent records are in this
+    #: service's state, so the coordination backup's HTTP-state pair carries them.
+    SELF_CHECKS_KEPT = 5
+    SELF_CHECK_ROLES = ('coordinator', 'worker', 'unknown')
+    #: At most SELF_CHECK_RATE reports per agent in SELF_CHECK_WINDOW seconds; the next is 429 with Retry-After.
+    #: Counted in memory, like the account lookups, so a restart starts the count again.
+    SELF_CHECK_RATE = 10
+    SELF_CHECK_WINDOW = 60
+
+    def _self_check_entry(self, entry):
+        """A stored report as written, or None when it is damaged (a damaged one is never shown)."""
+        if not (isinstance(entry, dict) and isinstance(entry.get('project'), str)
+                and entry.get('sha256_matches') in (True, False, None) and type(entry.get('project_listed')) is bool
+                and entry.get('role') in self.SELF_CHECK_ROLES and isinstance(entry.get('reported_at'), str)):
+            return None
+        return {key: entry[key] for key in ('project', 'sha256_matches', 'project_listed', 'role', 'reported_at')}
+
+    def _self_checks(self, agent):
+        kept = agent.get('self_checks')
+        return [e for e in map(self._self_check_entry, kept if isinstance(kept, list) else []) if e is not None]
+
+    def self_check_admit(self, principal):
+        """Count one report of ``principal``'s agent against the limit, or refuse it with 429.
+
+        Every authorized attempt counts, a refused body too, so a flood of any kind is bounded; a 429 does not
+        count. The caller holds the store lock across this and :meth:`keep_self_check`.
+        """
+        if principal is None or principal.via != 'credential' or not principal.agent_id:
+            raise forbidden('Only an agent reports its own first check, with its own credential')
+        with self.store.lock:
+            now = self._now()
+            recent = [t for t in self._self_check_times.get(principal.agent_id, [])
+                      if t > now - self.SELF_CHECK_WINDOW]
+            if len(recent) >= self.SELF_CHECK_RATE:
+                self._self_check_times[principal.agent_id] = recent
+                wait = max(1, int(math.ceil(recent[0] + self.SELF_CHECK_WINDOW - now)))
+                error = throttled('Too many first-check reports: at most %d a minute. Send it again in %d '
+                                  'seconds.' % (self.SELF_CHECK_RATE, wait))
+                error.retry_after = wait
+                raise error
+            recent.append(now)
+            self._self_check_times[principal.agent_id] = recent
+
+    def keep_self_check(self, principal, report):
+        """Keep one report of the credential's own agent, newest first, at most SELF_CHECKS_KEPT across projects.
+
+        ``report`` is ``{project, sha256_matches, project_listed, role}``, already checked by the route; the time
+        is this service's own (``reported_at``), never one the agent sends. The project need not be one the agent
+        has: "not listed" is what the report is for, and a report about a project that does not exist is kept and
+        shown nowhere, so the answer never says whether a project exists.
+        """
+        if not AGENT_PROJECT_ID.fullmatch(report['project']):
+            raise invalid('project must be a project id')
+        with self.store.lock:
+            agent = self._agent(principal.agent_id)
+            entry = dict(report, reported_at=now_iso(self._now()))
+            agent['self_checks'] = [entry] + self._self_checks(agent)[:self.SELF_CHECKS_KEPT - 1]
+            self.store.save()
+            return entry
+
+    def _self_check_for(self, agent, project_id):
+        """The newest report of ``agent`` about ``project_id``, or None."""
+        return next((e for e in self._self_checks(agent) if e['project'] == project_id), None)
 
     def _may_coordinate(self, project_id, agent):
         """Whether the agent's account holds the coordinator's capabilities in the project now."""
