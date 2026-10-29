@@ -1577,6 +1577,279 @@ def split_pointer(pointer):
     return pointer, '', ''
 
 
+JS_MAX_BYTES = 2_000_000
+JS_MAX_TOKENS = 150_000
+JS_MAX_SECONDS = 3.0
+_JS_IDENT = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*')
+
+
+class JSUnreadable(ValueError):
+    pass
+
+
+def js_tokens(text):
+    deadline = time.monotonic() + JS_MAX_SECONDS
+    out = []
+    i = 0
+    line = 1
+    n = len(text)
+    while i < n:
+        if len(out) >= JS_MAX_TOKENS or time.monotonic() > deadline:
+            raise JSUnreadable('too-complex')
+        c = text[i]
+        if c.isspace():
+            line += c == '\n'
+            i += 1
+            continue
+        if text.startswith('//', i):
+            end = text.find('\n', i + 2)
+            i = n if end < 0 else end
+            continue
+        if text.startswith('/*', i):
+            end = text.find('*/', i + 2)
+            if end < 0:
+                raise JSUnreadable('parse-error')
+            line += text.count('\n', i, end + 2)
+            i = end + 2
+            continue
+        if c in "'\"`":
+            start = i
+            frames = [(c, 0)]
+            i += 1
+            while i < n and frames:
+                if time.monotonic() > deadline or len(frames) > 100:
+                    raise JSUnreadable('too-complex')
+                quote, depth = frames[-1]
+                char = text[i]
+                if char == '\\':
+                    i += 2
+                elif quote == '`' and depth and text.startswith('//', i):
+                    end = text.find('\n', i + 2)
+                    i = n if end < 0 else end
+                elif quote == '`' and depth and text.startswith('/*', i):
+                    end = text.find('*/', i + 2)
+                    if end < 0:
+                        raise JSUnreadable('parse-error')
+                    i = end + 2
+                elif quote == '`' and depth and char == '/':
+                    raise JSUnreadable('unsupported-syntax')
+                elif quote == '`' and depth and char in "'\"`":
+                    frames.append((char, 0))
+                    i += 1
+                elif quote == '`' and depth and char == '{':
+                    frames[-1] = (quote, depth + 1)
+                    i += 1
+                elif quote == '`' and depth and char == '}':
+                    frames[-1] = (quote, depth - 1)
+                    i += 1
+                elif quote == '`' and not depth and text.startswith('${', i):
+                    frames[-1] = (quote, 1)
+                    i += 2
+                elif not depth and char == quote:
+                    frames.pop()
+                    i += 1
+                else:
+                    if quote != '`' and char in '\r\n':
+                        raise JSUnreadable('parse-error')
+                    i += 1
+            if frames:
+                raise JSUnreadable('parse-error')
+            line += text.count('\n', start, i)
+            out.append(('<literal>', line))
+            continue
+        if c == '/':
+            # A slash may start a regex containing arbitrary braces. Refuse rather
+            # than confuse its contents with declarations or block delimiters.
+            raise JSUnreadable('unsupported-syntax')
+        m = _JS_IDENT.match(text, i)
+        if m:
+            out.append((m.group(), line))
+            i = m.end()
+        elif c.isascii() and (c.isdigit() or c in '{}[]();:,.=<>?!*+-&|%^~@'):
+            out.append((c, line))
+            i += 1
+        else:
+            raise JSUnreadable('unsupported-syntax')
+    return out
+
+
+def js_definitions(text):
+    t = js_tokens(text)
+    deadline = time.monotonic() + JS_MAX_SECONDS
+
+    def check_time():
+        if time.monotonic() > deadline:
+            raise JSUnreadable('too-complex')
+    values = [v for v, _ in t]
+    n = len(t)
+    pairs = {}
+    stack = []
+    for i, (v, _) in enumerate(t):
+        if i % 1024 == 0:
+            check_time()
+        if v in '({[' and len(v) == 1:
+            stack.append((v, i))
+        elif v in ')}]' and len(v) == 1:
+            if not stack or stack[-1][0] != {')': '(', '}': '{', ']': '['}[v]:
+                raise JSUnreadable('parse-error')
+            _, start = stack.pop()
+            pairs[start] = i
+    if stack:
+        raise JSUnreadable('parse-error')
+    found = {}
+    aliases = []
+
+    def put(name, kind, pos):
+        found[name] = (kind, t[pos][1])
+
+    def identifier(v):
+        return bool(_JS_IDENT.fullmatch(v))
+
+    def find_body(start, end):
+        j = start
+        while j < end:
+            check_time()
+            if values[j] == '{':
+                return j
+            if values[j] in ('(', '['):
+                j = pairs[j] + 1
+            elif values[j] == ';':
+                break
+            else:
+                j += 1
+        return None
+
+    def class_methods(name, start, end):
+        j = start + 1
+        while j < end:
+            check_time()
+            k = j
+            while k < end and values[k] in ('static', 'async', 'get', 'set', 'public', 'private', 'protected', 'readonly', 'abstract', 'override', 'declare', '*'):
+                k += 1
+            if k >= end:
+                break
+            if identifier(values[k]):
+                method = values[k]
+                q = k + 1
+                # generic parameters, simple balanced angle brackets
+                if q < end and values[q] == '<':
+                    depth = 1
+                    q += 1
+                    while q < end and depth:
+                        check_time()
+                        depth += (values[q] == '<') - (values[q] == '>')
+                        q += 1
+                if q < end and values[q] == '(':
+                    put(name + '.' + method, 'method', k)
+                    q = pairs[q] + 1
+                    body = find_body(q, end)
+                    if body is not None:
+                        j = pairs[body] + 1
+                        continue
+            # A field initializer can contain calls; none of those calls is a
+            # class method. Require a semicolon when skipping an unrecognised field.
+            while j < end and values[j] != ';':
+                check_time()
+                if values[j] in ('{', '(', '['):
+                    j = pairs[j] + 1
+                else:
+                    j += 1
+            if j == end:
+                raise JSUnreadable('unsupported-syntax')
+            j += 1
+
+    i = 0
+    while i < n:
+        check_time()
+        v = values[i]
+        if v == 'export' and i + 1 < n:
+            j = i + 1
+            if values[j] == 'type' and j + 1 < n and values[j + 1] == '{':
+                i = pairs[j + 1] + 1
+                continue
+            if values[j] == '{':
+                end = pairs[j]
+                j += 1
+                while j < end:
+                    if values[j] == 'type':
+                        while j < end and values[j] != ',':
+                            j += 1
+                    elif identifier(values[j]):
+                        source, pos = values[j], j
+                        j += 1
+                        alias = source
+                        if j + 1 < end and values[j] == 'as':
+                            alias = values[j + 1]
+                            j += 2
+                        aliases.append((source, alias, pos))
+                    else:
+                        raise JSUnreadable('unsupported-syntax')
+                    if j < end:
+                        if values[j] != ',':
+                            raise JSUnreadable('unsupported-syntax')
+                        j += 1
+                i = end + 1
+                continue
+            if values[j] == 'default':
+                put('default', 'export', j)
+                i = j + 1
+                continue
+        if v in ('function', 'class') and i > 0 and values[i - 1] in ('=', ':', '(', ','):
+            body = find_body(i + 1, n)
+            if body is None:
+                raise JSUnreadable('unsupported-syntax')
+            i = pairs[body] + 1
+            continue
+        if v in ('function', 'class'):
+            j = i + 1
+            if j < n and values[j] == '*':
+                j += 1
+            if j < n and identifier(values[j]):
+                name = values[j]
+                put(name, v, j)
+                body = find_body(j + 1, n)
+                if body is None:
+                    raise JSUnreadable('unsupported-syntax')
+                if v == 'class':
+                    class_methods(name, body, pairs[body])
+                i = pairs[body] + 1
+                continue
+        if v in ('const', 'let') and i > 0 and values[i - 1] in ('export', 'declare'):
+            j = i + 1
+            if j >= n or not identifier(values[j]):
+                raise JSUnreadable('unsupported-syntax')
+            put(values[j], 'variable', j)
+            j += 1
+            angle = 0
+            while j < n and values[j] != ';':
+                check_time()
+                if t[j][1] > t[j - 1][1] and values[j] in ('export', 'function', 'class', 'const', 'let'):
+                    break
+                if values[j] in ('{', '(', '['):
+                    j = pairs[j] + 1
+                    continue
+                if values[j] == '<':
+                    angle += 1
+                elif values[j] == '>' and angle:
+                    angle -= 1
+                elif values[j] == ',' and not angle:
+                    j += 1
+                    if j >= n or not identifier(values[j]):
+                        raise JSUnreadable('unsupported-syntax')
+                    put(values[j], 'variable', j)
+                j += 1
+            i = j + 1 if j < n and values[j] == ';' else j
+            continue
+        if v in ('{', '(', '['):
+            i = pairs[i] + 1
+        else:
+            i += 1
+    for source, alias, pos in aliases:
+        # Re-exports are valid symbols even when the source is in another file.
+        put(alias, found.get(source, ('export', 0))[0], pos)
+    return found
+
+
 def resolve_pointer(repo, pointer, graph_index=None):
     """Whether one pointer still resolves in the checkout. resolved is None when this
     version cannot check that kind of pointer (the reason says why)."""
@@ -1628,6 +1901,27 @@ def resolve_pointer(repo, pointer, graph_index=None):
             kind, node = found[target]
             result.update(resolved=True, kind=kind, line=node.lineno,
                           end_line=getattr(node, 'end_lineno', None))
+        else:
+            result['reason'] = 'symbol-missing'
+        return result
+    if rel.endswith(('.js', '.mjs', '.cjs', '.ts', '.tsx')):
+        try:
+            with full.open('rb') as stream:
+                data = stream.read(JS_MAX_BYTES + 1)
+            if len(data) > JS_MAX_BYTES:
+                result.update(resolved=None, reason='file-too-large')
+                return result
+            found = js_definitions(data.decode('utf-8-sig'))
+        except OSError:
+            result.update(resolved=None, reason='unreadable')
+            return result
+        except (UnicodeError, JSUnreadable, RecursionError, MemoryError) as exc:
+            result.update(resolved=None, reason=str(exc) if isinstance(exc, JSUnreadable) else 'parse-error')
+            return result
+        result['basis'] = 'javascript'
+        if target in found:
+            kind, line = found[target]
+            result.update(resolved=True, kind=kind, line=line)
         else:
             result['reason'] = 'symbol-missing'
         return result
@@ -1733,13 +2027,13 @@ def lookup(index, phrase, limit=LIMIT_DEFAULT):
 
 
 def verify_matches(index, views):
-    """Graph-sourced Python matches are re-checked with ast before they are returned."""
+    """Re-check supported graph-sourced matches against the checkout."""
     if index.code_source != 'graphify':
         return
     for item in views:
         if item['source'] != 'graphify':
             continue
-        if not item['file'].endswith('.py'):
+        if not item['file'].endswith(('.py', '.js', '.mjs', '.cjs', '.ts', '.tsx')):
             item['verified'] = None
             continue
         check = resolve_pointer(index.repo, item['id'])
