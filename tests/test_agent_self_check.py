@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -20,7 +21,7 @@ sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import admin
 import test_coordinator_grant
-from http_auth import Service, Store, now_iso
+from http_auth import HttpError, Service, Store, now_iso
 from test_coordinator_agent_md import BUNDLE, node_json
 
 
@@ -78,6 +79,16 @@ class RouteTests(CheckCase):
         self.assertEqual(201, other.status, other.data)
         self.assertEqual([self.project], [r['project'] for r in self.kept()])  # Kite's report is on Kite only
         self.assertEqual(['elsewhere'], [r['project'] for r in self.kept(kite)])
+
+    def test_the_service_itself_refuses_anyone_but_an_agent_credential(self):
+        # The route's CAP_AGENT_SELF already refuses a session (http_authority.py:991); the service's own guard holds
+        # for any other caller of it too (mutant S1 of kittrial-5bb.444).
+        for principal in (types.SimpleNamespace(via='session', agent_id=None, user_id=self.ids['cora']),
+                          types.SimpleNamespace(via='credential', agent_id=None, user_id=self.ids['cora']), None):
+            with self.assertRaises(HttpError) as refused:
+                self.service.self_check_admit(principal)
+            self.assertEqual(403, refused.exception.status)
+        self.assertEqual({}, self.service._self_check_times)
 
     def test_every_field_and_value_is_checked(self):
         bad = [
