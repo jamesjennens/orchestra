@@ -3718,6 +3718,27 @@ class Service:
         """The newest report of ``agent`` about ``project_id``, or None."""
         return next((e for e in self._self_checks(agent) if e['project'] == project_id), None)
 
+    # -- program links (kittrial-5bb.446; design PROGRAM_DESIGN §2.2) ------------------------------------------
+    def is_person_owner(self, principal, project_id):
+        """Whether ``principal`` is a person, by their own web session, whose live role in ``project_id`` is owner
+        and whose account is enabled: the only web caller who accepts or retires a program link."""
+        if principal is None or principal.via != 'session' or not principal.user_id:
+            return False
+        with self.store.lock:
+            user = self.state['users'].get(principal.user_id)
+            return (isinstance(user, dict) and not user.get('disabled')
+                    and ((self.state.get('memberships') or {}).get(project_id) or {}).get(principal.user_id) == 'owner')
+
+    def program_link_people(self, project_ids):
+        """``(memberships, users)`` for the live owner check of program links: the roles in ``project_ids`` and each
+        account's disabled flag, read in one lock. Nothing else about anyone."""
+        with self.store.lock:
+            everyone = self.state.get('memberships') or {}
+            memberships = {pid: dict(everyone.get(pid) or {}) for pid in project_ids}
+            users = {uid: {'disabled': bool(user.get('disabled'))}
+                     for uid, user in self.state['users'].items() if isinstance(user, dict)}
+        return memberships, users
+
     def _may_coordinate(self, project_id, agent):
         """Whether the agent's account holds the coordinator's capabilities in the project now."""
         owner = self.state['users'].get(agent.get('owner')) or {}

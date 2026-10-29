@@ -86,6 +86,7 @@ import contextvars
 import design_documents
 import keyed_entries
 import keyed_records as core
+import program_links
 from briefing import clip
 from export_requirements import parse_json
 from keyed_entries import (ACCEPTANCE_RECORD_FIELDS, CATALOG_SHOW_MAX, CONTRIBUTOR_OPERATIONS,
@@ -691,6 +692,11 @@ def check_successor(key, successor, rows, operators=None):
 
 
 def _pre_write(payload, run, operators=None):
+    # kittrial-5bb.446: the program. keys are the two program links, with their fixed statement lines and a
+    # decision authority (program_links.write_problem); checked first, so a refusal reads nothing.
+    problem = program_links.write_problem(payload)
+    if problem is not None:
+        raise ValueError(problem)
     check_decisions(payload, run)
     check_authority_decision(payload, run)
     if payload.get('operation') == 'retire':
@@ -1500,7 +1506,8 @@ def help_payload():
             'usage': ['ref get KEY', 'ref list [--tag TAG]... [--owner IDENTITY] '
                       '[--state draft-only|accepted|superseded|all] [--due expired|due-soon|unset] '
                       '[--authority repository|url|attested|decision] [--limit N] [--offset N]',
-                      'ref find PHRASE [--limit N]', 'ref misses [--limit N]', 'ref propose --file entry.json', 'ref revise --file entry.json'],
+                      'ref find PHRASE [--limit N]', 'ref links', 'ref misses [--limit N]', 'ref propose --file entry.json',
+                      'ref revise --file entry.json'],
             'lookup': 'Look here before asking the owner or searching: ref find PHRASE returns the entries a '
                       'phrase names (accepted first; a draft is marked and is never authority) and the nearest '
                       'ones when none does. When you learn a durable operational fact, propose it.',
@@ -1590,7 +1597,35 @@ def read(args, run, operators, web_service=False, verifiers=None):
     if command == 'find':
         phrase, limit = parse_find_options(rest)
         return find(read_rows(run), phrase, operators, limit=limit)
-    raise ValueError('ref: unknown command %s; use get, list, find, misses, propose or revise' % command)
+    if command == 'links':
+        if [token for token in rest if token != '--json']:
+            raise ValueError('ref links takes no arguments')
+        return links(read_rows(run), operators)
+    raise ValueError('ref: unknown command %s; use get, list, find, links, misses, propose or revise' % command)
+
+
+def links(rows, operators):
+    """`ref links`: this project's program-link entries (kittrial-5bb.446; PROGRAM_DESIGN.md section 2.2).
+
+    Only the keys program.member-of and program.area.<area>, one item per key: its newest accepted or
+    superseded revision (`record`, with the author of its live acceptance) and the newest draft above it.
+    It reads this project only; the web service puts the two sides of a link together."""
+    entries, incomplete = catalog(rows, operators)
+    items = []
+    for entry in sorted(entries, key=lambda e: e.get('key') or ''):
+        if program_links.side_of(entry.get('key')) is None or entry.get('state') in ('malformed', 'unsupported'):
+            continue
+        record = entry.get('record') or None
+        proposed = entry.get('proposed') or None
+        items.append({'key': entry['key'], 'state': entry['state'],
+                      'record': None if record is None else {
+                          'revision': record['revision'], 'statement': record['statement'],
+                          'authority': record['authority'], 'acceptance_state': record['acceptance_state']},
+                      'accepted_by': entry.get('accepted_by') if record is not None else None,
+                      'accepted_at': (entry.get('acceptance') or {}).get('at') if record is not None else None,
+                      'proposed_revision': proposed['revision'] if proposed is not None else None})
+    return {'schema_version': 1, 'items': items,
+            'coverage': _coverage(entries, incomplete, 'the program-link keys of this project only')}
 
 
 def parse_find_options(args):

@@ -497,6 +497,8 @@ export const NEVER_CLAIM = 'You coordinate: never claim a worker task. A task th
 //: tests/test_vscode_setup.py pins them against agent_prompts.py.
 export const WEB_WORKER_TOOLS = 'A web worker has no kit and no command line: it reaches Orchestra only through the Orchestra Bridge tools (#orchestraNext, #orchestraBrief, #orchestraHistory, #orchestraClaim, #orchestraCheckpoint, #orchestraReview, #orchestraRelease) and the HTTP routes in its .orchestra/AGENT.md. Tell it the read for each need: brief for task text and the latest checkpoint with all open items (#orchestraBrief or GET /v1/projects/PROJECT/tasks/TASK/brief); history for comments (#orchestraHistory or GET /v1/projects/PROJECT/tasks/TASK/history); me/next for its own work (#orchestraNext or GET /v1/agents/me/next). Never tell a web worker to install the kit, and never give it a CLI-only kit command.';
 export const WORKER_ON_ANOTHER_MACHINE = "Workers usually run on other machines and cannot read your folders: never name a local path. Share the content as a branch or path in the project's repository, as text in a task comment (up to 64 KiB), on a network share both can open, or through the project's task files when they exist.";
+//: The coordinator's paragraph on programs (kittrial-5bb.446), word for word with agent_prompts.PROGRAM_LINKS.
+export const PROGRAM_LINKS = 'If this project is in a program: a program link grants nothing. You read an area, or the program, only as its member, through the usual routes; a program coordinator who is not a member of an area reads nothing in it. A link is two reference entries with a decision authority: program.area.AREA in the program project and program.member-of in the area project, each opening with an "Area: AREA" or "Program: PROGRAM" line and a "State: in" or "State: left" line. Propose or revise them; only a person owner of each project accepts them, because joining or leaving is the owner\'s decision. Read them with GET /v1/projects/PROJECT/program-links.';
 //: The coordinator's side of the workers' "ask in the task" sentence (kittrial-5bb.372).
 export const QUESTIONS_IN_THE_TASK = 'Workers ask their questions in the task (a comment, or an open item of kind question in their checkpoint): read them there with the brief and the history, and answer in the task.';
 
@@ -554,6 +556,10 @@ function coordinatorSection(payload, file, { hasCertificate = false } = {}) {
     ...coordinatorSteps(payload.server, file),
     troubleStep(8, payload, file),
     '9. Stop and ask your owner if anything is unclear.',
+    '',
+    '## If this project is in a program',
+    '',
+    PROGRAM_LINKS,
   ];
 }
 

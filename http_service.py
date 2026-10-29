@@ -74,6 +74,7 @@ from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACC
                        uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
                        validate_claim_limit, validate_password_min_length)
 from version import report as version_report
+import program_links
 
 KIT_VERSION = '0.1.0'
 #: Where the installed kit is: the documents this service shows are read from it.
@@ -1489,6 +1490,11 @@ class InProcessBackend:
 
     def reference(self, project_id, key):
         raise not_found('Reference not found')
+
+    def reference_links(self, project_id):
+        """kittrial-5bb.446: the in-process backend holds no native records, so no program links."""
+        return {'schema_version': 1, 'items': [],
+                'coverage': 'the in-process backend holds no native reference records'}
 
     def references_find(self, project_id, phrase, limit=5):
         return {'schema_version': 1, 'phrase': phrase, 'total': 0, 'items': [],
@@ -3382,6 +3388,10 @@ class EndpointBackend:
     def reference(self, project_id, key):
         """One entry through `ref get`; an unknown or unfinished key is a 404."""
         return self._ref_read(project_id, ['get', caller_arg(key, 'key')], missing=True)
+
+    def reference_links(self, project_id):
+        """kittrial-5bb.446: this project's program-link entries through the read-only `ref links`."""
+        return self._ref_read(project_id, ['links'])
 
     def references_find(self, project_id, phrase, limit=5):
         return self._ref_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
@@ -11932,6 +11942,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         needed = CAP_COORDINATE if coordinator else CAP_RECORDS
         self._project(ctx, needed)
         self._require_record_membership(ctx, coordinator=coordinator)
+        if (route_name in ('references.accept', 'references.retire')
+                and str(ctx.params.get('key') or '').startswith(program_links.PREFIX)
+                and not self.service.is_person_owner(ctx.principal, ctx.params['pid'])):
+            # kittrial-5bb.446 (PROGRAM_DESIGN.md section 2.2, Q1 A): joining or leaving a program is the owner's
+            # decision, so only a person owner's own session accepts or retires a program link here; the operator
+            # accepts on the host. An acceptance that would not count is never written.
+            raise forbidden(program_links.OWNER_SENTENCE)
         if route_name in ('references.propose', 'references.revise'):
             # kittrial-5bb.418: the body is read only now, after the capability and the role passed.
             self._read_deferred_body(ctx, ctx.params.get('key') if key_param else None)
@@ -12198,6 +12215,89 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._records_write(ctx, 'references.retire', 'retire',
                                    self.REF_RETIRE_FIELDS, 'A reference retirement',
                                    coordinator=True, key_param=True, status=200)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/program-links')
+    def program_links_read(self, ctx):
+        """The program links of a project (kittrial-5bb.446; PROGRAM_DESIGN.md sections 2.2, 2.3, 9.1), at CAP_READ.
+
+        ``as_program``: one row per ``program.area.<area>`` key here, at most 50 a page. A row carries this
+        project's own side (program data) and ONE fact about the area: whether its ``program.member-of`` counts for
+        this program. The service decides that fact the same way for every reader of this project, and only for an
+        area this project's owner admitted: a missing, unreadable or unrelated area answers exactly like one that
+        has not joined, so the read never says whether a project exists and shows nothing inside an area.
+        ``as_area``: this project's ``program.member-of`` and the same one fact about the program's side.
+
+        A link grants nothing: no role, no grant and no visibility (section 2.3). Each side counts only when the
+        live acceptance of its newest accepted revision was written by a person owner of that project or a listed
+        operator (``program_links.owner_or_operator``).
+        """
+        pid = ctx.params['pid']
+        self._project(ctx, CAP_READ)
+        limit, cursor = self._page(ctx, ctx.query)
+        if limit > program_links.PAGE_MAX:
+            raise invalid('limit must be between 1 and %d' % program_links.PAGE_MAX)
+        own = {item['key']: item for item in self.backend.reference_links(pid).get('items') or []
+               if isinstance(item, dict) and isinstance(item.get('key'), str)}
+        keys = sorted(key for key in own if (program_links.side_of(key) or ('',))[0] == 'program')
+        page = keys[cursor['o']:cursor['o'] + limit]
+        member = own.get(program_links.MEMBER_OF)
+        program = None
+        if member is not None and isinstance(member.get('record'), dict):
+            try:
+                program = program_links.statement_lines(member['record'].get('statement'), 'Program')[0]
+            except ValueError:
+                program = None
+        named = {program_links.side_of(key)[1] for key in page} | ({program} if program else set())
+        memberships, users = self.service.program_link_people({pid} | named)
+
+        def counts(other, key, expected):
+            # The other side's one fact, read through that project's own `ref links` by the service. Any failure
+            # (no such project, not a host project, unreadable) is the same answer: it does not count.
+            try:
+                items = self.backend.reference_links(other).get('items') or []
+            except HttpError:
+                return False
+            item = next((i for i in items if isinstance(i, dict) and i.get('key') == key), None)
+            return program_links.side_status(item, other, expected, memberships, users)[0] == 'in'
+
+        rows, tally = [], dict.fromkeys(program_links.STATES, 0)
+        for key in page:
+            area = program_links.side_of(key)[1]
+            status, reason = program_links.side_status(own[key], pid, area, memberships, users)
+            other = counts(area, program_links.MEMBER_OF, pid) if status == 'in' else False
+            state = program_links.link_state(status, other)
+            tally[state] += 1
+            rows.append({'area': area, 'state': state, 'program_side': self._program_link_side(own[key], status, reason),
+                         'area_side': {'counts': other} if status == 'in' else None})
+        as_area = None
+        if member is not None:
+            status, reason = program_links.side_status(member, pid, None, memberships, users)
+            other = (counts(program, 'program.area.' + pid, pid)
+                     if status == 'in' and program and program != pid else False)
+            as_area = {'program': program, 'state': program_links.link_state(status, other),
+                       'area_side': self._program_link_side(member, status, reason),
+                       'program_side': {'counts': other} if status == 'in' else None}
+        following = cursor['o'] + limit
+        return 200, {'project': pid,
+                     'as_program': {'items': rows, 'total': len(keys), 'counts': tally,
+                                    'next_cursor': (make_cursor(ctx.principal, pid, ctx.query, following,
+                                                                key=self.service.cursor_key())
+                                                    if following < len(keys) else None)},
+                     'as_area': as_area,
+                     'coverage': ('Each side counts only when a person owner of its project (or an operator) accepted '
+                                  'it. A link grants nothing: an area is read only by its own members.'),
+                     'generated_at': now_iso(self.service._now())}
+
+    def _program_link_side(self, item, status, reason):
+        """This project's own side of a link, as program data: its revisions, who accepted it and when, its decision."""
+        record = item.get('record') or {}
+        return {'key': item.get('key'), 'counts': status in ('in', 'left'), 'status': status, 'reason': reason,
+                'revision': record.get('revision'), 'accepted_by': item.get('accepted_by'),
+                'accepted_by_name': self.service.actor_names([item.get('accepted_by')]).get(item.get('accepted_by'))
+                if item.get('accepted_by') else None,
+                'accepted_at': item.get('accepted_at'),
+                'decision': (record.get('authority') or {}).get('id'),
+                'proposed_revision': item.get('proposed_revision')}
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
     def capabilities_list(self, ctx):

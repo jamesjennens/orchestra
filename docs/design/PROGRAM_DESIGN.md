@@ -83,8 +83,8 @@ A link counts only when **both** sides have accepted their record:
 
 | side | record | key | authority | who accepts |
 | --- | --- | --- | --- | --- |
-| program | reference entry | `program.area.<area>` | `decision`: the program owner's decision admitting the area | the program project's coordinator |
-| area | reference entry | `program.member-of` | `decision`: the area owner's decision joining the program | the area's coordinator |
+| program | reference entry | `program.area.<area>` | `decision`: the program owner's decision admitting the area | a person owner of the program project (or an operator) |
+| area | reference entry | `program.member-of` | `decision`: the area owner's decision joining the program | a person owner of the area (or an operator) |
 
 - **Keys:** `<area>` is the area's canonical project name (http_authority.py:349, which fits the
   key pattern). The statement names the other project's exact id.
@@ -99,6 +99,26 @@ A link counts only when **both** sides have accepted their record:
 - **What the program side reveals:** `program.area.<area>` is program data, readable by the
   program project's members. It names the area and nothing inside it. While the area has not
   accepted, the program view shows the link as one-sided, with no counts or contents.
+
+**As built (kittrial-5bb.446, slice 1):**
+- **Who accepts (Q1 A, amended above):** a person owner of each project, by their own web session, or an operator on
+  the host. A coordinator, person or agent, proposes and revises. A native issue author is only an `--actor` label
+  (TRACEABILITY_DESIGN.md:544-547), so the owner's act is the acceptance, whose evidence only the web service or an
+  operator writes. It is checked live at every read: an owner who loses the role or whose account is disabled stops
+  the side counting. The web accept and retire routes refuse anyone else for a `program.` key.
+- **Follow-up, not in this slice:** letting an owner delegate the acceptance through a `delegation-v1` record, as
+  record acceptance is delegated today (delegations.py).
+- **The statement's lines:** `Area: <area>` or `Program: <program>`, then `State: in` or `State: left`. A
+  `program.` key is written only as one of the two links, with these lines and a `decision` authority.
+- **States:** `linked`, `one-sided`, `left` and `proposed`.
+  - `left` is the program side saying so, or its record superseded.
+  - An area that leaves makes the link `one-sided` from the program's view; an area learns one fact about the
+    program, and the program one fact about an area: whether the other side counts.
+  - `proposed` is a program side that does not count yet; no area is read for it.
+- **The read:** `GET /v1/projects/{pid}/program-links`, 50 areas a page and so at most 50 area reads. The host's
+  `ref links` lists one project's link records only.
+- **The isolation harness:** tests/program_isolation.py. Later slices add their reads to it, and a test fails if
+  any route whose pattern mentions "program" is missing from it.
 
 ### 2.3 What being in a program grants: nothing
 

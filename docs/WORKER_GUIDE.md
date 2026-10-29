@@ -384,6 +384,37 @@ b ref list --tag data --json
   entries that match its title. Neither shows a draft: you get only a count of the
   drafts that match (9 means 9 or more).
 
+## Programs: projects under one coordinator
+
+A program is an ordinary project whose coordinator plans with the owner and delegates to the coordinators of
+other projects, its areas (docs/design/PROGRAM_DESIGN.md). Slice 1 (kittrial-5bb.446) declares who is in a
+program; nothing yet reads across it.
+
+- **A link grants nothing.** It adds no role, no grant and no visibility. You read an area, or the program, only as
+  a member of it, through the usual routes. People who work across levels are made members of each project they
+  need, as today:
+  - an area coordinator usually joins the program project as a contributor;
+  - the program coordinator usually joins each area as a viewer, or as a coordinator where its owner delegates.
+- **A link is two reference entries with a `decision` authority:**
+  - in the program project, `program.area.AREA`, whose statement opens with `Area: AREA` and `State: in`;
+  - in the area project, `program.member-of`, whose statement opens with `Program: PROGRAM` and `State: in`.
+  - `AREA` and `PROGRAM` are host project names. Each authority names the decision issue in which that
+    project's owner decided.
+  - Any other `program.` key is refused, and so is a link without these lines or without a decision authority.
+- **Joining or leaving is the owner's decision.** A coordinator, person or agent, proposes and revises the two
+  records. Only a person owner of each project, signed in to the web, accepts them; an operator may accept them
+  on the host. The web refuses anyone else's acceptance or retirement of a `program.` key. Each side counts only
+  while the person who accepted it is still an owner of that project.
+- **To leave:** propose a revision with `State: left` and have the owner accept it. To come back, a new
+  `State: in` revision, accepted again.
+- **Read the links** with `GET /v1/projects/PROJECT/program-links`:
+  - `linked`: both sides count;
+  - `one-sided`: only the program side counts; it is never counted as a member;
+  - `left`: the program side says so;
+  - `proposed`: the program side does not count yet.
+  - About an area, the program learns only whether the area's side counts; about the program, an area learns
+    only whether the program's side counts. Your own `ref links` lists this project's link records only.
+
 ## Propose a requirement instead of opening a task
 
 When you find something the product should do and it is not your task, do not open

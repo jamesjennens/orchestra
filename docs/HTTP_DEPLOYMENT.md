@@ -843,6 +843,21 @@ page or route that fixes it. It writes nothing, and the page changes nothing its
 - **It is the agent's claim:** it grants nothing, no authority check reads it, and no other step changes with it.
 - **The coordinator AGENT.md** has a "Your first check" section with the call that reports it, using `curl -K` like every other call.
 
+**Program links** (kittrial-5bb.446; docs/design/PROGRAM_DESIGN.md section 2): an area joins a program project
+through two reference entries, `program.area.<area>` in the program and `program.member-of` in the area.
+- **The rule of a link:** it grants nothing. No role, grant or visibility comes with it.
+- **Who makes a side count:** a person owner of that project, by accepting its record on the web, or an operator
+  with `admin.py reference-apply`. The web accept and retire routes refuse anyone else for a `program.` key. Each
+  side is checked live at every read: an owner who loses the role, or whose account is disabled, stops the side
+  counting.
+- **The read:** `GET /v1/projects/{id}/program-links`, at `CAP_READ`, 50 areas a page.
+  - `as_program`: one row per admitted area, with this project's own side and one fact about the area, whether its
+    side counts.
+  - `as_area`: this project's own side and the same one fact about the program.
+  - A missing, unreadable or unrelated area answers exactly like one that has not joined.
+- **The host:** `ref links` lists one project's link records only; the web service alone puts the two sides
+  together.
+
 ### Creating a project from the web interface
 
 An operator creates a project on the host (`admin.py add-project NAME`) and a superuser

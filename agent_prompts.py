@@ -61,6 +61,17 @@ WORKER_ON_ANOTHER_MACHINE = (
     'local path. Share the content as a branch or path in the project\'s repository, as '
     'text in a task comment (up to 64 KiB), on a network share both can open, or through '
     'the project\'s task files when they exist.')
+#: The coordinator-only paragraph on programs (kittrial-5bb.446; PROGRAM_DESIGN.md sections 2.2, 2.3): a link
+#: grants nothing, and joining or leaving is a person owner's acceptance on each side. Word for word with
+#: web/js/agentSetup.js PROGRAM_LINKS (tests/test_program_links.py pins them).
+PROGRAM_LINKS = (
+    'If this project is in a program: a program link grants nothing. You read an area, or the program, '
+    'only as its member, through the usual routes; a program coordinator who is not a member of an area '
+    'reads nothing in it. A link is two reference entries with a decision authority: program.area.AREA in '
+    'the program project and program.member-of in the area project, each opening with an "Area: AREA" or '
+    '"Program: PROGRAM" line and a "State: in" or "State: left" line. Propose or revise them; only a '
+    "person owner of each project accepts them, because joining or leaving is the owner's decision. Read "
+    'them with GET /v1/projects/PROJECT/program-links.')
 #: Every quote-like character (ASCII, typographic, guillemets, low-9, primes,
 #: fullwidth, CJK corner brackets) becomes a plain apostrophe, so a title can never
 #: close or imitate the label's own double quotes.
@@ -401,7 +412,7 @@ def build_prompt(agent, owner_name, projects, generated_at, server):
     else:
         # Only a project where this person coordinates gets the paragraph (kittrial-5bb.357);
         # a contributor or owner is not told how to direct a web worker.
-        coordinator_tools = ['', WEB_WORKER_TOOLS, WORKER_ON_ANOTHER_MACHINE] if any(
+        coordinator_tools = ['', WEB_WORKER_TOOLS, WORKER_ON_ANOTHER_MACHINE, PROGRAM_LINKS] if any(
             p.get('role') == 'coordinator' for p in acting) else []
         head = intro + coordinator_tools + [
             '',
