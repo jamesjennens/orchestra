@@ -3442,6 +3442,29 @@ class Service:
                                'granted_at': grant.get('granted_at')})
             return {'people': people, 'agents': agents}
 
+    def handover_facts(self, project_id, person_id, viewer_agent=None):
+        """The raw facts of handing ``project_id`` to ``person_id`` (kittrial-5bb.442). Changes nothing.
+
+        Read in one lock: the person's membership role, every personal agent they own (whether it has the
+        project, whether it is switched on, when it last reached the server, and its coordinator grant here as
+        :meth:`coordinator_view` says it), and the name of one of their agents whose grant has effect (what
+        :meth:`coordinators_of` shows any reader). The route authorizes the reader and ``handover_steps``
+        masks these per reader; nothing here is returned to anyone as it is.
+        """
+        with self.store.lock:
+            role = (self.state.get('memberships') or {}).get(project_id, {}).get(person_id)
+            agents = []
+            for agent in sorted(self.state['agents'].values(), key=lambda a: a['id']):
+                if agent.get('owner') != person_id:
+                    continue
+                has = project_id in (agent.get('projects') or [])
+                agents.append({'id': agent['id'], 'name': agent['name'], 'has_project': has,
+                               'enabled': bool(agent.get('enabled')), 'last_seen_at': agent.get('last_seen_at'),
+                               'coordinator': self.coordinator_view(project_id, agent) if has else None})
+            effective = next((a['name'] for a in agents if a['coordinator'] and a['coordinator']['effective']), None)
+            return {'person': person_id, 'name': self._owner_name(person_id), 'member': role is not None,
+                    'role': role, 'agents': agents, 'effective_agent': effective, 'viewer_agent': viewer_agent}
+
     def _may_coordinate(self, project_id, agent):
         """Whether the agent's account holds the coordinator's capabilities in the project now."""
         owner = self.state['users'].get(agent.get('owner')) or {}

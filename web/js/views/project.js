@@ -800,6 +800,8 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
+    // kittrial-5bb.442: the hand-over walkthrough, checked live (each member reads their own).
+    h('p', null, h('a', { href: ctx.href(`/p/${pid}/handover`), 'data-link': 'handover' }, 'Hand this project to a coordinator')),
     membersHost, claimingPanel(ctx, project), agentApprovalPanel(ctx, project), coordination.node,
     // kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator.
     switchesPanel(ctx, project),

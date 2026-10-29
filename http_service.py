@@ -52,6 +52,7 @@ import agent_prompts
 import bd_refusals
 from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
 import claim_limit
+import handover_steps
 import project_setup
 import project_coordination
 import nudges
@@ -9104,6 +9105,67 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._mutate(ctx, 'projects.onboarding', ctx.params['pid'], write, capability=CAP_COORDINATE,
                             serialize=False, canonical=True, reason='account=%s %s' % (ctx.principal.user_id, size),
                             replay_check=replay_check)
+
+    #: The one answer for a walkthrough this reader may not read: the same whoever the person is, so it says
+    #: nothing about them or their agents (kittrial-5bb.442).
+    HANDOVER_REFUSED = ("You may read your own hand-over walkthrough here; an owner or a coordinator of this "
+                        "project reads another member's.")
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/handover')
+    def project_handover(self, ctx):
+        """The hand-over walkthrough of one member (kittrial-5bb.442, design COORDINATOR_ONBOARDING_DESIGN §3, §5.1).
+
+        Steps O1-O5 and C1, each checked from what the service already holds, with a plain sentence and the
+        existing route or page that fixes it. It writes nothing. Who reads what (design §3.3): any member
+        their own walkthrough; an owner or superuser any member's, seeing only the agents that already have
+        the project; a coordinator any member's, without their agents or a grant's reasons (``hidden``); an
+        agent its own steps. Anyone else gets HANDOVER_REFUSED whoever the person is.
+        """
+        pid = ctx.params['pid']
+        self._project(ctx, CAP_READ)
+        principal = ctx.principal
+        asked = ctx.query.get('person')
+        agent_asked = ctx.query.get('agent')
+
+        def holds(capability):
+            try:
+                self.service.check_authority(principal, pid, capability)
+                return True
+            except HttpError:
+                return False
+        viewer_agent = None
+        if principal.via == 'credential':
+            if asked not in (None, principal.user_id) or not principal.agent_id:
+                raise forbidden(self.HANDOVER_REFUSED)
+            tier, person, viewer_agent = 'agent', principal.user_id, principal.agent_id
+        elif asked in (None, principal.user_id):
+            tier, person = 'self', principal.user_id
+        elif holds(CAP_PROJECT_ADMIN):
+            tier, person = 'owner', asked
+        elif holds(CAP_COORDINATE):
+            tier, person = 'coordinator', asked
+        else:
+            raise forbidden(self.HANDOVER_REFUSED)
+        facts = self.service.handover_facts(pid, person, viewer_agent=viewer_agent)
+        if not facts['member']:
+            raise not_found('Member not found')
+        if not holds(CAP_COORDINATE):
+            switches = {'refused': True}
+        elif getattr(self.backend, 'switches', None) is None:
+            switches = {'unavailable': True}
+        else:
+            # An endpoint that cannot answer the switches (an older kit in a staged upgrade, a busy host) makes
+            # this one step say so; the rest of the walkthrough is still answered.
+            try:
+                switches = self.backend.switches(pid)
+            except HttpError:
+                switches = {'unavailable': True}
+        steps = handover_steps.steps(facts, tier=tier, agent_id=agent_asked, switches=switches,
+                                     approval=self.service.agent_approval(pid))
+        agent = handover_steps.pick(facts, viewer_agent or agent_asked, tier)
+        return 200, {'project': pid, 'person': {'id': person, 'name': facts['name']}, 'viewer': tier,
+                     'agent': {'id': agent['id'], 'name': agent['name']} if agent else None,
+                     'steps': steps, 'generated_at': now_iso(self.service._now())}
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/setup')
     def project_setup(self, ctx):

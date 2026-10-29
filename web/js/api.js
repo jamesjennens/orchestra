@@ -493,6 +493,8 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     archiveProject: (pid) => mutate('POST', `/v1/projects/${pid}/archive`, {}),
     // The setup steps of a project (owners and superusers), and where its repository is.
     projectSetup: (pid) => call('GET', `/v1/projects/${pid}/setup`),
+    // kittrial-5bb.442: the hand-over walkthrough of one member (their own when person is null).
+    projectHandover: (pid, person) => call('GET', `/v1/projects/${pid}/handover`, person ? { params: { person } } : {}),
     mergeSlot: (pid) => call('GET', `/v1/projects/${pid}/merge-slot`),
     acquireMergeSlot: (pid, task_id, target) => mutate('POST', `/v1/projects/${pid}/merge-slot/acquire`, { task_id, target }),
     releaseMergeSlot: (pid) => mutate('POST', `/v1/projects/${pid}/merge-slot/release`, {}),

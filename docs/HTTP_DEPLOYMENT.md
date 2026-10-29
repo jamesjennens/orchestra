@@ -782,6 +782,34 @@ commands of that text.
   routes return the record as it is stored, so the field still appears in them, and
   that kit has no route that changes it and no page that shows it.
 
+### Handing a project to a coordinator
+
+**The page and the route** (kittrial-5bb.442; docs/design/COORDINATOR_ONBOARDING_DESIGN.md §3): the page
+**Hand this project to a coordinator** (`#/p/NAME/handover`, linked from Members & settings and from Set up)
+reads `GET /v1/projects/{id}/handover[?person=USER&agent=AGENT]`. It answers the steps for one member, each
+with a state (`done`, `todo`, `waiting`, `failed`, `hidden`), a plain sentence, who does it, and the existing
+page or route that fixes it. It writes nothing, and the page changes nothing itself.
+
+| Step | Read from | Who fixes it |
+| --- | --- | --- |
+| Coordinator role | the member's role | an owner (Members) |
+| Their agent has this project (only after the role, so no agent is made first) | the agents that have the project | the member, under My agents |
+| Coordinator grant | the grant and, when it has no effect, why: agent switched off, account disabled, no longer a coordinator, granting owner no longer an owner | an owner (Members & settings) |
+| Installation switches | `GET /v1/projects/{id}/switches`; an endpoint that cannot answer makes only this step say so | the operator, with the command shown |
+| Agent approvals | the project's `agent_approval` setting | an owner |
+| Set up after the grant | the agent has reached the server since the grant (`last_seen_at` later than `granted_at`) | the member, by opening the agent's set-up again |
+
+**Who reads what:**
+- **Any member:** their own walkthrough, with their own agents. An agent made before they were a member is named, so they know to tick the project on it.
+- **An owner or superuser:** any member's (`person=`), seeing only the agents that already have the project. A missing agent is then said without naming any.
+- **A coordinator:** any member's, without their agents, a grant's reasons or the set-up step (`hidden`). An effective grant is shown, as the coordination panel shows it to any reader.
+- **An agent:** its own steps only.
+- **Refusals:**
+  - anyone else asking for another member gets one `403` sentence, the same whoever the person is;
+  - a `person` who is not a member is `404` for an owner or coordinator;
+  - outsiders get `404`;
+  - nobody signed in gets `401`.
+
 ### Creating a project from the web interface
 
 An operator creates a project on the host (`admin.py add-project NAME`) and a superuser

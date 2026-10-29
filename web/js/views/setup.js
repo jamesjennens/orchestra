@@ -146,6 +146,8 @@ export async function page(ctx, { pid }) {
         lede: summary(data) + ' Each step says who can do it. Steps done on the server show the command for an operator; this page does not run anything there.',
       }),
       h('ol', { class: 'stack setup-steps' }, data.steps.map((item) => stepItem(ctx, pid, item, draw))),
+      // kittrial-5bb.442: handing the project to a coordinator has its own checked walkthrough.
+      h('p', null, h('a', { href: ctx.href(`/p/${pid}/handover`), 'data-link': 'handover' }, 'Hand this project to a coordinator')),
       rulesNote(data.rules)].filter(Boolean));
   }
   await draw();

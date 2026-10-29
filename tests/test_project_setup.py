@@ -1657,12 +1657,13 @@ class SetupScreenTests(test_http_agents.AgentHarness):
         self.assertIn('looks like an access token', seen['warning'][0])
         self.assertEqual(seen['noWarning'], 0)
         # The review rule of the installation (kittrial-5bb.199): said when the service says it, and
-        # nothing at all is added to the page when it does not.
+        # nothing at all is added to the page when it does not. The page's children are its head, the steps
+        # and the link to the hand-over walkthrough (kittrial-5bb.442), plus the note when there is one.
         self.assertEqual(seen['rule'], [
-            [[], [], 2], [[], [], 2],
-            [['true'], ['On this server nobody approves or recomm'], 3],
-            [['false'], ['On this server an owner may approve work'], 3],
-            [[], [], 2]])
+            [[], [], 3], [[], [], 3],
+            [['true'], ['On this server nobody approves or recomm'], 4],
+            [['false'], ['On this server an owner may approve work'], 4],
+            [[], [], 3]])
 
 
 class MergeSlotReportTests(unittest.TestCase):
