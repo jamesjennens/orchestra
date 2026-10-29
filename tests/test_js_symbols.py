@@ -91,5 +91,74 @@ class JavaScriptSymbols(unittest.TestCase):
         with mock.patch.object(capabilities.time, 'monotonic', side_effect=[0.0, 4.0]):
             self.assertIsNone(self.resolve('function f() {}', 'f')['resolved'])
 
-    def test_unsupported_syntax_is_unknown(self):
-        self.assertIsNone(self.resolve('const pattern = /x/;', 'missing')['resolved'])
+    def test_declaration_after_closed_statement(self):
+        self.assertTrue(self.resolve('run()\nfunction f() {}', 'f')['resolved'])
+
+    def test_ternary_function_expression(self):
+        self.assertIs(self.resolve('const x = c ? function ghost(){} : null;', 'ghost')['resolved'], False)
+
+    def test_and_class_expression(self):
+        self.assertIs(self.resolve('c && class Ghost{};', 'Ghost')['resolved'], False)
+
+    def test_negated_function_expression(self):
+        self.assertIs(self.resolve('!function ghost(){}();', 'ghost')['resolved'], False)
+
+    def test_arrow_function_expression(self):
+        self.assertIs(self.resolve('const x = () => function ghost(){};', 'ghost')['resolved'], False)
+
+    def test_typeof_class_expression(self):
+        self.assertIs(self.resolve('typeof class Ghost{};', 'Ghost')['resolved'], False)
+
+    def test_interface(self):
+        self.assertTrue(self.resolve('export interface I {}', 'I', 'ts')['resolved'])
+
+    def test_type_alias(self):
+        self.assertTrue(self.resolve('export type X = string;', 'X', 'ts')['resolved'])
+
+    def test_enum(self):
+        self.assertTrue(self.resolve('export enum E { A }', 'E', 'ts')['resolved'])
+
+    def test_const_enum(self):
+        self.assertTrue(self.resolve('export const enum E { A }', 'E', 'ts')['resolved'])
+
+    def test_export_var(self):
+        self.assertTrue(self.resolve('export var w = 1;', 'w', 'js')['resolved'])
+
+    def test_declare_function(self):
+        self.assertTrue(self.resolve('declare function f(x: string): void;', 'f', 'ts')['resolved'])
+
+    def test_string_named_export(self):
+        self.assertTrue(self.resolve('const a = 1; export { a as "b-c" };', 'b-c')['resolved'])
+
+    def test_block_comment(self):
+        self.assertIs(self.resolve('/* function ghost() {} */ function real() {}', 'ghost')['resolved'], False)
+
+    def test_template_interpolation_brace_depth(self):
+        text = 'const t = `${ { x: "}" }.x + `inside {` }`; function real() {}'
+        self.assertTrue(self.resolve(text, 'real')['resolved'])
+        self.assertIs(self.resolve(text, 'ghost')['resolved'], False)
+
+    def test_token_cap(self):
+        with mock.patch.object(capabilities, 'JS_MAX_TOKENS', 5):
+            self.assertIsNone(self.resolve('const one = 1; function f() {}', 'f')['resolved'])
+
+    def test_division(self):
+        self.assertTrue(self.resolve('const ratio = total / count; export function render() {}', 'render')['resolved'])
+
+    def test_regex(self):
+        self.assertTrue(self.resolve('const re = /[{}\\/]+/gi; export function render() {}', 'render')['resolved'])
+
+    def test_jsx(self):
+        text = 'export const App = () => <div className="x"><A value={item.name} />Hello {name}</div>; export function later() {}'
+        self.assertTrue(self.resolve(text, 'App', 'tsx')['resolved'])
+        self.assertTrue(self.resolve(text, 'later', 'tsx')['resolved'])
+
+    def test_slash_inside_expressions(self):
+        text = 'const t = `${value / count} ${/[{}]/.test(x)}`; const el = <div>{value / count}</div>; function done() {}'
+        self.assertTrue(self.resolve(text, 'done', 'tsx')['resolved'])
+
+    def test_jsx_in_js(self):
+        self.assertTrue(self.resolve('const x = <div>hello</div>; function after() {}', 'after', 'jsx')['resolved'])
+
+    def test_invalid_regex_is_unknown(self):
+        self.assertIsNone(self.resolve('const pattern = /unterminated', 'missing')['resolved'])

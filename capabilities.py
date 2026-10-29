@@ -1587,6 +1587,139 @@ class JSUnreadable(ValueError):
     pass
 
 
+def js_skip_expression_slash(text, i, deadline):
+    """Skip a slash inside a discarded expression, including regex character classes."""
+    j = i - 1
+    while j >= 0 and text[j].isspace():
+        j -= 1
+    prefix = text[max(0, j - 12):j + 1]
+    keyword = re.search(r'(?:^|[^A-Za-z0-9_$])(return|throw|case|typeof|void|delete|yield|await)$', prefix)
+    is_regex = j < 0 or text[j] in '([{=,:;!?&|+-*%^~<>' or bool(keyword)
+    if not is_regex:
+        return i + 1
+    j = i + 1
+    in_class = False
+    while j < len(text):
+        if time.monotonic() > deadline:
+            raise JSUnreadable('too-complex')
+        if text[j] == '\\':
+            j += 2
+            continue
+        if text[j] in '\r\n':
+            raise JSUnreadable('parse-error')
+        if text[j] == '[':
+            in_class = True
+        elif text[j] == ']':
+            in_class = False
+        elif text[j] == '/' and not in_class:
+            j += 1
+            while j < len(text) and text[j].isascii() and text[j].isalpha():
+                j += 1
+            return j
+        j += 1
+    raise JSUnreadable('parse-error')
+
+
+def js_skip_jsx(text, start, deadline):
+    """Skip balanced JSX tags and embedded expressions, refusing ambiguous input."""
+    n = len(text)
+    i = start
+    tags = []
+
+    def expression(pos):
+        depth = 1
+        pos += 1
+        while pos < n and depth:
+            if time.monotonic() > deadline or depth > 100:
+                raise JSUnreadable('too-complex')
+            c = text[pos]
+            if c in "'\"`":
+                quote = c
+                pos += 1
+                while pos < n and text[pos] != quote:
+                    if quote == '`' and text.startswith('${', pos):
+                        raise JSUnreadable('unsupported-syntax')
+                    if text[pos] == '\\':
+                        pos += 2
+                    else:
+                        pos += 1
+                if pos >= n:
+                    raise JSUnreadable('parse-error')
+                pos += 1
+            elif text.startswith('//', pos):
+                end = text.find('\n', pos + 2)
+                pos = n if end < 0 else end
+            elif text.startswith('/*', pos):
+                end = text.find('*/', pos + 2)
+                if end < 0:
+                    raise JSUnreadable('parse-error')
+                pos = end + 2
+            elif c == '/':
+                pos = js_skip_expression_slash(text, pos, deadline)
+            elif c == '{':
+                depth += 1
+                pos += 1
+            elif c == '}':
+                depth -= 1
+                pos += 1
+            else:
+                pos += 1
+        if depth:
+            raise JSUnreadable('parse-error')
+        return pos
+
+    while i < n:
+        if time.monotonic() > deadline or len(tags) > 100:
+            raise JSUnreadable('too-complex')
+        if text[i] == '{':
+            i = expression(i)
+            continue
+        if text[i] != '<':
+            i += 1
+            continue
+        closing = text.startswith('</', i)
+        j = i + (2 if closing else 1)
+        if j < n and text[j] == '>':
+            name = ''
+        else:
+            match = re.match(r'[A-Za-z_$][A-Za-z0-9_$.:-]*', text[j:])
+            if not match:
+                raise JSUnreadable('unsupported-syntax')
+            name = match.group()
+            j += len(name)
+        quote = None
+        while j < n:
+            if time.monotonic() > deadline:
+                raise JSUnreadable('too-complex')
+            c = text[j]
+            if quote:
+                if c == quote:
+                    quote = None
+                j += 1
+            elif c in "'\"":
+                quote = c
+                j += 1
+            elif c == '{':
+                j = expression(j)
+            elif c == '>':
+                break
+            else:
+                j += 1
+        if j >= n:
+            raise JSUnreadable('parse-error')
+        self_closing = not closing and j > i and text[j - 1] == '/'
+        if closing:
+            if not tags or tags[-1] != name:
+                raise JSUnreadable('parse-error')
+            tags.pop()
+        elif not self_closing:
+            tags.append(name)
+        i = j + 1
+        if not tags:
+            return i
+    raise JSUnreadable('parse-error')
+
+
 def js_tokens(text):
     deadline = time.monotonic() + JS_MAX_SECONDS
     out = []
@@ -1632,7 +1765,7 @@ def js_tokens(text):
                         raise JSUnreadable('parse-error')
                     i = end + 2
                 elif quote == '`' and depth and char == '/':
-                    raise JSUnreadable('unsupported-syntax')
+                    i = js_skip_expression_slash(text, i, deadline)
                 elif quote == '`' and depth and char in "'\"`":
                     frames.append((char, 0))
                     i += 1
@@ -1655,12 +1788,51 @@ def js_tokens(text):
             if frames:
                 raise JSUnreadable('parse-error')
             line += text.count('\n', start, i)
-            out.append(('<literal>', line))
+            literal = text[start:i]
+            if c != '`' and '\\' not in literal:
+                out.append(('<string:' + literal[1:-1] + '>', line))
+            else:
+                out.append(('<literal>', line))
             continue
         if c == '/':
-            # A slash may start a regex containing arbitrary braces. Refuse rather
-            # than confuse its contents with declarations or block delimiters.
-            raise JSUnreadable('unsupported-syntax')
+            prev = out[-1][0] if out else None
+            regex_start = prev is None or prev in ('(', '[', '{', ';', ',', '=', ':', '!', '?', '&', '|', '+', '-', '*', '%', '^', '~', '<', '>', 'return', 'throw', 'case', 'typeof', 'void', 'delete', 'yield', 'await')
+            if regex_start:
+                i += 1
+                in_class = False
+                while i < n:
+                    if time.monotonic() > deadline:
+                        raise JSUnreadable('too-complex')
+                    if text[i] == '\\':
+                        i += 2
+                        continue
+                    if text[i] in '\r\n':
+                        raise JSUnreadable('parse-error')
+                    if text[i] == '[':
+                        in_class = True
+                    elif text[i] == ']':
+                        in_class = False
+                    elif text[i] == '/' and not in_class:
+                        i += 1
+                        while i < n and text[i].isascii() and text[i].isalpha():
+                            i += 1
+                        out.append(('<literal>', line))
+                        break
+                    i += 1
+                else:
+                    raise JSUnreadable('parse-error')
+            else:
+                out.append(('/', line))
+                i += 1
+            continue
+        if c == '<' and i + 1 < n and (text[i + 1].isalpha() or text[i + 1] == '>'):
+            prev = out[-1][0] if out else None
+            if prev in ('=', '(', '[', '{', ',', ':', 'return') or (prev == '>' and len(out) > 1 and out[-2][0] == '='):
+                start = i
+                i = js_skip_jsx(text, i, deadline)
+                line += text.count('\n', start, i)
+                out.append(('<literal>', line))
+                continue
         m = _JS_IDENT.match(text, i)
         if m:
             out.append((m.group(), line))
@@ -1780,6 +1952,10 @@ def js_definitions(text):
                         alias = source
                         if j + 1 < end and values[j] == 'as':
                             alias = values[j + 1]
+                            if alias.startswith('<string:') and alias.endswith('>'):
+                                alias = alias[8:-1]
+                            elif not identifier(alias):
+                                raise JSUnreadable('unsupported-syntax')
                             j += 2
                         aliases.append((source, alias, pos))
                     else:
@@ -1794,12 +1970,19 @@ def js_definitions(text):
                 put('default', 'export', j)
                 i = j + 1
                 continue
-        if v in ('function', 'class') and i > 0 and values[i - 1] in ('=', ':', '(', ','):
-            body = find_body(i + 1, n)
-            if body is None:
-                raise JSUnreadable('unsupported-syntax')
-            i = pairs[body] + 1
-            continue
+        if v in ('function', 'class'):
+            p = i - 1
+            while p >= 0 and values[p] in ('export', 'default', 'declare', 'async'):
+                p -= 1
+            statement = p < 0 or values[p] in (';', '}')
+            if p >= 0 and t[p][1] < t[i][1] and values[p] in (')', ']'):
+                statement = True
+            if not statement:
+                body = find_body(i + 1, n)
+                if body is None:
+                    raise JSUnreadable('unsupported-syntax')
+                i = pairs[body] + 1
+                continue
         if v in ('function', 'class'):
             j = i + 1
             if j < n and values[j] == '*':
@@ -1809,12 +1992,26 @@ def js_definitions(text):
                 put(name, v, j)
                 body = find_body(j + 1, n)
                 if body is None:
+                    if i > 0 and values[i - 1] == 'declare':
+                        i = j + 1
+                        continue
                     raise JSUnreadable('unsupported-syntax')
                 if v == 'class':
                     class_methods(name, body, pairs[body])
                 i = pairs[body] + 1
                 continue
-        if v in ('const', 'let') and i > 0 and values[i - 1] in ('export', 'declare'):
+        if v in ('interface', 'type', 'enum') and i + 1 < n and identifier(values[i + 1]):
+            p = i - 1
+            while p >= 0 and values[p] in ('export', 'declare', 'const'):
+                p -= 1
+            if p < 0 or values[p] in (';', '}'):
+                put(values[i + 1], v, i + 1)
+                i += 2
+                continue
+        if v == 'const' and i + 1 < n and values[i + 1] == 'enum':
+            i += 1
+            continue
+        if v in ('const', 'let', 'var') and i > 0 and values[i - 1] in ('export', 'declare'):
             j = i + 1
             if j >= n or not identifier(values[j]):
                 raise JSUnreadable('unsupported-syntax')
@@ -1904,7 +2101,7 @@ def resolve_pointer(repo, pointer, graph_index=None):
         else:
             result['reason'] = 'symbol-missing'
         return result
-    if rel.endswith(('.js', '.mjs', '.cjs', '.ts', '.tsx')):
+    if rel.endswith(('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')):
         try:
             with full.open('rb') as stream:
                 data = stream.read(JS_MAX_BYTES + 1)
