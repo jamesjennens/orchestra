@@ -487,8 +487,7 @@ class HarnessTests(unittest.TestCase):
     def test_every_route_that_mentions_program_is_in_the_harness(self):
         # The addition at VERIFIED: any route whose pattern contains "program", not only those under /program.
         self.assertEqual(sorted(program_isolation.PROGRAM_ROUTES), program_isolation.program_routes(http_service.ROUTES))
-        covered = {name for name, _template in program_isolation.AREA_READS}
-        self.assertTrue(set(program_isolation.PROGRAM_ROUTES.values()) <= covered)
+        self.assertTrue(set(program_isolation.PROGRAM_ROUTES.values()) <= program_isolation.covered_reads())
 
     @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
     def test_a_host_key_without_the_area_is_refused_as_for_no_project(self):

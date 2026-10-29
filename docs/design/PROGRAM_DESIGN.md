@@ -119,6 +119,10 @@ A link counts only when **both** sides have accepted their record:
   `ref links` lists one project's link records only.
 - **The isolation harness:** tests/program_isolation.py. Later slices add their reads to it, and a test fails if
   any route whose pattern mentions "program" is missing from it.
+- **Notes between coordinators (kittrial-5bb.447):** a link is also what lets the coordinators of the two
+  projects (and of two areas of one program) write to each other. The link is checked live, the sender needs no
+  right in the other project, and a note's text reaches only the coordinators of its two projects. The harness
+  covers the note reads, and its route test now catches any route mentioning "program" or "notes".
 
 ### 2.3 What being in a program grants: nothing
 

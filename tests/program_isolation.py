@@ -6,7 +6,10 @@ no rows, no counts, no names beyond the program's own link records. So does an a
 the area, and so does a host key that omits it.
 
 Later slices add their reads to ``AREA_READS`` and their routes to ``PROGRAM_ROUTES``; a test checks that every
-route whose pattern mentions "program" is listed, so no program read can skip this harness.
+route whose pattern mentions "program" or "notes" is listed, so no program read can skip this harness.
+
+kittrial-5bb.447 adds the notes between coordinators: their reads join ``AREA_READS`` and ``PERSONAL_READS``, and
+``assert_text_hidden`` checks that a note's text reaches nobody but the coordinators of its two projects.
 """
 import json
 
@@ -18,9 +21,19 @@ AREA_READS = (
     ('references', '/v1/projects/{project}/references'),
     ('member-of', '/v1/projects/{project}/references/program.member-of'),
     ('program-links', '/v1/projects/{project}/program-links'),
+    ('notes', '/v1/projects/{project}/notes'),
+    ('notes-sent', '/v1/projects/{project}/notes?box=sent'),
+)
+#: Reads of the caller's own, across projects: they must show nothing of a project the caller does not coordinate.
+PERSONAL_READS = (
+    ('me-notes', '/v1/me/notes'),
+    ('agent-next', '/v1/agents/me/next'),
+    ('agent-wait', '/v1/agents/me/wait'),
+    ('agent-wait-coordinator', '/v1/agents/me/wait?form=coordinator'),
 )
 #: Every route handler whose pattern mentions "program", with the read above that covers it.
-PROGRAM_ROUTES = {'program_links_read': 'program-links'}
+PROGRAM_ROUTES = {'program_links_read': 'program-links', 'notes_read': 'notes', 'notes_write': 'notes',
+                  'notes_noted': 'notes', 'me_notes': 'me-notes'}
 
 
 def without_request_id(body):
@@ -55,5 +68,21 @@ def assert_outsiders_see_nothing(test, request, area, missing, callers):
 
 
 def program_routes(routes):
-    """The handler names of the routes whose pattern mentions "program", from ``http_service.ROUTES``."""
-    return sorted({name for _method, compiled, name, *_rest in routes if 'program' in compiled.pattern.lower()})
+    """The handler names of the routes whose pattern mentions "program" or "notes", from ``http_service.ROUTES``."""
+    return sorted({name for _method, compiled, name, *_rest in routes
+                   if 'program' in compiled.pattern.lower() or 'notes' in compiled.pattern.lower()})
+
+
+def covered_reads():
+    return {name for name, _template in AREA_READS} | {name for name, _template in PERSONAL_READS}
+
+
+def assert_text_hidden(test, request, text, callers, projects):
+    """``text`` appears in no answer any of ``callers`` ({label: token}) gets from every area read of each of
+    ``projects`` and every personal read: a note's text is for the coordinators of its two projects only."""
+    for label, token in callers.items():
+        reads = [template.format(project=project) for project in projects for _name, template in AREA_READS]
+        reads += [template for _name, template in PERSONAL_READS]
+        for path in reads:
+            answer = request('GET', path, token=token)
+            test.assertNotIn(text, json.dumps(answer.data), (label, path))

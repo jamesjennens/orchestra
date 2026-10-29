@@ -858,6 +858,30 @@ through two reference entries, `program.area.<area>` in the program and `program
 - **The host:** `ref links` lists one project's link records only; the web service alone puts the two sides
   together.
 
+**Notes between coordinators** (kittrial-5bb.447): a coordinator of one project writes to the coordinator role of a
+project linked with it in a program, and the addressed agents are woken.
+- **Routes:**
+  - `POST /v1/projects/{id}/notes` with `{to_project, text, reply_to?}` and an Idempotency-Key, at CAP_COORDINATE in
+    the sending project;
+  - `GET /v1/projects/{id}/notes?box=to|sent&state=all|unsettled` (CAP_COORDINATE, 50 a page);
+  - `POST /v1/projects/{id}/notes/{note}/noted`;
+  - `GET /v1/me/notes`.
+- **The address:** checked live through both projects' link records. No right in the addressed project is needed,
+  and every refusal is one 404.
+- **Bounds:**
+  - text 1-4,000 characters of plain text;
+  - 30 notes an hour from one project to another, then `429` with Retry-After; only the first 429 in an hour is
+    audited;
+  - 1,000 notes kept per addressed project, the oldest settled first, with drops counted and audited.
+- **The wake:**
+  - an unsettled note is the first next action of the agents holding an effective coordinator grant in the
+    addressed project, without its text;
+  - it changes both wait forms' fingerprints;
+  - with no note, the coordinator wait's fingerprint is exactly the CLI's.
+- **Storage:** the web service's state (`coordinator_notes`). The coordination backup's HTTP-state pair carries it,
+  and an older kit keeps it untouched. Each record has a random id and `to.installation` (null), so a later relay
+  between installations can carry it.
+
 ### Creating a project from the web interface
 
 An operator creates a project on the host (`admin.py add-project NAME`) and a superuser

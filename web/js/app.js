@@ -13,6 +13,7 @@ import * as records from './views/records.js';
 import * as agents from './views/agents.js';
 import * as setup from './views/setup.js';
 import * as handover from './views/handover.js';
+import * as notes from './views/notes.js';
 import * as how from './views/how.js';
 import * as rooms from './views/rooms.js';
 import * as releases from './views/releases.js';
@@ -22,7 +23,7 @@ import * as trace from './views/trace.js';
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
   home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list, agentSetup: agents.setupWizardPage,
-  project: project.overview, reviews: project.reviews, releases: releases.page, feedback: project.feedback, settings: project.settings, setup: setup.page, handover: handover.page, how: how.page,
+  project: project.overview, reviews: project.reviews, releases: releases.page, feedback: project.feedback, settings: project.settings, setup: setup.page, handover: handover.page, notes: notes.page, how: how.page,
   newTask: task.create, task: task.detail,
   lanes: project.lanesPage,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,

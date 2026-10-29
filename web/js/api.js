@@ -499,6 +499,12 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     handoverNote: (pid) => call('GET', `/v1/projects/${pid}/handover/note`),
     writeHandoverNote: (pid, text, forPerson) => mutate('PUT', `/v1/projects/${pid}/handover/note`, { text, for_person: forPerson }),
     acknowledgeHandoverNote: (pid, version) => mutate('POST', `/v1/projects/${pid}/handover/note/acknowledge`, { version }),
+    // kittrial-5bb.446/.447: program links, and notes between the coordinators of linked projects.
+    programLinks: (pid) => call('GET', `/v1/projects/${pid}/program-links`),
+    notes: (pid, box) => call('GET', `/v1/projects/${pid}/notes`, { params: { box } }),
+    writeNote: (pid, toProject, text, replyTo) => mutate('POST', `/v1/projects/${pid}/notes`,
+      replyTo ? { to_project: toProject, text, reply_to: replyTo } : { to_project: toProject, text }),
+    noteNoted: (pid, nid) => mutate('POST', `/v1/projects/${pid}/notes/${nid}/noted`, {}),
     mergeSlot: (pid) => call('GET', `/v1/projects/${pid}/merge-slot`),
     acquireMergeSlot: (pid, task_id, target) => mutate('POST', `/v1/projects/${pid}/merge-slot/acquire`, { task_id, target }),
     releaseMergeSlot: (pid) => mutate('POST', `/v1/projects/${pid}/merge-slot/release`, {}),
