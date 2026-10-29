@@ -79,6 +79,7 @@ import json
 import re
 import time
 from datetime import date, timedelta
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import contextvars
@@ -691,10 +692,11 @@ def check_successor(key, successor, rows, operators=None):
     raise ValueError('The successor chain from %s is too long' % successor)
 
 
-def _pre_write(payload, run, operators=None):
+def _pre_write(payload, run, operators=None, project=None):
     # kittrial-5bb.446: the program. keys are the two program links, with their fixed statement lines and a
-    # decision authority (program_links.write_problem); checked first, so a refusal reads nothing.
-    problem = program_links.write_problem(payload)
+    # decision authority (program_links.write_problem); checked first, so a refusal reads nothing. The project's
+    # own id is its directory's name, so a link naming this project itself is refused here too (review of .446, N2).
+    problem = program_links.write_problem(payload, project_id=Path(str(project)).name if project else None)
     if problem is not None:
         raise ValueError(problem)
     check_decisions(payload, run)
@@ -716,7 +718,7 @@ KIND = keyed_entries.AnchoredKind(
     entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
     validate_content=_validate_content, write_time_rules=lambda record: _write_time_rules(record),
     content_fields=CONTENT_FIELDS,
-    pre_write=lambda payload, run, operators: _pre_write(payload, run, operators),
+    pre_write=lambda payload, run, operators, project=None: _pre_write(payload, run, operators, project),
     entry_prefixes=tuple(ENTRY_PREFIXES.values()), entry_prefix_for=lambda record: entry_prefix_for(record),
     acceptance_rules=lambda record, acceptance, run: acceptance_rules(record, acceptance, run),
     unsupported_reason=lambda body, row=None: unsupported_reason(body, row),

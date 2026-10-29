@@ -34,6 +34,7 @@ KEYS_SENTENCE = ('The program. keys are kept for program links: program.area.<ar
                  '(<area> a host project name) and program.member-of in the area project')
 AUTHORITY_SENTENCE = ("A program link needs a decision authority: the decision issue in which this project's owner "
                       'decided to join or admit (PROGRAM_DESIGN.md section 2.2)')
+SELF_SENTENCE = 'A program link names another project: a project cannot link itself'
 OWNER_SENTENCE = ("Only a person owner of this project accepts or retires a program link: joining or leaving a "
                   "program is the owner's decision (PROGRAM_DESIGN.md section 2.2). A coordinator or an agent "
                   'proposes it, and the owner accepts it')
@@ -58,8 +59,11 @@ def statement_lines(statement, label):
     return named.group(1), state.group(1)
 
 
-def write_problem(payload):
-    """The refusal sentence for a write of a ``program.`` key, or None (accept and retire carry no content)."""
+def write_problem(payload, project_id=None):
+    """The refusal sentence for a write of a ``program.`` key, or None (accept and retire carry no content).
+
+    ``project_id`` is the project written to: a link naming it is refused (review of kittrial-5bb.446, N2); the read
+    still refuses one that got in before this check (``side_status``, ``links-itself``)."""
     key = payload.get('key') if isinstance(payload, dict) else None
     if not isinstance(key, str) or not key.startswith(PREFIX) or payload.get('operation') in ('accept', 'retire'):
         return None
@@ -75,6 +79,8 @@ def write_problem(payload):
         return str(error)
     if side[0] == 'program' and named != side[1]:
         return 'The Area line must name the area of the key, %s' % side[1]
+    if project_id is not None and named == project_id:
+        return SELF_SENTENCE
     return None
 
 

@@ -63,6 +63,14 @@ class WriteRuleTests(unittest.TestCase):
             self.assertIsNotNone(problem, payload)
             self.assertIn(words, problem, payload)
 
+    def test_a_project_cannot_link_itself_at_write(self):
+        # Review of kittrial-5bb.446, N2: refused when written, not only when read.
+        self.assertEqual(pl.SELF_SENTENCE, pl.write_problem(self.payload('program.area.prog', statement('Area', 'prog')),
+                                                            project_id='prog'))
+        self.assertEqual(pl.SELF_SENTENCE, pl.write_problem(self.payload('program.member-of', statement('Program', 'north')),
+                                                            project_id='north'))
+        self.assertIsNone(pl.write_problem(self.payload('program.area.north', statement('Area', 'north')), project_id='prog'))
+
     def test_good_links_other_keys_and_accept_or_retire_pass(self):
         for payload in (self.payload('program.area.north', statement('Area', 'north')),
                         self.payload('program.area.north', statement('Area', 'north', state='left')),
@@ -136,6 +144,15 @@ class RecordTests(DecisionCase):
         self.assertIn('opens with two lines', str(refused.exception))
         if before is not None:
             self.assertEqual(before, len(self.native.rows))
+
+    def test_a_link_to_this_project_itself_is_refused_when_written(self):
+        # Review of kittrial-5bb.446, N2, through the records' own pre-write check: the project is its directory.
+        here = self.project / 'north'
+        here.mkdir()
+        self.project = here
+        with self.assertRaises(ValueError) as refused:
+            self.link('program.member-of', statement('Program', 'north'), 'prog-self-1')
+        self.assertIn(pl.SELF_SENTENCE, str(refused.exception))
 
     def test_ref_links_lists_only_the_link_keys_with_who_accepted_them(self):
         self.propose(key='calendar.trading', title='Not a link', statement='Ordinary.',
