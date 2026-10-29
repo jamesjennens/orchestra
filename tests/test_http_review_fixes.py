@@ -206,7 +206,9 @@ class Harness(unittest.TestCase):
 
     def request(self, method, path, body=None, token=None, cookie=None, csrf=None,
                 key=None, headers=None, content_type='application/json'):
-        client = http.client.HTTPConnection('127.0.0.1', self.port, timeout=getattr(self, 'http_timeout', 20))
+        # 60 s, not 20 (1024v): on a shared host under another user's load (koopa at 70-110) the real-bd web
+        # tests timed out at 20 s and a timed-out test left its draft for the next one on the class runtime.
+        client = http.client.HTTPConnection('127.0.0.1', self.port, timeout=getattr(self, 'http_timeout', 60))
         request_headers = {}
         if body is not None:
             request_headers['Content-Type'] = content_type
