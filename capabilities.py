@@ -464,7 +464,7 @@ def contained_file(root, rel):
     """The regular file at rel inside root, following no link out of the root."""
     try:
         full = (root / rel).resolve()
-        full.relative_to(root)
+        full.relative_to(Path(root).resolve())
     except (OSError, RuntimeError, ValueError):
         return None
     return full if full.is_file() else None

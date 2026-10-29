@@ -1,4 +1,5 @@
 """Real-file checks for JS and TS capability pointers."""
+import os
 import tempfile
 import time
 import tracemalloc
@@ -306,6 +307,53 @@ class JavaScriptSymbols(unittest.TestCase):
     def test_lone_close_brace_in_template_text(self):
         text = 'const t = `a } b ${x}`\nexport function f(){}'
         self.assertIs(self.resolve(text, 'f', 'ts')['resolved'], True)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX symlink root test')
+    def test_symlinked_root_resolves_python_and_javascript_and_rejects_escape(self):
+        alias = self.root.parent / (self.root.name + '-alias')
+        outside = self.root.parent / (self.root.name + '-outside.py')
+        outside.write_text('def secret(): pass\n', encoding='utf-8')
+        self.addCleanup(outside.unlink)
+        try:
+            alias.symlink_to(self.root, target_is_directory=True)
+            (self.root / 'escape.py').symlink_to(outside)
+        except (OSError, NotImplementedError) as exc:
+            if alias.is_symlink():
+                alias.unlink()
+            self.skipTest('symlinks unavailable: %s' % exc)
+        self.addCleanup(alias.unlink)
+        (self.root / 'file.py').write_text('def present(): pass\n', encoding='utf-8')
+        (self.root / 'file.js').write_text('function present() {}', encoding='utf-8')
+        repo = {'root': alias}
+        for pointer in ('file.py::present', 'file.js::present'):
+            with self.subTest(pointer=pointer):
+                self.assertIs(capabilities.resolve_pointer(repo, pointer)['resolved'], True)
+        escaped = capabilities.resolve_pointer(repo, 'escape.py::secret')
+        self.assertIs(escaped['resolved'], False)
+        self.assertEqual(escaped['reason'], 'file-missing')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows short-path test')
+    def test_windows_short_root_resolves_python_and_javascript(self):
+        import ctypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        get_short = kernel.GetShortPathNameW
+        get_short.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
+        get_short.restype = ctypes.c_uint32
+        folder = self.root / 'long directory name for short path'
+        folder.mkdir()
+        needed = get_short(str(folder), None, 0)
+        if not needed:
+            self.skipTest('GetShortPathNameW unavailable for this directory')
+        buf = ctypes.create_unicode_buffer(needed)
+        written = get_short(str(folder), buf, needed)
+        if not written or written >= needed or os.path.normcase(buf.value) == os.path.normcase(str(folder)):
+            self.skipTest('8.3 short path not available for this directory')
+        (folder / 'file.py').write_text('def present(): pass\n', encoding='utf-8')
+        (folder / 'file.js').write_text('function present() {}', encoding='utf-8')
+        repo = {'root': Path(buf.value)}
+        for pointer in ('file.py::present', 'file.js::present'):
+            with self.subTest(pointer=pointer):
+                self.assertIs(capabilities.resolve_pointer(repo, pointer)['resolved'], True)
 
     def test_invalid_regex_is_unknown(self):
         self.assertIsNone(self.resolve('const pattern = /unterminated', 'missing')['resolved'])
