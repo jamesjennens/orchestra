@@ -906,7 +906,8 @@ class AnchoredKind:
                             or (receipt.get('acceptance') or {}).get('record_sha256') == record['sha256']):
                         already(revision)
             return
-        if existing[payload['revision']]['acceptance_state'] != 'draft':
+        if (existing[payload['revision']]['acceptance_state'] != 'draft'
+                and payload['revision'] in self.live_acceptances(row, operators)):
             already(payload['revision'])
 
     def revision_authors_on(self, row):

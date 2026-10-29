@@ -12,7 +12,7 @@ from pathlib import Path
 
 class AcceptPendingTests(unittest.TestCase):
     @contextlib.contextmanager
-    def seeded(self, kind):
+    def seeded(self, kind, direct=False):
         import reference_records
         import capability_records
         from test_reference_records import ReferenceCase, OPERATOR, acceptance
@@ -23,7 +23,17 @@ class AcceptPendingTests(unittest.TestCase):
         module = reference_records if kind == 'reference' else capability_records
         key = 'calendar.trading' if kind == 'reference' else 'review.structured-contribution'
         try:
-            draft = case.propose()
+            if direct:
+                from test_reference_records import entry as reference_entry
+                from test_capability_records import entry as capability_entry
+                entry = reference_entry if kind == 'reference' else capability_entry
+                case.native.actor = OPERATOR
+                initial = dict(entry(operation='draft', operation_id='direct-accepted'),
+                               acceptance_state='accepted', acceptance=acceptance())
+                accepted = module.apply_native(initial, OPERATOR, case.native, case.project,
+                                               operator=True, operators=[OPERATOR])
+            else:
+                case.propose()
             payload = dict(schema_version=1, operation='accept', operation_id='original-accept',
                            key=key, revision=1, record_sha256=case.sha(1),
                            acceptance_state='accepted', acceptance=acceptance())
@@ -31,7 +41,8 @@ class AcceptPendingTests(unittest.TestCase):
                 case.native.actor = OPERATOR
                 return module.apply_native(body, OPERATOR, case.native, case.project,
                                            operator=True, operators=[OPERATOR])
-            accepted = apply(payload)
+            if not direct:
+                accepted = apply(payload)
             receipt = case.project / module.JOURNAL / (content_hash({'operation_id': payload['operation_id']}) + '.json')
             yield case, module, payload, accepted, receipt, apply
         finally:
@@ -132,6 +143,26 @@ class AcceptPendingTests(unittest.TestCase):
                 row = case.native.rows[0]
                 self.assertEqual(len(module.existing_revisions(row)), 2)
                 self.assertIn(2, module.KIND.live_acceptances(row, [OPERATOR, 'replacement']))
+
+    def test_inert_direct_and_newest_accepted_revisions_are_repairable(self):
+        for kind in ('reference', 'capability'):
+            for direct in (True, False):
+                with self.subTest(kind=kind, direct=direct), self.seeded(kind, direct) as values:
+                    case, module, payload, accepted, receipt, apply = values
+                    revision = accepted['revision']
+                    row = case.native.rows[0]
+                    self.assertNotIn(revision, module.KIND.live_acceptances(row, ['replacement']))
+                    previous = copy.deepcopy(row['comments'])
+                    case.native.actor = 'replacement'
+                    body = dict(payload, operation_id='repair-named-accepted', revision=revision,
+                                record_sha256=case.sha(revision))
+                    result = self.must_apply(lambda request: module.apply_native(
+                        request, 'replacement', case.native, case.project, operator=True,
+                        operators=['replacement']), body)
+                    self.assertEqual(result['revision'], revision + 1)
+                    self.assertEqual(row['comments'][:len(previous)], previous)
+                    self.assertIn(revision + 1, module.KIND.live_acceptances(row, ['replacement']))
+                    self.assertEqual(len(module.existing_revisions(row)), revision + 1)
 
     def test_changed_payload_and_damaged_selected_receipt_are_not_replays(self):
         for kind in ('reference', 'capability'):

@@ -3,7 +3,7 @@
   "operation_id": "accept-pending-569ef2e2bfdd4c348d9eadd1f760891b",
   "key": "records.accept-pending-draft",
   "name": "Receipt-aware acceptance of waiting reference and capability drafts",
-  "summary": "Fresh reference/capability accepts consume a waiting draft and refuse an already accepted revision without native writes. Matching operation receipts preserve exact retries and incomplete-write recovery; retained acceptance receipts distinguish fresh consumed-draft requests. Lost-receipt native-identical requests retain legacy no-op recovery, including indistinguishable fresh identities. Inert prior-operator evidence can still be replaced; verification stays a separate attestation.",
+  "summary": "Fresh reference/capability accepts consume a waiting draft and refuse a revision with live acceptance evidence without native writes. A currently listed operator may repair an inert accepted revision, including a direct-accepted first revision. Matching operation receipts preserve exact retries and incomplete-write recovery; retained acceptance receipts distinguish fresh consumed-draft requests. Lost-receipt native-identical requests retain legacy no-op recovery, including indistinguishable fresh identities. Inert prior-operator evidence can still be replaced; verification stays a separate attestation.",
   "owner": "person:orchestra-coordinator",
   "tags": [
     "records",
@@ -13,7 +13,8 @@
   "aliases": [
     "accepted revision receipt replay fresh acceptance",
     "accept already accepted revision",
-    "waiting draft acceptance"
+    "waiting draft acceptance",
+    "inert acceptance repair"
   ],
   "code": [
     "keyed_entries.py::AnchoredKind.check_accept_request",

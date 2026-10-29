@@ -47,7 +47,7 @@ class NativeAcceptPendingTests(RulesHelpers, unittest.TestCase):
                                     approvers=['person:maintainer'], policy='any-owner',
                                     evidence='Synthetic native acceptance regression'))
 
-    def call(self, route, kind, payload, batch=False):
+    def call(self, route, kind, payload, batch=False, actor='ops'):
         if route == 'http':
             body = dict(expected_revision=payload['revision'], record_sha256=payload['record_sha256'],
                         decision_id=payload['acceptance']['decision_id'], evidence=payload['acceptance']['evidence'])
@@ -68,7 +68,7 @@ class NativeAcceptPendingTests(RulesHelpers, unittest.TestCase):
         attachment.write_text(json.dumps(body))
         if route == 'admin':
             reply = subprocess.run([sys.executable, str(KIT / 'admin.py'), '--root', str(self.root),
-                                    command, 'pp', '--actor', 'ops', '--file', str(attachment)],
+                                    command, 'pp', '--actor', actor, '--file', str(attachment)],
                                    capture_output=True, text=True, timeout=240)
             answer = dict(code=reply.returncode, stdout=reply.stdout, error=reply.stderr)
         else:
@@ -180,6 +180,70 @@ class NativeAcceptPendingTests(RulesHelpers, unittest.TestCase):
                         result = self.success(self.call(route, kind, retry, batch), route, 2, batch)
                         self.assertEqual(result['native_id'], accepted['native_id'])
                         self.assertEqual(canonical_bytes(self.rows()), before)
+
+    def test_cli_and_http_repair_inert_direct_and_newest_accepted_revisions(self):
+        self.start_web()
+        from test_web_records import _valid_ref_propose, _valid_cap_propose
+        for route in ('admin', 'http'):
+            for kind in ('reference', 'capability'):
+                for direct in (True, False):
+                    with self.subTest(route=route, kind=kind, direct=direct):
+                        self.deployment(operators=['ops', 'former'], coordinator_writes=True,
+                                        independent_approval=False)
+                        key = 'repair.' + secrets.token_hex(8)
+                        if direct:
+                            body = _valid_ref_propose(key) if kind == 'reference' else _valid_cap_propose(key)
+                            if kind == 'reference':
+                                body['review_by'] = (datetime.datetime.now(datetime.timezone.utc).date()
+                                                     + datetime.timedelta(days=90)).isoformat()
+                            else:
+                                body['aliases'] = []
+                            body.update(schema_version=1, operation='draft', operation_id='direct-' + key,
+                                        acceptance_state='accepted', acceptance=self.payload(key, 1, '', '')['acceptance'])
+                            self.success(self.call('admin', kind, body, actor='former'), 'admin', 1, False)
+                            revision = 1
+                        else:
+                            draft = self.proposal(kind, key)
+                            body = self.payload(key, 1, draft['sha256'], 'first-' + key)
+                            self.success(self.call('admin', kind, body, actor='former'), 'admin', 2, False)
+                            revision = 2
+                        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+                        get = self.caller.get_reference if kind == 'reference' else self.caller.get_capability
+                        inert = get('pp', key)
+                        self.assertEqual(inert['state'], 'draft-only', inert)
+                        self.assertTrue(inert['acceptance_inert'], inert)
+                        before = self.rows()
+                        accepted = self.revision(kind, key, revision)
+                        repair = self.payload(key, revision, accepted['sha256'], 'repair-' + key)
+                        self.success(self.call(route, kind, repair), route, revision + 1, False)
+                        live = get('pp', key)
+                        self.assertEqual(live['state'], 'accepted', live)
+                        self.assertFalse(live['acceptance_inert'], live)
+                        after = canonical_bytes(self.rows())
+                        self.assertNotEqual(after, canonical_bytes(before))
+                        self.success(self.call(route, kind, repair), route, revision + 1, False)
+                        self.assertEqual(canonical_bytes(self.rows()), after)
+                        latest = self.revision(kind, key, revision + 1)
+                        self.refusal(self.call(route, kind, self.payload(
+                            key, revision + 1, latest['sha256'], 'live-again-' + key)), route, False)
+                        self.assertEqual(canonical_bytes(self.rows()), after)
+
+    def test_http_refuses_fresh_live_accepted_and_consumed_draft(self):
+        self.start_web()
+        for kind in ('reference', 'capability'):
+            with self.subTest(kind=kind):
+                key = 'http.refusal.' + secrets.token_hex(8)
+                draft = self.proposal(kind, key)
+                original = self.payload(key, 1, draft['sha256'], 'first-' + key)
+                self.success(self.call('http', kind, original), 'http', 2, False)
+                accepted = self.revision(kind, key, 2)
+                before = canonical_bytes(self.rows())
+                for revision, digest in ((1, draft['sha256']), (2, accepted['sha256'])):
+                    fresh = self.payload(key, revision, digest, 'fresh-' + key + '-' + str(revision))
+                    self.refusal(self.call('http', kind, fresh), 'http', False)
+                    self.assertEqual(canonical_bytes(self.rows()), before)
+                self.success(self.call('http', kind, original), 'http', 2, False)
+                self.assertEqual(canonical_bytes(self.rows()), before)
 
     def test_web_verify_remains_a_separate_attestation_and_exact_retry(self):
         self.start_web()
