@@ -170,7 +170,8 @@ class FindTests(LookupCase):
         self.assertIn('ref find PHRASE [--limit N]', usage['usage'])
         self.assertIn('ref misses [--limit N]', usage['usage'])
         self.assertIn('no actor is stored', usage['telemetry'])
-        with self.assertRaisesRegex(ValueError, 'use get, list, find, misses, propose or revise'):
+        self.assertIn('ref links', usage['usage'])               # kittrial-5bb.446: the program-link read
+        with self.assertRaisesRegex(ValueError, 'use get, list, find, links, misses, propose or revise'):
             rr.read(['search', 'x'], self.native, [OPERATOR])
 
 

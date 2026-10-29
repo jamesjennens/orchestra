@@ -395,6 +395,71 @@ class AcceptGateTests(LinkCase):
         self.assertEqual([('references.accept', 'calendar.trading')], self.invoked)
 
 
+# -- end to end, with the real endpoint.py and a real bd (POSIX) -----------------------------------------------
+from test_coordinator_rules_endpoint import RulesHelpers  # noqa: E402
+import test_http_review_fixes as fixes  # noqa: E402
+from test_web_records import _review_by  # noqa: E402
+
+
+@unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
+class NativeLinkTests(RulesHelpers, unittest.TestCase):
+    """One program project on the real endpoint: the write refusal, `ref links` through the endpoint, the owner-only
+    acceptance and the read. (The two-project link is read through the same code with an injected read above.)"""
+
+    def setUp(self):
+        super().setUp()
+        root = self.root
+
+        class Harness(fixes.Harness):
+            def make_backend(h):
+                return http_service.EndpointBackend(sys.executable, str(KIT / 'endpoint.py'), str(root),
+                                                    service=h.service)
+
+        self.harness = Harness(methodName='runTest')
+        self.harness.setUp()
+        self.addCleanup(self.harness._stop_server)
+        self.owner = self.harness.admin_token()
+        made = self.harness.request('POST', '/v1/projects', {'project_id': 'pp', 'name': 'Native Program'},
+                                    token=self.owner)
+        self.assertEqual(201, made.status, made.data)
+
+    def test_native_a_program_link_from_proposal_to_the_read(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        h = self.harness
+        created = self.r.bd('create', 'Admit north', '--type', 'decision', '--json', actor='op')
+        self.assertEqual(0, created.returncode, created.stderr)
+        decision = json.loads(created.stdout)['id']
+        uid = h.create_account(self.owner, 'pl-coord', 'pl-password-1')
+        self.assertEqual(200, h.request('PUT', '/v1/projects/pp/members/%s' % uid, {'role': 'coordinator'},
+                                        token=self.owner).status)
+        coord = h.login('pl-coord', 'pl-password-1')[0]
+        refs = '/v1/projects/pp/references'
+        body = {'key': 'program.lead', 'title': 'Not a link', 'statement': 'Area: north\nState: in',
+                'authority': {'type': 'decision', 'id': decision}, 'owner': 'person:maintainer',
+                'review_by': _review_by(), 'tags': ['program'], 'decisions': []}
+        refused = h.request('POST', refs, body, token=coord, key='pl-bad-1')
+        self.assertEqual(422, refused.status, refused.data)
+        self.assertIn('kept for program links', refused.data['error']['message'])
+        body.update(key='program.area.north', statement='Area: north\nState: in\n\nAdmitted by the owner.')
+        proposed = h.request('POST', refs, body, token=coord, key='pl-propose-1')
+        self.assertEqual(201, proposed.status, proposed.data)
+        read = h.request('GET', '/v1/projects/pp/program-links', token=coord)
+        self.assertEqual(200, read.status, read.data)
+        self.assertEqual(['proposed'], [row['state'] for row in read.data['as_program']['items']])
+        accept = {'expected_revision': 1, 'record_sha256': proposed.data['sha256'],
+                  'evidence': 'The owner decided to admit north.', 'decision_id': decision}
+        gate = h.request('POST', refs + '/program.area.north/accept', accept, token=coord, key='pl-accept-coord')
+        self.assertEqual(403, gate.status, gate.data)
+        accepted = h.request('POST', refs + '/program.area.north/accept', accept, token=self.owner, key='pl-accept-1')
+        self.assertEqual(200, accepted.status, accepted.data)
+        read = h.request('GET', '/v1/projects/pp/program-links', token=coord)
+        row = read.data['as_program']['items'][0]
+        # north is no project here, so its side cannot count: one-sided, and the program side is the owner's.
+        self.assertEqual(('north', 'one-sided', True, {'counts': False}),
+                         (row['area'], row['state'], row['program_side']['counts'], row['area_side']))
+
+
 # -- the docs an agent reads ----------------------------------------------------------------------------------
 class AgentMdTests(unittest.TestCase):
     """The coordinator AGENT.md and the site's coordinator prompt say the same about programs, word for word."""
