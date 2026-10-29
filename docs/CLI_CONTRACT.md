@@ -1690,6 +1690,12 @@ sets `operation`.
   - A different operation proposing that key is refused until then, or until the
     operator releases the anchor (`admin.py anchor-release`).
 
+Reference and capability accepts consume a waiting draft: a fresh accept of an already
+accepted revision is refused (HTTP 409, or the existing CLI/batch refusal), while an
+exact same-operation retry still replays. If the acceptance receipt is lost, a
+native-identical retry, including an indistinguishable fresh identity naming the
+consumed draft, remains a successful no-op without a native write.
+
 Acceptance is not a client command. It is the operator's
 `admin.py reference-apply` ([operations](OPERATIONS.md#operator-commands)), for one
 entry or for a batch of them.
