@@ -146,7 +146,8 @@ class ScopeTests(CarrierCase):
 
 
 SAMPLES = ('a1', '1', 'abc123', 'a.b', 'a.b-c', 'p-' + '0' * 12, 'nudge-' + '0' * 24, '0' * 8, 'usr_' + '0' * 16, 'cred_' + '0' * 16,
-           'a' * 40, 'a.b.c', 'f' * 64)
+           'a' * 40, 'a.b.c', 'f' * 64,
+           'cnote-' + '0' * 24)   # kittrial-5bb.447: a coordinator note's id
 
 
 def fill(pattern):
