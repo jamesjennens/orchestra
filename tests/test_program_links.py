@@ -414,6 +414,20 @@ class AcceptGateTests(LinkCase):
         self.assertNotEqual(403, made.status, made.data)
         self.assertEqual([('references.accept', 'program.area.north')], self.invoked)
 
+    def test_an_owners_own_agent_does_not_pass_the_gate(self):
+        # Review of kittrial-5bb.446, N4: pat owns prog, and her agent's credential carries her account; the gate
+        # still refuses it, because the owner's act is her own web session (http_auth.is_person_owner).
+        made = self.request('POST', '/v1/agents', {'name': 'Pike', 'working_directory': '/home/x/pike',
+                                                   'projects': ['prog']}, token=self.tokens['pat'])
+        self.assertEqual(201, made.status, made.data)
+        self.assertEqual(200, self.request('PUT', '/v1/projects/prog/agents/%s/coordinator' % made.data['agent']['id'],
+                                           {}, token=self.tokens['pat']).status)
+        for what in ('accept', 'retire'):
+            refused = self.accept(made.data['credential']['secret'], what=what)
+            self.assertEqual(403, refused.status, (what, refused.data))
+            self.assertIn('Only a person owner of this project', refused.data['error']['message'])
+        self.assertEqual([], self.invoked)
+
     def test_other_keys_keep_their_rules(self):
         made = self.accept(self.tokens['cleo'], key='calendar.trading')
         self.assertNotEqual(403, made.status, made.data)
