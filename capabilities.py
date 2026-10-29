@@ -1872,6 +1872,7 @@ def js_definitions(text):
         raise JSUnreadable('parse-error')
     found = {}
     aliases = []
+    statement_starts = set()
 
     def put(name, kind, pos):
         found[name] = (kind, t[pos][1])
@@ -1892,6 +1893,48 @@ def js_definitions(text):
             else:
                 j += 1
         return None
+
+    def signature_tail(pos, end):
+        """Find a signature body or stop at its semicolon/next statement."""
+        if pos >= end:
+            return None, pos
+        if values[pos] == '{':
+            return pos, pairs[pos] + 1
+        if values[pos] == ';':
+            return None, pos + 1
+        if values[pos] != ':':
+            if t[pos][1] > t[pos - 1][1]:
+                return None, pos
+            raise JSUnreadable('unsupported-syntax')
+        pos += 1
+        type_start = pos
+        angle = 0
+        while pos < end:
+            check_time()
+            v = values[pos]
+            if pos > type_start and t[pos][1] > t[pos - 1][1] and angle == 0 and (identifier(v) or v == '@'):
+                return None, pos
+            if v == ';' and angle == 0:
+                return None, pos + 1
+            if v == '{' and angle == 0:
+                if pos == type_start:
+                    # An object return type needs a full TS parser to distinguish
+                    # it from the following function body reliably.
+                    raise JSUnreadable('unsupported-syntax')
+                return pos, pairs[pos] + 1
+            if v in ('(', '['):
+                pos = pairs[pos] + 1
+                continue
+            if v == '<':
+                angle += 1
+            elif v == '>':
+                if not angle:
+                    raise JSUnreadable('unsupported-syntax')
+                angle -= 1
+            pos += 1
+        if angle or pos == type_start:
+            raise JSUnreadable('unsupported-syntax')
+        return None, pos
 
     def class_methods(name, start, end):
         j = start + 1
@@ -1916,10 +1959,8 @@ def js_definitions(text):
                 if q < end and values[q] == '(':
                     put(name + '.' + method, 'method', k)
                     q = pairs[q] + 1
-                    body = find_body(q, end)
-                    if body is not None:
-                        j = pairs[body] + 1
-                        continue
+                    body, j = signature_tail(q, end)
+                    continue
             # A field initializer can contain calls; none of those calls is a
             # class method. Require a semicolon when skipping an unrecognised field.
             while j < end and values[j] != ';':
@@ -1941,7 +1982,7 @@ def js_definitions(text):
                 p -= 2
             else:
                 break
-        if p < 0:
+        if p < 0 or p + 1 in statement_starts:
             return True
         v = values[p]
         if v == ':' and p > 0 and identifier(values[p - 1]):
@@ -2011,20 +2052,23 @@ def js_definitions(text):
             if j < n and identifier(values[j]):
                 name = values[j]
                 put(name, v, j)
-                body = find_body(j + 1, n)
-                if body is None:
+                if v == 'function':
                     k = j + 1
-                    while k < n and values[k] != ';':
-                        if values[k] in ('(', '['):
-                            k = pairs[k] + 1
-                        else:
-                            k += 1
+                    while k < n and values[k] != '(':
+                        check_time()
+                        if values[k] in ('{', ';'):
+                            raise JSUnreadable('unsupported-syntax')
+                        k += 1
                     if k == n:
                         raise JSUnreadable('unsupported-syntax')
-                    i = k + 1
+                    body, i = signature_tail(pairs[k] + 1, n)
+                    if body is None:
+                        statement_starts.add(i)
                     continue
-                if v == 'class':
-                    class_methods(name, body, pairs[body])
+                body = find_body(j + 1, n)
+                if body is None:
+                    raise JSUnreadable('unsupported-syntax')
+                class_methods(name, body, pairs[body])
                 i = pairs[body] + 1
                 continue
         if v in ('interface', 'type', 'enum', 'namespace', 'module', 'global') and declaration_position(i):

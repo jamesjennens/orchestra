@@ -263,5 +263,49 @@ class JavaScriptSymbols(unittest.TestCase):
         capabilities.verify_matches(index, [view])
         self.assertIs(view['verified'], True)
 
+    def test_export_declare_without_semicolon_then_function(self):
+        text = 'export declare function f(a:number):void\nexport function g(){}'
+        self.assertIs(self.resolve(text, 'g', 'ts')['resolved'], True)
+
+    def test_declare_without_semicolon_then_two_functions(self):
+        text = 'declare function f():void\nexport function g(){}\nexport function h(){}'
+        for name in ('f', 'g', 'h'):
+            self.assertIs(self.resolve(text, name, 'ts')['resolved'], True)
+
+    def test_overloads_without_semicolons(self):
+        text = 'export function f(a:number):void\nexport function f(a:any){}\nexport function g(){}'
+        self.assertIs(self.resolve(text, 'g', 'ts')['resolved'], True)
+        self.assertEqual(self.resolve(text, 'f', 'ts')['line'], 2)
+
+    def test_overloads_with_semicolons_followed_by_function(self):
+        text = 'export function f(a:number):void; export function g(){}'
+        self.assertIs(self.resolve(text, 'g', 'ts')['resolved'], True)
+
+    def test_abstract_method_without_body(self):
+        text = 'abstract class A { abstract f():void\ng() {} }'
+        self.assertIs(self.resolve(text, 'A.f', 'ts')['resolved'], True)
+        self.assertIs(self.resolve(text, 'A.g', 'ts')['resolved'], True)
+
+    def test_two_declare_functions_without_semicolons(self):
+        text = 'export declare function f():void\nexport declare function g():void'
+        self.assertIs(self.resolve(text, 'f', 'ts')['resolved'], True)
+        self.assertIs(self.resolve(text, 'g', 'ts')['resolved'], True)
+
+    def test_bodyless_without_return_type(self):
+        text = 'declare function f()\nexport function g(){}'
+        self.assertIs(self.resolve(text, 'g', 'ts')['resolved'], True)
+
+    def test_body_on_next_line(self):
+        text = 'function f():void\n{} export function g(){}'
+        self.assertIs(self.resolve(text, 'f', 'ts')['resolved'], True)
+        self.assertIs(self.resolve(text, 'g', 'ts')['resolved'], True)
+
+    def test_object_return_type_is_unknown(self):
+        self.assertIsNone(self.resolve('function f():{x:number} { return {x:1}; }', 'f', 'ts')['resolved'])
+
+    def test_lone_close_brace_in_template_text(self):
+        text = 'const t = `a } b ${x}`\nexport function f(){}'
+        self.assertIs(self.resolve(text, 'f', 'ts')['resolved'], True)
+
     def test_invalid_regex_is_unknown(self):
         self.assertIsNone(self.resolve('const pattern = /unterminated', 'missing')['resolved'])
