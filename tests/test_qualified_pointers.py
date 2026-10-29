@@ -114,8 +114,9 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(['north'], self.reads)                   # south (unreadable) and ghost (missing): no read
 
     def test_not_visible_is_byte_identical_for_a_missing_and_an_unreadable_project(self):
-        # §8, the second row: the two answers differ only in the text the caller wrote.
-        snap = self.snapshot({'north'}, description='decision:south/s-1 decision:ghost/s-1')
+        # §8, the second row: the two answers differ only in the text the caller wrote. ghost is in the caller's set but
+        # does not exist (looked for, nothing there); south exists but is outside the set (never read).
+        snap = self.snapshot({'north', 'ghost'}, description='decision:south/s-1 decision:ghost/s-1')
         rows = {c['pointer']: c for c in trace_read.trace(snap, 'tasks')['rows'][0]['cites']}
         south = json.dumps(rows['decision:south/s-1'], sort_keys=True).replace('south', 'X')
         ghost = json.dumps(rows['decision:ghost/s-1'], sort_keys=True).replace('ghost', 'X')
@@ -123,7 +124,7 @@ class TraceTests(unittest.TestCase):
         tokens = [json.dumps(r, sort_keys=True).replace('south', 'X').replace('ghost', 'X')
                   for r in trace_read.tokens_view(snap)]
         self.assertEqual(1, len(set(tokens)))
-        self.assertEqual([], self.reads)
+        self.assertEqual(['ghost'], self.reads)                   # south, outside the set, is never read
 
     def test_at_most_50_other_projects_then_not_checked(self):
         description = ' '.join('decision:p%02d/x-1' % n for n in range(51))
