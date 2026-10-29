@@ -17,6 +17,26 @@ sys.path.insert(0, str(KIT / 'tests'))
 
 
 class RequirementTasksPageTests(unittest.TestCase):
+    def test_233_character_titles_are_clamped_with_full_text_in_both_lists(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        done = test_http_web.run_node_module(self, node, 'await import(process.argv[1])',
+                                             (KIT / 'tests' / 'web_task_title_clamp.mjs').as_uri(),
+                                             (KIT / 'tests' / 'web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web' / 'js' / 'api.js').as_uri(),
+                                             (KIT / 'web' / 'js' / 'views' / 'project.js').as_uri(),
+                                             (KIT / 'web' / 'js' / 'views' / 'work.js').as_uri(),
+                                             (KIT / 'web' / 'css' / 'app.css').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        seen = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(233, seen['titleLength'])
+        self.assertEqual(seen['title'], seen['projectTitle'])
+        self.assertEqual(seen['title'], seen['workTitle'])
+        self.assertTrue(seen['projectClamped'])
+        self.assertTrue(seen['workClamped'])
+
     def test_requirement_rows_are_out_of_the_default_task_view_and_marked_when_shown(self):
         node = shutil.which('node')
         if not node:

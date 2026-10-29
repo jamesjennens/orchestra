@@ -419,6 +419,23 @@ details.fold .fold-hint { font-size: var(--t-sm); font-weight: 400; color: var(-
 /* ---------- task list: one row, the facts a reader scans ---------- */
 .task-row .title { font-weight: 600; }
 .task-row .who-acts { margin-top: 4px; }
+.task-list-title {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden;
+}
+@media (min-width: 761px) {
+  .task-list-project, .task-list-work { table-layout: fixed; }
+  .task-list-project { min-width: 900px; }
+  .task-list-project .task-title-column, .task-list-project .task-title-cell { width: 52%; min-width: 360px; }
+  .task-list-project .task-state-column { width: 120px; }
+  .task-list-project .task-next-column { width: 28%; min-width: 220px; }
+  .task-list-project .task-updated-column { width: 112px; }
+  .task-list-work { min-width: 1000px; }
+  .task-list-work .task-title-column, .task-list-work .task-title-cell { width: 39%; min-width: 340px; }
+  .task-list-work .task-project-column { width: 140px; }
+  .task-list-work .task-state-column { width: 120px; }
+  .task-list-work .task-next-column { width: 27%; min-width: 220px; }
+  .task-list-work .task-updated-column { width: 112px; }
+}
 
 /* ---------- side column on the task page (wide screens) ---------- */
 .detail .side .panel-body { gap: 10px; }
