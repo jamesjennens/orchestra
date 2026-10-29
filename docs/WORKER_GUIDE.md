@@ -427,8 +427,11 @@ The coordinators of linked projects write to each other and are woken, without t
     holding the project's coordinator grant.
   - **The addressee** is the coordinator role of a project linked with it in a program: the program and its
     areas, either way, or two areas of one program.
-  - You need no right in the other project. Every refusal of the address is the same 404, whether the
-    project does not exist, is not linked, or you cannot read it.
+  - You need no right in the other project, but you must really coordinate your own: an owner or a
+    coordinator, or their agent holding the grant. A web superuser who is only a viewer may not.
+  - Your project must itself name the other one: as its area, as its program, or as an area its own program
+    lists. Every refusal of the address is the same 404, whether the project does not exist, is not linked, or
+    you cannot read it.
 - **Write:**
   - `POST /v1/projects/PROJECT/notes` with `to_project`, `text` (plain text, at most 4,000 characters) and an
     Idempotency-Key.

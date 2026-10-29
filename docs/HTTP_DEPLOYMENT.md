@@ -866,8 +866,11 @@ project linked with it in a program, and the addressed agents are woken.
   - `GET /v1/projects/{id}/notes?box=to|sent&state=all|unsettled` (CAP_COORDINATE, 50 a page);
   - `POST /v1/projects/{id}/notes/{note}/noted`;
   - `GET /v1/me/notes`.
-- **The address:** checked live through both projects' link records. No right in the addressed project is needed,
-  and every refusal is one 404.
+- **The address:** checked live, the sending project's own link records first. A project it does not name is
+  refused before anything of it is read. No right in the addressed project is needed, and every refusal of the
+  address is one 404.
+- **Who:** the sender, the reader and the one who marks a note noted hold the coordinator role or own the project
+  (or are their agent holding the grant). A web superuser who is only a viewer is refused like any viewer.
 - **Bounds:**
   - text 1-4,000 characters of plain text;
   - 30 notes an hour from one project to another, then `429` with Retry-After; only the first 429 in an hour is
