@@ -236,8 +236,11 @@ class HandoverHttpTests(test_coordinator_grant.Grants):
         outsider = self.login('olga', 'olga-password-1')[0]
         real = self.read(outsider)
         missing = self.request('GET', '/v1/projects/proj_missing0000/handover', token=outsider)
-        self.assertEqual((real.status, missing.status), (404, 404))
-        self.assertEqual(real.data['error'], missing.data['error'])
+        usual = self.request('GET', '/v1/projects/%s' % self.project, token=outsider)
+        self.assertEqual((real.status, missing.status, usual.status), (404, 404, 404))
+        # Both equal the project read's own 404, so neither comes from the walkthrough's later member check.
+        self.assertEqual(real.data['error'], usual.data['error'])
+        self.assertEqual(missing.data['error'], usual.data['error'])
 
     def test_only_an_owner_or_a_coordinator_is_offered_the_member_picker(self):
         self.assertEqual(200, self.member('carl', 'coordinator').status)
