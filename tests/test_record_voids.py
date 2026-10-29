@@ -256,14 +256,16 @@ class ReferenceVoidTests(VoidCase):
                                         accepted)
         _, body = rr.acceptance_evidence(bound, 'ref-1', 2, accepted, OPERATOR, at='2026-10-01T12:00:00Z')
         planted = self.native.add_comment('ref-1', body, author='mallory')
-        self.assertEqual(self.accept(2, accepted['sha256'])['revision'], 3)   # the inert copy is ignored
+        self.revise(operation_id='before-void-draft', revision=3, expected_sha256=accepted['sha256'])
+        self.assertEqual(self.accept(3, self.sha(3))['revision'], 4)   # a genuine draft; inert copy ignored
         with self.assertRaisesRegex(ValueError, 'well-formed reference-acceptance record the entry reads'):
             self.void(void_payload('ref-1', legitimate['id'], legitimate['text'], kind='reference-acceptance'))
         self.void(void_payload('ref-1', planted['id'], planted['text'], kind='reference-acceptance'))
         view = self.get()
         self.assertEqual((view['state'], view['acceptance']['decision_id'], view['acceptance_inert']),
                          ('accepted', 'decision-42', False))
-        self.assertEqual(self.accept(3, self.sha(3))['revision'], 4)   # the writer agrees again
+        self.revise(operation_id='after-void-draft', revision=5, expected_sha256=self.sha(4))
+        self.assertEqual(self.accept(5, self.sha(5))['revision'], 6)   # the writer agrees again
 
     def test_an_inert_plant_is_the_voidable_holder_not_the_operators_evidence(self):
         # kittrial-5bb.92 review item 2 (checkpoint `inert-dup-holder`): the plant is
@@ -345,8 +347,9 @@ class ReferenceVoidTests(VoidCase):
         authors = [comment['author'] for comment in self.native.row('ref-1')['comments']
                    if comment['text'].startswith('Kind: reference-acceptance-v1\n')]
         self.assertEqual(authors.count(OPERATOR), 1)
-        # A later accept still reads the ledger: the inert copy is no conflict.
-        self.assertEqual(self.accept(2, self.sha(2))['revision'], 3)
+        # A later genuine pending draft still reads the ledger: the inert copy is no conflict.
+        self.revise(operation_id='later-real-draft', revision=3, expected_sha256=self.sha(2))
+        self.assertEqual(self.accept(3, self.sha(3))['revision'], 4)
 
     def test_a_backdated_holder_makes_the_history_conflicted_and_never_voidable(self):
         # kittrial-5bb.92 item 2: bd orders comments by the stored created_at, which
