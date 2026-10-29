@@ -116,7 +116,8 @@ class CoordinatorGuideTests(unittest.TestCase):
         self.assertNotIn('Claim exactly one', got['guide'])
         steps = [line for line in guide if line and line.split('.', 1)[0].isdigit()]
         self.assertEqual(got['steps'], steps[:len(got['steps'])])
-        self.assertTrue(steps[0].startswith('1. First, check your own setup.'))
+        self.assertTrue(steps[0].startswith('1. On your first run and after a set-up change (not at every run)'))
+        self.assertIn('## Your first check', steps[0])
         self.assertTrue(steps[1].startswith('2. Read GET https://office.example:7443/v1/projects/PROJECT/guidance first.'), 'guidance first, as a worker')
         self.assertEqual('3. ' + got['never'], steps[2][:3 + len(got['never'])])
         # The run order, in the order of the steps' text.
@@ -149,23 +150,37 @@ class CoordinatorGuideTests(unittest.TestCase):
                 'POST https://office.example:7443/v1/projects/PROJECT/tasks/TASK/assign'):
             self.assertIn(text, step)
 
-    def test_coordinator_first_check_uses_setup_certificate_without_revealing_secret(self):
+    def test_step_one_points_to_the_first_check_and_says_when_to_run_it(self):
         step = self.guides("[{ project: 'alpha', effective: true }]")['steps'][0]
         for text in (
-                'curl with -K',
-                'GET https://office.example:7443/v1/projects',
-                'GET https://office.example:7443/v1/service/certificate',
+                'first run',
+                'after a set-up change',
+                'not at every run',
+                '## Your first check',
                 '.orchestra-agent-kestrel.crt',
-                'compare its SHA-256 with the sha256 field',
-                'Confirm your project is listed',
-                'this AGENT.md contains the coordinator section for it',
-                'comment on your most recent task or tell your owner',
-                'Never print, copy or disclose the secret file'):
+                'project membership',
+                'POST https://office.example:7443/v1/agents/me/checks',
+                'Never reveal the secret file',
+                'curl -K'):
             self.assertIn(text, step)
-        self.assertNotIn('Authorization:', step)
+        self.assertNotIn('GET https://office.example:7443/v1/projects', step)
+        self.assertNotIn('GET https://office.example:7443/v1/service/certificate', step)
+        self.assertNotIn('comment on your most recent task', step)
+        self.assertNotIn('tell your owner', step)
+
+    def test_coordinator_step_numbers_include_the_reference_step_and_trouble_step(self):
+        got = self.guides("[{ project: 'alpha', effective: true }]")
+        steps = [line for line in got['guide'].split('\n') if line and line.split('.', 1)[0].isdigit()]
+        self.assertTrue(steps[0].startswith('1. On your first run'))
+        self.assertTrue(steps[1].startswith('2. Read GET https://office.example:7443/v1/projects/PROJECT/guidance first.'))
+        self.assertTrue(steps[8].startswith('9. Approve, not recommend:'))
+        self.assertTrue(steps[9].startswith('10. Requirement records are not work:'))
+        self.assertTrue(steps[10].startswith('11. If a call returns 401'))
+        self.assertEqual('12. Stop and ask your owner if anything is unclear.', steps[11])
 
     def test_coordinator_guide_says_approve_not_recommend(self):
         step = self.guides("[{ project: 'alpha', effective: true }]")['steps'][8]
+        self.assertTrue(step.startswith('9. '))
         for text in ('Approve, not recommend', '(operation: approve)', '(operation: recommend)',
                      'moves a contribution to integration', 'only records an opinion',
                      'approves or requests changes; it does not recommend'):
@@ -173,6 +188,7 @@ class CoordinatorGuideTests(unittest.TestCase):
 
     def test_coordinator_guide_says_requirement_records_are_not_work(self):
         step = self.guides("[{ project: 'alpha', effective: true }]")['steps'][9]
+        self.assertTrue(step.startswith('10. '))
         for text in ('Requirement records are not work', 'never claimed or delivered',
                      'drafted, revised and accepted', 'Requirements page',
                      'My work lists it only while it waits for acceptance',
