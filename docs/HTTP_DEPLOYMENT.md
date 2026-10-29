@@ -810,6 +810,23 @@ page or route that fixes it. It writes nothing, and the page changes nothing its
   - outsiders get `404`;
   - nobody signed in gets `401`.
 
+**The hand-over note** (kittrial-5bb.443): a versioned plain-text note about the project, written for one member.
+- **Routes:**
+  - `PUT /v1/projects/{id}/handover/note` with `{text, for_person}` and an Idempotency-Key: an owner, or the current coordinator (a coordinator person, or an agent holding an effective grant). Answers `201`.
+  - `GET .../handover/note`: any member. Answers the current version and the older ones by number.
+  - `POST .../handover/note/acknowledge` with `{version}`: the person it is for, or their agent holding an effective grant. Only the current version: an older one is `409`.
+- **Bounds:**
+  - text is 1-8,000 characters, by the kit's shared plain-text rule;
+  - `for_person` must be a member;
+  - the last 20 versions are kept, and drops are counted and audited.
+- **Where it shows:**
+  - an unacknowledged note is the first entry of that agent's `GET /v1/agents/me/next` (`kind: handover-note`);
+  - task briefs carry `handover`, a pointer: version, for whom, by whom, when, acknowledged;
+  - the walkthrough shows it as two steps: the note was written, and it was acknowledged;
+  - none of these carries the text.
+- **It is data, not instructions:** a colleague's notes, shown as text.
+- **Storage and backup:** it lives in the web service's state, so the coordination backup's HTTP-state pair carries it, and an older kit restoring that pair ignores it.
+
 ### Creating a project from the web interface
 
 An operator creates a project on the host (`admin.py add-project NAME`) and a superuser

@@ -34,9 +34,12 @@ def agent(ident='agt_1', name='Heron', has=True, last_seen=None, coordinator=Non
             'coordinator': coordinator}
 
 
-def facts(role='coordinator', agents=(), effective_agent=None, viewer_agent=None):
+def facts(role='coordinator', agents=(), effective_agent=None, viewer_agent=None, note=None):
     return {'person': 'u_cora', 'name': 'cora', 'member': True, 'role': role, 'agents': list(agents),
-            'effective_agent': effective_agent, 'viewer_agent': viewer_agent}
+            'effective_agent': effective_agent, 'viewer_agent': viewer_agent, 'note': note}
+
+
+NOTE = {'version': 1, 'written_by_name': 'olive', 'written_at': T0, 'acknowledged': True}
 
 
 def by_id(steps):
@@ -52,9 +55,11 @@ class StepRuleTests(unittest.TestCase):
         return by_id(hs.steps(f, tier=tier, agent_id=agent_id, switches=switches, approval=approval))
 
     def test_the_steps_come_in_order_and_use_only_the_five_states(self):
-        steps = hs.steps(facts(agents=[agent(coordinator=grant(), last_seen=T1)]), tier='owner', switches=ON)
+        steps = hs.steps(facts(agents=[agent(coordinator=grant(), last_seen=T1)], note=NOTE), tier='owner',
+                         switches=ON)
+        # O6 and C3 (the hand-over note) arrived with kittrial-5bb.443.
         self.assertEqual([s['id'] for s in steps], ['role', 'agent', 'grant', 'switches', 'agent-approval',
-                                                     'setup-after-grant'])
+                                                     'handover-note', 'setup-after-grant', 'acknowledge-note'])
         self.assertTrue(all(s['state'] in hs.STATES for s in steps))
         self.assertEqual({s['state'] for s in steps}, {'done'})
 
@@ -149,6 +154,21 @@ class StepRuleTests(unittest.TestCase):
         self.assertEqual(self.read(facts(agents=[agent(coordinator=grant(at=T0), last_seen=None)]))
                          ['setup-after-grant']['state'], 'todo')
 
+    def test_c1_a_grant_and_a_request_in_the_same_second_is_not_after(self):
+        # The stamps are whole seconds: a request in the grant's own second cannot show it came after the grant
+        # (review of kittrial-5bb.442, M8).
+        same = self.read(facts(agents=[agent(coordinator=grant(at=T0), last_seen=T0)]))['setup-after-grant']
+        self.assertEqual(same['state'], 'todo')
+
+    def test_an_agent_asked_for_that_the_reader_cannot_see_gets_one_generic_sentence(self):
+        f = facts(agents=[agent(ident='agt_1', name='Early', has=False), agent(ident='agt_2', name='Heron')])
+        for asked in ('agt_1', 'agt_unknown'):
+            with self.subTest(asked=asked):
+                step = self.read(f, agent_id=asked)['agent']
+                self.assertEqual((step['state'], step['detail']),
+                                 ('hidden', 'The agent asked for is not one you can see in this project.'))
+        self.assertEqual(self.read(f, agent_id='agt_2')['agent']['state'], 'done')
+
     def test_an_unknown_viewer_is_refused(self):
         with self.assertRaises(ValueError):
             hs.steps(facts(), tier='anyone')
@@ -209,6 +229,33 @@ class HandoverHttpTests(test_coordinator_grant.Grants):
         self.create_account(self.admin, 'otis', 'otis-password-1')
         self.assertEqual(404, self.read(self.login('otis', 'otis-password-1')[0]).status)
         self.assertEqual(401, self.read(None).status)
+
+    def test_an_outsider_gets_exactly_the_answer_for_a_project_that_does_not_exist(self):
+        # Review of kittrial-5bb.442, M5b: the route's own project check, not a later one, answers an outsider.
+        self.create_account(self.admin, 'olga', 'olga-password-1')
+        outsider = self.login('olga', 'olga-password-1')[0]
+        real = self.read(outsider)
+        missing = self.request('GET', '/v1/projects/proj_missing0000/handover', token=outsider)
+        self.assertEqual((real.status, missing.status), (404, 404))
+        self.assertEqual(real.data['error'], missing.data['error'])
+
+    def test_only_an_owner_or_a_coordinator_is_offered_the_member_picker(self):
+        self.assertEqual(200, self.member('carl', 'coordinator').status)
+        for token, offered in ((self.tokens['olive'], True), (self.tokens['carl'], True)):
+            self.assertIs(self.steps(token)[1]['can_choose_person'], offered)
+        self.assertEqual(200, self.member('carl', 'contributor').status)
+        self.assertIs(self.steps(self.tokens['carl'])[1]['can_choose_person'], False)
+        self.assertEqual(200, self.grant().status)
+        self.assertIs(self.steps(self.agent)[1]['can_choose_person'], False)
+
+    def test_an_owner_asking_for_an_agent_it_cannot_see_gets_the_generic_sentence(self):
+        _, early_id = self.agent_with_id('cora', 'Kite')         # the fixture gives it the project ...
+        self.assertEqual(200, self.request('PATCH', '/v1/agents/%s' % early_id, {'projects': []},
+                                           token=self.tokens['cora']).status)   # ... and cora takes it away
+        answer = self.read(self.tokens['olive'], self.ids['cora'], agent=early_id)
+        step = {s['id']: s for s in answer.data['steps']}['agent']
+        self.assertEqual(step['detail'], 'The agent asked for is not one you can see in this project.')
+        self.assertNotIn('Kite', json.dumps(answer.data))
 
     def test_an_owner_asking_for_a_non_member_gets_404(self):
         stranger = self.create_account(self.admin, 'nina', 'nina-password-1')
@@ -313,6 +360,25 @@ console.log(JSON.stringify(out));"""
         self.assertEqual((out['switches']['codes'], out['switches']['buttons']), (1, 1))   # a command and its copy
         self.assertEqual(out['role']['scripts'], 0)
         self.assertIn('<img src=x onerror=1>cora', out['role']['text'])
+
+
+    def test_the_member_picker_appears_only_on_the_servers_word(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        import test_http_web
+        code = """await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const ctx={href:(p)=>'#'+p,api:{members:async()=>({items:[{user_id:'u1',display_name:'olive'},{user_id:'u2',display_name:'cora'}]})}};
+const base={person:{id:'u1',name:'olive'}};
+const off=await view.memberPicker(ctx,'pp',Object.assign({can_choose_person:false},base),()=>{});
+const on=await view.memberPicker(ctx,'pp',Object.assign({can_choose_person:true},base),()=>{});
+console.log(JSON.stringify({off:off===null,on:on?on.querySelectorAll('select').length:0}));"""
+        done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web/js/views/handover.js').as_uri(), '{}')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual((out['off'], out['on']), (True, 1))
 
 
 if __name__ == '__main__':

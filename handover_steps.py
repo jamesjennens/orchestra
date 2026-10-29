@@ -1,7 +1,7 @@
 """The steps of handing a project to a coordinator (kittrial-5bb.442).
 
-Slice 2 of docs/design/COORDINATOR_ONBOARDING_DESIGN.md: steps O1-O5 and C1, each checked from facts the
-web service already holds and said in one plain sentence, with the existing page or route that fixes it.
+Slices 2 and 3 of docs/design/COORDINATOR_ONBOARDING_DESIGN.md: steps O1-O6, C1 and C3 (O6 and C3, the
+hand-over note, from kittrial-5bb.443), each checked from facts the web service already holds and said in one plain sentence, with the existing page or route that fixes it.
 Nothing here reads or writes state: the route gathers the facts (``Service.handover_facts`` and the
 switches read) and this module only turns them into steps, masked for the viewer:
 
@@ -92,6 +92,12 @@ def steps(facts, *, tier, agent_id=None, switches=None, approval=None):
     if o1['state'] != 'done':
         o2 = step('agent', 'Their agent has this project', 'waiting', 'Waits for the coordinator role (step 1).',
                   who='person')
+    elif agent_id and agent is None and tier in ('owner', 'self'):
+        # An agent asked for by id that this reader cannot see (another person's, or one without the project for
+        # an owner): one sentence for every such id, so the answer says nothing about which agents exist
+        # (review of kittrial-5bb.442, note 3).
+        o2 = step('agent', 'Their agent has this project', 'hidden',
+                  'The agent asked for is not one you can see in this project.', who='person')
     elif tier == 'coordinator':
         o2 = step('agent', 'Their agent has this project', 'hidden',
                   'Only an owner of this project, or %s, sees their agents here.' % name, who='person')
@@ -170,6 +176,18 @@ def steps(facts, *, tier, agent_id=None, switches=None, approval=None):
     out.append(step('agent-approval', 'Agent approvals', 'done', detail,
                     fix={'page': 'settings', 'route': 'PUT /v1/projects/{pid}/agent-approval'}))
 
+    # O6: the hand-over note (kittrial-5bb.443). Optional: without one the step is todo, never blocking.
+    note = facts.get('note')
+    if note:
+        out.append(step('handover-note', 'Hand-over note', 'done',
+                        '%s wrote a hand-over note for %s (version %d, %s).'
+                        % (note['written_by_name'], 'you' if you else name, note['version'], note['written_at'])))
+    else:
+        out.append(step('handover-note', 'Hand-over note', 'todo',
+                        'No hand-over note was written for %s. The outgoing coordinator or an owner writes one '
+                        'on this page; it is optional and blocks nothing.' % ('you' if you else name),
+                        who='owner', fix={'page': 'handover-note', 'route': 'PUT /v1/projects/{pid}/handover/note'}))
+
     # C1: the agent's folder set up after the grant (it has reached the server since the grant).
     if tier == 'coordinator' or (o3['state'] == 'done' and agent is None):
         c1 = step('setup-after-grant', 'Set up after the grant', 'hidden',
@@ -186,6 +204,20 @@ def steps(facts, *, tier, agent_id=None, switches=None, approval=None):
                   'Open the set-up for %s again now and replace its AGENT.md: it was written before the grant.'
                   % agent['name'], who='person', fix={'page': 'agent-setup', 'route': None})
     out.append(c1)
+
+    # C3: the hand-over note acknowledged by its person or their granted agent (kittrial-5bb.443).
+    if not note:
+        out.append(step('acknowledge-note', 'Acknowledge the hand-over note', 'done',
+                        'There is no hand-over note to acknowledge.'))
+    elif note['acknowledged']:
+        out.append(step('acknowledge-note', 'Acknowledge the hand-over note', 'done',
+                        'Version %d of the hand-over note has been acknowledged.' % note['version']))
+    else:
+        out.append(step('acknowledge-note', 'Acknowledge the hand-over note', 'todo',
+                        ('Read the hand-over note and acknowledge version %d.' if you else
+                         '%s has not yet acknowledged version %%d of the hand-over note.' % name) % note['version'],
+                        who='person', fix={'page': 'handover-note',
+                                           'route': 'POST /v1/projects/{pid}/handover/note/acknowledge'}))
     return out
 
 

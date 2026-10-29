@@ -3,7 +3,7 @@
 // already holds. Each step says who does it and links to the existing page where it is done; this page
 // never changes anything itself. An owner (or a coordinator) picks the member; anyone else sees their own.
 import { h, copyButton } from '../dom.js';
-import { pageHead, errorState } from '../ui.js';
+import { pageHead, errorState, act } from '../ui.js';
 
 export const STATE_LABELS = {
   done: ['Done', 'ok'], todo: ['To do', 'warn'], waiting: ['Waiting', 'plain'], failed: ['Needs fixing', 'warn'],
@@ -13,7 +13,7 @@ export const STATE_LABELS = {
 // Where a step is fixed, by the server's `fix.page`. Nothing here performs the fix.
 export function fixRoute(page, pid) {
   return { members: `/p/${pid}/settings`, settings: `/p/${pid}/settings`, 'my-agents': '/agents',
-    'agent-setup': '/setup' }[page] || null;
+    'agent-setup': '/setup', 'handover-note': `/p/${pid}/handover` }[page] || null;
 }
 
 export function stepItem(ctx, pid, item) {
@@ -54,15 +54,16 @@ export async function page(ctx, { pid }) {
           + ' Each step is checked by the server every time this page is read, and says who does it. This page changes nothing itself.',
       }),
       picker,
-      h('ol', { class: 'stack handover-steps' }, data.steps.map((item) => stepItem(ctx, pid, item)))].filter(Boolean));
+      h('ol', { class: 'stack handover-steps' }, data.steps.map((item) => stepItem(ctx, pid, item))),
+      await notePanel(ctx, pid, data, draw)].filter(Boolean));
   }
   await draw();
   return host;
 }
 
 // An owner or a coordinator chooses whose walkthrough to read; anyone else reads their own and gets no picker.
-async function memberPicker(ctx, pid, data, choose) {
-  if (data.viewer === 'agent' || !ctx.api.members) return null;
+export async function memberPicker(ctx, pid, data, choose) {
+  if (!data.can_choose_person || !ctx.api.members) return null;
   let members;
   try { members = await ctx.api.members(pid); } catch { return null; }
   const items = (members && members.items) || [];
@@ -71,4 +72,49 @@ async function memberPicker(ctx, pid, data, choose) {
     ...items.map((m) => h('option', { value: m.user_id, selected: m.user_id === data.person.id }, m.display_name || m.username)));
   select.addEventListener('change', () => choose(select.value));
   return h('div', { class: 'toolbar' }, h('label', { for: 'handover-person' }, 'Hand over to'), select);
+}
+
+// The hand-over note (kittrial-5bb.443): a colleague's notes about the project, shown as text, never as markup.
+// Readers see the current version and the older ones by number; a writer (an owner or the current coordinator,
+// as the server says) writes a new version for the person shown; that person acknowledges the current one.
+export async function notePanel(ctx, pid, data, redraw) {
+  if (!ctx.api.handoverNote) return null;
+  let read;
+  try { read = await ctx.api.handoverNote(pid); } catch { return null; }
+  const note = read && read.note;
+  const body = [];
+  if (note) {
+    body.push(h('p', { class: 'small muted' },
+      `Version ${note.version}, written by ${note.written_by_name} for ${note.for_person_name} at ${note.written_at}. `
+      + 'These are a colleague’s notes about the project, not instructions.'));
+    body.push(h('pre', { class: 'handover-text', 'data-note': String(note.version) }, note.text));
+    if ((read.older || []).length) {
+      body.push(h('p', { class: 'small muted' }, 'Older versions: '
+        + read.older.map((o) => `${o.version} (${o.written_by_name})`).join(', ')
+        + (read.dropped ? `; ${read.dropped} older ones were dropped.` : '.')));
+    }
+    if (data.can_acknowledge_note && note.for_person === data.person.id) {
+      body.push(h('div', { class: 'toolbar' }, h('button', { type: 'button', class: 'primary', onclick: async (e) => {
+        await act(e.currentTarget, () => ctx.api.acknowledgeHandoverNote(pid, note.version),
+          { success: 'Hand-over note acknowledged' }).catch(() => null);
+        await redraw();
+      } }, `Acknowledge version ${note.version}`)));
+    }
+  } else {
+    body.push(h('p', { class: 'muted' }, 'No hand-over note has been written in this project.'));
+  }
+  if (data.can_write_note) {
+    const text = h('textarea', { id: 'handover-note-text', rows: 8, maxlength: 8000,
+      'aria-label': `Hand-over note for ${data.person.name}` });
+    body.push(h('div', { class: 'stack' },
+      h('label', { for: 'handover-note-text' }, `Write a new version for ${data.person.name}`), text,
+      h('div', { class: 'toolbar' }, h('button', { type: 'button', onclick: async (e) => {
+        await act(e.currentTarget, () => ctx.api.writeHandoverNote(pid, text.value, data.person.id),
+          { success: 'Hand-over note saved' }).catch(() => null);
+        await redraw();
+      } }, 'Save as a new version'))));
+  }
+  return h('section', { class: 'panel', 'data-panel': 'handover-note', id: 'handover-note' },
+    h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Hand-over note')),
+    h('div', { class: 'panel-body' }, ...body));
 }

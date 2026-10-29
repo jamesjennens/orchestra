@@ -3462,8 +3462,164 @@ class Service:
                                'enabled': bool(agent.get('enabled')), 'last_seen_at': agent.get('last_seen_at'),
                                'coordinator': self.coordinator_view(project_id, agent) if has else None})
             effective = next((a['name'] for a in agents if a['coordinator'] and a['coordinator']['effective']), None)
+            note = self._handover_current(project_id)
+            note_view = None
+            if note is not None and note.get('for_person') == person_id:
+                note_view = {'version': note['version'], 'written_by_name': self._owner_name(note['written_by']),
+                             'written_at': note['written_at'], 'acknowledged': bool(note['acknowledged'])}
             return {'person': person_id, 'name': self._owner_name(person_id), 'member': role is not None,
-                    'role': role, 'agents': agents, 'effective_agent': effective, 'viewer_agent': viewer_agent}
+                    'role': role, 'agents': agents, 'effective_agent': effective, 'viewer_agent': viewer_agent,
+                    'note': note_view}
+
+    # -- the hand-over note (kittrial-5bb.443; design COORDINATOR_ONBOARDING_DESIGN §5.2) ---------------------
+    #: A project's hand-over note lives in this service's state, ``handover_notes[project] = {versions: [...],
+    #: dropped}``. The state is copied whole by the coordination backup's HTTP-state pair and put back whole by
+    #: ``admin.py restore-new --restore-http-state``; a kit that does not know the key reads and writes the
+    #: state as before and never looks at it.
+    HANDOVER_TEXT_MAX = 8000
+    HANDOVER_VERSIONS_KEPT = 20
+
+    def _handover_record(self, project_id):
+        """The project's note record, or None; damage reads as None (no readable note), never as a note."""
+        notes = self.state.get('handover_notes')
+        record = notes.get(project_id) if isinstance(notes, dict) else None
+        if not isinstance(record, dict) or not isinstance(record.get('versions'), list):
+            return None
+        good = [v for v in record['versions'] if isinstance(v, dict) and type(v.get('version')) is int
+                and isinstance(v.get('text'), str) and isinstance(v.get('for_person'), str)
+                and isinstance(v.get('written_by'), str) and isinstance(v.get('acknowledged'), list)]
+        return dict(record, versions=good) if good else None
+
+    def _handover_current(self, project_id):
+        record = self._handover_record(project_id)
+        return max(record['versions'], key=lambda v: v['version']) if record else None
+
+    def handover_note(self, project_id):
+        """The project's current note with the list of older versions (number, writer, time; no older text)."""
+        with self.store.lock:
+            record = self._handover_record(project_id)
+            if record is None:
+                return {'project': project_id, 'note': None, 'older': [], 'dropped': 0}
+            current = max(record['versions'], key=lambda v: v['version'])
+            return {'project': project_id, 'note': self._handover_view(current),
+                    'older': [{'version': v['version'], 'written_by_name': self._owner_name(v['written_by']),
+                               'written_at': v.get('written_at')}
+                              for v in sorted(record['versions'], key=lambda v: -v['version']) if v is not current],
+                    'dropped': record.get('dropped') if type(record.get('dropped')) is int else 0}
+
+    def _handover_view(self, version):
+        return {'version': version['version'], 'text': version['text'], 'for_person': version['for_person'],
+                'for_person_name': self._owner_name(version['for_person']),
+                'written_by': version['written_by'], 'written_by_name': self._owner_name(version['written_by']),
+                'written_by_actor': version.get('written_by_actor'), 'written_at': version.get('written_at'),
+                'acknowledged': [dict(a) for a in version['acknowledged'] if isinstance(a, dict)]}
+
+    def handover_pointer(self, project_id):
+        """What a brief or a next action carries: the note's identity and state, never its text."""
+        with self.store.lock:
+            current = self._handover_current(project_id)
+            if current is None:
+                return None
+            return {'version': current['version'], 'for_person': current['for_person'],
+                    'written_by_name': self._owner_name(current['written_by']), 'written_at': current.get('written_at'),
+                    'acknowledged': bool(current['acknowledged'])}
+
+    def handover_notes_to_acknowledge(self, agent_id):
+        """``[(project, pointer)]``: the current notes this agent may acknowledge and has not: notes for its own
+        person, in projects it has, where it holds an effective coordinator grant (the acknowledge rule)."""
+        with self.store.lock:
+            agent = self.state['agents'].get(agent_id) if agent_id else None
+            if not isinstance(agent, dict):
+                return []
+            found = []
+            for project_id in sorted(agent.get('projects') or []):
+                current = self._handover_current(project_id)
+                if current is None or current['for_person'] != agent.get('owner') or current['acknowledged']:
+                    continue
+                grant = self.coordinator_view(project_id, agent)
+                if not (grant and grant['effective']):
+                    continue
+                found.append((project_id, {'version': current['version'], 'for_person': current['for_person'],
+                                           'written_by_name': self._owner_name(current['written_by']),
+                                           'written_at': current.get('written_at'), 'acknowledged': False}))
+            return found
+
+    def write_handover_note(self, principal, project_id, text, for_person):
+        """Write a new version (the route holds CAP_COORDINATE). Returns ``(note view, dropped now)``.
+
+        ``text`` is plain text, 1-8000 characters, by the kit's shared rule; it never starts with a reserved
+        machine-record prefix. ``for_person`` must be a member. Only the last 20 versions are kept: an older
+        one drops off and the record counts how many were dropped (the route audits the count).
+        """
+        from review_workflow import plain_text
+        from reserved_comments import reserved_match
+        if not isinstance(text, str) or not text.strip():
+            raise invalid('A hand-over note must be 1-%d characters of text' % self.HANDOVER_TEXT_MAX)
+        if len(text) > self.HANDOVER_TEXT_MAX:
+            raise invalid('A hand-over note is at most %d characters; this one is %d.'
+                          % (self.HANDOVER_TEXT_MAX, len(text)))
+        try:
+            plain_text(text, 'A hand-over note')
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        if reserved_match(text) is not None:
+            raise invalid('A hand-over note cannot start with a reserved machine-record prefix')
+        if not isinstance(for_person, str) or not for_person:
+            raise invalid('for_person must name a member of this project')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            if (self.state.get('memberships') or {}).get(project_id, {}).get(for_person) is None:
+                raise invalid('for_person must name a member of this project')
+            if 'handover_notes' in self.state and not isinstance(self.state.get('handover_notes'), dict):
+                raise HttpError(503, 'unavailable', 'The record of hand-over notes in the service state is damaged '
+                                '(it is not an object), so nothing was written. An operator must repair the state file')
+            record = self._handover_record(project_id) or {'versions': [], 'dropped': 0}
+            number = max((v['version'] for v in record['versions']), default=0) + 1
+            version = {'version': number, 'text': text, 'for_person': for_person,
+                       'written_by': principal.user_id, 'written_by_actor': principal.actor,
+                       'written_at': now_iso(self._now()), 'acknowledged': []}
+            versions = sorted(record['versions'], key=lambda v: v['version']) + [version]
+            dropped_now = max(0, len(versions) - self.HANDOVER_VERSIONS_KEPT)
+            kept = versions[dropped_now:]
+            dropped = (record.get('dropped') if type(record.get('dropped')) is int else 0) + dropped_now
+            self.state.setdefault('handover_notes', {})[project_id] = {'versions': kept, 'dropped': dropped}
+            self.store.save()
+            return self._handover_view(version), dropped_now
+
+    def acknowledge_handover_note(self, principal, project_id, version):
+        """Acknowledge the CURRENT version: by its person, or by their agent holding an effective grant here.
+
+        An older version is refused (409, naming the current one), so an acknowledgement never lands on text
+        its reader did not see.
+        """
+        if type(version) is not int:
+            raise invalid('version must be the number of the note being acknowledged')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            current = self._handover_current(project_id)
+            if current is None:
+                raise not_found('There is no hand-over note in this project')
+            person = current['for_person']
+            if principal.via == 'credential':
+                agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
+                grant = self.coordinator_view(project_id, agent) if isinstance(agent, dict) else None
+                allowed = (isinstance(agent, dict) and agent.get('owner') == person
+                           and project_id in (agent.get('projects') or []) and bool(grant and grant['effective']))
+            else:
+                allowed = principal.user_id == person
+            if not allowed:
+                raise forbidden('Only the person this hand-over note is for, or their agent holding the '
+                                'coordinator grant here, acknowledges it')
+            if version != current['version']:
+                raise conflict('Version %d is not the current hand-over note; version %d is. Read it, then '
+                               'acknowledge that one.' % (version, current['version']),
+                               {'current_version': current['version']})
+            if not any(a.get('by') == principal.user_id and a.get('actor') == principal.actor
+                       for a in current['acknowledged'] if isinstance(a, dict)):
+                current['acknowledged'].append({'by': principal.user_id, 'actor': principal.actor,
+                                                'at': now_iso(self._now())})
+                self.store.save()
+            return self._handover_view(current)
 
     def _may_coordinate(self, project_id, agent):
         """Whether the agent's account holds the coordinator's capabilities in the project now."""

@@ -495,6 +495,10 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     projectSetup: (pid) => call('GET', `/v1/projects/${pid}/setup`),
     // kittrial-5bb.442: the hand-over walkthrough of one member (their own when person is null).
     projectHandover: (pid, person) => call('GET', `/v1/projects/${pid}/handover`, person ? { params: { person } } : {}),
+    // kittrial-5bb.443: the project's hand-over note: read, write a new version, acknowledge the current one.
+    handoverNote: (pid) => call('GET', `/v1/projects/${pid}/handover/note`),
+    writeHandoverNote: (pid, text, forPerson) => mutate('PUT', `/v1/projects/${pid}/handover/note`, { text, for_person: forPerson }),
+    acknowledgeHandoverNote: (pid, version) => mutate('POST', `/v1/projects/${pid}/handover/note/acknowledge`, { version }),
     mergeSlot: (pid) => call('GET', `/v1/projects/${pid}/merge-slot`),
     acquireMergeSlot: (pid, task_id, target) => mutate('POST', `/v1/projects/${pid}/merge-slot/acquire`, { task_id, target }),
     releaseMergeSlot: (pid) => mutate('POST', `/v1/projects/${pid}/merge-slot/release`, {}),
