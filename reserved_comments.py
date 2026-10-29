@@ -239,6 +239,14 @@ TASK_FILE_WITHDRAWN_PREFIX = 'Kind: task-file-withdrawn-v1\n'
 # entry (``<project>/.delegations/``), so one planted where the prefix is not reserved (an
 # older kit) grants nothing. Not a record-anchor family: every surface reads it as a comment.
 DELEGATION_PREFIX = 'Kind: delegation-v1\n'
+# kittrial-5bb.418 (TRACEABILITY_DESIGN §5.1 step 2). The index of a design document, derived by
+# the server from the stored bytes and written by the propose or revise of a design.<scope>
+# reference entry (design_documents). Reserved, every version, so no raw `comments add` can plant
+# one; acceptance re-derives it from the bytes and refuses when a differing one is on the anchor.
+DESIGN_INDEX_PREFIX = 'Kind: design-index-v1\n'
+# kittrial-5bb.418 part 2. A `trace --verify` report on a design document (design_documents). Written
+# only by `ref verify` (unverified) or `admin.py design-verify` (trusted); reserved in every version.
+DESIGN_VERIFICATION_PREFIX = 'Kind: design-verification-v1\n'
 
 RESERVED = (
     (TASK_ASSIGNMENT_PREFIX, 'task assignment notice', 'the dedicated coordinate assignment operation'),
@@ -282,6 +290,10 @@ RESERVED = (
     (DELEGATION_PREFIX, 'delegation record',
      "the delegations route (a person owner's web session) or admin.py delegation-record on the "
      'coordination host'),
+    (DESIGN_INDEX_PREFIX, 'design document index',
+     'ref propose|revise of a design.<scope> entry with its document (the server writes the index)'),
+    (DESIGN_VERIFICATION_PREFIX, 'design document verification',
+     'trace --verify --record (ref verify) or admin.py design-verify on the coordination host'),
 )
 
 PREFIXES = tuple(prefix for prefix, _, _ in RESERVED)
@@ -942,7 +954,8 @@ RECORD_ANCHOR_LABELS = frozenset(RECORD_ANCHOR_FAMILIES)
 RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: proposal-disposition-', 'Kind: contribution-settings-',
                            'Kind: capability-', 'Kind: open-item-', 'Kind: item-resolution-',
-                           'Kind: owner-answer-', 'Kind: coordinator-decision-')
+                           'Kind: owner-answer-', 'Kind: coordinator-decision-', 'Kind: design-index-',
+                           'Kind: design-verification-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
 SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3)})
@@ -1984,6 +1997,15 @@ def reserved_match(body):
         if versioned:
             kind, operation = _RECORD_KIND_RESERVATIONS[versioned.group(1)]
             return (versioned.group(0), kind, operation)
+        # A lookalike of a record family that carries no version line (`Kind: owner-answer-v1`
+        # without its newline, `-vx`, `-v1x`) is hidden from history by is_record_comment, so the
+        # raw write is refused as well: one family list for both (kittrial-5bb.171 item 3).
+        for family in RECORD_COMMENT_FAMILIES:
+            if view.startswith(family):
+                key = next((k for k in _RECORD_KIND_RESERVATIONS if ('Kind: %s-' % k).startswith(family)
+                            or family.startswith('Kind: %s-' % k)), None)
+                kind, operation = _RECORD_KIND_RESERVATIONS[key]
+                return (family, kind, operation)
     return None
 
 

@@ -15,6 +15,8 @@ import * as setup from './views/setup.js';
 import * as how from './views/how.js';
 import * as rooms from './views/rooms.js';
 import * as releases from './views/releases.js';
+import * as designs from './views/designs.js';
+import * as trace from './views/trace.js';
 
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
@@ -24,6 +26,7 @@ const VIEWS = {
   lanes: project.lanesPage,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
   records: records.page, referenceRecord: records.referencePage, capabilityRecord: records.capabilityPage,
+  designPage: designs.page, tracePage: trace.page,
   rooms: rooms.list, room: rooms.detail,
   users: admin.users, account: admin.account,
 };

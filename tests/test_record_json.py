@@ -188,88 +188,46 @@ class NoUnguardedParseTests(unittest.TestCase):
 
     ALLOWED = {
         'activity.py': (2, "the tracker export, and a cursor file on the caller's own machine"),
-        'admin.py': (26, 'bd output and files on the coordination host, in operator commands; the export row reads '
-                         'of credential-actors (kittrial-5bb.184) and adopt-actor\'s tracker check (kittrial-5bb.194 '
-                         'revision 2) go through record_json.loads_rows (kittrial-5bb.221 revision 2): rows nested '
-                         'to 750 read normally and any unreadable row fails the read as a whole; two more '
-                         '(kittrial-5bb.202) read a project\'s .beads/metadata.json and one bd merge-slot check '
-                         'answer in project_merge_slot_state, whose caller catches OSError/ValueError itself; the '
-                         'twenty-sixth (kittrial-5bb.343) reads one .assignee-followons entry before its own '
-                         'validator checks it, exactly as the .integration-reverts entry beside it is read'),
-        'artifacts.py': (1, 'the artifact index the kit writes'),
+        'admin.py': (25, 'bd output and host files whose validators or callers preserve their established error classifications'),
         'bootstrap.py': (2, 'bd output on the host'),
         'bd_refusals.py': (1, "bd's own answer to one command; it catches RecursionError itself"),
-        'briefing.py': (3, 'bd comment-write receipt and the snapshot files the kit writes; exports use the guard'),
+        'briefing.py': (1, 'bd comment-write receipt; history snapshots use the guard'),
         'capabilities.py': (1, "a graph.json in the caller's own checkout; it catches RecursionError itself"),
         'capability_misses.py': (1, 'the telemetry file the kit writes; any failure starts a new log'),
-        'claiming.py': (2, 'the project\'s own .claiming.json, written by this kit on the coordination host; '
-                           'a damaged, unreadable or nested file is caught and read as the restrictive '
-                           '\'assigned\' value with a warning (kittrial-5bb.352), never as a crash or the '
-                           'permissive default'),
-        'client.py': (16, "the endpoint's own answer, on the caller's machine, and the --config it reads there; "
-                         'kittrial-5bb.285 added the wait read\'s answer from the endpoint (and wait\'s --config read, '
-                         'which kittrial-5bb.373 merged with main()\'s --config read into one parse after delivery; '
-                         "neither is a record comment or a caller's payload). The twelfth (kittrial-5bb.327 "
-                         "review 2) is the wait's own small state file: text this client wrote beside its config, "
-                         'read at most 64 KiB at a time and any unreadable, nested or corrupt value is caught and '
-                         'treated as absent. The last three (kittrial-5bb.384) are the `files` command\'s reads of the endpoint\'s own answer line '
-                         'and of the file record inside it, on the caller\'s machine; kittrial-5bb.402 adds the '
-                         'validate command\'s read of the endpoint\'s validation result'),
+        'claiming.py': (2, 'the project\'s own .claiming.json, with damaged or unreadable files failing closed'),
+        'client.py': (18, "the endpoint's own answer and client-local configuration, state, attachment and trace answer records"),
         'coordination.py': (7, 'bd output'),
-        'endpoint.py': (6, 'bd output, and the project\'s .beads/metadata.json whose Dolt server coordinates '
-                           'guard bd (kittrial-5bb.202 rev-3 item 2; the file is the host\'s own); the sixth '
-                           'is the claim guard\'s read of the other ends of a blocking dependency '
-                           '(kittrial-5bb.293 rev5), parsed inside a try that turns unreadable bd output '
-                           'into fail-closed refusal rather than a crash'),
-        'export_requirements.py': (3, 'offline native export rows are first parsed through the row guard '
-                                  '(750 levels), then reparsed with duplicate-field refusal; syntax checking '
-                                  'of a malformed row runs only within the same bound and catches parser '
-                                  'recursion; the iterative identity scanner parses single string literals '
-                                  'only. Reserved revision comments still use the 64-level record guard'),
-        'handoff.py': (15, 'bd output and the request, receipt and recovery files the kit writes'),
+        'endpoint.py': (6, 'bd output, host tracker metadata, and the fail-closed dependency guard'),
+        'export_requirements.py': (3, 'offline native export rows use bounded parsing before duplicate-field refusal'),
+        'handoff.py': (6, 'bd output; request, receipt and recovery files use the guard'),
         'http_auth.py': (3, "the service's own store"),
         'http_authority.py': (3, "the service's own store and journal"),
-        'http_client.py': (3, "the service's answer, a body typed on the caller's own machine, and a lifecycle file after its standalone 64-level/size/duplicate-field guard"),
-        'http_service.py': (6, "the endpoint's answer to the service, and host configuration; since kittrial-5bb.169 the "
-                               "answer is parsed in _parse_native only when record_json.nesting has counted it within "
-                               "ROW_NESTING_MAX (one call), each row of a deeper answer in _row under the same count (one "
-                               "call), and _row_id parses single string literals (one call)"),
+        'http_client.py': (3, "the service's answer and caller-local input"),
+        'http_service.py': (6, "the endpoint's answer and host configuration with bounded native parsing"),
         'keyed_records.py': (2, 'bd output'),
-        'lane_state.py': (1, 'bd output (the receipt of the comments add that published the reserved '
-                             'lane-state record; the record body itself is read through record_json.loads)'),
-        'lifecycle.py': (3, "bd output, plus the endpoint's release-query and group answers on the caller's machine (kittrial-5bb.107 rev3)"),
-        'lifecycle_voids.py': (1, 'the bd comments-add receipt; native record bodies and bounded host journal files use the guard'),
+        'lane_state.py': (1, 'bd output'),
+        'lifecycle.py': (4, "bd output, endpoint answers, and installed tracker metadata for a host journal"),
+        'lifecycle_voids.py': (1, 'the bd comments-add receipt'),
         'native.py': (2, 'bd output'),
         'office_service.py': (1, 'host configuration'),
-        'proposal_records.py': (4, 'bd output, the host session file, and a copy of a structure the kit built'),
+        'proposal_records.py': (3, 'bd output and a copy of a structure the kit built; host journals use the guard'),
         'record_json.py': (3, 'the guard itself, row-level parsing, and iterative array decoding'),
         'reference_records.py': (2, 'bd output'),
-        'project_creation.py': (2, 'the creation record and the failure note the kit writes on the coordination host; a note that cannot be parsed, however deep, is ignored'),
-        'review_recommendations.py': (1, 'bd output (the answer of comments add)'),
-        'review_workflow.py': (4, 'bd output and the revert journal the kit writes'),
-        'sessions.py': (1, 'the session registry the kit writes in read_registry (which turns a '
-                           'damaged or nested file into one plain sentence; kittrial-5bb.194 revision 2 made '
-                           'execute read through it)'),
-        'ssh_forced_command.py': (1, "one installation setting read from the runtime's own "
-                                     'deployment.private.json (kittrial-5bb.196): the wrapper cannot import the kit '
-                                     '(it must start on any interpreter the account has), so it reads that '
-                                     'host-written file itself and refuses a file it cannot read, a deeply nested '
-                                     'one included'),
+        'review_recommendations.py': (1, 'bd output'),
+        'review_workflow.py': (3, 'bd output; the revert journal uses the guard'),
+        'sessions.py': (1, 'the session registry, with one sanitized unreadable-file error'),
+        'ssh_forced_command.py': (1, "the runtime's bounded installation setting"),
         'version.py': (1, "the kit's own version file"),
-        'wake_log.py': (2, 'the bounded empty-wake host log this kit writes (kittrial-5bb.397): '
-                          'the audit is read one line at a time, at most 32 KiB, and a damaged line '
-                          'is skipped rather than raised into a wait; the .last.json snapshot is the '
-                          'kit\'s own small state, at most 64 KiB, and an unreadable, nested or corrupt '
-                          'value is caught and treated as no remembered rows'),
-        'waiting.py': (1, "the wait's own small state file beside the caller's config (kittrial-5bb.327 "
-                          'review 2): text this kit wrote, read at most 64 KiB at a time, and any unreadable, '
-                          'nested or corrupt value is caught and treated as absent'),
-        'work.py': (1, 'the request files the kit writes'),
+        'wake_log.py': (2, 'the bounded empty-wake host log and snapshot'),
+        'waiting.py': (1, "the wait's client-local state file"),
         'worker.py': (2, "the endpoint's answer, on the caller's machine"),
         'worker_gate.py': (1, "the endpoint's answer, on the caller's machine"),
     }
     # Files that parse text somebody else wrote, and have no bare json.loads at all.
-    GUARDED_ONLY = ('capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py', 'keyed_entries.py', 'recovery.py', 'requirement_baseline_records.py', 'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py', 'delegations.py')
+    GUARDED_ONLY = ('artifacts.py', 'capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py',
+                    'keyed_entries.py', 'project_creation.py', 'recovery.py', 'requirement_baseline_records.py',
+                    'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py',
+                    'delegations.py', 'work.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -319,7 +277,11 @@ class NoUnguardedParseTests(unittest.TestCase):
             # crashing the copy out of the guard.
             # The twelfth (kittrial-5bb.407) reads a `.delegations` journal entry for a backup:
             # a host file, but one a damaged or nested copy must refuse, never traceback.
-            'admin.py': 12,
+            # The thirteenth (kittrial-5bb.171) is read_sidecar_json: the depth bound, not the
+            # interpreter's recursion limit, decides whether a nested sidecar reads.
+            # The fourteenth (kittrial-5bb.426) reads deployment.private.json from the same
+            # checked descriptor, with a damaged or nested document reading as a configuration fault.
+            'admin.py': 14,
             # D2: bounded native history, review VOID and preserved target payload.
             'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
@@ -363,57 +325,24 @@ class NoUnguardedParseTests(unittest.TestCase):
             # endpoint.py (kittrial-5bb.384): the framed task-file header line, and the request text read
             # whole (the same guarded parse the old reader made, now in two places: a pipe and a text stream).
             'task_files.py': 9,
-            'briefing.py': 3, 'coordination.py': 3, 'endpoint.py': 16, 'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
-            # Requirements request bodies use the guard and reject duplicate fields.
-            # lane_state.py reads the body of a reserved Kind: lane-state-v1 record comment
-            # (kittrial-5bb.263): any actor's comments can carry one, so it is parsed through
-            # the guard and a nested body is dropped as an unusable record.
-            # http_authority reads the operation of an attached review record through the guard,
-            # exactly as work.py does, to know which capability the request needs (kittrial-5bb.261).
-            # lifecycle.py also guards exported correction payloads in its offline reader.
-            'handoff.py': 1, 'http_authority.py': 1, 'http_service.py': 4, 'lane_state.py': 1, 'lifecycle.py': 2, 'recovery.py': 1, 'requirements.py': 1, 'requirement_records.py': 1, 'reserved_comments.py': 1,
-            # The simple owner adapter guards bd's decision-create receipt too. The third
-            # (kittrial-5bb.388) guards the service-only room-decision payload the route
-            # transports (room, item number, title, text and pointer) before it is used.
+            'artifacts.py': 1, 'briefing.py': 4, 'coordination.py': 4, 'endpoint.py': 16,
+            'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            'handoff.py': 2, 'http_authority.py': 1, 'http_service.py': 5, 'keyed_records.py': 1,
+            'lane_state.py': 1, 'lifecycle.py': 2, 'project_creation.py': 1, 'proposal_records.py': 1,
+            'recovery.py': 1, 'requirements.py': 1, 'requirement_governance.py': 1, 'requirement_records.py': 1,
+            'reserved_comments.py': 1,
             'requirement_http.py': 3,
-            # Assignment adds closed roster/request payloads at the endpoint and
-            # guards both its native task reply and its reserved notice body.
             'task_assignment.py': 2,
-            # B2 frozen snapshot bytes and sidecar records are bounded untrusted
-            # text, parsed through the nesting guard with duplicate-key refusal.
             'requirement_baseline_records.py': 1, 'requirement_baselines.py': 1,
-
-            # Service-only guidance bodies are caller text, parsed through the nesting guard.
             'web_guidance.py': 2,
-            'web_merge_slot.py': 4,
-            # office_service.py (kittrial-5bb.168 review item 2) reads the /healthz answer of
-            # whatever holds the port through the guard, not bare json.loads: the mark check
-            # exists because that answer may come from another program, and a deeply nested one
-            # must read as "not this service" rather than raising RecursionError. The answer is
-            # cut to 2000 bytes first.
+            'web_merge_slot.py': 5,
             'office_service.py': 1,
-            # Lifecycle host entry and restore identity are bounded untrusted text.
             'web_lifecycle_marks.py': 2,
-            # F0: bounded host entries/restore marker and native correction/comment
-            # bodies use the guard; none is trusted merely because it parses. The
-            # abandonment target lookup (kittrial-5bb.271) adds one more: the retained
-            # payload of a cut native correction comment the operator names. The
-            # abandonment store beside the family (kittrial-5bb.271 item 1) is read
-            # through the guard as well, so a deeply nested store is a refusal.
             'lifecycle_voids.py': 7,
-            # kittrial-5bb.343: followon.py parses the reserved record body carried by any
-            # actor's comment, its host journal entry files and the bd comments-add
-            # receipts of both writes through the guard (four).
             'followon.py': 4,
-            # kittrial-5bb.398: fault_clear.py parses the reserved clear body, its journal entry
-            # files and the bd comments-add receipt through the guard (three).
             'fault_clear.py': 3,
-            # kittrial-5bb.407: delegations.py parses the reserved delegation body carried by any
-            # actor's comment, its host journal entry files and the bd create and comments-add
-            # receipts through the guard (four). endpoint.py's sixteenth is the delegation
-            # request the web service sends.
             'delegations.py': 4,
-            'review_recommendations.py': 2, 'review_workflow.py': 4, 'work.py': 1, 'worker_gate.py': 1})
+            'review_recommendations.py': 2, 'review_workflow.py': 5, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):
         # Review of 7c14f6a: the capability and proposal record parsers, and load_json.

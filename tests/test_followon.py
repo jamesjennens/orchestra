@@ -7,6 +7,8 @@ coordinator's own ``superseded`` disposition rather than a second direction.
 """
 import copy
 import json
+import os
+import signal
 import sys
 import tempfile
 import types
@@ -66,6 +68,26 @@ def issue(comments, status='in_progress'):
 
 def record_comment(cid='fo1', value=None):
     return comment(cid, followon.body(value or payload()))
+
+
+class BlockingReadTimeout(Exception):
+    pass
+
+
+def bounded(call):
+    previous = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(BlockingReadTimeout()))
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def make_fifo(case, path):
+    if not hasattr(os, 'mkfifo'):
+        case.skipTest('mkfifo is unavailable')
+    os.mkfifo(path)
 
 
 class FollowonValidationTests(unittest.TestCase):
@@ -199,6 +221,23 @@ class FollowonJournalTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.project = Path(self.temp.name)
+
+    def test_regular_file_host_journal_missing_damaged_and_valid_classifications(self):
+        self.assertEqual(({}, []), followon.host_journal(self.project))
+        entry = followon.journal_entry(payload(), 'fo1', COORD, 0)
+        path = followon.publish(self.project, entry)
+        self.assertEqual(({'fo1': entry}, []), followon.host_journal(self.project))
+        path.write_text('{bad', encoding='utf-8')
+        self.assertEqual(({}, [followon.JOURNAL_DIR + '/' + path.name]),
+                         followon.host_journal(self.project))
+
+    def test_fifo_host_journal_never_blocks_and_is_invalid(self):
+        entry = followon.journal_entry(payload(), 'fo1', COORD, 0)
+        path = followon.publish(self.project, entry)
+        path.unlink()
+        make_fifo(self, path)
+        self.assertEqual(({}, [followon.JOURNAL_DIR + '/' + path.name]),
+                         bounded(lambda: followon.host_journal(self.project)))
 
     def test_the_entry_name_is_the_canonical_payload_digest_and_the_path_is_checked(self):
         value = payload()

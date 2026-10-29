@@ -66,7 +66,10 @@ class RulesHelpers:
     # -- helpers ---------------------------------------------------------------
     def deployment(self, operators=None, **rules):
         document = json.loads((self.root / 'deployment.private.json').read_text(encoding='utf-8'))
-        for key in ('lifecycle_authors', 'independent_approval', 'coordinator_writes'):
+        # The installation switches too (1024s): a test that turned one on must not leak it into the next test
+        # on this shared runtime (kittrial-5bb.434's switches read saw review_workflow_writes left on).
+        for key in ('lifecycle_authors', 'independent_approval', 'coordinator_writes',
+                    'review_workflow_writes', 'checkpoint_provenance_writes', 'web_lifecycle_mark_writes'):
             document.pop(key, None)
         document.update(rules)
         document['operators'] = ['ops'] if operators is None else operators

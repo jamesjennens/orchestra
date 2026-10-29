@@ -28,7 +28,8 @@ def install(root, asset_dir=None):
         receipt=root/'bin'/(name+'.receipt.json')
         if dest.exists():
             if not receipt.exists(): raise SystemExit(f'Refusing to replace unmanaged binary: {dest}; discard this deployment root and prepare a new one')
-            old=json.loads(receipt.read_text())
+            from regular_file import read_regular_text
+            old=json.loads(read_regular_text(receipt))
             kept=[key for key,pin in pins.items() if pin['sha256']==old['archive_sha256']]
             if not kept or hashlib.sha256(dest.read_bytes()).hexdigest()!=old['binary_sha256']:
                 raise SystemExit(f'Binary/pin mismatch; use a new deployment root for upgrade: {dest}')

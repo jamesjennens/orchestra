@@ -2303,9 +2303,13 @@ console.log(JSON.stringify({
             'workerPreselected',
             # kittrial-5bb.387: an agent with an effective coordinator grant.
             'coordinatorHasNoRoleChoice',
+            'coordinatorRoleKeepsGrantLocation',
             'coordinatorRoleNotSaved',
             'coordinatorRoleScreen',
+            'coordinatorSetupHintAbsentWithGrant',
+            'coordinatorSetupHintPresentWithoutGrant',
             'noEffectGrantIsAWorker',
+            'noEffectGrantShowsCoordinatorHint',
         }, set(observed))
 
 

@@ -161,6 +161,66 @@ def next_actor(state, assignee=None, closed=False, pending_items=0, claimable=No
     return 'unknown'
 
 
+#: Open review items a sentence names before "and N more" (kittrial-5bb.431).
+OPEN_ITEM_IDS_SHOWN = 5
+#: Open review items a structured list carries: the record's own ceiling (review_workflow, 20).
+OPEN_ITEMS_MAX = 20
+
+
+def open_review_items(pending):
+    """The blocking review items still open, as ``[{request, item, contribution}]`` in filing order.
+
+    ``pending`` is the projection's ``pending_requests``. Only a ``respond`` record answers one: a new
+    revision or a plain comment leaves it open (kittrial-5bb.431). A note is never in it (the projection
+    keeps notes apart, review_workflow.py ``notes``), so it is never listed. Bounded to
+    :data:`OPEN_ITEMS_MAX`.
+    """
+    found = []
+    for entry in pending or []:
+        if not isinstance(entry, dict):
+            continue
+        found.append({'request': str(entry.get('request')), 'item': str(entry.get('item')),
+                      'contribution': entry.get('contribution')})
+    return found[:OPEN_ITEMS_MAX]
+
+
+def respond_way(task, route=None):
+    """How the caller answers an open item: the client command, or over HTTP the route (never the command)."""
+    if route is None:
+        return 'a respond record (`review %s --file respond.json`, operation respond)' % task
+    return 'a respond record (POST `%s/reviews`, operation respond)' % route
+
+
+def _by_request(items):
+    grouped = {}
+    for entry in items:
+        grouped.setdefault(entry['request'], []).append(entry['item'])
+    return grouped
+
+
+def open_items_warnings(items, task, route=None):
+    """One plain warning per request whose items a new revision left open (advice, never a refusal)."""
+    warnings = []
+    for request, ids in _by_request(items).items():
+        one = len(ids) == 1
+        warnings.append('%d %s of request %s %s still open (%s): a new revision does not answer them; '
+                        'answer each with %s.' % (len(ids), 'item' if one else 'items', request,
+                                                   'is' if one else 'are', ', '.join(ids),
+                                                   respond_way(task, route)))
+    return warnings
+
+
+def open_items_sentence(items, task, route=None):
+    """The open item ids and how to answer them, for the work row's and the brief's next step ('' if none)."""
+    if not items:
+        return ''
+    shown = _by_request(items[:OPEN_ITEM_IDS_SHOWN])
+    named = '; '.join('%s of request %s' % (', '.join(ids), request) for request, ids in shown.items())
+    more = len(items) - min(len(items), OPEN_ITEM_IDS_SHOWN)
+    return 'Open: %s%s. Answer each with %s.' % (named, ' and %d more' % more if more else '',
+                                                  respond_way(task, route))
+
+
 def reconciliation(result, scopes=None):
     """``{'needed', 'reasons'}``: recorded evidence that must be reconciled first.
 

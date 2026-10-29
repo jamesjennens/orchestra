@@ -42,12 +42,28 @@ assert.equal(calls.length, 15);
 
 // 3. Render the Records page (`page`) and verify waiting queue + two-step badge
 const navigated = [];
+const assertRecordsBreadcrumb = (dom, page) => {
+  const nav = dom.all((e) => e.attributes['aria-label'] === 'Breadcrumb')[0];
+  assert.ok(nav, `${page} should render the breadcrumb navigation`);
+  assert.equal(nav.textContent, 'Records', `${page} should render the Records breadcrumb`);
+  const link = nav.all((e) => e.tagName === 'A')[0];
+  assert.ok(link, `${page} should render the Records breadcrumb as a link`);
+  assert.equal(link.attributes.href, '/p/pp/records');
+};
+const assertLede = (dom, expected, page) => {
+  const ledes = dom.all((e) => e.tagName === 'P' && e.className === 'lede');
+  assert.equal(ledes.length, 1, `${page} should render one lede`);
+  assert.equal(ledes[0].textContent, expected, `${page} should render the expected lede`);
+};
 const app = {
   navigate: (url) => navigated.push(url),
+  projects: [{ id: 'pp', name: 'Test Project' }],
   api: {
     project: async (pid) => ({ id: pid, name: 'Test Project', role: 'coordinator' }),
+    coordination: async (_pid) => ({ people: [{ display_name: 'Dana', disabled: false }], holds: true }),
+    delegations: async (_pid) => ({ names: {}, granted_agents: [], items: [] }),
     references: async (_pid, query) => {
-      if (query && query.waiting === 'true') {
+      if (query && (query.waiting === 'true' || query.waiting === 1)) {
         return {
           items: [
             {
@@ -56,8 +72,12 @@ const app = {
               state: 'accepted',
               waiting_acceptance: true,
               proposed_by: 'usr_1111111111111111',
-              record: { revision: 2, title: 'Kit Guide', summary: 'Accepted v2', kind: 'runbook', scope: 'project' },
-              proposed: { revision: 3, title: 'Kit Guide v3', summary: 'Revised draft v3', kind: 'runbook', scope: 'project' },
+              record: { revision: 2, title: 'Kit Guide', summary: 'Accepted v2', kind: 'runbook', scope: 'project', authority: { type: 'repo-path', path: 'docs/OLD.md', commit: 'b'.repeat(40) } },
+              proposed: { revision: 3, title: 'Kit Guide v3', summary: 'Revised draft v3', kind: 'runbook', scope: 'project', authority: { type: 'attestation', basis: 'host-check', by: 'person:maintainer', observed: '2026-10-25', how: 'Checked the board.' } },
+              proposed_authority: { type: 'attestation', basis: 'host-check', by: 'person:maintainer', observed: '2026-10-25', how: 'Checked the board.' },
+              authority: { type: 'attestation', basis: 'host-check', by: 'person:maintainer', observed: '2026-10-25', how: 'Checked the board.' },
+              viewer_may_accept: true,
+              viewer_may_accept_reason: '',
             },
           ],
           can_propose: true,
@@ -72,8 +92,12 @@ const app = {
             state: 'accepted',
             waiting_acceptance: true,
             proposed_by: 'usr_1111111111111111',
-            record: { revision: 2, title: 'Kit Guide', summary: 'Accepted v2', kind: 'runbook', scope: 'project', Pointers: ['docs/OPERATIONS.md'] },
-            proposed: { revision: 3, title: 'Kit Guide v3', summary: 'Revised draft v3', kind: 'runbook', scope: 'project', Pointers: ['docs/OPERATIONS.md'] },
+            record: { revision: 2, title: 'Kit Guide', summary: 'Accepted v2', kind: 'runbook', scope: 'project', Pointers: ['docs/OPERATIONS.md'], authority: { type: 'repo-path', path: 'docs/OLD.md', commit: 'b'.repeat(40) } },
+            proposed: { revision: 3, title: 'Kit Guide v3', summary: 'Revised draft v3', kind: 'runbook', scope: 'project', Pointers: ['docs/OPERATIONS.md'], authority: { type: 'attestation', basis: 'host-check', by: 'person:maintainer', observed: '2026-10-25', how: 'Checked the board.' } },
+            proposed_authority: { type: 'attestation', basis: 'host-check', by: 'person:maintainer', observed: '2026-10-25', how: 'Checked the board.' },
+            authority: { type: 'attestation', basis: 'host-check', by: 'person:maintainer', observed: '2026-10-25', how: 'Checked the board.' },
+            viewer_may_accept: true,
+            viewer_may_accept_reason: '',
           },
         ],
         can_propose: true,
@@ -81,7 +105,7 @@ const app = {
       };
     },
     capabilities: async (_pid, query) => {
-      if (query && query.waiting === 'true') {
+      if (query && (query.waiting === 'true' || query.waiting === 1)) {
         return {
           items: [
             {
@@ -93,6 +117,8 @@ const app = {
               verification_state: 'unverified',
               record: null,
               proposed: { revision: 1, title: 'Web Sync', summary: 'Draft cap', kind: 'workflow', scope: 'project' },
+              viewer_may_accept: false,
+              viewer_may_accept_reason: 'Only the project coordinator may accept.',
             },
           ],
           can_propose: true,
@@ -110,6 +136,8 @@ const app = {
             verification_state: 'unverified',
             record: null,
             proposed: { revision: 1, title: 'Web Sync', summary: 'Draft cap', kind: 'workflow', scope: 'project', points_to: ['http_service.py'] },
+            viewer_may_accept: true,
+            viewer_may_accept_reason: '',
           },
         ],
         can_propose: true,
@@ -120,11 +148,45 @@ const app = {
 };
 
 const recordsDom = await page(app, { pid: 'pp' });
+await new Promise((resolve) => setTimeout(resolve, 0));
+await new Promise((resolve) => setTimeout(resolve, 0));
+assertLede(recordsDom, 'Test Project · Reference catalog & capability registry', 'Records page');
 assert.ok(recordsDom.textContent.includes('Waiting to be accepted'));
 assert.ok(recordsDom.textContent.includes('2 waiting'));
 assert.ok(recordsDom.textContent.includes('Accepted rev 2 · Draft rev 3 waiting'));
 assert.ok(recordsDom.textContent.includes('kit.guide'));
 assert.ok(recordsDom.textContent.includes('records.web-sync'));
+// Slice 4 (kittrial-5bb.420): the button follows ONLY the server's viewer_may_accept,
+// the authority cell reads the draft's authority, and propose forms sit folded.
+assert.ok(recordsDom.textContent.includes('Who acts'));
+assert.ok(recordsDom.textContent.includes('Who accepts here:'));
+assert.ok(recordsDom.textContent.includes('Dana'));
+assert.ok(recordsDom.textContent.includes('Review & accept'));
+const refRow = recordsDom.all((e) => e.attributes['data-reference-row'] === 'kit.guide')[0];
+assert.ok(refRow, 'waiting draft kit.guide renders in the catalog');
+assert.ok(refRow.textContent.includes('attestation (host-check)'),
+  'catalog authority cell prints the waiting draft attestation, not the old accepted authority');
+const acceptButtons = recordsDom.all((e) => e.tagName === 'A' && e.textContent === 'Review & accept');
+assert.ok(acceptButtons.length >= 1, `expected gated Review & accept links, saw ${acceptButtons.length}`);
+const viewButtons = recordsDom.all((e) => e.tagName === 'A' && e.textContent === 'View');
+assert.ok(viewButtons.length >= 1, `expected a View link where the server says the reader may not act, saw ${viewButtons.length}`);
+const whoCells = recordsDom.all((e) => e.className.split(/\s+/).includes('who-acts'));
+assert.ok(whoCells.length >= 2, `expected Who acts cells, saw ${whoCells.length}`);
+const proposeFold = recordsDom.all((e) => e.attributes['data-propose-fold'] === '1')[0];
+assert.ok(proposeFold, 'propose forms fold behind details.fold');
+const acceptedPanel = recordsDom.all((e) => e.attributes['data-accepted-records'] === '1')[0];
+assert.ok(acceptedPanel, 'single Accepted records panel with the kind filter');
+const kindFilter = recordsDom.all((e) => e.attributes['data-accepted-kind-filter'] === '1')[0];
+assert.ok(kindFilter, 'kind filter for the accepted list');
+assert.equal(kindFilter.all((e) => e.tagName === 'BUTTON').length, 3);
+
+const recordsErrorApp = {
+  ...app,
+  api: { ...app.api, references: async () => { throw new Error('records unavailable'); } },
+};
+const recordsErrorDom = await page(recordsErrorApp, { pid: 'pp' });
+assertLede(recordsErrorDom, 'Test Project', 'Records error page');
+assert.ok(recordsErrorDom.textContent.includes('records unavailable'));
 
 // 4. Render Reference Detail (`referencePage`) with two-step revise-then-accept & self_accept_blocked
 let acceptedRefPayload = null;
@@ -179,9 +241,18 @@ const refApp = {
 };
 
 const refDom = await referencePage(refApp, { pid: 'pp', key: 'kit.guide' });
+assertRecordsBreadcrumb(refDom, 'reference success page');
+assertLede(refDom, 'Reference record · accepted', 'Reference success page');
 assert.ok(refDom.textContent.includes('Pending draft revision 3 (waiting to be accepted)'));
 assert.ok(refDom.textContent.includes('Two-step revise-then-accept'));
 assert.ok(refDom.textContent.includes('path-syntax-only'));
+
+const refErrorApp = {
+  ...refApp,
+  api: { ...refApp.api, reference: async () => { throw new Error('reference unavailable'); } },
+};
+const refErrorDom = await referencePage(refErrorApp, { pid: 'pp', key: 'kit.guide' });
+assertRecordsBreadcrumb(refErrorDom, 'reference error page');
 
 const acceptForm = refDom.all((e) => e.attributes['data-accept-reference-form'] === '1')[0];
 assert.ok(acceptForm, 'Accept reference form should be present');
@@ -242,8 +313,18 @@ const capApp = {
 };
 
 const capDom = await capabilityPage(capApp, { pid: 'pp', key: 'records.web-sync' });
+assertRecordsBreadcrumb(capDom, 'capability success page');
+assertLede(capDom, 'Capability record · accepted', 'Capability success page');
 assert.ok(capDom.textContent.includes('syntax-and-requirements'));
 assert.ok(capDom.textContent.includes('Verify revision 2'));
+
+const capErrorApp = {
+  ...capApp,
+  api: { ...capApp.api, capability: async () => { throw new Error('capability unavailable'); } },
+};
+const capErrorDom = await capabilityPage(capErrorApp, { pid: 'pp', key: 'records.web-sync' });
+assertRecordsBreadcrumb(capErrorDom, 'capability error page');
+
 const verifyForm = capDom.all((e) => e.attributes['data-verify-capability-form'] === '1')[0];
 assert.ok(verifyForm, 'Verify capability form should be present');
 verifyForm.all((e) => e.attributes.name === 'commit')[0].value = 'f'.repeat(40);

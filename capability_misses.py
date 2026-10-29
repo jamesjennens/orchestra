@@ -213,11 +213,8 @@ def load(project, which=CAPABILITY):
             return None, 'absent'
         if not stat.S_ISREG(info.st_mode) or info.st_size > FILE_BYTES_MAX:
             return None, 'unreadable'
-        descriptor = os.open(path, _flags('O_RDONLY', 'O_NOFOLLOW', 'O_CLOEXEC', 'O_NONBLOCK', 'O_BINARY'))
-        with os.fdopen(descriptor, 'rb') as stream:
-            raw = stream.read(FILE_BYTES_MAX + 1)
-        if len(raw) > FILE_BYTES_MAX:
-            return None, 'unreadable'
+        from admin import read_regular_text
+        raw = read_regular_text(path, limit=FILE_BYTES_MAX, raw=True)
         log = json.loads(raw.decode('utf-8'), parse_int=_small_int, parse_float=lambda text: None,
                          parse_constant=lambda text: None)
         return (log, 'ok') if _valid(log) else (None, 'unreadable')

@@ -111,6 +111,35 @@ export async function detail(ctx, { pid, rid }) {
     return jobs;
   }
 
+  // Slice 5 (kittrial-5bb.427, design 2.6): moderation is a fold on each message
+  // (mock-up room.html:40 `details > summary "Moderate"`). The message-number
+  // form is gone: the fold passes the sequence of its own message. The reason
+  // hint stays on the fold. Review r2: offer it only on message/item lines that
+  // are not moderated — the server refuses a second moderation with 409
+  // (rooms.py:1669 already_moderated) and a 404 for other kinds
+  // (rooms.py:1666 not_found), so do not offer it there.
+  function moderateFold(message) {
+    if (!canModerate(project)) return null;
+    if (message.kind !== 'message' && message.kind !== 'item') return null;
+    if (message.moderated) return null;
+    const fold = h('details', { class: 'small' },
+      h('summary', { class: 'muted' }, 'Moderate'),
+      h('form', { class: 'form', novalidate: true },
+        h('p', { class: 'muted' }, 'Remove this message, with a reason (owners and coordinators).'),
+        field({ id: 'moderate-reason-' + message.sequence, label: 'Reason', maxlength: 500, hint: 'The message becomes a tombstone: removed by you, at this time, for this reason.' }),
+        h('div', null, h('button', { type: 'submit', class: 'danger' }, 'Remove message'))));
+    fold.querySelector('form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const reason = (formValues(form)['moderate-reason-' + message.sequence] || '').trim();
+      if (!reason) return setFieldError(form, 'moderate-reason-' + message.sequence, 'Give a reason.');
+      setFieldError(form, 'moderate-reason-' + message.sequence, '');
+      const saved = await act(form.querySelector('button'), () => ctx.api.moderateRoomMessage(pid, rid, message.sequence, reason), { success: 'Message removed' });
+      if (saved) { since = null; draw(); }
+    });
+    return fold;
+  }
+
   function messageRow(message) {
     const label = message.kind === 'item' ? 'item: ' + message.item_kind
       : message.kind === 'item-event' ? 'item ' + message.event + ' on #' + message.target_sequence
@@ -127,7 +156,8 @@ export async function detail(ctx, { pid, rid }) {
           message.kind === 'tombstone' ? h('span', { class: 'chip warn' }, 'removed') : null),
         // Text only: h() appends a text node, so <img onerror=...> and javascript: links
         // stay literal characters and make no element.
-        h('p', { class: 'event-body prose room-text' }, message.text)));
+        h('p', { class: 'event-body prose room-text' }, message.text),
+        moderateFold(message)));
   }
 
   // One item's current state and the record it became (a pointer shown as text, never a link
@@ -330,6 +360,8 @@ export async function detail(ctx, { pid, rid }) {
       adding.push(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Post')), h('div', { class: 'panel-body' }, form)));
     }
 
+    // Slice 5 (kittrial-5bb.427, design 2.6): room tools (archive) fold below the
+    // post form (mock-up room.html:56-59 `details.fold > summary "Room tools"`).
     if (canModerate(project) && room.state === 'open') {
       const archive = h('button', { type: 'button', class: 'danger', onclick: async () => {
         const yes = await confirmDialog({ title: 'Archive this room?', body: 'It stays readable and exportable; nobody can post to it again.', confirmLabel: 'Archive', danger: true });
@@ -337,28 +369,14 @@ export async function detail(ctx, { pid, rid }) {
         const saved = await act(archive, () => ctx.api.archiveRoom(pid, rid), { success: 'Room archived' });
         if (saved) { since = null; draw(); }
       } }, 'Archive room');
-      adding.push(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Moderation')),
-        h('div', { class: 'panel-body' }, archive)));
+      adding.push(h('details', { class: 'fold' },
+        h('summary', null, 'Room tools ', h('span', { class: 'fold-hint' }, 'archive')),
+        h('div', { class: 'fold-body' },
+          h('p', { class: 'small' }, 'Archiving keeps the room readable and exportable; nobody can post afterwards.'),
+          archive)));
     }
-    if (canModerate(project)) {
-      const form = h('form', { class: 'form', novalidate: true },
-        field({ id: 'moderate-seq', label: 'Message number to remove', type: 'number', hint: 'The #number shown in the log.' }),
-        field({ id: 'moderate-reason', label: 'Reason', maxlength: 500, hint: 'The message becomes a tombstone: removed by you, at this time, for this reason.' }),
-        h('div', null, h('button', { type: 'submit', class: 'danger' }, 'Remove message')));
-      form.addEventListener('submit', async (event) => {
-        event.preventDefault();
-        const values = formValues(form);
-        const sequence = Number(values['moderate-seq']);
-        const reason = (values['moderate-reason'] || '').trim();
-        if (!Number.isInteger(sequence) || sequence < 1) return setFieldError(form, 'moderate-seq', 'Give the message number.');
-        if (!reason) return setFieldError(form, 'moderate-reason', 'Give a reason.');
-        setFieldError(form, 'moderate-seq', ''); setFieldError(form, 'moderate-reason', '');
-        const saved = await act(form.querySelector('button'), () => ctx.api.moderateRoomMessage(pid, rid, sequence, reason), { success: 'Message removed' });
-        if (saved) { form.reset(); since = null; draw(); }
-      });
-      adding.push(h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Remove a message')),
-        h('div', { class: 'panel-body' }, form)));
-    }
+    // The old message-number "Remove a message" form is gone: moderation is the
+    // per-message fold above (moderateFold), so no free-typed sequence remains.
 
     async function download(format) {
       const result = await ctx.api.exportRoom(pid, rid, format);

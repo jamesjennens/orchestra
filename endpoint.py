@@ -121,6 +121,26 @@ ALLOWED={'list','show','ready','search','count','create','update','close','reope
 # spelling-aware reserved_comments.operator_only_in_args() below.
 FORBIDDEN={'--directory','-C','--db','--repo','--global','--actor','--author','--profile','--graph','--config','--metadata'}
 FILE_FLAGS={'--body-file','--design-file','--file','-f'}
+from field_limits import DESCRIPTION_MAX,DESCRIPTION_TOO_LONG
+
+
+def _description_over_limit(args,attachments):
+    # create/update only: an inline --description/-d value, or an attached --body-file text, over the bound.
+    if not args or args[0] not in ('create','update'):return False
+    n=len(args)
+    for i,a in enumerate(args[1:],1):
+        if a=='--':break
+        if a.startswith('@attachment:'):
+            item=(attachments or {}).get(a.partition(':')[2])
+            if isinstance(item,dict) and item.get('flag')=='--body-file' and isinstance(item.get('text'),str) and len(item['text'])>DESCRIPTION_MAX:return True
+        elif a in ('--description','-d') and i+1<n and not args[i+1].startswith('@attachment:') and len(args[i+1])>DESCRIPTION_MAX:return True
+        else:
+            # pflag spellings with the value joined: --description=V, -d=V and -dV.
+            for lead in ('--description=','-d=','-d'):
+                if a.startswith(lead):
+                    if len(a)-len(lead)>DESCRIPTION_MAX:return True
+                    break
+    return False
 
 def _guidance_ack_version(args):
     """The version named by `guidance ack --version VERSION` (kittrial-5bb.99).
@@ -213,7 +233,7 @@ def _guard_reserved_labels(root,path,args,actor):
         if carries_record_label(row):
             row['comments']=_native_comments(root,path,actor,canonical)
             if is_record_anchor(row):
-                raise ValueError('Refusing to replace labels on %s: it is a reference/proposal/settings/capability record anchor, whose labels only its record operations may change. --add-label remains available for ordinary labels.'%(canonical,))
+                raise ValueError('Refusing to replace labels on %s: it is a reference/proposal/settings/capability/open-item record anchor, whose labels only its record operations may change. --add-label remains available for ordinary labels.'%(canonical,))
 
 def _native_anchor_rows(root,path,actor,tokens):
     """Resolve every named token to its canonical id and row, in ONE native read.
@@ -400,7 +420,7 @@ def _guard_record_anchor_status(root,path,args,actor):
     for token in targets:
         canonical,row=rows[token]
         if is_record_anchor(row):
-            raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability record anchor, '
+            raise ValueError('Refusing to %s %s: it is a reference/proposal/settings/capability/open-item record anchor, '
                              'whose status only its record operations may change.'%(command,canonical))
         # The merge slot is held and released only through `coordinate` (kittrial-5bb.113).
         if is_merge_slot(row):
@@ -446,7 +466,7 @@ def _guard_record_anchor_title(root,path,args,actor,rows=None):
     for token in targets:
         canonical,row=read[token]
         if is_record_anchor(row):
-            raise ValueError('Refusing to update the title of %s: it is a reference/proposal/settings/capability record '
+            raise ValueError('Refusing to update the title of %s: it is a reference/proposal/settings/capability/open-item record '
                              'anchor, and its title is how the kit finds it.'%canonical)
 
 #: bd 1.2.2's structured answer when `show ID` resolved to no single row. bd prints it both
@@ -696,19 +716,19 @@ def tracker_actors(root,path,before=None,own=()):
     ``own`` are the lifetimes of earlier credentials of the same name whose rows are not
     held against this one (item 3)."""
     import actor_names
-    from admin import run_bd
+    from admin import run_bd,server_metadata_fault
     # The SAME guard ``admin.project_merge_slot_state`` uses, for the same reason: without the
-    # Dolt server coordinates recorded in ``.beads/metadata.json`` bd falls back to an EMBEDDED
+    # Dolt server coordinates and ``dolt_mode`` server recorded in ``.beads/metadata.json`` bd falls back to an EMBEDDED
     # database, creates ``.beads/embeddeddolt`` and exits 0 having printed nothing. That answer
     # is not this project's tracker at all, so it is the host fault and never the empty-project
     # missing-slot answer: reading it as "no rows at all" answered 503 merge_slot_missing and
     # advised a merge-create that then fails (kittrial-5bb.202 review of revision 2, F2).
     try:
-        metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        metadata=json.loads(read_regular_text(path/'.beads'/'metadata.json'))
     except (OSError,ValueError,UnicodeError):
         metadata=None
-    coordinates=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
-    if not isinstance(metadata,dict) or not all(metadata.get(key) for key in coordinates):
+    if server_metadata_fault(metadata) is not None:
         raise actor_names.TrackerUnreadable()
     try:
         text=run_bd(root,path.name,['export','--all'])
@@ -941,10 +961,12 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: The actions that exist only for the web service: they name no existing project.
 #: ``host-coordination`` and ``host-projects`` are reads for the web interface (kittrial-5bb.198,
 #: host_reads.py): the operator list, the project's session names and the runtime's projects,
-#: which a bound key is not told.
+#: which a bound key is not told. ``web-switches`` (kittrial-5bb.434) is the installation switches
+#: read the HTTP route serves under CAP_COORDINATE; it checks no capability itself, so no bound key
+#: may name it.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
-                      'task-file','room-decision','delegation')
+                      'task-file','room-decision','delegation','web-switches')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -1188,6 +1210,8 @@ READ_ONLY_ACTIONS={
     'brief':_read_only_always,
     'history':_read_only_always,
     'requirements':_read_only_always,
+    'trace':_read_only_always,
+    'web-switches':_read_only_always,
     'work':_read_only_always,
     'review':_review_rounds_read_only,
     # kittrial-5bb.285: the blocking wait's per-poll read. It is one work read (one export)
@@ -1239,6 +1263,32 @@ def held_coordination_lock(path,shared=False):
     with (path/'.coordination.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         yield
+
+
+def trace_answer(root,path,name,args,actor,authority_config=None):
+    """(answer, warnings) of one trace page (kittrial-5bb.425). Under a shared lock: the export from the read
+    cache, the live membership (whose lines count: the round's publication line, the owner-only decision
+    heuristic) and the governance snapshot. The views are built after the lock is released (review b2), from
+    what was read; the generation is the caller's filtered snapshot's, and a page at another one is refused."""
+    import trace_read
+    from read_cache import cached_export_rows
+    options=trace_read.parse_options(args)
+    run_warnings=[]
+    def run(argv):
+        stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+        if warnings:run_warnings.append(warnings)
+        return stdout
+    with held_coordination_lock(path,shared=True):
+        rows=cached_export_rows(root,path,run,name)
+        members=None
+        if authority_config is not None:
+            from http_authority import AuthorityDenied,read_state
+            try:members=((read_state(authority_config.store).get('memberships') or {}).get(name)) or {}
+            except AuthorityDenied:members={}
+        governance=trace_read.read_governance(rows,path,name)
+    result=trace_read.answer(rows,name,options,operators=configured_operators(root),verifiers=configured_verifiers(root),
+                             members=members,governance=governance)
+    return result,''.join(run_warnings)
 
 
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None,frame=None):
@@ -1399,7 +1449,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             lanes_scope,request.get('lanes_scope') if isinstance(request,dict) else None)
         def work_effect():
             read_context = {}
-            if action in ('work', 'wait'):
+            if action in ('work', 'wait') and args[:1] != ['summary']:
                 read_context['comment_authority'] = comment_contact_authority(root,path,operators,authority_config)
             result=work_execute(path,actor,action,args,request.get('attachments',{}),runner,
                                 operators=operators,
@@ -1432,6 +1482,20 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         with held_coordination_lock(path,shared=coordination_lock_shared(request,'requirements',request.get('args',[]))):
             result=read_requirements(path,name,request.get('args',[]),run,configured_operators(root))
         return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+    if action=='web-switches':
+        # kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator on the web:
+        # each name, its state as its own writers read it, what it unlocks and the operator command. A read
+        # of the host's own settings; it takes no lock and writes nothing, and it returns no path or actor.
+        from admin import installation_switches
+        if request.get('args',[]) not in ([],['--json']):raise ValueError('web-switches takes no arguments')
+        return {'returncode':0,'stdout':json.dumps({'schema_version':1,'items':installation_switches(root)},
+                                                   ensure_ascii=False)+'\n','stderr':''}
+    if action=='trace':
+        # kittrial-5bb.425: the trace read (TRACEABILITY_DESIGN §5.2-§5.4), answered from records alone.
+        # Read-only: a shared lock and no guarded write. One export from the read cache; the generation it
+        # was read at goes back with the answer, and a page asked for at another generation is refused.
+        result=trace_answer(root,path,name,request.get('args',[]),actor,authority_config)
+        return {'returncode':0,'stdout':json.dumps(result[0],ensure_ascii=False)+'\n','stderr':result[1]}
     if action=='owner-requirements':
         from requirement_http import web_action
         run_warnings=[]
@@ -1695,13 +1759,39 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     # the project requires approval by another party (approval_by_another_party or
                     # independent_approval) the agent faces exactly the rule a person faces below.
                     delegation_check(state,decision_id)
-                    if not isinstance(proposer,str) or not proposer:
+                    import record_acceptance as shared_acceptance
+                    head=(actor.split('/',1)[0] if isinstance(actor,str) else None)
+                    caller_parties=set(actor_parties(state,actor,name))
+                    if user_id:caller_parties.add(user_id)
+                    proposer_parties=(set(actor_parties(state,proposer,name))
+                                      if isinstance(proposer,str) and proposer else set())
+                    if isinstance(proposer,str) and proposer:
+                        if proposer.split('/',1)[0]==head:
+                            raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
+                                                     'whatever its delegation says.')
+                    else:
                         raise RecordsRefusal(403,'This draft has no recorded proposer, so no delegation can admit it.')
-                    if proposer.split('/',1)[0]==(actor.split('/',1)[0] if isinstance(actor,str) else actor):
-                        raise RecordsRefusal(403,'An agent never accepts or verifies a draft it wrote itself, '
-                                                 'whatever its delegation says.')
+                    same_session_owner=False
+                    if rules.get('independent_approval') and isinstance(proposer,str) and proposer:
+                        try:
+                            owners=approval_owners(owner_loader(path,'independent_approval'))
+                        except CoordinatorRuleRefusal as error:
+                            raise RecordsRefusal(409,str(error)) from None
+                        same_session_owner=same_party(actor,proposer,owners)
                     if not approval_by_another:
                         return
+                    # proposer_known/own_draft are refused above, so decide's
+                    # defaults (True/False) carry the same values (notes tidy-up).
+                    may,reason=shared_acceptance.decide(
+                        can_coordinate=True,approval_by_another_party=approval_by_another,
+                        waiting=True,by_agent=True,agent_head=head,
+                        delegation_covers_kind=True,delegation_missing=False,
+                        caller_parties=caller_parties,draft_parties=proposer_parties,
+                        own_party=bool(caller_parties & proposer_parties),
+                        independent_hold=bool(same_session_owner))
+                    if not may:
+                        raise RecordsRefusal(403,reason)
+                    return
                 elif not approval_by_another:
                     return
                 caller_parties=set(actor_parties(state,actor,name))
@@ -1738,7 +1828,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if warnings:run_warnings.append(warnings)
             return stdout
         by_service=authority_config is not None and require_authority
-        writes=reference_records.CONTRIBUTOR_OPERATIONS+(reference_records.HTTP_WRITE_COMMANDS if by_service else ())
+        if args[:1]==['design']:
+            # kittrial-5bb.418: the design page read (the stored document as text, its index and state).
+            # Read-only, no lock; it reads one key's rows and that revision's stored bytes.
+            rest=[token for token in args[1:] if token!='--json']
+            revision=None
+            if len(rest)==3 and rest[1]=='--revision' and re.fullmatch(r'[1-9][0-9]{0,8}',rest[2]):
+                revision=int(rest[2]);rest=rest[:1]
+            if len(rest)!=1 or not isinstance(rest[0],str):raise ValueError('ref design takes SCOPE [--revision N]')
+            key='design.'+rest[0]
+            try:reference_records.valid_key(key)
+            except ValueError:raise ValueError('Design not found') from None
+            result=reference_records.design_page(reference_records.read_key_rows(run,key),rest[0],path,
+                                                 configured_operators(root),configured_verifiers(root),revision)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        writes=reference_records.CONTRIBUTOR_OPERATIONS+('verify',)+(reference_records.HTTP_WRITE_COMMANDS if by_service else ())
         if not args or args[0] not in writes:
             import capability_misses
             log=capability_misses.REFERENCE
@@ -1755,7 +1859,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                 result=capability_misses.report(path,lambda:reference_records.NowAnswered(reference_records.read_rows(run),configured_operators(root)),limit,log)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=True)+'\n','stderr':''.join(run_warnings)}
             looked_up=reference_records.miss_phrase(args)
-            try:result=reference_records.read(args,run,configured_operators(root),web_service=authority_config is not None)
+            try:result=reference_records.read(args,run,configured_operators(root),web_service=authority_config is not None,
+                                              verifiers=configured_verifiers(root))
             except ValueError as error:
                 # `ref get` of a key nobody has recorded is a lookup that missed.
                 if looked_up is not None and str(error).startswith('Unknown reference key'):counted(looked_up,False)
@@ -1766,14 +1871,34 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
         coordinator=args[0] in reference_records.HTTP_WRITE_COMMANDS
         identity_check,party_check,_=_records_http_context(coordinator,run_warnings,run,'references')
-        payload=reference_records.write_payload(args,request.get('attachments',{}),commands=writes)
+        # kittrial-5bb.418: a design.<scope> propose or revise carries its document as a second
+        # attachment (flag --document), checked, stored and indexed by reference_records.
+        if args[0]=='verify':
+            # kittrial-5bb.418 (Q4): a `trace --verify` report through the endpoint is written unverified;
+            # only admin.py design-verify on the host writes a trusted one. Contributor-level, like propose.
+            payload=reference_records.verification_payload(args,request.get('attachments',{}))
+            runner=NativeRunner(run, project=path)
+            def verify_effect():
+                result=reference_records.write_verification(payload,actor,runner,operators=configured_operators(root),
+                                                            verifiers=configured_verifiers(root),
+                                                            route='web' if by_service else 'endpoint')
+                return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                return guarded_write(root,request,journal_path(path),verify_effect,
+                                     authority_config=authority_config,
+                                     require_authority=require_authority,runner=runner,
+                                     identity_check=identity_check)
+        payload,document=reference_records.write_payload_and_document(args,request.get('attachments',{}),commands=writes)
         runner=NativeRunner(run, project=path)
         def ref_effect():
+            import task_files
             try:
                 result=reference_records.apply_native(payload,actor,runner,path,operator=coordinator,
                                                       operators=configured_operators(root),
                                                       web_coordinator=coordinator,party_check=party_check,
-                                                      web_service=by_service)
+                                                      web_service=by_service,document=document,
+                                                      document_limits=task_files.limits(root,run_warnings))
             except RecordsRefusal as error:
                 return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
@@ -2001,8 +2126,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     raise onboarding_directory_refusal(target)
                 if target.is_file() and not target.is_symlink():
                     try:
-                        previous=target.read_text(encoding='utf-8-sig')
-                    except (UnicodeDecodeError,OSError):
+                        from admin import read_regular_text
+                        previous=read_regular_text(target,raw=True).decode('utf-8-sig')
+                    except (OSError,ValueError):
                         # A damaged previous document must not stop the route from replacing it
                         # (review of 6f3007a, finding 1; kittrial-5bb.238 item 1): the host command
                         # replaces it, and a caller with no shell has no other way. The unreadable
@@ -2785,11 +2911,21 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                     owners=owner_loader(path,'lifecycle_authors'),**diagnostic_context)
             elif action=='coordinate':
                 from coordination import apply_native as coordinate
+                def create_assignment(args):
+                    import assignee_names
+                    try:
+                        resolved,note=_resolved_bd_assignee(root,path,actor,authority_config,args)
+                    except assignee_names.NameRefusal as error:
+                        raise ValueError('Invalid child assignee: '+str(error)) from None
+                    _guard_claiming_on_assignment(root,path,actor,authority_config,request,resolved)
+                    if note:run_warnings.append(note)
+                    return resolved
                 result=coordinate(payload,actor,runner,path,operators=coordinate_operators,
                                   coordinator_writes=rules['coordinator_writes'],
                                   independent_approval=rules['independent_approval'],
                                   owners=owner_loader(path,'coordinator_writes'),
-                                  review_writes=configured_review_writes(root,warnings=switch_warnings))
+                                  review_writes=configured_review_writes(root,warnings=switch_warnings),
+                                  create_assignment=create_assignment)
             else:
                 from requirement_records import apply_native as requirement_apply
                 result=requirement_apply(payload,actor,runner,path)
@@ -2822,7 +2958,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         target=request.get('path','CURRENT.md')
         viewroot=(path/'views').resolve();view=(viewroot/target).resolve()
         if not view.is_relative_to(viewroot) or view.suffix not in ('.md','.jsonl'):raise ValueError('Invalid view path')
-        return {'returncode':0,'stdout':view.read_text(encoding='utf-8'),'stderr':''}
+        from admin import read_regular_text
+        return {'returncode':0,'stdout':read_regular_text(view),'stderr':''}
     if action=='refresh':
         with (path/'.refresh.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
@@ -2867,7 +3004,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     # the native write).
     label=reserved_label_in_args(args)
     if label==MERGE_SLOT_LABEL:raise ValueError('The label %s marks the merge slot of a project and is reserved: it is not added, removed or replaced on any task. Only `coordinate` writes it (merge-create restores it on a damaged slot).'%label)
-    if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise)')
+    if label is not None:raise ValueError('Reserved coordination/requirement labels are operator-only; use the coordination request workflow (coordination.py) or the requirement command (requirement_records.py draft|revise); `open-item:` labels belong to open item records, which no command writes yet')
     # bd 1.2.2 accepts the undocumented `create --label` alias of --labels, so a
     # table built only from --help missed a whole label-writing spelling. Every
     # accepted alias is now in the table above; an unresolvable create/update
@@ -2888,6 +3025,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     # actual request target; unresolvable targets fail closed.
     check_raw_request(args, request.get('attachments', {}),
                       actor=actor, task=comment_target(args))
+    if _description_over_limit(args,request.get('attachments',{})):raise ValueError(DESCRIPTION_TOO_LONG)
     with tempfile.TemporaryDirectory(prefix='request-',dir=root) as tmp:
         attachments=request.get('attachments',{})
         final=[]
@@ -3033,6 +3171,10 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
+    ('trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]',
+     'the trace read, answered by the server: summary, requirements, tasks, tokens, decisions, designs, round'),
+    ('trace --verify [--repo DIR] [--record | --payloads FILE]',
+     "check each accepted design document against git at its pinned commit (verified, design-drift)"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),
@@ -3296,7 +3438,8 @@ def framed_files(root,path,actor,header,frame):
         name=task_files.clean_name(header['name'])
         sha256=task_files.check_sha256(header['sha256'])
         known=task_files.read_entry(path,task,sha256)
-        if known is not None and known.get('withdrawn') is None and known['name']==name and task_files.blob_size(path,sha256)==known['bytes']:
+        # kittrial-5bb.418 review r2 (N1): a design document's entry is not an attached file; it is never a replay.
+        if known is not None and known.get('withdrawn') is None and known.get('direction')!=task_files.DESIGN and known['name']==name and task_files.blob_size(path,sha256)==known['bytes']:
             return answer(dict(task_files.view(known),replayed=True),200)
         length=header['bytes']
         task_files.check_room(path,task,length,limit)

@@ -19,6 +19,7 @@ per-installation setting `review_workflow_writes` is on (default off).
 """
 import json
 import sys
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -663,6 +664,36 @@ class PlainTextTests(Base):
                   'reviewer')
         # Only the contribution and the one accepted request were written.
         self.assertEqual(self.review_count(), 2)
+
+    def test_every_added_format_character_is_refused_on_a_write_path(self):
+        ranges = ((0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD), (0x070F, 0x070F),
+                  (0x0890, 0x0891), (0x08E2, 0x08E2), (0x180E, 0x180E), (0x206A, 0x206F),
+                  (0xFFF9, 0xFFFB), (0x110BD, 0x110BD), (0x110CD, 0x110CD), (0x13430, 0x1343F),
+                  (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A))
+        added = {code for first, last in ranges for code in range(first, last + 1)}
+        contribution = self.send(self.contribution())['comment_id']
+        for code in sorted(added):
+            with self.subTest(code='U+%04X' % code), self.assertRaisesRegex(ValueError, 'plain text'):
+                self.send(self.payload('approve', contribution=contribution,
+                                       summary='new' + chr(code) + 'write'), 'reviewer')
+        self.assertEqual(self.review_count(), 1)
+        w.plain_text('stored\u061ctext', 'stored', stored=True)
+        self.send(self.payload('approve', contribution=contribution, summary='unassigned\u2065'), 'reviewer')
+        self.assertEqual(self.review_count(), 2)
+
+    def test_the_fixed_format_list_is_reported_against_current_unicode_data(self):
+        ranges = ((0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD), (0x070F, 0x070F),
+                  (0x0890, 0x0891), (0x08E2, 0x08E2), (0x180E, 0x180E), (0x206A, 0x206F),
+                  (0xFFF9, 0xFFFB), (0x110BD, 0x110BD), (0x110CD, 0x110CD), (0x13430, 0x1343F),
+                  (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A))
+        fixed = {code for first, last in ranges for code in range(first, last + 1)}
+        current = {code for code in range(sys.maxunicode + 1)
+                   if unicodedata.category(chr(code)) == 'Cf'
+                   and not w.PLAIN_INVISIBLE.search(chr(code)) and not w.PLAIN_JOINER.search(chr(code))}
+        if fixed != current:
+            print('Unicode Cf audit (informational, not a failure): missing=%s extra=%s'
+                  % (['U+%04X' % code for code in sorted(current - fixed)],
+                     ['U+%04X' % code for code in sorted(fixed - current)]))
 
     def test_reads_stay_tolerant_of_records_written_before_the_rule(self):
         """The rule is a write check; validate() must still accept old bytes."""

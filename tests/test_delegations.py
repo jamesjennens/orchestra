@@ -6,6 +6,7 @@ test_web_records.NativeWebRecordsTests (run_delegation_suite).
 """
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -84,6 +85,26 @@ class Native:
         return comment
 
 
+class BlockingReadTimeout(Exception):
+    pass
+
+
+def bounded(call):
+    previous = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(BlockingReadTimeout()))
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def make_fifo(case, path):
+    if not hasattr(os, 'mkfifo'):
+        case.skipTest('mkfifo is unavailable')
+    os.mkfifo(path)
+
+
 class DelegationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -138,6 +159,22 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(self.check(issue=created)['decision'], created)
 
     # -- the write ---------------------------------------------------------------------------
+    def test_regular_file_journal_missing_damaged_and_valid_classifications(self):
+        record = self.write(request())['record']
+        path = self.project / d.JOURNAL_DIR / (record['sha256'] + '.json')
+        self.assertTrue(d.journaled(self.project, record))
+        path.write_text('{bad', encoding='utf-8')
+        self.assertFalse(d.journaled(self.project, record))
+        path.unlink()
+        self.assertFalse(d.journaled(self.project, record))
+
+    def test_fifo_journal_never_blocks_and_grants_nothing(self):
+        record = self.write(request())['record']
+        path = self.project / d.JOURNAL_DIR / (record['sha256'] + '.json')
+        path.unlink()
+        make_fifo(self, path)
+        self.assertFalse(bounded(lambda: d.journaled(self.project, record)))
+
     def test_a_grant_writes_one_record_its_journal_entry_and_the_label(self):
         result = self.write(request())
         record = result['record']
@@ -290,6 +327,17 @@ class DelegationTests(unittest.TestCase):
         record = result['record']
         self.assertIsNone(d.parse_comment({'author': OWNER, 'text': d.body(record)}, project='other', decision='pp-dec'))
         self.assertIsNone(d.parse_comment({'author': OWNER, 'text': d.body(record)}, project=PROJECT, decision='pp-x'))
+
+    def test_a_stored_delegation_with_a_legacy_invisible_reason_still_reads(self):
+        record = d.make_record(request(), project=PROJECT, recorded_by=OWNER,
+                               via='session', account=OWNER, at=AT[1])
+        record['reason'] = 'Stored before the expanded rule\u061c'
+        record['sha256'] = d.content_hash(record)
+        comment = {'author': OWNER, 'text': d.body(record)}
+        self.assertEqual(record, d.parse_comment(comment, project=PROJECT, decision='pp-dec'))
+        with self.assertRaisesRegex(ValueError, 'plain text'):
+            self.write(request(reason='New write\u061c'))
+        self.assertEqual([], self.row()['comments'])
 
     def test_two_grants_on_one_decision_grant_nothing(self):
         self.write(request())

@@ -48,22 +48,24 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'endpoint_process.py', 'feedback.py', 'field_history.py',  # kittrial-5bb.354: library-only; imported by briefing and http_service
            'field_limits.py',
            'delegations.py',  # kittrial-5bb.407: library-only (no __main__ block); imported by endpoint/admin/http_service
+           'design_documents.py',  # kittrial-5bb.418: library-only (no __main__ block); imported by reference_records
            'fault_clear.py',  # kittrial-5bb.398: library-only (no __main__ block); imported by endpoint/admin
            'followon.py',  # kittrial-5bb.343: library-only (no __main__ block); imported by work/endpoint
            'guidance.py', 'handoff.py', 'host_reads.py', 'http_auth.py', 'http_authority.py',
            'keyed_entries.py', 'keyed_records.py', 'lane_state.py', 'lanes.py', 'lifecycle_audit.py', 'nudges.py', 'lifecycle_voids.py', 'native.py', 'nudge_messages.py', 'onboarding.py', 'open_items.py',
-           'project_coordination.py', 'project_creation.py', 'project_setup.py', 'proposal_records.py', 'raw_lifecycle.py', 'read_cache.py', 'record_json.py', 'recovery.py',
+           'project_coordination.py', 'project_creation.py', 'project_setup.py', 'proposal_records.py', 'raw_lifecycle.py', 'read_cache.py', 'record_acceptance.py', 'record_json.py', 'recovery.py', 'regular_file.py',
            'reference_records.py', 'render.py', 'requirement_baseline_http.py', 'requirement_baseline_records.py',
            'requirement_baselines.py', 'requirement_brd.py', 'requirement_governance.py', 'requirement_http.py',
            'requirement_owner_records.py', 'requirement_terminal.py', 'reserved_comments.py', 'review_recommendations.py',
            'review_rounds.py', 'review_state.py', 'review_workflow.py',
            'task_files.py',  # kittrial-5bb.370: library-only (no __main__ block); imported by http_service/endpoint
+           'trace_read.py',  # kittrial-5bb.425: library-only (no __main__ block); imported by endpoint/http_service
            'rooms.py',  # kittrial-5bb.385: library-only (no __main__ block); imported by http_service/admin
            'server_address.py',  # kittrial-5bb.360: library-only; imported by office_service, http_auth, http_service
            'wake_log.py',  # kittrial-5bb.397: library-only (no __main__ block); imported by work, lanes and http_service
            'sessions.py', 'task_assignment.py', 'version.py', 'waiting.py', 'web_guidance.py', 'web_lifecycle.py', 'web_lifecycle_marks.py', 'web_merge_slot.py',
            'web_release.py',  # kittrial-5bb.378: library-only (no __main__ block); imported by endpoint
-           'work.py')
+           'work.py', 'work_summary.py')
 
 AS_VERSION = """
 import collections, runpy, sys

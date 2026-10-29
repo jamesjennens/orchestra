@@ -11,12 +11,14 @@ import argparse
 import json
 import os
 import record_json
+from field_limits import DESCRIPTION_MAX,DESCRIPTION_TOO_LONG
 import re
 import secrets
 import stat
 import time
 from pathlib import Path
-from requirements import content_hash, load_json
+from regular_file import read_regular_text
+from requirements import _fail, _unique_object, canonical_bytes, content_hash, load_json
 
 
 # Native `bd create --validate` enforces the type templates, and the identical
@@ -26,6 +28,8 @@ from requirements import content_hash, load_json
 # documentation hint, appended to an error when native validation itself reports
 # missing sections; it is not a gate and must not refuse a text bd accepts.
 REQUIRED_SECTIONS = {'decision': ('Decision', 'Rationale', 'Alternatives Considered')}
+#: The types create-child files (kittrial-5bb.434: the web route takes exactly this list; no epic).
+CHILD_TYPES = ('task', 'bug', 'feature', 'chore', 'decision')
 # A receipt in one of these states may be replaced under the same request ID by
 # its original actor, or by any actor after an explicit operator release.
 RELEASABLE = ('failed', 'released')
@@ -68,11 +72,28 @@ def _unique_temporary(path):
             continue
     raise OSError('Could not create a unique temporary file beside %s; nothing was written'%path)
 
+def _load_host_json(path):
+    """Load a coordination journal with the manifest reader's JSON contract."""
+    try:
+        payload=read_regular_text(path,raw=True)
+    except (OSError, ValueError) as exc:
+        detail = exc.strerror or exc if isinstance(exc, OSError) else exc
+        _fail('cannot read %s: %s'%(path,detail))
+    try:
+        result=record_json.loads(payload.decode('utf-8'),object_pairs_hook=_unique_object)
+        canonical_bytes(result)
+        return result
+    except UnicodeDecodeError:
+        _fail('cannot read %s: not valid UTF-8'%path)
+    except json.JSONDecodeError as exc:
+        _fail('cannot parse %s as JSON: %s'%(path,exc))
+
+
 def _same_bytes(path,payload):
     """Whether ``path`` already holds exactly ``payload`` (a lost-race target)."""
     if path.is_symlink():return False
-    try:return path.read_text(encoding='utf-8')==payload
-    except (OSError,UnicodeError):return False
+    try:return read_regular_text(path)==payload
+    except (OSError,UnicodeError,ValueError):return False
 
 def _discard(tmp):
     try:tmp.unlink()
@@ -289,7 +310,7 @@ def reconcile_request(project, request_id, actor, reason, disposition, run, at=N
     identity=content_hash({'request_id':request_id})
     receipt=project/'.coordination-requests'/(identity+'.json')
     if not receipt.exists():raise ValueError('No coordination request reservation exists for that request ID')
-    prior=load_json(receipt)
+    prior=_load_host_json(receipt)
     if not isinstance(prior,dict) or not isinstance(prior.get('status'),str):
         raise ValueError('Malformed coordination request receipt; inspect before reconciling')
     audit=prior.get('reconciliation') or {}
@@ -490,7 +511,7 @@ def require_unheld_merge_task(issue, task, operators=None, project=None):
 
 
 def apply_native(p, actor, run, project, operators=None, coordinator_writes=False, independent_approval=False,
-                 owners=None, verified_web_authority=False, review_writes=False):
+                 owners=None, verified_web_authority=False, review_writes=False, create_assignment=None):
     """Caller holds canonical project lock. Journals belong to runtime, never Git.
 
     ``coordinator_writes`` and ``independent_approval`` are the per-installation
@@ -503,19 +524,22 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
     if not isinstance(p,dict):raise ValueError('Expected object')
     op=p.get('operation')
     if op=='create-child':
-        if set(p)!={'operation','request_id','parent','title','description','type'}:raise ValueError('Invalid child request fields')
+        fields={'operation','request_id','parent','title','description','type'}
+        if not fields.issubset(p) or not set(p).issubset(fields|{'assignee','priority'}):raise ValueError('Invalid child request fields')
         identifier(p['request_id']);identifier(p['parent'])
         # bd resolves a parent from any substring of an id, so the row is read, not guessed.
         parents=record_json.loads(run(['show',p['parent'],'--json']))
         for parent in parents if isinstance(parents,list) else [parents]:
             if is_merge_slot(parent):raise ValueError(merge_slot_sentence(parent.get('id'))+'; it takes no child')
         if not isinstance(p['title'],str) or not p['title'].strip() or not isinstance(p['description'],str):raise ValueError('Child needs title and description')
-        if p['type'] not in ('task','bug','feature','chore','decision'):raise ValueError('Invalid child type')
+        if len(p['description'])>DESCRIPTION_MAX:raise ValueError(DESCRIPTION_TOO_LONG)
+        if p['type'] not in CHILD_TYPES:raise ValueError('Invalid child type')
+        if 'assignee' in p and not isinstance(p['assignee'],str):raise ValueError('Child assignee must be text')
         identity=content_hash({'request_id':p['request_id']})
         digest=content_hash({'actor':actor,'payload':p})
         journal=project/'.coordination-requests';journal.mkdir(exist_ok=True)
         receipt=journal/(identity+'.json')
-        prior=load_json(receipt) if receipt.exists() else None
+        prior=_load_host_json(receipt) if receipt.exists() else None
         reusable=resubmittable(prior,actor)
         if prior and prior['sha256']!=digest and not reusable:raise ValueError('Request ID already reserved for different content or actor')
         label='request:'+identity
@@ -536,6 +560,9 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         if prior and not reusable:
             raise ValueError('Reserved request has no visible issue; outcome uncertain. Operator must reconcile before any new request; do not allocate another ID.')
         args=['create','--title',p['title'],'--parent',p['parent'],'--description',p['description'],'--type',p['type'],'--no-inherit-labels','--labels',label+',request-content:'+digest,'--json']
+        if 'assignee' in p:args[-1:-1]=['--assignee',p['assignee']]
+        if 'priority' in p:args[-1:-1]=['--priority',str(p['priority'])]
+        if create_assignment is not None:args=create_assignment(args)
         if p['type']=='decision':args.append('--validate')
         # Preflight the identical create natively BEFORE any reservation exists.
         # `--dry-run` writes nothing: native validation and a missing parent are
@@ -642,7 +669,7 @@ def apply_native(p, actor, run, project, operators=None, coordinator_writes=Fals
         if isinstance(state,dict) and state.get('error'):detail=' (%s)' % state['error']
         raise ValueError('Merge slot does not exist for this project%s; run the merge-create operation to create it before checking, acquiring or releasing' % detail)
     if merge_slot_damaged(state):raise ValueError(SLOT_DAMAGED)
-    context=load_json(context_path) if context_path.exists() else None
+    context=_load_host_json(context_path) if context_path.exists() else None
     if op=='merge-check':
         state['context']=context if context and context['holder']==state.get('holder') else None
         return state

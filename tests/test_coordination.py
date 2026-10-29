@@ -1,7 +1,9 @@
 import copy
 import json
+import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -154,6 +156,30 @@ class CoordinationTests(unittest.TestCase):
     def apply(self, payload, actor='alice'):
         return coordination.apply_native(copy.deepcopy(payload), actor, self.native, self.project)
 
+    def test_same_bytes_accepts_only_identical_undamaged_text(self):
+        target = self.project / 'target.json'
+        target.write_text('payload', encoding='utf-8')
+        self.assertTrue(coordination._same_bytes(target, 'payload'))
+        self.assertFalse(coordination._same_bytes(target, 'different'))
+        self.assertFalse(coordination._same_bytes(self.project / 'missing.json', 'payload'))
+        target.write_bytes(b'\xff')
+        self.assertFalse(coordination._same_bytes(target, 'payload'))
+        directory = self.project / 'directory.json'
+        directory.mkdir()
+        self.assertFalse(coordination._same_bytes(directory, 'payload'))
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'FIFOs are POSIX-only')
+    def test_same_bytes_fifo_answers_at_once(self):
+        target = self.project / 'target.json'
+        os.mkfifo(str(target))
+        outcome = []
+        worker = threading.Thread(target=lambda: outcome.append(coordination._same_bytes(target, 'payload')),
+                                  daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), 'the coordination comparison blocked')
+        self.assertEqual(outcome, [False])
+
     def test_child_repeat_uses_returned_native_id_without_second_create(self):
         self.assertEqual(self.apply(CHILD), {'id': 'sample-job.7', 'reconciled': False})
         self.assertEqual(self.apply(CHILD), {'id': 'sample-job.7', 'reconciled': True})
@@ -164,6 +190,50 @@ class CoordinationTests(unittest.TestCase):
         self.assertIn('--no-inherit-labels', create)
         preflight = next(c for c in self.native.calls if c[0] == 'create' and '--dry-run' in c)
         self.assertEqual([a for a in preflight if a != '--dry-run'], create)
+
+    def test_child_without_new_fields_keeps_legacy_digest_arguments_and_result(self):
+        legacy_digest = '37e924490c48d5a7e1252eae3120e806ba9501253e147d51028e02fda7521fd5'
+        self.assertEqual({'id': 'sample-job.7', 'reconciled': False}, self.apply(CHILD))
+        create = next(c for c in self.native.calls if c[0] == 'create' and '--dry-run' not in c)
+        self.assertEqual(['create', '--title', CHILD['title'], '--parent', CHILD['parent'],
+                          '--description', CHILD['description'], '--type', CHILD['type'],
+                          '--no-inherit-labels', '--labels',
+                          'request:efac7609acb5950956d6bf6a1ac80ef8a79fc50519b479dfd5b0b5b011d58c99,request-content:' + legacy_digest,
+                          '--json'], create)
+        receipt = json.loads(next((self.project / '.coordination-requests').iterdir()).read_text())
+        self.assertEqual(legacy_digest, receipt['sha256'])
+        self.assertEqual({'id': 'sample-job.7', 'reconciled': True}, self.apply(CHILD))
+
+    def test_child_fields_use_the_shared_assignment_callback_for_both_native_calls(self):
+        seen = []
+        def assignment(args):
+            seen.append(list(args))
+            resolved = list(args)
+            resolved[resolved.index('--assignee') + 1] = 'session-resolved'
+            return resolved
+        payload = dict(CHILD, assignee='Worker One', priority=1)
+        result = coordination.apply_native(payload, 'alice', self.native, self.project,
+                                          create_assignment=assignment)
+        self.assertEqual({'id': 'sample-job.7', 'reconciled': False}, result)
+        self.assertEqual(1, len(seen))
+        create = next(c for c in self.native.calls if c[0] == 'create' and '--dry-run' not in c)
+        self.assertEqual('session-resolved', create[create.index('--assignee') + 1])
+        self.assertEqual('1', create[create.index('--priority') + 1])
+        preflight = next(c for c in self.native.calls if c[0] == 'create' and '--dry-run' in c)
+        self.assertEqual([a for a in preflight if a != '--dry-run'], create)
+
+    def test_child_assignment_and_priority_refusals_write_no_issue_or_receipt(self):
+        def refuse_assignment(args):
+            raise ValueError('assignee is unknown')
+        with self.assertRaisesRegex(ValueError, 'assignee'):
+            coordination.apply_native(dict(CHILD, assignee='nobody'), 'alice', self.native,
+                                      self.project, create_assignment=refuse_assignment)
+        self.native.refuse_preflight = 'invalid priority "9"'
+        with self.assertRaisesRegex(ValueError, 'priority'):
+            coordination.apply_native(dict(CHILD, request_id='session/bad-priority', priority=9),
+                                      'alice', self.native, self.project)
+        self.assertEqual([], self.native.issues)
+        self.assertEqual([], list((self.project / '.coordination-requests').iterdir()))
 
     def test_lost_and_malformed_create_response_reconcile_without_duplicates(self):
         for outcome in ('lost-response', 'malformed-response'):
@@ -191,7 +261,8 @@ class CoordinationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'different content or actor'):
             self.apply(CHILD, actor='bob')
         for field, value in (('title', 'different'), ('parent', 'another-job'),
-                             ('description', 'new intent'), ('type', 'bug')):
+                             ('description', 'new intent'), ('type', 'bug'),
+                             ('assignee', 'bob'), ('priority', 1)):
             with self.subTest(field=field):
                 with self.assertRaisesRegex(ValueError, 'different content or actor'):
                     self.apply(dict(CHILD, **{field: value}))

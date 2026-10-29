@@ -4,6 +4,7 @@ import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError
 import { canWrite, canApprove, isOwner } from './project.js';
 import { lifecyclePanel } from './lifecycle.js';
 import { taskFilesPanel } from './taskFiles.js';
+import { childForm } from './children.js';
 
 const ACTIONS = {
   'task-created': ['Created the task', ''], 'task-claimed': ['Claimed the task', 'accent'], 'task-updated': ['Edited the task', ''],
@@ -338,7 +339,9 @@ export async function detail(ctx, { pid, tid }) {
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Depends on')),
       h('ul', { class: 'panel-body open-items' }, brief.depends_on.map((d) => h('li', null, h('a', { href: ctx.href(`/p/${pid}/t/${d.id}`) }, d.title), ' ', statusChip(d.status))))) : null,
     taskFilesPanel(ctx, { pid, tid, task: t, project }),
-    (ownerToolsFold = h('details', { class: 'fold' }, h('summary', null, 'Owner tools'),
+    // kittrial-5bb.434: a coordinator adds a child task or a decision here (null for everybody else).
+    childForm(ctx, project, t, (made) => { if (made && made.id) ctx.go(`/p/${pid}/t/${made.id}`); else reload(); }),
+    (ownerToolsFold =h('details', { class: 'fold' }, h('summary', null, 'Owner tools'),
       h('div', { class: 'fold-body' },
         brief.lifecycle ? h('div', { id: 'lifecycle-facts' }, lifecyclePanel(ctx, project, t)) : null,
         owner && !project.archived ? assignmentForm(ctx, pid, tid, t) : null,
@@ -357,6 +360,9 @@ export async function detail(ctx, { pid, tid }) {
   return h('div', { class: 'stack' },
     pageHead({ crumbs: [{ label: 'Projects', href: ctx.href('/projects') }, { label: project.name, href: ctx.href('/p/' + pid) }, { label: t.id }], title: t.title, actions }),
     summaryStrip,
+    // kittrial-5bb.425 part 2: the task's own req: and design: tokens, resolved by the server (TRACEABILITY_DESIGN §5.2).
+    brief.description_pointers ? h('section', { class: 'panel', 'aria-label': 'What this task cites', 'data-description-pointers': '1' },
+      h('h3', { class: 'small' }, 'Cites'), contextPointers(brief.description_pointers)) : null,
     nextBanner,
     h('div', { class: 'detail' },
       h('div', { class: 'stack' }, editPanel, wantedPanel, briefPanel, reviewPanel, activityPanel, checkpointFold, writer ? commentForm(ctx, pid, tid) : null),

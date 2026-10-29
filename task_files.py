@@ -39,6 +39,8 @@ import uuid
 from pathlib import Path
 
 import record_json
+import regular_file
+from admin import read_regular_text
 
 FOLDER = '.task-files'
 TMP = 'tmp'
@@ -49,6 +51,11 @@ WITHDRAWN_PREFIX = 'Kind: task-file-withdrawn-v1\n'
 TO_WORKER = 'to-worker'
 FROM_WORKER = 'from-worker'
 DIRECTIONS = (TO_WORKER, FROM_WORKER)
+#: kittrial-5bb.418: the stored document of a `design.<scope>` reference revision, journaled on the entry's
+#: anchor by design_documents (never by an upload, which may name only DIRECTIONS). A journal direction only:
+#: backup, restore, verify and the project's byte limit count it; purge keeps it whatever its anchor's status.
+DESIGN = 'design'
+JOURNAL_DIRECTIONS = DIRECTIONS + (DESIGN,)
 NAME_LIMIT = 128
 NOTE_LIMIT = 1000
 REASON_LIMIT = 1000
@@ -78,6 +85,8 @@ LIMIT_DEFAULTS = {
     # The defaults let 25 MiB take 60 s + 800 s.
     'min_transfer_bytes_per_second': 32 * 1024,
     'transfer_grace_seconds': 60,
+    # kittrial-5bb.418: how many distinct design documents (design.<scope> revisions' stored files) a project holds.
+    'max_design_documents': 200,
 }
 #: The two that may be 0 (keep no disk free) without meaning "nothing at all".
 LIMIT_ZERO_ALLOWED = ('min_free_bytes',)
@@ -154,7 +163,7 @@ def limits(root, warnings=None):
 
 
 # -- names ----------------------------------------------------------------------------------------
-def clean_name(name):
+def clean_name(name, *, stored=False):
     """The display name, checked: a basename of 1-128 characters, or :class:`Refusal` 422.
 
     The same rule ``http_service.validate_attachments`` applies (no ``/`` or ``\\``, no control
@@ -170,17 +179,17 @@ def clean_name(name):
             or any(ord(c) < 32 or ord(c) == 127 for c in name):
         raise Refusal(422, 'invalid', 'A file name must be a plain name: no / or \\, no control '
                       'characters, not . or .., and no leading or trailing space.')
-    plain(name, 'A file name')
+    plain(name, 'A file name', stored=stored)
     return name
 
 
-def plain(value, label):
+def plain(value, label, *, stored=False):
     # r2 (review s3): the kit's rule for text other people read (review_workflow.plain_text): no control, bidi,
     # zero-width, C1, tag or variation-selector characters. A name with a right-to-left override that shows as
     # invoiceexe.jpg is refused, and so is a note or a reason that hides text.
     from review_workflow import plain_text
     try:
-        plain_text(value, label)
+        plain_text(value, label, stored=stored)
     except ValueError as refused:
         raise Refusal(422, 'invalid', str(refused) + '.') from None
     return value
@@ -319,17 +328,14 @@ def open_blob(project, sha256):
     path = blob_path(project, sha256)
     if path is None:
         raise Refusal(409, 'conflict', 'The stored file is missing: its record is here, its bytes are not.')
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
     try:
-        descriptor = os.open(str(path), flags)
+        return regular_file.open_regular(path)
     except FileNotFoundError:
         raise Refusal(409, 'conflict', 'The stored file is missing: its record is here, its bytes are not.') from None
+    except ValueError:
+        raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file is not a regular file')) from None
     except OSError:
         raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file cannot be opened')) from None
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode) or os.path.islink(str(path)):
-        os.close(descriptor)
-        raise Refusal(503, 'unavailable', UNUSABLE % (FOLDER, 'a stored file is not a regular file'))
-    return os.fdopen(descriptor, 'rb')
 
 
 def referenced(project):
@@ -354,8 +360,9 @@ def referenced(project):
 
 
 def _purged_file(path):
+    from admin import read_regular_text
     try:
-        entry = record_json.loads(Path(path).read_text(encoding='utf-8'))
+        entry = record_json.loads(read_regular_text(path))
     except (OSError, ValueError, UnicodeError):
         return False
     return isinstance(entry, dict) and bool(entry.get('purged'))
@@ -419,10 +426,10 @@ def _valid_entry(entry, task, sha256):
         return False
     if type(entry.get('bytes')) is not int or entry['bytes'] < 0:
         return False
-    if entry.get('direction') not in DIRECTIONS or not isinstance(entry.get('by'), str):
+    if entry.get('direction') not in JOURNAL_DIRECTIONS or not isinstance(entry.get('by'), str):
         return False
     try:
-        clean_name(entry.get('name'))
+        clean_name(entry.get('name'), stored=True)
     except Refusal:
         return False
     withdrawn = entry.get('withdrawn')
@@ -444,13 +451,7 @@ def read_entry(project, task, sha256):
     if path is None:
         return None
     try:
-        info = os.lstat(str(path))
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(info.st_mode):
-        return None
-    try:
-        entry = record_json.loads(path.read_text(encoding='utf-8'))
+        entry = record_json.loads(read_regular_text(path))
     except (OSError, ValueError, UnicodeError):
         return None
     return entry if _valid_entry(entry, task, sha256) else None
@@ -486,8 +487,12 @@ def entries(project, task):
 
 
 def live(project, task):
-    """The task's files a person may be shown: journal entries not withdrawn (a purged one is shown as purged)."""
-    return [entry for entry in entries(project, task) if entry.get('withdrawn') is None]
+    """The task's files a person may be shown: journal entries not withdrawn (a purged one is shown as purged).
+
+    kittrial-5bb.418 review: a design document's entry (direction `design`, on a reference anchor) is never a
+    task file: no list shows it and no file route serves it, on SSH as on HTTP (which refuses anchors)."""
+    return [entry for entry in entries(project, task) if entry.get('withdrawn') is None
+            and entry.get('direction') != DESIGN]
 
 
 def held(project, task):
@@ -731,6 +736,9 @@ def apply(payload, actor, run, project, now, limit=None):
     sha256 = payload['sha256']
     row = _row(run, task)
     current = read_entry(project, task, sha256)
+    if current is not None and current.get('direction') == DESIGN:
+        # kittrial-5bb.418 review: a design document's journal entry is not a task file; no file route touches it.
+        raise Refusal(404, 'not_found', 'No such file on this task.')
     if operation.endswith('-record'):
         if operation == 'assignee-record' and not is_assignee(row, actor):
             raise Refusal(403, 'forbidden', 'Only the task\'s current assignee attaches files from the worker, '
@@ -835,7 +843,7 @@ def listing(project, task, may):
 def download_target(project, task, sha256):
     """``(entry, open handle)`` of a live file of ``task``, or :class:`Refusal`; the caller closes the handle."""
     entry = read_entry(project, task, sha256)
-    if entry is None or entry.get('withdrawn') is not None:
+    if entry is None or entry.get('withdrawn') is not None or entry.get('direction') == DESIGN:
         raise Refusal(404, 'not_found', 'No such file on this task.')
     if entry.get('purged'):
         raise Refusal(410, 'gone', purged_sentence(entry))
@@ -943,7 +951,7 @@ def all_entries(project, problems=None):
                         bad(relative, sha256, 'a symlink or not a regular file')
                         continue
                     try:
-                        entry = record_json.loads(Path(item.path).read_text(encoding='utf-8'))
+                        entry = record_json.loads(read_regular_text(item.path))
                     except (OSError, ValueError, UnicodeError):
                         bad(relative, sha256, 'not readable as JSON')
                         continue
@@ -964,7 +972,7 @@ def _problems_sentence(problems):
 def _hash_file(path):
     digest = hashlib.sha256()
     count = 0
-    with open(str(path), 'rb') as handle:
+    with regular_file.open_regular(path) as handle:
         while True:
             chunk = handle.read(STEP)
             if not chunk:
@@ -982,7 +990,7 @@ def _copy_hashed(source, target):
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
     descriptor = os.open(str(temp), flags, 0o600)
     try:
-        with os.fdopen(descriptor, 'wb') as out, open(str(source), 'rb') as handle:
+        with os.fdopen(descriptor, 'wb') as out, regular_file.open_regular(source) as handle:
             while True:
                 chunk = handle.read(STEP)
                 if not chunk:
@@ -1037,7 +1045,7 @@ def _old_manifest(path):
     try:
         if not stat.S_ISREG(os.lstat(str(path)).st_mode):
             return None
-        manifest = record_json.loads(path.read_text(encoding='utf-8'))
+        manifest = record_json.loads(read_regular_text(path))
     except (OSError, ValueError, UnicodeError):
         return None
     return manifest if isinstance(manifest, dict) else None
@@ -1124,7 +1132,7 @@ def backup_folder(project, target, now=None, lock=None):
         for relative, entry in entries_now:
             parts = relative.split('/')
             task_dir = _plain_dir(target / RECORDS / parts[1], True, 'A task-files backup records folder')
-            data = (Path(source) / relative).read_bytes()
+            data = read_regular_text(Path(source) / relative, raw=True)
             dest = task_dir / parts[2]
             temp = dest.with_name('.t' + uuid.uuid4().hex[:16])
             with open(str(temp), 'xb') as handle:
@@ -1138,7 +1146,7 @@ def backup_folder(project, target, now=None, lock=None):
             digest = kept_before.get(item['path'])
             copy = target / item['path']
             if digest and os.path.isfile(str(copy)) and not os.path.islink(str(copy)):
-                if hashlib.sha256(copy.read_bytes()).hexdigest() == digest:
+                if hashlib.sha256(read_regular_text(copy, raw=True)).hexdigest() == digest:
                     carried = {'path': item['path'], 'sha256': digest}
                     records.append(carried)
             problems.append({'sha256': item['sha256'] or '-', 'path': item['path'],
@@ -1180,7 +1188,7 @@ def restore_folder(source, project):
     try:
         if not stat.S_ISREG(os.lstat(str(manifest_path)).st_mode):
             raise ValueError('not a file')
-        manifest = record_json.loads(manifest_path.read_text(encoding='utf-8'))
+        manifest = record_json.loads(read_regular_text(manifest_path))
         blobs = manifest['blobs']
         records = manifest['record_files']
         assert isinstance(blobs, list) and isinstance(records, list)
@@ -1207,8 +1215,8 @@ def restore_folder(source, project):
             continue
         path = source / relative
         try:
-            data = path.read_bytes() if not os.path.islink(str(path)) else None
-        except OSError:
+            data = read_regular_text(path, raw=True) if not os.path.islink(str(path)) else None
+        except (OSError, ValueError):
             data = None
         if data is None or hashlib.sha256(data).hexdigest() != record.get('sha256'):
             problems.append('the record %s is missing or changed in the backup' % relative)
@@ -1231,7 +1239,7 @@ def restore_folder(source, project):
         dest = task_dir / parts[2]
         temp = dest.with_name('.t' + uuid.uuid4().hex[:16])
         with open(str(temp), 'xb') as handle:
-            handle.write((source / relative).read_bytes())
+            handle.write(read_regular_text(source / relative, raw=True))
         os.replace(str(temp), str(dest))
     return {'status': 'restored', 'files': len(blobs), 'bytes': total, 'records': len(records), 'problems': []}
 
@@ -1341,6 +1349,11 @@ def purge_plan(project, closed_before, rows, now_seconds=None):
     needed, candidates = set(), []
     for relative, entry in entries_now:
         if entry.get('purged'):
+            continue
+        if entry.get('direction') == DESIGN:
+            # kittrial-5bb.418: a design document is what a reference revision selected; its anchor is a closed
+            # catalog row by construction, and the revision never stops needing the bytes.
+            needed.add(entry['sha256'])
             continue
         row = rows.get(entry['task'])
         why = 'withdrawn' if entry.get('withdrawn') is not None else (

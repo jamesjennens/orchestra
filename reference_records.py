@@ -74,12 +74,16 @@ carry `trust`. The due-soon window is fixed at 30 days (a per-project setting is
 deferred to slice 2 with its configuration store).
 """
 import calendar
+import hashlib
 import json
 import re
 import time
 from datetime import date, timedelta
 from urllib.parse import urlsplit
 
+import contextvars
+
+import design_documents
 import keyed_entries
 import keyed_records as core
 from briefing import clip
@@ -131,11 +135,12 @@ ATTESTATION_LINE_MAX = 300
 ATTESTED_REVIEW_MONTHS = 6
 # What a reader is told the authority is. `repository` and `url` are pointers a person
 # can follow; `attested` is provenance only.
-AUTHORITY_KINDS = {'repo-path': 'repository', 'url': 'url', 'attestation': 'attested', 'decision': 'decision'}
+AUTHORITY_KINDS = {'repo-path': 'repository', 'url': 'url', 'attestation': 'attested', 'decision': 'decision',
+                   'repo-document': 'repository'}
 # The record version each authority type is written under. A type added after `decision`
 # is written under 3 as well: from version 3 on, a reader that does not know a type reads
 # the entry `unsupported` (`unsupported_reason`), so no further version is needed for one.
-AUTHORITY_VERSION = {'repo-path': 1, 'url': 1, 'attestation': 2, 'decision': 3}
+AUTHORITY_VERSION = {'repo-path': 1, 'url': 1, 'attestation': 2, 'decision': 3, 'repo-document': 3}
 ENTRY_PREFIXES = {1: ENTRY_PREFIX, 2: ENTRY_V2_PREFIX, 3: ENTRY_V3_PREFIX}
 AUTHORITY_TYPE = re.compile(r'[a-z][a-z0-9-]{0,31}')
 ENTRY_FIELDS = ('schema_version', 'key', 'revision', 'title', 'statement', 'authority', 'owner',
@@ -143,6 +148,10 @@ ENTRY_FIELDS = ('schema_version', 'key', 'revision', 'title', 'statement', 'auth
 CONTENT_FIELDS = ('key', 'title', 'statement', 'authority', 'owner', 'review_by', 'tags', 'decisions')
 LIST_LIMIT_MAX = 100
 ANCHOR_TITLE = 'Reference %s'
+#: kittrial-5bb.418: the project folder of the write in progress, for document_acceptance_rules (the
+#: acceptance hook is given the native runner only). Set by apply_native and apply_batch, the entry points of
+#: every reference write; a repo-document acceptance without it is refused.
+_PROJECT = contextvars.ContextVar('reference_project', default=None)
 ANCHOR_DESCRIPTION = ('Reference catalog entry %s. Read it with `ref get %s`; its record comments are '
                       'authoritative. This anchor is not a work item.')
 DUE_ORDER = {'expired': 0, 'due-soon': 1, 'unset': 2, 'ok': 3}
@@ -194,25 +203,47 @@ def _one_line(value, where, limit):
     return value
 
 
-def valid_authority(value):
-    """Exactly one closed `repo-path`, `url` or `attestation` object (.41 3.6), time-independent rules."""
+def _repository_location(value):
+    """The path, commit and anchor rules a repo-path and a repo-document authority share."""
+    path = value.get('path')
+    if not isinstance(path, str) or not path or len(path) > PATH_MAX or '\\' in path \
+            or path.startswith(('/', '~')) or re.match(r'[A-Za-z]:', path) \
+            or any(part in ('', '.', '..') for part in path.split('/')):
+        raise ValueError('authority.path must be a relative / path inside the repository, with no .. '
+                         'segment, ~ or drive')
+    if 'commit' in value and (not isinstance(value['commit'], str) or not COMMIT.fullmatch(value['commit'])):
+        raise ValueError('authority.commit must be a 40-character lowercase hex revision')
+    if 'anchor' in value:
+        _bounded_text(value['anchor'], 'authority.anchor', ANCHOR_MAX)
+        if any(ord(character) < 32 for character in value['anchor']):
+            raise ValueError('authority.anchor must be one line')
+
+
+def valid_authority(value, *, stored=True):
+    """Exactly one closed authority object; stored records keep the legacy plain-text set."""
     if not isinstance(value, dict):
         raise ValueError('authority must be an object of type repo-path, url or attestation')
     kind = value.get('type')
     if kind == 'repo-path':
         core.checked_fields(value, ('type', 'path', 'commit', 'anchor'), 'authority')
-        path = value.get('path')
-        if not isinstance(path, str) or not path or len(path) > PATH_MAX or '\\' in path \
-                or path.startswith(('/', '~')) or re.match(r'[A-Za-z]:', path) \
-                or any(part in ('', '.', '..') for part in path.split('/')):
-            raise ValueError('authority.path must be a relative / path inside the repository, with no .. '
-                             'segment, ~ or drive')
-        if 'commit' in value and (not isinstance(value['commit'], str) or not COMMIT.fullmatch(value['commit'])):
-            raise ValueError('authority.commit must be a 40-character lowercase hex revision')
-        if 'anchor' in value:
-            _bounded_text(value['anchor'], 'authority.anchor', ANCHOR_MAX)
-            if any(ord(character) < 32 for character in value['anchor']):
-                raise ValueError('authority.anchor must be one line')
+        _repository_location(value)
+    elif kind == 'repo-document':
+        # kittrial-5bb.418: a repository file whose exact bytes the server stores (design_documents).
+        core.checked_fields(value, ('type', 'path', 'commit', 'anchor', 'sha256'), 'authority')
+        if 'commit' not in value or 'sha256' not in value:
+            raise ValueError('a repo-document authority needs its pinned commit and the document sha256')
+        _repository_location(value)
+        # Review of part 1: a repo-document path is one plain line (no NUL, newline or other C0/C1 control). The
+        # repo-path rule is left as it was: existing entries are validated on every read, so tightening it could
+        # turn a stored entry malformed.
+        if any(ord(character) < 32 or 127 <= ord(character) < 160 for character in value['path']):
+            raise ValueError('authority.path of a repo-document must not contain a control character')
+        # Review r2 (b2): nor a bidi, zero-width, line-separator, tag or other invisible character: the kit's rule
+        # for text other people read, as task-file names apply it (task_files.plain).
+        from review_workflow import plain_text
+        plain_text(value['path'], 'authority.path of a repo-document', stored=stored)
+        if not isinstance(value['sha256'], str) or not design_documents.SHA256.fullmatch(value['sha256']):
+            raise ValueError('authority.sha256 must be the 64-character lowercase hex sha256 of the document')
     elif kind == 'url':
         core.checked_fields(value, ('type', 'url', 'retrieved'), 'authority')
         url = value.get('url')
@@ -241,7 +272,7 @@ def valid_authority(value):
         if not isinstance(value.get('id'), str) or not ISSUE_ID.fullmatch(value['id']):
             raise ValueError('authority.id must be the id of a native decision issue')
     else:
-        raise ValueError('authority.type must be repo-path, url, attestation or decision')
+        raise ValueError('authority.type must be repo-path, url, attestation, decision or repo-document')
     return value
 
 
@@ -251,6 +282,10 @@ def attested(record):
 
 def decided(record):
     return record['authority']['type'] == 'decision'
+
+
+def documented(record):
+    return record['authority']['type'] == 'repo-document'
 
 
 def valid_tags(value):
@@ -283,8 +318,11 @@ def validate_entry(record):
     # only that, so no revision can be written both ways.
     if (record['schema_version'] == 2) != attested(record):
         raise ValueError('schema_version 2 is the entry record with an attestation authority, and only that')
-    if (record['schema_version'] == 3) != decided(record):
-        raise ValueError('schema_version 3 is the entry record with a decision authority, and only that')
+    if (record['schema_version'] == 3) != (decided(record) or documented(record)):
+        raise ValueError('schema_version 3 is the entry record with a decision or repo-document authority, and only '
+                         'that')
+    if documented(record) and not design_documents.is_design_key(record['key']):
+        raise ValueError('a repo-document authority belongs to a design.<scope> entry')
     valid_owner(record['owner'])
     if record['review_by'] is not None:
         _date(record['review_by'], 'review_by')
@@ -395,7 +433,21 @@ def _validate_content(payload):
             raise ValueError('reference payload is missing field ' + name)
     _bounded_text(payload['title'], 'title', TITLE_MAX)
     _bounded_text(payload['statement'], 'statement', STATEMENT_MAX)
-    valid_authority(payload['authority'])
+    valid_authority(payload['authority'], stored=False)
+    # kittrial-5bb.418 (Q3): a design.<scope> revision written from this kit on carries its document. The
+    # repo-path design entries written before stay readable (their sections unchecked, their state unverified).
+    if design_documents.is_document_authority(payload['authority']):
+        # A written repo-document path also refuses every separator, private-use, surrogate or unassigned character;
+        # format characters use plain_text's fixed set above. A WRITE rule only: Unicode categories move between
+        # Python versions, and a rule read back on every read must not turn a stored entry malformed after an upgrade.
+        import unicodedata
+        if any(unicodedata.category(character) in ('Zl', 'Zp', 'Co', 'Cs', 'Cn')
+               for character in payload['authority']['path']):
+            raise ValueError('authority.path of a repo-document must be plain text (no invisible or unassigned '
+                             'characters)')
+    if design_documents.is_design_key(payload.get('key')) != design_documents.is_document_authority(payload['authority']):
+        raise ValueError('a design.<scope> entry is written with a repo-document authority (its document attached), '
+                         'and a repo-document authority only on a design.<scope> entry')
     valid_owner(payload['owner'])
     if payload.get('review_by') is not None:
         _date(payload['review_by'], 'review_by')
@@ -531,6 +583,29 @@ def acceptance_rules(record, acceptance, run):
         attestation_acceptance_rules(record, acceptance, run)
     elif decided(record):
         decision_acceptance_rules(record, acceptance, run)
+    elif documented(record):
+        document_acceptance_rules(record, run)
+
+
+def document_acceptance_rules(record, run):
+    """kittrial-5bb.418 (TRACEABILITY_DESIGN §5.1 step 3): accept a repo-document revision only when the
+    stored bytes still hash to `authority.sha256`, exactly the index derived from them is on the anchor (at
+    least one, and no lookalike that differs), and the front block's scope is the key's (derive_index). Each
+    refusal comes before any write."""
+    project = _PROJECT.get()
+    if project is None:
+        raise ValueError('a design document can be accepted only where its stored bytes can be read')
+    authority = record['authority']
+    text = design_documents.read_document(project, authority['sha256']).decode('utf-8')
+    derived = design_documents.derive_index(text, record['key'], authority['path'], authority['commit'])
+    row, _ = KIND.anchor_for(KIND.read_key_rows(run, record['key']), record['key'])
+    found = design_documents.indexes_for(row, record['key'], authority)
+    if not found:
+        raise ValueError('the design document of %s has no index on its anchor; revise it to write one'
+                         % record['key'])
+    if any(index != derived for index in found):
+        raise ValueError('an index on the anchor of %s is not the one derived from its stored document; it is not '
+                         'accepted (an operator removes the stray record)' % record['key'])
 
 
 def attestation_acceptance_rules(record, acceptance, run):
@@ -659,7 +734,8 @@ def validate_payload(payload, operator=False, web_coordinator=False):
 
 
 def apply_native(payload, actor, run, project, operator=False, operators=None,
-                 web_coordinator=False, party_check=None, web_service=False):
+                 web_coordinator=False, party_check=None, web_service=False, document=None,
+                 document_limits=None):
     """Caller holds the canonical project lock; run(argv) invokes pinned bd.
 
     The contributor route (`operator=False`) proposes and revises drafts. The operator
@@ -668,11 +744,57 @@ def apply_native(payload, actor, run, project, operator=False, operators=None,
     the deployment allowlist, checked before any journal or native read on the host route.
     On both routes it decides which operator voids apply (the endpoint supplies it to
     contributors).
+
+    kittrial-5bb.418: `document` is the text of the design document a `design.<scope>`
+    propose or revise carries (its repo-document authority names its sha256); it is
+    checked, stored and indexed here (`_write_document`). `document_limits` are the
+    installation's task-files limits (task_files.limits), the defaults when None.
     """
+    token = _PROJECT.set(project)
+    try:
+        return _apply_native(payload, actor, run, project, operator, operators, web_coordinator, party_check,
+                             web_service, document, document_limits)
+    finally:
+        _PROJECT.reset(token)
+
+
+def _document_payload(payload, document):
+    """Which writes carry a document, refused before any read or write when they do not match."""
+    operation = payload.get('operation') if isinstance(payload, dict) else None
+    authority = payload.get('authority') if isinstance(payload, dict) else None
+    carries = design_documents.is_document_authority(authority)
+    if operation in ('propose', 'revise') and carries:
+        if document is None:
+            raise ValueError('a repo-document authority is written with its document: send the design document '
+                             '(the web form\'s file, or ref %s --document-from-git)' % operation)
+        return True
+    if carries and operation == 'draft':
+        raise ValueError('a design document is proposed and then accepted; a direct accepted revision cannot carry one')
+    if document is not None:
+        raise ValueError('only a design.<scope> propose or revise with a repo-document authority carries a document')
+    return False
+
+
+def _apply_native(payload, actor, run, project, operator, operators, web_coordinator, party_check, web_service,
+                  document, document_limits):
     seen = {}
-    outcome = KIND.apply_native(payload, actor, run, project, operator=operator,
-                                operators=operators, web_coordinator=web_coordinator,
-                                party_check=party_check, seen=seen, web_service=web_service)
+    stored = None
+    if _document_payload(payload, document):
+        stored = _store_document(payload, project, document, document_limits)
+    try:
+        outcome = KIND.apply_native(payload, actor, run, project, operator=operator,
+                                    operators=operators, web_coordinator=web_coordinator,
+                                    party_check=party_check, seen=seen, web_service=web_service)
+    except ValueError as error:
+        # A refusal wrote no revision: the bytes this call stored are removed again (discard keeps a blob
+        # any journal entry names). Only a write whose native outcome is uncertain keeps them, decided by
+        # its type (review b1: a refusal's message can carry caller text); its retry sends the same document.
+        if stored is not None and stored[2] and not isinstance(error, core.UncertainOutcome):
+            import task_files
+            task_files.discard(project, stored[0])
+        raise
+    if stored is not None:
+        _write_document(payload, actor, run, project, outcome, stored)
     if web_coordinator or web_service:
         op = payload.get('operation') if isinstance(payload, dict) else None
         if op in ('accept', 'retire'):
@@ -696,7 +818,64 @@ def apply_batch(payload, actor, run, project, operators=None, lock=None):
     decision, as `capability-apply` does (`AnchoredKind.apply_batch`). Each item is one
     ordinary accept with its own receipt and its own hold of the coordination lock; a
     refused item does not stop the others."""
-    return KIND.apply_batch(payload, actor, run, project, operators=operators, lock=lock)
+    token = _PROJECT.set(project)
+    try:
+        return KIND.apply_batch(payload, actor, run, project, operators=operators, lock=lock)
+    finally:
+        _PROJECT.reset(token)
+
+
+def _store_document(payload, project, document, limits):
+    """Check a design document completely, then store its bytes; returns (sha256, data, created).
+
+    Every bound and the index are checked before a byte is written, so a refused document
+    leaves nothing behind (TRACEABILITY_DESIGN §5.1 steps 1-2)."""
+    import task_files
+    valid_key(payload.get('key'))
+    if not design_documents.is_design_key(payload['key']):
+        raise ValueError('a repo-document authority belongs to a design.<scope> entry')
+    authority = valid_authority(payload['authority'])
+    _validate_content(payload)              # the write-time content rules too, before a byte is stored
+    data = design_documents.document_bytes(document)
+    if hashlib.sha256(data).hexdigest() != authority['sha256']:
+        raise ValueError('the document sent is not the one authority.sha256 names (its sha256 is %s)'
+                         % hashlib.sha256(data).hexdigest())
+    design_documents.derive_index(document, payload['key'], authority['path'], authority['commit'])
+    design_documents.check_room(project, data, dict(task_files.LIMIT_DEFAULTS, **(limits or {})))
+    sha256, created = design_documents.store_blob(project, data)
+    return sha256, data, created
+
+
+def _write_document(payload, actor, run, project, outcome, stored):
+    """After the revision: journal the stored bytes on the anchor and write the server-derived index,
+    each only when it is not already there (a retry finishes what an interrupted write left)."""
+    sha256, data, _ = stored
+    anchor, key, authority = outcome['native_id'], payload['key'], payload['authority']
+    at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    design_documents.journal(project, anchor, key, outcome.get('revision', 1), sha256, len(data), actor, at)
+    index = design_documents.derive_index(data.decode('utf-8'), key, authority['path'], authority['commit'])
+    row, _ = KIND.anchor_for(KIND.read_key_rows(run, key), key)
+    if index not in design_documents.indexes_for(row, key, authority):
+        run(['comments', 'add', anchor, design_documents.index_body(index), '--json'])
+    outcome['document'] = {'sha256': sha256, 'bytes': len(data), 'index_sha256': index['sha256'],
+                           'headings': len(index['headings'])}
+
+
+def write_payload_and_document(args, attachments, commands=keyed_entries.CONTRIBUTOR_OPERATIONS):
+    """`ref propose|revise --file entry.json [--document DOC]`: the payload, and the document text or None.
+
+    The client sends the design document as a second attachment whose flag is `--document`, its exact
+    bytes decoded as UTF-8 (client.py, --document-from-git). It is taken out before the payload is read."""
+    document, rest = None, []
+    for token in args:
+        item = (attachments or {}).get(token.partition(':')[2]) if token.startswith('@attachment:') else None
+        if isinstance(item, dict) and item.get('flag') == '--document':
+            if document is not None or not isinstance(item.get('text'), str):
+                raise ValueError('ref takes at most one --document')
+            document = item['text']
+            continue
+        rest.append(token)
+    return write_payload(rest, attachments, commands=commands), document
 
 
 def reconcile(project, operation_id, actor, reason, disposition, run, issue_id=None, operators=None):
@@ -835,7 +1014,7 @@ def _record_view(record, accepted=False, current=None):
     return view
 
 
-def get(rows, key, operators, current=None, web_service=False):
+def get(rows, key, operators, current=None, web_service=False, verifiers=None):
     """`ref get KEY`: found through the lookup label, then the record's own key must match.
 
     A malformed or unsupported entry is returned with that state (its key is known only
@@ -856,6 +1035,10 @@ def get(rows, key, operators, current=None, web_service=False):
               'anchors': entry.get('duplicate_anchors', []),
               'coverage': 'newest accepted revision and its acceptance evidence; unresolved drafts are returned '
                           'in proposed'}
+    verification = document_verification(rows, entry, operators, verifiers)
+    if verification is not None:
+        # kittrial-5bb.418: verified, unverified or design-drift (TRACEABILITY_DESIGN §5.1 step 4).
+        result['verification'] = verification
     if web_service:
         result.update(
             proposer=entry.get('proposer'), acceptor=entry.get('acceptor'),
@@ -873,6 +1056,8 @@ def get(rows, key, operators, current=None, web_service=False):
 def _list_item(entry, current=None, web_service=False):
     source = entry.get('candidate') or entry['record'] or entry['proposed'] or {}
     waiting = entry.get('proposed') is not None and entry['state'] in ('draft-only', 'accepted')
+    proposed = entry.get('proposed') or {}
+    record = entry.get('record') or {}
     item = {'key': entry['key'], 'title': (source.get('title') or entry.get('title') or '')[:TITLE_MAX], 'state': entry['state'],
             'owner': source.get('owner'), 'review_by': source.get('review_by') if entry['record'] else None,
             'proposed_review_by': (entry['proposed'] or {}).get('review_by'),
@@ -883,6 +1068,16 @@ def _list_item(entry, current=None, web_service=False):
             # is the accepted record: a draft attestation is never shown unmarked.
             'authority_kind': authority_kind(source) if source else None, 'authority_accepted': entry['record'] is not None}
     if web_service:
+        # The authority object itself rides along ONLY for the web waiting queue
+        # (endpoint.py's ref/capability reads run with web_service=False, so the
+        # CLI ref/capability list payloads keep only the authority_kind and
+        # authority_accepted flags above; review notes, r2). The waiting queue's
+        # authority cell prints an attested draft (kittrial-5bb.420 2.3: the cell
+        # read only rec.authority/item.authority and showed a dash although the
+        # draft's attestation was there).
+        item['authority'] = source.get('authority')
+        item['proposed_authority'] = proposed.get('authority')
+        item['record_authority'] = record.get('authority')
         item.update(
             waiting_acceptance=waiting,
             proposed_revision=(entry['proposed'] or {}).get('revision'),
@@ -1376,7 +1571,7 @@ def parse_list_options(args, web_service=False):
 HTTP_WRITE_COMMANDS = ('accept', 'retire')
 
 
-def read(args, run, operators, web_service=False):
+def read(args, run, operators, web_service=False, verifiers=None):
     """`ref get KEY` / `ref list ...` / `ref find PHRASE` / `ref --help`: read-only. `get`
     reads only its key (`read_key_rows`); `list` and `find` read the catalog (`read_rows`).
     `ref misses` is answered by the endpoint itself (it needs the project directory)."""
@@ -1388,7 +1583,7 @@ def read(args, run, operators, web_service=False):
         if len(rest) != 1:
             raise ValueError('ref get takes exactly one KEY')
         valid_key(rest[0])
-        return get(read_key_rows(run, rest[0]), rest[0], operators, web_service=web_service)
+        return get(read_key_rows(run, rest[0]), rest[0], operators, web_service=web_service, verifiers=verifiers)
     if command == 'list':
         return list_entries(read_rows(run), parse_list_options(rest, web_service=web_service), operators,
                             web_service=web_service)
@@ -1420,3 +1615,138 @@ def parse_find_options(args):
     if not FIND_LIMIT[0] <= limit <= FIND_LIMIT[1]:
         raise ValueError('ref find: --limit must be %d..%d' % FIND_LIMIT)
     return phrases[0], limit
+
+
+# -- design documents, part 2 (kittrial-5bb.418): verification, the verification block, the page ---
+
+def _anchor_row(rows, native_id):
+    return next((row for row in rows if isinstance(row, dict) and row.get('id') == native_id), None)
+
+
+def _trusted(operators, verifiers):
+    from capability_verification import trusted_actors
+    return trusted_actors(operators, verifiers)
+
+
+def document_verification(rows, entry, operators, verifiers=None, record=None):
+    """The `verification` block of an entry's accepted repo-document revision, or None."""
+    record = record if record is not None else entry.get('record')
+    if not record or not documented(record):
+        return None
+    row = _anchor_row(rows, entry.get('native_id'))
+    items = design_documents.verifications_for(row, record['key'], record['authority'])
+    return design_documents.derive_verification(items, _trusted(operators, verifiers))
+
+
+def verification_payload(args, attachments):
+    """`ref verify --file payload.json`: one `trace --verify` report."""
+    rest = [token for token in args[1:] if token != '--json']
+    if len(rest) != 1 or not rest[0].startswith('@attachment:'):
+        raise ValueError('ref verify takes --file payload.json')
+    item = (attachments or {}).get(rest[0].partition(':')[2])
+    if not isinstance(item, dict) or item.get('flag') not in ('--file', '-f') or not isinstance(item.get('text'), str):
+        raise ValueError('ref verify takes --file payload.json')
+    payload = parse_json(item['text'])
+    if isinstance(payload, dict):
+        payload = {name: value for name, value in payload.items() if name not in ('operation', 'operation_id')}
+    return design_documents.check_verification_payload(payload)
+
+
+def write_verification(payload, actor, run, operators=None, verifiers=None, route='endpoint'):
+    """Record one report on the accepted repo-document revision it names (§5.1 step 4; Q4).
+
+    `route` is `host` only for `admin.py design-verify`, which requires an actor on the operator
+    allowlist or the verifiers list and writes identity `verified`. Every other route writes an
+    `unverified` report: it can open design-drift (trusted: false, reported_by) and never verify. A
+    report must name the accepted revision's own document, path and commit. A repeat of the same
+    report by the same actor is answered without a write; untrusted reports on one document are
+    bounded."""
+    design_documents.check_verification_payload(payload)
+    key = payload['key']
+    trusted = route == 'host'
+    if trusted and actor not in _trusted(operators, verifiers):
+        raise ValueError('only an actor on the operator allowlist or the verifiers list records a trusted design '
+                         'verification')
+    row, _ = KIND.anchor_for(KIND.read_key_rows(run, key), key)
+    if row is None:
+        raise ValueError('Unknown reference key %s' % key)
+    record = KIND.entry_view(row, operators).get('record')
+    if not record or not documented(record):
+        raise ValueError('%s has no accepted design document to verify' % key)
+    authority = record['authority']
+    if (payload['doc_sha256'], payload['path'], payload['commit']) != \
+            (authority['sha256'], authority['path'], authority['commit']):
+        raise ValueError('the report names a document that is not the accepted revision of %s' % key)
+    existing = design_documents.verifications_for(row, key, authority)
+    if existing:
+        # Review of part 2 (B1): a report is a repeat only when it is the newest one on this document. With a
+        # pinned commit an honest re-check is always identical, so a re-check after a newer report (a fail
+        # filed since) is written and counts.
+        _, item, author = existing[-1]
+        if item['submitter'] == {'actor': actor, 'route': route} and item['result'] == payload['result'] \
+                and item['observed_sha256'] == payload['observed_sha256'] and author == actor:
+            return {'key': key, 'recorded': False, 'result': item['result'], 'identity': item['identity']}
+    if not trusted:
+        # N2: bounded per submitter, passes and fails apart.
+        limit = design_documents.UNTRUSTED_PASSES_PER_SUBMITTER if payload['result'] == 'pass' \
+            else design_documents.UNTRUSTED_FAILS_PER_SUBMITTER
+        mine = sum(1 for _, item, author in existing if item['identity'] != 'verified' and author == actor
+                   and item['result'] == payload['result'])
+        if mine >= limit:
+            raise ValueError('%s already holds %d %s reports by %s for this document; an operator or a listed '
+                             'verifier records the next check' % (key, limit, payload['result'], actor))
+    at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    entry = design_documents.verification_record(payload, actor, route, 'verified' if trusted else 'unverified', at)
+    run(['comments', 'add', row['id'], design_documents.verification_body(entry), '--json'])
+    return {'key': key, 'recorded': True, 'result': entry['result'], 'identity': entry['identity']}
+
+
+def design_page(rows, scope, project, operators, verifiers=None, revision=None):
+    """`ref design SCOPE [--revision N]`: the stored document of design.SCOPE as text, its index and state.
+
+    The accepted revision by default (else the newest draft); `revision` names another. Anything that
+    is not a readable repo-document revision of that key answers the same refusal, so a reader learns
+    nothing from it (hidden equals absent; the HTTP route answers one 404 for all of them)."""
+    missing = ValueError('Design not found')
+    key = design_documents.DESIGN_KEY_PREFIX + scope
+    try:
+        valid_key(key)
+        entry = KIND.find_entry(rows, key, operators, view=lambda row, operators: entry_view(row, operators))
+    except ValueError:
+        raise missing from None
+    row = _anchor_row(rows, entry.get('native_id'))
+    if row is None:
+        raise missing
+    try:
+        revisions = KIND.existing_revisions(KIND.live_row(row, operators)[0])
+    except ValueError:
+        raise missing from None
+    if revision is not None:
+        record = revisions.get(revision)
+    else:
+        record = entry.get('record') or entry.get('proposed')
+    if not record or not documented(record):
+        raise missing
+    authority = record['authority']
+    try:
+        data = design_documents.read_document(project, authority['sha256'])
+        text = data.decode('utf-8')
+        derived = design_documents.derive_index(text, key, authority['path'], authority['commit'])
+    except ValueError:
+        raise missing from None
+    stored = design_documents.indexes_for(row, key, authority)
+    index_state = 'missing' if not stored else 'matches' if all(index == derived for index in stored) else 'differs'
+    # Review of part 2 (N4): the page places the server's anchors by line, so a reader never re-implements the
+    # heading rule (capabilities.markdown_headings: 1-based line numbers, in the index's order).
+    from capabilities import markdown_headings
+    heading_lines = [item[0] for item in markdown_headings(data)][:len(derived['headings'])]
+    accepted = entry.get('record') is not None and entry['record'].get('sha256') == record.get('sha256')
+    return {'schema_version': 1, 'key': key, 'scope': scope, 'revision': record['revision'],
+            'acceptance_state': record['acceptance_state'], 'accepted': accepted,
+            'record_sha256': record['sha256'], 'title': record['title'], 'authority': dict(authority),
+            'verification': design_documents.derive_verification(
+                design_documents.verifications_for(row, key, authority), _trusted(operators, verifiers))
+            if record['acceptance_state'] != 'draft' else None,
+            'index': derived, 'index_state': index_state, 'heading_lines': heading_lines, 'document': text,
+            'trust': 'data',
+            'revisions': sorted(number for number, item in revisions.items() if documented(item))}

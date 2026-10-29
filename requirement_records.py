@@ -82,7 +82,7 @@ from export_requirements import (ACCEPTANCE_PREFIX, REVISION_PREFIX, parse_json,
                                  revision_comment)
 from keyed_records import (ACCEPTANCE_EVIDENCE_FIELDS, RECEIPT_STATUSES,
                            RECONCILE_RELEASABLE, bind_acceptance, bound_acceptance,
-                           find, latest_revision, read_rows, validate_receipt)
+                           find, latest_revision, read_host_json, read_rows, validate_receipt)
 from requirements import canonical_bytes, content_hash, load_json
 
 OPERATIONS = ('draft', 'revise')
@@ -319,6 +319,32 @@ def existing_acceptances(row, operators=None):
             raise ValueError('Conflicting host and owner requirement acceptance evidence')
         result[revision] = evidence
     return result
+
+
+def assigned_state(row, operators=None):
+    """What an assigned requirement record asks of its assignee (kittrial-5bb.433), from its own ledger only.
+
+    `accepted`: the newest revision is accepted, by the same `resolved_acceptance` the requirements read uses,
+    and no owner state ended it; nothing is pending, so it is not work. `awaiting-acceptance`: the newest
+    revision is a draft (a first draft, or an edit after an acceptance). `withdrawn` or `superseded`: the owner
+    ended it. `unknown`: the ledger cannot be read or does not add up; it stays visible. No label is read: the
+    state labels can lag a revision."""
+    from requirement_owner_records import state_ledger
+    try:
+        existing = existing_revisions(row)
+        if not existing:
+            return 'unknown'
+        terminal, _ = state_ledger(row)
+        if terminal is not None:
+            return terminal['state'] if terminal.get('state') in ('withdrawn', 'superseded') else 'unknown'
+        latest = existing[max(existing)]
+        if latest.get('acceptance_state') == 'draft':
+            return 'awaiting-acceptance'
+        if latest.get('acceptance_state') == 'accepted' and resolved_acceptance(row, latest, operators):
+            return 'accepted'
+    except (ValueError, TypeError, KeyError):
+        pass
+    return 'unknown'
 
 
 def resolved_acceptance(row, record, operators=None):
@@ -749,7 +775,7 @@ def backfill(payload, actor, run, project, operators=None):
     digest = content_hash({'actor': actor, 'payload': payload})
     journal = _journal(project, BACKFILL_JOURNAL)
     receipt = _receipt_path(journal, identity)
-    prior = load_json(receipt) if receipt.exists() else None
+    prior = read_host_json(receipt) if receipt.exists() else None
     if prior is not None and prior.get('sha256') != digest:
         raise ValueError('Operation ID already used for different content or actor')
     rows = read_rows(run)

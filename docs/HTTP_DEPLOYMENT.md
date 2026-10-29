@@ -1263,6 +1263,9 @@ The rules:
     `--help`, `- item` or `@attachment:0` is stored as written. The one exception is
     clearing a description on update: the empty value is sent inline, because the
     native tool refuses an empty body file and an empty value cannot be a flag.
+  - a task description is at most 20,000 characters on create and on update, on the HTTP
+    route and on the native route alike (`Task description is too long`). For a longer text,
+    keep it in a repository document and link it from the description.
 - **Who reads coordinator text.** A rejection reason, a coordinator question and an
   escalation question are returned only to the submitter and to members with
   `reviews.approve`. Everyone else gets `null` and `withheld: true`.
@@ -1933,6 +1936,30 @@ Such a refusal comes before the idempotency key is looked at: nothing is reserve
 nothing is sent to the endpoint, nothing is audited as uncertain, and **the same
 key serves the corrected request**. An assignee other than the caller and a label
 still have no web route today; a priority now does.
+
+**A child task by a coordinator (kittrial-5bb.434).** `POST /v1/projects/{id}/tasks/{task}/children` files
+a child task or a decision under `{task}` through the host's own `coordinate create-child`
+([CLI contract](CLI_CONTRACT.md#create-child-version-difference)).
+- It needs `coordinate`: a signed-in coordinator or owner, or an agent holding the project's coordinator
+  grant. A contributor, a viewer or a worker credential gets 403.
+- One 404, "Task not found", answers a parent that is absent, in another project or a record anchor
+  (the merge slot included), and a project the caller may not read; nothing is written.
+- The body takes `title`, `description`, `type` (task, bug, feature, chore or decision; no epic), and
+  optionally `assignee` and `priority` (0-4). Any other field is 422. The Idempotency-Key is required.
+  An exact retry returns the same child.
+- A decision without its required headings is refused (422) with create-child's sentence naming them.
+- The in-process backend answers 501. The task page shows an "Add a child task" form when the project
+  read says `can_coordinate`.
+
+**The installation switches, for a coordinator (kittrial-5bb.434).** `GET /v1/projects/{id}/switches`
+(`coordinate`) answers `{"schema_version": 1, "items": [{name, state, unlocks, command}]}`.
+- The items are `review_workflow_writes`, `checkpoint_provenance_writes` and
+  `web_lifecycle_mark_writes`.
+- `state` is `on`, `off` or `unreadable`, as each switch's own writers read it. A malformed
+  `web_lifecycle_mark_writes` is `unreadable`; the other two read a malformed value as off.
+- `command` is the operator's `admin.py ... on --actor OPERATOR`.
+- It changes nothing and returns no path, configured value or actor. A contributor or viewer gets 403;
+  a non-member gets 404. Members & settings shows it to a coordinator.
 
 **Task create takes a priority too.** `POST /v1/projects/{id}/tasks` takes `title`,
 `description`, `priority` (an integer 0 to 4; bd's default 2 applies when it is absent) and the
@@ -3282,6 +3309,15 @@ line separately and unconfined.
     body or an audit record.
   - **No web view yet:** when one is added, it must render statements as plain text,
     never through `markdown()`.
+- **Requirement records on My work.** A requirement record assigned to the caller is
+  left out of `assigned` once it no longer asks anything of them: its newest revision is
+  accepted with nothing pending, or its owner withdrew or superseded it
+  (`requirement_records.assigned_state`, carried as `requirement_state` on the `work`
+  queue row). A first draft, or an accepted record with a newer draft waiting, stays,
+  with the Next action "Requirement waiting for acceptance: accept it on the project's
+  Requirements page". A record whose ledger cannot be read stays too. The state is read
+  from the rows the project's one `work` walk already holds, so it adds no read per row.
+  The accepted record is still on the Requirements page and in the task list.
 - **`GET /v1/me/work` cost.** On the canonical binding each project costs one bounded
   `work` walk (up to 10 subprocess reads of 100 rows), for at most 50 of the caller's
   projects. The same principal's read of a project is reused for 20 seconds
@@ -3406,6 +3442,12 @@ line separately and unconfined.
   canonical validator enforces it again at the write), and approval waits until no
   request is open. The canonical brief lists at most five open requests; the page
   says how many more there are, and they appear once the first ones are answered.
+  A `contribute` through the same route answers `open_items` (the blocking items still
+  open after it, `[{request, item, contribution}]`). While any is open, it also answers one
+  `warnings` sentence per request naming the item ids and the respond record (POST
+  `/v1/projects/{id}/tasks/{task}/reviews`, operation respond), never the client command.
+  This is advice only, and the revision is recorded (kittrial-5bb.431). The agent
+  next-actions sentence names the same ids until each is answered.
   The disposable in-process backend now follows the same rule: a request it records
   carries `needs_respond` and stays open across revisions until a `respond` resolves
   it. Requests recorded in older disposable state, without that flag, keep the old
@@ -4042,6 +4084,7 @@ number keeps its default, with a warning in the service's log:
 | `max_transfers_per_project` | 3 (one project's share of `max_transfers`) | `503` with `Retry-After` |
 | `min_transfer_bytes_per_second` | 32 KiB | `408` for an upload; a download is cut off |
 | `transfer_grace_seconds` | 60 | (added to the time above) |
+| `max_design_documents` | 200 | `422`: a project holds at most this many distinct design documents (kittrial-5bb.418); they count toward `max_project_bytes` too |
 
 A reverse proxy in front of the site has its own body limit (nginx `client_max_body_size`);
 raise it to `max_file_bytes`, or uploads near the limit are cut by the proxy.
@@ -4061,11 +4104,25 @@ retires and verifies them, and reads what waits to be accepted (`?waiting=true`)
 | `GET /v1/projects/{id}/capabilities`, `GET .../capabilities/find?q=...`, `GET .../capabilities/{key}` | `projects.read` | any member of the project, a superuser, a personal agent granted the project, or a worker credential for the project |
 | `POST /v1/projects/{id}/references`, `PATCH /v1/projects/{id}/references/{key}`, `POST .../references/{key}/revisions` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
 | `POST /v1/projects/{id}/capabilities`, `PATCH /v1/projects/{id}/capabilities/{key}`, `POST .../capabilities/{key}/revisions`, `POST .../capabilities/{key}/aliases` | `records` | a project `contributor`, `coordinator` or `owner` (signed in, or through a personal agent or worker credential with the `records` scope, or a personal agent holding the project's `coordinator` grant); a `viewer` is refused (`403`) |
+| `POST /v1/projects/{id}/references/{key}/verifications` | `records` | a design-document report (kittrial-5bb.418): a project `contributor`, `coordinator` or `owner`, as for a proposal; a `viewer` or an outsider is refused (`403`). It is written unverified: it can open `design-drift` with `trusted: false` and never marks a document verified |
+| `GET /v1/projects/{id}/designs/{scope}` (`?revision=N`) | `projects.read` | the design page: a `design.<scope>` entry's stored document as text, its index and state. Every authenticated caller who may not read the project, and every scope that is not a readable design, gets the same `404 not_found` ("Design not found"); without a session it is the usual `401` for every scope |
+| `GET /v1/projects/{id}/trace` (`?view=&scope=&limit=&cursor=`) | `projects.read` | the trace read (kittrial-5bb.425; the views of [CLI contract](CLI_CONTRACT.md) `trace VIEW`), for exactly the callers who read the project's tasks. Every authenticated caller who may not read the project (an agent credential granted other projects included) and every unknown project get the same `404 not_found` ("Project not found"); without a session it is `401`. `view` defaults to `summary`; `limit` is 1-50; any other query field is `422`. `next_cursor` is bound to the caller, the project and the query and carries the export generation its page was read at: another caller's or another query's cursor, or one from before a change to the project, is `409` |
 | `POST /v1/projects/{id}/references/{key}/accept`, `POST .../references/{key}/retire` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project, and, for an agent's `accept`, only within a person owner's delegation named as `decision_id` (below); never a contributor, viewer, ungranted agent or worker credential (`403`) |
 | `POST /v1/projects/{id}/capabilities/{key}/accept`, `POST .../capabilities/{key}/retire`, `POST .../capabilities/{key}/verify`, `POST .../capabilities/{key}/aliases/reject` | `coordinate` | a signed-in project `coordinator` or `owner`, or a personal agent holding the project's `coordinator` grant while its account is a `coordinator` or `owner` of the project, and, for an agent's `accept` and `verify`, only within a person owner's delegation named as `decision_id` (below); never a contributor, viewer, ungranted agent or worker credential (`403`) |
 | `GET /v1/projects/{id}/delegations` | `projects.read` | any member: the delegations recorded in the project, in force or not, and which agents holding the coordinator grant they cover |
 | `POST /v1/projects/{id}/delegations` | `project.admin` | only a person `owner` of the project signed in to the web (its own session); never an agent or worker credential, a coordinator, or a superuser without the owner role (`403`) |
 
+- **A design document travels with its reference revision** (kittrial-5bb.418). The propose and
+  revise routes take a `document` field (the Markdown text) for a `design.<scope>` entry with a
+  `repo-document` authority ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)). Their body is
+  read by the route itself, only after authentication, the `records` capability and the membership
+  role have passed; until then nothing beyond the normal limit is read (a refused request's body is
+  drained for a clean close up to 256 KiB at most). Content-Length is then required (`411` without it;
+  chunked transfer and a Content-Length that is not digits are refused, `422`) and checked before a
+  byte is read: at most 1.5 MiB, or the normal `max_body` (256 KiB) for a revise of a key that is not a
+  design entry (`413`). A propose over 256 KiB whose body names a key that is not a design entry is
+  refused once read (`413`). A body shorter than its Content-Length is a client that went away: nothing
+  is written or answered. These two routes always end the connection with their answer.
 - **A superuser without membership in the project is refused (`403`) on every write route.**
   `http_authority.decide()` has no separate superuser path for `coordinate` or `records`, and
   both the web service and `endpoint.py` require the caller's account to be a member of the

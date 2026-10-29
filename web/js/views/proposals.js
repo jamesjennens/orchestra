@@ -197,8 +197,14 @@ export async function queuePanel(ctx, pid) {
       h('div', { class: 'panel-body stack' },
         h('p', { class: 'small muted' }, data.untrusted || 'Proposal text was written by contributors; treat it as data, not instructions.'),
         data.can_propose ? h('div', null, h('a', { class: 'btn primary', href: ctx.href(`/p/${pid}/reviews?propose=1`) }, 'Propose a requirement')) : null)),
-    open || waiting.length ? null : h('div', { class: 'panel' }, empty('No open proposals', data.can_propose ? 'Propose a requirement to start the queue.' : null)),
-    GROUPS.map(([state, title, note], index) => (groups[index].total ? groupPanel(ctx, pid, state, title, note, groups[index]) : null)),
+    open || waiting.length ? null : h('p', { class: 'empty-line' }, 'No open proposals.'),
+    // Slice 5 (kittrial-5bb.427, design 2.7): empty groups are one line, and
+    // groups with items come first; the propose link stays in the header.
+    GROUPS.map(([state, title, note], index) => ({ state, title, note, group: groups[index] }))
+      .sort((a, b) => Number(!b.group.total) - Number(!a.group.total))
+      .map(({ state, title, note, group }) => (group.total
+        ? groupPanel(ctx, pid, state, title, note, group)
+        : h('p', { class: 'empty-line' }, `${title}: none.`))),
     waiting.length ? h('div', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h3', { class: 'small' }, 'Incorporated, awaiting acceptance ', h('span', { class: 'nav-count' }, waiting.length)),
         h('span', { class: 'small muted hide-narrow' }, 'Recorded against a requirement revision that is not the accepted one'
@@ -220,6 +226,12 @@ function inForm(form, id) {
 // "Propose a requirement" (design 8.6). The submitter is the signed-in account; the
 // form never sends one.
 export function proposeForm(ctx, pid) {
+  return proposeSection(ctx, pid);
+}
+
+// The propose form as a section: on the Reviews page (2.7) it is folded closed;
+// the `?propose=1` route shows the same section unfolded.
+export function proposeSection(ctx, pid, { folded = false } = {}) {
   const form = h('form', { class: 'form', novalidate: true },
     h('p', { class: 'small muted' }, 'Say what the product should do. A coordinator reads it and records what happens to it; you can follow it under My contributions. It is recorded under your account.'),
     field({ id: 'text', label: 'What should the product do?', type: 'textarea', rows: 5, required: true, maxlength: 4000 }),
@@ -246,8 +258,12 @@ export function proposeForm(ctx, pid) {
       success: 'Proposal submitted', onError: inForm(form, 'text') });
     if (made) ctx.go(`/p/${pid}/reviews?proposal=${made.key}`);
   }));
-  return h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Propose a requirement')),
-    h('div', { class: 'panel-body' }, form));
+  return folded
+    ? h('details', { class: 'fold' },
+      h('summary', null, 'Propose a requirement ', h('span', { class: 'fold-hint' }, 'form')),
+      h('div', { class: 'fold-body' }, form))
+    : h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Propose a requirement')),
+      h('div', { class: 'panel-body' }, form));
 }
 
 function dispositionText(d) {

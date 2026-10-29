@@ -149,7 +149,173 @@ def _attachments(args):
         i += 1
     return converted,attachments
 
-def _wire(project,actor,args,action,path):
+def _document_from_git(entry,repo):
+    """kittrial-5bb.418: (entry with authority.sha256, document text) for --document-from-git.
+
+    The entry's repo-document authority names the path and commit. The document is git's own object at
+    that commit (never the working tree), refused unless it is a regular file (no symlink, submodule or
+    tree), at most 1 MiB and UTF-8; its bytes are kept exactly (line endings, a byte-order mark). The
+    client ships standalone, so http_client.py holds the same few lines."""
+    authority=entry.get('authority') if isinstance(entry,dict) else None
+    if not isinstance(authority,dict) or authority.get('type')!='repo-document' \
+            or not isinstance(authority.get('path'),str) or not isinstance(authority.get('commit'),str):
+        raise ValueError('--document-from-git needs an entry whose authority is a repo-document with a path and commit')
+    path,commit=authority['path'],authority['commit']
+    def git(*args):
+        done=subprocess.run(['git','--no-optional-locks','-C',repo,*args],capture_output=True,timeout=30,
+                            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        if done.returncode:raise ValueError('git cannot read %s at %s' % (path,commit[:12]))
+        return done.stdout
+    found=[]
+    for item in git('ls-tree','-z','--full-tree',commit,'--',path).split(b'\0'):
+        meta,_,name=item.partition(b'\t')
+        if item and name.decode('utf-8','replace')==path and len(meta.split())==3:found.append(meta.split())
+    if len(found)!=1:raise ValueError('commit %s holds no file %s' % (commit[:12],path))
+    mode,kind,obj=(part.decode('ascii','replace') for part in found[0])
+    if kind!='blob' or mode not in ('100644','100755'):
+        raise ValueError('%s at %s is not a regular file (git mode %s, %s)' % (path,commit[:12],mode,kind))
+    data=git('cat-file','blob',obj)
+    if len(data)>1024*1024:raise ValueError('the design document is %d bytes; the limit is 1 MiB' % len(data))
+    try:text=data.decode('utf-8')
+    except UnicodeDecodeError:raise ValueError('%s at %s is not UTF-8 text' % (path,commit[:12])) from None
+    sha256=hashlib.sha256(data).hexdigest()
+    if authority.get('sha256') not in (None,sha256):
+        raise ValueError('authority.sha256 is not the sha256 of %s at %s (%s)' % (path,commit[:12],sha256))
+    return dict(entry,authority=dict(authority,sha256=sha256)),text
+
+def _git_document(repo,path,commit):
+    """(data, None) for the regular file `path` at `commit`, else (None, reason): a design check's view."""
+    def git(*args):
+        done=subprocess.run(['git','--no-optional-locks','-C',repo,*args],capture_output=True,timeout=30,
+                            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        return done.stdout if done.returncode==0 else None
+    # Review of part 2 (N3): a checkout that does not hold the commit cannot check it: not checked, never a fail.
+    if git('cat-file','-e',commit+'^{commit}') is None:return None,'commit-not-in-checkout'
+    listing=git('ls-tree','-z','--full-tree',commit,'--',path)
+    if listing is None:return None,'missing'
+    found=[]
+    for item in listing.split(b'\0'):
+        meta,_,name=item.partition(b'\t')
+        if item and name.decode('utf-8','replace')==path and len(meta.split())==3:found.append(meta.split())
+    if len(found)!=1:return None,'missing'
+    mode,kind,obj=(part.decode('ascii','replace') for part in found[0])
+    if kind!='blob' or mode not in ('100644','100755'):return None,'not-a-regular-file'
+    data=git('cat-file','blob',obj)
+    if data is None:return None,'missing'
+    return data,None
+
+def _answer(reply):
+    """The JSON an endpoint read or write answered, or its refusal raised as one sentence."""
+    if not isinstance(reply,dict) or reply.get('returncode'):
+        raise ValueError(server_text(str((reply or {}).get('stderr') or 'the endpoint refused'))[:500])
+    return json.loads(reply.get('stdout') or 'null')
+
+def _trace_command(args,config,project,actor,out):
+    """kittrial-5bb.418: `trace --verify [--repo DIR] [--record | --payloads FILE]`; kittrial-5bb.425: `trace VIEW ...`.
+
+    The one part of trace that needs a checkout (TRACEABILITY_DESIGN §5.1 step 4): for every accepted
+    design.<scope> entry with a repo-document authority, read the file at its pinned commit from git's own
+    object and compare its sha256 with the stored document's. `--record` files each result as an unverified
+    report (`ref verify`); `--payloads FILE` writes them for `admin.py design-verify`, the trusted host route."""
+    import tempfile
+    if '--verify' not in args:
+        # kittrial-5bb.425: every view is answered by the server's trace read; this is a convenience over it.
+        answer=_answer(request(config,project,actor,list(args),'trace'))
+        text=json.dumps(answer,indent=2,ensure_ascii=False)+'\n'
+        if out:Path(out).write_text(text,encoding='utf-8')
+        else:sys.stdout.write(text)
+        return 0
+    repo='.';record=False;payloads=None;i=0;rest=[token for token in args if token!='--verify']
+    while i<len(rest):
+        token=rest[i]
+        if token=='--repo' and i+1<len(rest):repo=rest[i+1];i+=2
+        elif token=='--record':record=True;i+=1
+        elif token=='--payloads' and i+1<len(rest):payloads=rest[i+1];i+=2
+        else:raise ValueError('trace --verify takes [--repo DIR] [--record | --payloads FILE]')
+    if record and payloads:raise ValueError('trace --verify: --record or --payloads, not both')
+    keys=[];offset=0
+    while offset is not None:
+        page=request(config,project,actor,['list','--limit','100','--offset',str(offset)],'ref')
+        page=_answer(page)
+        keys+=[item['key'] for item in page.get('items') or [] if str(item.get('key','')).startswith('design.')]
+        offset=page.get('next_offset')
+    results,items=[],[]
+    for key in keys:
+        entry=request(config,project,actor,['get',key],'ref')
+        entry=_answer(entry)
+        authority=((entry.get('record') or {}).get('authority')) or {}
+        if authority.get('type')!='repo-document':
+            results.append({'key':key,'checked':False,'why':'no accepted repo-document revision'})
+            continue
+        data,reason=_git_document(repo,authority['path'],authority['commit'])
+        if reason=='commit-not-in-checkout':
+            # Fetch the commit and run again; nothing is reported for it. (There is no dirty-checkout refusal:
+            # every read is git's object at the pinned commit, never the working tree.)
+            results.append({'key':key,'checked':False,'why':'commit %s is not in this checkout' % authority['commit'][:12]})
+            continue
+        observed=None
+        if data is not None:
+            observed=hashlib.sha256(data).hexdigest()
+            try:data.decode('utf-8');reason='match' if observed==authority['sha256'] else 'mismatch'
+            except UnicodeDecodeError:reason='not-utf8'
+        payload={'schema_version':1,'key':key,'doc_sha256':authority['sha256'],'path':authority['path'],
+                 'commit':authority['commit'],'observed_sha256':observed,
+                 'result':'pass' if reason=='match' else 'fail','reason':reason}
+        items.append(payload)
+        row={'key':key,'checked':True,'result':payload['result'],'reason':reason}
+        if record:
+            handle=tempfile.NamedTemporaryFile('w',encoding='utf-8',suffix='.json',delete=False)
+            with handle:handle.write(json.dumps(payload))
+            try:
+                answer=request(config,project,actor,['verify','--file',handle.name],'ref')
+                row['recorded']=_answer(answer)
+            finally:
+                Path(handle.name).unlink(missing_ok=True)
+        results.append(row)
+    if payloads:
+        Path(payloads).write_text(json.dumps({'items':items},indent=1)+'\n',encoding='utf-8')
+    summary={'schema':'trace-verify-v1','checked':len(items),'passed':sum(1 for item in items if item['result']=='pass'),
+             'failed':sum(1 for item in items if item['result']=='fail'),'results':results,
+             'payloads':payloads,'recorded':record}
+    text=json.dumps(summary,indent=2)+'\n'
+    if out:Path(out).write_text(text,encoding='utf-8')
+    else:sys.stdout.write(text)
+    # 3: a check failed. 4 (review of part 2, n5): nothing was checked, so a CI step cannot pass silently.
+    if summary['failed']:return 3
+    return 4 if summary['checked']==0 else 0
+
+def _design_document_args(args):
+    """kittrial-5bb.418: `ref propose|revise --file entry.json --document-from-git [--repo DIR]`.
+
+    Returns (args, document, temporary): the entry file is replaced by the entry with its repo-document
+    `authority.sha256` filled in (a temporary file the caller removes), and the document is the text of
+    the authority's path at its commit, read from git's own object (never the working tree)."""
+    if '--document-from-git' not in args:
+        return args,None,None
+    import tempfile
+    rest=[];repo='.';i=0
+    while i<len(args):
+        token=args[i]
+        if token=='--document-from-git':
+            i+=1;continue
+        if token=='--repo' or token.startswith('--repo='):
+            if '=' in token:repo=token.split('=',1)[1]
+            else:
+                if i+1>=len(args):raise ValueError('--repo needs a directory')
+                repo=args[i+1];i+=1
+            i+=1;continue
+        rest.append(token);i+=1
+    files=[n for n,token in enumerate(rest) if token in ('--file','-f') and n+1<len(rest)]
+    if not rest or rest[0] not in ('propose','revise') or len(files)!=1:
+        raise ValueError('--document-from-git goes with ref propose|revise --file entry.json')
+    entry=json.loads(Path(rest[files[0]+1]).read_text(encoding='utf-8-sig'))
+    entry,document=_document_from_git(entry,repo)
+    handle=tempfile.NamedTemporaryFile('w',encoding='utf-8',suffix='.json',delete=False)
+    with handle:handle.write(json.dumps(entry,ensure_ascii=False))
+    rest[files[0]+1]=handle.name
+    return rest,document,handle.name
+
+def _wire(project,actor,args,action,path,document=None):
     # Same actor rule as the endpoint, enforced here too: a rejected actor must not
     # reach the transport layer, and never reaches the server as a shell word.
     registering=action=='session' and args[:1]==['register']
@@ -164,6 +330,10 @@ def _wire(project,actor,args,action,path):
     if not registering and (not isinstance(actor,str) or not ACTOR.fullmatch(actor)):
         raise ValueError('Supply a short contributor/session actor')
     converted,attachments = _attachments(args)
+    if document is not None:
+        # The design document's exact text (kittrial-5bb.418), never read through a text-mode file.
+        key=str(len(attachments));attachments[key]={'flag':'--document','text':document}
+        converted.append('@attachment:'+key)
     payload = {'project':project,'actor':actor,'action':action,'args':converted,'attachments':attachments}
     if path is not None:payload['path'] = path
     wire = json.dumps(payload,ensure_ascii=False)
@@ -224,8 +394,11 @@ def _interpreter_refusal(returncode,stdout,stderr,config):
     return server_text(stderr.strip())
 
 def request(config,project,actor,args,action='bd',path=None):
+    return _send(config,_wire(project,actor,args,action,path))
+
+def _send(config,wire):
+    """One request already on the wire (request, and a design document's propose or revise)."""
     argv,label = _argv(config)
-    wire = _wire(project,actor,args,action,path)
     try:
         # A captured console child can still flash a window when the client is
         # launched by a GUI/agent on Windows. Preserve pipes and exit status.
@@ -1439,6 +1612,10 @@ CONTRIBUTOR_COMMANDS = (
     ('requirement ...', 'requirement records (the project owns these)'),
     ('requirements ...', 'requirement reads and owner answers'),
     ('ref ...', 'reference records'),
+    ('trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]',
+     'the trace read, answered by the server: summary, requirements, tasks, tokens, decisions, designs, round'),
+    ('trace --verify [--repo DIR] [--record | --payloads FILE]',
+     "check each accepted design document against git at its pinned commit (verified, design-drift)"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),
@@ -1540,7 +1717,8 @@ def help_requested(args):
 _COMMAND_HELP_USAGE = {
     'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
             '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
-            ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]',
+            ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]'
+                ' | work summary TASK [TASK ...] [--json]',
     'review': 'review TASK [--rounds | --file payload.json]',
     'handoff': 'handoff TASK --file payload.json',
     'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
@@ -1828,12 +2006,22 @@ def main():
                              config_path=a.config)
     if args[0]=='files':
         return _files_command(args[1:],json.loads(Path(a.config).read_text()),a.project,a.actor)
+    if args[0]=='trace':
+        return _trace_command(args[1:],config_doc,a.project,a.actor,a.out)
     action='bd';path=None
     if args[:1]==['refresh']:action='refresh';args=[]
     elif args[:1]==['view']:
         action='view';path=args[1] if len(args)>1 else 'CURRENT.md';args=[]
     elif args[0] in CLIENT_ACTIONS:action=args.pop(0)
-    result=request(config_doc,a.project,a.actor,args,action,path)
+    document=temporary=None
+    if action=='ref':
+        args,document,temporary=_design_document_args(args)
+    try:
+        result=(request(config_doc,a.project,a.actor,args,action,path) if document is None else
+                _send(config_doc,_wire(a.project,a.actor,args,action,path,document)))
+    finally:
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
     output = result['stdout']
     # The server's time of a write that was carried out (kittrial-5bb.97): one line on standard
     # error, so that standard output is exactly what it was. An older endpoint sends none.

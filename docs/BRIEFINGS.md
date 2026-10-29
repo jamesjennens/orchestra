@@ -95,6 +95,11 @@ carries the facts it needs, and this is the table per view:
   responses are owed. It is the one rule from `work.is_redelivery`, used by the
   `work` projection and by the in-process backend alike (kittrial-5bb.264 item 2/4).
   A malformed row carries it as `false`.
+- **`open_review_items`** (list) names the blocking review items still open, `[{request,
+  item}]` in filing order and at most 20, until a `respond` record answers each
+  (kittrial-5bb.431). A new revision or a plain comment answers none. While changes are
+  requested, `next` names them too: at most 5, then "and N more", with the respond record
+  that answers them. A malformed row carries `[]`.
 - **`claimable`** is the one bounded claimability rule: open, unassigned, no contribution,
   and neither a record anchor nor an epic, decision, gate or job — by issue TYPE or by the
   `decision` LABEL (`reference_records.py` treats that label as a decision whatever the
@@ -349,6 +354,12 @@ from `resolved.pointer_items`. HTTP keeps `checkpoint.open_items` raw, with meta
 paging; a first page is not the complete carry list. Web and text views join the maps
 for display without changing raw items.
 
+The task's own description is read the same way (kittrial-5bb.425): its `req:` and
+`design:` tokens, resolved first so the description never loses its budget to items, appear
+as `description_pointers` (`pointers`, `pointers_omitted`) in the brief and on the HTTP
+brief, and the task page shows them under its summary as "Cites". The description is not
+changed and other kinds in it are not resolved.
+
 Resolution uses only loaded, caller-authorized project data, with no new I/O.
 The five states are:
 
@@ -380,10 +391,12 @@ The five states are:
   `unavailable` with no flags.
 - `design:` resolves against the reference entry `design.SCOPE`. Flags: `unknown-scope`
   (no such readable entry) and `not-selected` (only a draft revision). A retired entry
-  reads `superseded`. A `#SECTION` is shown as `section: {anchor, state: "unchecked"}`:
-  headings are checked once designs are indexed on the server.
+  reads `superseded`. A `#SECTION` is shown as `section: {anchor, state}`, checked against the
+  server-derived index of the revision shown (kittrial-5bb.418): `live` when it has a heading with
+  that anchor, else `unknown` with the flag `unknown-section`. A design entry with no single index
+  (one written before design documents were stored, or two differing copies) reads `unchecked`.
 
-Text output appends `flags=...` and `section=ANCHOR unchecked` to these lines.
+Text output appends `flags=...` and `section=ANCHOR STATE` to these lines.
 
 Every pointer carries `trust: data`. Labels pass through `plain_text` before clipping
 at 120 characters, without leaving a partial Unicode escape. Text display folds line
@@ -396,3 +409,55 @@ predicate can only restrict them further for direct embedders and tests.
 
 The latest checkpoint's resolved list is shown within the requested item limit, with
 its total and omitted count, independently of the open-item page.
+
+
+## Read checkpoint summaries for many tasks
+
+`b work summary TASK [TASK ...] [--json]` reads a batch of 1..100 distinct task IDs
+under the shared project coordination lock. IDs must have the existing task-ID syntax;
+invalid, repeated, empty or oversized requests are refused before the native read.
+The batch shares one export snapshot instead of calling brief/history once per task.
+The existing generation cache can avoid that export on a warm read; generation and
+classification metadata queries are separate from the export.
+
+The HTTP client provides the same read:
+
+```sh
+python http_client.py --base-url https://office.example --token=TOKEN work PROJECT summary TASK TASK2
+```
+
+Its `Client.task_summaries(PROJECT, [TASK, TASK2])` method posts
+`{"tasks":["TASK","TASK2"]}` to `/v1/projects/PROJECT/tasks/summary`. This is a read,
+without an idempotency reservation. Current project read authority is required,
+including current membership and credential scope. Record anchors (including malformed
+anchors), the merge slot and rows of issue type `event` or `gate` are hidden just as
+on the task surface. A hidden task ID and an unknown ID return
+exactly the same missing item; the read never probes again to explain absence.
+
+Both forms return `schema_version: 1` and `items` in requested order. Each item has
+`task`, `found`, native `status`, `checkpoint`, `last_post` and `coverage`.
+The newest valid linked checkpoint contributes only its `comment_id`, `timestamp`,
+`state`, `next_action`, `next_action_omitted_chars` and `open_items_count`.
+Its `state` is the declared lane state only when the existing lane-state reader binds
+that record to the selected checkpoint; otherwise it is `unknown`. No prose or age
+implies a state. A missing checkpoint is null: its open-item count is unknown, never
+an invented zero. Conflicting/unreadable checkpoint history gives unknown coverage;
+invalid skipped checkpoint records give partial coverage. Neither means completion. Coverage describes the
+summary fields, not provenance completeness or incorporation of all history.
+
+`last_post` is the latest ordinary nonblank comment, ordered by timestamp then native
+comment-ID text, with `comment_id`, `timestamp`, `author` and
+`author_omitted_chars`. Record-family comments of any version and reserved record
+comments, including review, integration,
+checkpoint and lane-state records, never become ordinary posts. No checkpoint body,
+provenance map, item text or task description is returned. Next actions are clipped
+to 500 characters and authors to 96, with exact omitted-character counts. Unusable
+comment identities/timestamps are reported with unknown coverage instead of an
+unbounded or fabricated answer. The read changes no native task/comment record.
+
+`work --owner` shares a matching checkpoint's activity selection between attention
+and displayed fields within one request. An owner's earlier checkpoint remains a
+separate selection from another author's current checkpoint. This reuse is neither
+persistent nor shared between callers; current comment authority is still evaluated
+by the read. Performance depends on the project and host; synthetic timings are
+qualification evidence, not a guaranteed latency for another deployment.

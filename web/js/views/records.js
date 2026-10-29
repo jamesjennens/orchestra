@@ -1,6 +1,7 @@
 // Reference and capability records view: waiting queue, find/lookup, propose, revise,
 // coordinator accept/retire/verify, and two-step revise-then-accept (kittrial-5bb.213).
 import { h, mount, toast } from '../dom.js';
+import { designsPanel } from './trace.js';
 import { pageHead, empty, setFieldError, formValues, act, describe, errorState } from '../ui.js';
 
 function field(label, control, hint) {
@@ -77,10 +78,33 @@ function formatAuthority(auth) {
   if (auth.type === 'decision') {
     return `decision ${auth.id || '—'}`;
   }
+  if (auth.type === 'repo-document') {
+    return auth.path + (auth.anchor ? '#' + auth.anchor : '') + ' @ ' + String(auth.commit || '').slice(0, 12)
+      + ' (document sha256 ' + String(auth.sha256 || '').slice(0, 12) + ')';
+  }
   return auth.type || '—';
 }
 
-function buildAuthorityFromForm(v) {
+// kittrial-5bb.418: a design.<scope> revision carries its document. The file's exact bytes are hashed and
+// sent as text decoded strictly (no BOM stripped, no replacement), so the server's sha256 of the text it
+// encodes again is the one in the authority. Refused here before anything is sent when it is not UTF-8.
+export async function readDesignDocument(file) {
+  if (!file) throw new Error('Choose the design document (the Markdown file at the pinned commit).');
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length > 1024 * 1024) throw new Error('A design document is at most 1 MiB.');
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (err) {
+    throw new Error('The design document must be UTF-8 text.');
+  }
+  if (!globalThis.crypto || !globalThis.crypto.subtle) throw new Error('This browser cannot hash the document here (a secure connection is needed).');
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes));
+  const sha256 = Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('');
+  return { text, sha256 };
+}
+
+function buildAuthorityFromForm(v, designDoc) {
   const type = (v.authority_type || 'repo-path').trim();
   const target = (v.authority_target || '').trim();
   if (type === 'url') {
@@ -103,6 +127,11 @@ function buildAuthorityFromForm(v) {
   }
   if (type === 'decision') {
     return { type: 'decision', id: target };
+  }
+  if (type === 'repo-document') {
+    const out = { type: 'repo-document', path: target, commit: (v.authority_commit || '').trim(), sha256: designDoc ? designDoc.sha256 : '' };
+    if (v.authority_extra && v.authority_extra.trim()) out.anchor = v.authority_extra.trim();
+    return out;
   }
   const out = { type: 'repo-path', path: target };
   if (v.authority_extra && v.authority_extra.trim()) out.anchor = v.authority_extra.trim();
@@ -128,7 +157,7 @@ export async function page(ctx, { pid }) {
       ctx.api.capabilities(pid, { waiting: 1 }),
     ]);
   } catch (error) {
-    return h('div', null, pageHead({ title: 'Records', subtitle: project.name }), errorState(error, () => ctx.render()));
+    return h('div', null, pageHead({ title: 'Records', lede: project.name }), errorState(error, () => ctx.render()));
   }
 
   const canPropose = Boolean(refsResp.can_propose || capsResp.can_propose);
@@ -140,10 +169,11 @@ export async function page(ctx, { pid }) {
   const waitingCaps = waitingCapsResp.items || waitingCapsResp.records || [];
   const totalWaiting = waitingRefs.length + waitingCaps.length;
 
-  // Who accepts the waiting drafts in THIS project (kittrial-5bb.407): the people whose role
-  // coordinates, and the coordinator agents a person owner's delegation covers. Filled after the
-  // page draws; a server without either read leaves the line out.
-  function acceptorsLine() {
+  // Who accepts the waiting drafts in THIS project (kittrial-5bb.407, slice 4): the
+  // people whose role coordinates, and the coordinator agents a person owner's
+  // delegation covers. The FIRST name doubles as the page's who-acts sentence.
+  // Filled after the page draws; a server without either read leaves the line out.
+  function acceptorsLine(onReady) {
     const line = h('p', { class: 'small', 'data-acceptors': 'pending' });
     if (!ctx.api || typeof ctx.api.coordination !== 'function' || typeof ctx.api.delegations !== 'function') return line;
     Promise.all([ctx.api.coordination(pid), ctx.api.delegations(pid)]).then(([who, delegated]) => {
@@ -152,16 +182,22 @@ export async function page(ctx, { pid }) {
       const agents = (delegated.granted_agents || []).filter((a) => a.covered).map((a) => names[a.agent] || a.agent);
       const escalate = (delegated.items || []).filter((i) => i.in_force && i.delegation)
         .map((i) => i.delegation.escalate).filter(Boolean);
+      const first = people.length ? people[0] : (agents.length ? agents[0] + ' (agent)' : null);
       line.setAttribute('data-acceptors', 'ready');
       line.replaceChildren('Who accepts here: ',
         people.length ? people.join(', ') : 'no person coordinator',
         agents.length ? '; agents within a delegation: ' + agents.join(', ') : '; no agent (no delegation in force)',
         '.', escalate.length ? ' Escalated to the owner: ' + escalate.join(' · ') : '');
+      if (typeof onReady === 'function' && first) onReady(first);
     }).catch(() => { line.remove(); });
     return line;
   }
 
-  function renderWaitingRow(item, family) {
+  // One waiting row: the draft's own fields first, the list item's as fallback
+  // (kittrial-5bb.420). The Who-acts cell names the project's coordinator (the
+  // same server sentence as the summary); the action is 'Review & accept' only
+  // where the server's viewer_may_accept says the reader may act, else 'View'.
+  function renderWaitingRow(item, family, whoActs) {
     const rec = item.record || {};
     const draft = item.proposed || rec;
     const isRevisionToAccepted = item.state === 'accepted' && Boolean(item.proposed);
@@ -185,10 +221,21 @@ export async function page(ctx, { pid }) {
           : stateBadge(item.state || 'draft-only')),
       h('td', null, titleOrSummary),
       h('td', { class: 'small muted' }, item.proposed_by_name || item.proposer_name || item.proposed_by || '—'),
+      h('td', null, h('span', { class: 'who-acts' }, whoActs)),
       h('td', { class: 'right' },
-        h('a', { class: 'btn small', href: safeHref(href) }, canCoordinate ? 'Review & accept' : 'Open')));
+        h('a', { class: 'btn small', href: safeHref(href), title: item.viewer_may_accept ? undefined : (item.viewer_may_accept_reason || undefined) },
+          item.viewer_may_accept ? 'Review & accept' : 'View')));
   }
 
+  // The waiting table body is filled once the who-acts sentence resolves, so every
+  // row names the same coordinator the summary names (kittrial-5bb.420 item 1).
+  const waitingBody = h('tbody');
+  function fillWaiting(whoActs) {
+    waitingBody.replaceChildren(
+      ...waitingRefs.map((item) => renderWaitingRow(item, 'reference', whoActs)),
+      ...waitingCaps.map((item) => renderWaitingRow(item, 'capability', whoActs)));
+  }
+  fillWaiting('the project coordinator');
   const waitingPanel = h('section', { class: 'panel', 'data-waiting-queue': '1' },
     h('div', { class: 'panel-head' },
       h('h2', null, 'Waiting to be accepted'),
@@ -199,7 +246,7 @@ export async function page(ctx, { pid }) {
       approvalByAnotherParty
         ? ' This project requires approval by another party: a coordinator may not accept or verify a draft proposed by their own account or its agents.'
         : ' In this project a coordinator may accept a draft they proposed themselves; both proposer and acceptor are recorded.'),
-    acceptorsLine(),
+    acceptorsLine((name) => { acceptorsFirst = name; fillWaiting(name); paintSummary(); drawAccepted(); }),
     totalWaiting === 0
       ? empty('Nothing waiting to be accepted', 'All reference and capability drafts have been handled.')
       : h('div', { class: 'table-wrap' },
@@ -210,10 +257,9 @@ export async function page(ctx, { pid }) {
             h('th', null, 'Stage'),
             h('th', null, 'Title / Summary'),
             h('th', null, 'Proposed by'),
+            h('th', null, 'Who acts'),
             h('th', null))),
-          h('tbody', null,
-            waitingRefs.map((item) => renderWaitingRow(item, 'reference')),
-            waitingCaps.map((item) => renderWaitingRow(item, 'capability'))))));
+          waitingBody)));
 
   const findResultsBox = h('div', { 'data-find-results': '1' });
 
@@ -230,7 +276,10 @@ export async function page(ctx, { pid }) {
           h('th', null, 'Proposer / Acceptor'))),
         h('tbody', null, items.map((item) => {
           const rec = item.record || item.proposed || item;
-          const auth = rec.authority || item.authority;
+          // The waiting queue's authority cell prints the draft's own authority (kittrial-5bb.420
+          // item 3): read the draft first; a server sentence wins when one is present.
+          const draftAuth = item.proposed_authority || (item.proposed || {}).authority || null;
+          const auth = item.authority_note || draftAuth || rec.authority || item.authority;
           const href = `/p/${pid}/references/${encodeURIComponent(item.key)}`;
           const proposerLabel = item.accepted_proposer_name || item.proposed_by_name || item.proposer_name || item.proposed_by || '—';
           const acceptorLabel = item.accepted_by_name || item.acceptor_name || item.accepted_by || '';
@@ -385,20 +434,16 @@ export async function page(ctx, { pid }) {
         setFieldError(form, 'authority_target', 'Enter the repository path, URL, observation, or decision ID.');
         return;
       }
-      const authority = buildAuthorityFromForm(v);
       const btn = form.querySelector('button');
       await act(btn, async () => {
         try {
-          await ctx.api.proposeReference(pid, {
-            key,
-            title,
-            statement,
-            authority,
-            owner,
-            review_by,
-            tags,
-            decisions,
-          });
+          const fileInput = form.querySelector('input[name=document_file]');
+          const designDoc = (v.authority_type || '').trim() === 'repo-document'
+            ? await readDesignDocument(fileInput && fileInput.files && fileInput.files[0]) : null;
+          const authority = buildAuthorityFromForm(v, designDoc);
+          const body = { key, title, statement, authority, owner, review_by, tags, decisions };
+          if (designDoc) body.document = designDoc.text;
+          await ctx.api.proposeReference(pid, body);
           toast('Reference draft proposed.', 'ok');
           ctx.go(`/p/${pid}/references/${encodeURIComponent(key)}`);
         } catch (err) {
@@ -419,14 +464,16 @@ export async function page(ctx, { pid }) {
         h('option', { value: 'repo-path' }, 'repo-path (repository file)'),
         h('option', { value: 'url' }, 'url (https URL)'),
         h('option', { value: 'attestation' }, 'attestation (host-check / owner-statement)'),
-        h('option', { value: 'decision' }, 'decision (native decision issue)'))),
+        h('option', { value: 'decision' }, 'decision (native decision issue)'),
+        h('option', { value: 'repo-document' }, 'repo-document (design document, for design.<scope>)'))),
       field('Authority target (path / URL / how / decision id)', h('input', {
         name: 'authority_target',
         placeholder: 'docs/HTTP_DEPLOYMENT.md',
         required: true,
       })),
       field('Pinned commit (40-hex, for repo-path)', h('input', { name: 'authority_commit', class: 'mono', placeholder: '40-char commit sha' })),
-      field('Anchor or source (optional)', h('input', { name: 'authority_extra', placeholder: 'section-anchor' }))),
+      field('Anchor or source (optional)', h('input', { name: 'authority_extra', placeholder: 'section-anchor' })),
+      field('Design document (Markdown, for repo-document)', h('input', { name: 'document_file', type: 'file', accept: '.md,text/markdown,text/plain' }))),
     h('div', { class: 'row wrap' },
       field('Tags (comma-separated)', h('input', { name: 'tags', placeholder: 'ops, web' })),
       field('Decisions (comma-separated issue IDs, optional)', h('input', { name: 'decisions', placeholder: '' }))),
@@ -504,29 +551,139 @@ export async function page(ctx, { pid }) {
     h('div', { class: 'actions' },
       h('button', { type: 'submit', class: 'primary' }, 'Propose capability draft'))) : null;
 
+  // Summary strip (kittrial-5bb.420 item, mock-up records.html): what waits and who
+  // acts. The who-acts sentence is the SAME server sentence the waiting rows use;
+  // it resolves when the coordination/delegation reads resolve.
+  let acceptorsFirst = 'the project coordinator';
+  const summaryWho = h('span', { class: 'who-acts', 'data-summary-who': '1' }, acceptorsFirst);
+  const summaryMine = h('span', { class: 'small muted', 'data-summary-mine': '1' }, '');
+  const summaryStrip = h('section', { class: 'summary', 'aria-label': 'What waits on whom', 'data-records-summary': '1' },
+    h('p', { class: 'next' },
+      h('b', { 'data-summary-count': '1' }, totalWaiting ? `${totalWaiting} draft${totalWaiting === 1 ? '' : 's'} wait${totalWaiting === 1 ? 's' : ''} for ` : 'Nothing waits'),
+      totalWaiting ? summaryWho : null),
+    h('p', { class: 'next small muted' }, summaryMine));
+  function paintSummary() {
+    summaryWho.textContent = acceptorsFirst;
+    const mine = totalWaiting === 0
+      ? 'Nothing here waits on you.'
+      : ([...waitingRefs, ...waitingCaps].some((item) => item.viewer_may_accept)
+        ? 'Something here waits on you.'
+        : 'Nothing here waits on you. The coordinator checks each draft and accepts it with evidence; you are asked only when a decision is yours.');
+    summaryMine.textContent = mine;
+  }
+  paintSummary();
+
+  // One accepted list, waiting first (kittrial-5bb.420 item): waiting drafts reuse the
+  // waiting rows (with the gated action), then accepted rows; a kind filter swaps
+  // the accepted half without touching the waiting queue.
+  const acceptedRefs = (refsResp.items || refsResp.records || []);
+  const acceptedCaps = (capsResp.items || capsResp.records || []);
+  const acceptedKind = { value: 'all' };
+  const acceptedSlot = h('div', { 'data-accepted-list': '1' });
+  const acceptedCount = h('span', { class: 'badge muted', 'data-accepted-count': '1' });
+  function acceptedRows(kind) {
+    const rows = [];
+    if (kind === 'all' || kind === 'reference') rows.push(...acceptedRefs.map((item) => acceptedRefRow(item)));
+    if (kind === 'all' || kind === 'capability') rows.push(...acceptedCaps.map((item) => acceptedCapRow(item)));
+    return rows;
+  }
+  function drawAccepted() {
+    const rows = acceptedRows(acceptedKind.value);
+    acceptedCount.textContent = `${rows.length} shown`;
+    acceptedSlot.replaceChildren(rows.length
+      ? h('div', { class: 'table-wrap' },
+        h('table', { class: 'stack-narrow' },
+          h('thead', null, h('tr', null,
+            h('th', null, 'Kind'),
+            h('th', null, 'Key'),
+            h('th', null, 'Title / Summary'),
+            h('th', null, 'Proposed by'),
+            h('th', null, 'Who acts'),
+            h('th', null))),
+          h('tbody', null, rows)))
+      : empty(acceptedKind.value === 'all' ? 'No accepted records yet' : `No ${acceptedKind.value} records yet`,
+        acceptedKind.value === 'all'
+          ? 'Drafts above become records here once accepted.'
+          : 'Accept a waiting draft, or switch the kind filter.'));
+  }
+  function acceptedRefRow(item) {
+    const rec = item.record || item.proposed || item;
+    const href = `/p/${pid}/references/${encodeURIComponent(item.key)}`;
+    const whoActs = item.viewer_may_accept ? 'you' : acceptorsFirst;
+    return h('tr', { 'data-accepted-key': item.key, 'data-accepted-kind': 'reference' },
+      h('td', null, h('span', { class: 'badge' }, 'reference')),
+      h('td', null, h('a', { class: 'mono', href: safeHref(href) }, item.key)),
+      h('td', null, h('strong', null, textOf(rec.title || item.title) || '—')),
+      h('td', { class: 'small muted' }, item.accepted_proposer_name || item.proposed_by_name || item.proposer_name || item.proposed_by || '—'),
+      h('td', null, h('span', { class: 'who-acts' }, whoActs)),
+      h('td', { class: 'right' },
+        h('a', { class: 'btn small', href: safeHref(href), title: item.viewer_may_accept ? undefined : (item.viewer_may_accept_reason || undefined) },
+          item.viewer_may_accept ? 'Review & accept' : 'View')));
+  }
+  function acceptedCapRow(item) {
+    const rec = item.record || item.proposed || item;
+    const href = `/p/${pid}/capabilities/${encodeURIComponent(item.key)}`;
+    const whoActs = item.viewer_may_accept ? 'you' : acceptorsFirst;
+    return h('tr', { 'data-accepted-key': item.key, 'data-accepted-kind': 'capability' },
+      h('td', null, h('span', { class: 'badge' }, 'capability')),
+      h('td', null, h('a', { class: 'mono', href: safeHref(href) }, item.key)),
+      h('td', null, h('strong', null, textOf(rec.name || item.name) || '—')),
+      h('td', { class: 'small muted' }, item.accepted_proposer_name || item.proposed_by_name || item.proposer_name || item.proposed_by || '—'),
+      h('td', null, h('span', { class: 'who-acts' }, whoActs)),
+      h('td', { class: 'right' },
+        h('a', { class: 'btn small', href: safeHref(href), title: item.viewer_may_accept ? undefined : (item.viewer_may_accept_reason || undefined) },
+          item.viewer_may_accept ? 'Review & accept' : 'View')));
+  }
+  const kindSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Kind', 'data-accepted-kind-filter': '1' },
+    ['all', 'reference', 'capability'].map((kind) =>
+      h('button', {
+        type: 'button',
+        'data-kind': kind,
+        'aria-pressed': String(acceptedKind.value === kind),
+        onclick: () => {
+          acceptedKind.value = kind;
+          for (const btn of kindSeg.querySelectorAll('button')) btn.setAttribute('aria-pressed', String(btn.getAttribute('data-kind') === kind));
+          drawAccepted();
+        },
+      }, kind === 'all' ? 'All' : kind === 'reference' ? 'References' : 'Capabilities')));
+  const acceptedPanel = h('section', { class: 'panel', 'data-accepted-records': '1' },
+    h('div', { class: 'panel-head' },
+      h('h2', null, 'Accepted records'),
+      acceptedCount,
+      h('span', { class: 'toolbar' }, kindSeg)));
+  drawAccepted();
+  acceptedPanel.appendChild(acceptedSlot);
+
+  // Propose forms folded (kittrial-5bb.420 item): proposing is rare and mostly done
+  // by agents; the hooks the pins assert stay on the forms themselves.
+  const proposeFold = (proposeRefForm || proposeCapForm) ? h('details', { class: 'fold', 'data-propose-fold': '1' },
+    h('summary', null, 'Propose a record ', h('span', { class: 'fold-hint' }, 'usually done by an agent')),
+    h('div', { class: 'fold-body' }, proposeRefForm, proposeCapForm)) : null;
+
   const refPanel = h('section', { class: 'panel', 'data-reference-catalog': '1' },
     h('div', { class: 'panel-head' },
       h('h2', null, 'Reference catalog'),
       h('span', { class: 'badge muted' }, `${(refsResp.items || refsResp.records || []).length} shown`)),
-    refTableSlot,
-    proposeRefForm ? h('div', { class: 'divider' }) : null,
-    proposeRefForm);
+    refTableSlot);
 
   const capPanel = h('section', { class: 'panel', 'data-capability-catalog': '1' },
     h('div', { class: 'panel-head' },
       h('h2', null, 'Capability registry'),
       h('span', { class: 'badge muted' }, `${(capsResp.items || capsResp.records || []).length} shown`)),
-    capTableSlot,
-    proposeCapForm ? h('div', { class: 'divider' }) : null,
-    proposeCapForm);
+    capTableSlot);
 
   return h('div', { class: 'stack', 'data-records-page': '1' },
     pageHead({
       title: 'Records',
-      subtitle: `${project.name} · Reference catalog & capability registry`,
+      lede: `${project.name} · Reference catalog & capability registry`,
     }),
+    summaryStrip,
     waitingPanel,
     findPanel,
+    acceptedPanel,
+    proposeFold,
+    // kittrial-5bb.425 part 2: one row per design.<scope>, its state and coverage.
+    designsPanel(ctx, pid),
     refPanel,
     capPanel);
 }
@@ -537,7 +694,7 @@ export async function referencePage(ctx, { pid, key }) {
     entry = await ctx.api.reference(pid, key);
   } catch (error) {
     return h('div', null,
-      pageHead({ title: key, crumbs: [['Records', `/p/${pid}/records`]] }),
+      pageHead({ title: key, crumbs: [{ label: 'Records', href: `/p/${pid}/records` }] }),
       errorState(error, () => ctx.render()));
   }
 
@@ -564,6 +721,11 @@ export async function referencePage(ctx, { pid, key }) {
       h('dt', null, 'Native anchor'), h('dd', { class: 'mono' }, entry.native_id || entry.task || '—'),
       h('dt', null, 'Authority kind'), h('dd', { class: 'mono' }, entry.authority_kind || auth.type || '—'),
       h('dt', null, 'Authority'), h('dd', { class: 'mono', 'data-points-to': auth.path || auth.url || auth.id || '' }, formatAuthority(auth)),
+      // kittrial-5bb.418: a design document is read on its own page, as text, before it is accepted.
+      auth.type === 'repo-document' && String(entry.key || '').startsWith('design.') ? [
+        h('dt', null, 'Design document'),
+        h('dd', { 'data-design-link': '1' }, h('a', { href: ctx.href ? ctx.href(`/p/${pid}/designs/${encodeURIComponent(String(entry.key).slice(7))}`) : `#/p/${pid}/designs/${encodeURIComponent(String(entry.key).slice(7))}` }, 'Read the stored document'),
+          entry.verification ? ' — ' + entry.verification.state : '')] : null,
       h('dt', null, 'Owner'), h('dd', { class: 'mono' }, shown.owner || '—'),
       h('dt', null, 'Review by'), h('dd', { class: 'mono' }, `${shown.review_by || '—'} (${entry.due || 'ok'})`),
       h('dt', null, 'Tags'), h('dd', null, (shown.tags || []).join(', ') || '—'),
@@ -621,17 +783,22 @@ export async function referencePage(ctx, { pid, key }) {
         const btn = form.querySelector('button');
         await act(btn, async () => {
           try {
-            await ctx.api.reviseReference(pid, key, {
+            const fileInput = form.querySelector('input[name=document_file]');
+            const designDoc = (v.authority_type || '').trim() === 'repo-document'
+              ? await readDesignDocument(fileInput && fileInput.files && fileInput.files[0]) : null;
+            const body = {
               revision: Number(latest.revision || 1) + 1,
               expected_sha256: latest.sha256,
               title: (v.title || '').trim(),
               statement: (v.statement || '').trim(),
-              authority: buildAuthorityFromForm(v),
+              authority: buildAuthorityFromForm(v, designDoc),
               owner: (v.owner || latest.owner || '').trim(),
               review_by: (v.review_by || latest.review_by || '').trim(),
               tags: splitCsv(v.tags),
               decisions: splitCsv(v.decisions),
-            });
+            };
+            if (designDoc) body.document = designDoc.text;
+            await ctx.api.reviseReference(pid, key, body);
             toast('Draft revision recorded.', 'ok');
             await ctx.render();
           } catch (err) {
@@ -647,11 +814,12 @@ export async function referencePage(ctx, { pid, key }) {
         field('Review by (YYYY-MM-DD)', h('input', { name: 'review_by', value: latest.review_by || defaultReviewDate(), required: true }))),
       h('div', { class: 'row wrap' },
         field('Authority type', h('select', { name: 'authority_type' },
-          ['repo-path', 'url', 'attestation', 'decision'].map((t) =>
+          ['repo-path', 'url', 'attestation', 'decision', 'repo-document'].map((t) =>
             h('option', { value: t, selected: (latestAuth.type || 'repo-path') === t }, t)))),
         field('Authority target', h('input', { name: 'authority_target', value: defaultAuthTarget, required: true })),
         field('Pinned commit (40-hex)', h('input', { name: 'authority_commit', class: 'mono', value: defaultAuthCommit })),
-        field('Anchor or source (optional)', h('input', { name: 'authority_extra', value: defaultAuthExtra }))),
+        field('Anchor or source (optional)', h('input', { name: 'authority_extra', value: defaultAuthExtra })),
+        field('Design document (Markdown, for repo-document)', h('input', { name: 'document_file', type: 'file', accept: '.md,text/markdown,text/plain' }))),
       h('div', { class: 'row wrap' },
         field('Tags (comma-separated)', h('input', { name: 'tags', value: (latest.tags || []).join(', ') })),
         field('Decisions (comma-separated)', h('input', { name: 'decisions', value: (latest.decisions || []).join(', ') }))),
@@ -756,8 +924,8 @@ export async function referencePage(ctx, { pid, key }) {
   return h('div', { class: 'stack', 'data-reference-page': key },
     pageHead({
       title: entry.key,
-      subtitle: `Reference record · ${entry.state}`,
-      crumbs: [['Records', `/p/${pid}/records`]],
+      lede: `Reference record · ${entry.state}`,
+      crumbs: [{ label: 'Records', href: `/p/${pid}/records` }],
     }),
     detailCard,
     pendingDraftCard,
@@ -771,7 +939,7 @@ export async function capabilityPage(ctx, { pid, key }) {
     entry = await ctx.api.capability(pid, key);
   } catch (error) {
     return h('div', null,
-      pageHead({ title: key, crumbs: [['Records', `/p/${pid}/records`]] }),
+      pageHead({ title: key, crumbs: [{ label: 'Records', href: `/p/${pid}/records` }] }),
       errorState(error, () => ctx.render()));
   }
 
@@ -1116,8 +1284,8 @@ export async function capabilityPage(ctx, { pid, key }) {
   return h('div', { class: 'stack', 'data-capability-page': key },
     pageHead({
       title: entry.key,
-      subtitle: `Capability record · ${entry.state}`,
-      crumbs: [['Records', `/p/${pid}/records`]],
+      lede: `Capability record · ${entry.state}`,
+      crumbs: [{ label: 'Records', href: `/p/${pid}/records` }],
     }),
     detailCard,
     pendingDraftCard,

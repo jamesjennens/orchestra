@@ -162,10 +162,13 @@ class BoundEndpointTests(unittest.TestCase):
                                                                  'web-lifecycle', 'web-merge-slot',
                                                                  # kittrial-5bb.378: the release query and one release group; the canonical write is
                                                                  # `web-release`, which a bound key may not name directly.
-                                                                 'web-release'])
+                                                                 'web-release',
+                                                                 # kittrial-5bb.434: the installation switches read, served
+                                                                 # by the HTTP route under CAP_COORDINATE only.
+                                                                 'web-switches'])
         for action in ('create-project', 'project-creations', 'creation-standing', 'web-merge-slot',
                        'host-coordination', 'host-projects', 'web-guidance', 'web-lifecycle', 'assignment-roster', 'task-assign', 'task-release',
-                       'assignee-followon', 'task-file', 'room-decision', 'web-release'):
+                       'assignee-followon', 'task-file', 'room-decision', 'web-release', 'web-switches'):
             for project in ('alpha', 'beta', 'Not A Name', None):
                 with self.subTest(action=action, project=project):
                     self.refused({'project': project, 'actor': 'a', 'action': action},

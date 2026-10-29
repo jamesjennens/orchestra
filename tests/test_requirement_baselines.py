@@ -363,6 +363,18 @@ class StoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'cannot be verified'):
             store.get(self.path, 'alpha', 'review-1')
 
+    def test_regular_file_delegation_keeps_the_exact_byte_bound_and_missing_rule(self):
+        selected = self.path / 'bounded.json'
+        selected.write_bytes(b'x' * 1024)
+        with patch.object(store, '_reparse', return_value=False):
+            self.assertEqual(store._read(selected, 1024), b'x' * 1024)
+        selected.write_bytes(b'x' * 1025)
+        with self.assertRaisesRegex(ValueError, 'cannot be verified'):
+            store._read(selected, 1024)
+        self.assertIsNone(store._read(selected.with_name('missing.json'), 1024, missing=True))
+        with self.assertRaisesRegex(ValueError, 'cannot be verified'):
+            store._read(selected.with_name('missing.json'), 1024)
+
 
 if __name__ == '__main__':
     unittest.main()

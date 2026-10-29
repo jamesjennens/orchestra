@@ -1,6 +1,8 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
 import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
+import { proposeSection } from './proposals.js';
+export { proposeSection } from './proposals.js';
 import { setupHint } from './setup.js';
 import { mergeSlotPanel } from './merge_slot.js';
 import { guidancePanel } from './guidance.js';
@@ -8,6 +10,8 @@ import { coordinationPanel } from './coordination.js';
 import { delegationsPanel } from './delegations.js';
 import { expiryLine, extensionButton } from '../credentialLifetime.js';
 import { historyPanel } from '../agentHistory.js';
+import { switchesPanel } from './switches.js';
+import { coveragePanel } from './trace.js';
 
 const PAGE = 10;
 export const canWrite = (p) => ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role);
@@ -425,6 +429,8 @@ export async function overview(ctx, { pid }) {
     // project.html:44-80), then the fold (project.html:82-89); the overview text is
     // the summary, the strip link, the panel, the fold.
     summary,
+    // kittrial-5bb.425 part 2: one line per trace view with its counts; each opens its view.
+    coveragePanel(ctx, pid),
     tasksPanel(tableHost),
     h('p', { class: 'small muted' }, 'The Lanes board has its own page (',
       h('a', { href: ctx.href(`/p/${pid}/lanes`) }, 'Lanes'), '), where a coordinator reads it.'),
@@ -466,18 +472,25 @@ export async function reviews(ctx, { pid }) {
       const key = keys[0];
       const rows = data.items.filter((t) => keys.includes(t.review_state));
       if (key === 'error' && !rows.length) return null;
-      return h('section', { class: 'panel', 'aria-labelledby': 'g-' + key },
+      // Slice 5 (kittrial-5bb.427, design 2.7): groups with items first, and an
+      // empty contribution group is one line, not a panel.
+      const body = rows.length ? h('section', { class: 'panel', 'aria-labelledby': 'g-' + key },
         h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'g-' + key }, title, ' ', h('span', { class: 'nav-count' }, rows.length)), h('span', { class: 'small muted hide-narrow' }, note)),
-        rows.length ? h('div', { class: 'table-wrap' }, h('table', null,
+        h('div', { class: 'table-wrap' }, h('table', null,
           h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Task'), h('th', { scope: 'col' }, 'Contribution'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Open requests'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Waiting since'))),
           h('tbody', null, rows.map((t) => h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${pid}/t/${t.id}`); } },
             h('td', null, h('a', { class: 'title', href: ctx.href(`/p/${pid}/t/${t.id}`) }, t.title), h('div', { class: 'sub' }, t.assignee_name || 'Unassigned'),
               t.recommended ? h('span', { class: 'chip ok', title: 'A reviewer recommends approving this revision. An owner still decides.' }, 'Recommended') : null),
             h('td', null, t.contribution ? [t.contribution.revision ? h('span', null, 'Revision ', t.contribution.revision, ' · ') : null, h('code', null, shortSha(t.contribution.commit))] : '—'),
             h('td', { class: 'hide-narrow num' }, String(openRequests(t))),
-            h('td', { class: 'hide-narrow muted' }, (t.contribution && t.contribution.at) || t.updated_at ? time((t.contribution && t.contribution.at) || t.updated_at) : '')))))) :
-          empty('Nothing here', null));
-    }));
+            h('td', { class: 'hide-narrow muted' }, (t.contribution && t.contribution.at) || t.updated_at ? time((t.contribution && t.contribution.at) || t.updated_at) : ''))))))) :
+        h('p', { class: 'empty-line' }, `${title}: none.`);
+      // Review b1 (kittrial-5bb.427 r2): the empty 'error' group above is null,
+      // so filter before sorting — sorting first reads .rows of null and the
+      // Reviews page crashes in the normal case (no error-state item).
+      return { key, rows: rows.length, body };
+    }).filter(Boolean).sort((a, b) => b.rows - a.rows).map(({ body }) => body),
+    proposeSection(ctx, pid, { folded: true }));
 }
 
 // One sentence, said on the page and again before the form: whose feedback this is
@@ -747,5 +760,8 @@ export async function settings(ctx, { pid }) {
     pageHead({ crumbs: crumbs(ctx, project, 'Members & settings'), title: 'Members & settings', lede: owner ? 'Manage who can see and change this project.' : 'Only project owners can change membership.' }),
     archivedBanner(project),
     unusableBanner(project),
-    membersHost, claimingPanel(ctx, project), coordination.node, delegated.node, agentsHost, credsHost, auditHost, danger);
+    membersHost, claimingPanel(ctx, project), coordination.node,
+    // kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator.
+    switchesPanel(ctx, project),
+    delegated.node, agentsHost, credsHost, auditHost, danger);
 }

@@ -378,7 +378,7 @@ class BackupTests(unittest.TestCase):
         self.save_bundle(**bundle)
         (self.destination / '.beads').mkdir()
         (self.destination / '.beads' / 'metadata.json').write_text(
-            json.dumps({'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
+            json.dumps({'dolt_mode': 'server', 'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
                         'dolt_server_user': 'root', 'dolt_database': 'destination'}), encoding='utf-8')
         order = []
 

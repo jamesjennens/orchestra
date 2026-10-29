@@ -16,6 +16,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import sys
 import threading
@@ -31,6 +32,26 @@ import task_files
 from test_http_agents import unique_dir
 
 DAY = 24 * 3600
+
+
+class BlockingReadTimeout(Exception):
+    pass
+
+
+def bounded(call):
+    previous = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(BlockingReadTimeout()))
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def make_fifo(case, path):
+    if not hasattr(os, 'mkfifo'):
+        case.skipTest('mkfifo is unavailable')
+    os.mkfifo(path)
 
 
 def sha(data):
@@ -65,6 +86,96 @@ class TaskFilesOpsTests(unittest.TestCase):
         self.target = self.backups / 'p1.task-files'
 
     # -- backup and restore (4a A) --------------------------------------------------------------
+    def test_regular_file_live_journal_and_backup_restore_controls(self):
+        digest = self.store.attach('t1', b'regular')
+        path = self.store.project / task_files.FOLDER / task_files.RECORDS / task_files.task_key('t1') / (digest + '.json')
+        self.assertEqual(digest, task_files.read_entry(self.store.project, 't1', digest)['sha256'])
+        self.assertIsNone(task_files.read_entry(self.store.project, 't1', '0' * 64))
+        original = path.read_bytes()
+        path.write_bytes(b'{bad')
+        self.assertIsNone(task_files.read_entry(self.store.project, 't1', digest))
+        path.write_bytes(original)
+        self.assertEqual([], task_files.backup_folder(self.store.project, self.target)['problems'])
+        self.assertIsInstance(task_files._old_manifest(self.target / task_files.MANIFEST), dict)
+        self.assertEqual('restored', task_files.restore_folder(self.target, Store(self).project)['status'])
+        (self.target / task_files.MANIFEST).write_bytes(b'{bad')
+        self.assertIsNone(task_files._old_manifest(self.target / task_files.MANIFEST))
+        self.assertEqual('refused', task_files.restore_folder(self.target, Store(self).project)['status'])
+        (self.target / task_files.MANIFEST).unlink()
+        self.assertIsNone(task_files._old_manifest(self.target / task_files.MANIFEST))
+
+    def test_open_blob_fifo_and_symlink_are_refused_without_blocking(self):
+        digest = self.store.attach('t1', b'regular')
+        path = self.store.blob(digest)
+        outside = self.store.project / 'outside'
+        outside.write_bytes(b'not the stored blob')
+        for kind in ('fifo', 'symlink'):
+            os.unlink(str(path))
+            if kind == 'fifo':
+                make_fifo(self, path)
+            else:
+                path.symlink_to(outside)
+            with self.subTest(kind=kind), self.assertRaises(task_files.Refusal):
+                bounded(lambda: task_files.open_blob(self.store.project, digest))
+
+    def test_hash_file_fifo_and_symlink_are_refused_without_blocking(self):
+        path = self.store.project / 'hash-source'
+        outside = self.store.project / 'outside'
+        outside.write_bytes(b'not the stored blob')
+        for kind in ('fifo', 'symlink'):
+            if os.path.lexists(str(path)):
+                os.unlink(str(path))
+            if kind == 'fifo':
+                make_fifo(self, path)
+            else:
+                path.symlink_to(outside)
+            with self.subTest(kind=kind), self.assertRaises((OSError, ValueError)):
+                bounded(lambda: task_files._hash_file(path))
+
+    def test_copy_hashed_fifo_and_symlink_are_refused_without_blocking(self):
+        source = self.store.project / 'copy-source'
+        outside = self.store.project / 'outside'
+        outside.write_bytes(b'not the stored blob')
+        self.target.mkdir()
+        target = self.target / 'copy'
+        for kind in ('fifo', 'symlink'):
+            if os.path.lexists(str(source)):
+                os.unlink(str(source))
+            if kind == 'fifo':
+                make_fifo(self, source)
+            else:
+                source.symlink_to(outside)
+            with self.subTest(kind=kind), self.assertRaises((OSError, ValueError)):
+                bounded(lambda: task_files._copy_hashed(source, target))
+            self.assertFalse(target.exists())
+            self.assertEqual([], list(self.target.glob('.t*')))
+
+    def test_fifo_live_journal_never_blocks_and_backup_marks_it_unreadable(self):
+        digest = self.store.attach('t1', b'regular')
+        path = self.store.project / task_files.FOLDER / task_files.RECORDS / task_files.task_key('t1') / (digest + '.json')
+        path.unlink()
+        make_fifo(self, path)
+        self.assertIsNone(bounded(lambda: task_files.read_entry(self.store.project, 't1', digest)))
+        summary = bounded(lambda: task_files.backup_folder(self.store.project, self.target))
+        self.assertEqual([digest], [item['sha256'] for item in summary['problems']])
+
+    def test_fifo_backup_record_never_blocks_and_restore_is_refused(self):
+        digest = self.store.attach('t1', b'regular')
+        task_files.backup_folder(self.store.project, self.target)
+        path = self.target / task_files.RECORDS / task_files.task_key('t1') / (digest + '.json')
+        path.unlink()
+        make_fifo(self, path)
+        outcome = bounded(lambda: task_files.restore_folder(self.target, Store(self).project))
+        self.assertEqual('refused', outcome['status'])
+        self.assertIn('missing or changed', outcome['problems'][0])
+        manifest = self.target / task_files.MANIFEST
+        manifest.unlink()
+        make_fifo(self, manifest)
+        self.assertIsNone(bounded(lambda: task_files._old_manifest(manifest)))
+        outcome = bounded(lambda: task_files.restore_folder(self.target, Store(self).project))
+        self.assertEqual('refused', outcome['status'])
+        self.assertIn('no complete manifest', outcome['problems'][0])
+
     def test_backup_then_restore_round_trip(self):
         one = self.store.attach('t1', b'input sheet')
         two = self.store.attach('t2', b'results', withdrawn=True)
@@ -842,6 +953,31 @@ class AdminTaskFilesTests(unittest.TestCase):
         self.assertIn('cannot be read as an entry: not readable as JSON', out)
         code, out, err = self.run_admin('purge', 'p1', '--closed-before', '2026-02-01', '--actor', 'op', '--dry-run')
         self.assertNotEqual(0, code)
+
+    def test_regular_file_races_are_classified_by_backup_verify_and_restore(self):
+        import errno
+        self.store.attach('t1', b'abc')
+        (self.root/'backups').mkdir()
+        damaged = OSError(errno.ELOOP, 'Too many levels of symbolic links', 'host-record.json')
+        with mock.patch.object(task_files, 'backup_folder', side_effect=damaged):
+            with self.assertRaises(ValueError) as backup:
+                admin.backup_task_files(self.root, 'p1')
+        self.assertIn('host-record.json', str(backup.exception))
+
+        with mock.patch.object(task_files, 'verify', side_effect=damaged):
+            code, _, err = self.run_admin('verify', 'p1')
+        self.assertNotEqual(0, code)
+        self.assertIn('host-record.json', str(code))
+
+        backup = self.root/'backups'/'p1.task-files'
+        backup.mkdir(parents=True)
+        (self.root/'projects'/'p2').mkdir()
+        for failure in (ValueError('host-record.json changed while opening'), damaged):
+            with self.subTest(failure=type(failure).__name__):
+                with mock.patch.object(task_files, 'restore_folder', side_effect=failure):
+                    warning = admin.restore_task_files(self.root, 'p1', 'p2')
+                self.assertIn('Task files NOT restored', warning)
+                self.assertIn('host-record.json', warning)
 
     def test_r2_proxy_check_bytes_is_bounded(self):
         for bad in ('0', '-5', str(task_files.LIMIT_DEFAULTS['max_file_bytes'] + 1)):

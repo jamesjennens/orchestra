@@ -324,8 +324,26 @@ class OwnerRequirementTests(unittest.TestCase):
         self.assertEqual((answer['state'], answer['flags']), ('unavailable', []))
 
 
+def design_document(scope):
+    """A minimal design document for `design.<scope>` (kittrial-5bb.418: every new design entry carries one)."""
+    return '<!-- design-v1\nscope: %s\nstatus: candidate\n-->\n# Design\n\n## Plan phase 2\n' % scope
+
+
 class DesignPointerTests(ReferenceCase):
     """`design:SCOPE#section` against the reference entry `design.<scope>` (§2.2)."""
+
+    def propose(self, **extra):
+        key = extra.get('key', 'calendar.trading')
+        if not key.startswith('design.'):
+            return super().propose(**extra)
+        import hashlib
+        import reference_records
+        from test_reference_records import entry
+        text = design_document(key[len('design.'):])
+        extra['authority'] = {'type': 'repo-document', 'path': 'docs/design/DESIGN.md', 'commit': 'a' * 40,
+                              'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest()}
+        self.native.actor = 'alice'
+        return reference_records.apply_native(entry(**extra), 'alice', self.native, self.project, document=text)
 
     def resolve(self, token, data=None, **kwargs):
         return resolve(token, self.native.rows if data is None else data, operators=[OPERATOR], **kwargs)
@@ -343,12 +361,12 @@ class DesignPointerTests(ReferenceCase):
         answer = self.resolve('design:server-redesign#plan-phase-2')
         self.assertEqual((answer['state'], answer['flags']), ('live', ['not-selected']))
         self.assertEqual(answer['follow'], 'ref get design.server-redesign')
-        self.assertEqual(answer['section'], {'anchor': 'plan-phase-2', 'state': 'unchecked'})
+        self.assertEqual(answer['section'], {'anchor': 'plan-phase-2', 'state': 'live'})
         self.accept(1, self.sha(1, key='design.server-redesign'), key='design.server-redesign')
         answer = self.resolve('design:server-redesign#plan-phase-2')
         self.assertEqual((answer['state'], answer['flags']), ('live', []))
         self.assertEqual(answer['label']['text'], 'Trading calendar authority')
-        self.assertEqual(answer['section']['state'], 'unchecked')
+        self.assertEqual(answer['section']['state'], 'live')
         whole = self.resolve('design:server-redesign')
         self.assertNotIn('section', whole)
 
@@ -361,15 +379,36 @@ class DesignPointerTests(ReferenceCase):
             key='design.old', revision=1, record_sha256=self.sha(1, key='design.old'), successor='design.new',
             acceptance_state='superseded', acceptance=acceptance()),
             OPERATOR, self.native, self.project, operator=True, operators=[OPERATOR], web_coordinator=True)
-        answer = self.resolve('design:old#x')
+        answer = self.resolve('design:old#plan-phase-2')
         self.assertEqual((answer['state'], answer['flags']), ('superseded', []))
 
-    def test_section_is_never_checked_before_slice_three(self):
+    def test_sections_resolve_against_the_server_derived_index(self):
+        # kittrial-5bb.418: slice 3 checks the section against the index, never a file.
         self.propose(key='design.server-redesign')
-        for token in ('design:server-redesign#no-such-heading', 'design:missing#no-such-heading'):
-            answer = self.resolve(token)
-            self.assertEqual(answer['section']['state'], 'unchecked')
-            self.assertNotIn('unknown-section', answer['flags'])
+        answer = self.resolve('design:server-redesign#no-such-heading')
+        self.assertEqual(answer['section'], {'anchor': 'no-such-heading', 'state': 'unknown'})
+        self.assertEqual(answer['flags'], ['not-selected', 'unknown-section'])
+        self.assertEqual(self.resolve('design:server-redesign#plan-phase-2')['section']['state'], 'live')
+        missing = self.resolve('design:missing#no-such-heading')
+        self.assertEqual((missing['section']['state'], missing['flags']), ('unchecked', ['unknown-scope']))
+
+    def test_no_single_index_leaves_the_section_unchecked(self):
+        import copy as copying
+        import design_documents
+        self.propose(key='design.server-redesign')
+        row = self.native.row(next(r['id'] for r in self.native.rows
+                                   if any(c['text'].startswith(design_documents.INDEX_PREFIX) for c in r['comments'])))
+        index_comment = next(c for c in row['comments'] if c['text'].startswith(design_documents.INDEX_PREFIX))
+        other = copying.deepcopy(design_documents.parse_index(index_comment['text']))
+        other['headings'] = []
+        other.pop('sha256')
+        other['sha256'] = design_documents.content_hash(other)
+        self.native.add_comment(row['id'], design_documents.index_body(other))
+        answer = self.resolve('design:server-redesign#plan-phase-2')
+        self.assertEqual(answer['section']['state'], 'unchecked')
+        self.assertNotIn('unknown-section', answer['flags'])
+        row['comments'] = [c for c in row['comments'] if not c['text'].startswith(design_documents.INDEX_PREFIX)]
+        self.assertEqual(self.resolve('design:server-redesign#plan-phase-2')['section']['state'], 'unchecked')
 
     def test_unreadable_or_ambiguous_design_entries_are_unknown_scope(self):
         import reference_records

@@ -1510,7 +1510,7 @@ sets `operation`.
   - `title`: at most 200 characters.
   - `statement`: at most 2,000 characters. It is untrusted text, and it never
     appears in an error.
-  - `authority`: one of three types.
+  - `authority`: one of five types.
     - `repo-path`: a relative path with no `..`, an optional 40-hex `commit` and an
       optional `anchor`.
     - `url`: `https` only, no userinfo, with a `retrieved` date no later than today.
@@ -1567,6 +1567,109 @@ sets `operation`.
     refused until it points at a decision that exists.
   - A decision revision is stored as `Kind: reference-entry-v3`. A kit older than this
     one does not serve an entry that holds one.
+- **A repo-document authority** (kittrial-5bb.418) is what a `design.<scope>` entry is written
+  with, and only such an entry (TRACEABILITY_DESIGN.md §5.1):
+
+  ```json
+  {"type": "repo-document", "path": "docs/design/SERVER_REDESIGN.md", "commit": "<40-hex>",
+   "anchor": "design-v1", "sha256": "<64-hex sha256 of the document>"}
+  ```
+
+  - `path` follows the `repo-path` rules; `commit` and `sha256` are required; `anchor` is optional.
+  - The propose or revise carries the document itself:
+    `ref propose|revise --file entry.json --document-from-git [--repo DIR]` reads the authority's
+    path at its commit from git's own object (never the working tree), refuses a symlink, a
+    submodule, a tree or a missing path, keeps the bytes exactly (line endings, a byte-order mark),
+    fills in `sha256` when the entry has none and refuses one that does not match. Over HTTP the
+    body's `document` field is the Markdown text.
+  - The server checks the document before it writes anything: strict UTF-8, no NUL, at most 1 MiB,
+    a `<!-- design-v1 ... -->` front block whose `scope` is the key's, at most 400 headings, at most
+    2,000 `req:` and `design:` tokens, and an index of at most 100,000 bytes. It stores the bytes in
+    the project's task-files store and writes the index it derives from them as a reserved
+    `Kind: design-index-v1` record on the entry's anchor (no raw comment can write one).
+  - An accept re-reads the stored bytes and refuses unless they still hash to `sha256`, exactly the
+    index derived from them is on the anchor (no differing one beside it), and the scope matches.
+  - A direct accepted revision (`draft`) cannot carry a document: propose, then accept.
+  - From this kit on a `design.<scope>` entry is written with a repo-document authority; the
+    `repo-path` design entries written before stay readable. A repo-document revision is stored as
+    `Kind: reference-entry-v3`, which a kit from the decision authority's release on reads
+    `unsupported` (never malformed).
+  - **Verification.** `ref get` of an entry with an accepted repo-document revision carries
+    `verification`: `unverified` until checked; `verified` (with `verified_by`, `verified_at`) after a
+    trusted pass; `design-drift` after a failing report, with `trusted` (whether a trusted verifier
+    reported it), `reported_by`, `reason` and `observed_sha256`. A later trusted pass clears a drift,
+    including a trusted re-check whose result is the same as an earlier one; a pinned commit's file
+    cannot change, so otherwise the way out is a revision.
+  - Reports belong to a document, not a revision: a check binds the document's sha256, path and
+    commit. A later revision that pins exactly the same bytes, path and commit again (for example a
+    revise that returns to an earlier document) carries that document's reports and state with it; a
+    revision with another path or commit starts unverified.
+  - `trace --verify [--repo DIR] [--record | --payloads FILE]` (client) reads each accepted design
+    document's path at its pinned commit from git's own object and compares its sha256 with the
+    stored document's. It exits 3 when any check fails and 4 when it checked nothing, so a CI step
+    cannot pass without a check. A commit the checkout does not hold is reported "not checked"
+    (fetch it and run again), never as a fail; there is no dirty-checkout refusal because every read is
+    git's object at the pinned commit, never the working tree. `--record` files each result with
+    `ref verify --file report.json`, which writes an **unverified** report: it can open
+    `design-drift` (marked `trusted: false`) and never marks a document verified. `--payloads FILE`
+    writes `{"items": [...]}` for `admin.py design-verify`, the only route that writes a trusted
+    check, for an actor on the operator allowlist or the deployment's verifiers list
+    ([operations](OPERATIONS.md#reference-and-capability-records)); it exits 1 when it refused any
+    item, after printing every item's outcome.
+  - A report is `{schema_version: 1, key, doc_sha256, path, commit, observed_sha256, result, reason}`:
+    `result` is `pass` (reason `match`, and `observed_sha256` equals `doc_sha256`) or `fail` (`mismatch`,
+    `missing`, `not-a-regular-file` or `not-utf8`). It must name the accepted revision's own document.
+    A report is a repeat, and writes nothing, only when the newest report on that document is the
+    same one: the same submitter and route, result and observed sha256. After any newer report it is
+    written again. Untrusted reports are bounded per submitter and document: at most 10 passes and 5
+    fails; the trusted route is not bounded.
+  - `ref design SCOPE [--revision N]` reads the design page: the stored document as text, its index,
+    `index_state` (`matches`, `missing` or `differs`), `heading_lines` (the line of each index heading,
+    in the index's order, so a reader places anchors without its own heading rule), and the revision's
+    state. Anything that is not a readable repo-document revision answers `Design not found`.
+  - `trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]` (kittrial-5bb.425) is the
+    trace read, answered by the server from records alone (no repository, no blob read); the client
+    passes it to the endpoint action `trace` and prints the answer. Views: `summary` (the Coverage
+    panel's counts), `requirements`, `tasks`, `tokens`, `decisions`, `designs` and `round`
+    ([traceability design](design/TRACEABILITY_DESIGN.md) §5.3).
+    - **What counts.** Every view and every count comes from one snapshot of the rows the caller may
+      read: another project's rows, record anchors and record comments, and the merge slot are never
+      work, so a hidden row is absent from every list and every total.
+    - **Rows.** Every row is data, with untrusted text escaped and clipped (`{text, omitted_chars}`).
+      Every list in a row holds at most 20 items with an `_omitted` count (5 cross-reviews per lane).
+      Pages hold at most 50 rows; `next_offset` and `generation` continue a page. The generation is a
+      digest of the caller's filtered rows, so a change to a row the caller cannot read never moves it;
+      a page asked for at another generation is refused ("The project changed since this page was
+      read"). One answer is at most 64 KiB, a hard limit: a page is shortened to fit, and a single row
+      still too large is replaced by its identifying fields and `oversized: true` with a plain note.
+    - **Cost.** Each source has at most 200 distinct tokens checked. A task's sources are its
+      fields, read in this order: the description first, then the current checkpoint's item sources
+      and evidence, then the current contribution's summary; each field has its own bound. A design
+      section is one source. A source over the bound has one `tokens-not-checked` row with the count
+      it left out (`where` names the task and field, or the design and section), and only its own
+      extra tokens go unchecked. A summary line a bound cut short says `partial: true`, and the coverage
+      line says why. A requirement's ledger is validated once per answer, however many of its revisions
+      are cited. The export, membership and governance are read under the project lock; the views are
+      built after it is released. Every truncated list carries an `_omitted` count, and the 64 KiB cap
+      keeps room for the generation and the route's cursor.
+    - **Flags.** `requirements`: each accepted requirement in force, with `no-design` (only when the
+      project has designs), `no-task`, `no-capability` (only when a task citing it is closed or its
+      contribution approved). `tasks`: open tasks and those closed in the last 14 days, with
+      `cites-superseded-revision` (from `requirement_impact.analyze`; a draft or unknown citation is the
+      `tokens` view's) and `cites-nothing` (a task under a selected design's plan-phase epic with no
+      token in its description). `tokens`: every `req:` and `design:` token that does not resolve, in a
+      task description, a checkpoint item, a contribution summary or a design's index, with the flags
+      `brief` gives it. `decisions`: decision issues, their `Supersedes: decision:<id>` first line and
+      the designs naming them, plus `possible-decision-in-comment`, a heuristic that lists a person
+      owner's comment with decision words that no decision cites; it scans the newest 2,000 of the
+      owners' comments (nobody else's count toward the bound) and says so. `designs`: selected or not, `verified`, `unverified` or `design-drift`,
+      `front-status-disagrees`, `review-by-past`, sections with no plan phase, plan phases with no epic,
+      epics with no task. `round`: each `design-round:<scope>` epic's lanes with plan and delivery times,
+      cross-reviews with their authors and `delivered-after-publication`; the publication time is the first line
+      `Published drafts of <scope> at <time>` written by a person owner or coordinator in current
+      membership or a listed operator, and nobody else's.
+    - A project with no `design.*` entries says so once (`note`), never flags `no-design`, and its
+      `summary` holds the requirement and token lines only.
 - **Caller-written fields are refused.** `acceptance_state`, `successor`, `sha256`,
   `acceptance` and `labels` are written by the operation.
 - **`propose`** creates the entry's native anchor, closes it and posts revision 1 as a
@@ -1933,6 +2036,32 @@ catalogued document as served with its size or refused with its sentence; whoeve
 and the project entry point together. A document that cannot be read is refused without
 printing a host path, and the sentence names the document.
 
+## A revision with review items still open (kittrial-5bb.431)
+
+Only a `respond` record answers a review item. A new revision does not, and neither does a
+plain comment. So a `contribute` answer (`review TASK --file`) carries two additive fields:
+
+- **`open_items`:** the blocking items still open after the write, `[{request, item,
+  contribution}]` in filing order, at most 20. It is `[]` when every item is answered. A note
+  never blocks, so it is never listed.
+- **`warnings`:** while any item is open, the list gains one sentence per request: "N items of
+  request R are still open (I1, I2): a new revision does not answer them; answer each with a
+  respond record (`review TASK --file respond.json`, operation respond)."
+
+The contribution is recorded either way: this is advice, never a refusal. An exact replay
+answers the same advice, and any other operation's answer is unchanged.
+
+While changes are requested, the `work` row says the same thing until each item is answered:
+- `items[].open_review_items` (`[{request, item}]`);
+- the `next` sentence, which ends "Open: I1, I2 of request R. Answer each with a respond
+  record (...)." It names at most 5 ids, then "and N more".
+
+The brief's `next_action` ends with the same words.
+
+Over HTTP, the route `POST /v1/projects/{pid}/tasks/{tid}/reviews` answers the same
+`open_items`. Its warning, and the agent next-actions sentence, name the respond record as
+"POST `/v1/projects/{pid}/tasks/{tid}/reviews`, operation respond" and never the client command.
+
 ## IDs and cursor roles
 
 - **Native task ID**: `task`/`items[].task`/the positional argument to `show`, `brief`,
@@ -2021,7 +2150,8 @@ lists the read-only rounds view's display bounds separately in `rounds_limits`.
 | `checkpoint` | `intent`, `next_action` | <= 600 characters each |
 | `checkpoint` | `acceptance`, `summary` | <= 1000 characters each |
 | `checkpoint` | `source_commit` / `branch` | <= 128 / <= 200 characters |
-| `checkpoint` | `open_items` / `resolved` | <= 100 each |
+| `checkpoint` | `open_items` / `resolved` | <= 100 each, within the 80,000-byte record; group them (one open item per theme with an id prefix, resolved ones folded) and link a longer text in a repository document through an item `source` |
+| `create` / `update` | `--description`, `--body-file` | <= 20,000 characters on the native route and on HTTP alike, answered with `Task description is too long`; keep a long text in a repository document and link it from the description |
 | `checkpoint` | item `text`/`reason` | <= 400 characters |
 | `checkpoint` | item `source`/`evidence` | <= 240 characters |
 | `checkpoint` | whole payload | <= 80 KB canonical bytes |
@@ -2191,6 +2321,18 @@ The native `create` call uses `--no-inherit-labels` and, for
 and content hashes are durable, so an uncertain create is reconciled with the same
 request ID instead of creating a duplicate.
 
+**Over the web (kittrial-5bb.434):** `POST /v1/projects/{id}/tasks/{task}/children` sends exactly this
+`coordinate create-child` request.
+- The parent is `{task}`; the body takes `title`, `description`, `type`, and optionally `assignee` and
+  `priority` (0-4).
+- It needs `coordinate`.
+- The request ID is the route's durable operation identity from the Idempotency-Key, so an exact retry
+  returns the same child. The route reads the parent first, so a parent that is absent, in another
+  project or a record anchor, and a project the caller may not read, all answer one 404 "Task not found".
+- Every other rule is the endpoint's own, unchanged: the type list (task, bug, feature, chore, decision;
+  no epic), the merge slot taking no child, the description bound, a decision's required headings (`##
+  Decision`, `## Rationale`, `## Alternatives Considered`, named in the refusal), and assignee names.
+
 ## Backward compatibility
 
 Unreadable native reference, capability and proposal rows are classified by their
@@ -2233,7 +2375,14 @@ Incremental `lifecycle.py release --live-verified` selection can add
 deployment. It is valid only with `live_verified=true`, without rollback, in the
 same environment, with the target's exact source/integration commits. The endpoint
 requires that scope to remain live and deployed=passed; otherwise it refuses before
-writing and requests a fresh export. The field is request-only: native scope and
+writing and requests a fresh export; the refusal names the task, the scope it was
+bound to, the live scope (or that nothing is live) and the time of the newest record
+in the view compared (kittrial-5bb.313). `lifecycle.py release` without `--export`
+plans from a live read made through the caller's existing `bd` reads (`list --all
+--limit 0 --json`, then `show IDS --json --include-comments` for rows with comments),
+so a release of many targets after other writes needs no retry; `--export FILE` keeps
+planning from the file as before, and the endpoint re-verifies every target under
+its lock either way. The field is request-only: native scope and
 fact payloads retain their old shape. A target being restored receives live before
 verification on the first command, without a verification-only binding.
 

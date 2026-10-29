@@ -6,6 +6,8 @@ own cases in ``test_web_lanes`` and ``test_coordinator_http_wait``.
 """
 import importlib.util
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -66,6 +68,26 @@ class FakeNative:
 
 def clear_request(task='t1', target='f1', reason='fixed the slot'):
     return {'schema_version': 1, 'task': task, 'target': target, 'reason': reason}
+
+
+class BlockingReadTimeout(Exception):
+    pass
+
+
+def bounded(call):
+    previous = signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(BlockingReadTimeout()))
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def make_fifo(case, path):
+    if not hasattr(os, 'mkfifo'):
+        case.skipTest('mkfifo is unavailable')
+    os.mkfifo(path)
 
 
 class RecordTests(unittest.TestCase):
@@ -243,6 +265,24 @@ class ClearTests(unittest.TestCase):
     def board_fault(self):
         result = lanes.read(self.native.rows, A, tl.registry(('lane-a', A)), [], now=NOW, journal=self.project)
         return next(item for item in result['items'] if item['actor'] == A)['needs_investigation']
+
+    def test_regular_file_host_journal_missing_damaged_and_valid_classifications(self):
+        self.assertEqual(({}, []), fault_clear.host_journal(self.project))
+        answer = self.native.apply(self.project, clear_request())
+        path = next((self.project / fault_clear.JOURNAL_DIR).glob('*.json'))
+        self.assertEqual([], fault_clear.host_journal(self.project)[1])
+        self.assertIn(answer['comment_id'], fault_clear.host_journal(self.project)[0])
+        path.write_text('{bad', encoding='utf-8')
+        self.assertEqual(({}, [fault_clear.JOURNAL_DIR + '/' + path.name]),
+                         fault_clear.host_journal(self.project))
+
+    def test_fifo_host_journal_never_blocks_and_is_invalid(self):
+        answer = self.native.apply(self.project, clear_request())
+        path = next((self.project / fault_clear.JOURNAL_DIR).glob('*.json'))
+        path.unlink()
+        make_fifo(self, path)
+        self.assertEqual(({}, [fault_clear.JOURNAL_DIR + '/' + path.name]),
+                         bounded(lambda: fault_clear.host_journal(self.project)))
 
     def test_a_coordinators_clear_removes_the_flag_and_is_audited_who_and_when(self):
         answer = self.native.apply(self.project, clear_request())

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "operation_id": "24162506-4fc4-484a-a130-eb986eee36c9",
+  "key": "tests.clock-stable-fixtures",
+  "name": "Clock-stable reference payload fixtures",
+  "aliases": ["clock stable test fixtures"],
+  "summary": "Shared reference payload helpers derive review_by from the UTC clock 365 days ahead instead of a hard-coded future date. Injected clocks remain authoritative, and the real-bd forced-wrapper fixture carries an opt-in test clock shim into its re-executed endpoint interpreter.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "tests/test_web_records.py::_review_by",
+    "tests/test_reference_records.py::_review_by",
+    "tests/test_coordinator_acceptance_real_bd.py::_review_by"
+  ],
+  "tests": [
+    "tests/test_web_records.py::ReviewByFixtureTests.test_review_by_is_one_year_after_the_utc_date",
+    "tests/test_reference_records.py::ReviewByFixtureTests.test_review_by_is_one_year_after_the_utc_date",
+    "tests/test_coordinator_acceptance_real_bd.py::ReviewByFixtureTests.test_review_by_is_one_year_after_the_utc_date",
+    "tests/test_coordinator_acceptance_real_bd.py::RealBdCoordinatorAcceptanceTests.test_the_two_step_propose_then_accept_runs_through_the_real_wrapper_on_a_real_bd",
+    "tests/test_catalog_followups.py::DuplicateWriteTests.test_propose_revise_direct_apply_accept_and_retire_refuse_before_native_mutation",
+    "tests/test_duplicate_release.py::ReferenceDuplicateWriteTests.test_every_reference_write_is_refused_on_a_duplicate_and_works_after_the_release"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": ["tests", "clock", "fixtures", "references"]
+}

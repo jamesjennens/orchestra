@@ -40,9 +40,9 @@ import test_http_review_fixes as fixes
 SESSION_A = 'session-11111111-2222-3333-4444-555555555555'
 SESSION_FREE = 'session-99999999-8888-7777-6666-555555555555'
 HOST = {'sessions': [SESSION_A], 'operators': ['ops-lead', 'team/alice'], 'verifiers': ['verity']}
-#: The four keys `admin.project_merge_slot_state` (and now `endpoint.tracker_actors`) require
-#: before bd is run at all: without them bd falls back to an embedded database (rev-3 item 2).
-SERVER_COORDINATES = {'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
+#: The four keys and dolt_mode `server` that `admin.project_merge_slot_state` and `endpoint.tracker_actors`
+#: require before bd is run at all: without them bd falls back to an embedded database (rev-3 item 2).
+SERVER_COORDINATES = {'dolt_mode': 'server', 'dolt_server_host': '127.0.0.1', 'dolt_server_port': 13317,
                       'dolt_server_user': 'root', 'dolt_database': 'probe'}
 #: (what it is, the namespace asked for, the rule it breaks)
 TAKEN = (
@@ -1346,6 +1346,18 @@ class RealEndpointCase(unittest.TestCase):
                              ['--authority-store', str(self.config_path)])
         self.assertEqual((2, 'merge-slot'), (told['returncode'], told.get('fault')), told)
 
+    def test_a_project_with_coordinates_but_no_server_mode_is_the_transient_fault(self):
+        """kittrial-5bb.171: bd runs embedded for any dolt_mode but `server`, coordinates or not."""
+        for mode in ('embedded', 'Server', None):
+            with self.subTest(mode=mode):
+                data = dict(SERVER_COORDINATES, dolt_mode=mode)
+                if mode is None:
+                    del data['dolt_mode']
+                (self.project / '.beads' / 'metadata.json').write_text(json.dumps(data), encoding='utf-8')
+                with self.assertRaises(actor_names.TrackerUnreadable):
+                    self.endpoint.tracker_actors(self.root, self.project)
+                self.assertFalse(self.marker.exists(), 'bd ran without dolt_mode server')
+
     def test_a_project_with_no_server_coordinates_is_the_transient_fault(self):
         """kittrial-5bb.202 rev-3 item 2 (F2): `tracker_actors` now applies the same guard
         `admin.project_merge_slot_state` does.
@@ -1728,6 +1740,14 @@ class RealEndpointCase(unittest.TestCase):
         path.write_text('[]', encoding='utf-8')
         with self.assertRaises(ValueError):
             admin.credential_actors(self.root, path)
+
+    def test_the_host_command_reads_a_symlinked_state(self):
+        import admin
+        real = self.tmp / 'credential-state-real.json'
+        real.write_text(json.dumps({'users': {}, 'credentials': {}}), encoding='utf-8')
+        path = self.tmp / 'credential-state.json'
+        path.symlink_to(real.name)
+        self.assertEqual(admin.credential_actors(self.root, path)['credentials'], [])
 
     def test_an_empty_export_is_tracker_rows_null_and_not_false(self):
         """kittrial-5bb.202 rev-3 item 3(a) (review F3): main's answer, restored.

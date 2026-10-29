@@ -597,22 +597,31 @@ def deployment_document(marker):
 
     Only a regular file is read. A FIFO in its place would block the reader until somebody
     wrote to it, and a directory has nothing to parse: both are refused at once, by opening
-    without waiting and looking at what was opened (review of kittrial-5bb.156). A file that
-    is not there, or cannot be opened, keeps its ``OSError``.
+    without waiting and looking at what was opened (review of kittrial-5bb.156). A configured
+    symlink is resolved before that one checked open. A file that is not there, or cannot be
+    opened, keeps its ``OSError``.
     """
-    descriptor=os.open(str(marker),os.O_RDONLY|getattr(os,'O_NONBLOCK',0))
+    configured=marker
     try:
-        import stat
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ConfigurationUnreadable('Deployment configuration %s is not a regular file'%marker)
-    finally:
-        os.close(descriptor)
-    try:
-        document=read_json_file(marker,'Deployment configuration')
+        marker=Path(os.path.realpath(str(marker)))
+        text=read_regular_text(marker)
+    except UnicodeError as error:
+        raise ConfigurationUnreadable('Deployment configuration %s is not readable text: %s'%(configured,error)) from None
     except ValueError as error:
-        raise ConfigurationUnreadable(str(error)) from None
+        message=str(error)
+        if message=='%s is not a regular file'%marker:
+            message='Deployment configuration %s is not a regular file'%configured
+        raise ConfigurationUnreadable(message) from None
+    except OSError as error:
+        if error.filename is None:raise
+        raise type(error)(error.errno,error.strerror,str(configured)) from None
+    try:
+        document=record_json.loads(text)
+    except ValueError as error:
+        if 'nested too deeply' in str(error):raise RecursionError(str(error)) from None
+        raise ConfigurationUnreadable('Deployment configuration %s is not valid JSON: %s'%(configured,error)) from None
     if not isinstance(document,dict):
-        raise ConfigurationUnreadable('Deployment configuration %s is not a JSON object'%marker)
+        raise ConfigurationUnreadable('Deployment configuration %s is not a JSON object'%configured)
     return document
 
 def deployment_password(root):
@@ -1038,6 +1047,45 @@ def lifecycle_void_generation_command(root, project):
 LIFECYCLE_VOID_WRITES_KEY = 'lifecycle_void_writes'
 LIFECYCLE_VOID_AUDIT_KEY = 'lifecycle_void_writes_audit'
 LIFECYCLE_VOID_AUDIT_MAX = 20
+
+
+#: The installation switches that refuse a web write while off (kittrial-5bb.434): the name, the writes it
+#: lets through, and the operator command that turns it on. Read by `installation_switches` for the web.
+INSTALLATION_SWITCHES = (
+    ('review_workflow_writes',
+     'the newer review operations: withdraw, request-review, resolve-item, decline-review, an item severity and a '
+     'request-changes summary',
+     'admin.py review-writes on --actor OPERATOR'),
+    ('checkpoint_provenance_writes',
+     'checkpoints written with their retained provenance, so the directions given on a task can be resolved',
+     'admin.py checkpoint-provenance-writes on --actor OPERATOR'),
+    ('web_lifecycle_mark_writes',
+     'the integration mark from the web: recording integrated as passed on a task',
+     'admin.py web_lifecycle_mark_writes on --actor OPERATOR'),
+)
+
+
+def installation_switches(root):
+    """Each web-write switch's name, state (`on`, `off` or `unreadable`), what it unlocks and the operator
+    command (kittrial-5bb.434). The state is the one the writers themselves read, through their own readers;
+    nothing here can change a switch, and no path, value or actor is returned."""
+    from briefing import checkpoint_writes_enabled
+    import contextlib
+    import io
+    readers = {'review_workflow_writes': lambda: review_workflow_writes(root, warnings=[]),
+               'checkpoint_provenance_writes': lambda: checkpoint_writes_enabled(root),
+               'web_lifecycle_mark_writes': lambda: web_lifecycle_mark_writes(root)}
+    items = []
+    for name, unlocks, command in INSTALLATION_SWITCHES:
+        try:
+            # A reader that warns on a malformed value prints to stderr; the state it returns is what counts.
+            with contextlib.redirect_stderr(io.StringIO()):
+                value = readers[name]()
+            state = 'on' if value is True else 'off'
+        except (ValueError, OSError):
+            state = 'unreadable'
+        items.append({'name': name, 'state': state, 'unlocks': unlocks, 'command': command})
+    return items
 
 
 def web_lifecycle_mark_writes(root):
@@ -1537,7 +1585,7 @@ def _read_review_writes_audit(root):
     if not path.is_file():
         return None,None
     try:
-        record=record_json.loads(path.read_text(encoding='utf-8'))
+        record=record_json.loads(read_regular_text(path))
     except (OSError,UnicodeError,ValueError):
         return [],'unreadable or not valid JSON'
     return _review_writes_history(record)
@@ -2322,6 +2370,41 @@ def run_bd(root,name,args):
     location=[] if args and args[0]=='init' else ['--directory',path]
     return checked([root/'bin/bd',*location,'--sandbox',*args],env=environment(root),cwd=path).stdout
 
+def read_regular_text(path,limit=None,raw=False,validate=None,prefix=None):
+    """Read a regular file through the shared nonblocking, no-follow primitive."""
+    from regular_file import read_regular_text as read
+    return read(path,limit=limit,raw=raw,validate=validate,prefix=prefix)
+
+def project_metadata_document(root,name):
+    """The parsed ``.beads/metadata.json`` object, or None when it cannot be read or is not an object."""
+    try:
+        data=json.loads(read_regular_text(project_dir(root,name)/'.beads'/'metadata.json'))
+    except (OSError,ValueError,RecursionError):
+        return None
+    return data if isinstance(data,dict) else None
+
+SERVER_COORDINATES=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
+
+def server_metadata_fault(data):
+    """Why a parsed ``.beads/metadata.json`` is not a server project bd may be run for: ``None``
+    when it is one, ``coordinates`` when the Dolt server coordinates are not all recorded, ``mode``
+    when they are but ``dolt_mode`` is missing or not exactly ``server``. bd runs EMBEDDED for any
+    other mode, CREATES ``.beads/embeddeddolt`` and lists nothing (kittrial-5bb.171). The one rule
+    every bd-running guard shares (admin, endpoint)."""
+    if not isinstance(data,dict) or not all(data.get(key) for key in SERVER_COORDINATES):return 'coordinates'
+    if data.get('dolt_mode')!='server':return 'mode'
+    return None
+
+def server_metadata_sentence(data):
+    """What is wrong with the metadata, in the operator's words, ending with why bd was not run."""
+    if server_metadata_fault(data)=='mode':
+        mode=data.get('dolt_mode')
+        shown='has no dolt_mode' if mode is None else 'has dolt_mode %s'%json.dumps(mode)[:40]
+        problem='.beads/metadata.json records the Dolt server coordinates but %s, not "server"'%shown
+    else:
+        problem='.beads/metadata.json does not record the Dolt server coordinates'
+    return problem+', so bd was not run (it would create an embedded database here and list nothing)'
+
 def project_server_metadata(root,name):
     """(host,port,user,database) from the project's ``.beads/metadata.json``, or None.
 
@@ -2331,19 +2414,16 @@ def project_server_metadata(root,name):
     recorded failure reason. A project without those keys (an older or partial
     project) has no SQL coordinates, and the caller keeps the pre-existing native path.
     """
-    try:
-        data=json.loads((project_dir(root,name)/'.beads'/'metadata.json').read_text(encoding='utf-8'))
-    except (OSError,ValueError):
-        return None
-    if not isinstance(data,dict):return None
-    keys=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
+    data=project_metadata_document(root,name)
+    if data is None:return None
+    keys=SERVER_COORDINATES
     if not all(data.get(key) for key in keys):return None
     return tuple(data[key] for key in keys)
 
 def project_metadata_state(root,name):
     """What ``.beads/metadata.json`` says about a project, for the checks that must not guess.
 
-    ``server`` (it records the Dolt server coordinates), ``absent`` (no such file: the
+    ``server`` (it records the Dolt server coordinates and ``dolt_mode`` server), ``absent`` (no such file: the
     project was never initialized), or ``unreadable`` (the file is there but cannot be
     opened, is not JSON, or does not record the coordinates). Every project this kit
     creates is a server project (``bd init --server``), so ``unreadable`` never means "an
@@ -2357,7 +2437,11 @@ def project_metadata_state(root,name):
         return 'absent'
     except OSError:
         return 'unreadable'
-    return 'server' if project_server_metadata(root,name) is not None else 'unreadable'
+    if project_server_metadata(root,name) is None:return 'unreadable'
+    # bd runs embedded for any other dolt_mode (a missing one too): it CREATES .beads/embeddeddolt
+    # and lists nothing, even with the server coordinates present (kittrial-5bb.171 item 1).
+    data=project_metadata_document(root,name)
+    return 'server' if server_metadata_fault(data) is None else 'unreadable'
 
 def server_database_name(root,name):
     """Return the case-insensitively matched server database name, if any."""
@@ -2401,7 +2485,7 @@ def project_backup_record(root,name):
     reads as None, which keeps a project with no recorded target on its pre-existing path.
     """
     try:
-        data=json.loads((project_dir(root,name)/'.beads'/'dolt-backup.json').read_text(encoding='utf-8'))
+        data=json.loads(read_regular_text(project_dir(root,name)/'.beads'/'dolt-backup.json'))
     except (OSError,ValueError):
         return None
     return data if isinstance(data,dict) else None
@@ -2596,10 +2680,11 @@ def adopt_project_identity(root,name):
     identity=project_identity(root,metadata[3])
     if identity is None:return None
     path=project_dir(root,name)/'.beads'/'metadata.json'
-    data=json.loads(path.read_text(encoding='utf-8'))
+    opened=[]
+    data=json.loads(read_regular_text(path,validate=opened.append))
     if data.get('project_id')==identity:return None
     data['project_id']=identity
-    mode=path.stat().st_mode&0o777
+    mode=opened[0].st_mode&0o777
     fd,temporary=tempfile.mkstemp(prefix=path.name+'.',suffix='.tmp',dir=str(path.parent))
     try:
         with os.fdopen(fd,'w',encoding='utf-8') as handle:
@@ -3013,7 +3098,7 @@ def office_bundled_python():
     manifest=release/'manifest.json'
     if not manifest.is_file():return None
     try:
-        document=record_json.loads(manifest.read_text(encoding='utf-8'))
+        document=record_json.loads(read_regular_text(Path(os.path.realpath(str(manifest)))))
     except (OSError,UnicodeError,ValueError):
         return None
     relative=document.get('python_executable') if isinstance(document,dict) else None
@@ -3404,11 +3489,10 @@ def project_merge_slot_state(root,name,path=None):
     # bd is never run without the server coordinates: it would fall back to an embedded
     # database and CREATE .beads/embeddeddolt here (see project_metadata_state).
     try:
-        metadata=json.loads((path/'.beads'/'metadata.json').read_text(encoding='utf-8'))
+        metadata=json.loads(read_regular_text(path/'.beads'/'metadata.json'))
     except (OSError,ValueError,UnicodeError):
         metadata=None
-    keys=('dolt_server_host','dolt_server_port','dolt_server_user','dolt_database')
-    if not isinstance(metadata,dict) or not all(metadata.get(key) for key in keys):
+    if server_metadata_fault(metadata) is not None:
         return {'state':'unknown','detail':None}
     try:
         state=json.loads(run_bd(root,name,['merge-slot','check','--json']) or 'null')
@@ -3444,7 +3528,7 @@ def project_setup_status(root,name,path=None):
     try:
         entry=path/'ONBOARDING.md'
         if entry.is_symlink():raise ValueError('symlink')
-        present=entry.is_file() and bool(entry.read_text(encoding='utf-8').strip())
+        present=entry.is_file() and bool(read_regular_text(entry).strip())
         result['onboarding']={'state':'set' if present else 'not-set',
                               'updated_at':(datetime.fromtimestamp(entry.stat().st_mtime,timezone.utc)
                                             .strftime('%Y-%m-%dT%H:%M:%SZ') if present else None)}
@@ -3879,7 +3963,7 @@ def retire_findings(root,name):
             unreadable[journal]=unreadable.get(journal,0)+1;continue
         for receipt in directory.glob('*.json'):
             try:
-                status=json.loads(receipt.read_text(encoding='utf-8'))['status']
+                status=json.loads(read_regular_text(receipt))['status']
                 if not isinstance(status,str):raise ValueError('status')
                 if status=='pending':pending[journal]=pending.get(journal,0)+1
             except (OSError,ValueError,KeyError,TypeError):
@@ -3898,8 +3982,8 @@ def retire_blockers(findings):
     counts=lambda found:', '.join('%d in %s'%(count,journal) for journal,count in sorted(found.items()))
     blockers=[]
     if findings.get('metadata')=='unreadable':
-        blockers.append('its .beads/metadata.json is there but could not be read (or does not record the Dolt '
-                        'server), so the project could not be checked: it may be a healthy tracker')
+        blockers.append('its .beads/metadata.json is there but could not be read, or does not record the Dolt '
+                        'server coordinates with dolt_mode "server", so the project could not be checked: it may be a healthy tracker')
     elif findings['bd']=='unreachable':
         blockers.append('the Dolt server (or bd) could not be reached, so the project could not be checked: it '
                         'may be a healthy tracker')
@@ -4588,25 +4672,16 @@ def read_sidecar_json(path):
     if path.is_symlink():return None,'it is a symlink'
     if not path.exists():return None,None
     if not path.is_file():return None,'it is not a regular file'
-    # Opened without following a symlink and without blocking, then checked to be a regular
-    # file on the open descriptor: a FIFO or device put in place between the checks above
-    # and the open answers at once instead of hanging the read (kittrial-5bb.150).
-    flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
     try:
-        fd=os.open(str(path),flags)
+        raw=read_regular_text(path,raw=True)
     except OSError as error:
         return None,'it cannot be read (%s)'%error.__class__.__name__
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):return None,'it is not a regular file'
-        with os.fdopen(fd,'rb') as handle:
-            fd=None
-            raw=handle.read()
-    except OSError as error:
-        return None,'it cannot be read (%s)'%error.__class__.__name__
-    finally:
-        if fd is not None:os.close(fd)
-    try:return json.loads(raw.decode('utf-8')),None
-    except ValueError:return None,'it is not valid JSON'
+    except ValueError:
+        return None,'it is not a regular file'
+    # record_json.loads bounds the nesting (record_json.NESTING_MAX) on every Python; the RecursionError
+    # catch stays as a backstop (kittrial-5bb.171).
+    try:return record_json.loads(raw.decode('utf-8')),None
+    except (ValueError,RecursionError):return None,'it is not valid JSON'
 
 def native_backup_manifest(directory):
     """``(manifest, None)`` for a native backup directory, or ``(None, reason)``.
@@ -4703,7 +4778,7 @@ def report_native_backup_change(root,source):
 
 def _atomic_copy(source,destination):
     """Replace ``destination`` with a byte-for-byte copy of ``source``, atomically."""
-    _atomic_write_bytes(Path(destination),Path(source).read_bytes())
+    _atomic_write_bytes(Path(destination),read_regular_text(source,raw=True))
 
 @contextmanager
 def last_complete_guard(root,name):
@@ -4743,7 +4818,7 @@ def last_complete_guard(root,name):
             try:
                 if last_complete.is_file() and not last_complete.is_symlink():
                     _atomic_copy(last_complete,bundle)
-            except OSError:
+            except (OSError, ValueError):
                 pass
         raise
 
@@ -4813,27 +4888,27 @@ def backup_project(root,name):
         if (path/'.coordination-requests').is_symlink() or (path/'.merge-context.json').is_symlink():raise ValueError('Coordination paths must not be symlinks')
         for record in sorted((path/'.coordination-requests').glob('*.json')):
             if record.is_symlink():raise ValueError('Coordination receipt must not be a symlink')
-            files['.coordination-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.coordination-requests/'+record.name]=json.loads(read_regular_text(record))
         context=path/'.merge-context.json'
-        if context.exists():files[context.name]=json.loads(context.read_text(encoding='utf-8'))
+        if context.exists():files[context.name]=json.loads(read_regular_text(context))
         registry=path/'.sessions.json'
         if registry.is_symlink():raise ValueError('Session registry must not be a symlink')
-        if registry.exists():files[registry.name]=json.loads(registry.read_text(encoding='utf-8'))
+        if registry.exists():files[registry.name]=json.loads(read_regular_text(registry))
         handoffs=path/'.handoffs'
         if handoffs.is_symlink():raise ValueError('Handoff journal must not be a symlink')
         for record in handoffs.glob('*.json'):
             if record.is_symlink():raise ValueError('Handoff receipt must not be a symlink')
-            files['.handoffs/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.handoffs/'+record.name]=json.loads(read_regular_text(record))
         requests=path/'.handoff-requests'
         if requests.is_symlink():raise ValueError('Handoff request journal must not be a symlink')
         for record in requests.glob('*.json'):
             if record.is_symlink():raise ValueError('Handoff request record must not be a symlink')
-            files['.handoff-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.handoff-requests/'+record.name]=json.loads(read_regular_text(record))
         recoveries=path/'.handoff-recoveries'
         if recoveries.is_symlink():raise ValueError('Handoff recovery journal must not be a symlink')
         for record in recoveries.glob('*.json'):
             if record.is_symlink():raise ValueError('Handoff recovery record must not be a symlink')
-            files['.handoff-recoveries/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.handoff-recoveries/'+record.name]=json.loads(read_regular_text(record))
         # The requirement journals are the operator's recovery cache for
         # requirement-apply/backfill: back them up so a restore keeps the F3
         # acceptance evidence and the pending/reconciled operation IDs.
@@ -4841,12 +4916,12 @@ def backup_project(root,name):
         if requirement_requests.is_symlink():raise ValueError('Requirement request journal must not be a symlink')
         for record in requirement_requests.glob('*.json'):
             if record.is_symlink():raise ValueError('Requirement request receipt must not be a symlink')
-            files['.requirement-requests/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.requirement-requests/'+record.name]=json.loads(read_regular_text(record))
         requirement_backfills=path/'.requirement-backfills'
         if requirement_backfills.is_symlink():raise ValueError('Requirement backfill journal must not be a symlink')
         for record in requirement_backfills.glob('*.json'):
             if record.is_symlink():raise ValueError('Requirement backfill receipt must not be a symlink')
-            files['.requirement-backfills/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.requirement-backfills/'+record.name]=json.loads(read_regular_text(record))
         # The host-issued integration revert journal (kittrial-5bb.52 P1). It is the
         # proof a revert was issued on this host, so a restore that dropped it would
         # silently un-revert every reverted contribution: it is backed up, validated
@@ -4857,7 +4932,7 @@ def backup_project(root,name):
         if revert_journal.is_symlink():raise ValueError('Integration revert journal must not be a symlink')
         for record in revert_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Integration revert journal entry must not be a symlink')
-            files['.integration-reverts/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.integration-reverts/'+record.name]=json.loads(read_regular_text(record))
         # The host-issued assignee follow-on journal (kittrial-5bb.343). It is the
         # proof a hand-back was recorded on this host, so a restore that dropped it
         # would silently make every recorded hand-back inert: it is backed up,
@@ -4866,21 +4941,21 @@ def backup_project(root,name):
         if followon_journal.is_symlink():raise ValueError('Assignee follow-on journal must not be a symlink')
         for record in followon_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Assignee follow-on journal entry must not be a symlink')
-            files['.assignee-followons/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+            files['.assignee-followons/'+record.name]=json.loads(read_regular_text(record))
         # The host-issued lane fault clear journal (kittrial-5bb.398), backed up and restored
         # like the follow-on journal: without it every cleared fault would show again.
         fault_journal=path/'.lane-fault-clears'
         if fault_journal.is_symlink():raise ValueError('Lane fault clear journal must not be a symlink')
         for record in fault_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Lane fault clear journal entry must not be a symlink')
-            files['.lane-fault-clears/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
+            files['.lane-fault-clears/'+record.name]=record_json.loads(read_regular_text(record))
         # The delegation journal (kittrial-5bb.407), backed up and restored like the two above:
         # without it every delegation would be inert after a restore.
         delegation_journal=path/'.delegations'
         if delegation_journal.is_symlink():raise ValueError('Delegation journal must not be a symlink')
         for record in delegation_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Delegation journal entry must not be a symlink')
-            files['.delegations/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
+            files['.delegations/'+record.name]=record_json.loads(read_regular_text(record))
         # The per-project claiming setting (kittrial-5bb.352). It lives outside the
         # tracker, so a backup that dropped it would silently open claiming again after
         # a restore. A damaged file is carried byte for byte and reads back restrictive.
@@ -4896,7 +4971,7 @@ def backup_project(root,name):
         if owner_answers.is_symlink():raise ValueError('Owner answers journal must not be a symlink')
         for record in owner_answers.glob('*.json'):
             if record.is_symlink():raise ValueError('Owner answers journal entry must not be a symlink')
-            files[OWNER_ANSWERS_JOURNAL+'/'+record.name]=record_json.loads(record.read_text(encoding='utf-8'))
+            files[OWNER_ANSWERS_JOURNAL+'/'+record.name]=record_json.loads(read_regular_text(record))
         # The record journals (kittrial-5bb.64). This kit writes none, but after a
         # rollback from a later slice they exist and must round-trip.
         for journal in RECORD_JOURNALS:
@@ -4904,7 +4979,7 @@ def backup_project(root,name):
             if folder.is_symlink():raise ValueError('Record journal %s must not be a symlink'%journal)
             for record in folder.glob('*.json'):
                 if record.is_symlink():raise ValueError('Record journal receipt must not be a symlink')
-                files[journal+'/'+record.name]=json.loads(record.read_text(encoding='utf-8'))
+                files[journal+'/'+record.name]=json.loads(read_regular_text(record))
         if (path/'ONBOARDING.md').exists() or (path/'ONBOARDING.md').is_symlink():
             from onboarding import read_document, PROJECT_LIMIT
             files['ONBOARDING.md']={'text':read_document(path,'ONBOARDING.md',PROJECT_LIMIT)}
@@ -4925,11 +5000,11 @@ def backup_project(root,name):
             if feedback.is_symlink():raise ValueError('Feedback feed must not be a symlink')
             from feedback import FEED_NAME, QUARANTINE_SUFFIX, _read as read_feedback, validate_quarantine_record
             read_feedback(feedback)
-            files['.feedback.jsonl']={'text':feedback.read_text(encoding='utf-8')}
+            files['.feedback.jsonl']={'text':read_regular_text(feedback)}
             for record in sorted(path.glob(FEED_NAME+'.*'+QUARANTINE_SUFFIX)):
                 if record.is_symlink():raise ValueError('Feedback quarantine must not be a symlink')
                 quarantine_name=record.name
-                content=record.read_bytes()
+                content=read_regular_text(record,raw=True)
                 backup={'base64':base64.b64encode(content).decode('ascii')}
                 validate_quarantine_record(quarantine_name,backup)
                 files[quarantine_name]=backup
@@ -5068,8 +5143,7 @@ def open_item_label_check(root,names=None):
             # bd would fall back to an embedded database here: it would CREATE
             # .beads/embeddeddolt inside the project and list nothing, which would read
             # as clean (kittrial-5bb.126 review). Nothing is run for such a project.
-            report[name]={'error':'.beads/metadata.json does not record the Dolt server coordinates, so bd '
-                                   'was not run (it would create an embedded database here and list nothing)'}
+            report[name]={'error':server_metadata_sentence(project_metadata_document(root,name))}
             continue
         try:
             rows=json.loads(run_bd(root,name,['list','--all','--limit','0','--json']) or '[]')
@@ -5158,8 +5232,7 @@ def assignee_name_report(root,names=None,state=None):
         if metadata=='absent':
             report[name]={'error':'unknown or uninitialized project'};continue
         if metadata!='server':
-            report[name]={'error':'.beads/metadata.json does not record the Dolt server coordinates, so bd '
-                                   'was not run (it would create an embedded database here and list nothing)'}
+            report[name]={'error':server_metadata_sentence(project_metadata_document(root,name))}
             continue
         try:
             rows=record_json.loads_rows(run_bd(root,name,['export','--all']))
@@ -5539,7 +5612,7 @@ def read_backup_status(root):
     path=root/'backups'/BACKUP_STATUS_NAME
     if path.is_symlink():raise ValueError('Backup status file must not be a symlink')
     if not path.is_file():raise ValueError('No backup status file; run a backup first')
-    try:record=json.loads(path.read_text(encoding='utf-8'))
+    try:record=json.loads(read_regular_text(path))
     except (OSError,ValueError):raise ValueError('Backup status file is not readable JSON') from None
     validate_backup_status(record)
     return record
@@ -5571,7 +5644,7 @@ def backup_schedule_log(root):
     """
     path=root/'backups'/BACKUP_SCHEDULE_LOG_NAME
     if path.is_symlink() or not path.is_file():return []
-    try:lines=path.read_text(encoding='utf-8').splitlines()
+    try:lines=read_regular_text(path).splitlines()
     except (OSError,ValueError):return []
     entries=[]
     for line in lines[-BACKUP_SCHEDULE_LOG_MAX:]:
@@ -5599,7 +5672,7 @@ def _append_backup_schedule_log(root,entry):
     if path.is_symlink():return None
     lines=[];set_aside=None
     try:
-        if path.is_file():lines=[line for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+        if path.is_file():lines=[line for line in read_regular_text(path).splitlines() if line.strip()]
     except (OSError,ValueError):
         lines=[]
         # The damaged log is kept aside AND said, so an operator is not left wondering why the
@@ -5639,8 +5712,7 @@ def read_backup_schedule_note(root):
     path=root/'backups'/BACKUP_SCHEDULE_NOTE_NAME
     if path.is_symlink() or not path.is_file():return None
     try:
-        if path.stat().st_size>BACKUP_SCHEDULE_NOTE_FILE_MAX:return None
-        record=record_json.loads(path.read_text(encoding='utf-8'))
+        record=record_json.loads(read_regular_text(path,limit=BACKUP_SCHEDULE_NOTE_FILE_MAX))
     except (OSError,ValueError):return None
     # The version must be the INTEGER 1: True == 1 and 1.0 == 1 in Python, so a hand-made
     # `schema_version: true` or `1.0` passed the plain comparison (kittrial-5bb.251 item 5).
@@ -5840,8 +5912,8 @@ def backup_copy_full_record(path):
     """
     path=Path(path)
     if path.is_symlink() or not path.is_file():return None
-    try:raw=path.read_bytes()
-    except OSError:return None
+    try:raw=read_regular_text(path,raw=True)
+    except (OSError,ValueError):return None
     described={'name':BACKUP_STATUS_NAME,'sha256':hashlib.sha256(raw).hexdigest()}
     # The record guard again: this file sits at an operator's off-machine destination, so
     # it may be hand-made or written by an older kit, and a deeply nested one must be
@@ -6184,9 +6256,9 @@ def backup_copy(root,destination,require_clean=False,all_or_nothing=False):
                                      'completeness record already there was left unchanged.'%(
                                          name,detail,destination))
             staged.append((name,staging/name,staging/(name+'.coordination.json'),staged_journal,
-                           backup_copy_generation(entry,(staging/(name+'.coordination.json')).read_bytes(),
-                                                  staged_rooms.read_bytes() if staged_rooms is not None else None,
-                                                  staged_rooms_last.read_bytes() if staged_rooms_last is not None else None),
+                           backup_copy_generation(entry,read_regular_text(staging/(name+'.coordination.json'),raw=True),
+                                                  read_regular_text(staged_rooms,raw=True) if staged_rooms is not None else None,
+                                                  read_regular_text(staged_rooms_last,raw=True) if staged_rooms_last is not None else None),
                            staged_rooms,staged_rooms_last))
         # Every project staged: move each pair into place, replacing (not merging) the
         # destination, then publish the completeness record last.
@@ -6472,6 +6544,10 @@ def task_files_backup_path(root,name):
     """Where a project's task files are backed up: ``backups/<name>.task-files`` (kittrial-5bb.380)."""
     return root/'backups'/(name+'.task-files')
 
+def _task_files_read_error(error):
+    import errno
+    return isinstance(error,ValueError) or (isinstance(error,OSError) and error.errno==errno.ELOOP)
+
 def coordination_lock(path,shared=False):
     """A factory of context managers holding ``path/.coordination.lock`` (shared or exclusive), for the
     task-files functions that take the lock only around their short steps (kittrial-5bb.380 r2, s5)."""
@@ -6503,7 +6579,8 @@ def backup_task_files(root,name):
     with backup_lock(root,name):
         try:
             return task_files.backup_folder(path,target,now=utc_stamp,lock=coordination_lock(path))
-        except task_files.Refusal as refused:
+        except (OSError,ValueError) as refused:
+            if not _task_files_read_error(refused):raise
             raise ValueError(str(refused)) from None
 
 def backup_projects(root,names,all_projects=False,named_http_state=None):
@@ -6730,11 +6807,11 @@ def rooms_status_entry(root,name):
     if canonical.is_symlink() or not canonical.is_file():
         return None
     entry={'file':canonical.relative_to(root).as_posix(),
-           'sha256':hashlib.sha256(canonical.read_bytes()).hexdigest()}
+           'sha256':hashlib.sha256(read_regular_text(canonical,raw=True)).hexdigest()}
     last=last_complete_rooms_path(root,name)
     if last.is_file() and not last.is_symlink():
         entry['last_complete']={'file':last.relative_to(root).as_posix(),
-                                'sha256':hashlib.sha256(last.read_bytes()).hexdigest()}
+                                'sha256':hashlib.sha256(read_regular_text(last,raw=True)).hexdigest()}
     return entry
 
 def complete_rooms_backup(path):
@@ -6744,7 +6821,7 @@ def complete_rooms_backup(path):
     if not path.is_file():return None,None
     try:
         import rooms
-        data=record_json.loads(path.read_text(encoding='utf-8'))
+        data=record_json.loads(read_regular_text(path))
         rooms.validate_backup(data)
         return data,None
     except (OSError,ValueError,UnicodeDecodeError) as error:
@@ -8398,7 +8475,7 @@ def actor_adoptions(root,project=None):
     """
     path=root/ACTOR_ADOPTIONS_AUDIT
     if not path.is_file():return []
-    try:record=record_json.loads(path.read_text(encoding='utf-8'))
+    try:record=record_json.loads(read_regular_text(path))
     except (OSError,UnicodeError,ValueError) as error:
         raise ValueError('The actor-adoptions audit %s cannot be read: %s'%(path,error)) from None
     entries=record.get('entries') if isinstance(record,dict) and record.get('schema_version')==ACTOR_ADOPTIONS_SCHEMA else None
@@ -8889,22 +8966,14 @@ def read_authority_changes(root,*,max_bytes=None):
         return [],None,('not-a-regular-file','is not a regular file (a directory, a fifo or a symlink)')
     if not path.exists():return [],None,None
     try:
-        if max_bytes is None:
-            text=path.read_text(encoding='utf-8')
-        else:
-            # The host's optional read-only diagnostics use this same validator,
-            # with a byte bound that also holds if a file grows after its stat.
-            if type(max_bytes) is not int or max_bytes<1:raise ValueError('Invalid authority audit byte bound')
-            before=path.lstat()
-            flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0)
-            with os.fdopen(os.open(str(path),flags),'rb') as source:
-                opened=os.fstat(source.fileno())
-                if (not stat.S_ISREG(opened.st_mode) or
-                        (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)):
-                    raise ValueError('Authority audit changed while opening')
-                raw=source.read(max_bytes+1)
-                if len(raw)>max_bytes:raise ValueError('Authority audit exceeds the read byte bound')
-                text=raw.decode('utf-8')
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes<1):
+            raise ValueError('Invalid authority audit byte bound')
+        try:
+            text=read_regular_text(path,limit=max_bytes)
+        except ValueError as error:
+            if max_bytes is not None and str(error).endswith('exceeds its byte bound'):
+                raise ValueError('Authority audit exceeds the read byte bound') from None
+            raise
         record=record_json.loads(text)
     except (OSError,UnicodeError,ValueError) as error:
         return [],None,('unreadable','cannot be read: %s'%error)
@@ -9029,12 +9098,8 @@ def authority_change_same_bytes(first,second):
     """Whether two regular files hold exactly the same bytes, never following a symlink. Reads only."""
     try:
         if os.lstat(str(first)).st_size!=os.lstat(str(second)).st_size:return False
-        with open(first,'rb') as left,open(second,'rb') as right:
-            while True:
-                chunk=left.read(131072)
-                if chunk!=right.read(131072):return False
-                if not chunk:return True
-    except OSError:
+        return read_regular_text(first,raw=True)==read_regular_text(second,raw=True)
+    except (OSError,ValueError):
         return False
 
 def authority_change_copy_bytes(source,destination):
@@ -9076,8 +9141,8 @@ def authority_change_copy_bytes(source,destination):
             'taken. Nothing was changed. Move the damaged file aside by hand and run the command again.'
             %(source,AUTHORITY_CHANGE_ASIDE_ATTEMPTS,destination.parent))
     try:
-        with os.fdopen(descriptor,'wb') as out, open(source,'rb') as src:
-            shutil.copyfileobj(src,out)
+        with os.fdopen(descriptor,'wb') as out:
+            shutil.copyfileobj(io.BytesIO(read_regular_text(source,raw=True)),out)
         if os.path.lexists(str(destination)):return False
         os.rename(temporary,destination)
         temporary=None
@@ -10196,7 +10261,7 @@ def credential_actors(root,state_path,service_namespace=None):
     from sessions import registered_actors
     source=Path(state_path)
     if not source.is_file():raise ValueError('No web service state at %s'%source)
-    try:state=json.loads(source.read_text(encoding='utf-8'))
+    try:state=json.loads(read_regular_text(Path(os.path.realpath(str(source)))))
     except (ValueError,RecursionError):raise ValueError('The web service state at %s is not readable as JSON'%source) from None
     if not isinstance(state,dict) or not isinstance(state.get('credentials'),dict):
         raise ValueError('The file at %s is not a web service state document'%source)
@@ -10557,6 +10622,8 @@ def main():
     a.add_argument('--evidence',required=True,action='append')
     a.add_argument('--operation-id',default=None,help='retain the returned identity for an exact retry after uncertainty')
     a=sub.add_parser('capability-verify',help='record verified capability checks (operator allowlist or verifiers list)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('design-verify',help='record trusted design-document checks from trace --verify --payloads (operator allowlist or verifiers list)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('authorized-keys',help='print the confined contributor and unrestricted operator authorized_keys lines for one public key')
     a.add_argument('--key-file',required=True,help='a file holding one plain OpenSSH public key line')
@@ -11210,6 +11277,32 @@ def main():
         print(json.dumps(sweep_project_temporaries(root,args.project,dry_run=args.dry_run,
                                                    min_age_seconds=args.min_age_minutes*60),
                          sort_keys=True,indent=1))
+    elif args.command=='design-verify':
+        # kittrial-5bb.418 (TRACEABILITY_DESIGN §5.1 step 4): the one route that writes a trusted design
+        # verification. Each report names an accepted repo-document revision; the actor must be on the operator
+        # allowlist or the verifiers list, both read strictly.
+        import fcntl
+        import reference_records
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        items=payload.get('items') if isinstance(payload,dict) else payload
+        if not isinstance(items,list) or not 1<=len(items)<=100:raise ValueError('design-verify takes {"items": [1..100 reports]}')
+        authority=operators(root,strict=True);listed=verifiers(root,strict=True)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        results=[]
+        for item in items:
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                try:
+                    results.append(reference_records.write_verification(item,args.actor,run,operators=authority,
+                                                                        verifiers=listed,route='host'))
+                except ValueError as error:
+                    results.append({'key':(item or {}).get('key') if isinstance(item,dict) else None,
+                                    'recorded':False,'refused':str(error)})
+        print(json.dumps({'items':results,'recorded':sum(1 for item in results if item.get('recorded'))}))
+        # Review of part 2 (N5): a run that refused any item does not exit 0.
+        if any('refused' in item for item in results):raise SystemExit(1)
     elif args.command=='capability-verify':
         import contextlib
         import fcntl
@@ -11956,7 +12049,8 @@ def restore_task_files(root,source,destination):
             fcntl.flock(lock,fcntl.LOCK_EX)
             try:
                 outcome=task_files.restore_folder(backup,path)
-            except task_files.Refusal as refused:
+            except (OSError,ValueError) as refused:
+                if not _task_files_read_error(refused):raise
                 outcome={'status':'refused','problems':[str(refused)]}
     if outcome['status']=='absent':
         print('This backup has no task files (backups/%s.task-files): any file records the task history '
@@ -12078,7 +12172,8 @@ def task_files_command(root,args):
         try:
             # kittrial-5bb.380 r2 (s5): the shared lock only to read and to confirm, never while hashing.
             result=task_files.verify(path,lock=coordination_lock(path,shared=True))
-        except task_files.Refusal as refused:
+        except (OSError,ValueError) as refused:
+            if not _task_files_read_error(refused):raise
             raise ValueError(str(refused)) from None
         for key,label in (('mismatched','does not match its name'),('wrong_size','has another size than its record'),
                           ('missing','is missing (a live record names it)')):

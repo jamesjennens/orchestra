@@ -142,12 +142,17 @@ REVIEWER = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@/-]{0,95}')
 #: no C0 control characters other than tab/newline/carriage return and no DEL, no
 #: C1 controls, bidi controls, word joiners, BOM, Unicode tag characters or
 #: variation selectors (U+E0100-U+E01EF, as guidance refuses), and a
-#: ZWNJ/ZWJ only between letters. Applied on the WRITE path, so a record written
-#: before the rule existed still reads.
+#: ZWNJ/ZWJ only between letters. New writes also refuse the fixed Cf ranges below;
+#: stored-record readers keep the legacy set so tightening the rule hides no old record.
 PLAIN_CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 PLAIN_INVISIBLE = re.compile('[\u0080-\u009f\u00ad\u200b\u200e\u200f\u2028\u2029\u202a-\u202e'
                              '\u2060-\u2064\u2066-\u2069\ufeff\U000E0000-\U000E007F'
                              '\U000E0100-\U000E01EF]')
+PLAIN_WRITE_INVISIBLE = re.compile(
+    '[\u0080-\u009f\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890-\u0891\u08e2\u180e'
+    '\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff'
+    '\ufff9-\ufffb\U000110bd\U000110cd\U00013430-\U0001343f\U0001bca0-\U0001bca3'
+    '\U0001d173-\U0001d17a\U000E0000-\U000E007F\U000E0100-\U000E01EF]')
 PLAIN_JOINER = re.compile('[\u200c\u200d]')
 #: Item severity on a request-changes item. Absent means ``blocking`` so every
 #: record written before severity existed keeps blocking approval.
@@ -271,19 +276,19 @@ def reviewer(value):
     return value
 
 
-def plain_text(value, name):
+def plain_text(value, name, *, stored=False):
     """Refuse control/bidi/zero-width/tag characters in text another worker reads.
 
     The same rule ``guidance`` applies to its payload (kittrial-5bb.99 review
     ``small`` 4/7): a summary or reason is shown to other workers in ``review`` and
     ``brief``, so ESC, bidi controls, zero-width and tag characters must not be
-    stored as instructions. It is applied on the WRITE path only
-    (``check_plain_text``), never inside ``validate``, so a record written before
-    the rule existed still reads.
+    stored as instructions. New writes use the expanded fixed set. A caller reading
+    a stored record passes ``stored=True`` to retain the legacy set.
     """
     if PLAIN_CONTROL.search(value):
         raise ValueError(f'{name} must be plain text (no control characters)')
-    if PLAIN_INVISIBLE.search(value):
+    invisible = PLAIN_INVISIBLE if stored else PLAIN_WRITE_INVISIBLE
+    if invisible.search(value):
         raise ValueError(f'{name} must be plain text (no bidi, zero-width, C1, tag or '
                          'variation-selector characters)')
     for match in PLAIN_JOINER.finditer(value):
@@ -1874,8 +1879,12 @@ def host_revert_journal(project):
                 raise ValueError('symlink')
             if path.stat().st_size > JOURNAL_FILE_LIMIT:
                 raise ValueError('oversized')
-            entry = validate_revert_journal_entry(
-                json.loads(path.read_text(encoding='utf-8')), name)
+            from admin import read_regular_text
+            from requirements import _unique_object
+            entry = record_json.loads(read_regular_text(path, limit=JOURNAL_FILE_LIMIT),
+                                      object_pairs_hook=_unique_object)
+            canonical_bytes(entry)
+            entry = validate_revert_journal_entry(entry, name)
         except (OSError, ValueError, TypeError, KeyError):
             invalid.append(JOURNAL_DIR + '/' + name)
             continue
@@ -3055,7 +3064,7 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
                 answer = dict(comment_id=str(c['id']), reconciled=True, **receipt(state, rows, task))
                 if party_problem:
                     answer['warnings'] = list(answer.get('warnings') or []) + [party_problem]
-                return answer
+                return open_items_advice(answer, p['operation'], state, task)
             raise ValueError('Operation ID already used with different payload or actor')
     # Staged rollout (item 3): a new-shaped write is refused unless this
     # installation turned the switch on. Reads are unaffected.
@@ -3209,6 +3218,24 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     answer = dict(comment_id=str(result['id']), reconciled=False, **receipt(preview, rows, task))
     if party_problem:
         answer['warnings'] = list(answer.get('warnings') or []) + [party_problem]
+    return open_items_advice(answer, payload['operation'], preview, task)
+
+
+def open_items_advice(answer, operation, projected, task):
+    """Tell a lane that its revision left review items open (kittrial-5bb.431). Advice, never a refusal.
+
+    A ``contribute`` answer gains ``open_items`` (the blocking items still open after it, from the same
+    projection the write was validated on) and, while any are open, one warning per request naming its
+    item ids and the respond record that answers them. Only a respond answers an item; a revision or a
+    plain comment does not. Any other operation's answer is unchanged.
+    """
+    if operation != 'contribute':
+        return answer
+    from review_state import open_items_warnings, open_review_items
+    items = open_review_items(projected.get('pending_requests'))
+    answer['open_items'] = items
+    if items:
+        answer['warnings'] = list(answer.get('warnings') or []) + open_items_warnings(items, task)
     return answer
 
 

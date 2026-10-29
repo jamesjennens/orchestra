@@ -247,7 +247,7 @@ def move_subject(caller, owner=None):
 
 
 def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                 way_back=None, followon=None, checkpoint_available=True):
+                 way_back=None, followon=None, checkpoint_available=True, open_items=None, respond_route=None):
     """`(whose_move, next)`: the caller-relative half of the one whose-move decision.
 
     Derived only from the review state the
@@ -269,6 +269,11 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
     defaults to the client command ``review TASK``; the HTTP next-actions answer passes
     this task's brief route instead, because a web agent cannot run the client command
     (kittrial-5bb.253 review, item 4). Every other word is the same in both answers.
+
+    ``open_items`` are the blocking items still open (``review_state.open_review_items``). While
+    changes are requested the sentence names them and the respond record that answers them
+    (kittrial-5bb.431); ``respond_route`` is the task's HTTP route, so a web agent is never told the
+    client command.
     """
     name = str(task or 'the task')
     try:
@@ -287,16 +292,19 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
         from followon import next_text
         return 'you', next_text(followon, checkpoint_available=checkpoint_available)
     if state == 'changes-requested':
+        from review_state import open_items_sentence
+        named = open_items_sentence(open_items, name, respond_route)
+        named = ' ' + named if named else ''
         if redelivered:
             # A revision that supersedes the one the items were filed on is already
             # delivered: only the responses are owed, so the worker does not redeliver
             # again (kittrial-5bb.249 review, item 3b).
             return 'you', ('This is your work now: %d outstanding review %s. Read %s and '
                            'respond to each item: the revision that supersedes this contribution '
-                           'has already been delivered.' % (items, plural, back))
+                           'has already been delivered.%s' % (items, plural, back, named))
         return 'you', ('This is your work now: %d outstanding review %s. Read %s, deliver '
-                       'a revision that supersedes this contribution and respond to each item.'
-                       % (items, plural, back))
+                       'a revision that supersedes this contribution and respond to each item.%s'
+                       % (items, plural, back, named))
     if state in ('awaiting-review', 'legacy-review-ready'):
         return 'reviewer', "Nothing is for you to do: the next move is the reviewer's."
     if state in ('awaiting-integration', 'approved'):
@@ -342,7 +350,7 @@ def _caller_move(state, task, owned, named_reviewer=False, pending_items=0, rede
 
 def move_decision(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
                   assignee=None, closed=False, claimable=None, way_back=None, followon=None,
-                  checkpoint_available=True, comment_pending=False):
+                  checkpoint_available=True, comment_pending=False, open_items=None, respond_route=None):
     """THE one whose-move decision (kittrial-5bb.6 review item 2): `(move, next, next_actor)`.
 
     One function gives all three answers, so no reader can be told one mover by
@@ -381,7 +389,8 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
         return ('you' if owned else 'unknown', text, 'assignee')
     move, text = _caller_move(state, task, owned, named_reviewer, pending_items, redelivered,
                              way_back=way_back, followon=followon,
-                             checkpoint_available=checkpoint_available)
+                             checkpoint_available=checkpoint_available,
+                             open_items=open_items, respond_route=respond_route)
     if applied:
         return move, text, 'assignee'
     return move, text, next_actor(state, assignee, closed, pending_items=pending_items,
@@ -389,7 +398,8 @@ def move_decision(state, task, owned, named_reviewer=False, pending_items=0, red
 
 
 def review_move(state, task, owned, named_reviewer=False, pending_items=0, redelivered=False,
-                way_back=None, followon=None, checkpoint_available=True, comment_pending=False, assignee=None):
+                way_back=None, followon=None, checkpoint_available=True, comment_pending=False, assignee=None,
+                open_items=None, respond_route=None):
     """`(whose_move, next)`: one plain sentence from the shared move decision.
 
     The public two-answer shape (kittrial-5bb.249), unchanged. The decision it comes
@@ -398,7 +408,7 @@ def review_move(state, task, owned, named_reviewer=False, pending_items=0, redel
     move, text, _ = move_decision(state, task, owned, named_reviewer, pending_items, redelivered,
                                   way_back=way_back, followon=followon,
                                   checkpoint_available=checkpoint_available, comment_pending=comment_pending,
-                                  assignee=assignee)
+                                  assignee=assignee, open_items=open_items, respond_route=respond_route)
     return move, text
 
 
@@ -520,7 +530,8 @@ def help_payload(action='work'):
     usage = {
         'work': 'work [--mine | --owner ACTOR] [--state STATE] [--claimable] [--limit N] [--offset N] '
                 '[--handoff-limit N] [--handoff-offset N] [--ref-limit N] [--ref-offset N] [--json]'
-                ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]',
+                ' | work lanes [--idle-minutes N] [--limit N] [--offset N] [--json]'
+                ' | work summary TASK [TASK ...] [--json]',
         'review': 'review TASK [--rounds | --file payload.json]',
         'handoff': 'handoff TASK --file payload.json',
         'brief': 'brief TASK [--items-offset N] [--items-limit N] [--full] [--json]',
@@ -550,8 +561,12 @@ def help_payload(action='work'):
             'lanes-idle-minutes': '%d..%d (work lanes; the threshold is an argument of the read, not a '
                                   'setting)' % (lanes.IDLE_MINUTES_MIN, lanes.IDLE_MINUTES_MAX),
             'lanes-limit': '%d..%d (work lanes)' % (lanes.LANES_LIMIT_MIN, lanes.LANES_LIMIT_MAX),
+            'summary-tasks': '1..100 distinct task IDs (work summary)',
+            'summary-next-action': '500 characters; omitted characters counted',
+            'summary-author': '96 characters; omitted characters counted',
         }
         payload['output'] = {
+            'task_summary': 'work summary returns schema_version and items in requested order; each item has task, found, status, checkpoint, last_post and coverage. Hidden and unknown task IDs have identical missing items. No checkpoint means unknown open items, never zero. checkpoint.state is a usable declared lane state or unknown; native task status is separate.',
             'top_level': ['owner', 'total', 'your_move', 'items', 'next_offset', 'coverage', 'attention', 'guidance'],
             'guidance': 'guidance: the project\'s current standing guidance version (kittrial-5bb.99), '
                         'with present, version (null for unbound text), set_at, set_by (null when the audit record does not bind to '
@@ -610,7 +625,7 @@ def help_payload(action='work'):
                            'Advisory: claimability is not a reservation.',
             'item_fields': ['task', 'title', 'owner', 'status', 'review_state', 'whose_move', 'next',
                             'next_actor', 'work_state', 'reconciliation_needed', 'reconciliation_reasons',
-                            'claimable', 'requirement_record', 'redelivered',
+                            'claimable', 'requirement_record', 'redelivered', 'open_review_items',
                             'contribution_id',
                             'commit', 'pending_review_items', 'pending_change_requests', 'open_items',
                             'blocking_items', 'checkpoint_at', 'newer_activity', 'checkpoint_wait',
@@ -914,11 +929,11 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         if len(request_files)>1000:raise ValueError('Handoff request journal exceeds bounded queue coverage')
         for request_file in request_files:
             try:
-                request=json.loads(request_file.read_text(encoding='utf-8'))
-                from handoff import validate_request_record
+                from handoff import read_journal_json, validate_request_record
+                request=read_journal_json(request_file)
                 validate_request_record(request)
                 journal_requests.append(request)
-            except (OSError,json.JSONDecodeError,ValueError) as exc:
+            except (OSError,json.JSONDecodeError,ValueError,TypeError) as exc:
                 journal_errors.append({'path':request_file.name,'error':str(exc)[:300]})
     # kittrial-5bb.339: the classified-events walk is computed ONCE for the whole
     # page and shared by every lifecycle reader (it was paid four times per read on
@@ -929,6 +944,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
     items=[]
     checkpoint_states={}
     attention_snapshots={}
+    attention_selections={}
     from review_state import is_integration_warning, reverts_by_task
     if reverts is None:
         revert_map,revert_problems=reverts_by_task(rows,operators,journal)
@@ -991,7 +1007,7 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                           'claimable':False,'requirement_record':False,'work_state':'error','next_actor':'operator',
                           # A malformed row has no validated contribution, so it is never
                           # a redelivery (kittrial-5bb.264 item 2).
-                          'redelivered':False,
+                          'redelivered':False,'open_review_items':[],
                           'reconciliation_needed':False,'reconciliation_reasons':[]})
             continue
         # The merge slot is an internal record (kittrial-5bb.113): on real bd it is a
@@ -1160,6 +1176,10 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         # (kittrial-5bb.249 review, item 3b).
         contribution_id=contribution.get('comment_id')
         redelivered=is_redelivery(contribution_id, pending_requests)
+        # The blocking items still open, named by the row and its sentence until a respond answers
+        # each (kittrial-5bb.431): a revision or a plain comment leaves them open.
+        from review_state import open_review_items
+        review_items_open=open_review_items(pending_requests)
         # The one bounded claimability answer for this row (kittrial-5bb.6 deliverable b).
         # It is computed before the move because next_actor needs it: an unassigned,
         # undelivered row may name `anyone` only when somebody could actually take it.
@@ -1185,13 +1205,15 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                 pass
         comment_pending = assignee_comment_pending(row, checkpoint_data,
                                                    review.get('last_response'), full=full,
+                                                   selection_cache=attention_selections,
                                                    authority=comment_authority or (lambda author: comment_author_allowed(author,operators,owners))) if state != 'error' else False
         move,move_text,role=move_decision(state,row['id'],bool(subject) and actor_holds(row.get('assignee'), subject),
                                           named_reviewer=review_request,pending_items=pending_items,
                                           redelivered=redelivered,assignee=row.get('assignee'),
                                           closed=row.get('status')=='closed',claimable=row_claimable,
                                           followon=task_followon.get('block') if task_followon else None,
-                                          checkpoint_available=provenance_writes, comment_pending=comment_pending)
+                                          checkpoint_available=provenance_writes, comment_pending=comment_pending,
+                                          open_items=review_items_open)
         # A standing hold (or a failed attestation) is shown BESIDE the state the row
         # already reads (kittrial-5bb.10 item 7): a revision still awaiting review stays in
         # the reviewers' queue, and an author with open requested changes is told the
@@ -1233,10 +1255,18 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
                       # from the same labels, so the Tasks page and work list can mark it plainly.
                       # It stays a visible row; only claimability (above) changes.
                       'requirement_record':requirement_record(row.get('labels')),
+                      # Additive (kittrial-5bb.433): what an assigned requirement record asks of its
+                      # assignee, from the record's own ledger (requirement_records.assigned_state):
+                      # accepted with nothing pending is not work, so My work leaves it out.
+                      'requirement_state':(__import__('requirement_records').assigned_state(row,operators)
+                                           if requirement_record(row.get('labels')) else None),
                       # Additive (kittrial-5bb.253 item 1): the same fact the sentence above
                       # used, carried on the row so the HTTP agent builders can hand it to
                       # the one helper instead of re-deriving it without it.
                       'redelivered':redelivered,
+                      # Additive (kittrial-5bb.431): the open blocking items, [{request, item}]
+                      # in filing order, bounded to 20; [] once each is answered.
+                      'open_review_items':[{'request':i['request'],'item':i['item']} for i in review_items_open],
                       'contribution_id':contribution.get('comment_id'),'commit':contribution.get('commit'),'pending_review_items':pending_items,
                       'pending_handoff_requests':handoff_requests,
                       'pending_handoff_total':handoff_total,
@@ -1352,7 +1382,8 @@ def queue(rows,actor,args,request_dir=None, operators=None, reverts=None, scopes
         if item['task'] in task_rows:
             item.update(checkpoint_queue_fields(rows,task_rows[item['task']],checkpoint_states.get(item['task']),
                                                 provenance_writes=provenance_writes,
-                                                full=attention_snapshots.get(item['task'])))
+                                                full=attention_snapshots.get(item['task']),
+                                                selection_cache=attention_selections))
     # The count of the QUEUE's items where the next move is the caller's, from the same
     # reconciled rows the sort used, so every page reports the same number
     # (kittrial-5bb.249 review, item 2a).
@@ -1425,6 +1456,10 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         # Structured output is already JSON; accept the flag consistently with brief/show/work.
         args=[token for token in args if token!='--json']
     if action in ('work','wait'):
+        summary_ids = None
+        if action == 'work' and args[:1] == ['summary']:
+            from work_summary import parse_args as summary_args
+            summary_ids = summary_args(args[1:])
         # kittrial-5bb.339: the export rows come from the generation-keyed cache when
         # the tracker has not committed since they were parsed (a write IS visible to
         # the next read: every write commits, so the key moves and the cache misses).
@@ -1432,6 +1467,9 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
         rows=cached_export_rows(path.parent.parent, path, run)
         from reserved_comments import RECORD_ANCHOR_LABELS
         rows=record_json.classify(rows,run,sorted(RECORD_ANCHOR_LABELS)+['gt:slot'], ['event','gate'])
+        if summary_ids is not None:
+            from work_summary import read as summary_read
+            return summary_read(rows, summary_ids, project=path.name)
         from lifecycle import host_snapshot
         rows=host_snapshot(rows, run=run, project=path)
         if action=='wait':

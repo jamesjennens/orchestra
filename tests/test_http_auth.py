@@ -439,5 +439,85 @@ class AuthCase(unittest.TestCase):
         self.assertRegex(now_iso(0), r'^1970-01-01T00:00:00Z$')
 
 
+class RegularStateReadTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp_path = unique_dir('regular-state-')
+        self.addCleanup(shutil.rmtree, self.tmp_path, ignore_errors=True)
+
+    def bounded(self, call):
+        import threading
+        result = []
+        def run():
+            try:
+                result.append((True, call()))
+            except BaseException as error:
+                result.append((False, error))
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive(), 'a state FIFO blocked the read')
+        self.assertTrue(result)
+        if result[0][0]:
+            return result[0][1]
+        raise result[0][1]
+
+    def test_store_state_regular_missing_damaged_and_fifo(self):
+        path = self.tmp_path / 'store.json'
+        self.assertEqual(Store(path).state['schema_version'], 1)
+        Store(path).save()
+        self.assertEqual(Store(path).state['schema_version'], 1)
+        real = self.tmp_path / 'store-real.json'
+        path.rename(real)
+        path.symlink_to(real.name)
+        self.assertEqual(Store(path).state['schema_version'], 1)
+        damaged = self.tmp_path / 'damaged.json'
+        damaged.write_text('{not json', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            Store(damaged)
+        import os
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        fifo = self.tmp_path / 'fifo.json'
+        os.mkfifo(fifo)
+        with self.assertRaises(ValueError):
+            self.bounded(lambda: Store(fifo))
+
+    def test_authority_and_legacy_journal_regular_missing_damaged_and_fifo(self):
+        import http_authority
+        state = self.tmp_path / 'authority.json'
+        state.write_text(json.dumps({'schema_version': http_authority.SCHEMA_VERSION}),
+                         encoding='utf-8')
+        self.assertEqual(http_authority.read_state(state)['schema_version'],
+                         http_authority.SCHEMA_VERSION)
+        real = self.tmp_path / 'authority-real.json'
+        state.rename(real)
+        state.symlink_to(real.name)
+        self.assertEqual(http_authority.read_state(state)['schema_version'],
+                         http_authority.SCHEMA_VERSION)
+        missing = self.tmp_path / 'missing.json'
+        with self.assertRaises(http_authority.AuthorityDenied) as denied:
+            http_authority.read_state(missing)
+        self.assertEqual(denied.exception.message, 'Service authority state is unavailable')
+        state.write_text('{not json', encoding='utf-8')
+        with self.assertRaises(http_authority.AuthorityDenied) as denied:
+            http_authority.read_state(state)
+        self.assertEqual(denied.exception.message, 'Service authority state is unreadable')
+        journal = self.tmp_path / 'journal.json'
+        journal.write_text(json.dumps({'operation': {'state': 'committed'}}), encoding='utf-8')
+        self.assertIn('operation', http_authority.read_legacy_journal(journal)['entries'])
+        self.assertIsNone(http_authority.read_legacy_journal(missing))
+        journal.write_text('{not json', encoding='utf-8')
+        self.assertIsNone(http_authority.read_legacy_journal(journal))
+        import os
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        fifo = self.tmp_path / 'fifo.json'
+        os.mkfifo(fifo)
+        with self.assertRaises(http_authority.AuthorityDenied) as denied:
+            self.bounded(lambda: http_authority.read_state(fifo))
+        self.assertEqual(denied.exception.message, 'Service authority state is unavailable')
+        self.assertIsNone(self.bounded(lambda: http_authority.read_legacy_journal(fifo)))
+
+
 if __name__ == '__main__':
     unittest.main()

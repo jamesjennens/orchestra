@@ -1102,8 +1102,13 @@ def file_lock(path, timeout=60.0, poll=0.02, shared=False):
 def read_state(path):
     """Read the durable authority/state document, or raise :class:`AuthorityDenied`."""
     try:
-        text = Path(path).read_text(encoding='utf-8')
+        from admin import read_regular_text
+        text = read_regular_text(Path(os.path.realpath(str(path))))
     except OSError:
+        raise deny(401, 'unauthenticated', 'Service authority state is unavailable')
+    except ValueError as error:
+        if isinstance(error, UnicodeError):
+            raise
         raise deny(401, 'unauthenticated', 'Service authority state is unavailable')
     try:
         state = json.loads(text)
@@ -1433,7 +1438,8 @@ def read_legacy_journal(path):
     by both the automatic migration and an explicit operator restore.
     """
     try:
-        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        data = json.loads(read_regular_text(path))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):
@@ -2688,7 +2694,7 @@ def descriptor_actor_denial(request, authority_config, reserved):
 #: are not judged there at all: they carry their own exact check
 #: (``project_creation.SERVICE_ACTIONS``).
 BLOCK_CAPABILITIES = {
-    'work': {'lanes': CAP_READ},
+    'work': {'lanes': CAP_READ, 'summary': CAP_READ},
     # The HTTP coordinator read uses exactly this canonical wait form. Other
     # wait forms have no web authority entry and cannot inherit its wider view.
     'wait': {'--coordinator': CAP_COORDINATE},
@@ -2699,7 +2705,8 @@ BLOCK_CAPABILITIES = {
     'task-assign': CAP_COORDINATE,         # dedicated assignee-only guarded operation
     'task-release': CAP_TASKS,             # releasing your OWN claim (kittrial-5bb.301)
     'assignment-roster': CAP_COORDINATE,   # project-scoped existing assignment targets
-    'coordinate': {'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
+    'coordinate': {'create-child': CAP_COORDINATE,
+                   'merge-check': CAP_READ, 'merge-acquire': CAP_COORDINATE,
                    'merge-release': CAP_COORDINATE, 'merge-create': CAP_PROJECT_ADMIN},
     'web-merge-slot': {'check': CAP_READ, 'acquire': CAP_COORDINATE,
                        'release': CAP_COORDINATE, 'force-release': CAP_PROJECT_ADMIN,
@@ -2736,7 +2743,8 @@ BLOCK_CAPABILITIES = {
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit
                  'review': CAP_APPROVE,                               # proposals.dispose, triage
                  'decide': CAP_PROJECT_ADMIN},                        # proposals.dispose, the owner decision
-    'ref': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
+    # kittrial-5bb.418: `verify` is a design-document report (unverified), filed by any member who may propose.
+    'ref': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS, 'verify': CAP_RECORDS,
             'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE},
     'capability': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
                    'propose-alias': CAP_RECORDS, 'verify': CAP_RECORDS,

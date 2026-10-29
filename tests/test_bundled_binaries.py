@@ -9,6 +9,7 @@ stays within Python 3.6.
 import ast
 import io
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -641,6 +642,34 @@ class BootstrapPinTests(unittest.TestCase):
             self.install(root, self.static)
         self.assertIn('Binary/pin mismatch', str(refused.exception))
 
+    def test_installed_receipt_missing_damaged_and_fifo_controls(self):
+        import threading
+        root = self.base/'runtime'
+        self.install(root, self.release)
+        receipt = root/'bin'/'bd.receipt.json'
+        receipt.unlink()
+        with self.assertRaisesRegex(SystemExit, 'unmanaged binary'):
+            self.install(root, self.release)
+        receipt.write_text('{not json', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            self.install(root, self.release)
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        receipt.unlink()
+        os.mkfifo(receipt)
+        result = []
+        def install():
+            try:
+                self.install(root, self.release)
+            except BaseException as error:
+                result.append(error)
+        worker = threading.Thread(target=install, daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive(), 'an installed receipt FIFO blocked bootstrap')
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], ValueError)
+
     def test_a_download_is_only_ever_the_release_pin(self):
         """With no bundled archives the url of "bd" is fetched; the static pin has none and is never accepted for it."""
         from unittest import mock
@@ -703,6 +732,28 @@ class VerifyRecordTests(unittest.TestCase):
         (self.root/'bin'/'bd').unlink()
         missing = self.verify.bundled_bd(self.root, self.kit)
         self.assertEqual((missing['starts'], bool(missing['says'])), (False, True))
+
+    def test_receipt_missing_damaged_and_fifo_keep_pin_unknown(self):
+        import threading
+        program = self.root/'bin'/'bd'
+        program.write_bytes(b'#!/bin/sh\necho "bd version 1.2.2"\n')
+        program.chmod(0o755)
+        receipt = self.root/'bin'/'bd.receipt.json'
+        self.assertIsNone(self.verify.bundled_bd(self.root, self.kit)['pin'])
+        receipt.write_text('{not json', encoding='utf-8')
+        self.assertIsNone(self.verify.bundled_bd(self.root, self.kit)['pin'])
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        receipt.unlink()
+        os.mkfifo(receipt)
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(self.verify.bundled_bd(self.root, self.kit)['pin']),
+            daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive(), 'an installed receipt FIFO blocked office verification')
+        self.assertEqual(result, [None])
 
 
 @unittest.skipUnless(LINUX, 'reads an installed release and starts a stand-in program')

@@ -1,7 +1,34 @@
 # A coordinator that works only over the web
 
 **Status: design note for James to decide on (kittrial-5bb.201), second version
-after review. Nothing here is built, and this task changes no behaviour.**
+after review.** Most of it is now built: see "Where this stands at release 1024r"
+just below. The sections "What is true today" and "What James can do today, on
+release 1008t" are kept as the record of release 1008t, when this note was written.
+
+## Where this stands at release 1024r (main 9ce10e0; kittrial-5bb.434)
+
+Read in the code of main `9ce10e0` plus kittrial-5bb.434. Line numbers are
+http_service.py's on that branch.
+
+| the coordinator's action | the route | who |
+| --- | --- | --- |
+| Assign a task to somebody else | `POST .../tasks/{tid}/assign` (:10696) | `coordinate` |
+| File a child task or a decision under a task | `POST .../tasks/{tid}/children` (:10737; kittrial-5bb.434). It runs the host's own `coordinate create-child`: the types task, bug, feature, chore and decision; a decision's required headings; the merge slot takes no child. | `coordinate` |
+| Comment | `POST .../tasks/{tid}/comments` (:10871) | contributor |
+| The merge slot | `GET/POST .../merge-slot` (:8581, :8716-8728) | `coordinate`; create and force-release are an owner's |
+| Lifecycle facts (integrated, deployed, live-verified) | `.../tasks/{tid}/lifecycle` (:8341, :8482, :8486). Recording integrated as passed from the web needs the installation switch `web_lifecycle_mark_writes`. | `coordinate` |
+| Release records | `POST .../releases/query`, `POST .../releases` (:8503, :8521) | `coordinate`; a deploy also needs the release authority |
+| The coordinator's hand-back to the assignee | `POST .../tasks/{tid}/...` (:8706, :8711; kittrial-5bb.343) | `coordinate` |
+| Guidance | `GET/PUT/DELETE .../guidance` (:8796-8833) | `coordinate` to write |
+| Reference and capability records | `.../references`, `.../capabilities` (:11659, :11724, :11814) | contributor to propose; `coordinate` to accept |
+| The coordinator role and an agent's grant | the member role `coordinator`; `PUT/DELETE .../agents/{aid}/coordinator` (:9829, :9842) | an owner |
+| See which installation switches refuse a web write | `GET .../switches` (:10795; kittrial-5bb.434), shown on Members & settings: each switch's name, state, what it unlocks and the operator command. Turning a switch on stays an operator's `admin.py` command on the server. | `coordinate` |
+| Approve a contribution | `POST .../tasks/{tid}/reviews` (:13011) | a person with `reviews.approve`, or an agent holding the coordinator grant (http_authority.py:399, `GRANT_CAPABILITIES`) |
+| Triage a proposal, or decide one | `POST .../proposals/{key}/dispositions`: **a signed-in person only**. See slice 8 below. | a coordinator triages; an owner decides |
+
+What stays on the server, as section "What stays with James" says: installing and
+upgrading, backups and restore, the first superuser, voiding and reverting records,
+reconciling, retiring a project, and the rollout switches themselves.
 
 The goal, in James's words of 2026-10-07: much more in the web interface, several
 coordinators across several projects, and **nobody but him needing SSH to the
@@ -452,7 +479,17 @@ coordinator can do in a browser is said.
 - **7. Release records** (many tasks, deployed, live-verified) and the read a
   release needs in place of a tracker export.
   *In the browser:* a release page.
-- **8. Handoff**, and proposal review and decision by a granted agent.
+- **8. Handoff**, and proposal review and decision.
+  - *As built:* the coordinator's hand-back has its routes (kittrial-5bb.343).
+  - **Proposal triage and the owner decision are refused to every agent, with or without the coordinator
+    grant** (kittrial-5bb.434 corrects the earlier "by a granted agent").
+    - `proposals_dispose` refuses any credential: "A credential cannot record a proposal disposition"
+      (http_service.py:12626).
+    - `_triages` (:12582) shows triage to a signed-in member with `reviews.approve` only.
+  - *Why:* a proposal changes what the project asks for, so its triage stays with the people who answer for
+    the project. The grant (http_authority.py:399) lets an agent approve contributions, which is the
+    delivery of work already asked for.
+  - Widening this is James's decision, not taken here.
 - **9. The client.** `http_client.py` commands for everything above, and the
   web variants of the coordinator prompt and the worker guide. Earlier slices
   add their own command as they go; this one closes the gaps and writes the

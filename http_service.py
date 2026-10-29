@@ -34,6 +34,7 @@ import json
 import os
 from server_address import ps_quote, sh_quote
 import record_json
+import regular_file
 import re
 import secrets
 import socket
@@ -49,6 +50,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 import actor_names
 import agent_prompts
 import bd_refusals
+from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
 import claim_limit
 import project_setup
 import project_coordination
@@ -95,6 +97,10 @@ def service_identity():
 
 
 MAX_BODY_BYTES = 262144
+#: kittrial-5bb.418: the body a design.<scope> reference propose or revise may send, its document inside it
+#: (1 MiB of Markdown, design_documents.DOCUMENT_MAX_BYTES, plus the JSON escaping). Only those two routes, and
+#: only after authentication, the capability and the membership role passed (_read_deferred_body).
+DESIGN_BODY_BYTES = 1536 * 1024
 MAX_ATTACHMENTS = 8
 MAX_ATTACHMENT_BYTES = 65536
 MAX_ATTACHMENT_TOTAL = 262144
@@ -1039,8 +1045,8 @@ class InProcessBackend:
         if not isinstance(title, str) or not title.strip() or len(title) > 200:
             raise invalid('Task title must be 1-200 characters')
         description = payload.get('description') or ''
-        if not isinstance(description, str) or len(description) > 20000:
-            raise invalid('Task description is too long')
+        if not isinstance(description, str) or len(description) > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
         # A null priority is absent, not a value (kittrial-5bb.183 review item 4): the route
         # guard and the endpoint backend already read it that way, and every released client
         # sends null where it has no value, so bd's default 2 applies on both backends.
@@ -1074,8 +1080,8 @@ class InProcessBackend:
                 value = payload[field]
                 if field == 'title' and (not isinstance(value, str) or not value.strip() or len(value) > 200):
                     raise invalid('Task title must be 1-200 characters')
-                if field == 'description' and (not isinstance(value, str) or len(value) > 20000):
-                    raise invalid('Task description is too long')
+                if field == 'description' and (not isinstance(value, str) or len(value) > DESCRIPTION_MAX):
+                    raise invalid(DESCRIPTION_TOO_LONG)
                 if field == 'status' and value not in ('open', 'closed'):
                     raise invalid('Task status must be open or closed')
                 if field == 'priority' and (type(value) is not int or not 0 <= value <= 4):
@@ -1206,11 +1212,14 @@ class InProcessBackend:
             contributions.append(record)
             # Like the canonical projection, a new revision does not resolve requests
             # that need a respond record: they stay open until the contributor responds.
-            task['review_state'] = ('changes-requested' if self._requests(contributions, True)
-                                    else 'awaiting-review')
+            still_open = self._requests(contributions, True)
+            task['review_state'] = 'changes-requested' if still_open else 'awaiting-review'
             task['version'] += 1
             self._event(project_id, task['id'], 'contribution', principal, record['actor'])
-            return {'contribution': record, 'task_version': task['version']}
+            # The canonical answer's additive `open_items` (kittrial-5bb.431); the route words its warning.
+            return {'contribution': record, 'task_version': task['version'],
+                    'open_items': [{'request': r['request'], 'item': r['id'], 'contribution': r['contribution']}
+                                   for r in still_open][:20]}
         current = [r for r in contributions if r['kind'] == 'contribution']
         if not current:
             raise conflict('There is no contribution to review')
@@ -1479,6 +1488,12 @@ class InProcessBackend:
         return {'schema_version': 1, 'total': 0, 'items': [], 'next_offset': None,
                 'coverage': 'the in-process backend holds no native capability records'}
 
+    def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None):
+        """kittrial-5bb.425: the in-process backend holds no native records, so every view is honestly empty."""
+        import trace_read
+        snap = trace_read.Snapshot([], project_id, now=trace_read.snapshot_now())
+        return dict(trace_read.trace(snap, view, scope=scope, offset=offset, limit=limit), generation='in-process')
+
     def capability(self, project_id, key):
         raise not_found('Capability not found')
 
@@ -1626,12 +1641,47 @@ class InProcessBackend:
                 'latest_at': records[-1]['created_at'] if records else None,
                 'revisions': len(contributions)}
 
+    def task_summaries(self, principal, project_id, tasks):
+        from work_summary import read, clipped, NEXT_ACTION_MAX, comment_identity
+        from activity import parse_moment, utc_text
+        result = read(self.read_tasks(project_id)['items'], tasks, project=project_id)
+        for item in result['items']:
+            checkpoints = self.state.get('checkpoints', {}).get(item['task']) or []
+            if not item['found'] or not checkpoints:
+                continue
+            latest = checkpoints[-1]
+            try:
+                cid = comment_identity(latest)
+                state = 'unknown'
+                declared = latest.get('lane_state')
+                if declared is not None:
+                    from lane_state import validate
+                    try:
+                        validate(declared, item['task'], cid)
+                        state = declared['state']
+                    except (ValueError, TypeError, KeyError, OverflowError):
+                        pass
+                action, omitted = clipped(latest.get('next_action'), NEXT_ACTION_MAX)
+                item['checkpoint'] = dict(comment_id=cid,
+                    timestamp=utc_text(parse_moment(latest.get('created_at'))), state=state,
+                    next_action=action, next_action_omitted_chars=omitted,
+                    open_items_count=len(latest.get('open_items') or []))
+            except (ValueError, TypeError, KeyError, OverflowError):
+                item.update(checkpoint=None, coverage='unknown')
+        return result
+
     def task_brief(self, project_id, task_id):
         """Everything the task page shows, from one read of the in-process state."""
         task = self._task(project_id, task_id)
         from briefing import ContextPointers
         pointer_rows=[row for row in self.state.get('tasks',{}).values() if row.get('project_id')==project_id]
         pointers=ContextPointers(pointer_rows,project_id,operators=())
+        # kittrial-5bb.425 part 2: the description's req: and design: tokens, first, as the brief resolves them.
+        from briefing import parse_context_pointers
+        described = [x['pointer'] for x in parse_context_pointers(task.get('description'))
+                     if x['kind'] in ('req', 'design')]
+        description = ({'description_pointers': pointers.item_pointers(
+            [{'id': 'description', 'text': ' '.join(described)}], 'text')['description']} if described else {})
         checkpoints = self.state.get('checkpoints', {}).get(task_id) or []
         checkpoint = None
         if checkpoints:
@@ -1649,7 +1699,7 @@ class InProcessBackend:
                           # This backend holds the checkpoint in memory and always reads
                           # every item, so the shown list is the whole list, with no note.
                           'open_items_shown': len(items), 'open_items_total': len(items)}
-        return {'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
+        return {**description, 'task': dict(task), 'checkpoint': checkpoint, 'review': self._review_view(task),
                 'carry_open_items': [dict(item) for item in checkpoints[-1].get('open_items') or []
                                      if isinstance(item, dict)] if checkpoints else [],
                 # The disposable backend records no lifecycle evidence, so every fact is
@@ -2043,7 +2093,7 @@ def queue_order(item):
 def queue_item(project_id, task, review_state, contribution, open_requests,
                pending_request_ids=None, waiting_since=None, integration=None,
                integration_warnings=None, attention=None, recommended_by=None, contribution_author=None,
-               claimable=None, followon=None):
+               claimable=None, followon=None, requirement_record=False, requirement_state=None):
     """One review-queue row, in the shape both backends return.
 
     ``pending_request_ids`` and ``waiting_since`` (time of the latest review record)
@@ -2090,7 +2140,12 @@ def queue_item(project_id, task, review_state, contribution, open_requests,
             'recommended_by': list(recommended_by or []),
             # Additive (kittrial-5bb.115 review): who delivered the current contribution, so
             # the person rule can be applied to a row as it is to a brief.
-            'contribution_author': contribution_author}
+            'contribution_author': contribution_author,
+            # Additive (kittrial-5bb.433): whether the row is a requirement record and, if so,
+            # what it asks of its assignee (requirement_records.assigned_state), from the
+            # canonical `work` row. None where the backend does not say.
+            'requirement_record': bool(requirement_record),
+            'requirement_state': requirement_state}
 
 
 def claimable_task(task, review, claiming='open'):
@@ -2184,6 +2239,9 @@ def own_queue_tasks(queue, actor=None):
                       # The superseding-redelivery fact the canonical row carries
                       # (kittrial-5bb.253 item 1), for `review_move`.
                       'redelivered':fields.get('redelivered'),
+                      # The open blocking items (kittrial-5bb.431), which the next-actions
+                      # sentence names with this task's route.
+                      'open_review_items':fields.get('open_review_items'),
                       'checkpoint_at':fields.get('checkpoint_at'),
                       'newer_activity':fields.get('newer_activity'),
                       # The stable marker and its counts (kittrial-5bb.351): a wait row
@@ -2227,6 +2285,8 @@ class EndpointBackend:
     """
 
     ROUTES = InProcessBackend.ROUTES + (
+        # A child task by a coordinator (kittrial-5bb.434): the canonical `coordinate create-child`.
+        'tasks.create-child',
         'tasks.assign', 'tasks.release', 'merge-slot.acquire',
         'merge-slot.release', 'merge-slot.force-release', 'merge-slot.create',
         # The release routes (kittrial-5bb.378): one canonical release-query or one
@@ -2239,6 +2299,7 @@ class EndpointBackend:
         # Files attached to a task (kittrial-5bb.370): the canonical `task-file` action.
         'files.record', 'files.withdraw',
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
+        'references.verify',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
         'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
         # Delegated decision rights (kittrial-5bb.407): the canonical `delegation` action.
@@ -3053,6 +3114,17 @@ class EndpointBackend:
             if payload.get('expected_assignee') is not None:
                 body['expected_assignee'] = payload['expected_assignee']
             return 'task-release', project_id, [json.dumps(body, ensure_ascii=False)], {}
+        if route == 'tasks.create-child':
+            # kittrial-5bb.434: exactly the host's `coordinate create-child` request. Every rule is the
+            # canonical one (coordination.apply_native); the request id is this route's durable operation
+            # identity, so an exact retry is reconciled by create-child's own receipt.
+            body = {'operation': 'create-child', 'request_id': 'web-' + operation_id,
+                    'parent': payload['task_id'], 'title': payload['title'],
+                    'description': payload.get('description') or '', 'type': payload['type']}
+            for name in ('assignee', 'priority'):
+                if payload.get(name) is not None:
+                    body[name] = payload[name]
+            return 'coordinate', project_id, [json.dumps(body, ensure_ascii=False)], {}
         if route == 'tasks.assign':
             from task_assignment import REQUEST_FIELDS
             fields={k:payload[k] for k in REQUEST_FIELDS if k not in ('operation_id','task','schema_version')}
@@ -3261,8 +3333,16 @@ class EndpointBackend:
             if isinstance(body.get('acceptance'), dict) and not body['acceptance'].get('decision_id'):
                 body['acceptance'] = dict(body['acceptance'], decision_id=body['operation_id'])
             action_name = 'ref' if route.startswith('references.') else 'capability'
-            return (action_name, project_id, [payload['command'], '@attachment:0'],
-                    {'0': {'flag': '--file', 'text': json.dumps(body, ensure_ascii=False)}})
+            document = body.pop('document', None) if action_name == 'ref' else None
+            args = [payload['command'], '@attachment:0']
+            attachments = {'0': {'flag': '--file', 'text': json.dumps(body, ensure_ascii=False)}}
+            if document is not None:
+                # kittrial-5bb.418: the design document travels as the client's second attachment does.
+                if not isinstance(document, str):
+                    raise invalid('document must be the Markdown text of the design document')
+                args.append('@attachment:1')
+                attachments['1'] = {'flag': '--document', 'text': document}
+            return (action_name, project_id, args, attachments)
         raise invalid('Backend route is not implemented for the canonical endpoint: %s' % route)
 
     # -- reads (no canonical mutation) ----------------------------------------
@@ -3294,6 +3374,39 @@ class EndpointBackend:
 
     def references_find(self, project_id, phrase, limit=5):
         return self._ref_read(project_id, ['find', caller_arg(phrase, 'q'), '--limit', str(limit)])
+
+    def design(self, project_id, scope, revision=None):
+        """kittrial-5bb.418: the design page through `ref design SCOPE`; anything not there is a 404."""
+        args = ['design', caller_arg(scope, 'scope')] + (['--revision', revision] if revision else [])
+        reply = self._endpoint('ref', project_id, self.actor_namespace + '/read', args)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and 'Design not found' in (reply.get('stderr') or ''):
+            raise not_found('Design not found')
+        payload = self._checked(reply, 'ref', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical design read returned an unexpected shape')
+        return payload
+
+    def switches(self, project_id):
+        """kittrial-5bb.434: the installation switches that refuse a web write, through the read-only
+        `web-switches` action: names, states, what each unlocks and the operator command."""
+        reply = self._endpoint('web-switches', project_id, self.actor_namespace + '/read', [])
+        payload = self._checked(reply, 'web-switches', reading=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+            raise uncertain('Canonical switch read returned an unexpected shape')
+        return payload
+
+    def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None):
+        """kittrial-5bb.425: one page of the trace read through the endpoint's read-only `trace` action."""
+        args = [view] + (['--scope', caller_arg(scope, 'scope')] if scope else []) \
+            + ['--offset', str(offset), '--limit', str(limit)] + (['--generation', generation] if generation else [])
+        reply = self._endpoint('trace', project_id, self.actor_namespace + '/read', args)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 \
+                and 'The project changed since this page was read' in (reply.get('stderr') or ''):
+            raise conflict('The project changed since this page was read; start again from the first page.')
+        payload = self._checked(reply, 'trace', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical trace read returned an unexpected shape')
+        return payload
 
     def capabilities(self, project_id, options):
         """One page of the capability catalog through the endpoint's read-only `capability list`."""
@@ -3805,6 +3918,19 @@ class EndpointBackend:
             detail['followon'] = data['followon']
         return detail
 
+    def task_summaries(self, principal, project_id, tasks):
+        """One host work-summary read, with the caller's live project authority."""
+        from work_summary import task_ids
+        tasks = task_ids(tasks)
+        reply = self._endpoint('work', project_id, principal.actor, ['summary'] + tasks,
+                               authority=authority_request(principal, project_id, CAP_READ,
+                                                           now=self.service._expiry_now()),
+                               require_authority=True)
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict) or payload.get('schema_version') != 1 or not isinstance(payload.get('items'), list):
+            raise uncertain('The canonical task summary returned an unexpected shape')
+        return payload
+
     def task_brief(self, project_id, task_id):
         """Map the canonical ``brief --json`` read onto the task page's shape.
 
@@ -3932,6 +4058,9 @@ class EndpointBackend:
                        'note': 'The complete text: GET /v1/projects/%s/tasks/%s.' % (project_id, task)}
                       if data.get('read_whole') else None)
         return {**({'assignment_records':data['assignment_records']} if data.get('assignment_records') else {}),
+                # kittrial-5bb.425 part 2: the description's own req: and design: tokens, resolved by the brief.
+                **({'description_pointers': data['description_pointers']}
+                   if isinstance(data.get('description_pointers'), dict) else {}),
                 'task': task, 'checkpoint': checkpoint, 'carry_open_items': carry,
                 'review': {'state': review.get('review_state') or 'none',
                            'waiting_for_approval':review.get('waiting_for_approval'),
@@ -4402,6 +4531,8 @@ class EndpointBackend:
                 # An older endpoint omits it: unknown, which `review_move` reads as not redelivered
                 # (kittrial-5bb.253 item 1).
                 'redelivered': redelivered if type(redelivered) is bool else None,
+                # The open blocking items (kittrial-5bb.431); None from an older endpoint.
+                'open_review_items': open_review_rows(row.get('open_review_items')),
                 'checkpoint_at': row.get('checkpoint_at') if isinstance(row.get('checkpoint_at'), str) else None,
                 'newer_activity': row.get('newer_activity') if type(row.get('newer_activity')) is bool else None,
                 # The stable marker and the counts it was computed with (kittrial-5bb.351):
@@ -4466,6 +4597,7 @@ class EndpointBackend:
                              'assignee_comment_pending':attention.get('assignee_comment_pending') is True,
                              # The superseding-redelivery fact (kittrial-5bb.253 item 1).
                              'redelivered': attention.get('redelivered'),
+                             'open_review_items': attention.get('open_review_items'),
                              'checkpoint_at': attention.get('checkpoint_at'),
                              'newer_activity': attention.get('newer_activity'),
                              # The stable newer-activity marker and its counts
@@ -4555,7 +4687,10 @@ class EndpointBackend:
                                         claimable=row.get('claimable')
                                         if isinstance(row.get('claimable'), bool) else None,
                                         followon=row.get('followon')
-                                        if isinstance(row.get('followon'), dict) else None))
+                                        if isinstance(row.get('followon'), dict) else None,
+                                        requirement_record=row.get('requirement_record') is True,
+                                        requirement_state=row.get('requirement_state')
+                                        if isinstance(row.get('requirement_state'), str) else None))
             offset = page.get('next_offset')
             if offset is None:
                 complete = True
@@ -4774,6 +4909,30 @@ def _canonical_payload(stdout):
 REQUIREMENT_DECISION_LABEL = 'owner-requirement-decision:'
 
 
+def open_review_rows(value):
+    """A canonical row's ``open_review_items`` (kittrial-5bb.431), kept only where well formed."""
+    return [{'request': str(i['request']), 'item': str(i['item'])} for i in value or []
+            if isinstance(i, dict) and isinstance(i.get('request'), str) and isinstance(i.get('item'), str)][:20]         if isinstance(value, list) else None
+
+
+def http_open_items_advice(answer, project_id, task_id):
+    """A contribute answer's open-item warning in the web's words (kittrial-5bb.431).
+
+    Both backends answer ``open_items``; the canonical one also words a warning for the client.
+    Over HTTP the warning names the respond record and this task's route, never the client
+    command. Advice only: the contribution is recorded either way, and with nothing open the
+    answer is returned as it came.
+    """
+    from review_state import open_items_warnings
+    items = open_review_rows((answer or {}).get('open_items')) if isinstance(answer, dict) else None
+    if not items:
+        return answer
+    client = set(open_items_warnings(items, task_id))
+    route = '/v1/projects/%s/tasks/%s' % (project_id, task_id)
+    kept = [w for w in answer.get('warnings') or [] if w not in client]
+    return dict(answer, warnings=kept + open_items_warnings(items, task_id, route))
+
+
 def next_action(task, claiming='open'):
     """Who acts next on a task, derived only from its status, assignee and review state."""
     state = task.get('review_state')
@@ -4798,6 +4957,14 @@ def next_action(task, claiming='open'):
         return {'who': 'coordinator', 'text': 'Release the integration hold or record a corrected verification'}
     if state == 'error':
         return {'who': 'owner', 'text': 'Needs operator attention'}
+    # kittrial-5bb.433: a requirement record is never work to deliver. One waiting for acceptance says
+    # where it is accepted; any other says where it is edited (the label, or the queue's own fact).
+    from work import requirement_record
+    if task.get('requirement_record') is True or requirement_record(task.get('labels')):
+        if task.get('requirement_state') == 'awaiting-acceptance':
+            return {'who': 'owner',
+                    'text': "Requirement waiting for acceptance: accept it on the project's Requirements page"}
+        return {'who': 'owner', 'text': "Requirement record: edit it on the project's Requirements page"}
     if task.get('assignee'):
         return {'who': 'assignee', 'text': 'Deliver a contribution'}
     # The last offer is a claim, so it follows the same claimability predicate the
@@ -4855,7 +5022,8 @@ def operator_allowlist_warnings(root):
     if not root:
         return []
     try:
-        document = json.loads((Path(root) / 'deployment.private.json').read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        document = json.loads(read_regular_text(Path(os.path.realpath(str(Path(root) / 'deployment.private.json')))))
         names = document.get('operators')
         names = [names] if isinstance(names, str) else names
     except (OSError, ValueError, AttributeError):
@@ -4901,7 +5069,7 @@ def task_matches(task, filters):
 class RouteContext:
     __slots__ = ('principal', 'payload', 'query', 'params', 'request_id',
                  'idempotency_key', 'body_hash', 'auth_source', 'secure',
-                 'route_target', 'authorize')
+                 'route_target', 'authorize', '_records_delegation_cache')
 
     def __init__(self, principal, payload, query, params, request_id, idempotency_key,
                  body_hash, auth_source, secure, route_target):
@@ -4926,6 +5094,10 @@ STREAMED = set()
 #: dispatcher refuses it everywhere else before the route runs, so a route written later is closed to it
 #: by default; ``tests/test_lane_nudge_carrier.py`` sweeps every route to prove it.
 CARRIER_ROUTES = set()
+#: kittrial-5bb.418: the routes whose JSON body is read by the route itself, after its own
+#: authority checks, so the larger DESIGN_BODY_BYTES is never read for a caller who may not use it:
+#: the reference propose and revise (a design.<scope> revision carries its document).
+DEFERRED_BODY = {'references_propose', 'references_revise'}
 
 
 def route(method, pattern, *, anonymous=False, csrf=True, stream=False, carrier=False):
@@ -5223,14 +5395,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise not_found('No such operation')
             name, anonymous, csrf, params = match
             stream = name in STREAMED
-            if stream:
+            deferred = name in DEFERRED_BODY
+            self._linger_cap = None
+            if stream or deferred:
                 # The streamed upload's answer always ends the connection: a refusal before its
                 # body was read, or a body that was not what its Content-Length said, must never
                 # leave bytes behind that the next request on this connection would be read from.
                 self._say_close = True
                 self._body_unread = True              # until the route has read it (kittrial-5bb.380)
+                if deferred:
+                    # kittrial-5bb.418: a deferred JSON body refused before it was read is drained
+                    # for a clean close only up to the normal body limit, never the upload's 64 MiB.
+                    self._linger_cap = self.max_body
             payload, auth_source = self._read_request(method, anonymous, params, csrf,
-                                                      request_id, stream=stream)
+                                                      request_id, stream=stream or deferred)
             # The semantic route target is the method plus the concrete path (with the
             # real account/project/task id substituted). It is the idempotency
             # namespace, so two different targets never share a receipt.
@@ -5313,8 +5491,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             ends = time.monotonic() + self.LINGER_SECONDS
             taken = 0
+            cap = getattr(self, '_linger_cap', None) or self.LINGER_BYTES
             try:
-                while taken < self.LINGER_BYTES:
+                while taken < cap:
                     left = ends - time.monotonic()
                     if left <= 0:
                         break
@@ -5452,6 +5631,71 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not IDEMPOTENCY_KEY.fullmatch(key):
             raise invalid('Idempotency-Key must be 8-128 URL-safe characters')
         return key
+
+    def _read_deferred_body(self, ctx, key=None):
+        """kittrial-5bb.418: read a DEFERRED_BODY route's JSON body, now that the route's authority checks passed.
+
+        Content-Length is required (411 without it; chunked transfer is refused) and checked before a byte is
+        read: at most DESIGN_BODY_BYTES when the key may be a design.<scope> entry (`key` is the route's key,
+        None when it is in the body), else the normal ``max_body``. A body over ``max_body`` whose key is not
+        a design entry is refused once read (the propose route learns its key from the body). A body shorter
+        than its Content-Length is a client that went away (nothing to answer); a longer one is never read
+        past its Content-Length, and the connection ends with the answer.
+        """
+        import design_documents
+        if (self.headers.get('Transfer-Encoding') or '').strip():
+            raise invalid('Send this body with a Content-Length; chunked transfer is not accepted here')
+        header = self.headers.get('Content-Length')
+        if header is None:
+            raise HttpError(411, 'length_required', 'Send the request body with a Content-Length')
+        if not re.fullmatch(r'[0-9]{1,12}', header.strip()):
+            raise invalid('Invalid Content-Length')
+        length = int(header.strip())
+        large = max(self.max_body, DESIGN_BODY_BYTES)
+        allowed = large if key is None or design_documents.is_design_key(key) else self.max_body
+        if length > allowed:
+            raise HttpError(413, 'payload_too_large', 'Request body exceeds the configured limit')
+        body = self._read_exact(length) if length else b''
+        self._body_unread = False
+        self._linger_cap = None
+        payload = self._json_body(body) if body else None
+        named = key if key is not None else (payload or {}).get('key')
+        if length > self.max_body and not design_documents.is_design_key(named):
+            raise HttpError(413, 'payload_too_large', 'Request body exceeds the configured limit')
+        try:
+            self._body_hash = request_hash(payload)
+        except UnicodeEncodeError:
+            raise invalid('The request holds text that is not valid Unicode (half of a surrogate pair)') from None
+        ctx.payload = payload
+        ctx.body_hash = self._body_hash
+
+    def _read_exact(self, length):
+        self._continue()
+        if not getattr(self, '_guarded', False):
+            body = self.rfile.read(length)
+        else:
+            self.server.watch(self.connection, self.server.client_seconds)
+            try:
+                body = self.rfile.read(length)
+            except OSError:
+                body = b''
+            finally:
+                self.server.unwatch(self.connection)
+        if len(body) < length:
+            raise ConnectionAbortedError('the request body did not arrive')
+        return body
+
+    def _json_body(self, body):
+        content_type = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+        if content_type != 'application/json':
+            raise unsupported('Content-Type must be application/json')
+        try:
+            payload = record_json.loads(body)
+        except (ValueError, UnicodeError):
+            raise invalid('Request body is not valid JSON')
+        if not isinstance(payload, dict):
+            raise invalid('Request body must be a JSON object')
+        return payload
 
     def _read_request(self, method, anonymous, params, csrf, request_id, stream=False):
         body = b'' if stream else self._read_body()
@@ -5997,7 +6241,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 # A retry of a file already attached under this name: answered from the record,
                 # without reading the body again (design 3a: an idempotent 200).
                 known = task_files.read_entry(project, tid, expected)
-                if known is not None and known.get('withdrawn') is None and known['name'] == name and \
+                # kittrial-5bb.418 review r2 (N1): a design document's entry is not an attached file.
+                if known is not None and known.get('withdrawn') is None and known.get('direction') != task_files.DESIGN \
+                        and known['name'] == name and \
                         task_files.blob_size(project, expected) == known['bytes']:
                     return 200, dict(task_files.view(known), replayed=True)
             task_files.check_room(project, tid, length, limit)
@@ -6241,6 +6487,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._task_title(title)
         if description is not None and not isinstance(description, str):
             raise invalid('Task description must be text')
+        if description is not None and len(description) > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
         if status is not None and status not in ('open', 'closed'):
             raise invalid('Task status must be open or closed')
         if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
@@ -6308,7 +6556,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         assignee = view.get('assignee')
         view['assignee_name'] = names.get(assignee, assignee) if assignee else None
         view['next_action'] = next_action(view, claiming=claiming)
-        view['requirement_record'] = requirement_record(view.get('labels'))
+        # A queue row carries no labels but says so itself (kittrial-5bb.433); keep that.
+        view['requirement_record'] = requirement_record(view.get('labels')) or view.get('requirement_record') is True
         from work import dependency_index, open_dependency_ids
         # A list view passes its snapshot; a single-task view passes none, and the
         # dependency entries themselves carry the other end's status (bd show),
@@ -8269,6 +8518,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         result['current_actor'] = self.service.bind_actor(ctx.principal, None)
         return 200, result
 
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/summary')
+    def task_summary(self, ctx):
+        # A read: no operation identity, reservation, or per-task existence probe.
+        self._project(ctx, CAP_READ)
+        from work_summary import task_ids
+        if not isinstance(ctx.payload, dict) or set(ctx.payload) != {'tasks'}:
+            raise invalid('Task summary requires exactly a tasks list')
+        try:
+            tasks = task_ids(ctx.payload['tasks'])
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        return 200, self.backend.task_summaries(ctx.principal, ctx.params['pid'], tasks)
+
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/lifecycle/scope')
     def lifecycle_scope(self, ctx):
         return self._lifecycle_write(ctx, 'scope')
@@ -10155,7 +10417,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                                               pending_items=item_count,
                                               redelivered=bool(task.get('redelivered')),
                                               way_back='`%s`' % (task_base + '/brief'),
-                                              comment_pending=comment_pending, assignee=task.get('assignee'))
+                                              comment_pending=comment_pending, assignee=task.get('assignee'),
+                                              open_items=open_review_rows(task.get('open_review_items')),
+                                              respond_route=task_base)
                 details['whose_move'], details['next'] = move, move_text
                 if review != 'changes-requested' and not in_progress and not comment_pending:
                     # The task asked for the two fields only where the kind is
@@ -10442,6 +10706,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._task_title(payload.get('title'))
         if payload.get('description') is not None and not isinstance(payload['description'], str):
             raise invalid('Task description must be text')
+        if len(payload.get('description') or '') > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
         self._bind_task_actor(ctx, payload)
 
         def create():
@@ -10519,6 +10785,85 @@ class ApiHandler(BaseHTTPRequestHandler):
             return write()
         return self._mutate(ctx,'tasks.assign',ctx.params['pid'],assign,capability=CAP_COORDINATE,
                             serialize=False,canonical=True,audit_metadata={'task':ctx.params['tid']})
+
+    TASK_CHILD_FIELDS = ('title', 'description', 'type', 'assignee', 'priority')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/children')
+    def task_children(self, ctx):
+        """kittrial-5bb.434: a child task (or a decision) under `{tid}`, by a coordinator on the web.
+
+        CAP_COORDINATE, the capability the endpoint's own table gives `coordinate create-child`
+        (http_authority.py). The route reads the parent first: a parent that is absent, in another
+        project or a record anchor, and a project the caller may not read, all answer the same 404 and
+        nothing is written. Every other rule is the host's own `coordinate create-child`
+        (coordination.apply_native): the merge slot takes no child, the type list, the description bound,
+        a decision's required headings (native validation), assignee names and the claiming guard, and
+        the request receipt. An Idempotency-Key is required; an exact retry returns the same child."""
+        absent = not_found('Task not found')
+        try:
+            self._project(ctx, CAP_COORDINATE)
+        except HttpError as error:
+            if error.status == 404:
+                raise absent from None
+            raise
+        if 'tasks.create-child' not in self.backend.ROUTES:
+            raise not_implemented('Creating a child task is unavailable on this server')
+        if ctx.idempotency_key is None:
+            raise invalid('Send an Idempotency-Key and reuse it with the identical child after an uncertain outcome')
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, self.TASK_CHILD_FIELDS, 'A child task')
+        from coordination import CHILD_TYPES
+        self._task_title(payload.get('title'))
+        if payload.get('type') not in CHILD_TYPES:
+            raise invalid('type must be one of %s' % ', '.join(CHILD_TYPES))
+        description = payload.get('description')
+        if description is not None and not isinstance(description, str):
+            raise invalid('Task description must be text')
+        if len(description or '') > DESCRIPTION_MAX:
+            raise invalid(DESCRIPTION_TOO_LONG)
+        if payload.get('assignee') is not None and not isinstance(payload['assignee'], str):
+            raise invalid('assignee must be text')
+        priority = payload.get('priority')
+        if priority is not None and (type(priority) is not int or not 0 <= priority <= 4):
+            raise invalid('Task priority must be an integer 0-4')
+        try:
+            parent = self.backend.get_task(ctx.params['pid'], ctx.params['tid'])
+            self._refuse_record_anchor(parent)
+        except HttpError as error:
+            if error.status == 404:
+                raise absent from None
+            raise
+        payload['task_id'] = ctx.params['tid']
+
+        def create():
+            result = self.backend.invoke('tasks.create-child', ctx.principal, ctx.params['pid'], payload,
+                                         ctx.idempotency_key, target=ctx.route_target,
+                                         authorize=ctx.authorize, capability=CAP_COORDINATE)
+            return result, result
+        try:
+            return self._mutate(ctx, 'tasks.create-child', ctx.params['pid'], create, status=201,
+                                capability=CAP_COORDINATE, serialize=False, canonical=True,
+                                audit_metadata={'task': ctx.params['tid']})
+        except HttpError as error:
+            # create-child's refusal names the required headings (coordination.validation_hint), but the
+            # endpoint's detail bound can cut that sentence off. The same sentence goes in `problems`, on
+            # the same gate validation_hint uses: a refusal about sections, for a type that has them.
+            from coordination import template_requirement
+            hint = template_requirement(payload['type'])
+            if error.status == 422 and hint and 'section' in str(error.detail or '').lower():
+                error.problems = [hint]
+            raise
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/switches')
+    def project_switches(self, ctx):
+        """kittrial-5bb.434: the installation switches that refuse a web write, for a coordinator: each
+        switch's name, state (`on`, `off`, `unreadable`), what it unlocks and the operator command. Read
+        only; CAP_COORDINATE; no path, value or actor is returned."""
+        self._project(ctx, CAP_COORDINATE)
+        reader = getattr(self.backend, 'switches', None)
+        if reader is None:
+            raise not_implemented('This server has no installation switches to read')
+        return 200, reader(ctx.params['pid'])
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/tasks/(?P<tid>' + ID + r')/release')
     def task_release(self, ctx):
@@ -10801,10 +11146,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                        'admin.py requirement-apply.' % label)
 
     # -- reference and capability records over the web (kittrial-5bb.213) -----
+    # kittrial-5bb.418: `document` is the Markdown text of a design.<scope> revision's repo-document.
     REF_PROPOSE_FIELDS = ('key', 'revision', 'expected_sha256', 'title', 'statement', 'authority',
-                          'owner', 'review_by', 'tags', 'decisions')
+                          'owner', 'review_by', 'tags', 'decisions', 'document')
     REF_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'title', 'statement',
-                         'authority', 'owner', 'review_by', 'tags', 'decisions')
+                         'authority', 'owner', 'review_by', 'tags', 'decisions', 'document')
+    REF_VERIFY_FIELDS = ('key', 'doc_sha256', 'path', 'commit', 'observed_sha256', 'result', 'reason')
     REF_ACCEPT_FIELDS = ('key', 'revision', 'expected_revision', 'record_sha256', 'expected_sha256',
                          'acceptance_state', 'acceptance', 'decision', 'evidence', 'decision_id',
                          'owners', 'approvers', 'policy', 'unverified_pointer_reason')
@@ -10856,7 +11203,197 @@ class ApiHandler(BaseHTTPRequestHandler):
         can_coordinate = role in ('coordinator', 'owner') and holds(CAP_COORDINATE)
         return can_propose, can_coordinate
 
-    def _enrich_record_view(self, ctx, pid, capabilities, item):
+    def _viewer_may_accept(self, ctx, pid, item, can_coordinate, record_kind=None):
+        """(may_accept, reason): the ONE server field gating 'Review & accept'.
+
+        Never combined in the page: the page shows 'Review & accept' only when
+        ``may_accept`` is true, else 'View'. The decision is the shared
+        ``record_acceptance.decide`` predicate (kittrial-5bb.420 r2, review
+        item b1), the SAME rule the accept route enforces through endpoint.py
+        ``party_check``/``delegation_check``. The accept route still enforces
+        on its own. ``reason`` is a short plain sentence for display only.
+
+        ``record_kind`` is the record family the route handler already knows
+        (``'references'`` or ``'capabilities'``) and MUST pass explicitly: every
+        caller does (the default is fail-closed, never a guess), so a
+        references-only delegation is never asked about capabilities (review
+        item r2-field-references).
+        """
+        import record_acceptance
+        if record_kind not in ('references', 'capabilities'):
+            return False, 'The record family could not be read.'
+        by_agent = getattr(ctx.principal, 'via', None) == 'credential'
+        entry_state = item.get('state')
+        proposed = item.get('proposed')
+        has_proposed_block = isinstance(proposed, dict) and bool(proposed)
+        # An r1-shaped waiting row carries NO proposed block (the block rides
+        # only on get/detail): fall back to proposed_revision/proposed_sha256,
+        # which list_entries sets from entry['proposed'] (both None when no
+        # draft waits). A full-catalog settled row has neither (both None) and
+        # stays not-waiting (review b2).
+        waiting = bool(
+            (has_proposed_block
+             or item.get('proposed_revision') is not None
+             or item.get('proposed_sha256') is not None)
+            and (entry_state in ('draft-only', 'draft', 'proposed')
+                 or (bool(item.get('waiting_acceptance')) and entry_state == 'accepted')))
+        with self.service.store.lock:
+            seen = self.service.state.get('settings_seen')
+            seen_flag = bool(isinstance(seen, dict) and seen.get('approval_by_another_party'))
+            service_flag = bool(self.service.approval_by_another_party)
+        # The installation's independent_approval rule (endpoint.py reads it as
+        # rules['independent_approval'] under the write's lock; review b1): the
+        # web-service state has no deployment root, so this enrichment reads
+        # the SAME canonical root the endpoint subprocess was launched with
+        # (self.backend.root). Read per request, never cached: a rule flip
+        # applies to the next read. (No fcntl/module import at module level;
+        # coordinator_rule is a plain JSON read — POSIX-safe by construction.)
+        try:
+            from admin import coordinator_rule
+            from pathlib import Path
+            backend_root = getattr(self.backend, 'root', None)
+            if backend_root:
+                try:
+                    independent = bool(coordinator_rule(Path(backend_root), 'independent_approval'))
+                except Exception:
+                    independent = False
+            else:
+                independent = False
+        except Exception:
+            independent = False
+        approval_by_another = bool(service_flag or seen_flag or independent)
+        caller_names = [getattr(ctx.principal, 'actor', None) or ctx.principal.user_id,
+                        ctx.principal.user_id]
+        draft_proposer = (
+            item.get('proposed_by')
+            or (item.get('draft') or {}).get('proposer')
+            or (item.get('proposer')
+                if item.get('state') in ('draft-only', 'draft', 'proposed')
+                or item.get('waiting_acceptance') or item.get('has_pending_draft')
+                else None)
+        )
+        draft_authors = [a for a in (item.get('draft_authors') or []) if isinstance(a, str) and a]
+        if not draft_authors and isinstance(draft_proposer, str) and draft_proposer:
+            draft_authors = [draft_proposer]
+        caller_parties = set()
+        draft_parties = set()
+        for name in caller_names:
+            if isinstance(name, str) and name:
+                caller_parties |= self.service.actor_parties(name, pid, by_agent)
+        for name in draft_authors:
+            if isinstance(name, str) and name:
+                draft_parties |= self.service.actor_parties(name, pid, by_agent)
+        actor = getattr(ctx.principal, 'actor', '') or ''
+        head = actor.split('/', 1)[0] if isinstance(actor, str) else ''
+        own_draft = bool(head) and any(
+            isinstance(a, str) and a.split('/', 1)[0] == head for a in draft_authors)
+        # The route's session-owner sameness (endpoint.py party_check reads the
+        # project's .sessions.json owners map via owner_loader, review t1): the
+        # field reads the same project directory the endpoint backend was
+        # launched with (self.backend.root). sessions/review_workflow import no
+        # POSIX-only module at module level, so this lazy read keeps the
+        # no-fcntl pin green. An unreadable-or-missing registry fails closed:
+        # the field refuses exactly where the route answers 409/403.
+        independent_hold = False
+        if independent and waiting and approval_by_another and can_coordinate:
+            try:
+                from pathlib import Path as _Path
+                import admin as _admin
+                import sessions as _sessions
+                from review_workflow import same_party as _same_party
+                _project_dir = _admin.project_dir(_Path(backend_root), pid)
+                _owners = _sessions.owners(_project_dir)
+                _actor = getattr(ctx.principal, 'actor', '') or ctx.principal.user_id
+                for _prop in draft_authors:
+                    if isinstance(_actor, str) and _actor and _same_party(_actor, _prop, _owners):
+                        independent_hold = True
+                        break
+            except Exception:
+                if by_agent:
+                    return False, 'Whether a delegation covers this agent could not be read.'
+                return False, ('A coordinator may not accept or verify a record whose draft was proposed '
+                               'by the same party while approval_by_another_party is enabled.')
+        covered = None
+        unreadable = False
+        refused = False
+        if by_agent:
+            covered = self._coverage_for(ctx, pid, record_kind)
+            if covered is None:
+                unreadable = True
+            elif covered is not True:
+                refused = True
+        return record_acceptance.decide(
+            can_coordinate=can_coordinate,
+            approval_by_another_party=approval_by_another,
+            waiting=waiting,
+            by_agent=by_agent,
+            agent_head=head or None,
+            delegation_covers_kind=covered,
+            delegation_refused=refused,
+            delegation_missing=False,
+            proposer_known=True,
+            delegation_unreadable=unreadable,
+            caller_parties=caller_parties,
+            draft_parties=draft_parties,
+            own_draft=own_draft,
+            own_party=bool(caller_parties & draft_parties),
+            independent_hold=independent_hold)
+
+    def _coverage_for(self, ctx, pid, kind):
+        """Whether a delegation in force covers the caller's agent FOR KIND.
+
+        ``kind`` is ``'references'`` or ``'capabilities'`` (review item b1):
+        a delegation narrowed to references never admits a capability draft.
+        Returns ``True`` (covered), ``False`` (a readable answer covering
+        nothing for this kind), or ``None`` (the delegations read refused or
+        this backend has no delegation signal, so the agent is uncovered,
+        the same refusal the accept route would give). Cached per (pid, kind).
+        """
+        cache = getattr(ctx, '_records_delegation_cache', None)
+        if cache is None:
+            cache = {}
+            ctx._records_delegation_cache = cache
+        key = (pid, kind)
+        if key in cache:
+            return cache[key]
+        covered = None
+        try:
+            read = getattr(self.backend, 'delegations_read', None)
+            if read is not None and getattr(ctx.principal, 'via', None) == 'credential':
+                actor = getattr(ctx.principal, 'actor', '') or ''
+                head = actor.split('/', 1)[0]
+                payload = read(pid, ctx.principal)
+                for entry in (payload.get('granted_agents') or []):
+                    if isinstance(entry, dict) and entry.get('agent') == head:
+                        covered = bool(entry.get('covered'))
+                        break
+                else:
+                    covered = False
+                if covered and kind is not None:
+                    kinds = set()
+                    for row in (payload.get('items') or []):
+                        if not isinstance(row, dict):
+                            continue
+                        delegation = row.get('delegation')
+                        if not isinstance(delegation, dict):
+                            continue
+                        if delegation.get('grantee') not in (head, 'coordinator-grant'):
+                            continue
+                        if delegation.get('right') != 'record-acceptance':
+                            continue
+                        scope = delegation.get('scope') or []
+                        if not isinstance(scope, list) or not scope:
+                            continue
+                        kinds |= {part for part in scope if isinstance(part, str)}
+                    covered = kind in kinds
+            elif getattr(ctx.principal, 'via', None) == 'credential':
+                covered = False
+        except HttpError:
+            covered = None
+        cache[key] = covered
+        return covered
+
+    def _enrich_record_view(self, ctx, pid, capabilities, item, record_kind=None):
         if not isinstance(item, dict):
             return item
         item = dict(item)
@@ -10957,15 +11494,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         item['can_propose'] = can_propose
         item['can_coordinate'] = can_coordinate
         item['approval_by_another_party'] = bool(self.service.approval_by_another_party)
+        may_accept, may_reason = self._viewer_may_accept(ctx, pid, item, can_coordinate,
+                                                        record_kind=record_kind)
+        item['viewer_may_accept'] = bool(may_accept)
+        item['viewer_may_accept_reason'] = may_reason
         return item
 
-    def _enrich_records_list(self, ctx, pid, result):
+    def _enrich_records_list(self, ctx, pid, result, record_kind=None):
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         can_propose, can_coordinate = self._records_standing(ctx, pid, capabilities)
         result = dict(result)
         for list_key in ('items', 'records', 'candidates'):
             if isinstance(result.get(list_key), list):
-                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item)
+                result[list_key] = [self._enrich_record_view(ctx, pid, capabilities, item,
+                                                             record_kind=record_kind)
                                     for item in result[list_key]]
         if 'items' not in result and isinstance(result.get('records'), list):
             seen = {r.get('key') for r in result['records'] if isinstance(r, dict)}
@@ -11076,6 +11618,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         needed = CAP_COORDINATE if coordinator else CAP_RECORDS
         self._project(ctx, needed)
         self._require_record_membership(ctx, coordinator=coordinator)
+        if route_name in ('references.propose', 'references.revise'):
+            # kittrial-5bb.418: the body is read only now, after the capability and the role passed.
+            self._read_deferred_body(ctx, ctx.params.get('key') if key_param else None)
         fields, operation_id = self._proposal_body(ctx, allowed_fields, where)
         pid = ctx.params['pid']
         if key_param and 'key' in fields and fields['key'] != ctx.params['key']:
@@ -11104,7 +11649,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                          capability=needed)
             capabilities = self.service.capabilities_for(ctx.principal, pid)
             if isinstance(result, dict):
-                result = self._enrich_record_view(ctx, pid, capabilities, result)
+                result = self._enrich_record_view(ctx, pid, capabilities, result,
+                                                  record_kind=route_name.split('.')[0])
             return result, result
         return self._mutate(ctx, route_name, pid, mutate_record, status=status,
                             capability=needed, serialize=False, canonical=True,
@@ -11200,7 +11746,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             options = reference_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('ref list: ', ''))
-        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options))
+        result = self._enrich_records_list(ctx, pid, self.backend.references(pid, options),
+                                             record_kind='references')
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
@@ -11225,7 +11772,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             raise invalid(str(error).replace('ref find: ', ''))
         result = self.backend.references_find(pid, phrase, parsed_limit)
-        return 200, self._enrich_records_list(ctx, pid, result)
+        return 200, self._enrich_records_list(ctx, pid, result, record_kind='references')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')')
     def references_get(self, ctx):
@@ -11233,7 +11780,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         return 200, self._enrich_record_view(
-            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']))
+            ctx, pid, capabilities, self.backend.reference(pid, ctx.params['key']),
+            record_kind='references')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_propose(self, ctx):
@@ -11247,6 +11795,83 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._records_write(ctx, 'references.revise', 'revise',
                                    self.REF_REVISE_FIELDS, 'A reference revision',
                                    coordinator=False, key_param=True, status=200)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/verifications')
+    def references_verify(self, ctx):
+        # kittrial-5bb.418 (Q4): a design-document report from a member who may propose (records capability,
+        # role contributor, coordinator or owner); never a viewer or an outsider. Written unverified: it can
+        # open design-drift (trusted: false, reported_by) and never marks a document verified.
+        return self._records_write(ctx, 'references.verify', 'verify',
+                                   self.REF_VERIFY_FIELDS, 'A design verification',
+                                   coordinator=False, key_param=True, status=201)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/designs/(?P<scope>[a-z0-9][a-z0-9.-]{0,72})')
+    def design_get(self, ctx):
+        """kittrial-5bb.418: the design page read: a design.<scope> entry's stored document as text, its index
+        and state. One 404 for every caller who may not read it and every scope that is not there."""
+        absent = not_found('Design not found')
+        try:
+            self._project(ctx, CAP_READ)
+            self._records_backend()
+        except HttpError:
+            raise absent from None
+        revision = ctx.query.get('revision')
+        if revision is not None and not re.fullmatch(r'[1-9][0-9]{0,8}', revision):
+            raise absent
+        reader = getattr(self.backend, 'design', None)
+        if reader is None:
+            raise absent
+        try:
+            return 200, reader(ctx.params['pid'], ctx.params['scope'], revision)
+        except HttpError as error:
+            if error.status in (400, 404, 422):
+                raise absent from None
+            raise
+
+    TRACE_QUERY = ('view', 'scope', 'limit', 'cursor')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/trace')
+    def trace_get(self, ctx):
+        """kittrial-5bb.425: the trace read (TRACEABILITY_DESIGN §5.2): one page of one view, from records alone.
+
+        CAP_READ, and one 404 for every caller who may not read the project and every project that is not
+        there (an agent credential scoped to other projects included: http_authority.decide). The cursor is
+        bound to the caller, project and query (`cursor_binding`) and carries the export generation its page
+        was read at, so a page of a project that changed since is refused, never stitched to another."""
+        absent = not_found('Project not found')
+        try:
+            self._project(ctx, CAP_READ)
+        except HttpError as error:
+            if error.status == 401:
+                raise
+            raise absent from None
+        reader = getattr(self.backend, 'trace', None)
+        if reader is None:
+            raise absent
+        import trace_read
+        unknown = sorted(set(ctx.query) - set(self.TRACE_QUERY))
+        if unknown:
+            raise invalid('trace takes %s; not %s' % (', '.join(self.TRACE_QUERY), ', '.join(unknown)))
+        view = ctx.query.get('view', 'summary')
+        if view not in trace_read.VIEWS:
+            raise invalid('view must be one of %s' % ', '.join(trace_read.VIEWS))
+        scope = ctx.query.get('scope')
+        if scope is not None and (len(scope) > 73 or not trace_read.SCOPE_RE.fullmatch(scope)):
+            # Review note 7: the endpoint's own rule and sentence, so `a.` and `a..b` are refused here too.
+            raise invalid(trace_read.USAGE)
+        limit, state = self._page(ctx, ctx.query)
+        if limit > trace_read.PAGE_MAX:
+            raise invalid('limit must be between 1 and %d' % trace_read.PAGE_MAX)
+        carried = state.get('x') if isinstance(state.get('x'), dict) else {}
+        generation = carried.get('g') if isinstance(carried.get('g'), str) else None
+        if state['o'] and generation is None:
+            raise conflict('Invalid cursor')
+        result = dict(reader(ctx.params['pid'], view, scope, state['o'], limit, generation))
+        following = result.pop('next_offset', None)
+        result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, following,
+                                             extra={'g': result.get('generation')}, key=self.service.cursor_key())
+                                 if following is not None else None)
+        return 200, result
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/references/(?P<key>' + REFERENCE_KEY + r')/accept')
     def references_accept(self, ctx):
@@ -11287,7 +11912,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             options = capability_records.parse_list_options(args, web_service=True)
         except ValueError as error:
             raise invalid(str(error).replace('capability list: ', ''))
-        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options))
+        result = self._enrich_records_list(ctx, pid, self.backend.capabilities(pid, options),
+                                             record_kind='capabilities')
         result['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query,
                                              state['o'] + limit, key=self.service.cursor_key())
                                  if result.get('next_offset') is not None else None)
@@ -11312,7 +11938,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             raise invalid(str(error).replace('capability find: ', ''))
         result = self.backend.capabilities_find(pid, phrase, parsed_limit)
-        return 200, self._enrich_records_list(ctx, pid, result)
+        return 200, self._enrich_records_list(ctx, pid, result, record_kind='capabilities')
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities/(?P<key>' + CAPABILITY_KEY + r')')
     def capabilities_get(self, ctx):
@@ -11320,7 +11946,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         pid = ctx.params['pid']
         capabilities = self.service.capabilities_for(ctx.principal, pid)
         return 200, self._enrich_record_view(
-            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']))
+            ctx, pid, capabilities, self.backend.capability(pid, ctx.params['key']),
+            record_kind='capabilities')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
     def capabilities_propose(self, ctx):
@@ -12578,6 +13205,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if sentence is not None:
                     raise invalid(sentence, refusal.detail) from None
                 raise
+            if payload.get('operation') == 'contribute':
+                result = http_open_items_advice(result, ctx.params['pid'], ctx.params['tid'])
             return result, result
         return self._mutate(ctx, 'reviews.add', ctx.params['pid'], add, status=201,
                             capability=capability, serialize=False, canonical=True)
@@ -13401,7 +14030,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 row = dict(item, project_name=project['name'])
                 if item.get('id') in blocked and item.get('status') != 'closed':
                     row['blocked'] = True
-                if item.get('assignee') == actor and item.get('status') != 'closed':
+                # kittrial-5bb.433: a requirement record accepted with nothing pending, or ended by its
+                # owner, is not work: it stays on the Requirements page, not on My work. One waiting
+                # for acceptance, and one whose ledger cannot be read, stay.
+                settled = item.get('requirement_record') and item.get('requirement_state') in (
+                    'accepted', 'withdrawn', 'superseded')
+                if item.get('assignee') == actor and item.get('status') != 'closed' and not settled:
                     assigned.append(row)
                 if CAP_APPROVE in capabilities and item['review_state'] in (
                         'awaiting-review', 'legacy-review-ready', 'awaiting-integration',
@@ -13635,9 +14269,9 @@ def key_needs_a_passphrase(keyfile):
     error is what the refusal reports (kittrial-5bb.168 review item 3).
     """
     try:
-        with open(keyfile, 'rb') as stream:
+        with regular_file.open_regular(os.path.realpath(keyfile)) as stream:
             return b'ENCRYPTED' in stream.read(4096)
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 #: How long a client may take over each thing the service waits for from it: completing the
@@ -14262,7 +14896,8 @@ def main(argv=None):
         # creates a state file from a mistyped path.
         if not Path(args.state).is_file():
             parser.error('--list-unconfirmed-projects needs an existing --state file')
-        document = json.loads(Path(args.state).read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        document = json.loads(read_regular_text(Path(os.path.realpath(args.state))))
         if not isinstance(document, dict) or not isinstance(document.get('projects'), dict):
             parser.error('--state is not a service state document')
         import types
@@ -14273,7 +14908,8 @@ def main(argv=None):
         # Read-only, like --list-unconfirmed-projects: the document is read as JSON, no store is opened.
         if not Path(args.state).is_file():
             parser.error('--list-dormant-grants needs an existing --state file')
-        document = record_json.loads(Path(args.state).read_text(encoding='utf-8'))
+        from admin import read_regular_text
+        document = record_json.loads(read_regular_text(Path(os.path.realpath(args.state))))
         if not isinstance(document, dict) or not isinstance(document.get('users'), dict):
             parser.error('--state is not a service state document')
         from http_authority import dormant_grants

@@ -580,6 +580,26 @@ of a kittrial-sized export, as the context index did for find.
    - `trace --verify` with the verifiers list, and `design-drift` and `unverified` states.
    - The design page on the web, rendered as text.
    - Tests: the §7 rows for upload, index and drift.
+   - **As built, part 1 (kittrial-5bb.418): upload, index, acceptance.** The authority is a new
+     type, `repo-document`, inside a `reference-entry-v3` record (a `sha256` added to the v1
+     `repo-path` type would make an older kit read the entry malformed; inside v3 it reads
+     `unsupported`). New `design.<scope>` entries must use it. The document travels in the
+     propose or revise itself (the HTTP body's `document`, read only after the route's authority
+     checks with a 1.5 MiB cap from Content-Length; the client's `--document-from-git`, from git's
+     object at the pinned commit). Its bytes are a task-file entry of direction `design` on the
+     anchor, so backup, verify and the byte limit count them and purge keeps them. The index is a
+     function of the bytes, key, path and commit, so revisions that pin one document share it and
+     an accepted revision keeps its own. Part 2 builds `trace --verify`, the design page and
+     `unknown-section`.
+   - **As built, part 2 (kittrial-5bb.418): verify, page, sections.** A report is a reserved
+     `Kind: design-verification-v1` record. Trust mirrors capabilities: only `admin.py design-verify`
+     by an actor on the operator allowlist or the verifiers list writes a trusted record; reports
+     through `ref verify`, `trace --verify --record` or the members-only web route are unverified.
+     Any failing report opens `design-drift`; one opened only by untrusted reports reads
+     `trusted: false` with `reported_by` (the coordinator's Q4). The design page
+     (`GET /v1/projects/{id}/designs/{scope}`, web `/p/{pid}/designs/{scope}`) renders the stored
+     document as text with the server's anchors and gives one 404 for everything a caller may not
+     read. `design:` sections resolve against the selected index: `live`, or `unknown-section`.
 4. **The trace read on the server, and the Coverage panel.**
    - `GET /trace` and the endpoint action, all six views, bounds, permission before counts, the
      no-design case.
@@ -587,6 +607,33 @@ of a kittrial-sized export, as the context index did for find.
    - The task page showing its own tokens resolved.
    - The client `trace` as a convenience.
    - The cost measured on a kittrial-sized export.
+   - **As built, part 1 (kittrial-5bb.425): the server read, the endpoint action, `GET /trace`, the
+     client.** trace_read.py is a library over one snapshot (`Snapshot`): the rows `brief` resolves
+     pointers from (briefing.py `ContextPointers.loaded`), with an `exclude` hook for any per-caller
+     rule. Requirement drafts and owner states are readable by every member today (the requirement
+     reads strip only operation handles, http_service.py `_requirements_state_only`), so no role-based
+     exclusion applies yet. `cites-superseded-revision` is `requirement_impact.analyze`'s first
+     production use, over manifests of the cited and the current accepted revisions. Lines read from
+     comments (the round's publication line, the owner-only decision heuristic) count only from a
+     person owner or coordinator in current membership or a listed operator; the converged design and
+     its decision are read from the `design.<scope>` entry, never from comments. **Measured** on a
+     synthetic kittrial-sized export (3,461 rows, 7,620 comments, 40 requirements, 20 indexed designs;
+     tests/trace_cost.py, Windows, Python 3.11): `analyze` 114 ms; each view's first answer in a fresh
+     interpreter 359-930 ms (`summary`, which builds every view, is the 930), a second answer 64-587 ms;
+     the generation (a digest of the filtered snapshot) 46 ms. **Bounds against planted input (review of
+     part 1):** every list in a row is bounded and the 64 KiB cap holds for one row; each requirement
+     ledger is validated once per answer, so 10 tasks of 1,000 distinct `req:` tokens read in about 0.1 s
+     (8.4-8.9 s before); at most 200 distinct tokens are checked per source (a task or a design section),
+     so a planted source hides only its own extra tokens and the summary says when a count is partial;
+     the views are built after the shared lock is released.
+   - **As built, part 2 (kittrial-5bb.425): the web.** A Coverage panel on the project page (one
+     line per `summary` line with its counts and "partial" when a bound cut it, each opening the
+     view's page at `/p/{pid}/trace/{view}`, which pages with the server's cursor), a Designs list
+     under Records (each `design.<scope>` with its state and requirement and plan coverage, opening
+     the design page) and, on the task page, the description's own `req:` and `design:` tokens
+     resolved by the brief (`description_pointers`). Everything is built with `h()` as text
+     (web/js/views/trace.js). After the re-review of part 1, each task field (description, current
+     checkpoint, current contribution) is its own 200-token source.
 5. **Orchestra's system design.** docs/SYSTEM_DESIGN.md rewritten with the front block, uploaded as
    `design.orchestra` and accepted, IMPLEMENTATION_PLAN retired, and trace's first report on
    kittrial attached.

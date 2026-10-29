@@ -2443,7 +2443,7 @@ Rollback and restore, exactly:
 - **This kit:** a malformed `.owner-answers/` entry or `.open-item-requests/` receipt refuses the backup before the native sync and the restore before its first write.
 - **The four kinds are not void targets yet:** `void-record` refuses them as an unsupported target kind, as before, until the release with their reader.
 
-At deploy time, list the projects that already use an `open-item` label: `python3 admin.py --root RUNTIME open-item-label-check [PROJECT...]`. It reads each initialized project once (no lock, no write), prints JSON naming every row carrying `open-item` or an `open-item:` label, and exits 1 when any project uses one or could not be read. A project whose `.beads/metadata.json` does not record the Dolt server coordinates is reported unreadable and bd is not run for it: bd would otherwise create an embedded database inside the project and list nothing. A project that does must choose another label for its own use before open-item writes are turned on for it; the later release that adds the switch refuses it.
+At deploy time, list the projects that already use an `open-item` label: `python3 admin.py --root RUNTIME open-item-label-check [PROJECT...]`. It reads each initialized project once (no lock, no write), prints JSON naming every row carrying `open-item` or an `open-item:` label, and exits 1 when any project uses one or could not be read. A project whose `.beads/metadata.json` does not record the Dolt server coordinates is reported unreadable and bd is not run for it: bd would otherwise create an embedded database inside the project and list nothing. A project that uses such a label must choose another label for its own use before open-item writes are turned on for it; the later release that adds the switch refuses it.
 
 **Requirement proposals: triage runs on the host.** A contributor submits a proposal through the client (`proposal submit`). Everything that rests on operator authority is a host command, because over SSH the actor is self-declared: `proposal-review`, `proposal-decide` and `proposal-settings` above. A stored settings record counts only when its native author is on the operator allowlist, and a stored disposition when its author is on the allowlist or is an HTTP account (the web service wrote it for a member with `reviews.approve`, see [HTTP deployment](HTTP_DEPLOYMENT.md#requirement-proposals)); removing an operator makes their dispositions inert (the proposal reads its earlier state) and re-adding them restores it.
 
@@ -2615,7 +2615,7 @@ What it does:
 `--force` is needed when the project looks like a working tracker, holds the merge slot, or has pending reservations. The checks fail closed: what cannot be read is treated as the dangerous answer. The refusal names what it found:
 - **It looks like a working tracker:** bd reads the project and it holds issues, or metadata is absent while the same-named server database holds issues. The state of its backups does not matter; a healthy project whose last backup failed is still a healthy project.
 - **Nothing could be checked:** the Dolt server (or bd itself) could not be reached, the server did not answer the probe within 15 seconds (a frozen server does not make the command hang with its locks held), or the database-list response was malformed or ambiguous. If a same-named database exists but its issue count cannot be read, that is also treated as unknown. The project may be a healthy tracker, so this needs `--force` too. Start the server and retry instead when you can.
-- **Its `.beads/metadata.json` is there but unusable:** it cannot be opened, is not JSON, or does not record the Dolt server. The kit cannot tell what the project is, so this needs `--force`. bd is never run on such a project: without the server coordinates bd would fall back to an embedded database, create `.beads/embeddeddolt` inside the project and report it as empty.
+- **Its `.beads/metadata.json` is there but unusable:** it cannot be opened, is not JSON, or does not record the Dolt server coordinates together with `"dolt_mode": "server"`. The kit cannot tell what the project is, so this needs `--force`. bd is never run on such a project: without the server coordinates and that mode bd would fall back to an embedded database, create `.beads/embeddeddolt` inside the project and report it as empty.
 - **The merge slot** is held, or bd reads the project but could not read its slot.
 - **Reservations:** pending receipts in its request journals, or receipts that could not be read.
 
@@ -3127,6 +3127,34 @@ it was set ([CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)).
   otherwise); one contributor's v3 draft makes it read a whole accepted entry
   `unsupported`; it cannot write to, void or release such an entry; and its backup and
   restore are unaffected. Nothing is lost; roll forward to read them.
+- **Design documents (kittrial-5bb.418).** A `design.<scope>` entry carries its document
+  (a `repo-document` authority, [CLI contract](CLI_CONTRACT.md#ref-the-reference-catalog)). The
+  bytes are kept in the project's `.task-files` store, journaled as a task-file entry of direction
+  `design` on the entry's anchor, so `task-files verify`, the backup's `NAME.task-files` copy,
+  `restore-new` and the project's byte limit cover them, and `task-files purge` never removes one
+  (its anchor is a closed catalog row by construction). `task_files.max_design_documents` (200)
+  bounds how many distinct documents a project holds. The server-derived index is a reserved
+  `Kind: design-index-v1` comment on the anchor. An accept of a design revision re-reads the
+  stored bytes: a missing or changed file, or a differing index beside the derived one, refuses it,
+  naming the cause; repair the store from a backup, or remove the stray record with the host
+  procedure for an orphan record. A propose or revise that is refused removes the bytes it stored;
+  one whose native write is uncertain keeps them for its retry. A host fault in between (a timeout
+  or a disk error before the operation's pending receipt is written) can leave stored bytes that no
+  entry names: they count toward nothing, `task-files verify` lists them as orphans, and
+  `task-files purge` removes them once they are a day old. **Rollback:** a kit before this one reads a repo-document
+  revision `unsupported` (as for any later authority type, below); its `task-files verify` and
+  backup report the `design` journal entries as entries it cannot read and do not copy their
+  bytes, and its purge refuses to run while they are there, so nothing is removed. Back up on
+  this release before a rollback, and roll forward to read the entries again.
+- **Verifying design documents.** A lane runs `trace --verify --payloads checks.json` in a
+  checkout; `admin.py design-verify PROJECT --actor NAME --file checks.json` records each check as a
+  trusted `Kind: design-verification-v1` record when NAME is on the operator allowlist or the
+  `verifiers` list (both read strictly, as for `capability-verify`). A pass marks the accepted
+  revision `verified`; a fail marks it `design-drift` (`trusted: true`). Members who may propose can
+  also file unverified reports (`trace --verify --record`, or the web route), which can open a drift
+  that says `trusted: false` and names who reported it. Removing an actor from the verifiers list
+  makes its records stop counting. A trusted re-check clears a drift; otherwise the way out of a drift
+  on a pinned commit is a revision. `admin.py design-verify` exits 1 when it refused any item.
 - **No further version for a new authority type.** Version 3 is the last one an
   authority type needs. A v3 revision whose authority type this kit does not know (one a
   later kit added) makes its entry read `unsupported`, with the warning `authority type

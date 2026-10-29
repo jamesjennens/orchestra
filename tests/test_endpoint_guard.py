@@ -618,6 +618,12 @@ class EndpointLabelAliasGuardTests(_EndpointRootMixin, unittest.TestCase):
                             self.bd(args)
             run.assert_not_called()
 
+    def test_the_reserved_label_refusal_names_open_item_labels(self):
+        # kittrial-5bb.171 item 4
+        with mock.patch.object(endpoint.subprocess, 'run'):
+            with self.assertRaisesRegex(ValueError, 'labels belong to open item records'):
+                self.bd(['create', 'x', '--label', self.RESERVED[0]])
+
     def test_unrecognized_create_update_flag_is_refused(self):
         with mock.patch.object(endpoint.subprocess, 'run') as run:
             for args in (['create', 'x', '--labell', 'requirement'],
@@ -643,6 +649,81 @@ class EndpointLabelAliasGuardTests(_EndpointRootMixin, unittest.TestCase):
                 with mock.patch.object(endpoint.subprocess, 'run', proc):
                     result = self.bd(args)
                 self.assertEqual(result['returncode'], 0)
+
+
+@unittest.skipIf(endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+class EndpointRegularReadTests(NativeLabelResolutionTests):
+    def bounded(self, call):
+        import threading
+        result = []
+        def run():
+            try:
+                result.append((True, call()))
+            except BaseException as error:
+                result.append((False, error))
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive(), 'a host FIFO blocked the endpoint read')
+        self.assertTrue(result)
+        if result[0][0]:
+            return result[0][1]
+        raise result[0][1]
+
+    def test_host_generated_view_regular_missing_and_damaged(self):
+        (self.path / '.beads').mkdir()
+        (self.path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        views = self.path / 'views'
+        views.mkdir()
+        request = {'project': 'pp', 'actor': 'worker', 'action': 'view'}
+        (views / 'CURRENT.md').write_text('current\n', encoding='utf-8')
+        self.assertEqual(endpoint.execute(self.root, request)['stdout'], 'current\n')
+        (views / 'CURRENT.md').unlink()
+        with self.assertRaises(FileNotFoundError):
+            endpoint.execute(self.root, request)
+        (views / 'CURRENT.md').write_bytes(b'\xff')
+        with self.assertRaises(UnicodeDecodeError):
+            endpoint.execute(self.root, request)
+
+    def test_host_generated_view_fifo_is_refused_without_blocking(self):
+        import os
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        (self.path / '.beads').mkdir()
+        (self.path / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
+        views = self.path / 'views'
+        views.mkdir()
+        os.mkfifo(views / 'CURRENT.md')
+        with self.assertRaises(ValueError):
+            self.bounded(lambda: endpoint.execute(
+                self.root, {'project': 'pp', 'actor': 'worker', 'action': 'view'}))
+
+    def test_tracker_metadata_regular_missing_damaged_and_fifo(self):
+        import actor_names
+        import os
+        metadata = self.path / '.beads' / 'metadata.json'
+        metadata.parent.mkdir()
+        metadata.write_text(json.dumps({
+            'dolt_mode': 'server', 'dolt_server_host': '127.0.0.1',
+            'dolt_server_port': 1, 'dolt_server_user': 'root', 'dolt_database': 'pp'}),
+            encoding='utf-8')
+        rows = json.dumps({'id': 'pp-merge-slot', 'labels': []}) + '\n'
+        with mock.patch('admin.run_bd', return_value=rows):
+            self.assertEqual(endpoint.tracker_actors(self.root, self.path), set())
+        metadata.unlink()
+        with mock.patch('admin.run_bd') as native:
+            with self.assertRaises(actor_names.TrackerUnreadable):
+                endpoint.tracker_actors(self.root, self.path)
+            native.assert_not_called()
+        metadata.write_text('{damaged', encoding='utf-8')
+        with self.assertRaises(actor_names.TrackerUnreadable):
+            endpoint.tracker_actors(self.root, self.path)
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('FIFOs unavailable')
+        metadata.unlink()
+        os.mkfifo(metadata)
+        with self.assertRaises(actor_names.TrackerUnreadable):
+            self.bounded(lambda: endpoint.tracker_actors(self.root, self.path))
 
 
 if __name__ == '__main__':

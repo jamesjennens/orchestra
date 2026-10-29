@@ -43,13 +43,16 @@ Covers:
      explicitly (`checkout_validated: False` on web acceptance and web attestation because the web service
      has no repository checkout; `verification_state: 'attested'`, `trusted: False`, `attested: True`).
 """
+import datetime
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 KIT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(KIT), str(KIT / 'tests')]
@@ -65,6 +68,11 @@ from test_coordinator_rules_endpoint import RulesHelpers
 STRICT_ENDPOINT = KIT / 'tools' / 'strict_canonical_endpoint.py'
 
 
+def _review_by():
+    today = datetime.date(*time.gmtime()[:3])
+    return (today + datetime.timedelta(days=365)).isoformat()
+
+
 def _valid_ref_propose(key='kit.guide', title='Kit Guide', statement='Operational guide for the kit.'):
     return {
         'key': key,
@@ -72,7 +80,7 @@ def _valid_ref_propose(key='kit.guide', title='Kit Guide', statement='Operationa
         'statement': statement,
         'authority': {'type': 'repo-path', 'path': 'docs/OPERATIONS.md', 'commit': 'a' * 40},
         'owner': 'person:maintainer',
-        'review_by': '2026-12-31',
+        'review_by': _review_by(),
         'tags': ['ops'],
         'decisions': [],
     }
@@ -108,6 +116,289 @@ def _valid_cap_results(passed=True):
 
 class _RecordsScenarioMixin:
     """Shared scenario assertions run against both the strict canonical endpoint and real bd."""
+
+    # -- kittrial-5bb.418: a design document over HTTP (TRACEABILITY_DESIGN §5.1; Q2's conditions) -------
+
+    def _design_body(self, text, key='design.web-design'):
+        import hashlib
+        body = _valid_ref_propose(key=key, title='Web design', statement='The selected web design.')
+        body['authority'] = {'type': 'repo-document', 'path': 'docs/design/WEB.md', 'commit': 'b' * 40,
+                             'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest()}
+        body['document'] = text
+        return body
+
+    def _raw(self, harness, path, headers, body=b'', close_write=False, wait=10):
+        """One hand-written request: answers None when the server closed without answering."""
+        import socket
+        lines = ['POST %s HTTP/1.1' % path, 'Host: 127.0.0.1'] + ['%s: %s' % item for item in headers.items()]
+        connection = socket.create_connection(('127.0.0.1', harness.port), timeout=wait)
+        try:
+            connection.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode('ascii') + body)
+            if close_write:
+                connection.shutdown(socket.SHUT_WR)
+            received = b''
+            while True:
+                try:
+                    piece = connection.recv(65536)
+                except (ConnectionResetError, socket.timeout):
+                    break
+                if not piece:
+                    break
+                received += piece
+                if b'\r\n\r\n' in received:
+                    head, _, rest = received.partition(b'\r\n\r\n')
+                    length = [int(line.split(b':', 1)[1]) for line in head.split(b'\r\n')
+                              if line.lower().startswith(b'content-length:')]
+                    if length and len(rest) >= length[0]:
+                        break
+        finally:
+            connection.close()
+        if not received:
+            return None
+        return int(received.split(b' ', 2)[1])
+
+    def run_design_document_suite(self):
+        harness = self.harness
+        people = self._setup_actors(harness)
+        path = f'/v1/projects/{self.pid}/references'
+        text = '<!-- design-v1\r\nscope: web-design\r\nstatus: candidate\r\n-->\r\n# Web design\r\n\r\n## Plan phase 1\r\n'
+
+        def auth(name):
+            return {'Authorization': 'Bearer ' + people[name]['token']}
+
+        big = 2 * 1024 * 1024
+        # Q2: the larger body is never read for an anonymous or under-privileged caller. The server answers
+        # from the headers alone (the body is never sent here), so it read nothing.
+        self.assertEqual(self._raw(harness, path, {'Content-Type': 'application/json',
+                                                   'Content-Length': str(1024 * 1024)}), 401)
+        self.assertEqual(self._raw(harness, path, dict(auth('viewer'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(1024 * 1024)})), 403)
+        # A contributor past the role check: over DESIGN_BODY_BYTES is refused before a byte is read.
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(big)})), 413)
+        # A revise of a key that is not a design entry may not send more than the normal limit.
+        self.assertEqual(self._raw(harness, path + '/kit.guide/revisions', dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(300 * 1024)})), 413)
+        # Content-Length is required, digits only; chunked transfer is refused.
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{'Content-Type': 'application/json'})), 411)
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': '+12'}), b'{}' * 6), 422)
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': '12abc'}), b'{}' * 6), 422)
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked'}), b'0\r\n\r\n'), 422)
+        # A body over the normal limit whose key is not a design entry is refused once read.
+        plain = _valid_ref_propose(key='kit.padded', statement='s')
+        plain['title'] = 'x' * 10
+        raw = json.dumps(dict(plain, decisions=[]) | {'tags': ['ops']}).encode('utf-8')
+        padded = raw[:-1] + b' ' * (300 * 1024) + b'}'
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(len(padded))}), padded), 413)
+        # A Content-Length shorter than the body: the cut body is not JSON.
+        good = json.dumps(self._design_body(text)).encode('utf-8')
+        self.assertEqual(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(len(good) - 10)}), good), 422)
+        # A Content-Length longer than the body: the client went away; nothing is answered or written.
+        self.assertIsNone(self._raw(harness, path, dict(auth('contrib'), **{
+            'Content-Type': 'application/json', 'Content-Length': str(len(good) + 100)}), good, close_write=True))
+        self.assertEqual(harness.request('GET', path + '/design.web-design', token=people['coord1']['token']).status,
+                         404)
+        # The design document itself, over 256 KiB of JSON and well under 1.5 MiB, by a contributor.
+        long_text = text + ('word ' * 70000) + '\r\n'
+        proposed = harness.request('POST', path, self._design_body(long_text), token=people['contrib']['token'],
+                                   key='design-web-1')
+        self.assertEqual(proposed.status, 201, proposed.data)
+        self.assertEqual(proposed.data['document']['bytes'], len(long_text.encode('utf-8')))
+        # The idempotency receipt binds the body read by the route: the same key with another document is refused.
+        again = harness.request('POST', path, self._design_body(long_text + 'more\r\n'),
+                                token=people['contrib']['token'], key='design-web-1')
+        self.assertGreaterEqual(again.status, 400, again.data)
+        draft = harness.request('GET', path + '/design.web-design', token=people['coord1']['token'])
+        self.assertEqual(draft.status, 200, draft.data)
+        accepted = harness.request('POST', path + '/design.web-design/accept',
+                                   {'expected_revision': 1, 'record_sha256': proposed.data['sha256'],
+                                    'evidence': 'Read the stored design document.'},
+                                   token=people['coord2']['token'], key='design-web-accept')
+        self.assertEqual(accepted.status, 200, accepted.data)
+        # Part 2: the design page. A member reads it; every caller who may not and every scope that is not
+        # there get one and the same 404 (hidden equals absent).
+        page = harness.request('GET', f'/v1/projects/{self.pid}/designs/web-design', token=people['viewer']['token'])
+        self.assertEqual(page.status, 200, page.data)
+        self.assertEqual(page.data['document'], long_text)
+        self.assertEqual((page.data['index_state'], page.data['verification']['state']), ('matches', 'unverified'))
+        harness.create_account(self.owner_token, 'rec-outsider', 'rec-password-1')
+        outsider, _, _ = harness.login('rec-outsider', 'rec-password-1')
+        absent = [harness.request('GET', f'/v1/projects/{self.pid}/designs/{scope}', token=token)
+                  for scope, token in (('web-design', outsider), ('no-such-design', outsider),
+                                       ('no-such-design', people['viewer']['token']),
+                                       ('kit', people['viewer']['token']))]
+        self.assertEqual({(r.status, r.data['error']['code'], r.data['error']['message']) for r in absent},
+                         {(404, 'not_found', 'Design not found')})
+        # Without a session every scope gets the authentication answer, the same whether it exists or not.
+        anonymous = [harness.request('GET', f'/v1/projects/{self.pid}/designs/{scope}')
+                     for scope in ('web-design', 'no-such-design')]
+        self.assertEqual({(r.status, r.data['error']['code']) for r in anonymous}, {(401, 'unauthenticated')})
+        # Q4: a member who may propose files a report; it opens design-drift marked untrusted.
+        authority = self._design_body(long_text)['authority']
+        report = {'doc_sha256': authority['sha256'], 'path': authority['path'], 'commit': authority['commit'],
+                  'observed_sha256': '0' * 64, 'result': 'fail', 'reason': 'mismatch'}
+        for name in ('viewer', 'nonmember_su'):
+            refused = harness.request('POST', path + '/design.web-design/verifications', report,
+                                      token=people[name]['token'], key='design-report-' + name)
+            self.assertEqual(refused.status, 403, (name, refused.data))
+        filed = harness.request('POST', path + '/design.web-design/verifications', report,
+                                token=people['contrib']['token'], key='design-report-contrib')
+        self.assertEqual(filed.status, 201, filed.data)
+        self.assertEqual(filed.data['identity'], 'unverified')
+        seen = harness.request('GET', path + '/design.web-design', token=people['viewer']['token'])
+        verification = seen.data['verification']
+        self.assertEqual((verification['state'], verification['trusted'], len(verification['reported_by'])),
+                         ('design-drift', False, 1))
+        # A viewer may not propose one even with a small body (the role, as for every reference write).
+        small = harness.request('POST', path, self._design_body(text, key='design.other-web'),
+                                token=people['viewer']['token'], key='design-viewer')
+        self.assertEqual(small.status, 403, small.data)
+
+    def run_trace_suite(self):
+        """kittrial-5bb.425: GET /v1/projects/{pid}/trace through the endpoint's `trace` action."""
+        from urllib.parse import urlencode
+        harness = self.harness
+        people = self._setup_actors(harness)
+        pid = self.pid
+        refs = f'/v1/projects/{pid}/references'
+        text = '<!-- design-v1\nscope: web-trace\nstatus: candidate\n-->\n# Web trace\n\n## Storage\nSee req:GHOST here.\n'
+        proposed = harness.request('POST', refs, self._design_body(text, key='design.web-trace'),
+                                   token=people['contrib']['token'], key='trace-design-1')
+        self.assertEqual(proposed.status, 201, proposed.data)
+        accepted = harness.request('POST', refs + '/design.web-trace/accept',
+                                   {'expected_revision': 1, 'record_sha256': proposed.data['sha256'],
+                                    'evidence': 'Read the stored design document.'},
+                                   token=people['coord2']['token'], key='trace-design-accept')
+        self.assertEqual(accepted.status, 200, accepted.data)
+        for number in range(3):
+            made = harness.request('POST', f'/v1/projects/{pid}/tasks',
+                                   {'title': 'Trace task %d' % number,
+                                    'description': 'Uses req:MISSING%d and design:web-trace#nowhere' % number},
+                                   token=people['coord1']['token'])
+            self.assertEqual(made.status, 201, made.data)
+
+        def get(token, project=pid, **query):
+            return harness.request('GET', f'/v1/projects/{project}/trace' + ('?' + urlencode(query) if query else ''),
+                                   token=token)
+
+        # Every member reads the same rows and the same counts: no role sees more or less.
+        answers = {name: get(people[name]['token'], view='tokens') for name in ('viewer', 'contrib', 'coord1',
+                                                                                'coord1_agent')}
+        for name, answer in answers.items():
+            self.assertEqual(answer.status, 200, (name, answer.data))
+        bodies = {json.dumps(answer.data, sort_keys=True) for answer in answers.values()}
+        self.assertEqual(len(bodies), 1)
+        tokens = answers['viewer'].data
+        self.assertEqual(sorted(row['pointer'] for row in tokens['rows']),
+                         ['design:web-trace#nowhere'] * 3 + ['req:GHOST', 'req:MISSING0', 'req:MISSING1',
+                                                             'req:MISSING2'])
+        self.assertEqual(tokens['total'], 7)
+        self.assertIsNone(tokens['next_cursor'])
+        # One 404 for a non-member, a superuser outside the project, an agent scoped to another project and an
+        # unknown project: hidden equals absent.
+        harness.create_account(self.owner_token, 'trace-outsider', 'rec-password-1')
+        outsider, _, _ = harness.login('trace-outsider', 'rec-password-1')
+        # An agent whose grant of this project was taken away (a native host holds one project here).
+        elsewhere = harness.request('POST', '/v1/agents', {'name': 'Elsewhere', 'working_directory': '/tmp/elsewhere',
+                                                           'projects': [pid], 'scopes': ['tasks']},
+                                    token=self.owner_token)
+        self.assertEqual(elsewhere.status, 201, elsewhere.data)
+        self.assertEqual(get(elsewhere.data['credential']['secret']).status, 200)
+        ungranted = harness.request('PATCH', '/v1/agents/' + elsewhere.data['agent']['id'], {'projects': []},
+                                    token=self.owner_token)
+        self.assertEqual(ungranted.status, 200, ungranted.data)
+        # A carrier agent's credential (scope `nudges`) meets the service-wide carrier gate before any route
+        # (http_service.py CARRIER_ROUTES): the same 403 as the tasks read. A coexisting gate, not trace's.
+        carrier = harness.request('POST', '/v1/agents', {'name': 'Carrier', 'working_directory': '/tmp/carrier',
+                                                         'projects': [pid], 'scopes': ['nudges']},
+                                  token=self.owner_token)
+        self.assertEqual(carrier.status, 201, carrier.data)
+        for route in ('trace', 'tasks'):
+            self.assertEqual(harness.request('GET', f'/v1/projects/{pid}/{route}',
+                                             token=carrier.data['credential']['secret']).status, 403, route)
+        absent = [get(outsider), get(elsewhere.data['credential']['secret']),
+                  get(people['viewer']['token'], project='no-such-project'), get(outsider, view='tokens')]
+        self.assertEqual({(r.status, r.data['error']['code'], r.data['error']['message']) for r in absent},
+                         {(404, 'not_found', 'Project not found')})
+        self.assertEqual(get(None).status, 401)
+        # The existing read rule decides, never trace: a caller reads the trace exactly when it reads the tasks.
+        for token in (people['nonmember_su']['token'], outsider, people['viewer']['token']):
+            tasks = harness.request('GET', f'/v1/projects/{pid}/tasks', token=token)
+            self.assertEqual(get(token).status, 200 if tasks.status == 200 else 404, tasks.status)
+        # Pages: the cursor is the caller's, for this query, at this generation.
+        viewer = people['viewer']['token']
+        first = get(viewer, view='tokens', limit='3')
+        self.assertEqual((first.status, len(first.data['rows'])), (200, 3), first.data)
+        second = get(viewer, view='tokens', limit='3', cursor=first.data['next_cursor'])
+        self.assertEqual(second.status, 200, second.data)
+        self.assertEqual([row['pointer'] for row in first.data['rows'] + second.data['rows']],
+                         [row['pointer'] for row in tokens['rows']][:6])
+        for token, query in ((people['contrib']['token'], {'view': 'tokens', 'limit': '3'}),
+                             (viewer, {'view': 'tasks', 'limit': '3'})):
+            stolen = get(token, cursor=first.data['next_cursor'], **query)
+            self.assertEqual(stolen.status, 409, stolen.data)
+        made = harness.request('POST', f'/v1/projects/{pid}/tasks', {'title': 'A later task',
+                                                                     'description': 'Cites req:LATER now'},
+                               token=people['coord1']['token'])
+        self.assertEqual(made.status, 201, made.data)
+        # No answer is kept across requests or callers: the next read of anyone sees the write.
+        for name in ('viewer', 'coord1'):
+            self.assertEqual(get(people[name]['token'], view='tokens').data['total'], 8, name)
+        stale = get(viewer, view='tokens', limit='3', cursor=first.data['next_cursor'])
+        self.assertEqual(stale.status, 409, stale.data)
+        self.assertIn('The project changed since this page was read', stale.data['error']['message'])
+        # A credential whose issuer has left the project: the tasks read says 403 (http_authority.py
+        # credential_capabilities); trace answers the one 404, like every caller who may not read the project.
+        agent_secret = people['coord1_agent']['token']
+        self.assertEqual(get(agent_secret).status, 200)
+        removed = harness.request('DELETE', f'/v1/projects/{pid}/members/' + people['coord1']['uid'],
+                                  token=self.owner_token)
+        self.assertIn(removed.status, (200, 204), removed.data)
+        self.assertEqual(harness.request('GET', f'/v1/projects/{pid}/tasks', token=agent_secret).status, 403)
+        left = get(agent_secret)
+        self.assertEqual((left.status, left.data['error']['message']), (404, 'Project not found'))
+        # Bounds and the query's shape.
+        for query in ({'view': 'everything'}, {'view': 'tokens', 'limit': '51'}, {'view': 'tokens', 'sort': 'x'},
+                      {'view': 'round', 'scope': 'Not A Scope'}):
+            refused = get(viewer, **query)
+            self.assertEqual(refused.status, 422, (query, refused.data))
+        # Review note 7: the route refuses what the endpoint refuses, with its sentence.
+        for scope in ('a.', 'a..b', '.a'):
+            refused = get(viewer, view='round', scope=scope)
+            self.assertEqual(refused.status, 422, (scope, refused.data))
+            self.assertTrue(refused.data['error']['message'].startswith('trace VIEW'), refused.data)
+        # The route refuses an over-long page itself, before the endpoint is asked.
+        self.assertEqual(get(viewer, view='tokens', limit='51').data['error']['message'],
+                         'limit must be between 1 and 50')
+        # Review b2: the reviewer's shape, 10 tasks of 1,000 distinct req: tokens, through the route (it took
+        # 8.4-8.9 s per read before; now one ledger validation per answer and 200 distinct tokens checked per source).
+        import time
+        for number in range(10):
+            planted = harness.request('POST', f'/v1/projects/{pid}/tasks',
+                                      {'title': 'Planted %d' % number,
+                                       'description': ' '.join('req:R01@%d' % (number * 1000 + k + 1)
+                                                               for k in range(1000))},
+                                      token=self.owner_token)
+            self.assertEqual(planted.status, 201, planted.data)
+        started = time.perf_counter()
+        heavy = get(viewer, view='tokens')
+        elapsed = time.perf_counter() - started
+        self.assertEqual(heavy.status, 200, heavy.data)
+        self.assertIn('sources carry more than 200 distinct tokens', heavy.data['coverage']['text'])
+        self.assertLess(elapsed, 5.0)
+        # Review r2 note 7: a full page with its cursor still fits the 64 KiB cap on the wire.
+        self.assertIsNotNone(heavy.data['next_cursor'])
+        self.assertLessEqual(len(json.dumps(heavy.data, ensure_ascii=False).encode('utf-8')), 64 * 1024)
+        summary = get(viewer)
+        self.assertEqual(summary.status, 200, summary.data)
+        self.assertEqual([line['view'] for line in summary.data['rows']],
+                         ['requirements', 'tokens', 'tasks', 'decisions', 'designs', 'round'])
+        self.assertTrue(summary.data['designs'])
 
     def _setup_actors(self, harness):
         owner = self.owner_token
@@ -1344,6 +1635,440 @@ class _RecordsScenarioMixin:
         self.assertEqual(c_ver_ok.status, 200, c_ver_ok.data)
         self.assertEqual(c_ver_ok.data['proposer'], people['coord2']['uid'])
 
+    def run_viewer_may_accept_suite(self):
+        """The ONE server field gating 'Review & accept' (kittrial-5bb.420 r2, review b1/b2).
+
+        The page must never combine flags itself: it shows 'Review & accept' only
+        when the waiting item's ``viewer_may_accept`` is true, else 'View'. The
+        field is the shared ``record_acceptance.decide`` predicate, the SAME rule
+        the accept route enforces through endpoint.py ``party_check`` and
+        ``delegation_check`` (kind-specific: a references-only delegation never
+        admits a capability draft; an accepted row with nothing waiting refuses
+        with 'Nothing waits to be accepted'), never a copy; the accept route
+        still enforces on its own. An owner, a person coordinator, a contributor,
+        a viewer, an agent with and without a delegation, and an own draft each
+        get the right button, and a forced accept the page did not offer is still
+        refused. Dates are derived from now (no hard-coded clock comparisons).
+        """
+        import datetime
+        harness = self.harness
+        people = self._setup_actors(harness)
+        coord1 = people['coord1']['token']
+        coord2 = people['coord2']['token']
+        contrib = people['contrib']['token']
+        viewer = people['viewer']['token']
+        agent1 = people['coord1_agent']
+        agent3 = people['coord2_agent']
+        pid = self.pid
+        for ag in (agent1, agent3):
+            g = harness.request('PUT', f'/v1/projects/{pid}/agents/{ag["id"]}/coordinator', {}, token=self.owner_token)
+            self.assertEqual(g.status, 200, g.data)
+        today = datetime.date.today().isoformat()
+
+        def attested_body(key, title):
+            body = _valid_ref_propose(key, title=title)
+            body['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
+                                 'observed': today, 'how': 'Checked the live board before proposing.'}
+            # An attestation must be reviewed within 6 months of observed; _review_by() is a year out.
+            body['review_by'] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=90)).isoformat()
+            return body
+
+        # An other-party draft: coord1 proposes, everyone reads the waiting item.
+        prop = harness.request('POST', f'/v1/projects/{pid}/references',
+                               attested_body('viewer.gate-ref', title='Viewer Gate Ref'),
+                               token=coord1, key='viewer-gate-propose')
+        self.assertEqual(prop.status, 201, prop.data)
+        seen = {}
+        for label, tok in (('owner', self.owner_token), ('person-coordinator', coord1),
+                           ('contributor', contrib), ('viewer', viewer),
+                           ('agent-no-delegation', agent3['token'])):
+            wait = harness.request('GET', f'/v1/projects/{pid}/references?waiting=true', token=tok)
+            self.assertEqual(wait.status, 200, wait.data)
+            (item,) = [i for i in wait.data['items'] if i['key'] == 'viewer.gate-ref']
+            seen[label] = (item.get('viewer_may_accept'), item.get('viewer_may_accept_reason'))
+            # The waiting item carries the draft's authority (kittrial-5bb.420 item 3).
+            self.assertEqual((item.get('proposed_authority') or {}).get('type'), 'attestation', label)
+            self.assertEqual((item.get('authority') or {}).get('type'), 'attestation', label)
+        # Owner and person coordinator may act on an other-party draft; a
+        # contributor and a viewer may not; an agent without a delegation may not.
+        self.assertTrue(seen['owner'][0], seen)
+        self.assertTrue(seen['person-coordinator'][0], seen)
+        self.assertFalse(seen['contributor'][0], seen)
+        self.assertFalse(seen['viewer'][0], seen)
+        self.assertFalse(seen['agent-no-delegation'][0], seen)
+        self.assertIn('delegation', seen['agent-no-delegation'][1], seen)
+        # A forced accept the page did not offer is still refused (viewer, contributor).
+        for label, tok in (('viewer', viewer), ('contributor', contrib)):
+            forced = harness.request(
+                'POST', f'/v1/projects/{pid}/references/viewer.gate-ref/accept',
+                {'expected_revision': 1, 'record_sha256': prop.data['sha256'],
+                 'evidence': 'Forced accept the page did not offer.'},
+                token=tok, key='viewer-gate-forced-' + label)
+            self.assertEqual(forced.status, 403, (label, forced.data))
+        # The owner's agent with a live delegation may act.
+        delegation = self._delegate(harness, title='Viewer gate delegation')
+        wait = harness.request('GET', f'/v1/projects/{pid}/references?waiting=true', token=agent1['token'])
+        (mine,) = [i for i in wait.data['items'] if i['key'] == 'viewer.gate-ref']
+        self.assertTrue(mine.get('viewer_may_accept'), mine)
+        # An own draft is never the reader's to accept, even with a delegation.
+        own = harness.request('POST', f'/v1/projects/{pid}/references',
+                              attested_body('viewer.own-ref', title='Viewer Own Ref'),
+                              token=agent1['token'], key='viewer-gate-own-propose')
+        self.assertEqual(own.status, 201, own.data)
+        own_view = harness.request('GET', f'/v1/projects/{pid}/references/viewer.own-ref', token=agent1['token'])
+        self.assertFalse(own_view.data['viewer_may_accept'], own_view.data)
+        r = harness.request(
+            'POST', f'/v1/projects/{pid}/references/viewer.own-ref/accept',
+            {'expected_revision': 1, 'record_sha256': own.data['sha256'],
+             'evidence': 'An agent never accepts its own draft.', 'decision_id': delegation},
+            token=agent1['token'], key='viewer-gate-own-accept-fail')
+        self.assertEqual(r.status, 403, r.data)
+        # The owner's own person draft is gated the same way (self_accept_blocked).
+        own_person = harness.request('POST', f'/v1/projects/{pid}/references',
+                                     attested_body('viewer.owner-own', title='Viewer Owner Own'),
+                                     token=self.owner_token, key='viewer-gate-owner-own-propose')
+        self.assertEqual(own_person.status, 201, own_person.data)
+        with harness.service.store.lock:
+            harness.service.approval_by_another_party = True
+            harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = True
+            harness.service.store.save()
+        try:
+            blocked = harness.request('GET', f'/v1/projects/{pid}/references/viewer.owner-own',
+                                      token=self.owner_token)
+            self.assertFalse(blocked.data['viewer_may_accept'], blocked.data)
+        finally:
+            with harness.service.store.lock:
+                harness.service.approval_by_another_party = False
+                harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = False
+                harness.service.store.save()
+
+    def run_shared_predicate_rows_suite(self):
+        """Field/route agreement matrix (kittrial-5bb.420 r3): probe rows below."""
+        import record_acceptance
+        harness = self.harness
+        people = self._setup_actors(harness)
+        agent1 = people['coord1_agent']
+        agent3 = people['coord2_agent']
+        pid = self.pid
+        for ag in (agent1, agent3):
+            g = harness.request('PUT', f'/v1/projects/{pid}/agents/{ag["id"]}/coordinator', {}, token=self.owner_token)
+            self.assertEqual(g.status, 200, g.data)
+        cap_sha = self._setup_probe_drafts(harness, people)
+        narrow = self._delegate(harness, title='Probe references-only delegation',
+                                scope=('references',))
+        by_other = cap_sha
+        ref_decide = record_acceptance.decide(
+            can_coordinate=True, approval_by_another_party=False, waiting=True,
+            by_agent=True, agent_head='probe-agent', delegation_covers_kind=True,
+            caller_parties={'probe-agent'}, draft_parties={'someone-else'},
+            own_draft=False, own_party=False)
+        cap_decide = record_acceptance.decide(
+            can_coordinate=True, approval_by_another_party=False, waiting=True,
+            by_agent=True, agent_head='probe-agent', delegation_covers_kind=False,
+            delegation_refused=True,
+            caller_parties={'probe-agent'}, draft_parties={'someone-else'},
+            own_draft=False, own_party=False)
+        self.assertEqual(ref_decide, (True, ''))
+        self.assertEqual(cap_decide[0], False)
+        self.assertIn('delegation', cap_decide[1])
+        refused = harness.request(
+            'POST', f'/v1/projects/{pid}/capabilities/probe.narrow-cap2/accept',
+            {'expected_revision': 1, 'record_sha256': by_other,
+             'evidence': 'Probe narrowed scope refuses capability.', 'decision_id': narrow},
+            token=agent1['token'], key='probe-narrow-cap2-accept')
+        self.assertEqual(refused.status, 403, refused.data)
+        self.assertIn('covers references, not capabilities', refused.data['error']['message'])
+        ref_row = harness.request('POST', f'/v1/projects/{pid}/references',
+                                  _valid_ref_propose('probe.narrow-ref3', title='Probe Narrow Ref3'),
+                                  token=people['coord2']['token'], key='probe-narrow-ref3-propose')
+        self.assertEqual(ref_row.status, 201, ref_row.data)
+        ref_field = harness.request('GET', f'/v1/projects/{pid}/references/probe.narrow-ref3',
+                                    token=agent1['token'])
+        self.assertEqual(ref_field.status, 200, ref_field.data)
+        cap_field = harness.request('GET', f'/v1/projects/{pid}/capabilities/probe.narrow-cap2',
+                                    token=agent1['token'])
+        self.assertEqual(cap_field.status, 200, cap_field.data)
+        self.assertTrue(ref_field.data['viewer_may_accept'], ref_field.data)
+        self.assertFalse(cap_field.data['viewer_may_accept'], cap_field.data)
+        ref_ok = harness.request(
+            'POST', f'/v1/projects/{pid}/references/probe.narrow-ref3/accept',
+            {'expected_revision': 1, 'record_sha256': ref_row.data['sha256'],
+             'evidence': 'Probe narrowed scope admits reference.', 'decision_id': narrow},
+            token=agent1['token'], key='probe-narrow-ref3-accept')
+        self.assertEqual(ref_ok.status, 200, ref_ok.data)
+        own_ref = harness.request('POST', f'/v1/projects/{pid}/references',
+                                  _valid_ref_propose('probe.own-ref4', title='Probe Own Ref4'),
+                                  token=agent1['token'], key='probe-own-ref4-propose')
+        self.assertEqual(own_ref.status, 201, own_ref.data)
+        with harness.service.store.lock:
+            harness.service.approval_by_another_party = True
+            harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = True
+            harness.service.store.save()
+        try:
+            own_field = harness.request('GET', f'/v1/projects/{pid}/references/probe.own-ref4',
+                                        token=agent1['token'])
+            self.assertEqual(own_field.status, 200, own_field.data)
+            self.assertFalse(own_field.data['viewer_may_accept'], own_field.data)
+            self.assertIn('never accepts or verifies a draft it wrote itself',
+                          own_field.data['viewer_may_accept_reason'], own_field.data)
+            own_route = harness.request(
+                'POST', f'/v1/projects/{pid}/references/probe.own-ref4/accept',
+                {'expected_revision': 1, 'record_sha256': own_ref.data['sha256'],
+                 'evidence': 'Probe own draft stays own-draft.', 'decision_id': narrow},
+                token=agent1['token'], key='probe-own-ref4-accept')
+            self.assertEqual(own_route.status, 403, own_route.data)
+            self.assertIn('never accepts or verifies a draft it wrote itself',
+                          own_route.data['error']['message'])
+            self.assertEqual(
+                record_acceptance.decide(
+                    can_coordinate=True, approval_by_another_party=True, waiting=True,
+                    by_agent=True, agent_head=agent1['actor'].split('/')[0],
+                    delegation_covers_kind=True,
+                    caller_parties={'coord1'}, draft_parties={'coord1'},
+                    own_draft=True, own_party=True),
+                (False, 'An agent never accepts or verifies a draft it wrote itself, '
+                        'whatever its delegation says.'))
+        finally:
+            with harness.service.store.lock:
+                harness.service.approval_by_another_party = False
+                harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = False
+                harness.service.store.save()
+        # A delegation naming one agent admits it and refuses another, named
+        # on the route (the field cannot name a decision).
+        solo = self._delegate(harness, title='Probe single-agent delegation',
+                              grantee=agent3['id'], key='probe-solo-delegation')
+        solo_ref = harness.request('POST', f'/v1/projects/{pid}/references',
+                                   _valid_ref_propose('probe.solo-ref5', title='Probe Solo Ref5'),
+                                   token=people['coord1']['token'], key='probe-solo-ref5-propose')
+        self.assertEqual(solo_ref.status, 201, solo_ref.data)
+        solo_no = harness.request(
+            'POST', f'/v1/projects/{pid}/references/probe.solo-ref5/accept',
+            {'expected_revision': 1, 'record_sha256': solo_ref.data['sha256'],
+             'evidence': 'Probe single-agent grant refuses other agent.', 'decision_id': solo},
+            token=agent1['token'], key='probe-solo-ref5-noaccept')
+        self.assertEqual(solo_no.status, 403, solo_no.data)
+        self.assertIn('granted to', solo_no.data['error']['message'], solo_no.data)
+        solo_yes = harness.request(
+            'POST', f'/v1/projects/{pid}/references/probe.solo-ref5/accept',
+            {'expected_revision': 1, 'record_sha256': solo_ref.data['sha256'],
+             'evidence': 'Probe single-agent grant admits named agent.', 'decision_id': solo},
+            token=agent3['token'], key='probe-solo-ref5-yesaccept')
+        self.assertEqual(solo_yes.status, 200, solo_yes.data)
+
+    def _setup_probe_drafts(self, harness, people):
+        import datetime
+        today = datetime.date.today().isoformat()
+        other_ref = _valid_ref_propose('probe.narrow-ref2', title='Probe Narrow Ref2')
+        other_ref['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
+                                  'observed': today, 'how': 'Checked the live board before proposing.'}
+        other_ref['review_by'] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=90)).isoformat()
+        made = harness.request('POST', f'/v1/projects/{self.pid}/references', other_ref,
+                               token=people['coord2']['token'], key='probe-narrow-ref2-propose')
+        self.assertEqual(made.status, 201, made.data)
+        other_cap_body = _valid_cap_propose('probe.narrow-cap2', name='Probe Narrow Cap2')
+        other_cap_body['aliases'] = ['probe.narrow.cap2']
+        other_cap = harness.request('POST', f'/v1/projects/{self.pid}/capabilities', other_cap_body,
+                                    token=people['coord2']['token'], key='probe-narrow-cap2-propose')
+        self.assertEqual(other_cap.status, 201, other_cap.data)
+        return other_cap.data['sha256']
+
+    def run_nothing_waits_suite(self):
+        """Review b2: an accepted row with nothing waiting refuses with a reason.
+
+        A record with no waiting draft answers ``viewer_may_accept`` false with
+        'Nothing waits to be accepted.' (``record_acceptance.NOTHING_WAITING_REASON``),
+        so the accepted panel never offers 'Review & accept' for it (a second
+        accept would answer 409). The waiting rows keep their own gate.
+        """
+        harness = self.harness
+        people = self._setup_actors(harness)
+        coord1 = people['coord1']['token']
+        pid = self.pid
+        prop = harness.request('POST', f'/v1/projects/{pid}/references',
+                               _valid_ref_propose('probe.settled-ref', title='Probe Settled Ref'),
+                               token=coord1, key='probe-settled-propose')
+        self.assertEqual(prop.status, 201, prop.data)
+        acc = harness.request(
+            'POST', f'/v1/projects/{pid}/references/probe.settled-ref/accept',
+            {'expected_revision': 1, 'record_sha256': prop.data['sha256'],
+             'evidence': 'Probe settles the draft.'},
+            token=coord1, key='probe-settled-accept')
+        self.assertEqual(acc.status, 200, acc.data)
+        view = harness.request('GET', f'/v1/projects/{pid}/references/probe.settled-ref', token=coord1)
+        self.assertEqual(view.status, 200, view.data)
+        self.assertFalse(view.data['viewer_may_accept'], view.data)
+        self.assertEqual(view.data['viewer_may_accept_reason'], 'Nothing waits to be accepted.')
+        listed = harness.request('GET', f'/v1/projects/{pid}/references', token=coord1)
+        (item,) = [i for i in listed.data['items'] if i['key'] == 'probe.settled-ref']
+        self.assertFalse(item.get('viewer_may_accept'), item)
+        self.assertEqual(item.get('viewer_may_accept_reason'), 'Nothing waits to be accepted.')
+    def run_independent_approval_session_owners_suite(self):
+        """Review t1 (r4): deployment independent_approval on, owners map decides.
+
+        No earlier suite ran with deployment independent_approval on, so a
+        mutant dropping independent_hold (record_acceptance.py) survives. The
+        ROUTE enforces it (endpoint.py reads .sessions.json owners and passes
+        same_session_owner): same principal -> 403 + field false; different
+        principals -> 200 + field true. Dates derive from now.
+        """
+        import datetime
+        harness = self.harness
+        people = self._setup_actors(harness)
+        agent1 = people['coord1_agent']
+        pid = self.pid
+        for ag in (agent1, people['coord1_agent2'], people['coord2_agent']):
+            g = harness.request('PUT', f'/v1/projects/{pid}/agents/{ag["id"]}/coordinator', {},
+                                token=self.owner_token)
+            self.assertEqual(g.status, 200, g.data)
+        today = datetime.date.today().isoformat()
+        delegation = self._delegate(harness, title='Independent approval session-owners delegation')
+        # coord2 proposes: a DIFFERENT party from agent1's owner (coord1), so
+        # only the session-owner sameness (independent_hold) can refuse. If
+        # coord1 proposed, own_party would refuse anyway and a mutant dropping
+        # independent_hold would survive.
+        body = _valid_ref_propose('indep.shared-ref', title='Independent Shared Ref')
+        body['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
+                             'observed': today, 'how': 'Checked the live board before proposing.'}
+        body['review_by'] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=90)).isoformat()
+        shared = harness.request('POST', f'/v1/projects/{pid}/references', body,
+                                 token=people['coord2']['token'], key='indep-shared-propose')
+        self.assertEqual(shared.status, 201, shared.data)
+        import admin as _admin
+        from pathlib import Path as _Path
+        project_dir = _admin.project_dir(_Path(harness.backend.root), pid)
+        registry = project_dir / '.sessions.json'
+        before = registry.read_text(encoding='utf-8') if registry.exists() else None
+        try:
+            registry.write_text(json.dumps({'schema_version': 1, 'records': {},
+                                            'owners': {agent1['actor']: 'person:shared',
+                                                       shared.data['proposer']: 'person:shared'}}),
+                                encoding='utf-8')
+            view = harness.request('GET', f'/v1/projects/{pid}/references/indep.shared-ref',
+                                   token=agent1['token'])
+            self.assertEqual(view.status, 200, view.data)
+            self.assertFalse(view.data['viewer_may_accept'], view.data)
+            refused = harness.request(
+                'POST', f'/v1/projects/{pid}/references/indep.shared-ref/accept',
+                {'expected_revision': 1, 'record_sha256': shared.data['sha256'],
+                 'evidence': 'Same-principal accept refused.', 'decision_id': delegation},
+                token=agent1['token'], key='indep-shared-accept')
+            self.assertEqual(refused.status, 403, refused.data)
+            self.assertIn('approval by another party', refused.data['error']['message'])
+        finally:
+            if before is None:
+                try:
+                    registry.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                registry.write_text(before, encoding='utf-8')
+        body2 = _valid_ref_propose('indep.split-ref', title='Independent Split Ref')
+        body2['authority'] = {'type': 'attestation', 'basis': 'host-check', 'by': 'person:maintainer',
+                              'observed': today, 'how': 'Checked the live board before proposing.'}
+        body2['review_by'] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=90)).isoformat()
+        split = harness.request('POST', f'/v1/projects/{pid}/references', body2,
+                                token=people['coord2']['token'], key='indep-split-propose')
+        self.assertEqual(split.status, 201, split.data)
+        before = registry.read_text(encoding='utf-8') if registry.exists() else None
+        try:
+            registry.write_text(json.dumps({'schema_version': 1, 'records': {},
+                                            'owners': {agent1['actor']: 'person:agent-side',
+                                                       split.data['proposer']: 'person:draft-side'}}),
+                                encoding='utf-8')
+            view = harness.request('GET', f'/v1/projects/{pid}/references/indep.split-ref',
+                                   token=agent1['token'])
+            self.assertEqual(view.status, 200, view.data)
+            self.assertTrue(view.data['viewer_may_accept'], view.data)
+            admitted = harness.request(
+                'POST', f'/v1/projects/{pid}/references/indep.split-ref/accept',
+                {'expected_revision': 1, 'record_sha256': split.data['sha256'],
+                 'evidence': 'Different-principal accept admitted.', 'decision_id': delegation},
+                token=agent1['token'], key='indep-split-accept')
+            self.assertEqual(admitted.status, 200, admitted.data)
+        finally:
+            if before is None:
+                try:
+                    registry.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                registry.write_text(before, encoding='utf-8')
+        # b1 (review round 5): indep.shared-ref stays waiting (independent_hold
+        # refused its same-party accept); indep.split-ref was accepted, so it
+        # leaves the waiting queue. The suite now runs on its own project (see
+        # NativeIndependentApprovalTests), where nothing else asserts.
+        not_waiting = harness.request(
+            'GET', f'/v1/projects/{pid}/references?waiting=true', token=people['coord1']['token'])
+        self.assertEqual(not_waiting.status, 200, not_waiting.data)
+        self.assertEqual([item['key'] for item in not_waiting.data['items']],
+                         ['indep.shared-ref'], not_waiting.data)
+
+    def run_settings_seen_alone_suite(self):
+        """Review t2 (r4): settings_seen WITHOUT the service flag (and reverse).
+
+        Every earlier suite sets them together, so a mutant dropping
+        settings_seen from the field survives. Each source rides alone, on a
+        person coordinator's own draft and on an agent's own-party draft (with
+        a delegation): field and route agree in all four corners, quiet when
+        both are off.
+        """
+        harness = self.harness
+        people = self._setup_actors(harness)
+        coord1 = people['coord1']['token']
+        agent1 = people['coord1_agent']
+        pid = self.pid
+        for ag in (agent1, people['coord2_agent']):
+            g = harness.request('PUT', f'/v1/projects/{pid}/agents/{ag["id"]}/coordinator', {},
+                                token=self.owner_token)
+            self.assertEqual(g.status, 200, g.data)
+        delegation = self._delegate(harness, title='Settings-seen alone delegation')
+        own_ref = harness.request('POST', f'/v1/projects/{pid}/references',
+                                  _valid_ref_propose('seen.person-ref', title='Seen Person Ref'),
+                                  token=coord1, key='seen-person-propose')
+        self.assertEqual(own_ref.status, 201, own_ref.data)
+        own_body = _valid_ref_propose('seen.agent-ref', title='Seen Agent Ref')
+        own_ag = harness.request('POST', f'/v1/projects/{pid}/references', own_body,
+                                 token=people['coord1']['token'], key='seen-agent-propose')
+        self.assertEqual(own_ag.status, 201, own_ag.data)
+        cases = [('service-only', True, False), ('seen-only', False, True)]
+        for label, service_flag, seen_flag in cases:
+            with harness.service.store.lock:
+                harness.service.approval_by_another_party = service_flag
+                harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = seen_flag
+                harness.service.store.save()
+            try:
+                person_view = harness.request(
+                    'GET', f'/v1/projects/{pid}/references/seen.person-ref', token=coord1)
+                self.assertEqual(person_view.status, 200, (label, person_view.data))
+                self.assertFalse(person_view.data['viewer_may_accept'], (label, person_view.data))
+                person_refused = harness.request(
+                    'POST', f'/v1/projects/{pid}/references/seen.person-ref/accept',
+                    {'expected_revision': 1, 'record_sha256': own_ref.data['sha256'],
+                     'evidence': 'Own draft refused under %s.' % label},
+                    token=coord1, key='seen-person-refuse-' + label)
+                self.assertEqual(person_refused.status, 403, (label, person_refused.data))
+                agent_view = harness.request(
+                    'GET', f'/v1/projects/{pid}/references/seen.agent-ref', token=agent1['token'])
+                self.assertEqual(agent_view.status, 200, (label, agent_view.data))
+                self.assertFalse(agent_view.data['viewer_may_accept'], (label, agent_view.data))
+                agent_refused = harness.request(
+                    'POST', f'/v1/projects/{pid}/references/seen.agent-ref/accept',
+                    {'expected_revision': 1, 'record_sha256': own_ag.data['sha256'],
+                     'evidence': 'Own-party draft refused under %s.' % label,
+                     'decision_id': delegation},
+                    token=agent1['token'], key='seen-agent-refuse-' + label)
+                self.assertEqual(agent_refused.status, 403, (label, agent_refused.data))
+                self.assertIn('approval by another party', agent_refused.data['error']['message'], label)
+            finally:
+                with harness.service.store.lock:
+                    harness.service.approval_by_another_party = False
+                    harness.service.state.setdefault('settings_seen', {})['approval_by_another_party'] = False
+                    harness.service.store.save()
+        quiet_view = harness.request('GET', f'/v1/projects/{pid}/references/seen.person-ref', token=coord1)
+        self.assertEqual(quiet_view.status, 200, quiet_view.data)
+        self.assertTrue(quiet_view.data['viewer_may_accept'], quiet_view.data)
+
+
 
 @unittest.skipUnless(os.name == 'nt', 'POSIX runs NativeWebRecordsTests against real endpoint.py and real bd')
 class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
@@ -1381,6 +2106,24 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
     def test_delegated_record_acceptance(self):
         self.run_delegation_suite()
 
+    def test_design_document_upload_and_its_body_limits(self):
+        self.run_design_document_suite()
+
+    def test_trace_read_over_http(self):
+        self.run_trace_suite()
+
+    def test_viewer_may_accept_gate(self):
+        self.run_viewer_may_accept_suite()
+
+    def test_shared_predicate_probe_rows(self):
+        self.run_shared_predicate_rows_suite()
+
+    def test_nothing_waits_gate(self):
+        self.run_nothing_waits_suite()
+
+    def test_settings_seen_alone(self):
+        self.run_settings_seen_alone_suite()
+
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
@@ -1412,6 +2155,66 @@ class NativeWebRecordsTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
     def test_native_self_acceptance_and_approval_by_another_party(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
         self.run_self_acceptance_and_party_rules_suite()
+
+    def test_native_design_document_upload_and_its_body_limits(self):
+        self.deployment(operators=['ops'], coordinator_writes=True)
+        self.run_design_document_suite()
+
+    def test_native_trace_read_over_http(self):
+        self.deployment(operators=['ops'], coordinator_writes=True)
+        self.run_trace_suite()
+
+    def test_native_viewer_may_accept_gate(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_viewer_may_accept_suite()
+
+    def test_native_shared_predicate_probe_rows(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_shared_predicate_rows_suite()
+
+    def test_native_settings_seen_alone(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_settings_seen_alone_suite()
+
+    def test_native_nothing_waits_gate(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_nothing_waits_suite()
+
+
+
+@unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
+class NativeIndependentApprovalTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCase):
+    """Independent-approval session-owners suite on a project of its own.
+
+    b1 (review round 5): run_independent_approval_session_owners_suite leaves
+    indep.shared-ref waiting and indep.split-ref accepted; on the shared class
+    project that broke the lifecycle suite's exact waiting list and its
+    find-corpus assertions. Like NativeDelegationTests, this runs on its own
+    project so its drafts meet no other suite's assertions.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pid = 'pp'
+        root = self.root
+
+        class Harness(fixes.Harness):
+            def make_backend(h):
+                return http_service.EndpointBackend(
+                    sys.executable, str(KIT / 'endpoint.py'), str(root), service=h.service)
+
+        self.harness = Harness(methodName='runTest')
+        self.harness.setUp()
+        self.addCleanup(self.harness._stop_server)
+        self.owner_token = self.harness.admin_token()
+        reg = self.harness.request('POST', '/v1/projects', {'project_id': self.pid, 'name': 'Native Independent Approval'},
+                                   token=self.owner_token)
+        self.assertEqual(reg.status, 201, reg.data)
+
+    def test_native_independent_approval_session_owners(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=True)
+        self.run_independent_approval_session_owners_suite()
 
 
 
@@ -1555,7 +2358,7 @@ class DeriveAttestedVsTrustedTests(unittest.TestCase):
 class WebRecordsScreenTests(unittest.TestCase):
     """Runs the Node DOM/screen test for web/js/views/records.js."""
 
-    def test_records_view_dom_flows(self):
+    def test_records_pages_show_breadcrumbs_and_dom_flows(self):
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not on PATH')
@@ -1563,6 +2366,12 @@ class WebRecordsScreenTests(unittest.TestCase):
         completed = subprocess.run(
             [node, str(script)], cwd=str(KIT), capture_output=True, text=True, encoding='utf-8', timeout=30)
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+
+class ReviewByFixtureTests(unittest.TestCase):
+    def test_review_by_is_one_year_after_the_utc_date(self):
+        with patch('time.gmtime', return_value=time.struct_time((2028, 10, 25, 12, 0, 0, 3, 299, 0))):
+            self.assertEqual(_review_by(), '2029-10-25')
 
 
 if __name__ == '__main__':

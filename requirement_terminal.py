@@ -12,7 +12,7 @@ import requirement_governance as governance
 import requirement_owner_records as owner
 import requirement_records as records
 from coordination import atomic, identifier
-from requirements import canonical_bytes, content_hash, load_json
+from requirements import canonical_bytes, content_hash
 
 JOURNAL = '.requirement-owner-requests'
 NATIVE_TIMEOUT = 120
@@ -109,7 +109,7 @@ def read_receipt(path):
     if path.is_symlink() or not path.is_file():
         raise ValueError('Unusable owner terminal receipt; ask the host operator to reconcile it')
     try:
-        return validate_receipt(load_json(path))
+        return validate_receipt(core.read_host_json(path))
     except (ValueError, OSError, TypeError, KeyError) as error:
         raise ValueError('Owner terminal receipt cannot be verified; ask the host operator to reconcile it') from error
 
@@ -519,7 +519,7 @@ def scan(project_path, project):
         try:
             if entry.is_symlink() or not entry.is_file():
                 raise ValueError('Unusable owner receipt')
-            saved = load_json(entry)
+            saved = core.read_host_json(entry)
             if not isinstance(saved, dict):
                 raise ValueError('Unusable owner receipt')
             if (saved.get('operation') not in ('withdraw', 'supersede')

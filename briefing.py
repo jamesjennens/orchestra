@@ -10,10 +10,20 @@ from activity import build_entries, parse_moment, utc_text
 from field_limits import check_text
 from claim_limit import actor_holds
 from lifecycle import project_facts
-from requirements import canonical_bytes, content_hash
+from requirements import _unique_object, canonical_bytes, content_hash
+
+
+def _read_history_snapshot(path):
+    from admin import read_regular_text
+    value = record_json.loads(read_regular_text(path), object_pairs_hook=_unique_object)
+    canonical_bytes(value)
+    return value
+
 
 PREFIX='Kind: task-checkpoint-v1\n'
 KINDS={'blocker','question','decision','correction','dependency'}
+GROUPING_ADVICE=('To fit the limit, group the items: one open item per theme with an id prefix, resolved ones folded into one entry, '
+ 'and a longer text in a repository document that an item source links')
 CHECKPOINT_ITEMS_MAX=100
 CHECKPOINT_TEXT_LIMIT=400
 #: The top-level text fields of a checkpoint and their limits; the validator and the
@@ -279,7 +289,9 @@ def checkpoint_problems(p,task):
         if field not in p:continue
         items=p[field]
         if not isinstance(items,list) or len(items)>CHECKPOINT_ITEMS_MAX:
-            problems.append('%s: expected a list of at most %d items' % (field,CHECKPOINT_ITEMS_MAX));continue
+            problems.append('%s: expected a list of at most %d items' % (field,CHECKPOINT_ITEMS_MAX))
+            if isinstance(items,list):problems.append(GROUPING_ADVICE)
+            continue
         ids=[]
         for index,item in enumerate(items):
             path='%s[%d]' % (field,index)
@@ -604,6 +616,7 @@ class ContextPointers:
         self.catalogs={}
         self.reviews={}
         self.requirements=None
+        self._ledgers={}
     def _load(self):
         # Pure prose and unchecked kinds never build a project-wide index.
         if self.rows is not None:
@@ -620,6 +633,31 @@ class ContextPointers:
             for comment in row.get('comments') or []:
                 if isinstance(comment,dict) and comment.get('id') is not None and not is_record_comment(comment.get('text',comment.get('body'))):
                     self.comments.setdefault(str(comment['id']),[]).append((row,comment))
+
+    def loaded(self):
+        """The caller-readable, project-scoped rows every resolution reads (kittrial-5bb.425: the trace read
+        counts only these, so hidden equals absent in its totals too)."""
+        self._load()
+        return self.rows
+
+    def requirement_keys(self):
+        """Every requirement key a readable row claims (kittrial-5bb.425, the trace read's requirements view)."""
+        self._load()
+        return sorted(self._requirement_index())
+
+    def ledger(self,key):
+        """A requirement's validated ledger (see `_ledger`), for a reader that needs its revisions too."""
+        self._load()
+        return self._ledger(key)
+
+    def requirement(self,key):
+        """`req:KEY` resolved for any key, including one the token grammar cannot spell (kittrial-5bb.425)."""
+        self._load()
+        entry={'pointer':'req:'+key,'kind':'req','state':'unavailable','trust':'data'}
+        label,_=self._requirement(entry,key,None)
+        if entry['state'] in ('live','superseded'):
+            entry['label']=clip_context_label(label)
+        return entry
 
     def _catalog(self,kind):
         if kind not in self.catalogs:
@@ -662,12 +700,18 @@ class ContextPointers:
         from requirement_governance import validate_evidence_files
         validate_evidence_files(self.governance,self.project,evidence)
 
-    def _requirement(self,entry,key,number):
-        """§2.4 `req`: flags unknown-key, unknown-revision, draft, superseded, withdrawn."""
+    def _ledger(self,key):
+        """One requirement's validated ledger, read once per resolver (kittrial-5bb.425 review b2: every token
+        of a key re-validated the whole ledger, so planted tokens cost a full validation each).
+
+        Returns 'unknown' (no single row claims the key), None (the ledger cannot be read), or
+        (row, revisions, accepted revision numbers, terminal owner state or None)."""
+        if key in self._ledgers:
+            return self._ledgers[key]
         rows=self._requirement_index().get(key,[])
         if len(rows)!=1:
-            entry['flags']=['unknown-key']
-            return None,None
+            self._ledgers[key]='unknown'
+            return 'unknown'
         row=rows[0]
         import requirement_records as records
         import requirement_owner_records as owner_records
@@ -687,8 +731,21 @@ class ContextPointers:
                 self._governed(terminal)
         except (ValueError,TypeError,KeyError):
             # The same failures the requirements read shows as unreadable: never promoted.
+            self._ledgers[key]=None
+            return None
+        self._ledgers[key]=(row,revisions,accepted,terminal)
+        return self._ledgers[key]
+
+    def _requirement(self,entry,key,number):
+        """§2.4 `req`: flags unknown-key, unknown-revision, draft, superseded, withdrawn."""
+        ledger=self._ledger(key)
+        if ledger=='unknown':
+            entry['flags']=['unknown-key']
+            return None,None
+        if ledger is None:
             entry['flags']=[]
             return None,None
+        row,revisions,accepted,terminal=ledger
         if number is None:
             number=accepted[-1] if accepted else max(revisions)
         elif number not in revisions:
@@ -708,9 +765,15 @@ class ContextPointers:
         return record.get('title'),'requirements get '+str(row['id'])
 
     def _design(self,entry,scope,section):
-        """§2.4 `design` before slice 3: unknown-scope or not-selected; the section unchecked."""
+        """§2.4 `design`: unknown-scope, not-selected, unknown-section.
+
+        The section is checked against the server-derived index of the revision shown (kittrial-5bb.418), read
+        from the loaded rows like every record: a heading with that anchor is `live`, none is the flag
+        `unknown-section`. A design entry with no single index (one written before documents were stored, or
+        two differing copies) leaves the section `unchecked`."""
         entry['flags']=['unknown-scope']
         label=follow=None
+        shown=None
         matches=self._catalog('ref').get('design.'+scope,[])
         if len(matches)==1 and matches[0].get('state') not in ('malformed','unsupported','conflicted','incomplete'):
             view=matches[0]
@@ -726,9 +789,22 @@ class ContextPointers:
             if record is not None:
                 label=record.get('name') or record.get('title') or 'design.'+scope
                 follow='ref get design.'+scope
+                shown=(view,record)
         if section is not None:
-            # Headings are checked against the server-held design index of slice 3.
             entry['section']={'anchor':section,'state':'unchecked'}
+            if shown is not None:
+                import design_documents
+                view,record=shown
+                authority=record.get('authority') or {}
+                if design_documents.is_document_authority(authority):
+                    row=next((item for item in self.rows if str(item.get('id'))==str(view.get('native_id'))),None)
+                    index=design_documents.selected_index(row,'design.'+scope,authority)
+                    if index is not None:
+                        if any(heading['anchor']==section for heading in index['headings']):
+                            entry['section']['state']='live'
+                        else:
+                            entry['section']['state']='unknown'
+                            entry['flags'].append('unknown-section')
         return label,follow
 
     def resolve(self,pointer):
@@ -930,7 +1006,27 @@ def checkpoint_snapshot(rows, row, state):
     return snapshot(rows, project, row['id'])
 
 
-def assignee_comment_pending(row, state=None, response=None, full=None, authority=None):
+def checkpoint_selection(full, state, index, comment, cache=None):
+    """Reuse selection only for the same request's snapshot and parsed history.
+
+    An assignee's earlier checkpoint and the current checkpoint have different
+    indexes. Identity checks prevent reuse across snapshots or new parses.
+    """
+    cid, payload = state['history'][index]
+    key = (str(cid), index)
+    found = cache.get(key) if cache is not None else None
+    if (found is not None and found[0] is full and found[1] is state['history']
+            and found[2] == (comment.get('author'), comment.get('created_at'))):
+        return found[3]
+    data = excluding_checkpoint(full, cid, comment.get('author'))
+    prov = retained_provenance(state, upto=index)
+    result = (data, prov, newer_selection(data, prov, comment.get('created_at')))
+    if cache is not None:
+        cache[key] = (full, state['history'], (comment.get('author'), comment.get('created_at')), result)
+    return result
+
+
+def assignee_comment_pending(row, state=None, response=None, full=None, authority=None, selection_cache=None):
     """Unconsumed comments for an open assignee, reusing checkpoint provenance.
 
     Review state does not decide whether a person has written to the assignee.
@@ -954,9 +1050,7 @@ def assignee_comment_pending(row, state=None, response=None, full=None, authorit
         if own:
             index, cid, payload = own[-1]
             comment = comments[str(cid)]
-            data = excluding_checkpoint(full, cid, comment.get('author'))
-            selected = newer_selection(data, retained_provenance(state, upto=index),
-                                       comment.get('created_at'))[1]
+            selected = checkpoint_selection(full, state, index, comment, selection_cache)[2][1]
         acknowledged = None
         if isinstance(response, dict) and same_activity_actor(response.get('author'), owner):
             acknowledged = row['id'] + '-c' + str(response['comment_id'])
@@ -1292,7 +1386,7 @@ def newer_selection(data,prov,checkpoint_timestamp):
     entries,fresh,changed_late,unverified=unincorporated(data,prov)
     return coverage,entries,fresh,changed_late,unverified
 
-def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off',field_changes=None,marker_fields=None):
+def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=None,direction_data=None,counted=True,directions_reason='switch-off',field_changes=None,marker_fields=None,selection=None):
     """Bounded, per-entry view of activity the current checkpoint did not incorporate.
 
     `prov` is the checkpoint's normalized provenance, so edited entries (same ID,
@@ -1303,7 +1397,8 @@ def newer_activity_summary(data,prov,checkpoint_timestamp,owner,direction_idx=No
     are tracked to an explicit acknowledged/resolved/superseded disposition; every
     collection is bounded with an explicit omitted count. Reading changes nothing.
     """
-    coverage,entries,fresh,changed_late,unverified=newer_selection(data,prov,checkpoint_timestamp)
+    coverage,entries,fresh,changed_late,unverified=(newer_selection(data,prov,checkpoint_timestamp)
+                                                 if selection is None else selection)
     own=[e for e in entries if same_activity_actor(e['author'],owner)]
     others=[e for e in entries if not same_activity_actor(e['author'],owner)]
     authors=sorted({e['author'] for e in others})
@@ -1426,7 +1521,11 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
     # two keys so a long chain does not grow past 6000 bytes.
     for entry in bounded_priors:
         entry['integration']=compact_integration(entry.get('integration'))
-    review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.',
+    # The open item ids and the respond record that answers them, in the work row's words
+    # (review_state.open_items_sentence, kittrial-5bb.431): a revision does not answer them.
+    from review_state import open_items_sentence, open_review_items
+    named_items=open_items_sentence(open_review_items(pending),task)
+    review_next={'changes-requested':'Address the outstanding review requests for the current contribution; read review '+task+'.'+(' '+named_items if named_items else ''),
                  'awaiting-review':'Reviewer: retrieve and verify the current contribution, then record a review request or approval.',
                  'awaiting-integration':'Authorized integrator: integrate the approved contribution and record scoped integration evidence.',
                  'held':'The contribution is held; read review '+task+' for the record.',
@@ -1653,18 +1752,26 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                        +['Newer activity also includes edits, deletions or changed task fields. Prose resolutions never silently clear explicit items.']
                        +[w for w in integration_warnings if w.startswith(RECONCILIATION_WARNING_PREFIX)]),
             'evidence':{'issue':'show '+task,'history':'history '+task,'checkpoint_entry':task+'-c'+str(c['id']) if c else None}}
-    if p is not None:
+    # kittrial-5bb.425 part 2: the task's own req: and design: tokens, resolved where the reader works (the
+    # task page, TRACEABILITY_DESIGN §5.2). Read first, so the description never loses its budget to items.
+    described=[x['pointer'] for x in parse_context_pointers(issue.get('description')) if x['kind'] in ('req','design')]
+    description=[{'id':'description','text':' '.join(described)}] if described else []
+    if p is not None or description:
         governance=None
         # Read the governance snapshot only for a `req:` token: every other brief reads
         # nothing new (TRACEABILITY_DESIGN §2.4; context index §2.1.2 "no new I/O").
-        if journal is not None and needs_requirement_governance((result['unresolved']['items'],'source'),
-                                                                (p['resolved'][:limit],'evidence')):
+        if journal is not None and needs_requirement_governance((result['unresolved']['items'] if p is not None else [],'source'),
+                                                                (p['resolved'][:limit] if p is not None else [],'evidence'),
+                                                                (description,'text')):
             import requirement_governance
             try:
                 governance=requirement_governance.snapshot(journal,project)
             except (ValueError,OSError):
                 governance=None
         pointers=ContextPointers(rows,project,operators,governance=governance)
+        if description:
+            result['description_pointers']=pointers.item_pointers(description,'text')['description']
+    if p is not None:
         result['unresolved']['pointer_items']=pointers.item_pointers(result['unresolved']['items'],'source')
         result['resolved']={'items':p['resolved'][:limit],
                             'pointer_items':pointers.item_pointers(p['resolved'][:limit],'evidence'),
@@ -2015,7 +2122,7 @@ def changes_since_checkpoint(data,prov,checkpoint,owner,fields=None,current=Fals
             'fields':list(fields or []),'fields_note':None if current else fields_note,
             'history':history,'note':note}
 
-def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None):
+def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None,selection_cache=None):
     """Bounded queue fields; share the brief's linked state and full-row snapshot.
 
     This is the ONE computation of the newer-activity fields (kittrial-5bb.354,
@@ -2053,9 +2160,10 @@ def checkpoint_queue_fields(rows,row,state=None,provenance_writes=True,full=None
         prov=retained_provenance(state);digest=fields_digest(row)
         newer=None
         if not cursor_matches(p['activity_cursor'],data):
+            selection = checkpoint_selection(full, state, len(state['history']) - 1, c, selection_cache)[2]
             newer=newer_activity_summary(data,prov,c.get('created_at'),
                                          context[0],dispositions,direction_data,counted,_directions_off_reason,
-                                         marker_fields=digest)
+                                         marker_fields=digest,selection=selection)
         fields=activity_fields(row,c,prov,digest,newer,
                                len(unresolved_directions(direction_data,dispositions,context[0],counted)),
                                data=full)
@@ -2783,7 +2891,7 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         file=cache/(digest+'.json')
         if file.is_symlink():raise ValueError('Invalid snapshot path')
         if not file.exists():raise ValueError('History snapshot unavailable/expired; restart history without a cursor')
-        saved=json.loads(file.read_text(encoding='utf-8'));data=saved['data']
+        saved=_read_history_snapshot(file);data=saved['data']
         if content_hash(data)!=digest:raise ValueError('History cache integrity mismatch')
     else:
         rows=exported_rows(run)
@@ -2822,7 +2930,7 @@ def execute(root,path,project,actor,action,args,attachments,run,operators=None,v
         if not file.exists():
             from coordination import atomic
             atomic(file,{'captured_at':datetime.now(timezone.utc).isoformat(),'data':data})
-        saved=json.loads(file.read_text(encoding='utf-8'))
+        saved=_read_history_snapshot(file)
     result=history_page(data,project,a.task,a.limit,a.since,a.cursor,a.body_budget,a.recent,a.kind,a.since_checkpoint,
                         actor=actor,since_my_checkpoint=a.since_my_checkpoint)
     result['captured_at']=saved['captured_at']
