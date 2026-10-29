@@ -74,6 +74,18 @@ export async function memberPicker(ctx, pid, data, choose) {
   return h('div', { class: 'toolbar' }, h('label', { for: 'handover-person' }, 'Hand over to'), select);
 }
 
+//: The server's limit on a hand-over note, in characters (http_auth.Service.HANDOVER_TEXT_MAX).
+export const NOTE_MAX = 8000;
+// A note's length as the server counts it: characters (code points), so an emoji is one, not two UTF-16 units.
+export function noteLength(text) {
+  return [...String(text)].length;
+}
+function countText(value) {
+  const n = noteLength(value);
+  return `${n.toLocaleString('en')} of ${NOTE_MAX.toLocaleString('en')} characters`
+    + (n > NOTE_MAX ? ': too long, the server will refuse it.' : '');
+}
+
 // The hand-over note (kittrial-5bb.443): a colleague's notes about the project, shown as text, never as markup.
 // Readers see the current version and the older ones by number; a writer (an owner or the current coordinator,
 // as the server says) writes a new version for the person shown; that person acknowledges the current one.
@@ -104,10 +116,13 @@ export async function notePanel(ctx, pid, data, redraw) {
     body.push(h('p', { class: 'muted' }, 'No hand-over note has been written in this project.'));
   }
   if (data.can_write_note) {
-    const text = h('textarea', { id: 'handover-note-text', rows: 8, maxlength: 8000,
+    // No maxlength: a textarea counts UTF-16 units, the server counts characters (review of kittrial-5bb.443, B2).
+    const text = h('textarea', { id: 'handover-note-text', rows: 8,
       'aria-label': `Hand-over note for ${data.person.name}` });
+    const count = h('p', { class: 'small muted', 'data-note-count': '' }, countText(''));
+    text.addEventListener('input', () => { count.textContent = countText(text.value); });
     body.push(h('div', { class: 'stack' },
-      h('label', { for: 'handover-note-text' }, `Write a new version for ${data.person.name}`), text,
+      h('label', { for: 'handover-note-text' }, `Write a new version for ${data.person.name}`), text, count,
       h('div', { class: 'toolbar' }, h('button', { type: 'button', onclick: async (e) => {
         await act(e.currentTarget, () => ctx.api.writeHandoverNote(pid, text.value, data.person.id),
           { success: 'Hand-over note saved' }).catch(() => null);

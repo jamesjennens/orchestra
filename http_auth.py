@@ -3485,9 +3485,13 @@ class Service:
         record = notes.get(project_id) if isinstance(notes, dict) else None
         if not isinstance(record, dict) or not isinstance(record.get('versions'), list):
             return None
+        # A version is kept only with every field a reader of it uses (the walkthrough, the pointer, the next
+        # action, the read and the acknowledgement), so no reader meets a half-valid one (review of
+        # kittrial-5bb.443, B1). The versions are the stored dicts themselves: an acknowledgement appends to one.
         good = [v for v in record['versions'] if isinstance(v, dict) and type(v.get('version')) is int
                 and isinstance(v.get('text'), str) and isinstance(v.get('for_person'), str)
-                and isinstance(v.get('written_by'), str) and isinstance(v.get('acknowledged'), list)]
+                and isinstance(v.get('written_by'), str) and isinstance(v.get('written_at'), str)
+                and isinstance(v.get('acknowledged'), list) and all(isinstance(a, dict) for a in v['acknowledged'])]
         return dict(record, versions=good) if good else None
 
     def _handover_current(self, project_id):
@@ -3586,6 +3590,26 @@ class Service:
             self.store.save()
             return self._handover_view(version), dropped_now
 
+    def _may_acknowledge(self, principal, project_id, person):
+        """Whether ``principal`` acknowledges a note for ``person``: that person by session, or their agent that has
+        the project and holds an effective coordinator grant here. The caller holds the store lock."""
+        if principal is None:
+            return False
+        if principal.via == 'credential':
+            agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
+            grant = self.coordinator_view(project_id, agent) if isinstance(agent, dict) else None
+            return (isinstance(agent, dict) and agent.get('owner') == person
+                    and project_id in (agent.get('projects') or []) and bool(grant and grant['effective']))
+        return principal.user_id == person
+
+    def may_acknowledge_handover_note(self, principal, project_id):
+        """Whether the current note waits for ``principal``'s acknowledgement: the walkthrough's flag, by the same
+        rule the acknowledge route applies (review of kittrial-5bb.443, B2), so the page never offers a refusal."""
+        with self.store.lock:
+            current = self._handover_current(project_id)
+            return (current is not None and not current['acknowledged']
+                    and self._may_acknowledge(principal, project_id, current['for_person']))
+
     def acknowledge_handover_note(self, principal, project_id, version):
         """Acknowledge the CURRENT version: by its person, or by their agent holding an effective grant here.
 
@@ -3599,15 +3623,7 @@ class Service:
             current = self._handover_current(project_id)
             if current is None:
                 raise not_found('There is no hand-over note in this project')
-            person = current['for_person']
-            if principal.via == 'credential':
-                agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
-                grant = self.coordinator_view(project_id, agent) if isinstance(agent, dict) else None
-                allowed = (isinstance(agent, dict) and agent.get('owner') == person
-                           and project_id in (agent.get('projects') or []) and bool(grant and grant['effective']))
-            else:
-                allowed = principal.user_id == person
-            if not allowed:
+            if not self._may_acknowledge(principal, project_id, current['for_person']):
                 raise forbidden('Only the person this hand-over note is for, or their agent holding the '
                                 'coordinator grant here, acknowledges it')
             if version != current['version']:

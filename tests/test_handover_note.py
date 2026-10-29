@@ -78,6 +78,12 @@ class WriteTests(NoteCase):
                              token=self.tokens['olive'], key='note-extra-1')
         self.assertEqual(422, extra.status, extra.data)
 
+    def test_the_limit_counts_characters_not_bytes(self):
+        # Review of kittrial-5bb.443, B2: 8,000 three-byte characters (24,000 bytes in UTF-8) are within it.
+        self.assertEqual(201, self.write(self.tokens['olive'], text='日' * 8000).status)
+        self.assertEqual(422, self.write(self.tokens['olive'], text='日' * 8001).status)
+        self.assertEqual(201, self.write(self.tokens['olive'], text='😀' * 8000).status)   # outside the BMP
+
     def test_a_key_is_required_and_a_replay_writes_nothing_more(self):
         missing = self.request('PUT', '/v1/projects/%s/handover/note' % self.project,
                                {'text': NOTE, 'for_person': self.ids['cora']}, token=self.tokens['olive'])
@@ -105,6 +111,22 @@ class WriteTests(NoteCase):
         self.assertEqual((read.data['note']['text'], read.data['note']['for_person_name']), (NOTE, 'cora'))
         self.assertEqual(self.read(None).status, 401)
 
+    def test_a_non_member_and_another_projects_member_get_the_projects_own_404(self):
+        # Review of kittrial-5bb.443, B2: the read's own project check answers them, as the project read does.
+        self.write(self.tokens['olive'])
+        self.create_account(self.admin, 'otto', 'otto-password-1')
+        outsider = self.login('otto', 'otto-password-1')[0]
+        self.create_account(self.admin, 'bea', 'bea-password-1')
+        other = self.login('bea', 'bea-password-1')[0]
+        beta = self.create_project(other, 'Beta')
+        self.assertEqual(200, self.request('GET', '/v1/projects/%s' % beta, token=other).status)
+        for token in (outsider, other):
+            usual = self.request('GET', '/v1/projects/%s' % self.project, token=token)
+            read = self.read(token)
+            self.assertEqual((usual.status, read.status), (404, 404))
+            self.assertEqual(usual.data['error'], read.data['error'])
+            self.assertNotIn('release branch', json.dumps(read.data))
+
 
 class AcknowledgeTests(NoteCase):
     def test_the_person_or_their_granted_agent_acknowledges_the_current_version_only(self):
@@ -127,6 +149,20 @@ class AcknowledgeTests(NoteCase):
         self.assertEqual(200, self.acknowledge(self.tokens['cora'], 1).status)
         self.write(self.tokens['olive'], 'second')
         self.assertEqual(self.read(self.tokens['carl']).data['note']['acknowledged'], [])
+
+    def test_the_pages_flag_follows_the_acknowledge_rule(self):
+        # Review of kittrial-5bb.443, B2: an agent without an effective grant is not offered what the route refuses.
+        def flag(token):
+            answer = self.request('GET', '/v1/projects/%s/handover' % self.project, token=token)
+            self.assertEqual(200, answer.status, answer.data)
+            return answer.data['can_acknowledge_note']
+        self.write(self.tokens['olive'])
+        self.assertEqual((flag(self.agent), self.acknowledge(self.agent, 1).status), (False, 403))
+        self.assertEqual(200, self.grant().status)
+        self.assertIs(flag(self.agent), True)
+        self.assertIs(flag(self.tokens['cora']), True)
+        self.assertEqual(200, self.acknowledge(self.agent, 1).status)
+        self.assertEqual((flag(self.agent), flag(self.tokens['cora'])), (False, False))   # nothing left to acknowledge
 
     def test_nothing_to_acknowledge_is_404(self):
         self.assertEqual(404, self.acknowledge(self.tokens['cora'], 1).status)
@@ -179,6 +215,28 @@ class WhereItShowsTests(NoteCase):
         self.assertEqual(steps(self.tokens['olive'], self.ids['cora'])['handover-note']['state'], 'todo')
 
 
+class DamagedVersionTests(NoteCase):
+    def test_a_version_missing_a_field_its_readers_use_reads_as_no_note(self):
+        # Review of kittrial-5bb.443, B1: a version without written_at made the walkthrough answer 500.
+        self.assertEqual(200, self.grant().status)         # so the agent would be offered a readable note
+        for field in ('written_at', 'written_by', 'text', 'version'):
+            self.write(self.tokens['olive'])
+            with self.service.store.lock:
+                for version in self.service.state['handover_notes'][self.project]['versions']:
+                    version.pop(field, None)
+            for token, person in ((self.tokens['cora'], None), (self.tokens['olive'], self.ids['cora'])):
+                path = '/v1/projects/%s/handover%s' % (self.project, '?person=%s' % person if person else '')
+                answer = self.request('GET', path, token=token)
+                self.assertEqual(200, answer.status, (field, answer.data))
+                steps = {s['id']: s for s in answer.data['steps']}
+                self.assertEqual((steps['handover-note']['state'], steps['acknowledge-note']['state']),
+                                 ('todo', 'done'), field)
+            self.assertIsNone(self.read(self.tokens['carl']).data['note'], field)
+            self.assertNotIn('handover-note', [a['kind'] for a in self.next_actions(self.agent)['next_actions']], field)
+            with self.service.store.lock:
+                del self.service.state['handover_notes'][self.project]
+
+
 class BackupTests(unittest.TestCase):
     """The HTTP-state pair of the coordination backup carries the note; an older kit restoring it ignores it."""
 
@@ -213,6 +271,18 @@ class BackupTests(unittest.TestCase):
             store.state['handover_notes'] = {'alpha': 'not a record'}
             store.save()
         self.assertIsNone(Service(Store(str(self.root / 'http-state.json'))).handover_note('alpha')['note'])
+        # A version missing a field its readers use, or with a junk acknowledgement, is not a note either (B1).
+        good = {'version': 1, 'text': NOTE, 'for_person': 'usr_cora', 'written_by': 'usr_olive',
+                'written_at': '2026-01-01T00:00:00Z', 'acknowledged': []}
+        for damaged in ({k: v for k, v in good.items() if k != 'written_at'}, dict(good, written_at=7),
+                        {k: v for k, v in good.items() if k != 'written_by'}, dict(good, acknowledged=['x'])):
+            with store.lock:
+                store.state['handover_notes'] = {'alpha': {'versions': [damaged], 'dropped': 0}}
+                store.save()
+            service = Service(Store(str(self.root / 'http-state.json')))
+            self.assertIsNone(service.handover_note('alpha')['note'], damaged)
+            self.assertIsNone(service.handover_pointer('alpha'), damaged)
+            self.assertIsNone(service.handover_facts('alpha', 'usr_cora')['note'], damaged)
 
     def test_an_older_kit_restores_the_pair_and_ignores_the_note(self):
         previous = os.environ.get('ORCHESTRA_POINTER_PREVIOUS_KIT')
@@ -279,6 +349,31 @@ console.log(JSON.stringify(out));"""
             self.assertEqual(out[name]['scripts'], 0)
             self.assertIn('<img src=x onerror=1>be careful', out[name]['text'])
             self.assertIn('not instructions', out[name]['text'])
+
+    def test_the_page_counts_characters_as_the_server_does(self):
+        # Review of kittrial-5bb.443, B2: a textarea's maxlength counts UTF-16 units; the server counts characters.
+        import shutil
+        import test_http_web
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        code = """await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const ctx={href:(p)=>'#'+p,api:{handoverNote:async()=>({note:null,older:[],dropped:0})}};
+const panel=await view.notePanel(ctx,'pp',{person:{id:'u_cora',name:'cora'},can_write_note:true},async()=>{});
+const area=panel.querySelector('textarea');
+console.log(JSON.stringify({max:view.NOTE_MAX,maxlength:area.getAttribute('maxlength'),
+  count:[...panel.querySelectorAll('p')].map((p)=>p.textContent).find((t)=>t.endsWith(' characters')),
+  lengths:JSON.parse(process.argv[3]).map((s)=>view.noteLength(s))}));"""
+        samples = ['abc', '日本', '😀😀', 'é']
+        done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web/js/views/handover.js').as_uri(), json.dumps(samples))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(out['max'], Service.HANDOVER_TEXT_MAX)
+        self.assertIsNone(out['maxlength'])
+        self.assertEqual(out['count'], '0 of 8,000 characters')
+        self.assertEqual(out['lengths'], [len(s) for s in samples])
 
 
 if __name__ == '__main__':
