@@ -75,6 +75,9 @@ from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACC
                        validate_claim_limit, validate_password_min_length)
 from version import report as version_report
 import program_links
+#: kittrial-5bb.449: a requirement key with `/` is kept, and said how it is cited (PROGRAM_DESIGN §3.1).
+QUALIFY_KEY_WARNING = ('The key %(key)s contains "/": cite it as req:%(project)s/%(key)s, even in this project, '
+                       'because the part before the first "/" of a token is a project')
 
 KIT_VERSION = '0.1.0'
 #: Where the installed kit is: the documents this service shows are read from it.
@@ -1504,7 +1507,7 @@ class InProcessBackend:
         return {'schema_version': 1, 'total': 0, 'items': [], 'next_offset': None,
                 'coverage': 'the in-process backend holds no native capability records'}
 
-    def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None):
+    def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None, readable=()):
         """kittrial-5bb.425: the in-process backend holds no native records, so every view is honestly empty."""
         import trace_read
         snap = trace_read.Snapshot([], project_id, now=trace_read.snapshot_now())
@@ -3416,10 +3419,13 @@ class EndpointBackend:
             raise uncertain('Canonical switch read returned an unexpected shape')
         return payload
 
-    def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None):
-        """kittrial-5bb.425: one page of the trace read through the endpoint's read-only `trace` action."""
+    def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None, readable=()):
+        """kittrial-5bb.425: one page of the trace read through the endpoint's read-only `trace` action. ``readable`` is
+        the caller's readable projects (kittrial-5bb.449), passed as the service's own --readable arguments."""
         args = [view] + (['--scope', caller_arg(scope, 'scope')] if scope else []) \
             + ['--offset', str(offset), '--limit', str(limit)] + (['--generation', generation] if generation else [])
+        args += ['--readable'] + [arg for project in sorted(readable) for arg in ('--readable', project)][1:] \
+            if readable else ['--readable']
         reply = self._endpoint('trace', project_id, self.actor_namespace + '/read', args)
         if isinstance(reply, dict) and reply.get('returncode') == 2 \
                 and 'The project changed since this page was read' in (reply.get('stderr') or ''):
@@ -12378,7 +12384,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         generation = carried.get('g') if isinstance(carried.get('g'), str) else None
         if state['o'] and generation is None:
             raise conflict('Invalid cursor')
-        result = dict(reader(ctx.params['pid'], view, scope, state['o'], limit, generation))
+        # kittrial-5bb.449: tokens into other projects resolve only where this caller may read (its own
+        # check_authority, project by project); outside-program is marked after, from the program links.
+        result = dict(reader(ctx.params['pid'], view, scope, state['o'], limit, generation,
+                             readable=self._readable_projects(ctx.principal)))
+        self._flag_outside_program(ctx.params['pid'], result)
         following = result.pop('next_offset', None)
         result['next_cursor'] = (make_cursor(ctx.principal, ctx.params['pid'], ctx.query, following,
                                              extra={'g': result.get('generation')}, key=self.service.cursor_key())
@@ -12885,7 +12895,49 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     @route('POST', r'/v1/projects/(?P<pid>'+ID+r')/requirements')
     def requirements_create(self,ctx):
-        return self._requirements_write(ctx,'create',status=201)
+        status, result = self._requirements_write(ctx,'create',status=201)
+        key = ctx.payload.get('key') if isinstance(ctx.payload, dict) else None
+        if isinstance(key, str) and '/' in key and isinstance(result, dict):
+            # kittrial-5bb.449, the `/` lint: kept, never refused, with how to cite it (PROGRAM_DESIGN §3.1).
+            result = dict(result, warnings=list(result.get('warnings') or []) + [
+                QUALIFY_KEY_WARNING % {'key': key, 'project': ctx.params['pid']}])
+        return status, result
+
+    def _readable_projects(self, principal):
+        """The projects this caller may read now, each by its own check (kittrial-5bb.449)."""
+        found = []
+        for project in self.service.list_projects(principal):
+            try:
+                self.service.check_authority(principal, project['id'], CAP_READ)
+            except HttpError:
+                continue
+            found.append(project['id'])
+        return found
+
+    def _flag_outside_program(self, pid, result):
+        """Mark a resolved token into a readable project that is not linked with ``pid`` in a program (PROGRAM_DESIGN
+        §3.2): information only, from the same link check a note between coordinators uses."""
+        decided = {}
+
+        def walk(value):
+            if isinstance(value, list):
+                for item in value:
+                    walk(item)
+                return
+            if not isinstance(value, dict):
+                return
+            project = value.get('project')
+            flags = value.get('flags')
+            if isinstance(value.get('pointer'), str) and isinstance(project, str) and project != pid \
+                    and isinstance(flags, list) and value.get('state') not in ('not-visible', 'not-checked') \
+                    and not {'not-visible', 'not-checked'} & set(flags):
+                if project not in decided and len(decided) < 50:
+                    decided[project] = self._note_pairing(pid, project)
+                if decided.get(project) is False and 'outside-program' not in flags:
+                    flags.append('outside-program')
+            for item in value.values():
+                walk(item)
+        walk(result)
 
     #: One batch acceptance is bounded (kittrial-5bb.278): one action, many requirements.
     REQUIREMENT_BATCH_MAX = 200

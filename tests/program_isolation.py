@@ -23,6 +23,7 @@ AREA_READS = (
     ('program-links', '/v1/projects/{project}/program-links'),
     ('notes', '/v1/projects/{project}/notes'),
     ('notes-sent', '/v1/projects/{project}/notes?box=sent'),
+    ('trace', '/v1/projects/{project}/trace'),          # kittrial-5bb.449: tokens into other projects
 )
 #: Reads of the caller's own, across projects: they must show nothing of a project the caller does not coordinate.
 PERSONAL_READS = (

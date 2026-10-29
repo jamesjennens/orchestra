@@ -195,6 +195,23 @@ citing project's program. Citing across programs is allowed; the flag only makes
 bound), with the same read cache. A token never triggers a read of a project the caller cannot
 read: the check comes first.
 
+**As built (kittrial-5bb.449, slice 2):**
+- **The grammar:** `req:`, `design:` and a new `decision:` take `<project>/` (briefing.QUALIFIED_KINDS). The split
+  is at the first `/`. `decision:` resolves to a native decision issue, with the flag `unknown-decision`.
+- **Where it resolves:** in the trace read, in one endpoint call, with the caller's readable projects.
+  - **On the web:** each project is checked with check_authority for this caller and passed as the service's own
+    `--readable`. Any other caller passing it is refused.
+  - **On the host:** the key's projects, or any project for an operator's unbound key.
+  - A project outside that set is never read and reads exactly like one that does not exist.
+  - At most 50 other projects are read; past that, `not-checked`.
+- **`outside-program`** is set on the web route only, from the same link check that allows a note between
+  coordinators.
+- **The summary** has a pointers line: resolved, broken, not-visible, not-checked.
+- **The lint:** the trace's `qualify-key` rows, and a warning on creating a key with `/`, never a refusal.
+- **Briefs** name another project's token as `cross-project` and read nothing of it.
+- **An accepted design document** containing a qualified `design:` token reads `differs` until it is accepted
+  again; the release notes say so.
+
 ## 4. The interface register (Q3 A)
 
 ### 4.1 One entry per major version

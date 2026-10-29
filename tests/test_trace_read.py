@@ -232,6 +232,8 @@ class ViewTests(Fixture):
             ('design:server#nowhere', '{"field": "description", "task": "trial-2"}', ('unknown-section',)),
             ('req:GHOST', '{"field": "description", "task": "trial-2"}', ('unknown-key',)),
             ('req:NOPE', '{"design": "server", "section": "typos"}', ('unknown-key',)),
+            # kittrial-5bb.449: `decision:` is a token now; trial-d1's Supersedes line names a decision not here.
+            ('decision:trial-d0', '{"field": "description", "task": "trial-d1"}', ('unknown-decision',)),
         ]))
 
     def test_tokens_view_reads_checkpoint_items(self):
@@ -338,7 +340,7 @@ class ViewTests(Fixture):
         lines = {line['view']: line for line in self.view('summary')['rows']}
         self.assertEqual(lines['requirements'], {'view': 'requirements', 'total': 2, 'partial': False,
                                                  'counts': {'no-task': 0, 'no-capability': 1, 'no-design': 0}})
-        self.assertEqual(lines['tokens']['total'], 4)
+        self.assertEqual(lines['tokens']['total'], 5)        # with decision:trial-d0 (kittrial-5bb.449)
         self.assertEqual(lines['tasks']['counts'], {'cites-superseded-revision': 1, 'cites-nothing': 1})
         self.assertEqual(lines['decisions'], {'view': 'decisions', 'total': 1, 'partial': False,
                                               'counts': {'possible-decision-in-comment': 1}})
@@ -369,7 +371,8 @@ class NoDesignTests(Fixture):
         self.assertEqual(self.view('round')['rows'], [])
 
     def test_summary_shows_the_requirement_and_token_lines_only(self):
-        self.assertEqual([line['view'] for line in self.view('summary')['rows']], ['requirements', 'tokens'])
+        # kittrial-5bb.449 adds the pointers line: resolved, broken, not visible and not checked.
+        self.assertEqual([line['view'] for line in self.view('summary')['rows']], ['requirements', 'tokens', 'pointers'])
 
     def test_no_index_or_blob_is_read(self):
         import design_documents
@@ -573,7 +576,7 @@ class TokenCostTests(Fixture):
         self.assertEqual(lines['tasks']['counts'], old['tasks']['counts'])
         self.assertEqual(lines['requirements']['counts'], old['requirements']['counts'])
         self.assertEqual({view for view, line in lines.items() if line['partial']},
-                         {'requirements', 'tokens', 'tasks'})
+                         {'requirements', 'tokens', 'tasks', 'pointers'})       # the pointers line: kittrial-5bb.449
         self.assertEqual(lines['tokens']['counts'], {'tokens-not-checked': 2500 - t.TOKENS_PER_SOURCE_MAX})
         self.assertIn('1 sources carry more than %d distinct tokens: %d of their tokens are not checked'
                       % (t.TOKENS_PER_SOURCE_MAX, 2500 - t.TOKENS_PER_SOURCE_MAX),

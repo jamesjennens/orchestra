@@ -103,9 +103,12 @@ class Snapshot:
     rule plugs in."""
 
     def __init__(self, rows, project, *, now, operators=None, verifiers=None, governance=None,
-                 members=None, exclude=None):
+                 members=None, exclude=None, others=None):
         from briefing import ContextPointers
         self.project = project
+        #: kittrial-5bb.449: ``others(project)`` gives the resolver of a project this caller may read, None for one
+        #: it may not read or that does not exist (the same answer), or 'not-checked' past the bound of targets.
+        self.others = others
         self.now = now
         self.operators = list(operators or [])
         self.verifiers = list(verifiers or [])
@@ -145,11 +148,30 @@ class Snapshot:
 
     # -- pointers ----------------------------------------------------------------------------
     def resolve(self, pointer):
-        """One resolution per distinct token; each requirement ledger is validated once (briefing._ledger)."""
+        """One resolution per distinct token; each requirement ledger is validated once (briefing._ledger). A token
+        into another project (kittrial-5bb.449) is resolved in that project for this caller, or reads
+        `not-visible`, the same row for a project that does not exist and one this caller may not read."""
         key = pointer['pointer']
         if key not in self._resolved:
-            self._resolved[key] = self.pointers.resolve(pointer)
+            entry = self.pointers.resolve(pointer)
+            if entry.get('state') == 'cross-project':
+                entry = self._elsewhere(pointer, entry['project'])
+            self._resolved[key] = entry
         return self._resolved[key]
+
+    def _elsewhere(self, pointer, project):
+        other = self.others(project) if self.others is not None else None
+        if other is None or other == 'not-checked':
+            return {'pointer': pointer['pointer'], 'kind': pointer['kind'], 'project': project,
+                    'state': 'not-visible' if other is None else 'not-checked', 'trust': 'data', 'flags': []}
+        entry = other.resolve(pointer)
+        entry['project'] = project
+        return entry
+
+    def local(self, pointer):
+        """Whether a token is this project's own (unqualified, or qualified with this project's id)."""
+        from briefing import pointer_target
+        return pointer_target(pointer, self.project)[0] == self.project
 
     def bounded_tokens(self, source, items, name=lambda item: item['pointer']):
         """`items` keeping only the first TOKENS_PER_SOURCE_MAX distinct tokens of one source (every occurrence of
@@ -247,7 +269,8 @@ class Snapshot:
                         continue
                     field = FIELD_OF.get(where, where)
                     for pointer in parse_context_pointers(text):
-                        if pointer['kind'] in ('req', 'design'):
+                        # kittrial-5bb.449: decision tokens are traceability kinds too (QUALIFIED_KINDS).
+                        if pointer['kind'] in ('req', 'design', 'decision'):
                             fields.setdefault(field, []).append((where, pointer))
                 cited = []
                 for field in FIELDS:
@@ -309,7 +332,7 @@ class Snapshot:
         current, cited = {}, {}
         for task, pointers in self.citations().items():
             for _, pointer in pointers:
-                if pointer['kind'] != 'req':
+                if pointer['kind'] != 'req' or not self.local(pointer):
                     continue
                 entry = self.resolve(pointer)
                 reference = entry.get('reference')
@@ -394,15 +417,17 @@ def requirements_view(snap):
             keys.add(item.split('@', 1)[0])
         for heading in design['index']['headings'] if design['index'] else []:
             for token in heading['tokens']:
-                if token.startswith('req:'):
-                    keys.add(token[4:].split('@', 1)[0])
+                key = local_req_key(token, snap.project)
+                if key is not None:
+                    keys.add(key)
         for key in keys:
             citing_designs.setdefault(key, set()).add(design['scope'])
     citing_tasks = {}
     for task, pointers in snap.citations().items():
         for _, pointer in pointers:
-            if pointer['kind'] == 'req':
-                citing_tasks.setdefault(pointer['value'].split('@', 1)[0], set()).add(task)
+            key = local_req_key(pointer['pointer'], snap.project)
+            if key is not None:
+                citing_tasks.setdefault(key, set()).add(task)
     import capability_records
     capabilities = {}
     entries, _ = capability_records.catalog(snap.rows, snap.operators)
@@ -458,13 +483,31 @@ def tasks_view(snap):
             flags.append('cites-nothing')
         shown, more = bounded(cited)
         rows.append({'id': task, 'title': label(row.get('title')), 'status': row.get('status'),
-                     'cites': [dict(pointer=p['pointer'], where=where, state=snap.resolve(p)['state'],
-                                    flags=snap.resolve(p).get('flags', [])) for where, p in shown],
+                     'cites': [cite(snap, where, p) for where, p in shown],
                      'cites_omitted': more, 'tokens_not_checked': sum(snap.truncated.get(('task', task, field), 0) for field in FIELDS),
                      'affected_requirements': affected.get(task, [])[:LIST_MAX],
                      'affected_requirements_omitted': max(0, len(affected.get(task, [])) - LIST_MAX),
                      'flags': flags})
     return rows
+
+
+def cite(snap, where, pointer):
+    entry = snap.resolve(pointer)
+    shown = dict(pointer=pointer['pointer'], where=where, state=entry['state'], flags=entry.get('flags', []))
+    if entry.get('project') is not None:
+        shown['project'] = entry['project']
+    return shown
+
+
+def local_req_key(token, project):
+    """The requirement key of a `req:` token that is this project's own, else None (kittrial-5bb.449: a token into
+    another project never counts as citing a key here)."""
+    from briefing import parse_context_pointers, pointer_target
+    found = parse_context_pointers(token) if isinstance(token, str) else []
+    if len(found) != 1 or found[0]['kind'] != 'req':
+        return None
+    where, value = pointer_target(found[0], project)
+    return value.split('@', 1)[0] if where == project else None
 
 
 def unresolved(entry):
@@ -478,16 +521,25 @@ def tokens_view(snap):
     rows = []
     for task, pointers in snap.citations().items():
         for where, pointer in pointers:
-            flags = unresolved(snap.resolve(pointer))
+            entry = snap.resolve(pointer)
+            flags = unresolved(entry)
             if flags:
-                rows.append({'pointer': pointer['pointer'], 'where': {'task': task, 'field': where}, 'flags': flags})
+                rows.append(dict({'pointer': pointer['pointer'], 'where': {'task': task, 'field': where}, 'flags': flags},
+                                 **({'project': entry['project']} if entry.get('project') is not None else {})))
     for design in snap.designs():
         for heading in design['index']['headings'] if design['index'] else []:
             for pointer in snap.section_tokens(design, heading):
-                flags = unresolved(snap.resolve(pointer))
+                entry = snap.resolve(pointer)
+                flags = unresolved(entry)
                 if flags:
-                    rows.append({'pointer': pointer['pointer'],
-                                 'where': {'design': design['scope'], 'section': heading['anchor']}, 'flags': flags})
+                    rows.append(dict({'pointer': pointer['pointer'],
+                                      'where': {'design': design['scope'], 'section': heading['anchor']}, 'flags': flags},
+                                     **({'project': entry['project']} if entry.get('project') is not None else {})))
+    # kittrial-5bb.449, the `/` lint: a key of this project containing `/` is cited qualified, even here.
+    for key in snap.requirement_keys():
+        if '/' in key:
+            rows.append({'pointer': None, 'where': {'requirement': key}, 'flags': ['qualify-key'],
+                         'cite_as': 'req:%s/%s' % (snap.project, key)})
     # Review b3: a source over the bound says so in one row; only its own extra tokens go unchecked.
     for source, count in sorted(snap.truncated.items()):
         where = {'task': source[1], 'field': source[2]} if source[0] == 'task' else {'design': source[1], 'section': source[2]}
@@ -567,15 +619,17 @@ def designs_view(snap):
             for phase in index['plan_phases']:
                 for line in phase['requirements']:
                     for pointer in parse_context_pointers(line):
-                        if pointer['kind'] == 'req':
-                            phase_keys.add(pointer['value'].split('@', 1)[0])
+                        key = local_req_key(pointer['pointer'], snap.project)
+                        if key is not None:
+                            phase_keys.add(key)
                 if phase['epic'] is None:
                     phases_without_epic.append(phase['anchor'])
                 elif not snap.children.get(phase['epic']):
                     epics_without_task.append(phase['epic'])
             planned = {phase['anchor'] for phase in index['plan_phases']}
             for heading in index['headings']:
-                keys = {token[4:].split('@', 1)[0] for token in heading['tokens'] if token.startswith('req:')}
+                keys = {key for key in (local_req_key(token, snap.project) for token in heading['tokens'])
+                        if key is not None}
                 cited |= keys
                 if heading['anchor'] in planned or heading['anchor'] == 'plan':
                     continue
@@ -689,7 +743,8 @@ def summary_view(snap):
               'counts': {flag: sum(flag in row['flags'] for row in requirements)
                          for flag in ('no-task', 'no-capability') + (('no-design',) if has_designs else ())}},
              {'view': 'tokens', 'total': len(tokens), 'partial': cut,
-              'counts': {'tokens-not-checked': sum(row.get('omitted', 0) for row in tokens)}}]
+              'counts': {'tokens-not-checked': sum(row.get('omitted', 0) for row in tokens)}},
+             pointers_line(snap)]
     if has_designs:
         tasks = tasks_view(snap)
         decisions = decisions_view(snap)
@@ -709,6 +764,34 @@ def summary_view(snap):
                   {'view': 'round', 'total': len(rounds) + snap.rounds_omitted, 'partial': bool(snap.rounds_omitted),
                    'counts': {'delivered-after-publication': sum(bool(row['flags']) for row in rounds)}}]
     return lines
+
+
+def all_pointers(snap):
+    """Every distinct token the views read: the tasks' and the designs' sections'."""
+    seen = {}
+    for _task, pointers in snap.citations().items():
+        for _where, pointer in pointers:
+            seen.setdefault(pointer['pointer'], pointer)
+    for design in snap.designs():
+        for heading in design['index']['headings'] if design['index'] else []:
+            for pointer in snap.section_tokens(design, heading):
+                seen.setdefault(pointer['pointer'], pointer)
+    return list(seen.values())
+
+
+def pointers_line(snap):
+    """kittrial-5bb.449: resolved, broken, not visible to this caller, and not checked (past the bound of other
+    projects). A token another reader may resolve is never called broken."""
+    counts = {'resolved': 0, 'broken': 0, 'not-visible': 0, 'not-checked': 0}
+    for pointer in all_pointers(snap):
+        entry = snap.resolve(pointer)
+        if entry['state'] in ('not-visible', 'not-checked'):
+            counts[entry['state']] += 1
+        elif entry['state'] == 'unchecked':
+            continue
+        else:
+            counts['broken' if unresolved(entry) else 'resolved'] += 1
+    return {'view': 'pointers', 'total': sum(counts.values()), 'partial': bool(snap.truncated), 'counts': counts}
 
 
 def coverage(snap):
@@ -858,17 +941,64 @@ def read_governance(rows, journal, project):
         return None
 
 
-def answer(rows, project, options, *, operators=None, verifiers=None, members=None, governance=None, now=None):
+def answer(rows, project, options, *, operators=None, verifiers=None, members=None, governance=None, now=None,
+           others=None):
     """One page for the endpoint action, from rows and state already read: no I/O, so the caller builds it after
-    releasing the project lock (review b2). A page asked for at another generation is refused."""
+    releasing the project lock (review b2). A page asked for at another generation is refused. ``others`` reads the
+    projects that this page's qualified tokens name, each under its own lock, only where the caller may read it
+    (kittrial-5bb.449)."""
     snap = Snapshot(rows, project, now=snapshot_now(now), operators=operators, verifiers=verifiers,
-                    governance=governance, members=members)
+                    governance=governance, members=members, others=others)
     current = generation(snap)
     if options['generation'] is not None and options['generation'] != current:
         raise ValueError(STALE)
     result = trace(snap, options['view'], scope=options['scope'], offset=options['offset'], limit=options['limit'])
     result['generation'] = current
     return result
+
+
+#: At most this many other projects are read for one trace page (PROGRAM_DESIGN §3.2, My work's bound).
+TARGETS_MAX = 50
+#: The web service's own argument: the projects its caller may read (kittrial-5bb.449). Any other caller is refused.
+READABLE_FLAG = '--readable'
+READABLE_REFUSED = ('trace: --readable is the web service\'s own argument, for the projects its caller may read; '
+                    'a host key reads the projects it is bound to')
+
+
+def split_readable(args):
+    """``(the other arguments, the set given with --readable or None)``: the web service passes one --readable per
+    project its caller may read, or a lone --readable for none."""
+    rest, readable, index = [], None, 0
+    while index < len(args):
+        if args[index] == READABLE_FLAG:
+            readable = set() if readable is None else readable
+            if index + 1 < len(args) and not args[index + 1].startswith('--'):
+                readable.add(args[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        rest.append(args[index])
+        index += 1
+    return rest, readable
+
+
+def others_loader(readable, read_project, limit=TARGETS_MAX):
+    """A Snapshot's ``others`` (kittrial-5bb.449). ``readable`` is the set of projects this caller may read (None:
+    any, an operator's unbound host key); ``read_project(project)`` reads one, under its own lock, and gives its
+    ContextPointers, or None when there is no such project. A project outside ``readable`` is never read and reads
+    exactly like one that does not exist. At most ``limit`` distinct projects are taken; past that, 'not-checked'."""
+    cache, asked = {}, []
+
+    def load(project):
+        if project not in cache:
+            if len(asked) >= limit:
+                return 'not-checked'
+            asked.append(project)
+            cache[project] = read_project(project) if readable is None or project in readable else None
+        return cache[project]
+    load.asked = asked
+    return load
 
 
 def snapshot_now(value=None):

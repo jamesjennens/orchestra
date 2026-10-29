@@ -553,13 +553,18 @@ def inline_context_text(value):
     return plain_text(text)
 
 
-CONTEXT_POINTER_RE = re.compile(r'(task|comment|ref|cap|item|file|room|commit|doc|archive|req|design):([A-Za-z0-9._/#:@-]{1,200})\Z')
+CONTEXT_POINTER_RE = re.compile(r'(task|comment|ref|cap|item|file|room|commit|doc|archive|req|design|decision):([A-Za-z0-9._/#:@-]{1,200})\Z')
 # The traceability kinds (TRACEABILITY_DESIGN.md §2.4) also fix their value's shape;
 # a value outside it is prose, like any token outside the grammar (§2.1). `@` is
 # legal only as the one revision separator of a `req` value, so the ten older kinds
 # read exactly as before.
 REQ_POINTER_VALUE_RE = re.compile(r'([A-Za-z0-9._/#:-]+)(?:@([1-9][0-9]{0,8}))?\Z')
 DESIGN_POINTER_VALUE_RE = re.compile(r'([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*)(?:#([A-Za-z0-9._-]{1,120}))?\Z')
+#: A decision issue's id, the value of `decision:` (kittrial-5bb.449, PROGRAM_DESIGN §3.1).
+DECISION_POINTER_VALUE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}\Z')
+#: The kinds that take a project qualifier: `KIND:<project>/<value>` (PROGRAM_DESIGN §3.1). The part before the
+#: first `/` is always a project, so a requirement key containing `/` is cited qualified, even in its own project.
+QUALIFIED_KINDS = ('req', 'design', 'decision')
 CONTEXT_POINTER_ITEM_MAX = 10
 CONTEXT_POINTER_BRIEF_MAX = 50
 
@@ -574,16 +579,32 @@ def parse_context_pointers(text):
         if not match:
             continue
         kind,value=match[1],match[2]
+        if kind in QUALIFIED_KINDS and value.startswith('/'):
+            continue                                   # a qualifier names a project; an empty one is prose
+        local=value.split('/',1)[1] if kind in QUALIFIED_KINDS and '/' in value else value
         if kind=='req':
-            if not REQ_POINTER_VALUE_RE.fullmatch(value):
+            if not REQ_POINTER_VALUE_RE.fullmatch(local):
                 continue
         elif kind=='design':
-            if not DESIGN_POINTER_VALUE_RE.fullmatch(value):
+            if not DESIGN_POINTER_VALUE_RE.fullmatch(local):
+                continue
+        elif kind=='decision':
+            if not DECISION_POINTER_VALUE_RE.fullmatch(local):
                 continue
         elif '@' in value:
             continue
         result.append({'pointer':token,'kind':kind,'value':value})
     return result
+
+
+def pointer_target(pointer, here=None):
+    """``(project, local value)`` of a pointer: for `req`, `design` and `decision` with a ``/``, the project is the
+    part before the first ``/`` (PROGRAM_DESIGN §3.1, kittrial-5bb.449); otherwise ``here``, this project."""
+    value = pointer['value']
+    if pointer['kind'] in QUALIFIED_KINDS and '/' in value:
+        project, local = value.split('/', 1)
+        return project, local
+    return here, value
 
 
 def needs_requirement_governance(*groups):
@@ -807,18 +828,39 @@ class ContextPointers:
                             entry['flags'].append('unknown-section')
         return label,follow
 
+    def _decision(self,entry,issue):
+        """`decision` (kittrial-5bb.449): a native issue of type or label decision, else the flag unknown-decision."""
+        from delegations import is_decision_issue
+        matches=self.tasks.get(issue,[])
+        if len(matches)==1 and is_decision_issue(matches[0]):
+            entry['state']='live'
+            entry['flags']=[]
+            return matches[0].get('title'),'show '+issue
+        entry['flags']=['unknown-decision']
+        return None,None
+
     def resolve(self,pointer):
         kind,value=pointer['kind'],pointer['value']
         entry={'pointer':pointer['pointer'],'kind':kind,'state':'unchecked','trust':'data'}
-        if kind in ('req','design'):
+        if kind in QUALIFIED_KINDS:
+            project,value=pointer_target(pointer,self.project)
+            if project!=self.project:
+                # Another project's: resolved only by a read that may read it (the trace, kittrial-5bb.449); here
+                # it is named, never read, so a brief makes no cross-project read.
+                entry.update(state='cross-project',project=project)
+                return entry
+            if '/' in pointer['value']:
+                entry['project']=project
             self._load()
             entry['state']='unavailable'
             if kind=='req':
                 match=REQ_POINTER_VALUE_RE.fullmatch(value)
                 label,follow=self._requirement(entry,match[1],int(match[2]) if match[2] else None)
-            else:
+            elif kind=='design':
                 match=DESIGN_POINTER_VALUE_RE.fullmatch(value)
                 label,follow=self._design(entry,match[1],match[2])
+            else:
+                label,follow=self._decision(entry,value)
             if entry['state'] in ('live','superseded'):
                 entry['label']=clip_context_label(label)
                 entry['follow']=follow

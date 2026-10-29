@@ -191,8 +191,10 @@ class HostRequirementTests(unittest.TestCase):
         answer = self.resolve('req:R01', foreign)
         self.assertEqual(answer, self.resolve('req:R01', []))
         self.assertEqual(answer['flags'], ['unknown-key'])
-        # A project-qualified spelling is just a key this project does not have.
-        self.assertEqual(self.resolve('req:other/R01')['flags'], ['unknown-key'])
+        # kittrial-5bb.449: a project-qualified spelling is another project's token, never a key of this one; here
+        # (a brief's resolver) it is named and not read: the trace resolves it for a caller who may read `other`.
+        self.assertEqual({k: v for k, v in self.resolve('req:other/R01').items() if k in ('state', 'project')},
+                         {'state': 'cross-project', 'project': 'other'})
 
     def test_hidden_equals_absent_byte_for_byte_apart_from_the_token(self):
         self.revise(2, accepted=True)
