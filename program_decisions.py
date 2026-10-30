@@ -104,7 +104,19 @@ def program_decision(row, program, state, operators, journals=None):
     return {'id': str(row.get('id')), 'title': row.get('title'), 'status': row.get('status'),
             'owner_only': found['owner_only'], 'binds': list(found['binds'] or []),
             'supersedes': first.group(1) if first else None, 'attestation_id': attested['id'], 'attestation': attested['state'],
+            'owner_level': attested['owner_level'] or found['owner_only'] is True,
             'attested_as': attested['role'], 'flags': flags, 'reasons': reasons}
+
+
+def check_supersession(decision, target):
+    """Review of r2: a row that supersedes owner-level text needs owner-level attestation. Otherwise it carries a flag, and
+    like any row with a flag it marks nothing and binds nothing: a coordinator or an agent cannot retire an owner's choice."""
+    if target is None or not target['owner_level'] or decision['flags'] or decision['attested_as'] in OWNERS:
+        return decision
+    decision['flags'].append('supersedes-owner-level')
+    decision['reasons'].append('decision %s is at an owner\'s level, so only a person owner of the program or an operator '
+                               'attests a decision that supersedes it' % target['id'])
+    return decision
 
 
 def adoption(row, decision, program, area, area_rows, state, operators, journals=None):
@@ -213,6 +225,9 @@ def decisions_section(program_rows, program, states_of_areas, area_rows_by_area,
     decisions = [d for d in (program_decision(row, program, state, operators, journals) for row in program_rows or [])
                  if d]
     decisions.sort(key=lambda d: d['id'])
+    by_id = {d['id']: d for d in decisions}
+    for decision in decisions:
+        check_supersession(decision, by_id.get(decision['supersedes']))
     links = chains(decisions)
     superseded = {old for chain in links.values() for old in chain[:1]}
     items = []
@@ -273,6 +288,9 @@ def trace_adopts(row, area, area_rows, program_rows, state, operators, journals=
         return {'pointer': pointer, 'state': 'not-visible'}
     target = next((r for r in program_rows if isinstance(r, dict) and str(r.get('id')) == decision_id), None)
     decision = program_decision(target, program, state, operators, journals) if target is not None else None
+    if decision is not None and decision['supersedes']:
+        older = next((r for r in program_rows if isinstance(r, dict) and str(r.get('id')) == decision['supersedes']), None)
+        check_supersession(decision, program_decision(older, program, state, operators, journals) if older else None)
     if decision is None:
         return {'pointer': pointer, 'state': 'unknown-decision'}
     if decision['flags']:

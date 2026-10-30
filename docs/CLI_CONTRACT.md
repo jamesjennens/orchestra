@@ -2067,9 +2067,7 @@ refused, and a row carrying `Adopts:` or `Authorises:` needs the pinned decision
 deployment's own unless `--state` names one) and `python3
 admin.py --root ROOT decision-change --project PROJECT --actor OPERATOR --decision ID --change
 close|reopen|type-decision|type-task|add-decision-label|remove-decision-label [--reason TEXT]`. The last is the only
-host route for those changes on a row with an honoured attestation: `bd close`, `reopen` and `update` with a status,
-type or decision-label flag are refused on every other host route, an operator's included. A project with no attestation
-is unaffected, and a text edit is never refused. There is no coordinator command for these, and a raw comment cannot
+host route for those changes on a row with an honoured attestation, or on any decision row carrying a `Binds:`, `Adopts:`, `Owner-only:`, `Per:` or `Authorises:` line: `bd close`, `reopen` and `update` with a status, type or decision-label flag are refused on every other host route, an operator's included. Any other row is unaffected, and a text edit is never refused. There is no coordinator command for these, and a raw comment cannot
 write the record: the `Kind: decision-attest-v1` prefix is reserved and is honoured only with its journal entry in
 `<project>/.decision-attests/<sha256>.json`. The web's routes and `http_client.py decision-attestation` and
 `decision-attest` are in docs/HTTP_DEPLOYMENT.md.

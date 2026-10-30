@@ -583,6 +583,29 @@ console.log(JSON.stringify({text:host.textContent,
             self.assertIn(words, out['text'])
         self.assertEqual([True, False, False, False], out['flags'])
 
+    def test_a_superseded_decision_still_shows_its_area_states(self):
+        # Review of .454 r2, b1: it still binds in the data, so the page must not show only the word superseded.
+        import shutil
+        import test_http_web
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        code = """await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const node=view.decisionsTable(JSON.parse(process.argv[3]));
+const host=document.createElement('div');
+host.appendChild(node);
+console.log(JSON.stringify({text:host.textContent}));"""
+        read = {'items': [{'id': 'p-1', 'title': 'T', 'owner_only': True, 'superseded': True, 'flags': [],
+                           'areas': {'north': {'state': 'adopted', 'adoption': 'n-1'}}},
+                          {'id': 'p-2', 'title': 'U', 'flags': ['supersedes-owner-level'], 'areas': {}}]}
+        done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web/js/views/program.js').as_uri(), json.dumps(read))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        text = json.loads(done.stdout.strip().splitlines()[-1])['text']
+        self.assertIn('superseded; north: adopted', text)
+        self.assertIn('supersedes-owner-level', text)
+
     def test_markup_in_a_name_renders_as_literal_text(self):
         # Review of .453, B2 (3): every name the page shows is set as text. A person's, an agent's, its owner's and a
         # requirement's title, each holding markup, come out literally, and no element is made from them. Needs node.

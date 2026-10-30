@@ -4956,8 +4956,9 @@ def backup_project(root,name):
         for record in delegation_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Delegation journal entry must not be a symlink')
             files['.delegations/'+record.name]=record_json.loads(read_regular_text(record))
-        # The attestation journal (kittrial-5bb.454 r2): without it every attested decision would read not-attested
-        # after a restore.
+        # The attestation journal (kittrial-5bb.454 r2). A restore under the same name honours its records. Under a new
+        # name it does not, on purpose: a record binds its project's name and a new name is a new project, so the rows read
+        # not-attested until an owner attests them again. Without the journal the same name reads not-attested too.
         attest_journal=path/'.decision-attests'
         if attest_journal.is_symlink():raise ValueError('Attestation journal must not be a symlink')
         for record in attest_journal.glob('*.json'):
@@ -11199,8 +11200,8 @@ def main():
         pinned=decision_attest.read_pins(before,pinned_decision) if isinstance(before,dict) else {}
         with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
             fcntl.flock(lock,fcntl.LOCK_EX)
+            # Read again under the lock: the library's own check refuses an actor taken off the list since.
             listed=operators(root,strict=True)
-            require_configured_operator(args.actor,listed,'attest a decision')
             print(json.dumps(decision_attest.apply(payload,project=args.project,journal=path,run=run,author=args.actor,
                                                    via='operator',at=server_time(),state=state,operators=listed,
                                                    pinned=pinned),ensure_ascii=False))

@@ -62,7 +62,7 @@ export function decisionsTable(decisions) {
       `${area}: ${entry.state}${entry.reason ? ` (${entry.reason})` : ''}`).join('; ');
     const flags = (d.flags || []).concat(d.superseded ? ['superseded'] : []);
     return h('tr', { 'data-decision': d.id }, h('td', null, d.id), h('td', null, d.title || ''),
-      h('td', null, d.owner_only ? 'owner-only' : ''), h('td', null, flags.join(', ') || areas));
+      h('td', null, d.owner_only ? 'owner-only' : ''), h('td', null, [flags.join(', '), areas].filter(Boolean).join('; ')));
   });
   return h('div', { class: 'stack' },
     h('p', { class: 'small muted' }, (decisions && decisions.scope) || ''),

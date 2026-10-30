@@ -445,20 +445,19 @@ def _guard_attested_decision(root,path,name,args,actor,authority_config):
     (kittrial-5bb.454 r2, Q1 at VERIFIED). Returns the refusal's answer, or None.
 
     A reopen would otherwise bring an owner's retired decision back into force with no attestation, and a retype or a
-    relabel would start or stop a row being a decision. A project with no attestation reads no row here. An invocation
-    that names no exact issue is refused where one exists, because bd would act on the last touched issue, which this
-    guard cannot verify. On the web the standing the row's records ask for; on a host route nobody, an operator included
-    (admin.py decision-change)."""
+    relabel would start or stop a row being a decision. An invocation that names no exact issue is refused, because bd
+    would act on the last touched issue, which this guard cannot verify. On the web the standing the row asks for; on a
+    host route nobody, an operator included (admin.py decision-change). The row is read only for a write this could stop,
+    and the status guard beside it already reads the same row."""
     import decision_attest
     request=decision_attest.gated_change(args)
-    if request is None or not decision_attest.journal_in_use(path):return None
+    if request is None:return None
     command,targets,change=request
     def refused(error):
         return {'returncode':2,'stdout':'','stderr':str(error)+'\n','delegation_status':error.status}
     if targets is None:
-        return refused(decision_attest.AttestRefusal(422,'Refusing %s: name exactly the issue(s) to change; this project '
-                                                         'has attested decisions, and bd would otherwise act on the last '
-                                                         'touched issue. Nothing was written.'%command))
+        return refused(decision_attest.AttestRefusal(422,'Refusing %s: name exactly the issue(s) to change; bd would '
+                                                         'otherwise act on the last touched issue. Nothing was written.'%command))
     rows=_native_anchor_rows(root,path,actor,targets)
     state=None
     if authority_config is not None:

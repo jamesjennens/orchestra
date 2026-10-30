@@ -366,6 +366,25 @@ class DecisionTests(unittest.TestCase):
         program_row['description'] = words
         self.assertEqual('adopted', self.adopt(program_row, adopted)[0])
 
+    def test_a_contributors_edit_then_a_coordinators_attestation_makes_an_adoption_stale(self):
+        # Review of r2, b2: text changed means a new run even at the same level. The coordinator case, then the owner's.
+        for attester, words in ((P_COORD, 'Binds: north\nOwner-only: no'), (P_OWNER, 'Binds: north\nOwner-only: yes')):
+            with self.subTest(attester=attester):
+                program_row = decision('prog-1', attester, words)
+                adoption_author = COORD if attester == P_COORD else OWNER
+                adopted = decision('north-1', adoption_author, 'Adopts: decision:prog/prog-1')
+                self.assertEqual('adopted', self.adopt(program_row, adopted)[0])
+                # A contributor's edit: stale, and the decision binds nothing.
+                program_row['description'] = words + '\nA contributor wrote this.'
+                self.assertEqual(['attestation-stale'], pd.program_decision(program_row, 'prog', web_state(), OPS, J)['flags'])
+                # The same attester attests the edit, so the decision counts again, and the area has not read this text.
+                attest(program_row, attester)
+                self.assertEqual([], pd.program_decision(program_row, 'prog', web_state(), OPS, J)['flags'])
+                self.assertEqual('adoption-stale', self.adopt(program_row, adopted)[0])
+                section = pd.decisions_section([program_row], 'prog', {'north': 'in'}, {'north': [adopted]}, web_state(), OPS,
+                                               journals=J)
+                self.assertEqual('adoption-stale', section['items'][0]['areas']['north']['state'])
+
     def test_another_attester_of_the_same_words_leaves_the_adoption_in_force(self):
         program_row = decision('prog-1', P_COORD, 'Binds: north', 'Owner-only: no')
         adopted = decision('north-1', COORD, 'Adopts: decision:prog/prog-1')
@@ -509,6 +528,50 @@ class SectionTests(unittest.TestCase):
             'north-2', 'Adopts: decision:prog/prog-1')]}, web_state(), OPS, journals=J)
         self.assertEqual('not-attested', section['items'][0]['areas']['north']['state'])
 
+    def test_a_row_that_supersedes_owner_level_text_needs_an_owners_attestation(self):
+        # Review of r2, b1: from a coordinator or a granted agent it marks nothing, carries a flag and binds nothing.
+        owner_only = decision('prog-0', P_OWNER, 'Binds: north', 'Owner-only: yes')
+        says = 'Supersedes: decision:prog-0'
+        for author in (P_COORD, P_AGENT):
+            with self.subTest(author=author):
+                row = decision('prog-2', author, 'Binds: north', 'Owner-only: no', first=says)
+                section = pd.decisions_section([owner_only, row], 'prog', {'north': 'in'}, {'north': []}, web_state(), OPS,
+                                               journals=J)
+                by_id = {i['id']: i for i in section['items']}
+                self.assertFalse(by_id['prog-0']['superseded'])
+                self.assertEqual({'north': {'state': 'not-adopted'}}, by_id['prog-0']['areas'])
+                self.assertEqual((['supersedes-owner-level'], {}), (by_id['prog-2']['flags'], by_id['prog-2']['areas']))
+        for author in (P_OWNER, 'ops'):
+            with self.subTest(author=author):
+                row = decision('prog-2', author, 'Binds: north', 'Owner-only: no', first=says)
+                section = pd.decisions_section([owner_only, row], 'prog', {}, {}, web_state(), OPS, journals=J)
+                by_id = {i['id']: i for i in section['items']}
+                self.assertTrue(by_id['prog-0']['superseded'])
+                self.assertEqual([], by_id['prog-2']['flags'])
+
+    def test_the_level_is_the_records_even_if_the_text_was_edited_or_the_row_closed(self):
+        says = 'Supersedes: decision:prog-0'
+        owner_only = decision('prog-0', P_OWNER, 'Binds: north', 'Owner-only: yes')
+        native = da.make_record({'schema_version': 1, 'operation_id': 'gated', 'decision': 'prog-0', 'digest': da.digest(owner_only)},
+                                project='prog', author=P_OWNER, via='session', gated=True, at='2026-06-01T00:00:00Z')
+        owner_only['comments'].append({'id': 'z', 'author': P_OWNER, 'text': da.body(native)})
+        da.publish(J['prog'], native)
+        row = decision('prog-2', P_COORD, 'Binds: north', 'Owner-only: no', first=says)
+        for label, target in (('edited out', dict(owner_only, description='Binds: north\nOwner-only: no')),
+                              ('closed', dict(owner_only, status='closed'))):
+            with self.subTest(label):
+                section = pd.decisions_section([target, row], 'prog', {}, {}, web_state(), OPS, journals=J)
+                by_id = {i['id']: i for i in section['items']}
+                self.assertEqual(['supersedes-owner-level'], by_id['prog-2']['flags'])
+                self.assertFalse(by_id['prog-0']['superseded'])
+
+    def test_a_coordinator_may_supersede_a_coordinators_decision(self):
+        old = decision('prog-0', P_COORD, 'Binds: north', 'Owner-only: no')
+        for author in (P_COORD, P_AGENT):
+            row = decision('prog-2', author, 'Binds: north', 'Owner-only: no', first='Supersedes: decision:prog-0')
+            by_id = {i['id']: i for i in pd.decisions_section([old, row], 'prog', {}, {}, web_state(), OPS, journals=J)['items']}
+            self.assertEqual(([], True), (by_id['prog-2']['flags'], by_id['prog-0']['superseded']), author)
+
     def test_an_area_outside_this_read_is_never_looked_at(self):
         # not-in-program and not-visible come from the program's records and the read set alone.
         class Untouchable(dict):
@@ -562,6 +625,13 @@ class TraceTests(unittest.TestCase):
         self.assertEqual('adopted', rows['north-1']['adopts']['state'])
         self.assertEqual('adoption-invalid', rows['north-2']['adopts']['state'])
         self.assertNotIn('adopts', rows['north-3'])
+
+    def test_the_trace_says_the_same_of_a_row_that_supersedes_an_owner(self):
+        older = decision('prog-0', P_OWNER, 'Binds: north', 'Owner-only: yes')
+        program_rows = [older, decision('prog-1', P_COORD, 'Binds: north', 'Owner-only: no', first='Supersedes: decision:prog-0')]
+        rows = {r['id']: r for r in trace_read.decisions_view(self.snap(program_rows)) if r['kind'] == 'decision'}
+        self.assertEqual('decision-does-not-count', rows['north-1']['adopts']['state'])
+        self.assertIn('owner', rows['north-1']['adopts']['reason'])
 
     def test_the_trace_uses_the_same_attestation_rule(self):
         unattested = {r['id']: r for r in trace_read.decisions_view(self.snap(

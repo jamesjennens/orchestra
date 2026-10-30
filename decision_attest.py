@@ -24,11 +24,13 @@ replaced stays stale); an author whose standing has gone is ``attester-not-autho
 as the highest live standing among the unbroken run of newest records over this text, so a coordinator attesting the
 same words cannot lower an owner's attestation.
 
-A status change, or a type or label change that starts or stops a row being a decision, on a row with an honoured
-attestation needs standing too (the gate below): a reopen would otherwise bring an owner's retired decision back. An
-owner's level is needed for a text that says ``Owner-only: yes``, that carries ``Authorises:``, or an adoption a person
-owner or an operator attested. That comes from the record (``owner_gated``), not from the row's text now, which any
-contributor can edit. A text edit is not gated: it only makes the row stale, which removes a binding and never makes one.
+A status change, or a type or label change that starts or stops a row being a decision, needs standing too (the gate
+below), on a row with an honoured attestation and on any decision row carrying these lines, attested or not: a reopen would
+otherwise bring an owner's retired decision back, and a row whose journal entry is gone, or that was restored under a new
+name, would stand open to a plain host actor. An owner's level is needed for a text that says ``Owner-only: yes``, that
+carries ``Authorises:``, or an adoption a person owner or an operator attested. Where there is a record that comes from the
+record (``owner_gated``), not from the row's text now, which any contributor can edit. A text edit is not gated: it only
+makes the row stale, which removes a binding and never makes one.
 
 This module has no store and no clock; callers pass what they read. Anyone with a shell on the host can write these
 files and forge bd rows; this defends the routes the kit exposes (the as-built says so).
@@ -301,15 +303,6 @@ def journaled(project, record):
     return stored == record
 
 
-def journal_in_use(project):
-    """Whether this project has any attestation at all: the gate reads no row in a project with none."""
-    from pathlib import Path
-    if project is None:
-        return False
-    directory = Path(project) / JOURNAL_DIR
-    return directory.is_symlink() or (directory.is_dir() and any(directory.glob('*.json')))
-
-
 def history(row, project, journal):
     """The honoured records on one row, oldest first, ordered by the record's own server time, then the native comment
     id, so the order never depends on how a native read happens to list comments."""
@@ -333,13 +326,16 @@ def _newest_run(records):
 
 
 def standing(row, project, state, operators, journal):
-    """How a row counts now: ``{'state', 'role', 'author', 'id', 'reason'}``. ``state`` is 'counts', or what it reads as;
-    ``id`` is what an adoption pins: the sha256 of the first record of the newest run over this text."""
+    """How a row counts now: ``{'state', 'role', 'author', 'id', 'owner_level', 'reason'}``. ``state`` is 'counts', or what
+    it reads as; ``id`` is what an adoption pins: the sha256 of the first record of the newest run over this text;
+    ``owner_level`` is what its records ask of anyone changing it, however it reads now."""
+    records = history(row, project, journal)
+    level = needs_owner(records)
+
     def reads(name):
-        return {'state': name, 'role': None, 'author': None, 'id': None, 'reason': REASONS[name]}
+        return {'state': name, 'role': None, 'author': None, 'id': None, 'owner_level': level, 'reason': REASONS[name]}
     if isinstance(row, dict) and row.get('status') == 'closed':
         return reads('closed')
-    records = history(row, project, journal)
     if not records:
         return reads('not-attested')
     if records[-1]['digest'] != digest(row):
@@ -349,7 +345,8 @@ def standing(row, project, state, operators, journal):
     found = sorted(((role, record) for role, record in found if role is not None), key=lambda item: RANK.index(item[0]))
     if not found:
         return reads('attester-not-authorised')
-    return {'state': 'counts', 'role': found[0][0], 'author': found[0][1]['author'], 'id': run[-1]['sha256'], 'reason': None}
+    return {'state': 'counts', 'role': found[0][0], 'author': found[0][1]['author'], 'id': run[-1]['sha256'],
+            'owner_level': level, 'reason': None}
 
 
 def read_issue(run, decision):
@@ -502,21 +499,34 @@ def needs_owner(records):
     return any(record['owner_gated'] for record in _newest_run(records))
 
 
+def carries_lines(row):
+    """Whether a row's text has any line of section 6, well formed or not."""
+    from program_decisions import LINES
+    description = row.get('description') if isinstance(row, dict) else None
+    if not isinstance(description, str):
+        return False
+    labels = tuple(label for label, _, _ in LINES)
+    return any(line.startswith(labels) for line in description.split('\n'))
+
+
 def gate(row, *, project, journal, actor, state, by_service, command, change):
-    """Refuse a gated change to a row with an honoured attestation, or None. On the web, the standing the row needs;
-    every host route refuses everyone, an operator included: an operator goes through admin.py decision-change."""
+    """Refuse a gated change, or None: to a row with an honoured attestation, or to a decision row carrying the lines of
+    section 6, attested or not (review of r2: a row with no honoured record must not stand open, and a task these lines
+    would turn into a decision is the same). On the web, the standing the row needs; every host route refuses everyone, an
+    operator included: an operator goes through admin.py decision-change."""
     records = history(row, project, journal)
-    if not records:
+    flips = changes_decision(row, change)
+    if not records and not (carries_lines(row) and (is_decision(row) or flips)):
         return None
-    if not change['status'] and not changes_decision(row, change):
+    if not change['status'] and not flips:
         return None
     what = 'change the status of' if change['status'] else 'change whether this row is a decision:'
     if not by_service:
-        return AttestRefusal(403, 'Refusing to %s %s: it carries an attestation. On the host, an operator does this '
+        return AttestRefusal(403, 'Refusing to %s %s: it is a decision that binds. On the host, an operator does this '
                                   'with admin.py decision-change. Nothing was written.' % (what, row.get('id')))
-    needed = OWNERS if needs_owner(records) else COORDINATORS
+    needed = OWNERS if (needs_owner(records) if records else owner_gated(row, None)) else COORDINATORS
     if authority(actor, project, state) in needed:
         return None
     who = 'a person owner' if needed is OWNERS else 'an owner or a coordinator'
-    return AttestRefusal(403, 'Refusing to %s %s: it carries an attestation, and only %s of %s, or an operator, may do '
+    return AttestRefusal(403, 'Refusing to %s %s: it is a decision that binds, and only %s of %s, or an operator, may do '
                               'that. Nothing was written.' % (what, row.get('id'), who, project))

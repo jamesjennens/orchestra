@@ -488,15 +488,22 @@ it), applied across levels.
   adoption's `Adopts:` pointer. An unrelated owner decision does not satisfy it. An agent never satisfies an owner-only
   rule on its own.
 - **Superseded:** only a counting row marks another superseded, and a chain does not pass through a row that does not
-  count.
-- **The gate on status, type and labels:** on a row with an honoured attestation, a status change (close, reopen, or any
+  count. A row that supersedes owner-level text needs owner-level attestation: from a coordinator or an agent it reads
+  `supersedes-owner-level`, marks nothing and binds nothing. The level is the same one the gate uses.
+- **The gate on status, type and labels:** on a row with an honoured attestation, and on any decision row carrying a
+  `Binds:`, `Adopts:`, `Owner-only:`, `Per:` or `Authorises:` line, attested or not, a status change (close, reopen, or any
   flag that moves status), or a type or label change that would start or stop the row being a decision, needs standing.
   An owner's level (a person owner or an operator) for a text that says `Owner-only: yes`, that carries `Authorises:`, or
-  an adoption a person owner or an operator attested; otherwise an owner or a coordinator, agents by the grant rule. That
-  level comes from the record, not from the text now. The web refuses anyone else with 403. Every host route refuses
+  an adoption a person owner or an operator attested; otherwise an owner or a coordinator, agents by the grant rule. Where
+  there is a record that level comes from the record, not from the text now. The web refuses anyone else with 403. Every host route refuses
   everyone, an operator included; an operator uses `admin.py decision-change`. A row moving from `in_progress` to
-  `open` through task assign or release does not reach this gate, and that changes nothing that binds. A row with no
-  attestation is not gated: retyping a task as a decision only makes a row that reads `not-attested`.
+  `open` through task assign or release does not reach this gate, and that changes nothing that binds. A decision row
+  with none of these lines and no attestation is not gated, and a task with none of them may be retyped: it reads
+  `not-attested`. The gate reads the row, so every status, type or label write costs one more read.
+- **Backup and restore:** the journal is in the backup. A restore under the same name honours the records. A restore under
+  a new name does not, on purpose: a record binds its project's name, and a new name is a new project. Its rows read
+  `not-attested`, its gate still stands, and adoptions elsewhere that pin the old name are not read as this one. An owner
+  of the new project attests them again.
 - **What a contributor can still do:** edit the text. That makes the row `attestation-stale`, which binds nothing and is
   visible, so it can only remove a binding, never create one. It is not refused.
 - **An adoption pins the text it saw:** the pin on an `Adopts:` or `Authorises:` line is the program decision's attestation
