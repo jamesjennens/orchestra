@@ -399,13 +399,16 @@ class AcceptanceTests(ReferenceCase):
             self.accept(3, 'f' * 64, operation_id='owner-apply-wrong')
         self.assertEqual(len(self.native.writes()), before)
 
-    def test_reaccepting_an_accepted_entry_writes_a_new_revision_and_evidence(self):
+    def test_reaccepting_an_accepted_entry_is_refused_without_writes(self):
         self.propose()
         self.accept(1, self.sha(1))
-        result = self.accept(2, self.sha(2), acceptance=acceptance(decision_id='decision-43'))
-        self.assertEqual((result['revision'], result['state']), (3, 'accepted'))
-        view = self.get()
-        self.assertEqual((view['record']['revision'], view['acceptance']['decision_id']), (3, 'decision-43'))
+        before = copy.deepcopy(self.native.rows)
+        self.native.calls = []
+        with self.assertRaisesRegex(ValueError, 'already accepted; nothing waits to be accepted'):
+            self.accept(2, self.sha(2), acceptance=acceptance(decision_id='decision-43'))
+        self.assertEqual(self.native.rows, before)
+        self.assertEqual(self.native.writes(), [])
+        self.assertEqual(self.get()['record']['revision'], 2)
 
     def test_a_contributor_revision_of_an_accepted_entry_is_proposed_not_accepted(self):
         self.propose()
@@ -484,9 +487,10 @@ class AcceptanceTests(ReferenceCase):
         view = self.get(operators=(OPERATOR, 'ops-ann'))
         self.assertEqual(view['state'], 'accepted')
         self.assertEqual(view['acceptance']['operator'], 'ops-ann')   # first in native order stands
-        # The writer's ledger no longer raises, so a later accept still works.
-        self.assertEqual(self.accept(2, accepted, actor=OPERATOR,
-                                     operators=(OPERATOR, 'ops-ann'))['revision'], 3)
+        # The ledger still permits accepting a genuine new pending draft.
+        self.revise(operation_id='later-draft', revision=3, expected_sha256=accepted)
+        self.assertEqual(self.accept(3, self.sha(3), actor=OPERATOR,
+                                     operators=(OPERATOR, 'ops-ann'))['revision'], 4)
 
     def test_differing_decision_evidence_for_one_revision_is_still_a_conflict(self):
         # Only a differing decision conflicts (kittrial-5bb.92 review item 3).

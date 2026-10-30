@@ -343,7 +343,8 @@ class BatchAcceptanceTests(CapabilityCase):
                               revision=2, expected_sha256=self.sha(1, 'a.three')), 'alice', self.native, self.project)
         stale = self.batch([{'key': 'a.two', 'revision': 2, 'record_sha256': 'f' * 64}, reviewed,
                             self.item('a.one', 1)], operation_id='batch-2')
-        self.assertEqual([item['result'] for item in stale['items']], ['refused', 'refused', 'already-accepted'])
+        self.assertEqual([item['result'] for item in stale['items']], ['refused', 'refused', 'refused'])
+        self.assertIn('already accepted', stale['items'][2]['reason'])
         self.assertIn('record_sha256 does not match', stale['items'][0]['reason'])
         self.assertIn('not the newest', stale['items'][1]['reason'])
         before = len(self.native.writes())
@@ -376,18 +377,21 @@ class BatchAcceptanceTests(CapabilityCase):
         self.assertEqual([call[0] for call in self.native.calls if call[0] in ('list', 'show', 'export')],
                          ['list', 'show', 'list', 'show', 'list', 'show'])
 
-    def test_reaccepting_an_accepted_revision_writes_a_new_revision_and_evidence(self):
+    def test_reaccepting_an_accepted_revision_is_refused_without_writes(self):
         self.batch([self.item('a.one')])
         first = self.read('get', 'a.one')
+        before = copy.deepcopy(self.native.rows)
         self.native.calls = []
         again = self.batch([self.item('a.one', 2)], operation_id='batch-again', decision='decision-8')
-        self.assertEqual([(item['result'], item['revision']) for item in again['items']], [('accepted', 3)])
-        writes = self.native.writes()
-        self.assertTrue(writes[0][3].startswith('Kind: capability-acceptance-v1\n'))
-        self.assertTrue(writes[1][3].startswith('Kind: capability-entry-v1\n'))
+        self.assertFalse(again['complete'])
+        self.assertEqual(again['items'][0]['result'], 'refused')
+        self.assertIn('already accepted; nothing waits to be accepted', again['items'][0]['reason'])
+        self.assertEqual(self.native.rows, before)
+        self.assertEqual(self.native.writes(), [])
         view = self.read('get', 'a.one')
-        self.assertEqual((view['record']['revision'], view['acceptance']['decision_id']), (3, 'decision-8'))
-        self.assertNotEqual(view['record']['sha256'], first['record']['sha256'])
+        self.assertEqual((view['record']['revision'], view['acceptance']['decision_id']),
+                         (first['record']['revision'], first['acceptance']['decision_id']))
+        self.assertEqual(view['record']['sha256'], first['record']['sha256'])
         self.assertEqual(view['record']['name'], first['record']['name'])
 
     def test_direct_accepted_revision_1_needs_an_owner(self):

@@ -1051,9 +1051,13 @@ revision the operator reviewed, by `revision` and `record_sha256`, and gets one 
   one item, never the whole batch. Each item reads only its own key and re-checks
   `revision` and `record_sha256` under its own hold: a capability revised between two
   items is seen, and its item is `refused` as stale.
-- **Re-accepting.** Naming a revision that is already accepted, and still the newest,
-  is a new decision: it writes the next revision with identical content, and new
-  evidence. `ref` acceptance follows the same rule.
+- **Re-accepting.** A fresh accept of a newest revision with live acceptance evidence
+  is refused; an exact same-operation retry still replays. To record a new decision,
+  revise the content to a pending draft and accept that draft. If the acceptance is
+  inert because its operator was removed, a currently listed operator may accept the
+  newest revision again to repair it, writing the next revision and new evidence.
+  `ref` acceptance follows the same rule; receipt-lost native-identical recovery is
+  described under [`ref`](#ref-the-reference-catalog).
 
 ### `capability check`: the drift check
 
@@ -1702,6 +1706,15 @@ sets `operation`.
     record.
   - A different operation proposing that key is refused until then, or until the
     operator releases the anchor (`admin.py anchor-release`).
+
+Reference and capability accepts consume a waiting draft: a fresh accept of a revision
+with live acceptance evidence is refused (HTTP 409, or the existing CLI/batch refusal),
+while an exact same-operation retry still replays. An entry whose acceptance went inert
+can be repaired by a currently listed operator accepting its newest revision again;
+this writes new acceptance evidence and, when naming the accepted revision itself,
+the next entry revision. If the acceptance receipt is lost, a
+native-identical retry, including an indistinguishable fresh identity naming the
+consumed draft, remains a successful no-op without a native write.
 
 Acceptance is not a client command. It is the operator's
 `admin.py reference-apply` ([operations](OPERATIONS.md#operator-commands)), for one

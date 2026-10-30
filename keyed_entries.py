@@ -218,6 +218,7 @@ class AnchoredKind:
             build_record=self.build_record,
             require_bound_key=self.require_bound_key,
             check_revision=self.check_revision,
+            check_accept_request=self.check_accept_request,
             check_acceptance=self.check_acceptance,
             acceptance_evidence=lambda bound, task, revision, record, actor: self.acceptance_evidence(
                 bound, task, revision, record, actor),
@@ -867,6 +868,48 @@ class AnchoredKind:
         if existing[payload['revision']]['sha256'] != payload['record_sha256']:
             raise ValueError('record_sha256 does not match revision %d of %s' % (payload['revision'], payload['key']))
 
+    def check_accept_request(self, payload, task, revision, existing, record, journal, prior, reconciled, row, operators=None):
+        """A fresh accept consumes a draft; preserve exact and native-only retries.
+
+        Native entry/evidence comments do not carry the acceptance operation ID.
+        If its receipt is lost, an identical native result remains a legacy no-op,
+        even for an indistinguishable fresh identity (kittrial-5bb.424 boundary 2).
+        """
+        if payload['operation'] != 'accept':
+            return
+        if prior is not None:
+            core.validate_receipt(prior)
+        if reconciled:
+            return
+
+        def already(number):
+            raise ValueError('Revision %d of %s is already accepted; nothing waits to be accepted'
+                             % (number, payload['key']))
+
+        if existing.get(revision) == record:
+            # An inert/voided former acceptance still needs current F3 evidence;
+            # preserve the existing operator-replacement/recovery path.
+            if revision not in self.live_acceptances(row, operators):
+                return
+            # The same native bytes alone cannot prove this request's identity.
+            # A retained acceptance receipt distinguishes a fresh request; without
+            # one the existing native-first recovery path must remain a no-op.
+            for path in journal.glob('*.json'):
+                if not core.SHA256_TEXT.fullmatch(path.stem):
+                    continue
+                receipt = core.read_host_json(path)
+                core.validate_receipt(receipt)
+                if (receipt.get('operation') == 'accept'
+                        and receipt.get('status') in ('pending', 'complete')
+                        and receipt.get('id') == task and receipt.get('revision') == revision):
+                    if (receipt['status'] == 'pending'
+                            or (receipt.get('acceptance') or {}).get('record_sha256') == record['sha256']):
+                        already(revision)
+            return
+        if (existing[payload['revision']]['acceptance_state'] != 'draft'
+                and payload['revision'] in self.live_acceptances(row, operators)):
+            already(payload['revision'])
+
     def revision_authors_on(self, row):
         """{revision_number: native_comment_author} for every readable entry revision on `row`."""
         authors = {}
@@ -1136,6 +1179,8 @@ class AnchoredKind:
         spec = copy.copy(self.spec)
         spec.validate = lambda payload, operator: self.validate_payload(
             payload, operator=operator, web_coordinator=web_coordinator)
+        spec.check_accept_request = lambda payload, task, revision, existing, record, journal, prior, reconciled, row: self.check_accept_request(
+            payload, task, revision, existing, record, journal, prior, reconciled, row, operators)
         spec.check_acceptance = lambda payload, existing, record, operator, row: self.check_acceptance(
             payload, existing, record, operator, row, run=run, party_check=party_check, seen=seen)
         spec.read_rows = lambda run, payload=None: self.live_rows(self.spec.read_rows(run, payload), operators)
