@@ -55,3 +55,38 @@ class InterfaceLockTests(unittest.TestCase):
                         result=endpoint.execute(root,{'action':'interface','args':['accept']})
                         self.assertEqual(503,result['records_status']);effect.assert_not_called()
                 finally:release.set();future.result(5)
+
+    @unittest.skipIf(os.name=='nt','endpoint is POSIX-only; HTTP lock uses the portable file_lock')
+    def test_project_membership_routes_and_interface_accept_serialize_in_both_orders(self):
+        import endpoint
+        import http_service
+        from types import SimpleNamespace
+        # Host creation is canonical for provisioning, but its owner-membership save
+        # is in this process. Its endpoint does not own the interface mutex.
+        for route,canonical in [('projects.create',False),('projects.host-create',True),('projects.confirm',False)]:
+            for first in ('interface','membership'):
+                with self.subTest(route=route,first=first),tempfile.TemporaryDirectory() as temp:
+                    root=Path(temp);entered=threading.Event();second_entered=threading.Event();release=threading.Event();order=[]
+                    def effect(name):
+                        with file_lock(root/(name+'.lock')):
+                            order.append(name+' start')
+                            if name==first:
+                                entered.set();self.assertTrue(release.wait(5))
+                            else:second_entered.set()
+                            order.append(name+' end')
+                        return {'returncode':0}
+                    handler=SimpleNamespace(backend=SimpleNamespace(root=root),
+                        _mutate_unlocked=lambda ctx,name,pid,fn,**kwargs:fn())
+                    def membership():
+                        return http_service.ApiHandler._mutate(handler,None,route,None,
+                            lambda:effect('membership'),capability='fixture',canonical=canonical)
+                    def interface():return endpoint.execute(root,{'action':'interface','args':['accept'],'project':'program'})
+                    calls={'interface':interface,'membership':membership}
+                    with patch.object(endpoint,'_execute',lambda *args,**kwargs:effect('interface')),ThreadPoolExecutor(2) as pool:
+                        try:
+                            one=pool.submit(calls[first]);self.assertTrue(entered.wait(5))
+                            other='membership' if first=='interface' else 'interface'
+                            two=pool.submit(calls[other]);self.assertFalse(second_entered.wait(.15))
+                        finally:release.set()
+                        self.assertEqual(0,one.result(5)['returncode']);self.assertEqual(0,two.result(5)['returncode'])
+                    self.assertEqual([first+' start',first+' end',other+' start',other+' end'],order)

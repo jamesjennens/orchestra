@@ -5954,8 +5954,11 @@ class ApiHandler(BaseHTTPRequestHandler):
     # -- mutation helper -------------------------------------------------------
     def _mutate(self, ctx, route_name, project_id, fn, **kwargs):
         root=getattr(self.backend,'root',None)
-        participates=route_name.startswith(('members.','accounts.','agents.'))
-        if root is not None and participates and not kwargs.get('canonical'):
+        # Project registration/creation establishes owner membership here, including
+        # canonical host provisioning whose endpoint does not take this mutex.
+        participates=(route_name in ('projects.create','projects.host-create','projects.confirm')
+                      or (route_name.startswith(('members.','accounts.','agents.')) and not kwargs.get('canonical')))
+        if root is not None and participates:
             import interface_lock
             try:
                 with interface_lock.held(root):
