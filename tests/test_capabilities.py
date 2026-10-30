@@ -410,9 +410,9 @@ class ResolveTests(Checkout):
         self.assertEqual(rows['pkg/core.py::helper.local_only']['reason'], 'symbol-missing')
         self.assertEqual(rows['pkg/missing.py::x']['reason'], 'file-missing')
         self.assertEqual(rows['docs/DESIGN.md#nope']['reason'], 'anchor-missing')
-        self.assertIsNone(rows['web/app.ts::render']['resolved'])
-        self.assertEqual(rows['web/app.ts::render']['reason'], 'unsupported-file-type')
-        self.assertEqual(result['summary'], {'resolved': 4, 'missing': 4, 'unknown': 1})
+        self.assertTrue(rows['web/app.ts::render']['resolved'])
+        self.assertEqual(rows['web/app.ts::render']['basis'], 'javascript')
+        self.assertEqual(result['summary'], {'resolved': 5, 'missing': 4, 'unknown': 0})
 
     def test_unsafe_pointers_are_refused_without_reading(self):
         pointers = ['../outside.py::f', '/etc/passwd', 'C:/x.py::f', 'pkg\\core.py::Engine',
@@ -494,7 +494,7 @@ class GraphTests(Checkout):
         ghost = self.lookup('ghost')['matches'][0]
         self.assertFalse(ghost['verified'])
         render = self.lookup('render')['matches'][0]
-        self.assertIsNone(render['verified'])
+        self.assertTrue(render['verified'])
 
     def test_resolve_uses_the_graph_only_for_files_ast_cannot_read(self):
         self.put_graph(graph_text())
@@ -502,7 +502,7 @@ class GraphTests(Checkout):
                                        'pkg/core.py::ghost', '--repo', str(self.root))
         self.assertEqual(code, 0, stderr)
         rows = {row['pointer']: row for row in result['results']}
-        self.assertEqual((rows['web/app.ts::render']['resolved'], rows['web/app.ts::render']['basis']), (True, 'graph'))
+        self.assertEqual((rows['web/app.ts::render']['resolved'], rows['web/app.ts::render']['basis']), (True, 'javascript'))
         self.assertEqual(rows['web/app.ts::missing']['reason'], 'symbol-missing')
         self.assertEqual((rows['pkg/core.py::ghost']['basis'], rows['pkg/core.py::ghost']['reason']),
                          ('ast', 'symbol-missing'))
@@ -762,7 +762,7 @@ class GitCheckoutTests(Checkout):
         self.assertFalse(self.lookup('ghost')['matches'][0]['verified'])
         code, result, _, _ = call('resolve', 'web/app.ts::render', '--repo', str(self.root))
         self.assertEqual((code, result['results'][0]['resolved'], result['results'][0]['basis']),
-                         (0, True, 'graph'))
+                         (0, True, 'javascript'))
         # Deleting the file is the other way out: the ast index, and nothing to warn about.
         graph.unlink()
         result = self.lookup('Engine')

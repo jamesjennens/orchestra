@@ -9619,13 +9619,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         # a label, null when not recorded. Data for the agent, never an instruction.
         projects = [{'id': p['id'], 'name': p['name'], 'repository': p.get('repository')}
                     for p in self.service.list_projects(ctx.principal)]
+        next_action = attention['actions'][0] if attention['actions'] else None
+        if next_action is None and not projects:
+            next_action = {'kind': 'no-project', 'reason': self.NO_PROJECT_NEXT_ACTION}
         return 200, {
             'agent': agent,
             'attention': self._agent_attention_view(agent, attention),
             # The agent's own claim limit and what holds it (kittrial-5bb.276), so an
             # agent can see what is in the way without reading the queue itself.
             'claim_limit': self._agent_claim_limit_view(agent, attention),
-            'next_action': attention['actions'][0] if attention['actions'] else None,
+            'next_action': next_action,
             'next_actions': attention['actions'],
             'projects': projects,
             'repositories_note': self.service.REPOSITORY_NOTE
@@ -10637,6 +10640,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: The order of the kinds that share a priority. The ORDER of ``next_actions`` is the
     #: contract; the priority numbers are not renumbered when a kind is added.
     AGENT_KIND_ORDER = {'review-recommended': 0, 'to-review': 1, 'claimable-task': 2}
+    NO_PROJECT_NEXT_ACTION = (
+        'No project is granted to this agent yet. Its person ticks projects under My agents; '
+        'a project appears there only once that person is a member of it.')
 
     def _agent_action(self, priority, kind, project_id, task, reason, **extra):
         task_id = task.get('id')

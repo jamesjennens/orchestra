@@ -364,6 +364,7 @@ class AgentRestContractTests(AgentHarness):
         self.assertEqual(1, first.data['attention']['counts']['claimable'])
         self.assertEqual(1, len(first.data['next_actions']))
         action = first.data['next_actions'][0]
+        self.assertEqual(action, first.data['next_action'])
         self.assertEqual('claimable-task', action['kind'])
         self.assertEqual(self.project, action['project'])
         self.assertIn('/v1/projects/%s/tasks/' % self.project, action['links']['task'])
@@ -378,6 +379,24 @@ class AgentRestContractTests(AgentHarness):
         second = self.request('GET', '/v1/agents/me/next', token=self.secret)
         self.assertEqual(2, second.data['attention']['counts']['claimable'])
         self.assertIsNotNone(second.data['generated_at'])
+
+    def test_agent_without_a_project_gets_owner_setup_guidance(self):
+        with_project = self.request('GET', '/v1/agents/me/next', token=self.secret)
+        self.assertEqual(200, with_project.status, with_project.data)
+        self.assertEqual([self.project], [p['id'] for p in with_project.data['projects']])
+        self.assertIsNone(with_project.data['next_action'])
+        _, secret, _ = self.agent_secret(self.alex, name='NoProjectAgent', projects=[])
+        nxt = self.request('GET', '/v1/agents/me/next', token=secret)
+        self.assertEqual(200, nxt.status, nxt.data)
+        self.assertEqual([], nxt.data['projects'])
+        self.assertEqual([], nxt.data['next_actions'])
+        self.assertEqual('idle', nxt.data['attention']['state'])
+        self.assertEqual('no-project', nxt.data['next_action']['kind'])
+        self.assertEqual('No project is granted to this agent yet. Its person ticks projects under My agents; '
+                         'a project appears there only once that person is a member of it.',
+                         nxt.data['next_action']['reason'])
+        self.assertNotIn(self.project, nxt.data['next_action']['reason'])
+        self.assertNotIn('Alpha', nxt.data['next_action']['reason'])
 
     def test_agent_claims_and_owner_sees_changes_requested_with_prompt(self):
         task = self.create_task(self.alex, self.project, 'first').data
@@ -1126,7 +1145,8 @@ class AgentAttentionAuthorizationTests(AgentHarness):
         self.assertEqual([], nxt.data['projects'])
         self.assertEqual('idle', nxt.data['attention']['state'])
         self.assertEqual(0, nxt.data['attention']['counts']['claimable'])
-        self.assertIsNone(nxt.data['next_action'])
+        self.assertEqual('no-project', nxt.data['next_action']['kind'])
+        self.assertNotIn(self.alpha, nxt.data['next_action']['reason'])
         self.assertNotIn('CONFIDENTIAL-after-removal', nxt.body.decode('utf-8'))
         self.assertNotIn(task.data['id'], nxt.body.decode('utf-8'))
         self.assertNotIn(self.alpha, json.dumps(nxt.data['attention']))
