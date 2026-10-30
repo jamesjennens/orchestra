@@ -270,7 +270,7 @@ class Snapshot:
                     field = FIELD_OF.get(where, where)
                     for pointer in parse_context_pointers(text):
                         # kittrial-5bb.449: decision tokens are traceability kinds too (QUALIFIED_KINDS).
-                        if pointer['kind'] in ('req', 'design', 'decision'):
+                        if pointer['kind'] in ('req', 'design', 'decision', 'iface'):
                             fields.setdefault(field, []).append((where, pointer))
                 cited = []
                 for field in FIELDS:

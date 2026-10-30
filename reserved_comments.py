@@ -194,6 +194,9 @@ PROPOSAL_PREFIX = 'Kind: requirement-proposal-v1\n'
 PROPOSAL_DISPOSITION_PREFIX = 'Kind: proposal-disposition-v1\n'
 CONTRIBUTION_SETTINGS_PREFIX = 'Kind: contribution-settings-v1\n'
 CAPABILITY_ENTRY_PREFIX = 'Kind: capability-entry-v1\n'
+CAPABILITY_ENTRY_V2_PREFIX = 'Kind: capability-entry-v2\n'
+INTERFACE_ENTRY_PREFIX = 'Kind: interface-entry-v1\n'
+INTERFACE_ACCEPTANCE_PREFIX = 'Kind: interface-acceptance-v1\n'
 CAPABILITY_ACCEPTANCE_PREFIX = 'Kind: capability-acceptance-v1\n'
 CAPABILITY_VERIFICATION_PREFIX = 'Kind: capability-verification-v1\n'
 CAPABILITY_ALIAS_PREFIX = 'Kind: capability-alias-v1\n'
@@ -272,6 +275,9 @@ RESERVED = (
     (PROPOSAL_DISPOSITION_PREFIX, 'proposal disposition', 'admin.py proposal-review|proposal-decide on the coordination host'),
     (CONTRIBUTION_SETTINGS_PREFIX, 'contribution settings', 'admin.py proposal-settings on the coordination host'),
     (CAPABILITY_ENTRY_PREFIX, 'capability entry', 'capability propose|revise'),
+    (CAPABILITY_ENTRY_V2_PREFIX, 'capability entry', 'capability propose|revise'),
+    (INTERFACE_ENTRY_PREFIX, 'interface entry', 'interface propose|revise'),
+    (INTERFACE_ACCEPTANCE_PREFIX, 'interface acceptance', 'admin.py interface-apply'),
     (CAPABILITY_ACCEPTANCE_PREFIX, 'capability acceptance evidence', 'admin.py capability-apply'),
     (CAPABILITY_VERIFICATION_PREFIX, 'capability verification', 'capability check --record (capability verify)'),
     (CAPABILITY_ALIAS_PREFIX, 'capability alias', 'capability propose-alias|alias-reject'),
@@ -821,7 +827,7 @@ def raw_file_flag_in_args(args):
 # either before a later slice turns writes on.
 RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:',
                            'reference:', 'reference-key:', 'proposal:', 'proposal-key:',
-                           'capability:', 'capability-key:', 'open-item:')
+                           'capability:', 'capability-key:', 'interface:', 'interface-key:', 'open-item:')
 # `gt:slot` marks a project's merge slot (coordination.MERGE_SLOT_LABEL). One
 # `--remove-label gt:slot` by a contributor put the slot back among claimable work
 # and a claim then jammed it (kittrial-5bb.113 review), so no contributor adds,
@@ -944,7 +950,8 @@ RECORD_ANCHOR_FAMILIES = {
                   REFERENCE_ACCEPTANCE_PREFIX),
     'proposal': (PROPOSAL_PREFIX, PROPOSAL_DISPOSITION_PREFIX),
     'contribution-settings': (CONTRIBUTION_SETTINGS_PREFIX,),
-    'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
+    'interface': (INTERFACE_ENTRY_PREFIX, INTERFACE_ACCEPTANCE_PREFIX),
+    'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ENTRY_V2_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
                    CAPABILITY_VERIFICATION_PREFIX, CAPABILITY_ALIAS_PREFIX),
     # kittrial-5bb.126. There is deliberately no family for coordinator-decision: its
     # native decision issue is a real work item and stays visible; only the comment hides.
@@ -953,12 +960,12 @@ RECORD_ANCHOR_FAMILIES = {
 RECORD_ANCHOR_LABELS = frozenset(RECORD_ANCHOR_FAMILIES)
 RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: proposal-disposition-', 'Kind: contribution-settings-',
-                           'Kind: capability-', 'Kind: open-item-', 'Kind: item-resolution-',
+                           'Kind: capability-', 'Kind: interface-', 'Kind: open-item-', 'Kind: item-resolution-',
                            'Kind: owner-answer-', 'Kind: coordinator-decision-', 'Kind: design-index-',
                            'Kind: design-verification-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
-SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3)})
+SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3), ('capability-entry', 2)})
 
 
 def carries_record_label(row):

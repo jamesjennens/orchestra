@@ -3467,3 +3467,67 @@ before the first new-family write. Do not use an older kit to take backups of a
 project with baselines: that kit does not enumerate this family and cannot preserve
 it. Keep the compatible kit and complete sidecar/native backup together. This
 feature does not authorize deployment or restoration of a live project.
+
+### Interface register mutations and recovery
+
+The program interface register uses native closed anchors and the shared record
+journal, not a second database. A configured operator may use
+`admin.py --root ROOT interface-apply PROGRAM --actor OPERATOR --file payload.json
+[--state PRIVATE_HTTP_STATE]`. Payloads are the shared `draft`
+(direct accepted first entry) or `accept` shapes, with interface content and F3
+acceptance. `--state` supplies current membership/accounts when program links were
+accepted by web owners; without it only operator-backed sides can be established.
+Web writes recheck the principal's own authority; a host actor label never grants
+coordinator permission. The new delegation scope is `interfaces`, not an expansion
+of an older reference/capability grant. Acceptance/retirement cannot fetch a URL or
+run a schema. Compatibility is unverified until the separately reviewed verifier
+slice ships.
+
+**Lock order:** the deployment's `.interface-mutations.lock` first, then ordinary
+project coordination locks, then the existing authority/journal locks. Canonical
+reference/capability/interface write entry points participate, including v1
+capability revisions that withdraw prior v2 consumers. The relevant operator
+apply/retire/reconcile/void/release/allowlist and authority-restore CLI paths
+participate too. Web account/member/agent authority changes participate before
+their store mutation. Never take this lock from inside a caller already holding a
+project lock; direct library callers must provide the same order. The five-second
+acquisition bound returns **503 busy** at the endpoint, with no project effect;
+retry the identical operation later. The lock is held for the check and write,
+including its authorized per-area reads; it is not held across a worker's whole
+plan, human review, network calls to another installation, or a test suite. A
+process exiting releases the OS lock; the file itself is not a reservation.
+Direct edits, raw operator bd commands and other programs outside these entry
+points bypass this discipline, just as they bypass the kit's project locks.
+
+Retirement is a state-only draft followed by acceptance, not a successor-key
+retirement. The complete-view check runs **as the acceptor**, with no privileged
+fallback and no decision override in slice 3a. An unreadable, absent, unsupported,
+malformed or truncated area/catalog is not evidence of zero consumers. A known
+consumer blocks regardless of the minor revision it pins. A later capability may
+still declare consumption of a retired major; the register then reports
+`consumes-retired`. The mutex prevents it racing the retirement check; it does not
+silently rewrite that later declaration or claim the consumer vanished.
+
+New-major acceptance and predecessor deprecation are two native entries. The
+new-major F3/G1 check runs first. Deprecation changes only predecessor `state`,
+with its own bound acceptance evidence, and preserves its schema/meaning/owner.
+A pending predecessor draft blocks a new-major acceptance. A cut after the new
+major commits can leave deprecation pending; the operation has not completed.
+Exact retries reconcile the immutable plan and evidence before appending the
+missing revision. Never infer cross-entry atomicity, release that operation or
+allocate a new identity to get around it. If the original authorized actor cannot
+retry, a configured operator completes it with
+`interface-reconcile PROGRAM --operation-id ID --actor OPERATOR --reason TEXT
+--disposition complete`; its own new evidence re-attests the same state-only plan.
+Conflicting predecessor content/revision remains a refusal requiring inspection,
+not an automatic overwrite. `record-reconcile --kind interface` is the equivalent
+operator entry point. Ordinary anchor release and void repair include interfaces;
+a void cannot erase a revision that still carries live acceptance evidence.
+
+Back up `.interface-requests/` **and** `.interface-transitions/` with the native
+project directory. Both join the validated coordination sidecar and pending-
+reservation inventory; transition bodies additionally validate the exact planned
+record/evidence and identity/path binding. Backup/restore retains incomplete
+plans instead of pretending only the first entry exists. Keep normal private
+sidecar permissions. The deployment mutex file needs no restoration of ownership
+state. No schema cache, interface verifier or runtime registry is introduced here.

@@ -42,6 +42,8 @@ def _endpoint_module(case):
     return endpoint
 
 
+from tests.lock_fixture import ordinary_calls
+
 class ClientRoutingTests(unittest.TestCase):
     def test_the_client_routes_the_ref_action(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -161,7 +163,7 @@ class OperatorCommandTests(unittest.TestCase):
             json.dumps({'password': 'x', 'unit': 'none', 'operators': [OPERATOR]}), encoding='utf-8')
         self.native = RefNative()
         for patcher in (patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
-                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}),
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}),
                         patch('time.gmtime', return_value=TODAY)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -233,7 +235,7 @@ class OperatorCommandTests(unittest.TestCase):
         self.assertEqual((result['complete'], result['stopped'], result['accepted'], result['refused']),
                          (False, False, 2, 1))
         # The batch receipt, three items, the batch receipt again: five separate holds.
-        self.assertEqual(flock.call_count, 5)
+        self.assertEqual(len(ordinary_calls(flock)), 5)
         for key in ('calendar.trading', 'office.server.check'):
             view = rr.get(rr.read_key_rows(self.native, key), key, [OPERATOR])
             self.assertEqual((view['state'], view['acceptance']['operator']), ('accepted', OPERATOR))

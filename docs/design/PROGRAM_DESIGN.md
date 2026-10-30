@@ -494,3 +494,16 @@ web service's read (`program_links_read`), with no change to the records.
 - Slice 3's register is useful as a catalog even before the view.
 - Slice 4 shows whatever slices 1-3 recorded.
 - Slice 5 adds the decision columns.
+
+## Slice 3a implementation boundary
+
+The interface record/catalog, capability v2 declarations, pinned `iface:` tokens,
+acceptance/deprecation and strict complete-view retirement are slice 3a. The schema
+compatibility verifier in §4.3/§9.3 is the separately reviewed slice 3b; slice 3a
+reports compatibility-unverified and does not fetch/parse schemas. The initial
+accepted content declares `initial`; subsequent content changes within a major
+must declare `additive`. A new major names the predecessor; state-only deprecation
+is journaled across two entries and replayable, not atomically committed with it.
+An already retired predecessor stays retired. No decision override of retirement
+is implemented in this slice. See OPERATIONS for the bounded deployment-before-
+project lock order, actor-scoped area reads, and operator recovery/backup paths.

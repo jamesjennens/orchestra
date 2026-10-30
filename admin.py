@@ -3837,7 +3837,7 @@ RETIRED_DIR='retired'
 RETIRE_JOURNAL='journal.jsonl'
 #: The receipt journals whose ``pending`` entries are reservations still in flight.
 RESERVATION_JOURNALS=('.coordination-requests','.requirement-requests','.handoff-requests',
-                      '.reference-requests','.proposal-requests','.capability-requests',
+                      '.reference-requests','.proposal-requests','.capability-requests','.interface-requests','.interface-transitions',
                       '.open-item-requests','.requirement-owner-requests')
 
 def retired_entries(root):
@@ -4301,7 +4301,7 @@ def backup_lock(root,name):
 # kittrial-5bb.126 (open items design, slice 0) adds `.open-item-requests`, which no
 # kit writes yet either. The host-issued `.owner-answers` journal is not a receipt
 # journal: see OWNER_ANSWERS_JOURNAL.
-RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.open-item-requests','.requirement-owner-requests')
+RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.interface-requests','.interface-transitions','.open-item-requests','.requirement-owner-requests')
 #: The host-issued owner answer and owner decision journal of the open items design
 #: (kittrial-5bb.126, slice 0). Nothing writes it yet. It is backed up when present and
 #: validated by its reader's own validator, open_items.validate_owner_entry, exactly
@@ -4351,6 +4351,11 @@ def validate_record_receipt(name,record):
     """
     from requirement_records import validate_receipt
     validate_receipt(record)
+    if name.startswith('.interface-transitions/'):
+        from interface_records import validate_transition
+        validate_transition(record)
+        if name!='.interface-transitions/'+content_hash({'operation_id':record['operation_id']})+'.json':
+            raise ValueError('Interface transition receipt path mismatch')
     if name.startswith('.requirement-owner-requests/'):
         from requirement_http import validate_receipt as validate_owner_receipt
         validate_owner_receipt(record)
@@ -4372,7 +4377,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.interface-requests|\.interface-transitions|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
         baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
         if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
@@ -5319,7 +5324,7 @@ def revoked_keyed_voids(root,actor,limit=5):
     allowlist and the allowlist without `actor`, read by the reader every other read
     uses. Read-only and best-effort, like `revoked_revert_records`.
     """
-    import capability_records,reference_records
+    import capability_records,reference_records,interface_records
     authority=operators(root)
     remaining=frozenset(item for item in authority if item!=actor)
     count=0;changed=[];unreadable=0
@@ -5329,7 +5334,7 @@ def revoked_keyed_voids(root,actor,limit=5):
         except (OSError,ValueError,TypeError,KeyError,subprocess.CalledProcessError):
             unreadable+=1
             continue
-        for kind in (reference_records.KIND,capability_records.KIND):
+        for kind in (reference_records.KIND,capability_records.KIND,interface_records.KIND):
             for row in rows:
                 if not isinstance(row,dict) or kind.type_label not in (row.get('labels') or []):continue
                 mine=[payload for payload,comment in kind.applied_voids(row,authority)[0] if comment.get('author')==actor]
@@ -10414,6 +10419,22 @@ class _OnceFlag(argparse.Action):
         setattr(namespace,self.dest,values)
 
 def main():
+    import interface_lock
+    words=sys.argv[1:]
+    root_parser=argparse.ArgumentParser(add_help=False)
+    root_parser.add_argument('--root')
+    root_arg=root_parser.parse_known_args(words)[0].root
+    participating=any(v in words for v in ('interface-apply','interface-reconcile','reference-apply','capability-apply',
+        'capability-retire','record-reconcile','reference-reconcile','capability-reconcile',
+        'void-record','anchor-release','operators','verifiers',
+        '--restore-operators','--restore-verifiers','--restore-http-state'))
+    if root_arg is not None and participating:
+        with interface_lock.held(Path(root_arg)):
+            return _main()
+    return _main()
+
+
+def _main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
     sub=p.add_subparsers(dest='command',required=True)
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
@@ -10477,6 +10498,8 @@ def main():
     a.add_argument('--dry-run',action='store_true',dest='dry_run',help='name the files without removing them')
     a.add_argument('--min-age-minutes',type=int,dest='min_age_minutes',default=60,
                    help='only remove a temporary at least this old (default 60; minimum 5)')
+    a=sub.add_parser('interface-apply',help='apply an interface draft/acceptance (operator only)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True);a.add_argument('--state',help='HTTP authority state for live owner-backed program links')
     a=sub.add_parser('reference-apply',help='accept a reference catalog entry, or a batch of them with items (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('proposal-review',help='record a coordinator disposition on a requirement proposal (operator allowlist)')
@@ -10493,13 +10516,13 @@ def main():
     a.add_argument('--to',metavar='IDENTITY',help='account:<uid> or person:<name>')
     a.add_argument('--unmap-actor',dest='unmap_actor',metavar='ACTOR');a.add_argument('--unmap-namespace',dest='unmap_namespace',metavar='NAME')
     a.add_argument('--add-decider',dest='add_decider',metavar='IDENTITY');a.add_argument('--remove-decider',dest='remove_decider',metavar='IDENTITY')
-    for name in ('reference-reconcile','capability-reconcile','proposal-reconcile','record-reconcile'):
+    for name in ('reference-reconcile','capability-reconcile','interface-reconcile','proposal-reconcile','record-reconcile'):
         a=sub.add_parser(name);a.add_argument('project');a.add_argument('--operation-id',required=True)
         a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
         a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
         a.add_argument('--issue-id',dest='issue_id',default=None,
                        help='with --disposition complete, the exact native record to confirm')
-        if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability','proposal'],required=True)
+        if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability','interface','proposal'],required=True)
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('attest-delivery',help='a listed verifier reads a delivered BUNDLE file ON THIS HOST (its bytes, '
                                             'SHA-256 and advertised heads) and writes the verifier attestation from '
@@ -10519,7 +10542,7 @@ def main():
     a.add_argument('--operation-id',dest='operation_id',default=None,
                    help='a stable id so an interrupted run retries as the same record')
     a=sub.add_parser('anchor-release',help='close a reference or capability anchor that holds no record and free its key, or with --duplicate release a named duplicate anchor of a key (operator allowlist)')
-    a.add_argument('project');a.add_argument('--kind',choices=['reference','capability'],required=True)
+    a.add_argument('project');a.add_argument('--kind',choices=['reference','capability','interface'],required=True)
     a.add_argument('--issue-id',dest='issue_id',required=True);a.add_argument('--actor',required=True)
     a.add_argument('--reason',required=True)
     a.add_argument('--duplicate',action='store_true',
@@ -11200,6 +11223,29 @@ def main():
                     raise ValueError('Owner requirement recovery needs --state with the existing web service state document')
                 print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
                                            args.disposition,run,issue_id=args.issue_id)))
+    elif args.command=='interface-apply':
+        import interface_records
+        from http_authority import file_lock
+        path=project_dir(root,args.project)
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        payload.setdefault('operation','accept')
+        authority=operators(root,strict=True)
+        core_actor=args.actor
+        if core_actor not in authority: raise ValueError('Only a configured operator applies interfaces')
+        def run(argv): return run_bd(root,args.project,['--actor',args.actor,*argv])
+        def read_project(other):
+            other_path=project_dir(root,other)
+            if not (other_path/'.beads/metadata.json').is_file():return None
+            def rows():return [record_json.loads_row(line) for line in run_bd(root,other,['export','--all']).splitlines() if line.strip()]
+            if other==args.project:return rows()
+            with file_lock(other_path/'.coordination.lock',shared=True):return rows()
+        from http_authority import read_state
+        state=read_state(args.state) if args.state else {}
+        context=interface_records.ProgramContext(args.project,read_project,operators=authority,
+            memberships=state.get('memberships'),users=state.get('users'))
+        with file_lock(path/'.coordination.lock'):
+            with interface_records.context(context):
+                print(json.dumps(interface_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)))
     elif args.command=='reference-apply':
         import contextlib
         import fcntl
@@ -11352,10 +11398,12 @@ def main():
                 result=proposal_records.dispose(payload,args.actor,run,path,operators=authority,
                                                 route='decide' if args.command=='proposal-decide' else 'review')
         print(json.dumps(result))
-    elif args.command in ('reference-reconcile','capability-reconcile','proposal-reconcile','record-reconcile'):
+    elif args.command in ('reference-reconcile','capability-reconcile','interface-reconcile','proposal-reconcile','record-reconcile'):
         import fcntl
-        kind={'reference-reconcile':'reference','capability-reconcile':'capability','proposal-reconcile':'proposal'}.get(args.command) or args.kind
-        if kind=='reference':from reference_records import reconcile as record_reconcile
+        kind={'reference-reconcile':'reference','capability-reconcile':'capability','interface-reconcile':'interface','proposal-reconcile':'proposal'}.get(args.command) or args.kind
+        if kind=='interface':
+            from interface_records import reconcile as record_reconcile
+        elif kind=='reference':from reference_records import reconcile as record_reconcile
         elif kind=='capability':from capability_records import reconcile as record_reconcile
         elif kind=='proposal':from proposal_records import reconcile as record_reconcile
         else:from requirement_records import reconcile as record_reconcile
@@ -11371,7 +11419,7 @@ def main():
             # review 01a10180). A reference or capability reconcile reads it strictly too,
             # only to decide which operator voids apply when `complete` confirms the anchor
             # holds a live record (kittrial-5bb.74 review); requirements do not take it.
-            extra={'operators':operators(root,strict=True)} if kind in ('proposal','reference','capability') else {}
+            extra={'operators':operators(root,strict=True)} if kind in ('proposal','reference','capability','interface') else {}
             print(json.dumps(record_reconcile(path,args.operation_id,args.actor,args.reason,
                                               args.disposition,run,issue_id=args.issue_id,**extra)))
     elif args.command=='anchor-release':
@@ -11380,6 +11428,7 @@ def main():
         # payload is lost. Host route only: the allowlist is the authority.
         import fcntl
         if args.kind=='reference':import reference_records as records
+        elif args.kind=='interface':import interface_records as records
         else:import capability_records as records
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
@@ -11403,8 +11452,8 @@ def main():
             if payload.get('target_kind') in KEYED_KIND_PREFIXES:
                 # A record on a reference or capability anchor (kittrial-5bb.74): the anchor's
                 # kind owns the void and reads only that anchor.
-                import capability_records,reference_records
-                kind=next((k for k in (reference_records.KIND,capability_records.KIND)
+                import capability_records,reference_records,interface_records
+                kind=next((k for k in (reference_records.KIND,capability_records.KIND,interface_records.KIND)
                            if payload['target_kind'].startswith(k.family)),None)
                 if kind is None:raise ValueError('Unsupported operator void target kind')
                 print(json.dumps(kind.apply_void(payload,args.actor,run,authority)))

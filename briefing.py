@@ -553,7 +553,7 @@ def inline_context_text(value):
     return plain_text(text)
 
 
-CONTEXT_POINTER_RE = re.compile(r'(task|comment|ref|cap|item|file|room|commit|doc|archive|req|design|decision):([A-Za-z0-9._/#:@-]{1,200})\Z')
+CONTEXT_POINTER_RE = re.compile(r'(task|comment|ref|cap|item|file|room|commit|doc|archive|req|design|decision|iface):([A-Za-z0-9._/#:@-]{1,200})\Z')
 # The traceability kinds (TRACEABILITY_DESIGN.md §2.4) also fix their value's shape;
 # a value outside it is prose, like any token outside the grammar (§2.1). `@` is
 # legal only as the one revision separator of a `req` value, so the ten older kinds
@@ -564,7 +564,7 @@ DESIGN_POINTER_VALUE_RE = re.compile(r'([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]
 DECISION_POINTER_VALUE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}\Z')
 #: The kinds that take a project qualifier: `KIND:<project>/<value>` (PROGRAM_DESIGN §3.1). The part before the
 #: first `/` is always a project, so a requirement key containing `/` is cited qualified, even in its own project.
-QUALIFIED_KINDS = ('req', 'design', 'decision')
+QUALIFIED_KINDS = ('req', 'design', 'decision', 'iface')
 CONTEXT_POINTER_ITEM_MAX = 10
 CONTEXT_POINTER_BRIEF_MAX = 50
 
@@ -582,7 +582,11 @@ def parse_context_pointers(text):
         if kind in QUALIFIED_KINDS and value.startswith('/'):
             continue                                   # a qualifier names a project; an empty one is prose
         local=value.split('/',1)[1] if kind in QUALIFIED_KINDS and '/' in value else value
-        if kind=='req':
+        if kind=='iface':
+            from interface_records import token as interface_token
+            try: interface_token(token)
+            except ValueError: continue
+        elif kind=='req':
             if not REQ_POINTER_VALUE_RE.fullmatch(local):
                 continue
         elif kind=='design':
@@ -853,7 +857,32 @@ class ContextPointers:
                 entry['project']=project
             self._load()
             entry['state']='unavailable'
-            if kind=='req':
+            if kind=='iface':
+                import interface_records
+                label, follow = None, None
+                _project, key, revision = interface_records.token('iface:' + value, self.project)
+                try:
+                    selected = interface_records.KIND.find_entry(self.rows, key, self.operators or ())
+                    rec = (selected.get('record') or {})
+                    revisions = {}
+                    for row in self.rows:
+                        if row.get('id') == selected.get('native_id'):
+                            live_row = interface_records.KIND.live_row(row,self.operators or ())[0]
+                            revisions = interface_records.KIND.existing_revisions(live_row)
+                            evidence = interface_records.KIND.live_acceptances(live_row,self.operators or ())
+                    wanted = revisions.get(revision)
+                    if wanted is None:
+                        entry['flags'] = ['unknown-revision']
+                    elif (wanted['acceptance_state'] != 'accepted' or rec.get('revision', 0) < revision
+                          or evidence.get(revision,{}).get('record_sha256') != wanted['sha256']):
+                        entry['flags'] = ['draft']
+                    else:
+                        entry.update(state='live' if rec.get('revision') == revision else 'superseded',
+                                     flags=[wanted['state']] if wanted['state'] in ('retired', 'deprecated') else [])
+                        label, follow = wanted['name'], 'interface get ' + key
+                except ValueError:
+                    entry['flags'] = ['unknown-key']
+            elif kind=='req':
                 match=REQ_POINTER_VALUE_RE.fullmatch(value)
                 label,follow=self._requirement(entry,match[1],int(match[2]) if match[2] else None)
             elif kind=='design':

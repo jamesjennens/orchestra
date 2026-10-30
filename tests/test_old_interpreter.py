@@ -53,7 +53,7 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'followon.py',  # kittrial-5bb.343: library-only (no __main__ block); imported by work/endpoint
            'guidance.py', 'handoff.py',
            'handover_steps.py',  # kittrial-5bb.442: library-only (no __main__ block); imported by http_service
-           'host_reads.py', 'http_auth.py', 'http_authority.py',
+           'host_reads.py', 'http_auth.py', 'http_authority.py', 'interface_lock.py', 'interface_records.py',
            'keyed_entries.py', 'keyed_records.py', 'lane_state.py', 'lanes.py', 'lifecycle_audit.py', 'nudges.py', 'lifecycle_voids.py', 'native.py', 'nudge_messages.py', 'onboarding.py', 'open_items.py',
            'program_links.py',  # kittrial-5bb.446: library-only (no __main__ block); imported by reference_records and http_service
            'project_coordination.py', 'project_creation.py', 'project_setup.py', 'proposal_records.py', 'raw_lifecycle.py', 'read_cache.py', 'record_acceptance.py', 'record_json.py', 'recovery.py', 'regular_file.py',

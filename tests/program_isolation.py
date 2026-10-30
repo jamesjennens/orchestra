@@ -19,6 +19,8 @@ AREA_READS = (
     ('project', '/v1/projects/{project}'),
     ('tasks', '/v1/projects/{project}/tasks'),
     ('references', '/v1/projects/{project}/references'),
+    ('interfaces', '/v1/projects/{project}/interfaces'),
+    ('interface-detail', '/v1/projects/{project}/interfaces/iface.synthetic.v1'),
     ('member-of', '/v1/projects/{project}/references/program.member-of'),
     ('program-links', '/v1/projects/{project}/program-links'),
     ('notes', '/v1/projects/{project}/notes'),
@@ -33,7 +35,9 @@ PERSONAL_READS = (
     ('agent-wait-coordinator', '/v1/agents/me/wait?form=coordinator'),
 )
 #: Every route handler whose pattern mentions "program", with the read above that covers it.
-PROGRAM_ROUTES = {'program_links_read': 'program-links', 'notes_read': 'notes', 'notes_write': 'notes',
+PROGRAM_ROUTES = {'interfaces_list':'interfaces','interfaces_get':'interface-detail',
+                  'interfaces_propose':'interfaces','interfaces_revise':'interfaces','interfaces_accept':'interfaces',
+                  'program_links_read': 'program-links', 'notes_read': 'notes', 'notes_write': 'notes',
                   'notes_noted': 'notes', 'me_notes': 'me-notes'}
 
 
@@ -71,7 +75,7 @@ def assert_outsiders_see_nothing(test, request, area, missing, callers):
 def program_routes(routes):
     """The handler names of the routes whose pattern mentions "program" or "notes", from ``http_service.ROUTES``."""
     return sorted({name for _method, compiled, name, *_rest in routes
-                   if 'program' in compiled.pattern.lower() or 'notes' in compiled.pattern.lower()})
+                   if 'program' in compiled.pattern.lower() or 'notes' in compiled.pattern.lower() or 'interfaces' in compiled.pattern.lower()})
 
 
 def covered_reads():

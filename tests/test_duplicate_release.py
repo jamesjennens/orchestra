@@ -620,7 +620,7 @@ class AdminCommandTests(ReleaseCase):
             json.dumps({'password': 'x', 'unit': 'none', 'operators': [OPERATOR]}), encoding='utf-8')
         self.flock = Mock()
         for patcher in (patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
-                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)})):
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.store = self.native(anchor(cr, 'one'), anchor(cr, 'two'))

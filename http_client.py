@@ -861,6 +861,22 @@ class Client:
         qs = '?' + urlencode({'q': q, 'limit': str(limit)})
         return self.request('GET', '/v1/projects/%s/capabilities/find%s' % (quote(project, safe=''), qs))
 
+    def list_interfaces(self,project,*,limit=None,cursor=None):
+        query={k:v for k,v in {'limit':limit,'cursor':cursor}.items() if v is not None}
+        return self.request('GET','/v1/projects/%s/interfaces%s'%(quote(project,safe=''),('?' + urlencode(query)) if query else ''))
+
+    def get_interface(self,project,interface_key):
+        return self.request('GET','/v1/projects/%s/interfaces/%s'%(quote(project,safe=''),quote(interface_key,safe='')))
+
+    def propose_interface(self,project,body,key=None):
+        return self._write_record('POST','/v1/projects/%s/interfaces'%quote(project,safe=''),body,key)
+
+    def revise_interface(self,project,interface_key,body,key=None):
+        return self._write_record('PATCH','/v1/projects/%s/interfaces/%s'%(quote(project,safe=''),quote(interface_key,safe='')),body,key)
+
+    def accept_interface(self,project,interface_key,body,key=None):
+        return self._write_record('POST','/v1/projects/%s/interfaces/%s/accept'%(quote(project,safe=''),quote(interface_key,safe='')),body,key)
+
     def get_capability(self, project, cap_key):
         return self.request('GET', '/v1/projects/%s/capabilities/%s'
                             % (quote(project, safe=''), quote(cap_key, safe='')))

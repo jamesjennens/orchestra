@@ -35,6 +35,8 @@ KEY = 'review.structured-contribution'
 COMMIT = '1' * 40
 
 
+from tests.lock_fixture import ordinary_calls
+
 class VerifiersCase(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -48,7 +50,7 @@ class VerifiersCase(unittest.TestCase):
         self.marker = self.root / 'deployment.private.json'
         self.configure(operators=[OPERATOR])
         self.flock = Mock()
-        for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)}),
+        for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}),
                         patch('time.gmtime', return_value=TODAY)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -178,7 +180,7 @@ class HostVerifyTests(VerifiersCase):
         self.flock.reset_mock()
         done = self.verify(VERIFIER, {'schema_version': 1, 'items': [self.payload()]})
         self.assertEqual((done['items'][0]['result'], done['recorded'], done['refused']), ('recorded', 1, 0))
-        self.assertEqual(self.flock.call_count, 1)        # one hold of the coordination lock per item
+        self.assertEqual(len(ordinary_calls(self.flock)), 1)        # one hold of the coordination lock per item
         self.assertEqual(self.state(), 'verified')
         self.assertEqual(self.verify(VERIFIER)['items'][0]['result'], 'already-recorded')
         # An operator needs no verifiers entry.

@@ -36,7 +36,7 @@ class BackupTests(unittest.TestCase):
         self.flock = Mock()
         # ``add-project`` takes the creation lock too (kittrial-5bb.176), so the stand-in
         # needs the whole fcntl surface ``http_authority.file_lock`` uses.
-        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         self.patcher = patch.dict(sys.modules, {'fcntl': self.fake_fcntl})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
@@ -829,7 +829,7 @@ class RequirementJournalBackupTests(unittest.TestCase):
                          'evidence': {'source-1.1': 'decision-bf'}}
         self.flock = Mock()
         # As above: the creation lock ``add-project`` now takes uses the same surface.
-        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         self.patcher = patch.dict(sys.modules, {'fcntl': self.fake_fcntl})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)

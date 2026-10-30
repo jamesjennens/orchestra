@@ -100,8 +100,9 @@ SESSION_MARKER = re.compile(r'session-[0-9a-f]{4}|/session[0-9]*(?:$|/)|(?:^|[^A
 REQUIREMENT_KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}')
 ENTRY_FIELDS = ('schema_version', 'key', 'revision', 'name', 'aliases', 'summary', 'requirements', 'anchors',
                 'code', 'tests', 'owner', 'tags', 'acceptance_state', 'successor', 'sha256')
+ENTRY_V2_PREFIX = 'Kind: capability-entry-v2\n'
 CONTENT_FIELDS = ('key', 'name', 'aliases', 'summary', 'requirements', 'anchors', 'code', 'tests', 'owner',
-                  'tags')
+                  'tags', 'interfaces')
 ALIAS_FIELDS = ('schema_version', 'key', 'alias', 'normalized', 'action', 'evidence', 'reason', 'submitter',
                 'at', 'sha256')
 SUBMITTER_FIELDS = ('actor', 'person', 'identity', 'submitted_by_agent')
@@ -205,10 +206,13 @@ def valid_aliases(value):
 
 def validate_entry(record):
     """The closed `capability-entry-v1` schema (.60 section 3.2), time-independent."""
-    if not isinstance(record, dict) or set(record) != set(ENTRY_FIELDS):
+    if not isinstance(record, dict) or set(record) != (set(ENTRY_FIELDS) | ({'interfaces'} if record.get('schema_version') == 2 else set())):
         raise ValueError('capability entry has the wrong field set')
-    if type(record['schema_version']) is not int or record['schema_version'] != 1:
-        raise ValueError('schema_version must be the integer 1')
+    if type(record['schema_version']) is not int or record['schema_version'] not in (1, 2):
+        raise ValueError('schema_version must be the integer 1 or 2')
+    if record['schema_version'] == 2:
+        from interface_records import valid_interfaces
+        valid_interfaces(record['interfaces'])
     valid_key(record['key'])
     core.positive_int(record['revision'], 'revision')
     _bounded_text(record['name'], 'name', NAME_MAX)
@@ -233,11 +237,14 @@ def validate_entry(record):
 
 
 def parse_entry(body):
-    if not isinstance(body, str) or not body.startswith(ENTRY_PREFIX):
+    if not isinstance(body, str) or not body.startswith((ENTRY_PREFIX, ENTRY_V2_PREFIX)):
         return None
-    rest = body[len(ENTRY_PREFIX):]
+    prefix = ENTRY_V2_PREFIX if body.startswith(ENTRY_V2_PREFIX) else ENTRY_PREFIX
+    rest = body[len(prefix):]
     try:
         record = parse_json(rest)
+        if record.get('schema_version') != (2 if prefix == ENTRY_V2_PREFIX else 1):
+            return None
         validate_entry(record)
         if canonical_bytes(record).decode('utf-8') != rest:
             return None
@@ -253,6 +260,8 @@ def entry_record(payload, revision, acceptance_state):
               'code': list(payload.get('code', [])), 'tests': list(payload.get('tests', [])),
               'owner': payload.get('owner'), 'tags': list(payload.get('tags', [])),
               'acceptance_state': acceptance_state, 'successor': None}
+    if 'interfaces' in payload:
+        record.update(schema_version=2, interfaces=payload['interfaces'])
     record['sha256'] = content_hash(record)
     validate_entry(record)
     return record
@@ -293,6 +302,9 @@ def _validate_content(payload, collect=False):
           lambda: valid_owner(payload.get('owner'), required=payload.get('operation') == 'draft'))
     check('tags', 'Use at most %d unique lowercase slugs.' % TAGS_MAX,
           lambda: valid_tags(payload.get('tags', [])))
+    if 'interfaces' in payload:
+        from interface_records import valid_interfaces
+        check('interfaces', 'Use at most 32 pinned {iface, role} links.', lambda: valid_interfaces(payload['interfaces']))
     return errors
 
 
@@ -512,6 +524,8 @@ def alias_state(view, operators):
 KIND = keyed_entries.AnchoredKind(
     noun='capability', title='Capability', command='capability', type_label=TYPE_LABEL, state_labels=STATE_LABEL,
     key_prefix=KEY_LABEL, family='capability-', entry_prefix=ENTRY_PREFIX, acceptance_prefix=ACCEPTANCE_PREFIX,
+    entry_prefixes=(ENTRY_PREFIX, ENTRY_V2_PREFIX),
+    entry_prefix_for=lambda record: ENTRY_V2_PREFIX if record['schema_version'] == 2 else ENTRY_PREFIX,
     journal=JOURNAL, source='capability-apply', accept_action='accept a capability',
     apply_command='admin.py capability-apply', reconcile_command='admin.py capability-reconcile',
     anchor_title=ANCHOR_TITLE, anchor_description=ANCHOR_DESCRIPTION,

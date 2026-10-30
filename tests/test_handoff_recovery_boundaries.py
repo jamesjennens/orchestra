@@ -47,7 +47,7 @@ class RecoveryBoundaryTests(unittest.TestCase):
     @without_void_tracker
     def test_backup_restore_retains_before_receipt_identity(self):
         self.interrupt_before_receipt()
-        fake=types.SimpleNamespace(flock=Mock(),LOCK_EX=2)
+        fake=types.SimpleNamespace(flock=Mock(),LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         with patch.dict('sys.modules',{'fcntl':fake}),patch.object(admin,'run_bd',return_value='synced'):
             admin.backup_project(self.root,'source')
         bundle=json.loads((self.root/'backups'/'source.coordination.json').read_text())

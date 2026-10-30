@@ -98,6 +98,8 @@ PAIRS += [('server-limit', 'merge-authority'), ('merge-authority', 'server-limit
           ('server-limit', 'merge-operators'), ('merge-verifiers', 'server-limit')]
 
 
+from tests.lock_fixture import ordinary_calls
+
 @unittest.skipIf(sys.platform == 'win32', 'flock is POSIX-only')
 class DeploymentWritersShareOneLockTests(unittest.TestCase):
 
@@ -360,13 +362,13 @@ class PrivateWriteLeftoverTests(unittest.TestCase):
         # The fallback for an fcntl with no LOCK_NB: one blocking flock, then the same work.
         import types
         from unittest.mock import Mock
-        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
+        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         (self.root / '.deployment.private.json.abcd1234').write_text('{}', encoding='utf-8')
         with patch.dict(sys.modules, {'fcntl': fake}):
             result, err = self.flip('on')
         self.assertTrue(result['checkpoint_provenance_writes'])
-        self.assertEqual(fake.flock.call_count, 1)
-        self.assertEqual(fake.flock.call_args[0][1], 2)
+        self.assertEqual(len(ordinary_calls(fake.flock)), 1)
+        self.assertEqual(ordinary_calls(fake.flock)[-1].args[1], 2)
         self.assertFalse((self.root / '.deployment.private.json.abcd1234').exists())
         self.assertIn('Removed 1 temporary copy', err)
 

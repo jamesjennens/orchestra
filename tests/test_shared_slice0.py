@@ -211,7 +211,7 @@ class JournalTests(unittest.TestCase):
         self.destination.mkdir()
         (self.root / 'backups' / 'source').mkdir(parents=True)
         self.bundle = self.root / 'backups' / 'source.coordination.json'
-        patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)})
+        patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -877,7 +877,7 @@ class NoWriterTests(unittest.TestCase):
             project = root / 'projects' / 'source'
             project.mkdir(parents=True)
             (root / 'backups' / 'source').mkdir(parents=True)
-            with patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+            with patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}), \
                     patch.object(admin, 'run_bd', return_value='synced'):
                 admin.backup_project(root, 'source')
             self.assertFalse(any((project / journal).exists() for journal in JOURNALS))
