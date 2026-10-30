@@ -2870,6 +2870,11 @@ def run_guarded(request, journal_path, effect, authority_config=None,
     * ``journal_options`` are optional :class:`OperationJournal` constructor overrides
       (limits, retention, skew allowance) for tests and operator tooling; the
       canonical endpoint passes none, so production uses the module defaults.
+    * Kit lock order is semantic deployment mutex (when relevant), project coordination,
+      authority/store, then operation journals. Effects may not acquire another project
+      lock. Cross-project snapshots are prepared before this boundary; cached reads
+      recheck current authority without project I/O. Store-only service mutations take
+      authority alone and release it before invoking a canonical backend.
     * The authority lock is held across re-validation and the effect, so an HTTP-side
       revocation that committed first is observed here and the effect never runs.
     * ``account_identity`` is a server adapter option, never a request field. The

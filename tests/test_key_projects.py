@@ -548,7 +548,7 @@ class ListingTests(unittest.TestCase):
                 for call in ast.walk(function):
                     if isinstance(call,ast.Call) and isinstance(call.func,ast.Name) and call.func.id=='_execute':
                         dispatch_callers.append(function.name)
-        self.assertEqual(dispatch_callers,['execute','execute'])
+        self.assertEqual(dispatch_callers,['execute'])
         # Both lexical scopes are behind the public project gate. Preserve main's
         # stronger ban on every path reference outside them, including aliases
         # and attributes; the private dispatcher itself has no alternate entry.
@@ -556,7 +556,7 @@ class ListingTests(unittest.TestCase):
         inside={id(node) for entry in entries for node in ast.walk(entry)}
         private_loads=[node for node in ast.walk(tree) if isinstance(node,ast.Name)
                        and isinstance(node.ctx,ast.Load) and node.id=='_execute']
-        self.assertEqual(len(private_loads),2,'the private dispatcher has no alias or alternate entry')
+        self.assertEqual(len(private_loads),1,'the private dispatcher has no alias or alternate entry')
         for node in ast.walk(tree):
             if id(node) in inside:
                 continue

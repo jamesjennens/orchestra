@@ -1320,14 +1320,7 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None,frame=None):
     key_project_refusal(request,key_projects)
     import interface_lock
-    action = request.get('action') if isinstance(request, dict) else None
-    args = request.get('args', []) if isinstance(request, dict) else []
-    participating = action in ('interface', 'ref') and args[:1] and args[0] in (
-        'propose', 'revise', 'draft', 'accept', 'retire', 'web-verify')
     try:
-        if participating:
-            with interface_lock.held(root):
-                return _execute(root,request,authority_config,require_authority,key_projects,key_principal,frame)
         return _execute(root,request,authority_config,require_authority,key_projects,key_principal,frame)
     except interface_lock.Busy as error:
         return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':503}
@@ -1949,12 +1942,15 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             except RecordsRefusal as error:
                 return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            return guarded_write(root,request,journal_path(path),ref_effect,
-                                 authority_config=authority_config,
-                                 require_authority=require_authority,runner=runner,
-                                 identity_check=identity_check)
+        import interface_lock
+        import contextlib
+        with interface_lock.held(root) if reference_records.touches_program_links(payload) else contextlib.nullcontext():
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                return guarded_write(root,request,journal_path(path),ref_effect,
+                                     authority_config=authority_config,
+                                     require_authority=require_authority,runner=runner,
+                                     identity_check=identity_check)
     if action=='interface':
         import interface_records
         import trace_read
@@ -1999,11 +1995,23 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                     if warnings: run_warnings.append(warnings)
                     import record_json
                     return [record_json.loads_row(line) for line in stdout.splitlines() if line.strip()]
-                if writing and other==name: return exported()
-                with held_coordination_lock(other_path,shared=True): return exported()
-            return interface_records.ProgramContext(name,read_project,operators=configured_operators(root),
+                with held_coordination_lock(other_path,shared=True):
+                    if writing:
+                        from http_authority import file_lock
+                        with file_lock(authority_config.lock,shared=True):
+                            refresh()
+                            if not allowed(other):return None
+                            return exported()
+                    return exported()
+            context=interface_records.ProgramContext(name,read_project,operators=configured_operators(root),
                 authority_state=state,memberships=state.get('memberships'),users=state.get('users'),
-                may_propose=(lambda area:allowed(area,CAP_COORDINATE)) if writing else None)
+                may_propose=(lambda area:allowed(area,CAP_COORDINATE)) if writing else None,
+                may_read=lambda other:allowed(other))
+            def refresh():
+                latest=dict(read_state(authority_config.store)) if authority_config is not None else {}
+                state.clear();state.update(latest);context.set_authority(state)
+            context.refresh_authority=refresh
+            return context
         if not writing:
             context=ctx_for(False)
             result=interface_records.read(args,run,configured_operators(root))
@@ -2016,18 +2024,26 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
         coordinator=args[0]=='accept'
         identity_check,party_check,user_id=_records_http_context(coordinator,run_warnings,run,'interfaces')
         runner=NativeRunner(run,project=path)
+        payload=interface_records.KIND.write_payload(args,request.get('attachments',{}),commands=('propose','revise','accept'))
+        interface_records.KIND.validate_payload(payload,operator=coordinator,web_coordinator=coordinator)
         def effect():
             try:
-                payload=interface_records.KIND.write_payload(args,request.get('attachments',{}),commands=('propose','revise','accept'))
-                with interface_records.context(ctx_for(True)):
+                context.refresh_authority()  # run_guarded holds authority; frozen reads do no project I/O.
+                with interface_records.context(context):
                     result=interface_records.apply_native(payload,actor,runner,path,operator=coordinator,operators=configured_operators(root),
                         web_coordinator=coordinator,party_check=party_check,web_service=True)
                 return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
             except (RecordsRefusal,interface_records.Refusal) as error:
                 return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
-        with held_coordination_lock(path):
-            return guarded_write(root,request,journal_path(path),effect,authority_config=authority_config,
-                require_authority=require_authority,runner=runner,identity_check=identity_check)
+        import interface_lock
+        with interface_lock.held(root):
+            context=ctx_for(True)
+            try:context.prepare(payload)
+            except interface_records.Refusal as error:
+                return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
+            with held_coordination_lock(path):
+                return guarded_write(root,request,journal_path(path),effect,authority_config=authority_config,
+                    require_authority=require_authority,runner=runner,identity_check=identity_check)
     if action=='capability':
         # The capability index (.60 slices 1a and 1b, kittrial-5bb.67/.69). get, list, find
         # and help are reads (one label-filtered bd list plus bd show; no lock, not

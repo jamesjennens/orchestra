@@ -257,15 +257,19 @@ class ProgramContext:
     read_project must check the caller BEFORE I/O; it returns a complete exported snapshot.
     The outer deployment mutation lock serializes graph/capability changes with accept.
     """
-    def __init__(self, project, read_project, *, operators=(), memberships=None, users=None, may_propose=None, authority_state=None):
+    def __init__(self, project, read_project, *, operators=(), memberships=None, users=None, may_propose=None, authority_state=None, may_read=None):
         self.project, self.read_project = project, read_project
         self.operators = operators
         self.memberships, self.users = memberships, users
         self.may_propose = may_propose
         self.authority_state = authority_state
+        self.may_read = may_read
+        self.frozen = False
         self.cache = {}
 
     def rows(self, project):
+        if self.may_read is not None and not self.may_read(project):return None
+        if project not in self.cache and self.frozen:return None
         if project not in self.cache:
             try:
                 rows = self.read_project(project)
@@ -283,31 +287,87 @@ class ProgramContext:
             raise Refusal('Program snapshot is unavailable; no interface acceptance was written')
         return rows
 
-    def owner_view_missing(self,item):
-        """An active owner-backed side is unknown until current authority was loaded."""
-        if self.memberships is not None and self.users is not None:
-            return False
-        import program_links
-        by=item.get('accepted_by')
-        if item.get('state')!='accepted' or not isinstance(by,str) or not program_links.PERSON.fullmatch(by):
-            return False
-        side=program_links.side_of(item.get('key'))
-        try:
-            _,state=program_links.statement_lines((item.get('record') or {}).get('statement'),
-                'Area' if side and side[0]=='program' else 'Program')
-        except ValueError:return True
-        return state=='in'
+    def prepare(self, payload=None):
+        """Read each possible area before the write's project/authority boundary.
 
-    @staticmethod
-    def accepted_side_requires_coverage(item, label):
-        if item.get('state') != 'accepted':
-            return False
+        Semantic records are stable under the deployment mutex. Authority can change
+        during these snapshots, so the effect refreshes it and every cached read is
+        gated again. A newly readable area missing from this snapshot is incomplete,
+        never fetched while holding authority.
+        """
         import program_links
+        entries,_=refs.KIND.catalog(self.own(),self.operators)
+        candidates=[]
+        for entry in entries:
+            side=program_links.side_of(entry.get('key'))
+            if side and side[0]=='program' and self.coverage_state(refs.KIND,entry,self.project,link=True) not in ('withdrawn','never-accepted'):
+                candidates.append(side[1])
+        candidates=sorted(set(candidates))
+        if len(candidates)>AREA_MAX:
+            self.frozen=True
+            return self
+        if payload is not None:
+            target=payload
+            if payload.get('operation')=='accept':
+                entries,_=catalog(self.own(),self.operators)
+                entry=next((e for e in entries if e.get('key')==payload.get('key')),None)
+                row=next((r for r in self.own() if entry and r.get('id')==entry.get('native_id')),None)
+                target=KIND.existing_revisions(KIND.live_row(row,self.operators)[0]).get(payload.get('revision'),{}) if row else {}
+            # Draft publication and ordinary acceptance need only the defining pair;
+            # only accepting retirement inventories all possible consumers.
+            if payload.get('operation')!='accept' or target.get('state')!='retired':
+                candidates=[area for area in candidates if area==target.get('owner_project')]
+        for area in candidates:self.rows(area)
+        self.frozen=True
+        return self
+
+    def set_authority(self,state):
+        self.authority_state=state
+        self.memberships=state.get('memberships')
+        self.users=state.get('users')
+
+    def coverage_state(self, kind, entry, project, *, link=False):
+        """One retirement rule for sides and capabilities, including inert approvals.
+
+        A historical approval is not a never-accepted draft merely because today's
+        allowlist/account/role/grant no longer admits it. Only an actual withdrawal
+        or a record with no acceptance evidence at all is outside this inventory.
+        """
+        if entry.get('state') in ('malformed','unsupported','conflicted'):
+            return 'incomplete'
+        rows=self.rows(project)
+        row=next((r for r in rows or [] if r.get('id')==entry.get('native_id')),None)
+        if row is None:return 'incomplete'
         try:
-            _,state=program_links.statement_lines((item.get('record') or {}).get('statement'),label)
-        except ValueError:
-            return True
-        return state != 'left'
+            live=kind.live_row(row,self.operators)[0]
+            revisions=kind.existing_revisions(live)
+            evidence=kind.existing_acceptances(live)
+            approved=[r for n,r in revisions.items() if r.get('acceptance_state')!='draft'
+                      and n in evidence and evidence[n]['record_sha256']==r['sha256']
+                      and evidence[n]['acceptance_state']==r['acceptance_state']]
+            if entry.get('acceptance_inert'):return 'incomplete'
+            record=entry.get('record')
+            if entry.get('state') in ('accepted','superseded') and record is not None:
+                if link:
+                    import program_links
+                    # A withdrawal must itself still have a live owner/operator
+                    # approval; an inert "left" record is not proof of absence.
+                    if not program_links.owner_or_operator(entry.get('accepted_by'),project,self.memberships,self.users):
+                        return 'incomplete'
+                    side=program_links.side_of(entry.get('key'))
+                    other=side[1] if side and side[0]=='program' else self.project
+                    status,_=program_links.side_status(entry,project,other,self.memberships,self.users)
+                    if status=='left':return 'withdrawn'
+                    return 'live' if status=='in' else 'incomplete'
+                if not self.proposer_holds(entry.get('accepted_by'),project):return 'incomplete'
+                if record['acceptance_state']=='superseded' or not record.get('interfaces'):
+                    return 'withdrawn'
+                return 'live'
+            # An approval hidden by a void is still not "never accepted". It takes
+            # an explicit withdrawal to prove that its former consumers vanished.
+            return 'incomplete' if approved or kind.existing_acceptances(row) else 'never-accepted'
+        except (ValueError,TypeError,KeyError):
+            return 'incomplete'
 
     def areas(self):
         import program_links
@@ -315,20 +375,12 @@ class ProgramContext:
         candidates = []
         complete = not incomplete
         for e in entries:
-            if e['state'] in ('malformed','unsupported','conflicted'):
-                complete=False
-            key = e.get('key') or ''
-            side = program_links.side_of(key)
-            if not side or side[0] != 'program':
-                continue
-            if self.owner_view_missing(e):complete=False
-            status, reason = program_links.side_status(e, self.project, side[1], self.memberships, self.users)
-            if self.accepted_side_requires_coverage(e,'Area') and status is None:
-                complete = False
-            if e['state'] in ('malformed', 'unsupported', 'conflicted'):
-                complete = False
-            if status == 'in':
-                candidates.append(side[1])
+            if e['state'] in ('malformed','unsupported','conflicted'):complete=False
+            side = program_links.side_of(e.get('key'))
+            if not side or side[0] != 'program':continue
+            status=self.coverage_state(refs.KIND,e,self.project,link=True)
+            if status=='incomplete':complete=False
+            if status=='live':candidates.append(side[1])
         if len(candidates) > AREA_MAX:
             return [], False, len(candidates)
         linked, unavailable = [], 0
@@ -340,15 +392,11 @@ class ProgramContext:
                 continue
             others, inc = refs.KIND.catalog(rows, self.operators)
             selected = [e for e in others if e.get('key') == program_links.MEMBER_OF]
-            if any(self.owner_view_missing(e) for e in selected):complete=False
-            if inc or any(e['state'] in ('malformed', 'unsupported', 'conflicted') for e in others):
-                complete = False
-            if len(selected) == 1:
-                status, reason = program_links.side_status(selected[0], area, self.project, self.memberships, self.users)
-                if self.accepted_side_requires_coverage(selected[0],'Program') and status is None:
-                    complete = False
-                if status == 'in':
-                    linked.append(area)
+            if inc or any(e['state'] in ('malformed','unsupported','conflicted') for e in others):complete=False
+            if len(selected)==1:
+                status=self.coverage_state(refs.KIND,selected[0],area,link=True)
+                if status=='incomplete':complete=False
+                if status=='live':linked.append(area)
         return linked, complete, unavailable
 
     def usage(self):
@@ -360,8 +408,10 @@ class ProgramContext:
             if incomplete or any(e['state'] in ('malformed', 'unsupported', 'conflicted') for e in entries):
                 complete = False
             for e in entries:
+                status=self.coverage_state(capability_records.KIND,e,area)
+                if status=='incomplete':complete=False
                 record = e.get('record')
-                if e['state'] == 'accepted' and record:
+                if status=='live' and e['state'] == 'accepted' and record:
                     try: valid_interfaces(record.get('interfaces',[]),area)
                     except ValueError:
                         complete=False
@@ -427,6 +477,20 @@ class ProgramContext:
             authors = KIND.draft_authors_for(row, revision or record['revision'], existing)
             if not authors or any(not self.proposer_holds(a, record['owner_project']) for a in authors):
                 raise Refusal('The stored draft proposer no longer coordinates its defining area')
+
+    def reconcile_deprecation(self, first, predecessor, actor):
+        """A listed operator explicitly proposes the stored state-only recovery leg.
+
+        This does not re-accept the first leg or borrow its demoted proposer. The
+        operator is this leg's new accountable proposer, with fresh bound evidence.
+        """
+        if not self.proposer_holds(actor,first['owner_project']) or actor not in self.operators:
+            raise Refusal('Explicit deprecation recovery needs a currently configured operator')
+        for record in (first,predecessor):
+            if self.stored_owner(record['key'])!=record['owner_project']:
+                raise Refusal('Stored defining area changed; deprecation recovery refused')
+        if first['owner_project']!=predecessor['owner_project'] or first['owner_project'] not in self.areas()[0]:
+            raise Refusal('Deprecation recovery needs the stored currently linked defining area')
 
     def propose(self, payload):
         area = payload['owner_project']
@@ -660,7 +724,7 @@ def reconcile(project,operation_id,actor,reason,disposition,run,issue_id=None,op
         ctx=_CONTEXT.get()
         if ctx is None:
             raise Refusal('Interface recovery needs current stored authority and program coverage')
-        ctx.accept(first)
+        ctx.reconcile_deprecation(first,plan['record'],actor)
         result={'operation_id':operation_id,'status':'complete','id':receipt['id'],
                 'reconciled':False,'transition_complete':plan['status']=='complete'}
     else:
@@ -671,6 +735,10 @@ def reconcile(project,operation_id,actor,reason,disposition,run,issue_id=None,op
         _,body=KIND.acceptance_evidence(bound,plan['id'],plan['revision'],plan['record'],actor)
         plan.update(actor=actor,evidence=body)
         atomic(path,plan,mode=0o600)
+        audit='Interface deprecation recovery %s explicitly re-attested by %s: %s' % (operation_id,actor,reason)
+        current=KIND.shown(run,[plan['id']])[0]
+        if not any(c.get('text')==audit and c.get('author')==actor for c in current.get('comments',[]) if isinstance(c,dict)):
+            run(['comments','add',plan['id'],audit,'--json'])
         resume_transition(path,plan,run,operators)
         result['transition_complete']=True
     return result

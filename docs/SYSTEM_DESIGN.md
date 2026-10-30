@@ -47,3 +47,19 @@ Keep role enforcement in existing account/repository controls for the trusted-te
 One export supplies requirements, comments and current labels. Build BRD, lifecycle table and activity views locally rather than issuing one query per record. A lifecycle event schema must be verified before extending the comment-only activity feed.
 
 SSH and explicit same-host execution are implemented client transports. Actual office Copilot validation remains an independent task and must not block an offline publisher prototype. Existing canonical task IDs, comments, backup paths and claims are preserved; no live project migration is part of this slice.
+
+
+## Kit lock order
+
+Every canonical route and host adapter uses the same acquisition order:
+
+1. The deployment semantic mutex (`.interface-mutations.lock`), only for operations that can change the program/interface graph or its operator evidence.
+2. A project coordination lock. Cross-project snapshots take one project's lock at a time and release it before the next; the final write takes only its own project's lock.
+3. The live authority/store lock, shared for an authorized snapshot and exclusive for a mutation.
+4. The operation journal/receipt locks and native effect.
+
+A route may omit a class of lock, but cannot acquire an earlier class while holding a later one. In particular, no read under authority may acquire an area/project lock. A store-only service mutation takes authority alone; it releases authority before invoking a canonical backend. Canonical calls already use `serialize=False` in the service and recheck authority in the endpoint. Host recovery/restore follows the same project-before-authority rule.
+
+An interface write prepares caller-authorized cross-project snapshots under the semantic mutex before its final project/authority boundary. Each snapshot checks current permission with project then authority already held. The final effect refreshes current accounts, roles and grants under authority and gates even cached rows again. Its frozen graph adapter cannot perform project I/O: a missing or newly readable area is incomplete and requires a retry. Membership and registration therefore need no semantic mutex and cannot form the old area/authority cycle. Ordinary proposals and non-retirement acceptance snapshot only the defining pair; accepting retirement inventories every possible linked consumer within the area budget. Unrelated references and v1 capabilities do not wait for this mutex; program-link references and interface declarations, including withdrawals, do.
+
+For retirement, one coverage classifier applies to link sides and capabilities. An acceptance that exists but no longer passes the live check is incomplete, including removed operators, lost roles and disabled accounts; its draft-only reader projection is not proof that nobody accepted it. Only a record never accepted or an actual withdrawal with currently live approval is outside scope; an inert withdrawal is incomplete until reaffirmed by current authority. No incomplete snapshot proves absence of consumers or providers.

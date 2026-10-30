@@ -1,9 +1,13 @@
 """Deployment-wide interface mutation order: this lock, then project locks.
 
-No POSIX import at module scope. Interface and program-link mutations participate. Capability mutations select
-this lock when their payload or stored revisions touch interfaces, including an
-implicit withdrawal by a v1 revision. Unrelated v1 capability writes use only
-their project lock. A bounded acquisition refuses busy rather than waiting indefinitely.
+No POSIX import at module scope. The kit's common order is this semantic mutex
+when needed, one project coordination lock at a time, authority/store, and journals.
+No effect under authority acquires another project's lock. Interface snapshots are
+prepared before that effect and frozen; live permissions are refreshed at use.
+Only program-link references and capability interface declarations/withdrawals need
+this mutex. Store-only membership/account/agent/registration mutations use authority
+alone; unrelated reference/capability writes use their ordinary project/authority
+boundary. A bounded acquisition refuses busy rather than waiting indefinitely.
 """
 from contextlib import contextmanager, ExitStack
 from pathlib import Path

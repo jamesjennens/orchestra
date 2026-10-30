@@ -239,7 +239,8 @@ class InterfaceCase(unittest.TestCase):
         calls=[]
         context=ir.ProgramContext('prog',lambda name:calls.append(name) or [],operators=[OPERATOR])
         entries=[{'key':'program.area.area'+str(n),'state':'accepted'} for n in range(ir.AREA_MAX+1)]
-        with patch.object(rr.KIND,'catalog',return_value=(entries,False)),patch.object(program_links,'side_status',return_value=('in',{})):
+        with patch.object(rr.KIND,'catalog',return_value=(entries,False)),patch.object(context,'coverage_state',return_value='live'):
+            context.prepare()
             self.assertEqual(([],False,ir.AREA_MAX+1),context.areas())
         self.assertEqual(['prog'],calls)
 
@@ -524,3 +525,221 @@ class InterfaceCase(unittest.TestCase):
         for items in (None,'bad',[None],['bad'],[1]):
             with self.subTest(items=items):
                 self.assertTrue(cr.touches_interfaces({'items':items},forbidden,[OPERATOR]))
+
+    def test_removed_operator_consumer_acceptance_makes_retirement_incomplete(self):
+        self.apply(payload());self.accept();record=self.entry()['record']
+        self.area.actor='ops2'
+        cap=cap_entry(operation='draft',operation_id='ops2-consumer',interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(cap,'ops2',self.area,self.path.parent/'area',operator=True,operators=[OPERATOR,'ops2'])
+        before=self.context();before.operators=[OPERATOR,'ops2']
+        self.assertTrue(before.usage()[1]['complete']);self.assertEqual(1,len(before.usage()[0]))
+        self.apply(payload(operation='revise',operation_id='retire-inert-cap',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        self.assertFalse(self.context().usage()[1]['complete'])
+        with self.assertRaisesRegex(ValueError,'incomplete'):self.accept(operation='refuse-inert-cap')
+
+    def test_removed_operator_bilateral_link_acceptances_make_retirement_incomplete(self):
+        self.apply(payload());self.accept();record=self.entry()['record']
+        other=RefNative();self.projects['other']=other.rows
+        for native,path,key,text in [(self.native,self.path,'program.area.other','Area: other\nState: in'),
+            (other,self.path.parent/'other','program.member-of','Program: prog\nState: in')]:
+            path.mkdir(exist_ok=True);native.seed('decision-42',issue_type='decision');native.actor='ops2'
+            rr.apply_native({'schema_version':1,'operation':'draft','operation_id':'ops2-side-'+key,
+                'key':key,'title':'Other link','statement':text,'authority':{'type':'decision','id':'decision-42'},
+                'owner':'person:example','review_by':payload()['review_by'],'tags':[],'decisions':[],
+                'acceptance_state':'accepted','acceptance':acceptance()},'ops2',native,path,operator=True,operators=[OPERATOR,'ops2'])
+        before=self.context();before.operators=[OPERATOR,'ops2'];self.assertIn('other',before.areas()[0])
+        self.apply(payload(operation='revise',operation_id='retire-inert-sides',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        self.assertFalse(self.context().usage()[1]['complete'])
+        with self.assertRaisesRegex(ValueError,'incomplete'):self.accept(operation='refuse-inert-sides')
+
+    def test_replaces_another_area_is_refused_independently_of_entry_owner_changes(self):
+        self.apply(payload());self.accept()
+        other=RefNative();self.projects['other']=other.rows
+        for native,path,key,text in [(self.native,self.path,'program.area.other','Area: other\nState: in'),
+            (other,self.path.parent/'other','program.member-of','Program: prog\nState: in')]:
+            path.mkdir(exist_ok=True);native.seed('decision-42',issue_type='decision');native.actor=OPERATOR
+            rr.apply_native({'schema_version':1,'operation':'draft','operation_id':'replace-other-'+key,
+                'key':key,'title':'Other link','statement':text,'authority':{'type':'decision','id':'decision-42'},
+                'owner':'person:example','review_by':payload()['review_by'],'tags':[],'decisions':[],
+                'acceptance_state':'accepted','acceptance':acceptance()},OPERATOR,native,path,operator=True,operators=[OPERATOR])
+        self.apply(payload(key='iface.quotes.v2',owner_project='other',replaces='iface.quotes.v1',operation_id='other-major'))
+        new=ir.get(self.native.rows,'iface.quotes.v2',[OPERATOR])['proposed']
+        before=copy.deepcopy(self.native.rows)
+        with self.assertRaises(ValueError):self.accept(new,operation='reject-other-predecessor')
+        self.assertEqual(before,self.native.rows,'replaces from another area must refuse before committing the new major')
+
+    @unittest.skipIf(__import__('os').name=='nt','endpoint is POSIX-only')
+    def test_endpoint_flags_use_caller_read_gate_and_never_read_hidden_area_counting_backend(self):
+        import endpoint
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        self.apply(payload());self.accept()
+        self.native.actor=OPERATOR
+        cap=cap_entry(operation='draft',operation_id='counted-program-consumer',interfaces=[{'iface':'iface:iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(cap,OPERATOR,self.native,self.path,operator=True,operators=[OPERATOR])
+        root=self.path.parent
+        for project in ('prog','area'):
+            (root/project/'.beads').mkdir(exist_ok=True)
+            (root/project/'.beads/metadata.json').write_text('{}')
+        (root/'deployment.private.json').write_text(json.dumps({'password':'synthetic','unit':'none','operators':[OPERATOR]}))
+        calls=[]
+        def argv(root,path,actor,args,**kwargs):return [Path(path).name,*args]
+        def run(command,env,**kwargs):
+            project,*args=command;calls.append(project)
+            rows=self.projects[project]
+            if args==['export','--all']:stdout='\n'.join(json.dumps(row) for row in rows)+'\n'
+            else:stdout=(self.native if project=='prog' else self.area)(args)
+            return SimpleNamespace(returncode=0,stdout=stdout,stderr='')
+        request={'project':'prog','actor':OPERATOR,'action':'interface','args':['list']}
+        with patch.object(endpoint,'project_dir',side_effect=lambda root,name:root/name), \
+             patch.object(endpoint,'environment',return_value={}), \
+             patch.object(endpoint.native,'argv',side_effect=argv),patch.object(endpoint.native,'run',side_effect=run):
+            hidden=json.loads(endpoint.execute(root,request,key_projects={'prog'})['stdout'])
+            self.assertFalse(hidden['program_coverage']['complete']);self.assertNotIn('area',calls)
+            self.assertNotIn('no-provider',hidden['items'][0]['flags'])
+            self.assertNotIn('provider-behind',hidden['items'][0]['flags'])
+            self.assertNotIn('orphan',hidden['items'][0]['flags'])
+            calls.clear()
+            visible=json.loads(endpoint.execute(root,request,key_projects={'prog','area'})['stdout'])
+            self.assertTrue(visible['program_coverage']['complete']);self.assertEqual(1,calls.count('area'))
+            self.assertIn('no-provider',visible['items'][0]['flags'])
+
+    def test_frozen_graph_rechecks_cached_read_gate_without_backend_io_under_authority(self):
+        self.apply(payload());self.accept();record=self.entry()['record'];calls=[];authority=[False]
+        def read(project):
+            self.assertFalse(authority[0],'a graph read acquired an area under authority')
+            calls.append(project);return copy.deepcopy(self.projects.get(project))
+        ctx=ir.ProgramContext('prog',read,operators=[OPERATOR],may_read=lambda project:True).prepare()
+        self.assertEqual(['prog','area'],calls)
+        authority[0]=True;ctx.accept(record)
+        ctx.may_read=lambda project:project!='area'
+        self.assertFalse(ctx.usage()[1]['complete']);self.assertEqual(['prog','area'],calls)
+        self.assertIsNone(ctx.rows('newly-readable-area'));self.assertEqual(['prog','area'],calls)
+
+    def test_explicit_operator_deprecation_recovery_after_original_proposer_demotion(self):
+        from unittest.mock import patch
+        uid='usr_'+'d'*16
+        state={'users':{uid:{'id':uid,'disabled':False}},'memberships':{'area':{uid:'coordinator'}}}
+        ctx=self.context();ctx.set_authority(state)
+        self.apply(payload(),actor=uid,ctx=ctx);self.accept(ctx=ctx)
+        self.apply(payload(key='iface.quotes.v2',replaces='iface.quotes.v1',operation_id='demoted-recovery-major'),actor=uid,ctx=ctx)
+        proposed=ir.get(self.native.rows,'iface.quotes.v2',[OPERATOR])['proposed']
+        original=self.native.__class__.__call__
+        def cut(native,args):
+            if args[:2]==['comments','add'] and len(args)>3 and args[3].startswith(ir.ENTRY_PREFIX):
+                record=ir.parse_entry(args[3])
+                if record and record['state']=='deprecated':raise RuntimeError('deprecation cut')
+            return original(native,args)
+        with patch.object(self.native.__class__,'__call__',cut):
+            with self.assertRaisesRegex(RuntimeError,'deprecation cut'):self.accept(proposed,operation='demoted-recovery-accept',ctx=ctx)
+        state['memberships']['area'][uid]='contributor';ctx.set_authority(state)
+        with self.assertRaisesRegex(ValueError,'proposer no longer coordinates'):
+            self.accept(proposed,operation='demoted-recovery-accept',ctx=ctx)
+        before=self.entry()['record'];self.native.actor=OPERATOR
+        with ir.context(ctx):
+            result=ir.reconcile(self.path,'demoted-recovery-accept',OPERATOR,'explicit program recovery','complete',self.native,operators=[OPERATOR])
+        self.assertTrue(result['transition_complete']);after=self.entry()['record']
+        self.assertEqual('deprecated',after['state'])
+        for field in ir.CONTENT_FIELDS:
+            if field!='state':self.assertEqual(before[field],after[field],field)
+        self.assertTrue(any('explicit program recovery' in c.get('text','') for row in self.native.rows for c in row.get('comments',[])))
+        writes=len(self.native.writes())
+        with ir.context(ctx):ir.reconcile(self.path,'demoted-recovery-accept',OPERATOR,'explicit program recovery','complete',self.native,operators=[OPERATOR])
+        self.assertEqual(writes,len(self.native.writes()))
+
+    def test_withdrawal_requires_live_approval_after_operator_removal_and_can_be_reaffirmed(self):
+        self.apply(payload());self.accept();record=self.entry()['record'];self.area.actor='ops2'
+        initial=cap_entry(operation='draft',operation_id='withdrawable-op2-consumer',interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(initial,'ops2',self.area,self.path.parent/'area',operator=True,operators=[OPERATOR,'ops2'])
+        current=cr.KIND.find_entry(self.area.rows,initial['key'],[OPERATOR,'ops2'])['record']
+        cr.apply_native(cap_entry(operation='revise',operation_id='withdraw-op2',revision=2,expected_sha256=current['sha256'],interfaces=[]),
+            'ops2',self.area,self.path.parent/'area',operators=[OPERATOR,'ops2'])
+        draft=cr.KIND.find_entry(self.area.rows,initial['key'],[OPERATOR,'ops2'])['proposed']
+        cr.apply_native({'schema_version':1,'operation':'accept','operation_id':'accept-withdraw-op2','key':initial['key'],
+            'revision':draft['revision'],'record_sha256':draft['sha256'],'acceptance_state':'accepted','acceptance':acceptance()},
+            'ops2',self.area,self.path.parent/'area',operator=True,operators=[OPERATOR,'ops2'])
+        before=self.context();before.operators=[OPERATOR,'ops2']
+        self.assertTrue(before.usage()[1]['complete']);self.assertEqual([],before.usage()[0])
+        self.assertFalse(self.context().usage()[1]['complete'],'an inert withdrawal cannot hide a formerly accepted consumer')
+        withdrawn=cr.KIND.find_entry(self.area.rows,initial['key'],[OPERATOR,'ops2'])['record']
+        self.area.actor=OPERATOR
+        cr.apply_native({'schema_version':1,'operation':'accept','operation_id':'reaffirm-withdrawal','key':initial['key'],
+            'revision':withdrawn['revision'],'record_sha256':withdrawn['sha256'],'acceptance_state':'accepted','acceptance':acceptance()},
+            OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        self.assertTrue(self.context().usage()[1]['complete']);self.assertEqual([],self.context().usage()[0])
+        self.apply(payload(operation='revise',operation_id='retire-after-real-withdrawal',revision=3,
+            expected_sha256=record['sha256'],state='retired'));self.accept(operation='real-withdrawal-retire')
+        self.assertEqual('retired',self.entry()['lifecycle'])
+
+    def test_draft_snapshot_reads_only_defining_pair_but_retirement_inventories_all_areas(self):
+        self.apply(payload());self.accept();record=self.entry()['record']
+        other=RefNative();self.projects['other']=other.rows
+        for native,path,key,text in [(self.native,self.path,'program.area.other','Area: other\nState: in'),
+            (other,self.path.parent/'other','program.member-of','Program: prog\nState: in')]:
+            path.mkdir(exist_ok=True);native.seed('decision-42',issue_type='decision');native.actor=OPERATOR
+            rr.apply_native({'schema_version':1,'operation':'draft','operation_id':'snapshot-scope-'+key,
+                'key':key,'title':'Other link','statement':text,'authority':{'type':'decision','id':'decision-42'},
+                'owner':'person:example','review_by':payload()['review_by'],'tags':[],'decisions':[],
+                'acceptance_state':'accepted','acceptance':acceptance()},OPERATOR,native,path,operator=True,operators=[OPERATOR])
+        calls=[]
+        def read(project):calls.append(project);return copy.deepcopy(self.projects.get(project))
+        draft=payload(key='iface.new.v1',operation_id='new-snapshot')
+        ctx=ir.ProgramContext('prog',read,operators=[OPERATOR]).prepare(draft)
+        ctx.propose(draft);self.assertEqual(['prog','area'],calls)
+        self.apply(payload(operation='revise',operation_id='snapshot-retirement',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        calls.clear();target=self.entry()['proposed']
+        ctx=ir.ProgramContext('prog',read,operators=[OPERATOR]).prepare({'operation':'accept','key':target['key'],'revision':target['revision']})
+        ctx.accept(target);self.assertEqual(['prog','area','other'],calls)
+
+    @unittest.skipIf(__import__('os').name=='nt','endpoint is POSIX-only')
+    def test_endpoint_prepares_foreign_snapshots_before_authority_and_does_no_project_io_in_effect(self):
+        import endpoint,http_authority,contextlib
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        root=self.path.parent;uid='usr_'+'d'*16;inside=[False];exports=[]
+        for project in ('prog','area'):
+            (root/project/'.beads').mkdir(exist_ok=True);(root/project/'.beads/metadata.json').write_text('{}')
+        state={'users':{uid:{'id':uid,'disabled':False}},'memberships':{'prog':{uid:'coordinator'},'area':{uid:'coordinator'}}}
+        config=SimpleNamespace(store=str(root/'state.json'),lock=str(root/'state.json.lock'))
+        body=payload()
+        for field in ('operation',):body.pop(field)
+        request={'project':'prog','actor':uid,'action':'interface','args':['propose','@attachment:p'],
+            'attachments':{'p':{'flag':'--file','text':json.dumps(body)}},'authority':{'via':'session','user_id':uid}}
+        original_lock=endpoint.held_coordination_lock
+        @contextlib.contextmanager
+        def project_lock(path,shared=False):
+            self.assertFalse(inside[0],'project lock acquired under authority')
+            with original_lock(path,shared=shared):yield
+        def argv(root,path,actor,args,**kwargs):return [Path(path).name,actor,*args]
+        def run(command,env,**kwargs):
+            project,actor,*args=command;native=self.native if project=='prog' else self.area;native.actor=actor
+            if args[:1]==['export']:
+                self.assertFalse(inside[0],'project snapshot read under authority');exports.append(project)
+            return SimpleNamespace(returncode=0,stdout=native(args),stderr='')
+        def guarded(root,req,journal,fn,**kwargs):
+            inside[0]=True
+            try:
+                kwargs['identity_check']();return fn()
+            finally:inside[0]=False
+        with contextlib.ExitStack() as stack:
+            for name in ('http_actor_denial','descriptor_actor_denial','block_mismatch_denial'):
+                stack.enter_context(patch.object(endpoint,name,return_value=None))
+            stack.enter_context(patch.object(endpoint,'verified_web_authority',return_value=True))
+            stack.enter_context(patch.object(endpoint,'configured_coordinator_rules',return_value={}))
+            stack.enter_context(patch.object(endpoint,'configured_operators',return_value=[OPERATOR]))
+            stack.enter_context(patch.object(endpoint,'project_dir',side_effect=lambda root,name:root/name))
+            stack.enter_context(patch.object(endpoint,'environment',return_value={}))
+            stack.enter_context(patch.object(endpoint,'held_coordination_lock',side_effect=project_lock))
+            stack.enter_context(patch.object(endpoint,'guarded_write',side_effect=guarded))
+            stack.enter_context(patch.object(http_authority,'read_state',return_value=state))
+            stack.enter_context(patch.object(http_authority,'decide',return_value={}))
+            stack.enter_context(patch.object(endpoint.native,'argv',side_effect=argv))
+            stack.enter_context(patch.object(endpoint.native,'run',side_effect=run))
+            result=endpoint.execute(root,request,authority_config=config,require_authority=True)
+        self.assertEqual(0,result['returncode'],result);self.assertEqual(['prog','area'],exports)

@@ -3486,27 +3486,46 @@ of an older reference/capability grant. Acceptance/retirement cannot fetch a URL
 run a schema. Compatibility is unverified until the separately reviewed verifier
 slice ships.
 
-**Lock order:** the deployment's `.interface-mutations.lock` first, then ordinary
-project coordination locks, then the existing authority/journal locks. Canonical
-reference/interface write entry points participate. Capability writes participate when an explicit interfaces field or their stored current/pending revision touches interface declarations, including v2-to-v1 withdrawal. Unrelated v1 capability writes bypass the deployment mutex; project CAS still prevents a stale v1 write from replacing an intervening v2 revision. The relevant operator
-apply/retire/reconcile/void/release/allowlist and authority-restore CLI paths
-participate too. Web account/member/agent authority changes and project
-creation/registration/confirmation participate before their store mutation,
-including host creation whose final owner membership is saved in the service. Never take this lock from inside a caller already holding a
-project lock; direct library callers must provide the same order. The five-second
-acquisition bound returns **503 busy** at the endpoint, with no project effect;
-retry the identical operation later. The lock is held for the check and write,
-including its authorized per-area reads; it is not held across a worker's whole
-plan, human review, network calls to another installation, or a test suite. A
-process exiting releases the OS lock; the file itself is not a reservation.
-A reference batch holds the deployment mutex for the batch. A capability batch selects and holds it per participating item, before the project lock, and releases both between items. Other participating mutations can receive 503 busy while an item runs.
+**One kit-wide lock order:** optional deployment semantic mutex
+(`.interface-mutations.lock`), then a project coordination lock, then the live
+authority/store lock, then journal/receipt locks and the native effect. Never take
+an area/project lock while holding authority. Cross-project snapshots take one
+project at a time and release it before the next; the final write locks only its
+own project. Store-only account/member/agent and project registration mutations
+use their authority transaction alone, and release it before invoking a canonical
+backend. Host recovery/restore follows project-before-authority too. See
+SYSTEM_DESIGN "Kit lock order"; there is no route-specific reverse order.
+
+The semantic mutex covers only graph checks and effects: program-link reference
+writes, interface writes, capability writes whose payload or stored declarations
+touch interfaces (including v2-to-v1 withdrawal), and operator repairs or changes
+that can affect this graph's evidence. Decode/structural validation happens before
+it. Unrelated reference proposals and v1 capabilities bypass it. Membership and
+registration do not wait on it. Batches release it and the project lock between
+items; mixed batches conservatively select against the batch. Its five-second
+acquisition bound still returns 503 busy before an effect; relevant simultaneous
+mutations can contend, but unrelated writes do not join that queue.
+
+An interface write prepares authorized graph snapshots before its final project
+and authority boundary. A snapshot acquires its project first and checks permission
+under shared authority before export. The effect refreshes live roles/accounts/grants
+under exclusive authority and gates even cached rows again. The frozen reader
+cannot fetch another project there: a missing or newly readable area is incomplete,
+never silently fetched or treated as empty. Drafts and non-retirement acceptance
+need only the defining pair; accepting retirement inventories all possible consumers
+within the area budget. The lock is not held across human review or a whole plan.
 Direct edits, raw operator bd commands and other programs outside these entry
 points bypass this discipline, just as they bypass the kit's project locks.
 
 Retirement is a state-only draft followed by acceptance, not a successor-key
 retirement. The complete-view check runs **as the acceptor**, with no privileged
 fallback and no decision override in slice 3a. An unreadable, absent, unsupported,
-malformed or truncated area/catalog is not evidence of zero consumers. A known
+malformed or truncated area/catalog is not evidence of zero consumers. A single
+coverage classifier applies to sides and capabilities: an acceptance that exists
+but is now inert for any reason (operator removed, role lost, account disabled or
+grant no longer effective) makes coverage incomplete, even when the ordinary
+catalog calls it draft-only. Only never-accepted records or an actual withdrawal whose approval is still live
+are outside scope; an inert withdrawal needs current reaffirmation too. A known
 consumer blocks regardless of the minor revision it pins. A later capability may
 still declare consumption of a retired major; the register then reports
 `consumes-retired`. The mutex prevents it racing the retirement check; it does not
@@ -3522,7 +3541,7 @@ missing revision. Never infer cross-entry atomicity, release that operation or
 allocate a new identity to get around it. If the original authorized actor cannot
 retry, a configured operator completes it with
 `interface-reconcile PROGRAM --operation-id ID --actor OPERATOR --reason TEXT
---disposition complete --state /path/to/existing-web-state.json`; its own new evidence re-attests the same state-only plan. Recovery rechecks the stored new-major proposer and current defining-area membership from that authority view; a host without it cannot approve an HTTP proposer or prove owner-backed coverage. The completed first-leg receipt remains intact and is not reconciled again.
+--disposition complete --state /path/to/existing-web-state.json`; its own new evidence re-attests the same state-only plan. Recovery confirms the exact live first-leg approval and immutable stored owner areas. It is an explicit fresh proposal of the planned state-only deprecation by the currently listed operator, with new bound operator evidence and a native reason audit; it does not re-accept the first leg or borrow its original proposer's lost rights. The defining area must still be linked in the current authority view. Ordinary retry remains refused after proposer demotion, but this explicit recovery can finish even if that proposer never returns. A program coordinator requests this configured-operator recovery; no new web reconciliation route is introduced. A host without the needed authority view cannot prove owner-backed links. The completed first-leg receipt remains intact and is not reconciled again.
 Conflicting predecessor content/revision remains a refusal requiring inspection,
 not an automatic overwrite. If a predecessor draft landed between the first commit and creation of the second-leg plan, inspect that draft with its owner. A configured operator can void that unaccepted draft with `void-record` (only after confirming it carries no live acceptance evidence), then retry the original new-major acceptance identity to create and finish the state-only plan. Never discard or overwrite the draft automatically. If the draft was accepted or changes cannot safely be voided, stop for operator/owner repair; both majors remain visible and the missing deprecation is not complete. `record-reconcile --kind interface` is the equivalent
 operator entry point. Ordinary anchor release and void repair include interfaces;

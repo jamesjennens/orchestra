@@ -209,3 +209,51 @@ class NativeInterfaceAuthorityTests(NativeInterfaceTests):
         accepted=h.request('POST','/v1/projects/pp/interfaces/iface.quotes.v1/accept',accept,
             token=self.owner,key='restored-source-proposer')
         self.assertEqual(200,accepted.status,accepted.data)
+
+
+class NativeInterfaceConcurrencyTests(NativeInterfaceTests):
+    test_http_interface_capability_v2_complete_retirement_and_host_read=None
+
+    def test_http_interface_and_v1_capability_routes_finish_in_seconds_in_both_orders(self):
+        self.deployment(operators=['ops'],coordinator_writes=True,independent_approval=False)
+        h=self.harness
+        area=self.root/'projects'/'area';area.mkdir()
+        init=subprocess.run([str(self.r.bd_path),'init','--server','--external','--server-host','127.0.0.1',
+             '--server-port',str(self.runtime.port),'--server-user','root','--prefix','area','--database','area',
+             '--skip-agents','--skip-hooks','--non-interactive'],cwd=area,env=native_fixture.admin.environment(self.root),capture_output=True,text=True,timeout=90)
+        self.assertEqual(0,init.returncode,init.stderr)
+        made=h.request('POST','/v1/projects',{'project_id':'area','name':'Synthetic area'},token=self.owner)
+        self.assertEqual(201,made.status,made.data)
+        for project,key,text in [('pp','program.area.area','Area: area\nState: in'),
+                                 ('area','program.member-of','Program: pp\nState: in')]:
+            run=lambda args,project=project:native_fixture.admin.run_bd(self.root,project,['--actor','ops',*args])
+            decision=json.loads(run(['create','Join program','--type','decision','--json']))['id']
+            body={'schema_version':1,'operation':'draft','operation_id':'native-'+key,'key':key,
+                  'title':'Synthetic link','statement':text,'authority':{'type':'decision','id':decision},
+                  'owner':'person:maintainer','review_by':(datetime.date.today()+datetime.timedelta(days=90)).isoformat(),
+                  'tags':[],'decisions':[],'acceptance_state':'accepted','acceptance':acceptance(decision_id=decision)}
+            refs.apply_native(body,'ops',run,self.root/'projects'/project,operator=True,operators=['ops'])
+        body=payload(owner_project='area')
+        for key in ('operation','operation_id','schema_version','revision','expected_sha256'):body.pop(key,None)
+
+        import concurrent.futures,time,threading
+        for number,first in enumerate(('interface','capability')):
+            with self.subTest(first=first):
+                interface_body=dict(body,key='iface.concurrent%d.v1'%number)
+                cap_body=_valid_cap_propose('synthetic.concurrent%d'%number)
+                self.assertNotIn('interfaces',cap_body)
+                started=threading.Event()
+                def post(kind):
+                    if kind==first:started.set()
+                    if kind=='interface':
+                        return h.request('POST','/v1/projects/pp/interfaces',interface_body,
+                            token=self.owner,key='concurrent-interface-'+str(number))
+                    return h.request('POST','/v1/projects/area/capabilities',cap_body,
+                        token=self.owner,key='concurrent-capability-'+str(number))
+                before=time.monotonic()
+                with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                    one=pool.submit(post,first);self.assertTrue(started.wait(2))
+                    two=pool.submit(post,'capability' if first=='interface' else 'interface')
+                    responses=[one.result(timeout=15),two.result(timeout=15)]
+                self.assertLess(time.monotonic()-before,15,'the two routes formed a lock cycle')
+                for response in responses:self.assertEqual(201,response.status,response.data)
