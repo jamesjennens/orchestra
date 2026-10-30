@@ -386,7 +386,9 @@ class ReviewR1Tests(NoteCase):
             self.assertEqual(200, self.request('PUT', '/v1/projects/north/members/%s' % self.ids[name],
                                                {'role': 'viewer'}, token=self.admin).status)
         self.tokens['vic'] = self.login('vic', 'vic-password-1')[0]
-        for name in ('vic', 'vera'):                                   # vera is an ordinary viewer of north
+        # And vic's agent Vale: a superuser's agent can be granted, but its account is only a viewer of north.
+        self.tokens['vale'] = self.granted_agent('vic', 'Vale', 'north', 'nora')
+        for name in ('vic', 'vale', 'vera'):                           # vera is an ordinary viewer of north
             token = self.tokens[name]
             sent = self.send(token, 'north', 'prog')
             read = self.request('GET', '/v1/projects/north/notes', token=token)
@@ -397,6 +399,8 @@ class ReviewR1Tests(NoteCase):
             self.assertNotIn('billing', json.dumps([sent.data, read.data, noted.data]), name)
             mine = self.request('GET', '/v1/me/notes', token=token).data
             self.assertEqual(([], 0), (mine['projects'], mine['unsettled']), name)
+        woken = self.request('GET', '/v1/agents/me/next', token=self.tokens['vale']).data
+        self.assertIsNone(woken['coordinator_notes_marker'])
 
     def test_a_target_the_sender_does_not_name_is_refused_before_it_is_read(self):
         # B3 (1): a counting backend; a project prog's records never name is never read, existing or not.
@@ -416,6 +420,13 @@ class ReviewR1Tests(NoteCase):
             refused = self.send(self.tokens['cleo'], 'prog', to)
             self.assertEqual(404, refused.status, to)
             self.assertEqual(['prog'], reads, to)                       # prog's own records, nothing of the target
+        # A sibling whose entry in the program was accepted by a non-owner is not named either: north reads its own
+        # records and its program's, never east's.
+        self.links['prog'] = list(self.links['prog']) + [item('program.area.east', statement('Area', 'east'),
+                                                             self.ids['carl'])]
+        reads.clear()
+        self.assertEqual(404, self.send(self.tokens['nora'], 'north', 'east').status)
+        self.assertEqual(['north', 'prog'], reads)
         reads.clear()
         self.assertEqual(201, self.send(self.tokens['cleo'], 'prog', 'north').status)
         self.assertIn('north', reads)
