@@ -336,6 +336,18 @@ class HostActorTests(unittest.TestCase):
             with self.subTest(actor=ascii(actor)):
                 self.assertIsNone(pd.authority(actor, 'north', web_state(), OPS))
 
+    def test_a_malformed_id_in_the_state_never_counts(self):
+        # The person and agent shapes are exact even against a damaged or foreign state document that holds a
+        # look-alike key with an owner's role, an enabled account, an agent and a grant (mutant D1).
+        state = web_state()
+        for odd in ('USR_' + HEX, 'usr_' + HEX + '/lane', 'usr_x', 'Agent_' + 'b' * 16, 'agent_x'):
+            with self.subTest(odd=odd):
+                state['users'][odd] = {'disabled': False}
+                state['memberships']['north'][odd] = 'owner'
+                state['agents'][odd] = {'id': odd, 'owner': OWNER, 'enabled': True, 'projects': ['north']}
+                state['coordinator_grants']['north'][odd] = {'granted_by': OWNER, 'granted_at': AT}
+                self.assertIsNone(pd.authority(odd, 'north', state, OPS))
+
     def test_admin_refuses_a_look_alike_before_any_command(self):
         with tempfile.TemporaryDirectory() as root:
             for actor in ('usr_' + HEX, 'USR_' + HEX, 'usr_x', 'uѕr_' + HEX):
