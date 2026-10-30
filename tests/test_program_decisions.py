@@ -146,6 +146,17 @@ class DecisionTests(unittest.TestCase):
                                                             OPS)['flags'])
         self.assertEqual(['malformed-lines'], pd.program_decision(decision('prog-2', P_OWNER, 'Binds: north'), 'prog',
                                                                   state, OPS)['flags'])
+        # Q1: a repeat or a line that does not read binds nothing, though both lines are there (mutant D13).
+        for lines in (('Binds: north', 'Owner-only: no', 'Owner-only: yes'), ('Binds: north', 'Binds: south',
+                                                                              'Owner-only: no'),
+                      ('Binds: north', 'Owner-only: no', 'Per: decision:north')):
+            with self.subTest(lines=lines):
+                found = pd.program_decision(decision('prog-6', P_OWNER, *lines), 'prog', state, OPS)
+                self.assertEqual(['malformed-lines'], found['flags'])
+                section = pd.decisions_section([decision('prog-6', P_OWNER, *lines)], 'prog', {'north': 'in'},
+                                               {'north': [decision('north-1', OWNER, 'Adopts: decision:prog/prog-6')]},
+                                               state, OPS)
+                self.assertEqual({}, section['items'][0]['areas'])
         self.assertIsNone(pd.program_decision(decision('prog-3', P_OWNER, 'Owner-only: yes'), 'prog', state, OPS))
         self.assertIsNone(pd.program_decision({'id': 'prog-4', 'issue_type': 'task', 'created_by': P_OWNER,
                                                'description': 'Binds: north\nOwner-only: no'}, 'prog', state, OPS))
