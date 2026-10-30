@@ -499,7 +499,8 @@ it), applied across levels.
   everyone, an operator included; an operator uses `admin.py decision-change`. A row moving from `in_progress` to
   `open` through task assign or release does not reach this gate, and that changes nothing that binds. A decision row
   with none of these lines and no attestation is not gated, and a task with none of them may be retyped: it reads
-  `not-attested`. The gate reads the row, so every status, type or label write costs one more read.
+  `not-attested`. A status write uses the row the status guard already read, and a label other than `decision` reads
+  nothing for this gate, so an ordinary write stays one read. Only a type change or a `decision` label change costs one more.
 - **Backup and restore:** the journal is in the backup. A restore under the same name honours the records. A restore under
   a new name does not, on purpose: a record binds its project's name, and a new name is a new project. Its rows read
   `not-attested`, its gate still stands, and adoptions elsewhere that pin the old name are not read as this one. An owner

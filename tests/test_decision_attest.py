@@ -476,6 +476,9 @@ class GateParseTests(unittest.TestCase):
         for args in (['update', 'x-1', '--title', 'A title'], ['update', 'x-1', '--description', 'Text'],
                      ['update', 'x-1', '@attachment:0'], ['update', 'x-1', '--assignee', 'w1'], ['update', 'x-1', '-a', 'w1'],
                      ['update', 'x-1', '--claim=false'], ['comments', 'add', 'x-1', 'A comment'], ['show', 'x-1'],
+                     # No other label starts or stops a decision, so an ordinary relabel reads nothing for the gate.
+                     ['update', 'x-1', '--add-label', 'bug'], ['update', 'x-1', '--remove-label', 'bug'],
+                     ['update', 'x-1', '--add-label=a,b'],
                      ['create', 'Title', '--type', 'decision'], ['dep', 'add', 'x-1', 'x-2'], [], None):
             with self.subTest(args=args):
                 self.assertIsNone(da.gated_change(args))
@@ -884,8 +887,22 @@ class WebRouteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as empty, patch.object(fixture.endpoint, '_native_anchor_rows',
                                                                   side_effect=AssertionError('read a row')):
             for args in (['update', 'pp-1', '--title', 'A title'], ['update', 'pp-1', '--assignee', 'w1'],
-                         ['comments', 'add', 'pp-1', 'A comment']):
+                         ['update', 'pp-1', '--add-label', 'bug'], ['comments', 'add', 'pp-1', 'A comment']):
                 self.assertIsNone(fixture.endpoint._guard_attested_decision(self.root, Path(empty), 'pp', args, 'w1', None))
+
+    def test_a_status_write_reads_its_row_once_for_both_guards(self):
+        # The status guard's read is the gate's: a gated close costs no second read.
+        issue = self.make()
+        real = fixture.endpoint._native_anchor_rows
+        with patch.object(fixture.endpoint, '_native_anchor_rows', side_effect=real) as read:
+            answer = self.host('w1', 'close', issue, '--json')
+        self.assertEqual((2, 403), (answer['returncode'], answer['delegation_status']), answer)
+        self.assertEqual(1, read.call_count)
+        # A retype has no status guard's read to use, so it reads for itself, and still answers.
+        with patch.object(fixture.endpoint, '_native_anchor_rows', side_effect=real) as read:
+            answer = self.host('w1', 'update', issue, '--type', 'task', '--json')
+        self.assertEqual((2, 403), (answer['returncode'], answer['delegation_status']), answer)
+        self.assertEqual(1, read.call_count)
 
     def test_a_text_edit_stays_open_to_a_contributor_and_an_ordinary_write_is_untouched(self):
         issue = self.make()

@@ -439,16 +439,17 @@ def _guard_record_anchor_status(root,path,args,actor):
             # claim, and it is not a claim at all when the caller may assign.
             if not _names_assignee(args):
                 _guard_claiming_on_claim(path,row)
+    return rows         # what it read, so that the next guard on this write need not read it again (kittrial-5bb.454 r3)
 
-def _guard_attested_decision(root,path,name,args,actor,authority_config):
+def _guard_attested_decision(root,path,name,args,actor,authority_config,rows=None):
     """Read-before-write guard: a status, type or label change on an attested decision needs standing
     (kittrial-5bb.454 r2, Q1 at VERIFIED). Returns the refusal's answer, or None.
 
     A reopen would otherwise bring an owner's retired decision back into force with no attestation, and a retype or a
     relabel would start or stop a row being a decision. An invocation that names no exact issue is refused, because bd
     would act on the last touched issue, which this guard cannot verify. On the web the standing the row asks for; on a
-    host route nobody, an operator included (admin.py decision-change). The row is read only for a write this could stop,
-    and the status guard beside it already reads the same row."""
+    host route nobody, an operator included (admin.py decision-change). A write this cannot stop reads nothing here, and a
+    status write uses the rows the status guard read, ``rows``: an ordinary write stays one read for all its rows."""
     import decision_attest
     request=decision_attest.gated_change(args)
     if request is None:return None
@@ -458,7 +459,7 @@ def _guard_attested_decision(root,path,name,args,actor,authority_config):
     if targets is None:
         return refused(decision_attest.AttestRefusal(422,'Refusing %s: name exactly the issue(s) to change; bd would '
                                                          'otherwise act on the last touched issue. Nothing was written.'%command))
-    rows=_native_anchor_rows(root,path,actor,targets)
+    if rows is None:rows=_native_anchor_rows(root,path,actor,targets)
     state=None
     if authority_config is not None:
         from http_authority import read_state
@@ -3386,9 +3387,9 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     # An unreadable registry proves no exemption; preserve the
                     # lifecycle refusal rather than blocking unrelated writes.
                     if not bound_raw_exemption():raise
-            _guard_record_anchor_status(root,path,args,actor)
+            anchor_rows=_guard_record_anchor_status(root,path,args,actor)
             _guard_record_anchor_title(root,path,args,actor,named)
-            denied=_guard_attested_decision(root,path,name,args,actor,authority_config)
+            denied=_guard_attested_decision(root,path,name,args,actor,authority_config,rows=anchor_rows)
             if denied is not None:return denied
             _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):

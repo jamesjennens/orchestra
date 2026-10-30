@@ -470,10 +470,10 @@ def gated_change(args):
             touched = True
         elif name == '--add-label':
             change['add'] += words
-            touched = True
+            touched = touched or 'decision' in words        # no other label starts or stops a decision
         elif name == '--remove-label':
             change['remove'] += words
-            touched = True
+            touched = touched or 'decision' in words
         elif name == '--set-labels':
             change['set'] = (change['set'] or []) + words
             touched = True
