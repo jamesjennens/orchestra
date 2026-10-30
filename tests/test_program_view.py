@@ -217,6 +217,15 @@ class WebTests(LinkCase):
         self.view(self.tokens['carl'])
         self.assertEqual([['north', 'prog'], ['prog']], seen)
 
+    def test_the_in_process_backend_applies_the_readable_set_itself(self):
+        # The route re-checks each readable row through coordinators_of; the backend must not lean on that: given a
+        # readable set, it shows numbers only inside it (P3).
+        rows = {row['area']: row for row in self.backend.program('prog', readable=['prog', 'north'])['areas']['items']}
+        self.assertTrue(rows['north']['visible'])
+        self.assertEqual(program_view.area_row('south', 'linked'), rows['south'])
+        rows = {row['area']: row for row in self.backend.program('prog', readable=['prog'])['areas']['items']}
+        self.assertEqual([False, False, False], [row['visible'] for row in rows.values()])
+
     def test_a_right_lost_after_the_read_hides_the_row(self):
         # coordinators_of checks the caller again: a role removed after the endpoint's read makes the row the
         # hidden one, and its rows no longer count.
