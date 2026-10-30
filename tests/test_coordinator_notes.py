@@ -351,6 +351,31 @@ class ReviewR1Tests(NoteCase):
         refused = self.send(self.tokens['nora'], 'north', 'west')
         self.assertEqual(404, refused.status, refused.data)
 
+    def test_a_sibling_the_program_has_let_go_is_refused(self):
+        # B1, N7's other half: south still names prog, and prog still names south, but prog has let it go. Both
+        # sides of each area's link must stand.
+        self.links['prog'] = [item('program.area.north', statement('Area', 'north'), self.ids['pat']),
+                              item('program.area.south', statement('Area', 'south', state='left'), self.ids['pat'])]
+        refused = self.send(self.tokens['nora'], 'north', 'south')
+        self.assertEqual(404, refused.status, refused.data)
+
+    def test_an_agent_of_a_coordinator_without_the_grant_coordinates_nothing(self):
+        # B2: the role is the account's, but the agent still needs the grant: Moth is cleo's agent in prog with
+        # no grant, so no route takes it and no note wakes it.
+        made = self.request('POST', '/v1/agents', {'name': 'Moth', 'working_directory': '/home/x/Moth',
+                                                   'projects': ['prog']}, token=self.tokens['cleo'])
+        self.assertEqual(201, made.status, made.data)
+        moth = made.data['credential']['secret']
+        self.send(self.tokens['nora'], 'north', 'prog')
+        self.assertEqual(403, self.send(moth).status)
+        self.assertEqual(403, self.request('GET', '/v1/projects/prog/notes', token=moth).status)
+        mine = self.request('GET', '/v1/me/notes', token=moth).data
+        self.assertEqual(([], 0), (mine['projects'], mine['unsettled']))
+        marker = [self.request('GET', '/v1/agents/me/next', token=token).data['coordinator_notes_marker']
+                  for token in (moth, self.tokens['rook'])]
+        self.assertIsNone(marker[0])
+        self.assertIsNotNone(marker[1])
+
     def test_a_superuser_who_is_only_a_viewer_is_refused_like_any_viewer(self):
         # B2: send, read, noted and notes to me, against an ordinary viewer of the same project.
         note = self.send(self.tokens['cleo']).data
