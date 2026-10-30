@@ -836,7 +836,7 @@ class NativeDecisionTests(unittest.TestCase):
                             'Binds: qq\nOwner-only: yes', '--json')
         self.write('pp', 'opx', 'create', 'Raise the limit', '--labels', 'suggestion', '--description',
                    'From: decision:qq/x-1', '--json')
-        pinned = self.attest_as_operator('pp', listed)['record']['digest']
+        pinned = self.attest_as_operator('pp', listed)['record']['sha256']
         adoption = self.write('qq', 'ops', 'create', 'We adopt it', '--type', 'decision', '--description',
                               'Adopts: decision:pp/%s@%s' % (listed, pinned), '--json')
         before = self.view()[0][listed]
@@ -855,7 +855,7 @@ class NativeDecisionTests(unittest.TestCase):
                                  'Binds: qq\nOwner-only: yes', '--json')
         found = self.view()[0][program_row]
         self.assertEqual((['not-attested'], {}), (found['flags'], found['areas']))
-        pinned = self.attest_as_operator('pp', program_row)['record']['digest']
+        pinned = self.attest_as_operator('pp', program_row)['record']['sha256']
         self.write('qq', 'ops', 'create', 'From a host actor', '--type', 'decision', '--description',
                    'Adopts: decision:pp/%s@%s' % (program_row, pinned), '--json')
         self.assertEqual('not-attested', self.view()[0][program_row]['areas']['qq']['state'])
