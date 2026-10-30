@@ -637,6 +637,17 @@ class WebRouteTests(unittest.TestCase):
         self.assertNotIn(answer.status, (200, 201), answer.data)
         self.assertEqual('not-attested', self.read(issue)['attestation'])
 
+    def test_a_worker_credential_cannot_write_one_even_an_owners(self):
+        # E1: an owner's own worker credential holds the route's capability and is still not the owner's own session.
+        issue = self.make()
+        issued = self.web.issue_credential(self.tokens['pat'], 'pp', label='lane')
+        answer = self.web.request('POST', '/v1/projects/pp/decisions/%s/attest' % issue,
+                                  {'digest': self.read(issue)['digest']}, token=issued['secret'],
+                                  key='cred-' + uuid.uuid4().hex)
+        self.assertEqual(403, answer.status, answer.data)
+        self.assertIn('own web session or agent', answer.data['error']['message'])
+        self.assertEqual('not-attested', self.read(issue)['attestation'])
+
     def test_the_route_takes_the_digest_and_nothing_else(self):
         # E6: the author, how it came and the time are the server's: naming them is refused, not ignored.
         issue = self.make()
@@ -738,6 +749,12 @@ class WebRouteTests(unittest.TestCase):
                                                            'w1', None)
         self.assertEqual((2, 422), (answer['returncode'], answer['delegation_status']), answer)
 
+    def test_a_project_with_no_attestation_reads_no_row_for_the_gate(self):
+        # G19: the guard costs an ordinary project nothing.
+        with tempfile.TemporaryDirectory() as empty, patch.object(fixture.endpoint, '_native_anchor_rows',
+                                                                  side_effect=AssertionError('read a row')):
+            self.assertIsNone(fixture.endpoint._guard_attested_decision(self.root, Path(empty), 'pp', ['close', 'pp-1'], 'w1', None))
+
     def test_a_text_edit_stays_open_to_a_contributor_and_an_ordinary_write_is_untouched(self):
         issue = self.make()
         self.attest(issue, 'pat')
@@ -769,12 +786,14 @@ class WebRouteTests(unittest.TestCase):
         refused = self.admin('decision-attest', '--project', 'pp', '--actor', 'someone', '--decision', issue, '--digest',
                              read['digest'])
         self.assertNotEqual(0, refused.returncode)
+        self.assertIn('configured operator', refused.stderr)        # O1: before anything is read or written
         for change, seen in (('close', 'closed'), ('reopen', 'counts')):
             done = self.admin('decision-change', '--project', 'pp', '--actor', 'ops', '--decision', issue, '--change', change)
             self.assertEqual(0, done.returncode, done.stderr)
             self.assertEqual(seen, self.read(issue)['attestation'])
         refused = self.admin('decision-change', '--project', 'pp', '--actor', 'someone', '--decision', issue, '--change', 'close')
         self.assertNotEqual(0, refused.returncode)
+        self.assertIn('configured operator', refused.stderr)
         self.assertEqual('counts', self.read(issue)['attestation'])
         done = self.admin('decision-change', '--project', 'pp', '--actor', 'ops', '--decision', issue, '--change', 'type-task')
         self.assertEqual(0, done.returncode, done.stderr)
