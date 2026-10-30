@@ -393,7 +393,7 @@ def _guard_open_dependency_on_claim(root,path,actor,row):
                          %(row.get('id'),open_dependency_sentence(open_deps) or 'it is blocked by an open dependency'))
 
 
-def _guard_record_anchor_status(root,path,args,actor):
+def _guard_record_anchor_status(root,path,args,actor,rows_read=None):
     """Read-before-write guard: a status change never moves a record anchor.
 
     A reference/proposal/settings/capability anchor is created closed on purpose and is
@@ -408,7 +408,9 @@ def _guard_record_anchor_status(root,path,args,actor):
     spellings, `--claim`, `--defer` and `--assignee` (`status_change_targets`). Runs
     under the same coordination lock as the write it guards, reads every named target in
     ONE native read, and fails closed when the target cannot be resolved: bd would
-    otherwise act on the last touched issue, which this guard cannot verify.
+    otherwise act on the last touched issue, which this guard cannot verify. ``rows_read``,
+    when given, is filled with that read, so that the next guard on this write need not read
+    the same rows again (kittrial-5bb.454 r3).
     """
     request=status_change_targets(args)
     if request is None:return
@@ -417,6 +419,7 @@ def _guard_record_anchor_status(root,path,args,actor):
         raise ValueError('Refusing %s: name exactly the issue(s) to change; bd would otherwise act on the last '
                          'touched issue, whose record-anchor status cannot be verified.'%command)
     rows=_native_anchor_rows(root,path,actor,targets)
+    if rows_read is not None:rows_read.update(rows)
     for token in targets:
         canonical,row=rows[token]
         if is_record_anchor(row):
@@ -439,7 +442,6 @@ def _guard_record_anchor_status(root,path,args,actor):
             # claim, and it is not a claim at all when the caller may assign.
             if not _names_assignee(args):
                 _guard_claiming_on_claim(path,row)
-    return rows         # what it read, so that the next guard on this write need not read it again (kittrial-5bb.454 r3)
 
 def _guard_attested_decision(root,path,name,args,actor,authority_config,rows=None):
     """Read-before-write guard: a status, type or label change on an attested decision needs standing
@@ -3387,9 +3389,10 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     # An unreadable registry proves no exemption; preserve the
                     # lifecycle refusal rather than blocking unrelated writes.
                     if not bound_raw_exemption():raise
-            anchor_rows=_guard_record_anchor_status(root,path,args,actor)
+            anchor_rows={}
+            _guard_record_anchor_status(root,path,args,actor,rows_read=anchor_rows)
             _guard_record_anchor_title(root,path,args,actor,named)
-            denied=_guard_attested_decision(root,path,name,args,actor,authority_config,rows=anchor_rows)
+            denied=_guard_attested_decision(root,path,name,args,actor,authority_config,rows=anchor_rows or None)
             if denied is not None:return denied
             _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):
