@@ -183,8 +183,12 @@ class InterfaceLockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)
             def effect():
-                with self.assertRaises(TimeoutError):
-                    with file_lock(root/'.interface-mutations.lock',timeout=.02):pass
+                def probe():
+                    try:
+                        with file_lock(root/'.interface-mutations.lock',timeout=.02):return False
+                    except TimeoutError:return True
+                with ThreadPoolExecutor(1) as pool:
+                    self.assertTrue(pool.submit(probe).result(1),'native restore skipped the semantic mutex')
                 return 0
             with patch.object(sys,'argv',['admin.py','--root',str(root),'restore-new']),patch.object(admin,'_main',side_effect=effect):
                 self.assertEqual(0,admin.main())
