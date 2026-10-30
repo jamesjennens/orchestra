@@ -6406,6 +6406,18 @@ def resolve_http_state_path(root, named=None):
         return default,'default'
     return None,None
 
+def decision_web_state(root,named):
+    """The web state an attestation is judged against (kittrial-5bb.454 r2), or None where the deployment has none, and
+    then no person's attestation counts. A file the operator named has to be there."""
+    from http_authority import read_state
+    path,_=resolve_http_state_path(root,named)
+    if path is None:return None
+    if named is not None:
+        if path.is_symlink() or not path.is_file():raise ValueError('Use the existing web service state document')
+        return read_state(path)
+    try:return read_state(path)
+    except Exception:return None
+
 def copy_sqlite_consistently(source, destination):
     """Copy a SQLite database consistently while others may use it; None or the reason.
 
@@ -10460,9 +10472,10 @@ def main():
     a=sub.add_parser('decision-attest',help="attest a decision's exact text (operator allowlist, host journal)")
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--decision',required=True)
     a.add_argument('--digest',required=True,help='the digest decision-attest-read printed for the text you read')
+    a.add_argument('--state',help='the web service state document, read only, if it is not the deployment\'s own')
     a=sub.add_parser('decision-attest-read',help="read-only: a decision's exact text, its digest and how it reads now")
     a.add_argument('--project',required=True);a.add_argument('--decision',required=True)
-    a.add_argument('--state',help='the existing web service state document (read only)')
+    a.add_argument('--state',help='the web service state document, read only, if it is not the deployment\'s own')
     a=sub.add_parser('decision-change',help='close, reopen, retype or relabel a decision that carries an attestation (operator allowlist)')
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--decision',required=True)
     a.add_argument('--change',required=True,choices=('close','reopen','type-decision','type-task','add-decision-label','remove-decision-label'))
@@ -11175,9 +11188,7 @@ def main():
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         payload={'schema_version':1,'operation_id':'operator-'+secrets.token_hex(16),'decision':args.decision,'digest':args.digest}
         # An operator reads any project. Before this project's lock, so that no lock is held across projects.
-        from http_authority import read_state
-        try:state=read_state(root/'http-state.json')
-        except Exception:state=None                  # absent or unreadable: no person owner counts
+        state=decision_web_state(root,args.state)
         def pinned_decision(other,issue):
             try:other_path=project_dir(root,other)
             except ValueError:return None
@@ -11196,15 +11207,9 @@ def main():
     elif args.command=='decision-attest-read':
         # Read-only (kittrial-5bb.454 r2): what an operator reads before attesting. Nothing is written; no lock is taken.
         import decision_attest
-        from http_authority import read_state
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
-        try:state=read_state(root/'http-state.json')
-        except Exception:state=None                  # absent or unreadable: no person owner counts
-        if args.state:
-            state_path=Path(args.state)
-            if state_path.is_symlink() or not state_path.is_file():raise ValueError('Use the existing web service state document')
-            state=read_state(state_path)
+        state=decision_web_state(root,args.state)
         def run(argv):return run_bd(root,args.project,argv)
         print(json.dumps(decision_attest.read_answer(decision_attest.read_issue(run,args.decision),args.project,state,
                                                      operators(root),path),ensure_ascii=False))

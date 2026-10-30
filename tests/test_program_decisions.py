@@ -816,10 +816,13 @@ class NativeDecisionTests(unittest.TestCase):
     def attest_as_operator(self, project, issue):
         def run(argv):
             return fixture.admin.run_bd(self.root, project, ['--actor', 'ops', *argv])
+        def pinned(other, wanted):
+            return da.pin_fact(da.read_issue(lambda argv: fixture.admin.run_bd(self.root, other, argv), wanted), other, None,
+                               ['ops'], self.root / 'projects' / other)
         row = da.read_issue(run, issue)
         return da.apply({'schema_version': 1, 'operation_id': 'op-' + issue, 'decision': issue, 'digest': da.digest(row)},
                         project=project, journal=self.root / 'projects' / project, run=run, author='ops', via='operator',
-                        at='2026-01-01T00:00:00Z', state=None, operators=['ops'])
+                        at='2026-01-01T00:00:00Z', state=None, operators=['ops'], pinned=da.read_pins(row, pinned))
 
     def view(self, **options):
         with patch('reference_records.links', self.fake_links), \

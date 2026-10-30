@@ -2062,7 +2062,9 @@ agent's web acceptance of a reference or capability record names its delegation 
 **Attested decisions** (kittrial-5bb.454 r2; `decision_attest.py`). An operator's host routes are:
 `python3 admin.py --root ROOT decision-attest-read --project PROJECT --decision ID [--state STATE.json]` (read-only: the
 exact text, its digest and how it reads now), `python3 admin.py --root ROOT decision-attest --project PROJECT --actor
-OPERATOR --decision ID --digest DIGEST` (attests what was read; a text that changed since is refused) and `python3
+OPERATOR --decision ID --digest DIGEST [--state STATE.json]` (attests what was read; a text that changed since is
+refused, and a row carrying `Adopts:` or `Authorises:` needs the pinned decision to count, judged against the web state, the
+deployment's own unless `--state` names one) and `python3
 admin.py --root ROOT decision-change --project PROJECT --actor OPERATOR --decision ID --change
 close|reopen|type-decision|type-task|add-decision-label|remove-decision-label [--reason TEXT]`. The last is the only
 host route for those changes on a row with an honoured attestation: `bd close`, `reopen` and `update` with a status,
