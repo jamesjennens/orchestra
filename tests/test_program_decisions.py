@@ -398,17 +398,27 @@ class CreatedByFlagTests(unittest.TestCase):
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 @unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
-class NativeCreatedByTests(fixture.RealBdLabelAliasTests):
+class NativeCreatedByTests(unittest.TestCase):
     """Real bd behind the real endpoint: created_by stays its first writer's through every write another can make."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.runtime = type('CreatedByRuntime', (fixture.RealBdLabelAliasTests,), {})
+        cls.runtime.setUpClass()
+        cls.root, cls.bd_path = cls.runtime.root, cls.runtime.bd_path
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.runtime.tearDownClass()
+
     def write(self, actor, *args):
-        answer = fixture.endpoint.execute(self.root, {'project': 'p', 'actor': actor, 'action': 'bd',
+        answer = fixture.endpoint.execute(self.root, {'project': 'pp', 'actor': actor, 'action': 'bd',
                                                       'args': list(args)})
         self.assertEqual(0, answer['returncode'], answer)
         return answer
 
     def created_by(self, issue):
-        shown = subprocess.run([str(self.bd_path), '--directory', str(self.root / 'projects' / 'p'), '--sandbox',
+        shown = subprocess.run([str(self.bd_path), '--directory', str(self.root / 'projects' / 'pp'), '--sandbox',
                                 'show', issue, '--json'], env=fixture.admin.environment(self.root),
                                capture_output=True, text=True, timeout=120)
         found = json.loads(shown.stdout)
@@ -422,8 +432,8 @@ class NativeCreatedByTests(fixture.RealBdLabelAliasTests):
         writes = [('update', issue, '--title', 'Retitled'), ('update', issue, '--description', 'Binds: north'),
                   ('update', issue, '--status', 'in_progress'), ('update', issue, '--assignee', 'opb'),
                   ('update', issue, '--priority', '1'), ('update', issue, '--add-label', 'note'),
-                  ('comments', 'add', issue, 'A comment'), ('dep', 'add', issue, other),
-                  ('close', issue), ('reopen', issue),
+                  ('comments', 'add', issue, 'A comment'), ('close', issue), ('reopen', issue),
+                  ('dep', 'add', issue, other),
                   ('update', issue, '--description', 'Binds: north'),        # a replay of the same write
                   ('update', issue, '--description', 'Binds: north')]
         for args in writes:
