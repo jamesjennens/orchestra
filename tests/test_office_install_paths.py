@@ -204,9 +204,12 @@ class CurrentPathTests(unittest.TestCase):
 
     def test_worker_client_setup_says_a_host_project_is_not_on_the_web_yet(self):
         text = worker_text(self.root)
-        self.assertIn('alpha', text)
-        self.assertIn('superuser registers it', text)
-        self.assertIn('POST /v1/projects', text)
+        self.assertIn(
+            'Host project alpha is not on the site yet; a superuser should register it under '
+            'Projects → Register a project, and the registering person becomes the owner '
+            '(they can add the intended owner and step down later).',
+            text)
+        self.assertNotIn('POST /v1/projects', text)
 
     def test_authorized_keys_print_the_current_interpreter_and_endpoint(self):
         key_file = self.root / 'lane.pub'

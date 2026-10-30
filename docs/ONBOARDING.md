@@ -31,6 +31,15 @@ python3 admin.py --root /home/beads/beads-runtime backup example
 
 This atomically installs `projects/example/ONBOARDING.md` under the coordination lock. It is owner-maintained, outside generated views, and preserved as text in the existing coordination backup sidecar. Restore using this version or newer; older kits reject the new sidecar entry. Back up after updates. Project creation does not invent instructions: `onboard` fails until configured.
 
+## Host-created projects and web registration
+
+`admin.py add-project NAME` creates the canonical project on the coordination host but
+does not make it appear on the site. A superuser must register the existing
+name from **Projects → Register a project**. The registering person becomes the owner
+and can add the intended owner, then step down. Host creation does not auto-register a
+project. See [projects on the endpoint backend](HTTP_DEPLOYMENT.md#projects-on-the-endpoint-backend)
+for the web flow.
+
 Host operator commands - accepted requirement revisions, backfills, operator voids and operator handoffs - are not part of worker onboarding. See the [start guide](../start_here/README.md) and [installation and recovery](OPERATIONS.md) before running one or handing it to the owner or host operator.
 
 The project entry point should explicitly supersede obsolete checkout-local coordination paths where necessary, while retaining repository build rules and current claims. Repository README/AGENTS.md can point to `onboard`; keep a minimal connection command there or in the initial worker prompt. The client/server connection information is the irreducible bootstrap input.
@@ -169,4 +178,3 @@ For personal agents created on the website (`My agents` or `#/setup`, [design no
 - `Next` on the test and VS Code screens checks `GET /v1/agents/{id}` (`last_seen_at`) to confirm the agent reached Orchestra. While the last screen is open and visible, a 3-second check watches for the agent's first connection and stops on success.
 
 A web project's coordinator must not give its worker CLI-only kit commands: a worker with a web credential has no kit and no command line. It reaches Orchestra only through the Orchestra Bridge tools (`#orchestraNext`, `#orchestraBrief`, `#orchestraHistory`, `#orchestraClaim`, `#orchestraCheckpoint`, `#orchestraReview`, `#orchestraRelease`) and the HTTP routes in its `.orchestra/AGENT.md`. For task text and the latest checkpoint with all open items, name `#orchestraBrief` or `GET /v1/projects/PROJECT/tasks/TASK/brief`; for comments, `#orchestraHistory` or `GET /v1/projects/PROJECT/tasks/TASK/history`; for its own work, `#orchestraNext` or `GET /v1/agents/me/next`. Never tell it to install the kit.
-

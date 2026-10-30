@@ -154,6 +154,18 @@ class OnboardingDocumentWordingTests(unittest.TestCase):
         self.assertIn('review requests on your own tasks', text)
         self.assertNotIn('review feedback', text)
 
+    def test_host_created_projects_explain_site_registration_and_ownership(self):
+        root = Path(__file__).resolve().parents[1]
+        for relative in ('README.md', 'start_here/README.md', 'docs/ONBOARDING.md'):
+            with self.subTest(document=relative):
+                text = ' '.join((root / relative).read_text(encoding='utf-8').split())
+                self.assertIn('admin.py add-project NAME', text)
+                self.assertIn('does not make it appear on the site', text)
+                self.assertIn('Projects → Register a project', text)
+                self.assertIn('registering person becomes the owner', text)
+                self.assertIn('add the intended owner', text)
+                self.assertIn('step down', text)
+
 
 class CodeHostGitAccessWordingTests(unittest.TestCase):
     """A new worker's own git access to the code host is a stated first step (kittrial-5bb.292).
