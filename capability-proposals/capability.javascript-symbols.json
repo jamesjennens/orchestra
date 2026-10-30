@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "operation_id": "kittrial-5bb-309-js-symbols",
+  "key": "capability.javascript-symbols",
+  "name": "Resolve JavaScript and TypeScript symbol pointers",
+  "aliases": [
+    "capability pointer symbol verification",
+    "JavaScript TypeScript symbol resolution"
+  ],
+  "summary": "Resolve JS, JSX, TS and TSX declaration pointers with a bounded lexical reader. Namespace members are not indexed. Unsupported examples include private names, hashbangs, destructured exports, object return types, fields without semicolons, static blocks, escaped export aliases and nested template interpolation inside JSX expressions.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "capabilities.py::js_tokens",
+    "capabilities.py::js_definitions",
+    "capabilities.py::resolve_pointer"
+  ],
+  "tests": [
+    "tests/test_js_symbols.py::JavaScriptSymbols.test_function",
+    "tests/test_js_symbols.py::JavaScriptSymbols.test_comment_and_string",
+    "tests/test_js_symbols.py::JavaScriptSymbols.test_large_file_bounded"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "capability",
+    "javascript",
+    "typescript"
+  ]
+}
