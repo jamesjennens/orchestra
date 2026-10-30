@@ -336,6 +336,36 @@ class DecisionTests(unittest.TestCase):
                 with self.subTest(adopter=adopter, owner_only=program_row['description']):
                     self.assertEqual('adoption-stale', self.adopt(program_row, decision('north-1', adopter, wrong))[0])
 
+    def test_text_changed_and_changed_back_starts_a_new_run_and_the_old_adoption_stays_stale(self):
+        # The coordinator's named test: the same words again are a new attestation, not the one the area read.
+        words = 'Binds: north\nOwner-only: no'
+        program_row = decision('prog-1', P_OWNER, words)
+        adopted = decision('north-1', COORD, 'Adopts: decision:prog/prog-1')
+        self.assertEqual('adopted', self.adopt(program_row, adopted)[0])
+        first_pin = _PINS['prog-1']
+        program_row['description'] = words + '\nOther text.'
+        attest(program_row, P_OWNER)
+        self.assertEqual('adoption-stale', self.adopt(program_row, adopted)[0])
+        program_row['description'] = words
+        attest(program_row, P_OWNER)
+        self.assertEqual(da.digest(decision('prog-1', P_OWNER, words)), da.digest(program_row))
+        attest_again = pd.program_decision(program_row, 'prog', web_state(), OPS, J)['attestation_id']
+        self.assertNotEqual(first_pin, attest_again)
+        self.assertEqual('adoption-stale', self.adopt(program_row, adopted)[0])
+        # The area adopts the new run, and it binds.
+        _PINS['prog-1'] = attest_again
+        self.assertEqual('adopted', self.adopt(program_row, decision('north-1', COORD, 'Adopts: decision:prog/prog-1'))[0])
+
+    def test_an_edit_undone_with_no_new_attestation_is_the_same_run(self):
+        # Nobody attested anything in between: the row reads stale during the edit, and the text is again what was read.
+        words = 'Binds: north\nOwner-only: no'
+        program_row = decision('prog-1', P_OWNER, words)
+        adopted = decision('north-1', COORD, 'Adopts: decision:prog/prog-1')
+        program_row['description'] = words + '\nAn edit.'
+        self.assertEqual(['attestation-stale'], pd.program_decision(program_row, 'prog', web_state(), OPS, J)['flags'])
+        program_row['description'] = words
+        self.assertEqual('adopted', self.adopt(program_row, adopted)[0])
+
     def test_another_attester_of_the_same_words_leaves_the_adoption_in_force(self):
         program_row = decision('prog-1', P_COORD, 'Binds: north', 'Owner-only: no')
         adopted = decision('north-1', COORD, 'Adopts: decision:prog/prog-1')
