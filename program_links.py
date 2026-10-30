@@ -85,6 +85,18 @@ def write_problem(payload, project_id=None):
     return None
 
 
+def link_people(state, project_ids):
+    """``(memberships, users)`` for the live owner check from a web state document (or None: no person owner then):
+    the roles in ``project_ids`` and each account's disabled flag. Nothing else about anyone. The web service and the
+    endpoint's program view read the same document through this one function (kittrial-5bb.453)."""
+    state = state if isinstance(state, dict) else {}
+    everyone = state.get('memberships') or {}
+    memberships = {pid: dict(everyone.get(pid) or {}) for pid in project_ids}
+    users = {uid: {'disabled': bool(user.get('disabled'))}
+             for uid, user in (state.get('users') or {}).items() if isinstance(user, dict)}
+    return memberships, users
+
+
 def owner_or_operator(accepted_by, project, memberships, users):
     """Whether a live acceptance was written by a person owner of ``project`` (live role, account enabled) or by
     a listed operator. ``accepted_by`` comes from the reader's live evidence (keyed_entries.evidence_is_live), so a

@@ -470,6 +470,15 @@ The coordinators of linked projects write to each other and are woken, without t
 - **A brief resolves only this project's tokens.** It names another project's as `cross-project`, and the trace
   resolves it.
 
+### The program view
+
+`trace --program` reads a program project's view (kittrial-5bb.453; docs/design/PROGRAM_DESIGN.md §5): each area
+with its link state and, for an area your key may read, its open tasks and lanes waiting long; program requirements
+no readable area cites, and area designs pinning a superseded program revision. An area you may not read is one
+line, "not visible to you", with no number; with a key bound to some projects, an area outside them reads
+`not-checked` and is not read at all. 50 areas a page (`--offset`, `--limit`); the coverage block says what was read.
+On the web it is the Program page, in the menu of a program project.
+
 ## Propose a requirement instead of opening a task
 
 When you find something the product should do and it is not your task, do not open

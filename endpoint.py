@@ -1211,6 +1211,8 @@ READ_ONLY_ACTIONS={
     'history':_read_only_always,
     'requirements':_read_only_always,
     'trace':_read_only_always,
+    # kittrial-5bb.453: the program view, read-only like the trace it is built beside.
+    'program':_read_only_always,
     'web-switches':_read_only_always,
     'work':_read_only_always,
     'review':_review_rounds_read_only,
@@ -1314,6 +1316,98 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
     result=trace_read.answer(rows,name,options,operators=configured_operators(root),verifiers=configured_verifiers(root),
                              members=members,governance=governance,
                              others=trace_read.others_loader(readable,read_project))
+    return result,''.join(run_warnings)
+
+def program_answer(root,path,name,args,actor,authority_config=None,key_projects=None,by_service=False,project_path=None,
+                   now=None):
+    """(answer, warnings) of one page of the program view (kittrial-5bb.453; PROGRAM_DESIGN.md section 5).
+
+    The readable set is .449's rule exactly: the web service's own --readable, honoured only from its launch; on
+    the host the key's projects, or any project for an operator's unbound key. An area outside it is never read
+    for numbers. The one fact the program-links read shows every reader of the program (whether the area's own
+    side counts, kittrial-5bb.446) is read for each area on the page, except that a key bound to projects reads
+    nothing of a project it is not bound to (rule 1 of COORDINATORS_PER_PROJECT_DESIGN.md): there the link state is
+    not-checked. Each project is read under its own shared lock, its path resolved only through execute's
+    resolver, after the gate."""
+    import program_links
+    import program_view
+    import reference_records
+    import trace_read
+    from briefing import ContextPointers
+    from read_cache import cached_export_rows
+    args,given=trace_read.split_readable(list(args))
+    if given is not None and not by_service:raise ValueError(trace_read.READABLE_REFUSED)
+    readable=frozenset(given or ()) if by_service else key_projects
+    facts=None if (by_service or key_projects is None) else key_projects
+    options=program_view.parse_args(args)
+    operators=configured_operators(root)
+    when=trace_read.snapshot_now(now)
+    run_warnings=[]
+    def runner(project_path_,project):
+        def run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,project_path_,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        return run
+    with held_coordination_lock(path,shared=True):
+        rows=cached_export_rows(root,path,runner(path,name),name)
+        governance=trace_read.read_governance(rows,path,name)
+    entries=program_view.area_keys(reference_records.links(rows,operators).get('items'))
+    page=entries[options['offset']:options['offset']+options['limit']]
+    state=None
+    try:
+        from http_authority import AuthorityDenied,read_state
+        state=read_state(authority_config.store if authority_config is not None else root/'http-state.json')
+    except Exception:                       # absent, unreadable or unsupported: no person owner counts
+        state=None
+    memberships,users=program_links.link_people(state,{name}|{area for area,_ in page})
+    def read_area(area):
+        # An area's rows, read like the program's, or None for no project (no directory, not a project,
+        # unfinished): a missing area and one the caller may not read give the same row.
+        if project_path is None:return None
+        try:area_path=project_path(area)
+        except ValueError:return None
+        if not (area_path/'.beads/metadata.json').is_file():return None
+        import project_creation
+        if project_creation.unfinished(root,area):return None
+        with held_coordination_lock(area_path,shared=True):
+            area_rows=cached_export_rows(root,area_path,runner(area_path,area),area)
+            area_governance=trace_read.read_governance(area_rows,area_path,area)
+        return area_path,area_rows,area_governance
+    areas,cited,pins=[],{},[]
+    for area,own_item in page:
+        if facts is not None and area not in facts:
+            areas.append(program_view.area_row(area,'not-checked'))
+            continue
+        loaded=read_area(area)
+        member=None
+        if loaded is not None:
+            member=next((item for item in reference_records.links(loaded[1],operators).get('items') or []
+                         if isinstance(item,dict) and item.get('key')==program_links.MEMBER_OF),None)
+        link=program_view.link_state(name,area,own_item,member,memberships,users)
+        if loaded is None or (readable is not None and area not in readable):
+            areas.append(program_view.area_row(area,link))
+            continue
+        area_path,area_rows,area_governance=loaded
+        import lanes
+        from sessions import read_registry
+        flags=lanes.read(area_rows,actor,read_registry(area_path),
+                         ['--idle-minutes',str(options['idle_minutes']),'--limit','1'],now=when,operators=operators,
+                         journal=area_path,scope='all',
+                         comment_authority=comment_contact_authority(root,area_path,operators,authority_config))['flags']
+        areas.append(program_view.area_row(area,link,program_view.area_details(area_rows,flags)))
+        snap=trace_read.Snapshot(area_rows,area,now=when,operators=operators,verifiers=configured_verifiers(root),
+                                 governance=area_governance)
+        found,pinned=program_view.citations_to(snap,name,area)
+        for key,where in found.items():cited.setdefault(key,[]).extend(where)
+        pins.extend(pinned)
+    requirements=program_view.requirements_section(ContextPointers(rows,name,operators,governance=governance),
+                                                   cited,pins,options['requirements_offset'])
+    result=program_view.answer(name,areas,len(entries),options['offset'],options['limit'],requirements)
+    result['is_program']=program_view.accepted_area(reference_records.links(rows,operators).get('items'),name,
+                                              memberships,users)
+    if not by_service:
+        result['coordinators']=program_view.COORDINATORS_ON_THE_WEB          # Q2: the web state is the web's
     return result,''.join(run_warnings)
 
 
@@ -1527,6 +1621,12 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # may read.
         result=trace_answer(root,path,name,request.get('args',[]),actor,authority_config,key_projects=key_projects,
                             by_service=authority_config is not None,project_path=lambda other:project_dir(root,other))
+        return {'returncode':0,'stdout':json.dumps(result[0],ensure_ascii=False)+'\n','stderr':result[1]}
+    if action=='program':
+        # kittrial-5bb.453: the program view. The same readable-set rule and the same resolver as the trace above;
+        # the program's path is this request's, already through the gate.
+        result=program_answer(root,path,name,request.get('args',[]),actor,authority_config,key_projects=key_projects,
+                              by_service=authority_config is not None,project_path=lambda other:project_dir(root,other))
         return {'returncode':0,'stdout':json.dumps(result[0],ensure_ascii=False)+'\n','stderr':result[1]}
     if action=='owner-requirements':
         from requirement_http import web_action
@@ -3207,6 +3307,8 @@ CONTRIBUTOR_COMMANDS = (
      'the trace read, answered by the server: summary, requirements, tasks, tokens, decisions, designs, round'),
     ('trace --verify [--repo DIR] [--record | --payloads FILE]',
      "check each accepted design document against git at its pinned commit (verified, design-drift)"),
+    ('trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N]',
+     "the program view of a program project: its areas, interfaces and requirements' coverage"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),

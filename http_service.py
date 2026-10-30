@@ -1499,6 +1499,34 @@ class InProcessBackend:
         return {'schema_version': 1, 'items': [],
                 'coverage': 'the in-process backend holds no native reference records'}
 
+    def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=()):
+        """kittrial-5bb.453: the program view from this backend's own link reads. It holds no native rows, so a
+        readable area has no open task and no lane, and the program no requirement; the rules are the endpoint's
+        (program_view), over the same link facts."""
+        import program_view
+        items = self.reference_links(project_id).get('items') or []
+        entries = program_view.area_keys(items)
+        page = entries[offset:offset + limit]
+        memberships, users = self.service.program_link_people({project_id} | {area for area, _ in page})
+        areas = []
+        for area, own in page:
+            try:
+                member = next((i for i in self.reference_links(area).get('items') or []
+                               if isinstance(i, dict) and i.get('key') == program_links.MEMBER_OF), None)
+            except HttpError:
+                member = None
+            with self.service.store.lock:
+                exists = area in self.service.state['projects']
+            state = program_view.link_state(project_id, area, own, member, memberships, users)
+            if not exists or area not in set(readable or ()):
+                areas.append(program_view.area_row(area, state))
+            else:
+                areas.append(program_view.area_row(area, state, program_view.area_details([], {})))
+        requirements = {'items': [], 'total': 0, 'next_offset': None, 'scope': program_view.REQUIREMENTS_SCOPE}
+        result = program_view.answer(project_id, areas, len(entries), offset, limit, requirements)
+        result['is_program'] = program_view.accepted_area(items, project_id, memberships, users)
+        return result
+
     def references_find(self, project_id, phrase, limit=5):
         return {'schema_version': 1, 'phrase': phrase, 'total': 0, 'items': [],
                 'coverage': 'the in-process backend holds no native reference records'}
@@ -3417,6 +3445,19 @@ class EndpointBackend:
         payload = self._checked(reply, 'web-switches', reading=True)
         if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
             raise uncertain('Canonical switch read returned an unexpected shape')
+        return payload
+
+    def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=()):
+        """kittrial-5bb.453: one page of the program view through the endpoint's read-only `program` action, with the
+        caller's readable projects as the service's own --readable arguments (the .449 rule)."""
+        args = ['--offset', str(offset), '--limit', str(limit), '--idle-minutes', str(idle_minutes),
+                '--requirements-offset', str(requirements_offset)]
+        args += ['--readable'] + [arg for project in sorted(readable) for arg in ('--readable', project)][1:] \
+            if readable else ['--readable']
+        reply = self._endpoint('program', project_id, self.actor_namespace + '/read', args)
+        payload = self._checked(reply, 'program', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical program read returned an unexpected shape')
         return payload
 
     def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None, readable=()):
@@ -12201,9 +12242,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self._enrich_record_view(ctx, pid, capabilities, result,
                                                   record_kind=route_name.split('.')[0])
             return result, result
-        return self._mutate(ctx, route_name, pid, mutate_record, status=status,
-                            capability=needed, serialize=False, canonical=True,
-                            reason='%s %s' % (command, body.get('key') or ''))
+        answer = self._mutate(ctx, route_name, pid, mutate_record, status=status,
+                              capability=needed, serialize=False, canonical=True,
+                              reason='%s %s' % (command, body.get('key') or ''))
+        if (route_name in ('references.accept', 'references.retire')
+                and str(ctx.params.get('key') or '').startswith(program_links.PREFIX)):
+            # kittrial-5bb.453 (Q1 at VERIFIED): the Program menu link's cached flag follows a web accept or retire
+            # of a program key. Read once here, at the write, never per menu render; a failed read keeps the flag.
+            self._refresh_program_flag(pid)
+        return answer
+
+    def _refresh_program_flag(self, pid):
+        import program_view
+        try:
+            items = self.backend.reference_links(pid).get('items') or []
+        except HttpError:
+            return
+        memberships, users = self.service.program_link_people({pid})
+        self.service.set_program_flag(pid, program_view.accepted_area(items, pid, memberships, users))
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/delegations')
     def delegations_list(self, ctx):
@@ -12437,6 +12493,63 @@ class ApiHandler(BaseHTTPRequestHandler):
         return self._records_write(ctx, 'references.retire', 'retire',
                                    self.REF_RETIRE_FIELDS, 'A reference retirement',
                                    coordinator=True, key_param=True, status=200)
+
+    PROGRAM_QUERY = ('cursor', 'limit', 'idle_minutes', 'requirements_offset')
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/program')
+    def program_view_read(self, ctx):
+        """The program view, the program manager's dashboard (kittrial-5bb.453; PROGRAM_DESIGN.md sections 5, 9.4).
+
+        CAP_READ in the program, with one 404 for every caller who may not read it and every project that is not
+        there, as the trace. One endpoint call with this caller's readable projects, each checked on its own
+        (``_readable_projects``, the .449 rule). An area outside them, and an area that does not exist, give the
+        same row: its link state and "not visible to you", no number (permission before counts). The coordinators
+        of a readable area are added here through ``coordinators_of``, which checks the caller again; a right lost
+        since makes the row the hidden one. Areas page 50 at a time; requirement rows 50 at a time.
+        """
+        import program_view
+        absent = not_found('Project not found')
+        try:
+            self._project(ctx, CAP_READ)
+        except HttpError as error:
+            if error.status == 401:
+                raise
+            raise absent from None
+        reader = getattr(self.backend, 'program', None)
+        if reader is None:
+            raise absent
+        unknown = sorted(set(ctx.query) - set(self.PROGRAM_QUERY))
+        if unknown:
+            raise invalid('program takes %s; not %s' % (', '.join(self.PROGRAM_QUERY), ', '.join(unknown)))
+        limit, state = self._page(ctx, ctx.query)
+        if limit > program_view.AREAS_MAX:
+            raise invalid('limit must be between 1 and %d' % program_view.AREAS_MAX)
+        idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        raw = ctx.query.get('requirements_offset', '0')
+        if not isinstance(raw, str) or not raw.isdigit() or len(raw) > 6:
+            raise invalid('requirements_offset must be a whole number from 0 to 999999')
+        pid = ctx.params['pid']
+        result = dict(reader(pid, state['o'], limit, idle_minutes, int(raw),
+                             readable=self._readable_projects(ctx.principal)))
+        for row in (result.get('areas') or {}).get('items') or []:
+            if not isinstance(row, dict) or not row.get('visible'):
+                continue
+            try:
+                row['coordinators'] = self.service.coordinators_of(ctx.principal, row['area'])
+            except HttpError:
+                hidden = program_view.area_row(row['area'], row['state'])
+                row.clear()
+                row.update(hidden)
+        result['coverage'] = program_view.coverage(result['areas']['items'], result['areas']['total'], state['o'],
+                                                   result['requirements'])
+        self.service.set_program_flag(pid, bool(result.pop('is_program', False)))
+        result.pop('coordinators', None)        # the host route's sentence; here they are on each readable row
+        following = result['areas'].pop('next_offset', None)
+        result['areas']['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, following,
+                                                      key=self.service.cursor_key())
+                                          if following is not None else None)
+        result['generated_at'] = now_iso(self.service._now())
+        return 200, result
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/program-links')
     def program_links_read(self, ctx):

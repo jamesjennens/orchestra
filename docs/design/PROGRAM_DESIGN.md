@@ -349,6 +349,35 @@ for the caller, then reports:
 - **The coverage block** says what was read: "4 of 5 linked areas readable; 3,120 rows".
 - **Permission comes before counts:** an unreadable area adds one line and no numbers.
 
+**As built (kittrial-5bb.453, slice 4):**
+- **One module, one action:** `program_view.py` builds the answer; the endpoint action `program` reads it, one call a
+  page. The web route `GET /v1/projects/{program}/program` and the client's `trace --program` both use it.
+- **The readable set** is .449's rule: the web service's own `--readable` (each project checked for this caller),
+  honoured only from its launch; on the host the key's projects, or any for an operator's unbound key. Every other
+  project's path is resolved by `execute`, after the gate.
+- **Areas:** each `program.area.*` entry with its link state, the same as the program-links read gives (.446's one
+  fact). For a readable area: open tasks, lanes `waiting_too_long` and `expect_by_passed` (from `lanes.read`,
+  `idle_minutes` passed through as on the Lanes page) and, on the web, its coordinators. Otherwise "not visible to
+  you": a missing area gives the same row.
+  - **Open tasks:** open, in progress or blocked, not an epic, not a requirement record (`requirement`,
+    `brd-section`), and nothing the queue never lists as work (event and gate rows, the merge slot, record anchors).
+  - **A key bound to projects** reads nothing of a project it is not bound to (rule 1 of
+    COORDINATORS_PER_PROJECT_DESIGN), so there an area outside the key reads `not-checked`, with no read at all.
+  - **A right lost after the read:** the web route asks `coordinators_of`, which checks the caller again; the row
+    becomes the hidden one and its rows stop counting.
+- **Interfaces** read `not-available` until slice 3 (kittrial-5bb.450) is merged forward. **Decisions** and
+  **suggestions** read `unchecked` until slice 5.
+- **Requirements:** each accepted program requirement that no readable area of this read cites (`no-area-cites`),
+  and each area design section pinning a superseded program revision (`cites-superseded-revision`), 50 rows a page.
+  The coverage says they are counted over the readable areas of this read only.
+- **Coordinators** are on the web route only (Q2): the host route says "Coordinators are shown on the web Program
+  page."
+- **The menu:** "Program" shows only on a project with an accepted `program.area.*` side, from a flag kept in the
+  web state (`program_flags`). Every program read recomputes it, and so does a web accept or retire of a
+  `program.` key; no menu render reads anything. The page itself always reads the view.
+- **The harness** covers the read twice: as an area read (an outsider's view of an area is a missing project's
+  404) and as the program's own read (`assert_area_rows_hidden`).
+
 ## 6. Decisions across levels (Q4 A)
 
 ### 6.1 A program decision that binds areas

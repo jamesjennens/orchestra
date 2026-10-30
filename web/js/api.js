@@ -505,6 +505,8 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     writeNote: (pid, toProject, text, replyTo) => mutate('POST', `/v1/projects/${pid}/notes`,
       replyTo ? { to_project: toProject, text, reply_to: replyTo } : { to_project: toProject, text }),
     noteNoted: (pid, nid) => mutate('POST', `/v1/projects/${pid}/notes/${nid}/noted`, {}),
+    // kittrial-5bb.453: the program view (the Program page).
+    programView: (pid, cursor) => call('GET', `/v1/projects/${pid}/program`, { params: cursor ? { cursor } : {} }),
     mergeSlot: (pid) => call('GET', `/v1/projects/${pid}/merge-slot`),
     acquireMergeSlot: (pid, task_id, target) => mutate('POST', `/v1/projects/${pid}/merge-slot/acquire`, { task_id, target }),
     releaseMergeSlot: (pid) => mutate('POST', `/v1/projects/${pid}/merge-slot/release`, {}),

@@ -885,6 +885,18 @@ project linked with it in a program, and the addressed agents are woken.
   and an older kit keeps it untouched. Each record has a random id and `to.installation` (null), so a later relay
   between installations can carry it.
 
+**The program view** (kittrial-5bb.453; docs/design/PROGRAM_DESIGN.md section 5): the program manager's dashboard.
+- **The route:** `GET /v1/projects/{id}/program?cursor=&limit=&idle_minutes=&requirements_offset=`, at `CAP_READ` in
+  the program, with one 404 for a caller who may not read it and a project that is not there. 50 areas a page,
+  50 requirement rows a page.
+- **Under the caller's permissions:** the service checks each project the caller can name and passes those as its
+  own `--readable`; the endpoint honours that set only from the service's launch. An area outside it, and one that
+  does not exist, give the same row: the link state and "not visible to you", with no number.
+- **Coordinators** of a readable area come from `coordinators_of`, which checks the caller again.
+- **The Program page** is in the menu of a project with an accepted `program.area.*` side: a flag kept in the web
+  state (`program_flags`), recomputed by every program read and by a web accept or retire of a `program.` key.
+  An older kit leaves it untouched; a stale flag only shows or hides the link.
+
 ### Creating a project from the web interface
 
 An operator creates a project on the host (`admin.py add-project NAME`) and a superuser

@@ -1646,6 +1646,13 @@ sets `operation`.
     state. Since kittrial-5bb.449 the index takes qualified `design:` tokens, and `req:/x`, `req:A/` and
     `req:A/@3` (an empty project or key) are prose, so a document accepted before that holds either reads
     `differs` until it is accepted again. Anything that is not a readable repo-document revision answers `Design not found`.
+  - `trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N]` (kittrial-5bb.453)
+    is the program view of a program project, the endpoint action `program` (PROGRAM_DESIGN.md §5): `areas`
+    (link state; for a readable area `open_tasks`, `lanes` and `rows_read`; otherwise `visible: false` and "not
+    visible to you"), `interfaces` (`not-available` until slice 3), `requirements` (`no-area-cites`,
+    `cites-superseded-revision`, 50 rows a page), `decisions` and `suggestions` (`unchecked` until slice 5) and
+    `coverage`. At most 50 areas a read. The readable areas are the key's projects, or any project for an
+    operator's unbound key; an area outside a bound key's projects is `not-checked` and is never read.
   - `trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]` (kittrial-5bb.425) is the
     trace read, answered by the server from records alone (no repository, no blob read); the client
     passes it to the endpoint action `trace` and prints the answer. Views: `summary` (the Coverage
