@@ -16,6 +16,9 @@ import admin
 
 NOTE = ("WORKER_SSH_HOST must lead to a name or address the worker's machine can reach; this\n"
         "server's own host name may not resolve from the worker's network.")
+PROJECT_NOTE = ("Host project alpha is not on the site yet; a superuser should register it under "
+                "Projects → Register a project, and the registering person becomes the owner "
+                "(they can add the intended owner and step down later).")
 
 
 class HostNoteTests(unittest.TestCase):
@@ -24,6 +27,7 @@ class HostNoteTests(unittest.TestCase):
         text = admin.worker_client_setup(Path('/srv/rt'), 'alpha')
         self.assertIn('"host": "WORKER_SSH_HOST"', text)
         self.assertIn(NOTE + '\nBootstrap command', text)                 # after the configuration it is about
+        self.assertIn(PROJECT_NOTE, text)
         self.assertLess(text.index('"host": "WORKER_SSH_HOST"'), text.index(NOTE))
         self.assertNotIn('publishes', text)
 

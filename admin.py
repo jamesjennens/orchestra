@@ -3158,9 +3158,9 @@ def worker_client_setup(root,name):
             f'register):\n  python client.py --config client.local.json --project {name} --actor ACTOR -- onboard\n'
             f'An agent that runs on the server itself uses the local transport instead (no SSH and no\n'
             f'host; {local_note}):\n{local}\n'
-            f'Host project not on the web yet: nothing of {name} appears in the web interface until a\n'
-            f'superuser registers it there (New project, with this name, or POST /v1/projects without\n'
-            f'"create").')
+            f'Host project {name} is not on the site yet; a superuser should register it under '
+            f'Projects → Register a project, and the registering person becomes the owner '
+            f'(they can add the intended owner and step down later).')
 
 #: Set by ``environment`` to the account's home when it scopes HOME into the runtime.
 ACCOUNT_HOME_ENV='ORCHESTRA_ACCOUNT_HOME'

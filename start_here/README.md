@@ -4,10 +4,12 @@ This is the short path into an Orchestra-coordinated project. Beads is the canon
 coordination service; a repository checkout is not a second coordination database.
 Project provisioning and worker registration are separate operations.
 
-The intended office path is a web interface with per-person and per-agent identities
-on a service-account-hosted server; each agent identity is owned by a person. That
-route is still in progress. The SSH/private-config instructions below and the fleet
-prompt are current interim or home-use options, not the recommended office setup.
+The office web path uses per-person and per-agent identities on a service-account-hosted
+server. For a host-created project, `admin.py add-project NAME` creates the canonical
+project but does not make it appear on the site. A superuser must register it from
+**Projects → Register a project**; the registering person becomes the owner and can add
+the intended owner, then step down. The SSH/private-config instructions below and the
+fleet prompt are current interim or home-use options, not web setup.
 
 ## Choose the path
 
