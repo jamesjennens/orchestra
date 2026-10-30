@@ -226,6 +226,20 @@ class WebTests(LinkCase):
         rows = {row['area']: row for row in self.backend.program('prog', readable=['prog'])['areas']['items']}
         self.assertEqual([False, False, False], [row['visible'] for row in rows.values()])
 
+    def test_a_hidden_row_never_gains_coordinators(self):
+        # The endpoint hides an area it could not read (here: north as no host project, though vera reads it on the
+        # web). The route adds coordinators to visible rows only, so the hidden row stays exactly as it came (P27).
+        inner = self.backend.program
+
+        def program(*args, **kw):
+            answer = inner(*args, **kw)
+            answer['areas']['items'] = [program_view.area_row(row['area'], row['state']) if row['area'] == 'north'
+                                        else row for row in answer['areas']['items']]
+            return answer
+        self.backend.program = program
+        rows = {row['area']: row for row in self.view(self.tokens['vera'])['areas']['items']}
+        self.assertEqual(program_view.area_row('north', 'linked'), rows['north'])
+
     def test_a_right_lost_after_the_read_hides_the_row(self):
         # coordinators_of checks the caller again: a role removed after the endpoint's read makes the row the
         # hidden one, and its rows no longer count.
