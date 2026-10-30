@@ -21,7 +21,8 @@ import decision_attest as da
 import reserved_comments
 import test_bd_label_aliases as fixture
 
-AT = ['2026-01-01T00:00:%02dZ' % n for n in range(60)]      # stored server times, only ever ordered
+AT = ['2026-01-01T00:%02d:%02dZ' % (n // 60, n % 60) for n in range(600)]      # stored server times, only ever ordered
+PIN = '@' + 'c' * 64
 OWNER, COORD, CONTRIB, VIEWER = ('usr_' + c * 16 for c in 'abcd')
 AGENT = 'agent_' + '1' * 16
 OPS = ['ops']
@@ -124,6 +125,35 @@ class RecordTests(Case):
         self.attest(row, OWNER, journal=False)
         self.assertEqual('not-attested', self.reads(row)['state'])
         self.assertEqual('not-attested', da.standing(row, PROJECT, web_state(), OPS, None)['state'])
+
+    def test_the_pin_cannot_be_derived_from_the_text(self):
+        # A reader of the area sees the pin and not the text: knowing or guessing the exact text gives them nothing.
+        row = row_of('Binds: north\nOwner-only: yes')
+        request = {'schema_version': 1, 'operation_id': 'op', 'decision': row['id'], 'digest': da.digest(row)}
+        made = [da.make_record(request, project=PROJECT, author=OWNER, via='session', gated=True, at=AT[1]) for _ in range(3)]
+        self.assertEqual(3, len({record['sha256'] for record in made}), 'the same text, author, time and operation')
+        self.assertEqual(3, len({record['nonce'] for record in made}))
+        for record in made:
+            self.assertEqual(32, len(record['nonce']))
+            self.assertNotEqual(da.digest(row), record['sha256'])
+            # Every field a guesser could know, without the nonce, does not give the id.
+            known = {key: value for key, value in record.items() if key not in ('nonce', 'sha256')}
+            self.assertNotEqual(da.content_hash(known), record['sha256'])
+
+    def test_the_pin_changes_with_new_text_and_not_with_another_attester_of_the_same(self):
+        row = row_of('First.')
+        first = self.attest(row, COORD)
+        self.assertEqual(first['sha256'], self.reads(row)['id'])
+        self.attest(row, OWNER)
+        self.assertEqual(first['sha256'], self.reads(row)['id'])
+        row['description'] = 'Second.'
+        self.assertIsNone(self.reads(row)['id'])                # stale: nothing to pin
+        second = self.attest(row, OWNER)
+        self.assertEqual(second['sha256'], self.reads(row)['id'])
+        row['description'] = 'First.'
+        third = self.attest(row, OWNER)
+        self.assertEqual(third['sha256'], self.reads(row)['id'], 'going back to old text is a new attestation')
+        self.assertNotEqual(first['sha256'], third['sha256'])
 
     def test_the_prefix_is_reserved(self):
         self.assertEqual('Kind: decision-attest-v1\n', reserved_comments.DECISION_ATTEST_PREFIX)
@@ -269,13 +299,16 @@ class Native:
 
 class ApplyTests(Case):
 
-    def write(self, native, author, digest=None, decision='north-1', state=None, operators=OPS):
+    def write(self, native, author, digest=None, decision='north-1', state=None, operators=OPS, pinned=None):
         native.writer = author
         self.seq += 1
+        # Unless a test is about them: every pin on the row is read, and is what the program decision has now.
+        if pinned is None:
+            pinned = {pin[:2]: {'pin': pin[2], 'state': 'counts'} for pin in da.pins(native.rows['north-1'])}
         return da.apply({'schema_version': 1, 'operation_id': 'op-%d' % self.seq, 'decision': decision,
                          'digest': digest or da.digest(native.rows['north-1'])}, project=PROJECT, journal=self.journal,
                         run=native, author=author, via=via_of(author), at=AT[self.seq],
-                        state=web_state() if state is None else state, operators=operators)
+                        state=web_state() if state is None else state, operators=operators, pinned=pinned)
 
     def test_each_standing_writes_a_record_that_counts(self):
         for author, role in ((OWNER, 'owner'), (COORD, 'coordinator'), (AGENT, 'agent-coordinator'), ('ops', 'operator')):
@@ -317,7 +350,8 @@ class ApplyTests(Case):
         self.assertEqual(404, refused.exception.status)
 
     def test_a_coordinator_cannot_replace_an_owners_level(self):
-        for text in ('Binds: north\nOwner-only: yes', 'Authorises: decision:prog/prog-1', 'Adopts: decision:prog/prog-1'):
+        for text in ('Binds: north\nOwner-only: yes', 'Authorises: decision:prog/prog-1' + PIN,
+                     'Adopts: decision:prog/prog-1' + PIN):
             with self.subTest(text=text):
                 native = Native(row_of(text))
                 self.write(native, OWNER)
@@ -343,13 +377,52 @@ class ApplyTests(Case):
 
     def test_what_needs_an_owner_is_recorded(self):
         cases = [(OWNER, 'Owner-only: yes', True), (COORD, 'Owner-only: yes', True), (OWNER, 'Owner-only: no', False),
-                 (OWNER, 'Authorises: decision:prog/prog-1', True), (COORD, 'Authorises: decision:prog/prog-1', True),
-                 (OWNER, 'Adopts: decision:prog/prog-1', True), ('ops', 'Adopts: decision:prog/prog-1', True),
-                 (COORD, 'Adopts: decision:prog/prog-1', False), (OWNER, 'Plain prose.', False),
+                 (OWNER, 'Authorises: decision:prog/prog-1' + PIN, True), (COORD, 'Authorises: decision:prog/prog-1' + PIN, True),
+                 (OWNER, 'Adopts: decision:prog/prog-1' + PIN, True), ('ops', 'Adopts: decision:prog/prog-1' + PIN, True),
+                 (COORD, 'Adopts: decision:prog/prog-1' + PIN, False), (OWNER, 'Plain prose.', False),
                  (COORD, 'Owner-only: maybe', True)]
         for author, text, expected in cases:
             with self.subTest(author=author, text=text):
                 self.assertEqual(expected, self.write(Native(row_of(text)), author)['record']['owner_gated'])
+
+    def test_a_pinned_decision_has_to_be_read_and_to_be_what_it_says_now(self):
+        for line in ('Adopts: decision:prog/prog-1' + PIN, 'Authorises: decision:prog/prog-1' + PIN):
+            key, fact = ('prog', 'prog-1'), {'pin': 'c' * 64, 'state': 'counts'}
+            for pinned, status, words in (({key: None}, 403, 'it does not exist, or you may not read it'),
+                                          ({}, 409, 'changed since you read it'),
+                                          ({key: dict(fact, pin='d' * 64)}, 409, 'other text now'),
+                                          ({key: dict(fact, state='attestation-stale')}, 409, 'does not count now'),
+                                          ({key: dict(fact, state='closed')}, 409, 'does not count now')):
+                with self.subTest(line=line, pinned=pinned):
+                    native = Native(row_of(line))
+                    with self.assertRaises(da.AttestRefusal) as refused:
+                        self.write(native, OWNER, pinned=pinned)
+                    self.assertEqual(status, refused.exception.status)
+                    self.assertIn(words, str(refused.exception))
+                    self.assertEqual([], native.rows['north-1']['comments'])
+            self.assertTrue(self.write(Native(row_of(line)), OWNER, pinned={key: fact})['record'])
+
+    def test_an_unreadable_program_and_a_missing_one_get_the_same_words(self):
+        said = set()
+        for pinned in ({('prog', 'prog-1'): None}, {('prog', 'prog-1'): None}):
+            with self.assertRaises(da.AttestRefusal) as refused:
+                self.write(Native(row_of('Adopts: decision:prog/prog-1' + PIN)), OWNER, pinned=pinned)
+            said.add((refused.exception.status, str(refused.exception)))
+        self.assertEqual(1, len(said))
+
+    def test_the_pins_are_read_for_each_line_and_a_row_without_one_reads_nothing(self):
+        seen = []
+
+        def read(program, issue):
+            seen.append((program, issue))
+            return {'pin': 'x', 'state': 'counts'}
+        self.assertEqual({}, da.read_pins(row_of('Plain prose.'), read))
+        self.assertEqual([], seen)
+        found = da.read_pins(row_of('Adopts: decision:prog/prog-1' + PIN + '\nAuthorises: decision:prog/prog-2' + PIN), read)
+        self.assertEqual({('prog', 'prog-1'), ('prog', 'prog-2')}, set(found))
+        self.assertIsNone(da.pin_fact(row_of(issue_type='task'), 'prog', web_state(), OPS, self.journal))
+        self.assertEqual({'pin': None, 'state': 'not-attested'},
+                         da.pin_fact(row_of(), 'prog', web_state(), OPS, self.journal))
 
     def test_a_journal_that_cannot_be_used_stops_it_before_the_comment(self):
         native = Native(row_of())
@@ -364,6 +437,11 @@ class ApplyTests(Case):
         answer = da.read_answer(row, PROJECT, web_state(), OPS, self.journal)
         self.assertEqual(('Exact <b>text</b> ', da.digest(row), 'not-attested', None),
                          (answer['description'], answer['digest'], answer['attestation'], answer['attested_as']))
+        self.assertEqual((None, None, None), (answer['attestation_id'], answer['adopt_line'], answer['authorise_line']))
+        record = self.attest(row, OWNER)
+        answer = da.read_answer(row, PROJECT, web_state(), OPS, self.journal)
+        self.assertEqual('Adopts: decision:north/north-1@' + record['sha256'], answer['adopt_line'])
+        self.assertEqual('Authorises: decision:north/north-1@' + record['sha256'], answer['authorise_line'])
         for bad in (None, row_of(issue_type='task')):
             with self.assertRaises(da.AttestRefusal) as refused:
                 da.read_answer(bad, PROJECT, web_state(), OPS, self.journal)
@@ -767,6 +845,113 @@ class WebRouteTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertEqual(0, self.host('w1', *args, '--json')['returncode'])
 
+    # -- pins, across two real projects ---------------------------------------------------------------------------
+    def second_project(self):
+        """oo: pat owns it too; vera does not belong to it. A decision of pp pins one of oo."""
+        if getattr(type(self), 'second', None):
+            return
+        path = self.root / 'projects' / 'oo'
+        path.mkdir(parents=True)
+        init = subprocess.run([str(self.runtime.bd_path), 'init', '--server', '--external', '--server-host', '127.0.0.1',
+                               '--server-port', str(self.runtime.port), '--server-user', 'root', '--prefix', 'oo',
+                               '--database', 'oo', '--skip-agents', '--skip-hooks', '--non-interactive'],
+                              cwd=str(path), env=fixture.admin.environment(self.root), capture_output=True, text=True, timeout=300)
+        self.assertEqual(0, init.returncode, init.stderr or init.stdout)
+        admin = self.web.admin_token()
+        made = self.web.request('POST', '/v1/projects', {'project_id': 'oo', 'name': 'Other'}, token=admin)
+        self.assertEqual(201, made.status, made.data)
+        self.assertEqual(200, self.web.request('PUT', '/v1/projects/oo/members/' + self.ids['pat'], {'role': 'owner'},
+                                               token=admin).status)
+        for key, value in fixture.admin.PROJECT_SETTINGS:
+            subprocess.run([str(self.runtime.bd_path), '--directory', str(path), '--sandbox', 'config', 'set', key, value],
+                           env=fixture.admin.environment(self.root), capture_output=True, text=True, timeout=120)
+        subprocess.run([str(self.runtime.bd_path), '--directory', str(path), '--sandbox', 'create', 'Merge Slot', '--id',
+                        'oo-merge-slot', '--labels', 'gt:slot', '--json'], env=fixture.admin.environment(self.root),
+                       capture_output=True, text=True, timeout=120)
+        type(self).second = True
+
+    def program_decision(self, text='Binds: pp\nOwner-only: no'):
+        """A decision of oo, attested by pat, and the line its attestation read gives."""
+        self.second_project()
+        answer = fixture.endpoint.execute(self.root, {'project': 'oo', 'actor': 'ops', 'action': 'bd',
+                                                      'args': ['create', 'A program decision ' + uuid.uuid4().hex[:6], '--type',
+                                                               'decision', '--description', text, '--json']})
+        self.assertEqual(0, answer['returncode'], answer)
+        issue = json.loads(answer['stdout'])['id']
+        read = self.web.request('GET', '/v1/projects/oo/decisions/%s/attestation' % issue, token=self.tokens['pat'])
+        self.assertEqual(200, read.status, read.data)
+        made = self.web.request('POST', '/v1/projects/oo/decisions/%s/attest' % issue, {'digest': read.data['digest']},
+                                token=self.tokens['pat'], key='attest-' + uuid.uuid4().hex)
+        self.assertEqual(201, made.status, made.data)
+        read = self.web.request('GET', '/v1/projects/oo/decisions/%s/attestation' % issue, token=self.tokens['pat'])
+        self.assertNotIn(read.data['digest'], read.data['adopt_line'])
+        return issue, read.data['adopt_line'], read.data['authorise_line']
+
+    def test_someone_who_cannot_read_the_program_cannot_attest_an_adoption(self):
+        # cleo coordinates pp and is not a member of oo; the agent Kite holds only pp.
+        _, adopt_line, authorise_line = self.program_decision()
+        for line in (adopt_line, authorise_line):
+            for name in ('cleo', 'kite'):
+                with self.subTest(line=line[:10], name=name):
+                    issue = self.make(line)
+                    answer = self.attest(issue, name, expected=403)
+                    self.assertIn('it does not exist, or you may not read it', answer['error']['message'])
+                    self.assertEqual('not-attested', self.read(issue)['attestation'])
+        # The owner of both can.
+        issue = self.make(adopt_line)
+        self.attest(issue, 'pat')
+        self.assertEqual('counts', self.read(issue)['attestation'])
+
+    def test_an_unreadable_program_a_missing_one_and_a_missing_decision_answer_alike(self):
+        _, adopt_line, _ = self.program_decision()
+        pin = adopt_line.rsplit('@', 1)[1]
+        said = set()
+        for program, issue_id in (('oo', 'oo-missing'), ('nosuchproject', 'nosuchproject-1')):
+            issue = self.make('Adopts: decision:%s/%s@%s' % (program, issue_id, pin))
+            answer = self.attest(issue, 'cleo', expected=403)
+            said.add(answer['error']['message'].replace('decision:%s/%s' % (program, issue_id), 'X').replace(program, 'Y'))
+        issue = self.make(adopt_line)
+        answer = self.attest(issue, 'cleo', expected=403)
+        said.add(answer['error']['message'].replace(adopt_line.split(' ')[1].split('@')[0], 'X').replace('oo', 'Y'))
+        self.assertEqual(1, len(said), said)
+
+    def test_a_reader_gets_a_conflict_for_other_text_and_the_right_digest_writes(self):
+        program, adopt_line, _ = self.program_decision()
+        wrong = self.make(adopt_line.rsplit('@', 1)[0] + '@' + 'd' * 64)
+        answer = self.attest(wrong, 'pat', expected=409)
+        self.assertIn('other text now', answer['error']['message'])
+        # A program decision that does not count now cannot be adopted.
+        self.assertEqual(0, fixture.endpoint.execute(self.root, {'project': 'oo', 'actor': 'w1', 'action': 'bd',
+                                                                 'args': ['update', program, '--description', 'Edited.', '--json']})['returncode'])
+        answer = self.attest(self.make(adopt_line), 'pat', expected=409)
+        self.assertIn('does not count now', answer['error']['message'])
+
+    def test_a_program_read_lost_later_keeps_the_adoption(self):
+        # It was read at write. cleo reads oo for long enough to adopt, and is then removed from it.
+        _, adopt_line, _ = self.program_decision()
+        admin = self.web.admin_token()
+        self.assertEqual(200, self.web.request('PUT', '/v1/projects/oo/members/' + self.ids['cleo'], {'role': 'viewer'},
+                                               token=admin).status)
+        adoption = self.make(adopt_line)
+        self.attest(adoption, 'cleo')
+        gone = self.web.request('DELETE', '/v1/projects/oo/members/' + self.ids['cleo'], token=admin)
+        self.assertIn(gone.status, (200, 204), gone.data)
+        self.assertEqual('counts', self.read(adoption)['attestation'])
+        self.attest(self.make(adopt_line), 'cleo', expected=403)
+
+    def test_the_operators_route_checks_the_pin_too(self):
+        program, adopt_line, _ = self.program_decision()
+        wrong = self.make(adopt_line.rsplit('@', 1)[0] + '@' + 'd' * 64)
+        read = json.loads(self.admin('decision-attest-read', '--project', 'pp', '--decision', wrong).stdout)
+        refused = self.admin('decision-attest', '--project', 'pp', '--actor', 'ops', '--decision', wrong, '--digest', read['digest'])
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn('other text now', refused.stderr)
+        right = self.make(adopt_line)
+        read = json.loads(self.admin('decision-attest-read', '--project', 'pp', '--decision', right).stdout)
+        done = self.admin('decision-attest', '--project', 'pp', '--actor', 'ops', '--decision', right, '--digest', read['digest'])
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual('counts', self.read(right)['attestation'])
+
     # -- the operator's own route ---------------------------------------------------------------------------------
     def admin(self, *args):
         return subprocess.run([sys.executable, str(KIT / 'admin.py'), '--root', str(self.root), *args],
@@ -838,6 +1023,15 @@ console.log(JSON.stringify({text:host.textContent,sent,button:!!button,
         self.assertEqual((0, text, True, ['a' * 64]), (out['markup'], out['pre'], out['button'], out['sent']))
         self.assertIn('<script>x</script>', out['text'])
         self.assertIn('Stale', out['text'])
+
+    def test_the_lines_to_copy_show_only_for_a_decision_that_counts(self):
+        read = {'type': 'decision', 'title': 'T', 'description': '', 'digest': 'a' * 64, 'attestation': 'counts',
+                'attested_as': 'owner', 'adopt_line': 'Adopts: decision:p/1@' + 'a' * 64,
+                'authorise_line': 'Authorises: decision:p/1@' + 'a' * 64}
+        out = self.panel(read, attest=False)
+        self.assertIn(read['adopt_line'], out['text'])
+        self.assertIn(read['authorise_line'], out['text'])
+        self.assertNotIn(read['adopt_line'], self.panel(dict(read, attestation='attestation-stale'), attest=False)['text'])
 
     def test_each_state_reads_in_words_and_says_who(self):
         for state, word in (('counts', 'Counts'), ('closed', 'Closed'), ('not-attested', 'Not attested'),

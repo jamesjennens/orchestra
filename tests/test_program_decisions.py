@@ -11,6 +11,7 @@ import copy
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,8 @@ def web_state():
                                    'prog': {P_AGENT: {'granted_by': P_OWNER, 'granted_at': AT}}}}
 
 
+#: {issue: the attestation id of the row of that id attested last}, for the pins below.
+_PINS = {}
 #: {project: the directory its attestation journal is read from}; the rows of this file are attested into these.
 _JOURNALS = tempfile.TemporaryDirectory()
 J = {name: Path(_JOURNALS.name) / name for name in ('prog', 'north', 'south', 'east', 'west', 'ghost')}
@@ -85,12 +88,21 @@ def attest(row, author):
                             gated=False, at=at)
     row.setdefault('comments', []).append({'id': 'c%06d' % seq, 'author': author, 'text': da.body(record)})
     da.publish(J[project], record)
+    _PINS[row['id']] = record['sha256']
     return row
+
+
+def _pinned(line):
+    """An Adopts: or Authorises: line written here with no pin gets the attestation id of the row of that id attested last,
+    the line an adopter copies from the attestation read. A test about pins writes its own."""
+    if re.fullmatch(r'(Adopts|Authorises): decision:[^/@]+/[^/@]+', line) is None:
+        return line
+    return '%s@%s' % (line, _PINS.get(line.rsplit('/', 1)[1], '0' * 64))
 
 
 def bare(issue, *lines, first=None, **extra):
     """A decision row nobody has attested."""
-    description = '\n'.join(([first] if first else []) + list(lines))
+    description = '\n'.join(([first] if first else []) + [_pinned(line) for line in lines])
     return dict({'id': issue, 'issue_type': 'decision', 'status': 'open', 'description': description,
                  'title': 'Decision ' + issue, 'comments': []}, **extra)
 
@@ -104,15 +116,23 @@ def decision(issue, author, *lines, first=None, **extra):
 class LinesTests(unittest.TestCase):
 
     def test_each_line_reads_exactly(self):
+        pin = 'a' * 64
         found = pd.lines(decision('prog-1', P_OWNER, 'Some prose.', 'Binds: north, south', 'Owner-only: yes',
-                                  'Adopts: decision:prog/prog-0', 'Per: decision:north/north-2'))
-        self.assertEqual((['north', 'south'], True, ('prog', 'prog-0'), ('north', 'north-2'), []),
-                         (found['binds'], found['owner_only'], found['adopts'], found['per'], found['problems']))
+                                  'Adopts: decision:prog/prog-0@' + pin, 'Per: decision:north/north-2',
+                                  'Authorises: decision:prog/prog-0@' + pin))
+        self.assertEqual((['north', 'south'], True, ('prog', 'prog-0', pin), ('north', 'north-2'),
+                          ('prog', 'prog-0', pin), []),
+                         (found['binds'], found['owner_only'], found['adopts'], found['per'], found['authorises'],
+                          found['problems']))
 
     def test_a_repeat_or_a_malformed_line_is_a_problem_and_a_line_with_a_lead_is_prose(self):
         for text in ('Binds: north\nBinds: south', 'Binds: North', 'Binds: north,south', 'Binds: north, north',
                      'Owner-only: maybe', 'Owner-only: yes\nOwner-only: no', 'Adopts: decision:prog-0',
-                     'Adopts: decision:/prog-0', 'Per: decision:north/', 'Per: task:north/x'):
+                     'Adopts: decision:/prog-0', 'Per: decision:north/', 'Per: task:north/x',
+                     # A pin is the whole digest, and a line without one does not read.
+                     'Adopts: decision:prog/prog-0', 'Authorises: decision:prog/prog-0',
+                     'Adopts: decision:prog/prog-0@abc', 'Adopts: decision:prog/prog-0@' + 'A' * 64,
+                     'Authorises: decision:prog/prog-0@' + 'a' * 63):
             with self.subTest(text=text):
                 self.assertTrue(pd.lines({'description': text})['problems'])
         self.assertEqual((None, []), (pd.lines({'description': ' Binds: north'})['binds'],
@@ -292,6 +312,50 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual('adoption-invalid', verdict)
         self.assertIn('do not read', reason)
 
+    def test_an_adoption_pins_the_text_it_saw(self):
+        # The coordinator's answer to the limit r2 reported: re-attested text leaves the area adoption-stale until it adopts again.
+        first = decision('prog-1', P_OWNER, 'Binds: north', 'Owner-only: no')
+        adopted = decision('north-1', COORD, 'Adopts: decision:prog/prog-1')
+        self.assertEqual('adopted', self.adopt(first, adopted)[0])
+        changed = attest(dict(first, description='Binds: north\nOwner-only: no\nOther text.', comments=list(first['comments'])),
+                         P_OWNER)
+        verdict, reason = self.adopt(changed, adopted)
+        self.assertEqual('adoption-stale', verdict)
+        self.assertIn('adopts again', reason)
+        section = pd.decisions_section([changed], 'prog', {'north': 'in'}, {'north': [adopted]}, web_state(), OPS, journals=J)
+        self.assertEqual('adoption-stale', section['items'][0]['areas']['north']['state'])
+        # The area adopts again, and it binds.
+        again = decision('north-1', COORD, 'Adopts: decision:prog/prog-1')
+        self.assertEqual('adopted', self.adopt(changed, again)[0])
+
+    def test_a_stale_pin_binds_nothing_whoever_attested_it(self):
+        wrong = 'Adopts: decision:prog/prog-1@' + 'b' * 64
+        for program_row in (decision('prog-1', P_OWNER, 'Binds: north', 'Owner-only: yes'),
+                            decision('prog-1', P_COORD, 'Binds: north', 'Owner-only: no')):
+            for adopter in (OWNER, 'ops', COORD, AGENT):
+                with self.subTest(adopter=adopter, owner_only=program_row['description']):
+                    self.assertEqual('adoption-stale', self.adopt(program_row, decision('north-1', adopter, wrong))[0])
+
+    def test_another_attester_of_the_same_words_leaves_the_adoption_in_force(self):
+        program_row = decision('prog-1', P_COORD, 'Binds: north', 'Owner-only: no')
+        adopted = decision('north-1', COORD, 'Adopts: decision:prog/prog-1')
+        pin = _PINS['prog-1']
+        attest(program_row, P_OWNER)
+        self.assertEqual('owner', pd.program_decision(program_row, 'prog', web_state(), OPS, J)['attested_as'])
+        self.assertEqual(pin, pd.program_decision(program_row, 'prog', web_state(), OPS, J)['attestation_id'])
+        self.assertEqual('adopted', self.adopt(program_row, adopted)[0])
+
+    def test_an_authorisation_pins_the_text_the_owner_saw(self):
+        # The same for Authorises: and its Per:: the adoption pins this text, the owner's line pinned other text.
+        owner_only = decision('prog-1', P_OWNER, 'Binds: north', 'Owner-only: yes')
+        row = decision('north-1', COORD, 'Adopts: decision:prog/prog-1', 'Per: decision:north/north-6')
+        cited = decision('north-6', OWNER, 'Authorises: decision:prog/prog-1@' + 'b' * 64)
+        verdict, reason = self.adopt(owner_only, row, cited)
+        self.assertEqual('adoption-stale', verdict)
+        self.assertIn('authorises it again', reason)
+        cited = decision('north-6', OWNER, 'Authorises: decision:prog/prog-1')
+        self.assertEqual('adopted', self.adopt(owner_only, row, cited)[0])
+
     def test_a_contributors_edit_of_an_owners_decision_binds_nothing(self):
         # b1 at the level of section 6: the program decision and the adoption, each edited.
         program_row = decision('prog-1', P_OWNER, 'Binds: north', 'Owner-only: no')
@@ -299,7 +363,7 @@ class DecisionTests(unittest.TestCase):
         found = pd.program_decision(edited, 'prog', web_state(), OPS, J)
         self.assertEqual(['attestation-stale'], found['flags'])
         row = decision('north-1', OWNER, 'Adopts: decision:prog/prog-1')
-        self.assertEqual('attestation-stale', self.adopt(program_row, dict(row, description='Adopts: decision:prog/prog-1\nx'))[0])
+        self.assertEqual('attestation-stale', self.adopt(program_row, dict(row, description=row['description'] + '\nx'))[0])
         section = pd.decisions_section([edited], 'prog', {'north': 'in'}, {'north': [row]}, web_state(), OPS, journals=J)
         self.assertEqual({}, section['items'][0]['areas'])
 
@@ -474,10 +538,10 @@ class TraceTests(unittest.TestCase):
             [bare('prog-1', 'Binds: north', 'Owner-only: yes', created_by=P_OWNER)])) if r['kind'] == 'decision'}
         self.assertEqual('decision-does-not-count', unattested['north-1']['adopts']['state'])
         # No journal to read: nothing is honoured.
+        program_row = decision('prog-1', P_OWNER, 'Binds: north', 'Owner-only: yes')
         no_journal = trace_read.Snapshot([decision('north-1', OWNER, 'Adopts: decision:prog/prog-1')], 'north',
                                          now=datetime(2026, 1, 2, tzinfo=timezone.utc), operators=OPS,
-                                         others=lambda project: SimpleNamespace(loaded=lambda: [
-                                             decision('prog-1', P_OWNER, 'Binds: north', 'Owner-only: yes')]),
+                                         others=lambda project: SimpleNamespace(loaded=lambda: [program_row]),
                                          authority_state=web_state())
         rows = {r['id']: r for r in trace_read.decisions_view(no_journal) if r['kind'] == 'decision'}
         self.assertEqual('decision-does-not-count', rows['north-1']['adopts']['state'])
@@ -737,11 +801,11 @@ class NativeDecisionTests(unittest.TestCase):
     def test_native_decisions_and_adoptions_on_the_real_endpoint(self):
         listed = self.write('pp', 'ops', 'create', 'Use the broker', '--type', 'decision', '--description',
                             'Binds: qq\nOwner-only: yes', '--json')
-        adoption = self.write('qq', 'ops', 'create', 'We adopt it', '--type', 'decision', '--description',
-                              'Adopts: decision:pp/%s' % listed, '--json')
         self.write('pp', 'opx', 'create', 'Raise the limit', '--labels', 'suggestion', '--description',
                    'From: decision:qq/x-1', '--json')
-        self.attest_as_operator('pp', listed)
+        pinned = self.attest_as_operator('pp', listed)['record']['digest']
+        adoption = self.write('qq', 'ops', 'create', 'We adopt it', '--type', 'decision', '--description',
+                              'Adopts: decision:pp/%s@%s' % (listed, pinned), '--json')
         before = self.view()[0][listed]
         self.assertEqual('not-attested', before['areas']['qq']['state'])
         self.attest_as_operator('qq', adoption)
@@ -756,11 +820,11 @@ class NativeDecisionTests(unittest.TestCase):
         # b3, the named test: an unbound key sends actor ops, for a program decision and for an adoption.
         program_row = self.write('pp', 'ops', 'create', 'From a host actor', '--type', 'decision', '--description',
                                  'Binds: qq\nOwner-only: yes', '--json')
-        self.write('qq', 'ops', 'create', 'From a host actor', '--type', 'decision', '--description',
-                   'Adopts: decision:pp/%s' % program_row, '--json')
         found = self.view()[0][program_row]
         self.assertEqual((['not-attested'], {}), (found['flags'], found['areas']))
-        self.attest_as_operator('pp', program_row)
+        pinned = self.attest_as_operator('pp', program_row)['record']['digest']
+        self.write('qq', 'ops', 'create', 'From a host actor', '--type', 'decision', '--description',
+                   'Adopts: decision:pp/%s@%s' % (program_row, pinned), '--json')
         self.assertEqual('not-attested', self.view()[0][program_row]['areas']['qq']['state'])
 
     def test_an_area_whose_program_side_is_not_in_is_not_in_program(self):

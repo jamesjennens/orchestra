@@ -74,11 +74,13 @@ PROGRAM_LINKS = (
     'with GET /v1/projects/PROJECT/program-links. A pointer into another project, such as '
 'req:PROJECT/KEY, resolves only for a reader of that project; others see not-visible. A program '
     'decision binds an area only when the area adopts it, with a decision of its own whose line reads '
-    '"Adopts: decision:PROGRAM/ID". A decision counts only once its author has attested its exact text: '
-    'POST /v1/projects/PROJECT/decisions/ID/attest with the digest from GET '
-    '/v1/projects/PROJECT/decisions/ID/attestation, and any later edit leaves it stale until it is attested '
-    'again. An agent never adopts an owner-only decision unless it cites, with "Per: decision:AREA/ID", a '
-    'decision of the area that a person owner attested and that says "Authorises: decision:PROGRAM/ID".')
+    '"Adopts: decision:PROGRAM/ID@ATTESTATION", the line GET /v1/projects/PROGRAM/decisions/ID/attestation gives; '
+    'it pins the text you read, and reads adoption-stale if the program attests other text. A decision counts '
+    'only once its author has attested its exact text: POST /v1/projects/PROJECT/decisions/ID/attest with the '
+    'digest from GET /v1/projects/PROJECT/decisions/ID/attestation, and any later edit leaves it stale until '
+    'it is attested again. An agent never adopts an owner-only decision unless it cites, with '
+    '"Per: decision:AREA/ID", a decision of the area that a person owner attested and that says '
+    '"Authorises: decision:PROGRAM/ID@ATTESTATION".')
 #: The coordinator-only paragraph on notes between coordinators (kittrial-5bb.447), with the wait loop for an
 #: agent without the Bridge. Word for word with web/js/agentSetup.js COORDINATOR_NOTES (pinned by
 #: tests/test_coordinator_notes.py).

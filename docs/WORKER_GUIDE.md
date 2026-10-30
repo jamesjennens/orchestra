@@ -493,11 +493,14 @@ For program and area owners and coordinators (kittrial-5bb.454; docs/design/PROG
   decision's page has the button) or your own agent. Who made the row does not matter. Any later edit reads
   `attestation-stale` and binds nothing until it is attested again; a row nobody has attested reads `not-attested`.
 - **It binds an area only when the area adopts it:** a decision issue of the area with the line
-  `Adopts: decision:PROGRAM/ID`.
+  `Adopts: decision:PROGRAM/ID@ATTESTATION`, copied from `GET /v1/projects/PROGRAM/decisions/ID/attestation`. It pins the
+  text you read: if the program attests other text, your adoption reads `adoption-stale` and binds nothing until you
+  adopt again. You need to be able to read the program decision to attest this line; otherwise nothing is written, and you
+  ask for read of the program.
   - A decision that is not owner-only is adopted by the area's coordinator, a person or an agent holding the grant.
   - An owner-only decision is adopted by a person owner of the area, or by an area coordinator whose adoption also
     has the line `Per: decision:AREA/ID`, naming a decision of the area that a person owner attested and that says
-    `Authorises: decision:PROGRAM/ID` for this very decision. An agent never adopts an owner-only decision alone; a
+    `Authorises: decision:PROGRAM/ID@ATTESTATION` for this very decision and text. An agent never adopts an owner-only decision alone; a
     `Per:` decision an agent attested, or one that does not authorise this decision, does not count.
 - **Who attested a row is checked at every read:** someone who has since lost the role stops counting.
 - **A closed decision or adoption binds nothing.** On an attested row, closing, reopening, retyping or relabelling it as

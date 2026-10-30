@@ -904,7 +904,11 @@ project linked with it in a program, and the addressed agents are woken.
   /v1/projects/{id}/decisions/{did}/attest` (`tasks`, with an `Idempotency-Key`) takes `{"digest": ...}` and is written
   only for the author's own web session or agent with owner or coordinator standing in the project now: 403 otherwise,
   and for a coordinator over a text attested at an owner's level; 404 for a row that is not a decision; 409 when the text
-  changed since it was read. The server fills in the author, how it came and the time. `http_client.py
+  changed since it was read. A row carrying `Adopts:` or `Authorises:` pins the program decision's attestation id: it
+  needs that decision readable by the caller now (the same 403 for an unreadable program, no such project and no such
+  decision), and 409 for another attestation or a decision that does not count. For a decision that counts, the read also
+  gives `attestation_id`, `adopt_line` and `authorise_line` to copy.
+  The server fills in the author, how it came and the time. `http_client.py
   decision-attestation` and `decision-attest` call them, and the decision's page has the button. Any later edit reads
   `attestation-stale` and binds nothing.
 - **Status, type and labels of an attested decision** (kittrial-5bb.454 r2): `PATCH .../tasks/{id}` with `status`, a claim,

@@ -1651,8 +1651,8 @@ sets `operation`.
     (link state; for a readable area `open_tasks`, `lanes` and `rows_read`; otherwise `visible: false` and "not
     visible to you"), `interfaces` (`not-available` until slice 3), `requirements` (`no-area-cites`,
     `cites-superseded-revision`, 50 rows a page), `decisions` (kittrial-5bb.454: each program decision with a
-    `Binds:` line, its flags (`closed`, `not-attested`, `attestation-stale`, `attester-not-authorised`, or why it does
-    not count), and per bound area `adopted`, `not-adopted`, `adoption-invalid` with the reason, what an adoption reads
+    `Binds:` line, its `attestation_id`, its flags (`closed`, `not-attested`, `attestation-stale`, `attester-not-authorised`, or why it does
+    not count), and per bound area `adopted`, `not-adopted`, `adoption-invalid` with the reason, `adoption-stale`, what an adoption reads
     as when it does not count, `superseded-upstream`, `not-visible`, `not-in-program` or `not-checked`;
     `--decisions-offset N`), `suggestions`
     (open tasks labelled `suggestion`, oldest first, with their `From:` line; `--suggestions-offset N`) and

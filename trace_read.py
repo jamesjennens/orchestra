@@ -222,7 +222,7 @@ class Snapshot:
         else:
             other = self.others(program) if self.others is not None else None
             if other == 'not-checked':
-                return {'pointer': 'decision:%s/%s' % found, 'state': 'not-checked'}
+                return {'pointer': 'decision:%s/%s' % found[:2], 'state': 'not-checked'}
             program_rows = other.loaded() if other is not None else None
         journals = {name: self.journal_of(name) for name in (self.project, program)} if self.journal_of else None
         return program_decisions.trace_adopts(row, self.project, self.rows, program_rows, self.authority_state,

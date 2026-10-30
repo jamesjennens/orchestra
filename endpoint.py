@@ -2982,7 +2982,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # An author's attestation of a decision row's exact text (kittrial-5bb.454 r2). `read` is for any member; `attest`
         # only for the author's own web session or agent, its standing checked in the library call under the lock.
         import decision_attest
-        from http_authority import CAP_READ,CAP_TASKS,read_state,server_time
+        from http_authority import AuthorityDenied,CAP_READ,CAP_TASKS,decide,read_state,server_time
         args=request.get('args',[])
         run_warnings=[]
         def attest_run(argv):
@@ -3030,11 +3030,42 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             if not verified_web_authority(request,authority_config,CAP_TASKS,name) or attester() is None:
                 raise decision_attest.AttestRefusal(403,'An attestation is written by the author\'s own web session or '
                                                         'agent; a worker credential cannot write one. Nothing was written.')
+        def caller_reads(other):
+            # This caller's read of another project, decided live by the function the service's check_authority uses,
+            # for that project (kittrial-5bb.454 r2). No service, no read.
+            if authority_config is None:return False
+            descriptor={key:value for key,value in authority.items() if key not in ('store','lock')}
+            try:
+                decide(read_state(authority_config.store),dict(descriptor,project=other,capability=CAP_READ))
+            except AuthorityDenied:
+                return False
+            return True
+        def pinned_decision(other,issue):
+            # A pinned decision, read for this caller under its own project's shared lock; the same None for a project
+            # it may not read, one that is not there and an issue that is not there.
+            if not caller_reads(other):return None
+            try:other_path=project_dir(root,other)
+            except ValueError:return None
+            if not (other_path/'.beads/metadata.json').is_file():return None
+            import project_creation
+            if project_creation.unfinished(root,other):return None
+            def run_other(argv):
+                stdout,warnings=native.split(native.run(native.argv(root,other_path,actor,argv),environment(root)))
+                if warnings:run_warnings.append(warnings)
+                return stdout
+            with held_coordination_lock(other_path,shared=True):
+                row=decision_attest.read_issue(run_other,issue)
+            return decision_attest.pin_fact(row,other,read_state(authority_config.store),configured_operators(root),other_path)
+        # Before this project's lock: no lock is held across projects (the .449 rule). What the row says under the lock
+        # is checked against what was read here.
+        with held_coordination_lock(path,shared=True):
+            before=decision_attest.read_issue(attest_run,payload['decision'])
+        pinned=decision_attest.read_pins(before,pinned_decision) if isinstance(before,dict) else {}
         def attest_effect():
             try:
                 result=decision_attest.apply(payload,project=name,journal=path,run=runner,author=actor,via=attester(),
                                              at=server_time(),state=read_state(authority_config.store),
-                                             operators=configured_operators(root))
+                                             operators=configured_operators(root),pinned=pinned)
             except decision_attest.AttestRefusal as error:
                 return refused(error)
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}

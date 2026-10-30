@@ -2,9 +2,10 @@
 
 A program decision is a decision issue of the program project with a ``Binds:`` line (the areas it applies to) and
 an ``Owner-only:`` line. It binds an area only when the area adopts it: a decision issue of the area with an
-``Adopts: decision:<program>/<id>`` line. An owner-only decision is adopted by a person owner of the area (or an
+``Adopts: decision:<program>/<id>@<attestation id>`` line, pinning the text the area saw. An owner-only decision is adopted by a person owner of the area (or an
 operator), or by an area coordinator whose adoption cites ``Per: decision:<area>/<id>``, a decision of the area
-attested by a person owner (or an operator) that says ``Authorises: decision:<program>/<id>`` for this very decision.
+attested by a person owner (or an operator) that says ``Authorises: decision:<program>/<id>@<attestation id>`` for this
+very decision. A pin that is not the program decision's attestation id now reads ``adoption-stale``.
 Never an agent alone. Nothing in the program grants authority in an area.
 
 A row's author is never its native ``created_by``: a row counts only with a live attestation of its exact text
@@ -21,9 +22,10 @@ AREA = r'[a-z][a-z0-9]{1,23}'
 ISSUE = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}'
 BINDS = re.compile(r'Binds: (%s(?:, %s)*)\Z' % (AREA, AREA))
 OWNER_ONLY = re.compile(r'Owner-only: (yes|no)\Z')
-ADOPTS = re.compile(r'Adopts: decision:(%s)/(%s)\Z' % (AREA, ISSUE))
+PIN = r'([0-9a-f]{64})'
+ADOPTS = re.compile(r'Adopts: decision:(%s)/(%s)@%s\Z' % (AREA, ISSUE, PIN))
 PER = re.compile(r'Per: decision:(%s)/(%s)\Z' % (AREA, ISSUE))
-AUTHORISES = re.compile(r'Authorises: decision:(%s)/(%s)\Z' % (AREA, ISSUE))
+AUTHORISES = re.compile(r'Authorises: decision:(%s)/(%s)@%s\Z' % (AREA, ISSUE, PIN))
 LINES = (('Binds:', 'binds', BINDS), ('Owner-only:', 'owner_only', OWNER_ONLY), ('Adopts:', 'adopts', ADOPTS),
          ('Per:', 'per', PER), ('Authorises:', 'authorises', AUTHORISES))
 FROM_LINE = re.compile(r'From: (\S{1,200})\Z')
@@ -62,7 +64,7 @@ def lines(row):
             elif name == 'owner_only':
                 found['owner_only'] = match.group(1) == 'yes'
             else:
-                found[name] = (match.group(1), match.group(2))
+                found[name] = match.groups()
             break
     return found
 
@@ -101,19 +103,23 @@ def program_decision(row, program, state, operators, journals=None):
     first = SUPERSEDES.fullmatch(description.split('\n')[0].rstrip('\r'))
     return {'id': str(row.get('id')), 'title': row.get('title'), 'status': row.get('status'),
             'owner_only': found['owner_only'], 'binds': list(found['binds'] or []),
-            'supersedes': first.group(1) if first else None, 'attestation': attested['state'],
+            'supersedes': first.group(1) if first else None, 'attestation_id': attested['id'], 'attestation': attested['state'],
             'attested_as': attested['role'], 'flags': flags, 'reasons': reasons}
 
 
 def adoption(row, decision, program, area, area_rows, state, operators, journals=None):
     """``(state, reason)`` of one adoption row in ``area`` of a counting program ``decision`` (section 6.2). A row
-    that does not read as attested reads as that (closed, not-attested, attestation-stale, attester-not-authorised)."""
+    that does not read as attested reads as that (closed, not-attested, attestation-stale, attester-not-authorised). One
+    that pinned other text than the program decision's now reads adoption-stale, whoever attested it."""
     found = lines(row)
     if found['problems']:
         return 'adoption-invalid', 'the adoption\'s lines do not read: ' + '; '.join(found['problems'])
     attested = standing(row, area, state, operators, _journal(journals, area))
     if attested['state'] != 'counts':
         return attested['state'], attested['reason']
+    if found['adopts'] is not None and found['adopts'][2] != decision['attestation_id']:
+        return 'adoption-stale', ('the program decision was attested with other text since this adoption read it: the '
+                                  'area adopts again to bind it')
     if not decision['owner_only'] or attested['role'] in OWNERS:
         return 'adopted', None
     if found['per'] is None:
@@ -133,9 +139,12 @@ def adoption(row, decision, program, area, area_rows, state, operators, journals
     named = lines(cited)
     if named['problems']:
         return 'adoption-invalid', 'the Per: decision\'s lines do not read: ' + '; '.join(named['problems'])
-    if named['authorises'] is None or named['authorises'] != found['adopts']:
+    if named['authorises'] is None or named['authorises'][:2] != (program, decision['id']):
         return 'adoption-invalid', ('the Per: decision does not say Authorises: decision:%s/%s: the owner\'s decision '
                                     'must name the decision it authorises' % (program, decision['id']))
+    if named['authorises'][2] != decision['attestation_id']:
+        return 'adoption-stale', ('the owner authorised other text of this program decision: the owner authorises '
+                                  'it again to bind it')
     return 'adopted', None
 
 
@@ -258,7 +267,7 @@ def trace_adopts(row, area, area_rows, program_rows, state, operators, journals=
     found = lines(row)
     if found['adopts'] is None:
         return None
-    program, decision_id = found['adopts']
+    program, decision_id = found['adopts'][:2]
     pointer = 'decision:%s/%s' % (program, decision_id)
     if program_rows is None:
         return {'pointer': pointer, 'state': 'not-visible'}

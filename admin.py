@@ -11174,19 +11174,33 @@ def main():
             raise ValueError('Coordination lock must not be a symlink')
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         payload={'schema_version':1,'operation_id':'operator-'+secrets.token_hex(16),'decision':args.decision,'digest':args.digest}
+        # An operator reads any project. Before this project's lock, so that no lock is held across projects.
+        from http_authority import read_state
+        try:state=read_state(root/'http-state.json')
+        except Exception:state=None                  # absent or unreadable: no person owner counts
+        def pinned_decision(other,issue):
+            try:other_path=project_dir(root,other)
+            except ValueError:return None
+            if not (other_path/'.beads/metadata.json').is_file():return None
+            def run_other(argv):return run_bd(root,other,argv)
+            return decision_attest.pin_fact(decision_attest.read_issue(run_other,issue),other,state,operators(root),other_path)
+        before=decision_attest.read_issue(lambda argv:run_bd(root,args.project,argv),args.decision)
+        pinned=decision_attest.read_pins(before,pinned_decision) if isinstance(before,dict) else {}
         with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
             fcntl.flock(lock,fcntl.LOCK_EX)
             listed=operators(root,strict=True)
             require_configured_operator(args.actor,listed,'attest a decision')
             print(json.dumps(decision_attest.apply(payload,project=args.project,journal=path,run=run,author=args.actor,
-                                                   via='operator',at=server_time(),state=None,operators=listed),ensure_ascii=False))
+                                                   via='operator',at=server_time(),state=state,operators=listed,
+                                                   pinned=pinned),ensure_ascii=False))
     elif args.command=='decision-attest-read':
         # Read-only (kittrial-5bb.454 r2): what an operator reads before attesting. Nothing is written; no lock is taken.
         import decision_attest
         from http_authority import read_state
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
-        state=None
+        try:state=read_state(root/'http-state.json')
+        except Exception:state=None                  # absent or unreadable: no person owner counts
         if args.state:
             state_path=Path(args.state)
             if state_path.is_symlink() or not state_path.is_file():raise ValueError('Use the existing web service state document')

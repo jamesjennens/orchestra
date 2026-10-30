@@ -453,14 +453,14 @@ it), applied across levels.
 - **The modules:** `decision_attest.py` is the record and how a row counts; `program_decisions.py` reads the lines and
   applies §6. The program view (endpoint action `program`, web route, `trace --program`) and the trace's decisions view
   use them alike.
-- **The lines:** `Binds: <area>, <area>`, `Owner-only: yes|no`, `Adopts: decision:<program>/<id>`,
-  `Per: decision:<area>/<id>` and `Authorises: decision:<program>/<id>`, each a whole line anywhere in the description,
+- **The lines:** `Binds: <area>, <area>`, `Owner-only: yes|no`, `Adopts: decision:<program>/<id>@<attestation id>`,
+  `Per: decision:<area>/<id>` and `Authorises: decision:<program>/<id>@<attestation id>`, each a whole line anywhere in the description,
   at most once. A repeat or a line that does not read makes the row `malformed-lines`: it binds and adopts nothing. A
   binding decision has both a `Binds:` and an `Owner-only:` line. An event or gate row is never a decision.
 - **The record:** `Kind: decision-attest-v1`, a reserved comment prefix no raw comment can write, honoured only with its
   journal entry `<project>/.decision-attests/<sha256>.json` (in backups, validated on restore). It names the project,
-  the decision, `via` (`session`, `agent` or `operator`), the author, the time and a digest of the row's exact type,
-  title and description. Status and labels are outside the digest.
+  the decision, `via` (`session`, `agent` or `operator`), the author, the time, a server-random nonce and a digest of the
+  row's exact type, title and description. Status and labels are outside the digest.
 - **Who writes it:** `POST /v1/projects/{id}/decisions/{did}/attest`, for the author's own web session or agent with
   owner or coordinator standing in that project now; a contributor, a viewer, a worker credential or an unbound key is
   refused. Or an operator with `admin.py decision-attest`. The body names the digest the author read
@@ -478,7 +478,7 @@ it), applied across levels.
 - **A program decision counts** when an owner-only one was attested by a person owner of the program or an operator
   (`owner-only-not-by-owner` otherwise), and another by a coordinator, an owner or an operator (anyone else reads
   `attester-not-authorised`). A coordinator agent's attestation counts as coordinator, never owner.
-- **An adoption**, per bound area: `adopted`, `not-adopted`, `adoption-invalid` (with the reason), what the row reads as
+- **An adoption**, per bound area: `adopted`, `not-adopted`, `adoption-invalid` (with the reason), `adoption-stale` (below), what the row reads as
   when it does not count (`closed` when only closed adoptions remain, `not-attested`, `attestation-stale`,
   `attester-not-authorised`), `superseded-upstream` (a counting adoption of a decision this one supersedes, and none of
   this one), `not-visible` (not readable or no such project: the same entry, nothing else), `not-in-program` (the
@@ -499,9 +499,21 @@ it), applied across levels.
   attestation is not gated: retyping a task as a decision only makes a row that reads `not-attested`.
 - **What a contributor can still do:** edit the text. That makes the row `attestation-stale`, which binds nothing and is
   visible, so it can only remove a binding, never create one. It is not refused.
-- **An adoption names a decision by id, not by its text:** when the program's owner attests changed text, an adoption
-  already made still reads `adopted`. Binding the digest across projects would disclose a program's row to an area that
-  may not read it. A change meant to reach areas is a new decision that says `Supersedes:`.
+- **An adoption pins the text it saw:** the pin on an `Adopts:` or `Authorises:` line is the program decision's attestation
+  id, and `GET /v1/projects/{program}/decisions/{id}/attestation` gives the line to copy. The id is the sha256 of the first
+  record of the unbroken run of newest records over this text. When the program decision is attested with other text, a
+  new run starts and the adoption reads `adoption-stale`, binding nothing until the area adopts again; an `Authorises:`
+  line that names this decision but pinned another attestation makes the `Per:` adoption read the same. Another attester
+  of the same words does not change the id.
+  - **At write:** a row carrying either line is attested only by someone who can read that decision now, decided live for
+    that project, and only with the id it has now while it counts. Otherwise nothing is written: 403 with the same
+    words for an unreadable program, no such project and no such decision, and 409 to a reader for other text or a
+    decision that does not count. An area owner who may not read the program cannot adopt; they ask for read of it. An
+    operator on `admin.py` reads any project.
+  - **Later:** an adopter who loses read of the program keeps the adoption. It was read at write, and it goes stale if the
+    text changes.
+  - **What it discloses:** nothing about the text. The id is a hash over the record's random nonce, so a reader of the area
+    cannot derive it from the text or confirm a guess of it.
 - **The boundary:** anyone with a shell on the host can forge bd rows with `--actor` or `BEADS_ACTOR`, and can write the
   journal. Only the attestation journal and the live checks defend, and only against the routes the kit exposes. An
   HTTP-shaped actor and its look-alikes are still refused on every host route (`reserved_comments.refuse_http_actor`), so

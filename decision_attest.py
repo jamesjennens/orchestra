@@ -11,6 +11,13 @@ and description, a reserved prefix a raw comment cannot write, honoured only wit
   the attestation is refused and never attested by mistake;
 - the operator's host path (``admin.py decision-attest``), for an actor on the installation's allowlist.
 
+A row whose text carries ``Adopts:`` or ``Authorises:`` pins the program decision's attestation id. It is attested only by
+someone who can read that decision now, and only with the id it has now: an area must not read ``adopted`` for text it
+never saw. The same refusal answers an unreadable program, no such project and no such decision. The id is the sha256 of
+the first record of the unbroken run of newest records over this text, a hash over a server-random ``nonce``, so a reader
+of the area learns nothing about the program's text and cannot confirm a guess of it. New text starts a new run, so the
+id changes exactly when the text attested does, and another attester of the same words does not change it.
+
 At every read, in this order: a closed row is ``closed``; a row with no honoured record is ``not-attested``; a newest
 record over any other text is ``attestation-stale`` (the newest, not any: going back to text the author has since
 replaced stays stale); an author whose standing has gone is ``attester-not-authorised``. Only then does the row count,
@@ -29,6 +36,7 @@ files and forge bd rows; this defends the routes the kit exposes (the as-built s
 import datetime
 import hashlib
 import re
+import secrets
 
 import record_json
 from requirements import canonical_bytes, content_hash
@@ -38,6 +46,7 @@ JOURNAL_DIR = '.decision-attests'
 JOURNAL_FILE_LIMIT = 16384
 VIA = ('session', 'agent', 'operator')
 DIGEST = re.compile(r'[0-9a-f]{64}\Z')
+NONCE = re.compile(r'[0-9a-f]{32}\Z')
 ISSUE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}\Z')
 PROJECT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z')
 OPERATION = re.compile(r'[\x21-\x7e]{1,200}\Z')
@@ -45,7 +54,8 @@ OPERATOR = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]{0,95}\Z')
 PERSON = re.compile(r'usr_[0-9a-f]{16}\Z')
 AGENT = re.compile(r'agent_[0-9a-f]{16}\Z')
 REQUEST_FIELDS = frozenset({'schema_version', 'operation_id', 'decision', 'digest'})
-RECORD_FIELDS = REQUEST_FIELDS | frozenset({'project', 'via', 'author', 'recorded_by', 'owner_gated', 'at', 'sha256'})
+RECORD_FIELDS = REQUEST_FIELDS | frozenset({'project', 'via', 'author', 'recorded_by', 'owner_gated', 'nonce', 'at',
+                                            'sha256'})
 #: Rows that are never decisions, whatever their labels: what the queue never lists as work.
 NOT_WORK_TYPES = ('event', 'gate')
 OWNERS = ('owner', 'operator')
@@ -167,6 +177,8 @@ def _validate_record(record):
     if not isinstance(author, str) or not shape.fullmatch(author) or record['recorded_by'] != author \
             or (record['via'] == 'operator' and (PERSON.fullmatch(author) or AGENT.fullmatch(author))):
         raise ValueError('An attestation record names the author that wrote it')
+    if not isinstance(record['nonce'], str) or not NONCE.fullmatch(record['nonce']):
+        raise ValueError('An attestation record carries its random nonce')
     if not isinstance(record['owner_gated'], bool):
         raise ValueError('An attestation record says whether its text needs an owner to change')
     if not isinstance(record['at'], str):
@@ -184,7 +196,8 @@ def _validate_record(record):
 def make_record(payload, *, project, author, via, gated, at):
     """Build a record from a validated request and trusted server attribution only."""
     validate_request(payload)
-    record = dict(payload, project=project, via=via, author=author, recorded_by=author, owner_gated=gated, at=at)
+    record = dict(payload, project=project, via=via, author=author, recorded_by=author, owner_gated=gated, at=at,
+                  nonce=secrets.token_hex(16))
     record['sha256'] = content_hash(record)
     _validate_record(record)
     return record
@@ -320,9 +333,10 @@ def _newest_run(records):
 
 
 def standing(row, project, state, operators, journal):
-    """How a row counts now: ``{'state', 'role', 'author', 'reason'}``. ``state`` is 'counts', or what it reads as."""
+    """How a row counts now: ``{'state', 'role', 'author', 'id', 'reason'}``. ``state`` is 'counts', or what it reads as;
+    ``id`` is what an adoption pins: the sha256 of the first record of the newest run over this text."""
     def reads(name):
-        return {'state': name, 'role': None, 'author': None, 'reason': REASONS[name]}
+        return {'state': name, 'role': None, 'author': None, 'id': None, 'reason': REASONS[name]}
     if isinstance(row, dict) and row.get('status') == 'closed':
         return reads('closed')
     records = history(row, project, journal)
@@ -330,18 +344,58 @@ def standing(row, project, state, operators, journal):
         return reads('not-attested')
     if records[-1]['digest'] != digest(row):
         return reads('attestation-stale')
-    found = [(role_now(record['via'], record['author'], project, state, operators), record)
-             for record in _newest_run(records)]
+    run = _newest_run(records)
+    found = [(role_now(record['via'], record['author'], project, state, operators), record) for record in run]
     found = sorted(((role, record) for role, record in found if role is not None), key=lambda item: RANK.index(item[0]))
     if not found:
         return reads('attester-not-authorised')
-    return {'state': 'counts', 'role': found[0][0], 'author': found[0][1]['author'], 'reason': None}
+    return {'state': 'counts', 'role': found[0][0], 'author': found[0][1]['author'], 'id': run[-1]['sha256'], 'reason': None}
 
 
 def read_issue(run, decision):
     """One native issue with its comments, or None when this project has no such issue."""
     from delegations import read_issue as read
     return read(run, decision)
+
+
+def pins(row):
+    """The ``(program, decision, attestation id)`` of a row's Adopts: and Authorises: lines."""
+    from program_decisions import lines
+    found = lines(row)
+    return [found[name] for name in ('adopts', 'authorises') if found[name] is not None]
+
+
+def pin_fact(row, program, state, operators, journal):
+    """What the write checks of a pinned decision: its attestation id and how it reads, or None for no decision."""
+    if not isinstance(row, dict) or not is_decision(row):
+        return None
+    found = standing(row, program, state, operators, journal)
+    return {'pin': found['id'], 'state': found['state']}
+
+
+def read_pins(row, read_decision):
+    """{(program, decision): its fact, or None where this caller cannot read it or it does not exist}, read BEFORE the
+    area's lock is taken, so that no lock is held across projects (the .449 rule)."""
+    return {pin[:2]: read_decision(*pin[:2]) for pin in pins(row)}
+
+
+def check_pins(row, pinned):
+    """Refuse a row whose pins this caller did not read, or that are not the program decision's attestation id now."""
+    for program, decision, pin in pins(row):
+        if (program, decision) not in (pinned or {}):
+            raise AttestRefusal(409, 'The text changed since you read it. Read it again before you attest it. Nothing was '
+                                     'written.')
+        fact = pinned[(program, decision)]
+        if fact is None:
+            raise AttestRefusal(403, 'This row names decision:%s/%s, and it cannot be read: it does not exist, or you may '
+                                     'not read it. An area adopts only text it has read: ask for read of %s. Nothing was '
+                                     'written.' % (program, decision, program))
+        if fact['state'] != 'counts':
+            raise AttestRefusal(409, 'decision:%s/%s does not count now (%s). Nothing was written.'
+                                     % (program, decision, fact['state']))
+        if fact['pin'] != pin:
+            raise AttestRefusal(409, 'decision:%s/%s has other text now: copy the line again from its attestation read. '
+                                     'Nothing was written.' % (program, decision))
 
 
 def read_answer(row, project, state, operators, journal):
@@ -353,14 +407,18 @@ def read_answer(row, project, state, operators, journal):
     return {'schema_version': 1, 'project': project, 'decision': row.get('id'), 'type': row.get('issue_type'),
             'title': row.get('title'), 'description': row.get('description') or '', 'status': row.get('status'),
             'digest': digest(row), 'attestation': found['state'], 'attested_as': found['role'],
-            'attested_by': found['author'], 'reason': found['reason']}
+            'attested_by': found['author'], 'reason': found['reason'],
+            'attestation_id': found['id'],
+            'adopt_line': 'Adopts: decision:%s/%s@%s' % (project, row.get('id'), found['id']) if found['id'] else None,
+            'authorise_line': 'Authorises: decision:%s/%s@%s' % (project, row.get('id'), found['id']) if found['id'] else None}
 
 
-def apply(payload, *, project, journal, run, author, via, at, state, operators):
+def apply(payload, *, project, journal, run, author, via, at, state, operators, pinned=None):
     """Append one attestation: check, journal readiness, one native comment, the entry.
 
     The caller holds the project's coordination lock and runs this inside its guarded write, and has proved who
     ``author`` is (a person's own web session, the agent's own credential, or a listed operator on the host path).
+    ``pinned`` is what ``read_pins`` read for this caller before the lock.
     The journal is proved writable BEFORE the native comment and the entry is written after it: a failure in between
     leaves a comment no reader honours."""
     validate_request(payload)
@@ -380,6 +438,7 @@ def apply(payload, *, project, journal, run, author, via, at, state, operators):
     if payload['digest'] != current:
         raise AttestRefusal(409, 'The text changed since you read it. Read it again before you attest it. Nothing was '
                                  'written.')
+    check_pins(row, pinned)
     record = make_record(payload, project=project, author=author, via=via, gated=owner_gated(row, role), at=at)
     open_journal(journal)
     comment = record_json.loads(run(['comments', 'add', payload['decision'], body(record), '--json']))

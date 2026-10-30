@@ -26,5 +26,10 @@ export function attestationPanel(read, attest) {
       h('p', { class: 'small muted' }, 'You attest exactly this:'),
       h('p', { class: 'small' }, `${read.type}: ${read.title}`),
       h('pre', { class: 'small' }, read.description),
+      read.attestation === 'counts' && read.adopt_line ? h('div', { class: 'stack', 'data-pin-lines': '' },
+        h('p', { class: 'small muted' }, 'An area that adopts this text has this line in its own decision. It pins this text: if this decision is attested with other text, the adoption reads stale until the area adopts again.'),
+        h('pre', { class: 'small' }, read.adopt_line),
+        h('p', { class: 'small muted' }, 'An owner who lets a coordinator adopt it has this line in their own decision:'),
+        h('pre', { class: 'small' }, read.authorise_line)) : null,
       button, said));
 }
