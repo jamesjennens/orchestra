@@ -221,9 +221,10 @@ class EndpointTests(unittest.TestCase):
         # task-file action (kittrial-5bb.370, `files_effect`): eleven. The twelfth is the
         # delegation action (kittrial-5bb.407, `delegation_effect`). The thirteenth is the
         # design-document report (kittrial-5bb.418, `ref verify`, `verify_effect`).
+        # The fourteenth is the interface write.
         # Every one goes through guarded_write, so every one reads the configuration
         # before it reserves.
-        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 13)
+        self.assertEqual(source.count('return guarded_write(root,request,journal_path(path),'), 14)
 
     def test_an_action_that_needs_nothing_from_the_file_is_not_stopped_by_its_damage(self):
         """Review of kittrial-5bb.156: the file was read before EVERY action, so the onboarding text could

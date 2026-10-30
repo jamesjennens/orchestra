@@ -1316,6 +1316,7 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
 
 
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None,frame=None):
+    key_project_refusal(request,key_projects)
     import interface_lock
     action = request.get('action') if isinstance(request, dict) else None
     args = request.get('args', []) if isinstance(request, dict) else []
@@ -1331,7 +1332,6 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
 
 
 def _execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None,frame=None):
-    key_project_refusal(request,key_projects)
     if isinstance(request,dict) and request.get('action')=='delivery':
         from review_workflow import DELIVERY_SSH_ONLY_HTTP
         raise ValueError(DELIVERY_SSH_ONLY_HTTP)

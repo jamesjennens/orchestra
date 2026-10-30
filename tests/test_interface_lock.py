@@ -90,3 +90,14 @@ class InterfaceLockTests(unittest.TestCase):
                         finally:release.set()
                         self.assertEqual(0,one.result(5)['returncode']);self.assertEqual(0,two.result(5)['returncode'])
                     self.assertEqual([first+' start',first+' end',other+' start',other+' end'],order)
+
+    @unittest.skipIf(os.name=='nt','endpoint is POSIX-only')
+    def test_project_refusal_precedes_mutex_and_dispatch(self):
+        import endpoint
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(interface_lock,'held') as mutex,patch.object(endpoint,'_execute') as dispatch:
+                with self.assertRaisesRegex(ValueError,'Unknown/uninitialized project'):
+                    endpoint.execute(Path(temp),{'project':'private','action':'interface','args':['accept']},
+                                     key_projects=frozenset({'public'}))
+                mutex.assert_not_called();dispatch.assert_not_called()
+                self.assertEqual([],list(Path(temp).iterdir()))

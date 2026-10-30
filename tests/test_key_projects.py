@@ -534,11 +534,21 @@ class ListingTests(unittest.TestCase):
         # execute (main's stdin loop is the one) goes through it: the module's own calls.
         import ast
         tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name not in ('execute',):
+        # Nested helpers are lexical closures of the gated dispatcher, not entry points.
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name not in ('execute','_execute'):
                 for call in ast.walk(node):
                     if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
                         self.assertNotEqual(call.func.id, 'project_dir', 'a path read outside execute')
+        # The private dispatcher is reached only from the gated public entry, in
+        # its locked and unlocked branches. No other caller can bypass that gate.
+        dispatch_callers=[]
+        for function in tree.body:
+            if isinstance(function,ast.FunctionDef):
+                for call in ast.walk(function):
+                    if isinstance(call,ast.Call) and isinstance(call.func,ast.Name) and call.func.id=='_execute':
+                        dispatch_callers.append(function.name)
+        self.assertEqual(dispatch_callers,['execute','execute'])
         # The structural refusals come before any action is answered, and the reviewer's
         # probe (an action answered in main() before execute) has no surface: main builds
         # argv and calls execute once, for every request.
@@ -546,7 +556,7 @@ class ListingTests(unittest.TestCase):
         calls = [line for line in source.split('\n') if 'execute(' in line and 'def execute' not in line
                  and 'session_execute' not in line and 'work_execute' not in line
                  and 'handoff_execute' not in line and 'briefing_execute' not in line
-                 and 'feedback_execute' not in line]
+                 and 'feedback_execute' not in line and '_execute(' not in line]
         self.assertTrue(all('answer=execute(' in line for line in calls), calls)
 
     def test_a_line_for_another_runtime_and_unknown_things(self):
