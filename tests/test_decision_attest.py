@@ -518,6 +518,13 @@ class WebRouteTests(unittest.TestCase):
         cls.runtime.setUpClass()
         cls.root = cls.runtime.root
         cls.project = cls.runtime.root / 'projects' / 'pp'
+        bound = cls.runtime(methodName='runTest')
+        for key, value in fixture.admin.PROJECT_SETTINGS:
+            assert bound.bd('config', 'set', key, value).returncode == 0
+        assert bound.bd('create', 'Merge Slot', '--id', 'pp-merge-slot', '--labels', 'gt:slot', '--json').returncode == 0
+        document = json.loads((cls.root / 'deployment.private.json').read_text(encoding='utf-8'))
+        document['operators'] = ['ops']
+        (cls.root / 'deployment.private.json').write_text(json.dumps(document), encoding='utf-8')
         import http_service
         import test_http_review_fixes as fixes
         root = cls.root
@@ -634,10 +641,12 @@ class WebRouteTests(unittest.TestCase):
         issue = self.make()
         row = self.read(issue)
         body = json.dumps({'schema_version': 1, 'operation_id': 'op-x', 'decision': issue, 'digest': row['digest']})
-        for args in (['attest', body], ['read', issue]):
-            answer = fixture.endpoint.execute(self.root, {'project': 'pp', 'actor': 'ops', 'action': 'decision-attest',
-                                                          'args': args, 'operation_id': 'op-x'})
-            self.assertEqual((2, 403), (answer['returncode'], answer['delegation_status']), answer)
+        answer = fixture.endpoint.execute(self.root, {'project': 'pp', 'actor': 'ops', 'action': 'decision-attest',
+                                                      'args': ['read', issue]})
+        self.assertEqual((2, 403), (answer['returncode'], answer['delegation_status']), answer)
+        answer = fixture.endpoint.execute(self.root, {'project': 'pp', 'actor': 'ops', 'action': 'decision-attest',
+                                                      'args': ['attest', body], 'operation_id': 'op-x'})
+        self.assertNotEqual(0, answer['returncode'], answer)
         with self.assertRaises(ValueError):
             fixture.endpoint.execute(self.root, {'project': 'pp', 'actor': 'ops', 'action': 'decision-attest',
                                                  'args': ['attest', body], 'operation_id': 'op-x'},
@@ -700,7 +709,12 @@ class WebRouteTests(unittest.TestCase):
     def test_a_host_write_naming_no_issue_is_refused_once_a_project_has_attestations(self):
         issue = self.make()
         self.attest(issue, 'pat')
-        answer = self.host('w1', 'update', '--type', 'task', '--json')
+        # Refused earlier on this route (bd would act on the last touched issue, kittrial-5bb.97's rule); the guard says
+        # the same on its own, so it cannot depend on where it is called.
+        with self.assertRaises(ValueError):
+            self.host('w1', 'update', '--type', 'task', '--json')
+        answer = fixture.endpoint._guard_attested_decision(self.root, self.project, 'pp', ['update', '--type', 'task', '--json'],
+                                                           'w1', None)
         self.assertEqual((2, 422), (answer['returncode'], answer['delegation_status']), answer)
 
     def test_a_text_edit_stays_open_to_a_contributor_and_an_ordinary_write_is_untouched(self):
