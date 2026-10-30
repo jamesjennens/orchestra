@@ -768,7 +768,7 @@ const node=view.attestationPanel(read,attest?async (digest)=>{sent.push(digest);
 const host=document.createElement('div');
 host.appendChild(node);
 const button=host.querySelector('button');
-if (button) await button.onclick();
+if (button) { await button.listeners.click[0](); }
 console.log(JSON.stringify({text:host.textContent,sent,button:!!button,
   markup:host.querySelectorAll('img').length+host.querySelectorAll('script').length,
   pre:host.querySelector('pre').textContent}));"""
