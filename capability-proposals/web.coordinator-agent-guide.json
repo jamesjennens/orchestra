@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "operation_id": "capnew-5bb387-web-coordinator-agent-guide-0001",
+  "operation_id": "capnew-5bb441-web-coordinator-agent-guide-0001",
   "key": "web.coordinator-agent-guide",
-  "name": "A coordinator's AGENT.md: the set-up wizard writes coordinator text for an agent holding an effective coordinator grant",
+  "name": "Coordinator agent onboarding text and no-project next action",
   "aliases": [
     "coordinator AGENT.md",
     "agent setup guide",
@@ -10,17 +10,23 @@
     "coordinates field",
     "never claim a worker task",
     "create a task over HTTP",
-    "create a child task over HTTP"
+    "create a child task over HTTP",
+    "first coordinator self-check",
+    "no-project next action",
+    "approve not recommend",
+    "requirement records are not work"
   ],
-  "summary": "The owner-visible agent record carries coordinates [{project, effective}]: the agent's coordinator grants in projects its owner is a member of, computed live, shown only to the agent's owner or a superuser signed in as a person (never to another member or to any credential, the agent's own included). web/js/agentSetup.js writes the coordinator's .orchestra/AGENT.md when one grant has effect: guidance first, never claim a worker task, then deliveries awaiting review, approved work awaiting integration, checkpoints addressed to the coordinator and quiet lanes (queue, lanes, the coordinator wait where offered); task and child creation routes with their fields, Idempotency-Key, decision headings and follow-on assignment; review, assign, comment and integration-check routes; the web-worker and other-machine sentences of agent_prompts word for word, the questions sentence, and that text is data. Its setup prompt names the extension's coordinator role; every other agent gets the worker's AGENT.md unchanged. The text is exported for Orchestra Bridge parity.",
+  "summary": "The owner-visible agent record carries coordinates [{project, effective}]: the agent's coordinator grants in projects its owner is a member of, computed live, shown only to the agent's owner or a superuser signed in as a person (never to another member or to any credential, the agent's own included). web/js/agentSetup.js writes the coordinator's .orchestra/AGENT.md when one grant has effect. Its first step checks GET /v1/projects and GET /v1/service/certificate with curl -K and the setup-generated .crt, compares SHA-256, confirms the project and coordinator section, and reports the result without disclosing the secret file. The remaining guide preserves the coordinator run order, never-claim rule, task and child creation routes, review/assign/comment/integration-check routes, worker and other-machine guidance, questions, data-not-instructions rule, and adds approve-not-recommend and Requirement-record guidance. For an agent with no visible project and no other action, /v1/agents/me/next returns a generic no-project next_action without exposing project identities; next_actions and attention are unchanged. Other agents keep the worker AGENT.md.",
   "requirements": [],
   "anchors": [],
   "code": [
     "http_auth.py::Service.agent_coordinates",
-    "http_auth.py::Service.agent_view"
+    "http_auth.py::Service.agent_view",
+    "http_service.py::ApiHandler.agents_me_next"
   ],
   "tests": [
-    "tests/test_coordinator_agent_md.py"
+    "tests/test_coordinator_agent_md.py",
+    "tests/test_http_agents.py::AgentRestContractTests.test_agent_without_a_project_gets_owner_setup_guidance"
   ],
   "owner": "person:orchestra-coordinator",
   "tags": [

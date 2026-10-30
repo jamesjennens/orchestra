@@ -534,20 +534,17 @@ class ListingTests(unittest.TestCase):
         # execute (main's stdin loop is the one) goes through it: the module's own calls.
         import ast
         tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name not in ('execute',):
-                for call in ast.walk(node):
-                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
-                        self.assertNotEqual(call.func.id, 'project_dir', 'a path read outside execute')
-        # kittrial-5bb.449: nor in a lambda outside execute. The trace's resolver for other projects is a lambda
-        # built in execute, after the gate, and that is the one place a lambda may resolve a project path.
+        # Every reference, including aliases, partials and attributes, must be
+        # within execute, which has already passed the project gate.
         execute = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'execute')
         inside = {id(node) for node in ast.walk(execute)}
         for node in ast.walk(tree):
-            if isinstance(node, ast.Lambda) and id(node) not in inside:
-                for call in ast.walk(node):
-                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
-                        self.assertNotEqual(call.func.id, 'project_dir', 'a path read in a lambda outside execute')
+            if id(node) in inside:
+                continue
+            if isinstance(node, ast.Name):
+                self.assertNotEqual(node.id, 'project_dir', 'project_dir reference outside execute')
+            if isinstance(node, ast.Attribute):
+                self.assertNotEqual(node.attr, 'project_dir', 'project_dir attribute outside execute')
         # The structural refusals come before any action is answered, and the reviewer's
         # probe (an action answered in main() before execute) has no surface: main builds
         # argv and calls execute once, for every request.
