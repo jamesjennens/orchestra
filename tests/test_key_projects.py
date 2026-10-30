@@ -549,6 +549,18 @@ class ListingTests(unittest.TestCase):
                     if isinstance(call,ast.Call) and isinstance(call.func,ast.Name) and call.func.id=='_execute':
                         dispatch_callers.append(function.name)
         self.assertEqual(dispatch_callers,['execute','execute'])
+        # kittrial-5bb.449: nor in a lambda outside execute. The trace's resolver for other projects is a lambda
+        # built in execute, after the gate, and that is the one place a lambda may resolve a project path.
+        entries=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in ('execute','_execute')]
+        inside={id(node) for entry in entries for node in ast.walk(entry)}
+        private_loads=[node for node in ast.walk(tree) if isinstance(node,ast.Name)
+                       and isinstance(node.ctx,ast.Load) and node.id=='_execute']
+        self.assertEqual(len(private_loads),2,'the private dispatcher has no alias or alternate entry')
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Lambda) and id(node) not in inside:
+                for call in ast.walk(node):
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                        self.assertNotEqual(call.func.id, 'project_dir', 'a path read in a lambda outside execute')
         # The structural refusals come before any action is answered, and the reviewer's
         # probe (an action answered in main() before execute) has no surface: main builds
         # argv and calls execute once, for every request.

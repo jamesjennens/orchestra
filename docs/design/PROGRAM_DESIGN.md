@@ -220,7 +220,8 @@ read: the check comes first.
 - **The lint:** the trace's `qualify-key` rows, and a warning on creating a key with `/`, never a refusal.
 - **Briefs** name another project's token as `cross-project` and read nothing of it.
 - **An accepted design document** containing a qualified `design:` token reads `differs` until it is accepted
-  again; the release notes say so.
+  again; the release notes say so. So does one containing `req:/x`, `req:A/` or `req:A/@3`: an empty project or an
+  empty key is prose now, where it was a token before. `decision:` tokens never enter a design index.
 
 ## 4. The interface register (Q3 A)
 

@@ -175,6 +175,14 @@ class DesignIndexTests(unittest.TestCase):
                                                 'docs/plat.md', 'a' * 40)
         self.assertIn('design:north/x#y', changed['headings'][1]['tokens'])
 
+    def test_an_empty_project_or_key_is_prose_and_changes_the_index(self):
+        # Review of .449: req:/x, req:A/ and req:A/@3 were tokens and are prose now, so a document holding them
+        # re-derives without them and reads differs; the release notes say so. decision: tokens never enter the index.
+        doc = self.DOC.replace('here.', 'and req:/x req:north/ req:north/@3 decision:d-1 here.')
+        index = design_documents.derive_index(doc, 'design.plat', 'docs/plat.md', 'a' * 40)
+        self.assertEqual(['req:K', 'req:north/K', 'design:x#y'], index['headings'][1]['tokens'])
+        self.assertEqual([], parse_context_pointers('req:/x req:north/ req:north/@3'))
+
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
 class EndpointArgumentTests(unittest.TestCase):
@@ -218,6 +226,25 @@ class WebTests(LinkCase):
             answer = self.request('GET', '/v1/projects/prog/trace?view=tasks', token=self.tokens[name])
             self.assertEqual(200, answer.status, (name, answer.data))
             self.assertEqual([expected], self.calls, name)
+
+    def test_a_project_listed_but_no_longer_readable_is_left_out(self):
+        # Review of .449 (M9): each listed project is checked on its own. vera's role in north is removed between
+        # the listing and the check, as a race would; north is listed, but no longer readable, so it is not passed.
+        listed = self.service.list_projects
+        seen = []
+
+        def racing(principal):
+            projects = listed(principal)
+            seen.extend(project['id'] for project in projects)
+            with self.service.store.lock:
+                self.service.state['memberships']['north'].pop(self.ids['vera'], None)
+            return projects
+        self.calls.clear()
+        with patch.object(self.service, 'list_projects', racing):
+            answer = self.request('GET', '/v1/projects/prog/trace?view=tasks', token=self.tokens['vera'])
+        self.assertEqual(200, answer.status, answer.data)
+        self.assertIn('north', seen)
+        self.assertEqual([['prog']], self.calls)
 
     def test_outside_program_marks_a_readable_unlinked_project_only(self):
         cites = {c['pointer']: c for c in
@@ -284,6 +311,7 @@ class NativeTraceTests(unittest.TestCase):
         return json.loads(made.stdout)['id']
 
     def cites(self, args, **kw):
+        kw.setdefault('project_path', lambda other: fixture.endpoint.project_dir(self.root, other))
         answer, _warnings = fixture.endpoint.trace_answer(self.root, self.root / 'projects' / 'pp', 'pp',
                                                           ['tasks'] + args, 'op', **kw)
         return {c['pointer']: c for row in answer['rows'] for c in row['cites']}
@@ -292,6 +320,8 @@ class NativeTraceTests(unittest.TestCase):
         theirs = self.created('qq', 'Use the shared broker', '--type', 'decision')
         token = 'decision:qq/' + theirs
         self.created('pp', 'Cites qq', '--description', token + ' decision:ghost/x-1')
+        # Without a resolver from execute, no other project is read at all.
+        self.assertEqual('not-visible', self.cites([], key_projects=None, project_path=None)[token]['state'])
         # Host: a key bound to pp alone reads nothing of qq; one bound to both, or an operator's unbound key, does.
         self.assertEqual('not-visible', self.cites([], key_projects=frozenset({'pp'}))[token]['state'])
         self.assertEqual('live', self.cites([], key_projects=frozenset({'pp', 'qq'}))[token]['state'])

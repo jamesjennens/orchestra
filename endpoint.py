@@ -1265,7 +1265,7 @@ def held_coordination_lock(path,shared=False):
         yield
 
 
-def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=None,by_service=False):
+def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=None,by_service=False,project_path=None):
     """(answer, warnings) of one trace page (kittrial-5bb.425). Under a shared lock: the export from the read
     cache, the live membership (whose lines count: the round's publication line, the owner-only decision
     heuristic) and the governance snapshot. The views are built after the lock is released (review b2), from
@@ -1294,8 +1294,10 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
         governance=trace_read.read_governance(rows,path,name)
     def read_project(other):
         # Another project, read like this one, under its own lock and after this one's is released; a name that is
-        # not a project, or one not fully made, is no project.
-        try:other_path=project_dir(root,other)
+        # not a project, or one not fully made, is no project. Its path comes from execute, after the project gate
+        # (project_path); without one, no other project is read.
+        if project_path is None:return None
+        try:other_path=project_path(other)
         except ValueError:return None
         if not (other_path/'.beads/metadata.json').is_file():return None
         import project_creation
@@ -1535,9 +1537,11 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
         # was read at goes back with the answer, and a page asked for at another generation is refused.
         # kittrial-5bb.449: the web service is the launch with --authority-store, which only the service passes
         # (an SSH key line cannot: see main()); its reads go without --require-authority, as the reference read's
-        # web_service does below. Only that launch's --readable is honoured.
+        # web_service does below. Only that launch's --readable is honoured. Another project's path is resolved
+        # here, in execute after the gate, as every project path is; trace_answer reads only the projects its caller
+        # may read.
         result=trace_answer(root,path,name,request.get('args',[]),actor,authority_config,key_projects=key_projects,
-                            by_service=authority_config is not None)
+                            by_service=authority_config is not None,project_path=lambda other:project_dir(root,other))
         return {'returncode':0,'stdout':json.dumps(result[0],ensure_ascii=False)+'\n','stderr':result[1]}
     if action=='owner-requirements':
         from requirement_http import web_action
