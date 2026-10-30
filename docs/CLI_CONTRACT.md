@@ -2617,7 +2617,8 @@ I/O. The trace's authorized loader resolves foreign tokens, with identical
 `not-visible` rows/no target reads for missing and inaccessible projects. A host
 caller cannot supply the web service's `--readable` set. The register reports
 coverage alongside `no-provider`, `consumes-retired`, `consumes-deprecated`,
-`provider-behind`, `orphan` and `compatibility-unverified`; absence flags are not
+`provider-behind`, `orphan` and `compatibility-unverified`. A deprecated major
+names its accepted replacement in `replacement` (or null when none is readable); absence flags are not
 asserted when coverage is incomplete. No field grants a role, a read or runtime
 registration. Interface schema verification and `breaking-without-version` evidence
 arrive only with slice 3b.

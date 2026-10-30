@@ -202,20 +202,23 @@ def catalog(rows, operators=None):
     return KIND.catalog(rows, operators or ())
 
 
-def view(entry):
+def view(entry, entries=()):
     record = entry.get('record') or entry.get('proposed')
-    return dict(entry, lifecycle=(record['state'] if entry.get('record') else 'draft') if record else None,
+    replacement=next((e['key'] for e in entries if e.get('state')=='accepted'
+                      and e.get('record',{}).get('replaces')==entry.get('key')),None)
+    return dict(entry, replacement=replacement, lifecycle=(record['state'] if entry.get('record') else 'draft') if record else None,
                 compatibility='compatibility-unverified', trust='data')
 
 
 def get(rows, key, operators=None):
-    return view(KIND.find_entry(rows, key, operators or ()))
+    entries,_=catalog(rows,operators)
+    return view(KIND.find_entry(rows, key, operators or ()),entries)
 
 
 def read(args, run, operators=None):
     rest = [v for v in args if v != '--json']
     if rest[:1] == ['get'] and len(rest) == 2:
-        return get(KIND.read_key_rows(run, valid_key(rest[1])), rest[1], operators)
+        return get(KIND.read_rows(run), valid_key(rest[1]), operators)
     if not rest or rest[0] != 'list':
         raise ValueError('interface get KEY | list [--offset N --limit N] | propose|revise --file FILE')
     opts = {'offset': 0, 'limit': 20}
@@ -230,7 +233,7 @@ def read(args, run, operators=None):
     entries, incomplete = catalog(KIND.read_rows(run), operators)
     entries = sorted(entries, key=lambda e: e.get('key') or '')
     page = entries[opts['offset']:opts['offset'] + opts['limit']]
-    return {'schema_version': 1, 'items': [view(e) for e in page], 'total': len(entries),
+    return {'schema_version': 1, 'items': [view(e,entries) for e in page], 'total': len(entries),
             'next_offset': opts['offset'] + len(page) if opts['offset'] + len(page) < len(entries) else None,
             'coverage': {'complete': not incomplete and all(e['state'] not in ('malformed', 'unsupported', 'conflicted') for e in entries),
                          'incomplete': incomplete}, 'compatibility': 'compatibility-unverified'}

@@ -166,6 +166,7 @@ class InterfaceCase(unittest.TestCase):
         self.accept(proposed,operation='accept-major2')
         after=self.entry()['record']
         self.assertEqual('deprecated',after['state'])
+        self.assertEqual('iface.quotes.v2',self.entry()['replacement'])
         self.assertEqual({k:old[k] for k in ir.CONTENT_FIELDS if k!='state'},
                          {k:after[k] for k in ir.CONTENT_FIELDS if k!='state'})
         count=len(self.native.writes());self.accept(proposed,operation='accept-major2')
