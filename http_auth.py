@@ -1109,6 +1109,8 @@ class Service:
         self._lookups = {}
         self._self_check_times = {}      # agent id -> times of its recent first-check reports (kittrial-5bb.444)
         self._self_check_throttle_audited = {}   # agent id -> time of its last audited 429 (at most one a window)
+        self._note_times = {}        # (from project, to project) -> times of its recent notes (kittrial-5bb.447)
+        self._note_throttle_audited = {}   # (from project, to project) -> time of its last audited 429
 
     # -- helpers ---------------------------------------------------------------
     def claim_gate(self, agent_id):
@@ -3533,6 +3535,194 @@ class Service:
                     'written_by_name': self._owner_name(current['written_by']), 'written_at': current.get('written_at'),
                     'acknowledged': bool(current['acknowledged'])}
 
+    # -- coordinator notes (kittrial-5bb.447) -------------------------------------------------------------------
+    #: Notes from the coordinators of one project to the coordinator role of another, on this installation. They live
+    #: in this service's state, ``coordinator_notes = {'notes': [...], 'dropped': {project: count}}``, and never in
+    #: either project's tracker, so a note grants its sender nothing in the addressed project. The coordination
+    #: backup's HTTP-state pair carries them. The record is shaped so that a later relay between installations
+    #: (kittrial-5bb.448) can carry it unchanged: a random id, and ``to.installation`` (null: this installation).
+    NOTE_TEXT_MAX = 4000
+    #: At most this many notes are kept per addressed project; the oldest settled ones are dropped first.
+    NOTES_KEPT = 1000
+    #: At most NOTE_RATE notes from one project to another in NOTE_WINDOW seconds; the next is 429 (in memory).
+    NOTE_RATE = 30
+    NOTE_WINDOW = 3600
+    NOTE_ID = re.compile(r'cnote-[0-9a-f]{24}\Z')
+    NOTE_SETTLED = ('replied', 'noted')
+
+    def _note_store(self, write=False):
+        """The notes record; a damaged one reads as empty and refuses a write (503)."""
+        record = self.state.get('coordinator_notes')
+        if record is None and write:
+            record = self.state['coordinator_notes'] = {'notes': [], 'dropped': {}}
+        if not isinstance(record, dict) or not isinstance(record.get('notes'), list):
+            if write:
+                raise HttpError(503, 'unavailable', 'The record of coordinator notes in the service state is damaged '
+                                '(it is not an object with a list of notes), so nothing was written. An operator must '
+                                'repair the state file')
+            return {'notes': [], 'dropped': {}}
+        if not isinstance(record.get('dropped'), dict):
+            if not write:
+                return {'notes': record['notes'], 'dropped': {}}
+            record['dropped'] = {}
+        return record
+
+    def _note_ok(self, note):
+        """Whether a stored note has every field its readers use; damage reads as no note."""
+        if not (isinstance(note, dict) and isinstance(note.get('id'), str) and self.NOTE_ID.fullmatch(note['id'])
+                and isinstance(note.get('text'), str) and isinstance(note.get('created_at'), str)
+                and isinstance(note.get('from'), dict) and isinstance(note['from'].get('project'), str)
+                and isinstance(note.get('to'), dict) and isinstance(note['to'].get('project'), str)
+                and isinstance(note.get('thread'), str)):
+            return False
+        settled = note.get('settled')
+        return settled is None or (isinstance(settled, dict) and settled.get('how') in self.NOTE_SETTLED)
+
+    def _notes(self):
+        return [note for note in self._note_store()['notes'] if self._note_ok(note)]
+
+    def note_admit(self, from_project, to_project):
+        """Count one note from ``from_project`` to ``to_project`` against the pair's hourly limit, or refuse it with
+        429. Every authorized attempt counts, so a flood of any kind is bounded; a 429 does not count, so refusals
+        never extend the window. Only the first 429 of a pair in a window is audited (the route skips the rest)."""
+        with self.store.lock:
+            now = self._now()
+            pair = (from_project, to_project)
+            recent = [moment for moment in self._note_times.get(pair, []) if moment > now - self.NOTE_WINDOW]
+            if len(recent) >= self.NOTE_RATE:
+                self._note_times[pair] = recent
+                wait = min(self.NOTE_WINDOW, max(1, int(math.ceil(recent[0] + self.NOTE_WINDOW - now))))
+                error = throttled('Too many notes from this project to that one: at most %d an hour. Send it again in '
+                                  '%d seconds.' % (self.NOTE_RATE, wait))
+                error.retry_after = wait
+                audited = self._note_throttle_audited.get(pair)
+                if audited is not None and now - self.NOTE_WINDOW < audited <= now:
+                    error.quiet_audit = True
+                else:
+                    self._note_throttle_audited[pair] = now
+                raise error
+            recent.append(now)
+            self._note_times[pair] = recent
+
+    def write_note(self, principal, from_project, to_project, text, reply_to, linked, unlinked_sentence):
+        """Keep one note from ``from_project``'s coordinator to ``to_project``'s coordinator role.
+
+        The route holds CAP_COORDINATE in ``from_project`` and passes ``linked``, its live program-link check.
+        ``text`` is plain text, 1-NOTE_TEXT_MAX characters, never a reserved record prefix. A reply names a note
+        addressed to ``from_project`` from ``to_project``, threads to it and settles it. Returns ``(view, dropped)``.
+        """
+        from review_workflow import plain_text
+        from reserved_comments import reserved_match
+        if not linked:
+            raise not_found(unlinked_sentence)
+        if not isinstance(text, str) or not text.strip():
+            raise invalid('A note must be 1-%d characters of text' % self.NOTE_TEXT_MAX)
+        if len(text) > self.NOTE_TEXT_MAX:
+            raise invalid('A note is at most %d characters; this one is %d.' % (self.NOTE_TEXT_MAX, len(text)))
+        try:
+            plain_text(text, 'A note')
+        except ValueError as error:
+            raise invalid(str(error)) from None
+        if reserved_match(text) is not None:
+            raise invalid('A note cannot start with a reserved machine-record prefix')
+        with self.store.lock:
+            self._refresh_authority(principal)
+            store = self._note_store(write=True)
+            notes = [note for note in store['notes'] if self._note_ok(note)]
+            parent = None
+            if reply_to is not None:
+                parent = next((note for note in notes if note['id'] == reply_to), None)
+                if (parent is None or parent['to']['project'] != from_project
+                        or parent['from']['project'] != to_project):
+                    raise not_found('There is no note %s to this project from %s' % (reply_to, to_project))
+            now = now_iso(self._now())
+            agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
+            note = {'schema_version': 1, 'id': 'cnote-' + secrets.token_hex(12),
+                    'from': {'project': from_project, 'user_id': principal.user_id, 'agent_id': principal.agent_id,
+                             'kind': 'agent' if principal.agent_id else 'person', 'actor': principal.actor,
+                             'name': (agent.get('name') if isinstance(agent, dict) else None)
+                             or self._owner_name(principal.user_id)},
+                    'to': {'project': to_project, 'role': 'coordinator', 'installation': None},
+                    'text': text, 'reply_to': reply_to, 'thread': parent['thread'] if parent else None,
+                    'created_at': now, 'settled': None}
+            note['thread'] = note['thread'] or note['id']
+            if parent is not None and parent['settled'] is None:
+                parent['settled'] = {'by': principal.user_id, 'actor': principal.actor, 'at': now, 'how': 'replied',
+                                     'reply': note['id']}
+            notes.append(note)
+            addressed = [n for n in notes if n['to']['project'] == to_project]
+            excess = max(0, len(addressed) - self.NOTES_KEPT)
+            victims = set()
+            if excess:
+                order = sorted(addressed, key=lambda n: (n['settled'] is None, n['created_at']))
+                victims = {n['id'] for n in order[:excess]}
+                notes = [n for n in notes if n['id'] not in victims]
+            store['notes'] = notes
+            if victims:
+                dropped = store['dropped'].get(to_project)
+                store['dropped'][to_project] = (dropped if type(dropped) is int else 0) + len(victims)
+            self.store.save()
+            return dict(note), len(victims)
+
+    def notes_for(self, project_id, box, unsettled_only=False):
+        """The notes to ``project_id``'s coordinators (``box='to'``) or sent from it (``'sent'``), newest first."""
+        side = 'to' if box == 'to' else 'from'
+        with self.store.lock:
+            found = [dict(note) for note in self._notes() if note[side]['project'] == project_id
+                     and (not unsettled_only or note['settled'] is None)]
+            dropped = self._note_store()['dropped'].get(project_id) if box == 'to' else None
+        found.sort(key=lambda note: (note['created_at'], note['id']), reverse=True)
+        return found, dropped if type(dropped) is int else 0
+
+    def settle_note(self, principal, project_id, note_id):
+        """Mark a note to ``project_id`` noted: nothing is owed. A settled one is 409 with how it was settled."""
+        with self.store.lock:
+            self._refresh_authority(principal)
+            self._note_store(write=True)
+            note = next((n for n in self._notes() if n['id'] == note_id and n['to']['project'] == project_id), None)
+            if note is None:
+                raise not_found('Note not found')
+            if note['settled'] is not None:
+                raise conflict('This note is already settled (%s)' % note['settled']['how'],
+                               {'settled': dict(note['settled'])})
+            note['settled'] = {'by': principal.user_id, 'actor': principal.actor, 'at': now_iso(self._now()),
+                               'how': 'noted'}
+            self.store.save()
+            return dict(note)
+
+    def note_projects(self, principal):
+        """The projects where ``principal`` coordinates now: a person's owner or coordinator memberships, or an agent's
+        projects where its coordinator grant has effect. Each is checked live; at most 50, in order."""
+        with self.store.lock:
+            if principal.via == 'credential':
+                agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
+                candidates = sorted(agent.get('projects') or []) if isinstance(agent, dict) else []
+            else:
+                candidates = sorted(project for project, members in (self.state.get('memberships') or {}).items()
+                                    if isinstance(members, dict)
+                                    and members.get(principal.user_id) in ('owner', 'coordinator'))
+        found = []
+        for project in candidates:
+            try:
+                self.check_authority(principal, project, CAP_COORDINATE)
+            except HttpError:
+                continue
+            # Review of .447, B2: the account's own role, as the records routes require; a superuser who is only a
+            # viewer, or their agent, coordinates nothing here.
+            with self.store.lock:
+                role = ((self.state.get('memberships') or {}).get(project) or {}).get(principal.user_id)
+            if role not in ('owner', 'coordinator'):
+                continue
+            found.append(project)
+        return found[:50], len(found) > 50
+
+    def unsettled_notes_to(self, projects):
+        wanted = set(projects)
+        with self.store.lock:
+            found = [dict(note) for note in self._notes() if note['to']['project'] in wanted and note['settled'] is None]
+        found.sort(key=lambda note: (note['created_at'], note['id']))
+        return found
+
     def handover_notes_to_acknowledge(self, agent_id):
         """``[(project, pointer)]``: the current notes this agent may acknowledge and has not: notes for its own
         person, in projects it has, where it holds an effective coordinator grant (the acknowledge rule)."""
@@ -3717,6 +3907,27 @@ class Service:
     def _self_check_for(self, agent, project_id):
         """The newest report of ``agent`` about ``project_id``, or None."""
         return next((e for e in self._self_checks(agent) if e['project'] == project_id), None)
+
+    # -- program links (kittrial-5bb.446; design PROGRAM_DESIGN §2.2) ------------------------------------------
+    def is_person_owner(self, principal, project_id):
+        """Whether ``principal`` is a person, by their own web session, whose live role in ``project_id`` is owner
+        and whose account is enabled: the only web caller who accepts or retires a program link."""
+        if principal is None or principal.via != 'session' or not principal.user_id:
+            return False
+        with self.store.lock:
+            user = self.state['users'].get(principal.user_id)
+            return (isinstance(user, dict) and not user.get('disabled')
+                    and ((self.state.get('memberships') or {}).get(project_id) or {}).get(principal.user_id) == 'owner')
+
+    def program_link_people(self, project_ids):
+        """``(memberships, users)`` for the live owner check of program links: the roles in ``project_ids`` and each
+        account's disabled flag, read in one lock. Nothing else about anyone."""
+        with self.store.lock:
+            everyone = self.state.get('memberships') or {}
+            memberships = {pid: dict(everyone.get(pid) or {}) for pid in project_ids}
+            users = {uid: {'disabled': bool(user.get('disabled'))}
+                     for uid, user in self.state['users'].items() if isinstance(user, dict)}
+        return memberships, users
 
     def _may_coordinate(self, project_id, agent):
         """Whether the agent's account holds the coordinator's capabilities in the project now."""

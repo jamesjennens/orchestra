@@ -181,7 +181,7 @@ class AnchoredKind:
     """
 
     def __init__(self, **values):
-        defaults = {'pre_write': lambda payload, run, operators: None, 'extra_records': {}, 'extra_parsers': {},
+        defaults = {'pre_write': lambda payload, run, operators, project=None: None, 'extra_records': {}, 'extra_parsers': {},
                     'supports_retire': False, 'entry_prefixes': None, 'entry_prefix_for': None,
                     'acceptance_rules': None, 'unsupported_reason': None, 'collecting_content': False}
         defaults.update(values)
@@ -1014,7 +1014,7 @@ class AnchoredKind:
         if operator and not web_coordinator:
             core.require_configured_operator(actor, operators, self.spec.accept_action)
         self.validate_payload(payload, operator=operator, web_coordinator=web_coordinator)
-        self.pre_write(payload, run, operators)
+        self.pre_write(payload, run, operators, project)
         if operator and payload['operation'] == 'draft' and self.acceptance_rules is not None:
             # A direct accepted revision creates its anchor, so its acceptance rules are
             # checked here, before the journal and the create.

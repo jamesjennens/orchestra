@@ -397,7 +397,7 @@ class _RecordsScenarioMixin:
         summary = get(viewer)
         self.assertEqual(summary.status, 200, summary.data)
         self.assertEqual([line['view'] for line in summary.data['rows']],
-                         ['requirements', 'tokens', 'tasks', 'decisions', 'designs', 'round'])
+                         ['requirements', 'tokens', 'pointers', 'tasks', 'decisions', 'designs', 'round'])
         self.assertTrue(summary.data['designs'])
 
     def _setup_actors(self, harness):

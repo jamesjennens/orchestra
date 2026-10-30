@@ -843,6 +843,48 @@ page or route that fixes it. It writes nothing, and the page changes nothing its
 - **It is the agent's claim:** it grants nothing, no authority check reads it, and no other step changes with it.
 - **The coordinator AGENT.md** has a "Your first check" section with the call that reports it, using `curl -K` like every other call.
 
+**Program links** (kittrial-5bb.446; docs/design/PROGRAM_DESIGN.md section 2): an area joins a program project
+through two reference entries, `program.area.<area>` in the program and `program.member-of` in the area.
+- **The rule of a link:** it grants nothing. No role, grant or visibility comes with it.
+- **Who makes a side count:** a person owner of that project, by accepting its record on the web, or an operator
+  with `admin.py reference-apply`. The web accept and retire routes refuse anyone else for a `program.` key. Each
+  side is checked live at every read: an owner who loses the role, or whose account is disabled, stops the side
+  counting.
+- **The read:** `GET /v1/projects/{id}/program-links`, at `CAP_READ`, 50 areas a page.
+  - `as_program`: one row per admitted area, with this project's own side and one fact about the area, whether its
+    side counts.
+  - `as_area`: this project's own side and the same one fact about the program.
+  - A missing, unreadable or unrelated area answers exactly like one that has not joined.
+- **The host:** `ref links` lists one project's link records only; the web service alone puts the two sides
+  together.
+
+**Notes between coordinators** (kittrial-5bb.447): a coordinator of one project writes to the coordinator role of a
+project linked with it in a program, and the addressed agents are woken.
+- **Routes:**
+  - `POST /v1/projects/{id}/notes` with `{to_project, text, reply_to?}` and an Idempotency-Key, at CAP_COORDINATE in
+    the sending project;
+  - `GET /v1/projects/{id}/notes?box=to|sent&state=all|unsettled` (CAP_COORDINATE, 50 a page);
+  - `POST /v1/projects/{id}/notes/{note}/noted`;
+  - `GET /v1/me/notes`.
+- **The address:** checked live, the sending project's own link records first. A project it does not name is
+  refused before anything of it is read. No right in the addressed project is needed, and every refusal of the
+  address is one 404.
+- **Who:** the sender, the reader and the one who marks a note noted hold the coordinator role or own the project
+  (or are their agent holding the grant). A web superuser who is only a viewer is refused like any viewer.
+- **Bounds:**
+  - text 1-4,000 characters of plain text;
+  - 30 notes an hour from one project to another, then `429` with Retry-After; only the first 429 in an hour is
+    audited;
+  - 1,000 notes kept per addressed project, the oldest settled first, with drops counted and audited.
+- **The wake:**
+  - an unsettled note is the first next action of the agents holding an effective coordinator grant in the
+    addressed project, without its text;
+  - it changes both wait forms' fingerprints;
+  - with no note, the coordinator wait's fingerprint is exactly the CLI's.
+- **Storage:** the web service's state (`coordinator_notes`). The coordination backup's HTTP-state pair carries it,
+  and an older kit keeps it untouched. Each record has a random id and `to.installation` (null), so a later relay
+  between installations can carry it.
+
 ### Creating a project from the web interface
 
 An operator creates a project on the host (`admin.py add-project NAME`) and a superuser

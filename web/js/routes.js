@@ -23,6 +23,7 @@ export const ROUTE_PATTERNS = [
   ['settings', '/p/{pid}/settings'],
   ['setup', '/p/{pid}/setup'],
   ['handover', '/p/{pid}/handover'],
+  ['notes', '/p/{pid}/notes'],
   ['how', '/p/{pid}/how'],
   ['newTask', '/p/{pid}/new'],
   ['task', '/p/{pid}/t/{tid}'],

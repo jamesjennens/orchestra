@@ -511,6 +511,10 @@ def dispatch(canonical, request, tmp, run=None):
         members = None
         if canonical.authority_config is not None and http_authority is not None:
             members = (http_authority.read_state(canonical.authority_config.store).get('memberships') or {}).get(project) or {}
+        # kittrial-5bb.449: the web service's --readable is taken off. One shared row store cannot tell one project's
+        # rows from another's, so here every token into another project reads not-visible; the real endpoint
+        # resolves them (tests/test_qualified_pointers.py, natively).
+        args = trace_read.split_readable(list(args))[0] if hasattr(trace_read, 'split_readable') else args
         result = trace_read.answer(rows, project, trace_read.parse_options(args),
                                    operators=config_data.get('operators') or [],
                                    verifiers=config_data.get('verifiers') or [], members=members,

@@ -83,8 +83,8 @@ A link counts only when **both** sides have accepted their record:
 
 | side | record | key | authority | who accepts |
 | --- | --- | --- | --- | --- |
-| program | reference entry | `program.area.<area>` | `decision`: the program owner's decision admitting the area | the program project's coordinator |
-| area | reference entry | `program.member-of` | `decision`: the area owner's decision joining the program | the area's coordinator |
+| program | reference entry | `program.area.<area>` | `decision`: the program owner's decision admitting the area | a person owner of the program project (or an operator) |
+| area | reference entry | `program.member-of` | `decision`: the area owner's decision joining the program | a person owner of the area (or an operator) |
 
 - **Keys:** `<area>` is the area's canonical project name (http_authority.py:349, which fits the
   key pattern). The statement names the other project's exact id.
@@ -99,6 +99,41 @@ A link counts only when **both** sides have accepted their record:
 - **What the program side reveals:** `program.area.<area>` is program data, readable by the
   program project's members. It names the area and nothing inside it. While the area has not
   accepted, the program view shows the link as one-sided, with no counts or contents.
+
+**As built (kittrial-5bb.446, slice 1):**
+- **Who accepts (Q1 A, amended above):** a person owner of each project, by their own web session, or an operator on
+  the host. A coordinator, person or agent, proposes and revises. A native issue author is only an `--actor` label
+  (TRACEABILITY_DESIGN.md:544-547), so the owner's act is the acceptance, whose evidence only the web service or an
+  operator writes. It is checked live at every read: an owner who loses the role or whose account is disabled stops
+  the side counting. The web accept and retire routes refuse anyone else for a `program.` key.
+- **Follow-up, not in this slice:** letting an owner delegate the acceptance through a `delegation-v1` record, as
+  record acceptance is delegated today (delegations.py).
+- **The statement's lines:** exactly `Area: <area>` or `Program: <program>`, then `State: in` or `State: left`,
+  with no second State line and nothing beyond (review N3). A
+  `program.` key is written only as one of the two links, with these lines and a `decision` authority.
+- **States:** `linked`, `one-sided`, `left` and `proposed`.
+  - `left` is the program side saying so, or its record superseded.
+  - An area that leaves makes the link `one-sided` from the program's view; an area learns one fact about the
+    program, and the program one fact about an area: whether the other side counts.
+  - `proposed` is a program side that does not count yet; no area is read for it.
+- **The read:** `GET /v1/projects/{pid}/program-links`, 50 areas a page and so at most 50 area reads. The host's
+  `ref links` lists one project's link records only.
+- **The isolation harness:** tests/program_isolation.py. Later slices add their reads to it, and a test fails if
+  any route whose pattern mentions "program" is missing from it.
+- **Notes between coordinators (kittrial-5bb.447):** a link is also what lets the coordinators of the two
+  projects (and of two areas of one program) write to each other. The link is checked live, the sender needs no
+  right in the other project, and a note's text reaches only the coordinators of its two projects. The harness
+  covers the note reads, and its route test now catches any route mentioning "program" or "notes".
+  - **Revision 2 (review 01a18a03):** the sender, the reader and the one who marks a note noted must really
+    coordinate the project: an owner or a coordinator, or their agent holding the grant. A web superuser who is
+    only a viewer is refused like any viewer; "operators" means the host's operator list.
+  - **The sender's own records first:** a target that A's own records do not name is refused, with the one 404,
+    before B is read at all. A names B by an accepted side: as its area, as its program, or as an area its own
+    program's accepted side lists.
+  - **Siblings:** each area's own program is read, and they must be the same program.
+  - **Wakes** name the sending project and "its coordinators", never a person or an agent.
+  - **Refusals of A's own right** may stay 403 or 404 (review F1). Only the refusal of the address must be the
+    one 404.
 
 ### 2.3 What being in a program grants: nothing
 
@@ -169,6 +204,24 @@ citing project's program. Citing across programs is allowed; the flag only makes
 **Cost:** one warm export read per distinct target project, at most 50 per read (My work's
 bound), with the same read cache. A token never triggers a read of a project the caller cannot
 read: the check comes first.
+
+**As built (kittrial-5bb.449, slice 2):**
+- **The grammar:** `req:`, `design:` and a new `decision:` take `<project>/` (briefing.QUALIFIED_KINDS). The split
+  is at the first `/`. `decision:` resolves to a native decision issue, with the flag `unknown-decision`.
+- **Where it resolves:** in the trace read, in one endpoint call, with the caller's readable projects.
+  - **On the web:** each project is checked with check_authority for this caller and passed as the service's own
+    `--readable`. Any other caller passing it is refused.
+  - **On the host:** the key's projects, or any project for an operator's unbound key.
+  - A project outside that set is never read and reads exactly like one that does not exist.
+  - At most 50 other projects are read; past that, `not-checked`.
+- **`outside-program`** is set on the web route only, from the same link check that allows a note between
+  coordinators.
+- **The summary** has a pointers line: resolved, broken, not-visible, not-checked.
+- **The lint:** the trace's `qualify-key` rows, and a warning on creating a key with `/`, never a refusal.
+- **Briefs** name another project's token as `cross-project` and read nothing of it.
+- **An accepted design document** containing a qualified `design:` token reads `differs` until it is accepted
+  again; the release notes say so. So does one containing `req:/x`, `req:A/` or `req:A/@3`: an empty project or an
+  empty key is prose now, where it was a token before. `decision:` tokens never enter a design index.
 
 ## 4. The interface register (Q3 A)
 
@@ -385,6 +438,26 @@ is conventions over records that exist.
 | a major is retired while still consumed | retirement needs a complete view and no consumer, or a program decision | an acceptor missing one area is refused with "1 area not visible to you" |
 | cross-project reads cost too much | one warm export per distinct project, at most 50; check first | a trace citing 3 projects makes 3 reads; a token to an unreadable project makes none |
 | untrusted text from another project | it is shown as text (the context index's escaping) and never put into prompts; pointers only | an interface `meaning` with HTML and bidi controls renders escaped |
+
+**The program-links read's timing (review of kittrial-5bb.446, N1).** The read answers alike for an admitted
+area that does not exist and for one that exists but has not joined: both read "does not count". Its time does not.
+The service's read of a missing project fails at once (about 1.6 s measured for the whole read in the review), while
+an existing one reads its records (about 2.5 s). So a program member can tell, from the time alone, whether a project
+with an admitted area's name exists on this installation. This is accepted, not padded:
+- It concerns only names that the program's own owner wrote into accepted `program.area.<area>` records, and only
+  readers of the program project.
+- It says nothing about what is inside the area: the answer itself carries one fact, the same for every reader.
+- The same difference exists wherever a read touches a project's records only when the project exists.
+- Padding every area read to the slower path would cost every reader up to 50 slow reads a page.
+
+If an installation needs the names hidden, the read can pad each area to a fixed floor.
+
+**Notes between coordinators: timing (review of kittrial-5bb.447, B3).** A note's address is checked from the
+sender's own records first. A target the sending project does not itself name by an accepted side (as its area, as
+its program, or as an area its program's accepted side lists) is refused before the target's records are read. So any project the sender has not named
+costs the same as one that does not exist. Only projects the sender's own owner-accepted records already name are
+read, and they are the projects it may write to. That is one change in the
+web service's read (`program_links_read`), with no change to the records.
 
 ## 9. Slices (five, each deliverable alone)
 

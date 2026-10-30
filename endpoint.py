@@ -1265,13 +1265,19 @@ def held_coordination_lock(path,shared=False):
         yield
 
 
-def trace_answer(root,path,name,args,actor,authority_config=None):
+def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=None,by_service=False,project_path=None):
     """(answer, warnings) of one trace page (kittrial-5bb.425). Under a shared lock: the export from the read
     cache, the live membership (whose lines count: the round's publication line, the owner-only decision
     heuristic) and the governance snapshot. The views are built after the lock is released (review b2), from
     what was read; the generation is the caller's filtered snapshot's, and a page at another one is refused."""
     import trace_read
     from read_cache import cached_export_rows
+    # kittrial-5bb.449: the projects this caller may read, for tokens into them. Only the web service gives them
+    # (its caller's own check_authority); any other caller reads the projects its key is bound to, or, with an
+    # operator's unbound key, any project.
+    args,given=trace_read.split_readable(list(args))
+    if given is not None and not by_service:raise ValueError(trace_read.READABLE_REFUSED)
+    readable=frozenset(given or ()) if by_service else key_projects
     options=trace_read.parse_options(args)
     run_warnings=[]
     def run(argv):
@@ -1286,8 +1292,28 @@ def trace_answer(root,path,name,args,actor,authority_config=None):
             try:members=((read_state(authority_config.store).get('memberships') or {}).get(name)) or {}
             except AuthorityDenied:members={}
         governance=trace_read.read_governance(rows,path,name)
+    def read_project(other):
+        # Another project, read like this one, under its own lock and after this one's is released; a name that is
+        # not a project, or one not fully made, is no project. Its path comes from execute, after the project gate
+        # (project_path); without one, no other project is read.
+        if project_path is None:return None
+        try:other_path=project_path(other)
+        except ValueError:return None
+        if not (other_path/'.beads/metadata.json').is_file():return None
+        import project_creation
+        if project_creation.unfinished(root,other):return None
+        def run_other(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,other_path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        with held_coordination_lock(other_path,shared=True):
+            other_rows=cached_export_rows(root,other_path,run_other,other)
+            other_governance=trace_read.read_governance(other_rows,other_path,other)
+        from briefing import ContextPointers
+        return ContextPointers(other_rows,other,configured_operators(root),governance=other_governance)
     result=trace_read.answer(rows,name,options,operators=configured_operators(root),verifiers=configured_verifiers(root),
-                             members=members,governance=governance)
+                             members=members,governance=governance,
+                             others=trace_read.others_loader(readable,read_project))
     return result,''.join(run_warnings)
 
 
@@ -1494,7 +1520,13 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         # kittrial-5bb.425: the trace read (TRACEABILITY_DESIGN §5.2-§5.4), answered from records alone.
         # Read-only: a shared lock and no guarded write. One export from the read cache; the generation it
         # was read at goes back with the answer, and a page asked for at another generation is refused.
-        result=trace_answer(root,path,name,request.get('args',[]),actor,authority_config)
+        # kittrial-5bb.449: the web service is the launch with --authority-store, which only the service passes
+        # (an SSH key line cannot: see main()); its reads go without --require-authority, as the reference read's
+        # web_service does below. Only that launch's --readable is honoured. Another project's path is resolved
+        # here, in execute after the gate, as every project path is; trace_answer reads only the projects its caller
+        # may read.
+        result=trace_answer(root,path,name,request.get('args',[]),actor,authority_config,key_projects=key_projects,
+                            by_service=authority_config is not None,project_path=lambda other:project_dir(root,other))
         return {'returncode':0,'stdout':json.dumps(result[0],ensure_ascii=False)+'\n','stderr':result[1]}
     if action=='owner-requirements':
         from requirement_http import web_action

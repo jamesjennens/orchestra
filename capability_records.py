@@ -520,7 +520,7 @@ KIND = keyed_entries.AnchoredKind(
     validate_entry=lambda record: validate_entry(record),
     entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
     validate_content=_validate_content, collecting_content=True, write_time_rules=lambda record: None,
-    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators: _pre_write(payload, run, operators),
+    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators, project=None: _pre_write(payload, run, operators),
     extra_records={'capability-alias': _read_alias, 'capability-verification': verification.read_record},
     extra_parsers={'capability-alias': parse_alias, 'capability-verification': verification.parse},
     supports_retire=True,
