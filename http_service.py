@@ -9891,13 +9891,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             except ValueError:
                 return None
 
-        # Review of .447, B3: the sender's own records first. A target that A does not itself name (as its area,
-        # as its program, or as an area its own program lists) is refused before B is read at all, so a project
-        # A never named costs the same as one that does not exist.
+        # Review of .447, B3: the sender's own records first. A target that A does not itself name by an accepted
+        # side (as its area, as its program, or as an area its own program's accepted side lists) is refused before
+        # B is read at all, so a project A never named costs the same as one that does not exist.
         own = member_of(a)
-        named = ('program.area.' + b) in items(a) or own == b
+        mine, users = self.service.program_link_people({a} | ({own} if own is not None else set()))
+
+        def names(project, key, other):
+            return program_links.side_status(items(project).get(key), project, other, mine, users)[0] == 'in'
+        named = names(a, 'program.area.' + b, b) or (own == b and names(a, program_links.MEMBER_OF, b))
         if not named and own is not None:
-            named = ('program.area.' + b) in items(own)
+            named = names(own, 'program.area.' + b, b)
         if not named:
             return False
         programs = {own, member_of(b)} - {None}
