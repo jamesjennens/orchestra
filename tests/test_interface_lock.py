@@ -139,3 +139,21 @@ class InterfaceLockTests(unittest.TestCase):
             native=stack.enter_context(patch.object(endpoint.native,'run',side_effect=AssertionError('unauthorized native read')))
             result=endpoint.execute(root,request,authority_config=config,require_authority=True)
             self.assertEqual(403,result['records_status']);native.assert_not_called()
+
+
+    @unittest.skipIf(os.name=='nt','endpoint is POSIX-only')
+    def test_unrelated_reference_proposal_bypasses_semantic_mutex(self):
+        import endpoint,reference_records,json
+        from contextlib import ExitStack
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as stack:
+            root=Path(temp);request,_=self.setup_routes(root);entered=threading.Event()
+            body=json.loads(request['attachments']['p']['text']);body['key']='ordinary.unrelated'
+            request['attachments']['p']['text']=json.dumps(body)
+            stack.enter_context(patch.object(endpoint,'guarded_write',lambda root,req,journal,fn,**kw:fn()))
+            stack.enter_context(patch.object(endpoint,'configured_operators',return_value=[]))
+            stack.enter_context(patch.object(reference_records,'apply_native',lambda *a,**kw:(entered.set() or {})))
+            with ThreadPoolExecutor(1) as pool:
+                with interface_lock.held(root):
+                    job=pool.submit(endpoint.execute,root,request)
+                    self.assertTrue(entered.wait(1),'unrelated reference waited for the interface mutex')
+                self.assertEqual(0,job.result(5)['returncode'])
