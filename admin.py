@@ -4316,7 +4316,7 @@ OWNER_ANSWERS_JOURNAL='.owner-answers'
 #: ``<name>.tmp`` does not match the sweep's shape, so sweeping it is a no-op.
 ATOMIC_SWEEP_DIRECTORIES=('.',)+RESERVATION_JOURNALS+( '.handoffs','.handoff-recoveries',
     '.requirement-backfills','.integration-reverts','.assignee-followons','.lane-fault-clears','.lifecycle-voids',
-    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL,'.delegations')
+    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL,'.delegations','.decision-attests')
 
 def sweep_project_temporaries(root,name,*,dry_run=False,min_age_seconds=None):
     """Sweep the project directory and every atomic family in it; never touches a live write.
@@ -4372,7 +4372,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.decision-attests|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
         baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
         if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
@@ -4956,6 +4956,13 @@ def backup_project(root,name):
         for record in delegation_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Delegation journal entry must not be a symlink')
             files['.delegations/'+record.name]=record_json.loads(read_regular_text(record))
+        # The attestation journal (kittrial-5bb.454 r2): without it every attested decision would read not-attested
+        # after a restore.
+        attest_journal=path/'.decision-attests'
+        if attest_journal.is_symlink():raise ValueError('Attestation journal must not be a symlink')
+        for record in attest_journal.glob('*.json'):
+            if record.is_symlink():raise ValueError('Attestation journal entry must not be a symlink')
+            files['.decision-attests/'+record.name]=record_json.loads(read_regular_text(record))
         # The per-project claiming setting (kittrial-5bb.352). It lives outside the
         # tracker, so a backup that dropped it would silently open claiming again after
         # a restore. A damaged file is carried byte for byte and reads back restrictive.
@@ -7195,6 +7202,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name.startswith('.delegations/'):
             from delegations import validate_entry as validate_delegation_entry
             validate_delegation_entry(record,name.partition('/')[2])
+        elif name.startswith('.decision-attests/'):
+            from decision_attest import validate_entry as validate_attest_entry
+            validate_attest_entry(record,name.partition('/')[2])
         elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])
@@ -10447,6 +10457,16 @@ def main():
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('delegation-record',help='grant, narrow or revoke a delegation of a decision right (operator allowlist, host journal)')
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('decision-attest',help="attest a decision's exact text (operator allowlist, host journal)")
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--decision',required=True)
+    a.add_argument('--digest',required=True,help='the digest decision-attest-read printed for the text you read')
+    a=sub.add_parser('decision-attest-read',help="read-only: a decision's exact text, its digest and how it reads now")
+    a.add_argument('--project',required=True);a.add_argument('--decision',required=True)
+    a.add_argument('--state',help='the existing web service state document (read only)')
+    a=sub.add_parser('decision-change',help='close, reopen, retype or relabel a decision that carries an attestation (operator allowlist)')
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--decision',required=True)
+    a.add_argument('--change',required=True,choices=('close','reopen','type-decision','type-task','add-decision-label','remove-decision-label'))
+    a.add_argument('--reason')
     a=sub.add_parser('delegation-check',help='read-only: the delegations of a project and which granted coordinator agents they cover')
     a.add_argument('--project',required=True)
     a.add_argument('--state',required=True,help='the existing web service state document (read only)')
@@ -11140,6 +11160,60 @@ def main():
             require_configured_operator(args.actor,operators(root,strict=True),'record a delegation')
             print(json.dumps(delegations.apply(payload,project=args.project,journal=path,run=run,recorded_by=args.actor,
                                                via='operator',account=None,at=server_time()),ensure_ascii=False))
+    elif args.command=='decision-attest':
+        # The operator's host route for an attestation (kittrial-5bb.454 r2); the SAME decision_attest.apply the web route
+        # calls, under the same project lock, after the same operator check. The record says via operator.
+        import fcntl
+        import decision_attest
+        from keyed_records import require_configured_operator
+        from http_authority import server_time
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        require_configured_operator(args.actor,operators(root,strict=True),'attest a decision')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        payload={'schema_version':1,'operation_id':'operator-'+secrets.token_hex(16),'decision':args.decision,'digest':args.digest}
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            listed=operators(root,strict=True)
+            require_configured_operator(args.actor,listed,'attest a decision')
+            print(json.dumps(decision_attest.apply(payload,project=args.project,journal=path,run=run,author=args.actor,
+                                                   via='operator',at=server_time(),state=None,operators=listed),ensure_ascii=False))
+    elif args.command=='decision-attest-read':
+        # Read-only (kittrial-5bb.454 r2): what an operator reads before attesting. Nothing is written; no lock is taken.
+        import decision_attest
+        from http_authority import read_state
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        state=None
+        if args.state:
+            state_path=Path(args.state)
+            if state_path.is_symlink() or not state_path.is_file():raise ValueError('Use the existing web service state document')
+            state=read_state(state_path)
+        def run(argv):return run_bd(root,args.project,argv)
+        print(json.dumps(decision_attest.read_answer(decision_attest.read_issue(run,args.decision),args.project,state,
+                                                     operators(root),path),ensure_ascii=False))
+    elif args.command=='decision-change':
+        # The one route on the host for what the gate refuses every other host route (kittrial-5bb.454 r2, Q1). An operator
+        # only, under the project lock. A retype changes the digest, so it reads attestation-stale until it is attested again.
+        import fcntl
+        from keyed_records import require_configured_operator
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        require_configured_operator(args.actor,operators(root,strict=True),'change an attested decision')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        argv={'close':['close',args.decision]+(['--reason',args.reason] if args.reason else []),
+              'reopen':['reopen',args.decision]+(['--reason',args.reason] if args.reason else []),
+              'type-decision':['update',args.decision,'--type','decision'],
+              'type-task':['update',args.decision,'--type','task'],
+              'add-decision-label':['update',args.decision,'--add-label','decision'],
+              'remove-decision-label':['update',args.decision,'--remove-label','decision']}[args.change]
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            require_configured_operator(args.actor,operators(root,strict=True),'change an attested decision')
+            print(run_bd(root,args.project,['--actor',args.actor,*argv,'--json']))
     elif args.command=='delegation-check':
         # Read-only (kittrial-5bb.407): before a release that requires a delegation for every
         # agent acceptance, list each agent holding this project's coordinator grant and the

@@ -324,6 +324,21 @@ class Client:
         if cursor is not None:query['cursor']=cursor
         return self.request('GET','/v1/projects/%s/assignment-roster' % quote(project,safe='') + '?' + urlencode(query))
 
+    def decision_attestation(self, project, decision):
+        """The exact text of one decision, its digest and how it reads now (kittrial-5bb.454 r2)."""
+        return self.request('GET','/v1/projects/%s/decisions/%s/attestation' %
+                            (quote(project,safe=''),quote(decision,safe='')))
+
+    def attest_decision(self, project, decision, digest, key=None):
+        """Attest the exact text you read, named by its digest: a text that changed since is refused with 409."""
+        identity=key or new_idempotency_key()
+        try:
+            return self.request('POST','/v1/projects/%s/decisions/%s/attest' %
+                                (quote(project,safe=''),quote(decision,safe='')),{'digest':digest},key=identity)
+        except OSError:
+            raise UncertainOutcome(0,'uncertain','Connection lost; reconcile the identical attestation',
+                                   None,None,identity) from None
+
     def assign_task(self, project, task, expected_assignee, assignee, reason,
                     *, allow_pending_review=False, allow_held_slot=False, key=None):
         identity=key or new_idempotency_key()
@@ -948,6 +963,13 @@ def _build_parser():
     roster.add_argument('project')
     roster.add_argument('--limit', type=int, default=100)
     roster.add_argument('--cursor')
+    attestation = sub.add_parser('decision-attestation', help="a decision's exact text, its digest and how it reads now")
+    attestation.add_argument('project')
+    attestation.add_argument('decision')
+    attest = sub.add_parser('decision-attest', help="attest a decision's exact text, as your own session or agent")
+    attest.add_argument('project')
+    attest.add_argument('decision')
+    attest.add_argument('--digest', required=True, help='what decision-attestation gave for the text you read')
     assignment = sub.add_parser('assign-task', help='coordinate an assignee-only change with a durable task notice')
     assignment.add_argument('project')
     assignment.add_argument('task')
@@ -1073,6 +1095,12 @@ def main(argv=None):
             return 0
         if args.command == 'assignment-roster':
             print(json.dumps(client.assignment_roster(args.project,args.limit,args.cursor),indent=2))
+            return 0
+        if args.command == 'decision-attestation':
+            print(json.dumps(client.decision_attestation(args.project,args.decision),indent=2))
+            return 0
+        if args.command == 'decision-attest':
+            print(json.dumps(client.attest_decision(args.project,args.decision,args.digest,key=args.idempotency_key),indent=2))
             return 0
         if args.command == 'assign-task':
             result=client.assign_task(args.project,args.task,args.expected_assignee,args.assignee,args.reason,

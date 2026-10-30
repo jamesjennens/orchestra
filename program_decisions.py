@@ -4,17 +4,18 @@ A program decision is a decision issue of the program project with a ``Binds:`` 
 an ``Owner-only:`` line. It binds an area only when the area adopts it: a decision issue of the area with an
 ``Adopts: decision:<program>/<id>`` line. An owner-only decision is adopted by a person owner of the area (or an
 operator), or by an area coordinator whose adoption cites ``Per: decision:<area>/<id>``, a decision of the area
-written by a person owner (or an operator). Never an agent alone. Nothing in the program grants authority in an area.
+attested by a person owner (or an operator) that says ``Authorises: decision:<program>/<id>`` for this very decision.
+Never an agent alone. Nothing in the program grants authority in an area.
 
-Who wrote a row is its native ``created_by``, trusted only for what cannot be forged there:
-* a bare ``usr_<16 hex>`` or ``agent_<16 hex>`` reaches the tracker only from the web service, under a live
-  descriptor that names it (http_authority.http_actor_denial); every host route refuses it and its look-alikes
-  (reserved_comments.refuse_http_actor);
-* any other name counts only as an operator on the installation's allowlist, by its exact name.
-Authority is decided LIVE at every read from the web state's memberships, accounts, agents and grants: an author
-who has lost the role since stops counting. Nothing here reads state, a clock or a file; callers pass what they read.
+A row's author is never its native ``created_by``: a row counts only with a live attestation of its exact text
+(decision_attest.py). Authority is decided LIVE at every read from the web state's memberships, accounts, agents and
+grants: an attester who has lost the role since stops counting. ``journals`` is {project: its directory}, what the
+attestation journal is read from; a project without one has no honoured attestation. Nothing here reads state or a
+clock; callers pass what they read.
 """
 import re
+
+from decision_attest import COORDINATORS, NOT_WORK_TYPES, OWNERS, is_decision, standing
 
 AREA = r'[a-z][a-z0-9]{1,23}'
 ISSUE = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}'
@@ -22,29 +23,24 @@ BINDS = re.compile(r'Binds: (%s(?:, %s)*)\Z' % (AREA, AREA))
 OWNER_ONLY = re.compile(r'Owner-only: (yes|no)\Z')
 ADOPTS = re.compile(r'Adopts: decision:(%s)/(%s)\Z' % (AREA, ISSUE))
 PER = re.compile(r'Per: decision:(%s)/(%s)\Z' % (AREA, ISSUE))
+AUTHORISES = re.compile(r'Authorises: decision:(%s)/(%s)\Z' % (AREA, ISSUE))
 LINES = (('Binds:', 'binds', BINDS), ('Owner-only:', 'owner_only', OWNER_ONLY), ('Adopts:', 'adopts', ADOPTS),
-         ('Per:', 'per', PER))
+         ('Per:', 'per', PER), ('Authorises:', 'authorises', AUTHORISES))
 FROM_LINE = re.compile(r'From: (\S{1,200})\Z')
 SUGGESTION_LABEL = 'suggestion'
-PERSON = re.compile(r'usr_[0-9a-f]{16}\Z')
-AGENT = re.compile(r'agent_[0-9a-f]{16}\Z')
-#: Rows that are never decisions or suggestions, whatever their labels: what the queue never lists as work.
-NOT_WORK_TYPES = ('event', 'gate')
 ROWS_MAX = 50
 #: How far a supersession chain is followed for superseded-upstream.
 CHAIN_MAX = 20
 
-OWNERS = ('owner', 'operator')
-COORDINATORS = ('owner', 'operator', 'coordinator', 'agent-coordinator')
-
 
 def lines(row):
-    """The decision lines of a row's description: ``{'binds', 'owner_only', 'adopts', 'per', 'problems'}``.
+    """The decision lines of a row's description: ``{'binds', 'owner_only', 'adopts', 'per', 'authorises',
+    'problems'}``.
 
     Each is a whole line, anywhere in the description, at most once (Q1 at VERIFIED). A line that starts with one of
-    the four labels but does not read exactly, or a second line with the same label, is a problem: the row then
-    binds and adopts nothing (``malformed-lines``)."""
-    found = {'binds': None, 'owner_only': None, 'adopts': None, 'per': None, 'problems': []}
+    the labels but does not read exactly, or a second line with the same label, is a problem: the row then binds and
+    adopts nothing (``malformed-lines``)."""
+    found = {'binds': None, 'owner_only': None, 'adopts': None, 'per': None, 'authorises': None, 'problems': []}
     description = row.get('description') if isinstance(row, dict) else None
     if not isinstance(description, str):
         return found
@@ -71,55 +67,16 @@ def lines(row):
     return found
 
 
-def is_decision(row):
-    """A decision issue (the kit's one predicate) that is not an event or gate row."""
-    from delegations import is_decision_issue
-    return is_decision_issue(row) and row.get('issue_type') not in NOT_WORK_TYPES
+def _journal(journals, project):
+    return journals.get(project) if isinstance(journals, dict) else None
 
 
-def authority(author, project, state, operators):
-    """Who ``author`` is in ``project`` now: 'owner', 'coordinator', 'agent-coordinator', 'operator' or None.
-
-    * a bare ``usr_`` id: its account enabled, and its role in the project owner or coordinator;
-    * a bare ``agent_`` id: the agent enabled and holding the project, its account enabled and itself owner or
-      coordinator there (a superuser who is only a viewer does not count: .447 r2's rule), and the coordinator grant
-      in force (http_authority.coordinator_grant, grant_issuer_holds);
-    * any other name: an operator on the allowlist, by its exact name (review_workflow.listed_operator_actor);
-    * anything else, a worker credential (``usr_.../label``) included: None."""
-    if not isinstance(author, str) or not author:
-        return None
-    state = state if isinstance(state, dict) else {}
-    users = state.get('users') or {}
-    roles = ((state.get('memberships') or {}).get(project) or {})
-    if PERSON.fullmatch(author):
-        user = users.get(author)
-        if not isinstance(user, dict) or user.get('disabled'):
-            return None
-        return {'owner': 'owner', 'coordinator': 'coordinator'}.get(roles.get(author))
-    if AGENT.fullmatch(author):
-        from http_authority import coordinator_grant, grant_issuer_holds
-        agent = (state.get('agents') or {}).get(author)
-        if not isinstance(agent, dict) or not agent.get('enabled') or project not in (agent.get('projects') or []):
-            return None
-        owner = users.get(agent.get('owner'))
-        if not isinstance(owner, dict) or owner.get('disabled') or roles.get(agent.get('owner')) not in ('owner',
-                                                                                                        'coordinator'):
-            return None
-        grant = coordinator_grant(state, project, author)
-        if grant is None or not grant_issuer_holds(state, project, grant):
-            return None
-        return 'agent-coordinator'
-    from review_workflow import listed_operator_actor
-    if '/' not in author and listed_operator_actor(author, list(operators or ()), None):
-        return 'operator'
-    return None
-
-
-def program_decision(row, program, state, operators):
+def program_decision(row, program, state, operators, journals=None):
     """One binding decision of the program, or None for a decision issue with no Binds: line.
 
-    It counts only without flags: an owner-only decision whose author is not a person owner of the program or an
-    operator (``owner-only-not-by-owner``), another whose author does not coordinate the program
+    It counts only without flags: one that does not read as attested (``closed``, ``not-attested``,
+    ``attestation-stale``, ``attester-not-authorised``), an owner-only decision not attested by a person owner of the
+    program or an operator (``owner-only-not-by-owner``), another not attested by a coordinator of the program
     (``not-by-coordinator``), or one whose lines do not read (``malformed-lines``) binds nothing."""
     if not is_decision(row):
         return None
@@ -127,33 +84,42 @@ def program_decision(row, program, state, operators):
     if found['binds'] is None and not any('Binds:' in problem for problem in found['problems']):
         return None
     flags, reasons = [], []
+    attested = standing(row, program, state, operators, _journal(journals, program))
     if found['problems'] or found['owner_only'] is None or found['binds'] is None:
         flags.append('malformed-lines')
         reasons.extend(found['problems'] or ['a binding decision has one Binds: line and one Owner-only: line'])
-    else:
-        who = authority(row.get('created_by'), program, state, operators)
+    if attested['state'] != 'counts':
+        flags.append(attested['state'])
+        reasons.append(attested['reason'])
+    elif not flags:
+        who = attested['role']
         if found['owner_only'] and who not in OWNERS:
             flags.append('owner-only-not-by-owner')
-            reasons.append('an owner-only decision counts only when a person owner of %s or an operator wrote it'
+            reasons.append('an owner-only decision counts only when a person owner of %s or an operator attested it'
                            % program)
         elif not found['owner_only'] and who not in COORDINATORS:
             flags.append('not-by-coordinator')
             reasons.append('a program decision counts only when a coordinator or an owner of %s, or an operator, '
-                           'wrote it' % program)
+                           'attested it' % program)
     from trace_read import SUPERSEDES
     description = row.get('description') if isinstance(row.get('description'), str) else ''
     first = SUPERSEDES.fullmatch(description.split('\n')[0].rstrip('\r'))
     return {'id': str(row.get('id')), 'title': row.get('title'), 'status': row.get('status'),
             'owner_only': found['owner_only'], 'binds': list(found['binds'] or []),
-            'supersedes': first.group(1) if first else None, 'flags': flags, 'reasons': reasons}
+            'supersedes': first.group(1) if first else None, 'attestation': attested['state'],
+            'attested_as': attested['role'], 'flags': flags, 'reasons': reasons}
 
 
-def adoption(row, decision, program, area, area_rows, state, operators):
-    """``(state, reason)`` of one adoption row in ``area`` of a counting program ``decision`` (section 6.2)."""
+def adoption(row, decision, program, area, area_rows, state, operators, journals=None):
+    """``(state, reason)`` of one adoption row in ``area`` of a counting program ``decision`` (section 6.2). A row
+    that does not read as attested reads as that (closed, not-attested, attestation-stale, attester-not-authorised)."""
     found = lines(row)
     if found['problems']:
         return 'adoption-invalid', 'the adoption\'s lines do not read: ' + '; '.join(found['problems'])
-    who = authority(row.get('created_by'), area, state, operators)
+    attested = standing(row, area, state, operators, _journal(journals, area))
+    if attested['state'] != 'counts':
+        return attested['state'], attested['reason']
+    who = attested['role']
     if not decision['owner_only']:
         if who in COORDINATORS:
             return 'adopted', None
@@ -170,9 +136,18 @@ def adoption(row, decision, program, area, area_rows, state, operators):
     cited = next((r for r in area_rows if isinstance(r, dict) and str(r.get('id')) == found['per'][1]), None)
     if cited is None or not is_decision(cited):
         return 'adoption-invalid', 'Per: names no decision of %s' % area
-    if authority(cited.get('created_by'), area, state, operators) not in OWNERS:
-        return 'adoption-invalid', ('the Per: decision was not written by a person owner of %s or an operator: an '
+    choice = standing(cited, area, state, operators, _journal(journals, area))
+    if choice['state'] != 'counts':
+        return 'adoption-invalid', 'the Per: decision does not count: %s (%s)' % (choice['state'], choice['reason'])
+    if choice['role'] not in OWNERS:
+        return 'adoption-invalid', ('the Per: decision was not attested by a person owner of %s or an operator: an '
                                     'agent or a coordinator never makes an owner-only choice' % area)
+    named = lines(cited)
+    if named['problems']:
+        return 'adoption-invalid', 'the Per: decision\'s lines do not read: ' + '; '.join(named['problems'])
+    if named['authorises'] is None or named['authorises'] != found['adopts']:
+        return 'adoption-invalid', ('the Per: decision does not say Authorises: decision:%s/%s: the owner\'s decision '
+                                    'must name the decision it authorises' % (program, decision['id']))
     return 'adopted', None
 
 
@@ -186,31 +161,42 @@ def area_adoptions(area_rows, program):
     return found
 
 
-def area_state(decision, chain, program, area, area_rows, state, operators):
-    """``{'state', ...}`` of one bound, readable area: adopted (with the adoption's id), adoption-invalid (with the
-    reason), superseded-upstream (an adoption of a decision this one supersedes, and none of this one), or
+def area_state(decision, chain, program, area, area_rows, state, operators, journals=None):
+    """``{'state', ...}`` of one bound, readable area: adopted (with the adoption's id); closed when the only
+    adoptions are closed; adoption-invalid or what a row reads as when it does not count (with the reason);
+    superseded-upstream (a counting adoption of a decision this one supersedes, and none of this one); or
     not-adopted."""
     adoptions = area_adoptions(area_rows, program)
-    first_reason = None
+    refused, closed = None, None
     for row in adoptions.get(decision['id'], []):
-        verdict, reason = adoption(row, decision, program, area, area_rows, state, operators)
+        verdict, reason = adoption(row, decision, program, area, area_rows, state, operators, journals)
         if verdict == 'adopted':
             return {'state': 'adopted', 'adoption': str(row.get('id'))}
-        if first_reason is None:
-            first_reason = (str(row.get('id')), reason)
-    if first_reason is not None:
-        return {'state': 'adoption-invalid', 'adoption': first_reason[0], 'reason': first_reason[1]}
-    older = [old for old in chain if adoptions.get(old)]
+        if verdict == 'closed':
+            closed = closed or (str(row.get('id')), reason)
+        elif refused is None:
+            refused = (verdict, str(row.get('id')), reason)
+    if refused is not None:
+        return {'state': refused[0], 'adoption': refused[1], 'reason': refused[2]}
+    if closed is not None:
+        return {'state': 'closed', 'adoption': closed[0], 'reason': closed[1]}
+    older = [old for old in chain
+             if any(standing(row, area, state, operators, _journal(journals, area))['state'] == 'counts'
+                    for row in adoptions.get(old, []))]
     if older:
         return {'state': 'superseded-upstream', 'adopts': older[0]}
     return {'state': 'not-adopted'}
 
 
 def chains(decisions):
-    """{decision id: [the ids it supersedes, nearest first]}, at most CHAIN_MAX deep, cycles cut."""
-    by_id = {d['id']: d for d in decisions}
+    """{decision id: [the ids it supersedes, nearest first]}, at most CHAIN_MAX deep, cycles cut. Only a row that counts
+    supersedes anything: one with flags marks nothing, and the chain does not pass through it."""
+    by_id = {d['id']: d for d in decisions if not d['flags']}
     out = {}
     for decision in decisions:
+        if decision['flags']:
+            out[decision['id']] = []
+            continue
         seen, current = [], decision.get('supersedes')
         while current and current not in seen and current != decision['id'] and len(seen) < CHAIN_MAX:
             seen.append(current)
@@ -219,14 +205,16 @@ def chains(decisions):
     return out
 
 
-def decisions_section(program_rows, program, states_of_areas, area_rows_by_area, state, operators, offset=0):
+def decisions_section(program_rows, program, states_of_areas, area_rows_by_area, state, operators, offset=0,
+                      journals=None):
     """The program view's decisions section (section 5 table; 6.1, 6.2), 50 a page.
 
     ``states_of_areas`` is {area: 'in' or 'not-checked'} for the areas whose program side is in: any other area is
     ``not-in-program`` and is never read. 'not-checked' is an area off this page of areas or outside a bound key.
     ``area_rows_by_area`` holds the rows of the readable areas of this read only; an area that is in but not among
     them is ``not-visible`` (not readable, or no such project: the same entry, no id, no reason)."""
-    decisions = [d for d in (program_decision(row, program, state, operators) for row in program_rows or []) if d]
+    decisions = [d for d in (program_decision(row, program, state, operators, journals) for row in program_rows or [])
+                 if d]
     decisions.sort(key=lambda d: d['id'])
     links = chains(decisions)
     superseded = {old for chain in links.values() for old in chain[:1]}
@@ -242,7 +230,7 @@ def decisions_section(program_rows, program, states_of_areas, area_rows_by_area,
                     entry['areas'][area] = {'state': 'not-checked'}
                 elif area in area_rows_by_area:
                     entry['areas'][area] = area_state(decision, links[decision['id']], program, area,
-                                                      area_rows_by_area[area], state, operators)
+                                                      area_rows_by_area[area], state, operators, journals)
                 else:
                     entry['areas'][area] = {'state': 'not-visible'}
         items.append(entry)
@@ -274,7 +262,7 @@ def suggestions_section(program_rows, offset=0):
     return {'items': page, 'total': len(found), 'next_offset': following if following < len(found) else None}
 
 
-def trace_adopts(row, area, area_rows, program_rows, state, operators):
+def trace_adopts(row, area, area_rows, program_rows, state, operators, journals=None):
     """The trace's ``adopts`` of one decision issue of an area (Q6 at VERIFIED), or None when it adopts nothing.
 
     ``program_rows`` is None when the caller may not read the program (or it does not exist): ``not-visible``, with
@@ -287,12 +275,12 @@ def trace_adopts(row, area, area_rows, program_rows, state, operators):
     if program_rows is None:
         return {'pointer': pointer, 'state': 'not-visible'}
     target = next((r for r in program_rows if isinstance(r, dict) and str(r.get('id')) == decision_id), None)
-    decision = program_decision(target, program, state, operators) if target is not None else None
+    decision = program_decision(target, program, state, operators, journals) if target is not None else None
     if decision is None:
         return {'pointer': pointer, 'state': 'unknown-decision'}
     if decision['flags']:
         return {'pointer': pointer, 'state': 'decision-does-not-count', 'reason': '; '.join(decision['reasons'])}
     if area not in decision['binds']:
         return {'pointer': pointer, 'state': 'not-bound', 'reason': 'the decision does not bind %s' % area}
-    verdict, reason = adoption(row, decision, program, area, area_rows, state, operators)
+    verdict, reason = adoption(row, decision, program, area, area_rows, state, operators, journals)
     return {'pointer': pointer, 'state': verdict, 'reason': reason}

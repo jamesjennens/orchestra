@@ -440,6 +440,37 @@ def _guard_record_anchor_status(root,path,args,actor):
             if not _names_assignee(args):
                 _guard_claiming_on_claim(path,row)
 
+def _guard_attested_decision(root,path,name,args,actor,authority_config):
+    """Read-before-write guard: a status, type or label change on an attested decision needs standing
+    (kittrial-5bb.454 r2, Q1 at VERIFIED). Returns the refusal's answer, or None.
+
+    A reopen would otherwise bring an owner's retired decision back into force with no attestation, and a retype or a
+    relabel would start or stop a row being a decision. A project with no attestation reads no row here. An invocation
+    that names no exact issue is refused where one exists, because bd would act on the last touched issue, which this
+    guard cannot verify. On the web the standing the row's records ask for; on a host route nobody, an operator included
+    (admin.py decision-change)."""
+    import decision_attest
+    request=decision_attest.gated_change(args)
+    if request is None or not decision_attest.journal_in_use(path):return None
+    command,targets,change=request
+    def refused(error):
+        return {'returncode':2,'stdout':'','stderr':str(error)+'\n','delegation_status':error.status}
+    if targets is None:
+        return refused(decision_attest.AttestRefusal(422,'Refusing %s: name exactly the issue(s) to change; this project '
+                                                         'has attested decisions, and bd would otherwise act on the last '
+                                                         'touched issue. Nothing was written.'%command))
+    rows=_native_anchor_rows(root,path,actor,targets)
+    state=None
+    if authority_config is not None:
+        from http_authority import read_state
+        state=read_state(authority_config.store)
+    for token in targets:
+        canonical,row=rows[token]
+        denied=decision_attest.gate(row,project=name,journal=path,actor=actor,state=state,
+                                    by_service=authority_config is not None,command=command,change=change)
+        if denied is not None:return refused(denied)
+    return None
+
 def _guard_record_anchor_title(root,path,args,actor,rows=None):
     """Read-before-write guard: the title of a record anchor is not changed through bd (kittrial-5bb.97).
 
@@ -966,7 +997,7 @@ def _resolved_bd_assignee(root,path,actor,authority_config,args):
 #: may name it.
 SERVICE_ONLY_ACTIONS=('create-project','project-creations','creation-standing','web-merge-slot','web-lifecycle','web-release','web-guidance',
                       'assignee-followon','host-coordination','host-projects','assignment-roster','task-assign','task-release',
-                      'task-file','room-decision','delegation','web-switches')
+                      'task-file','room-decision','delegation','decision-attest','web-switches')
 
 def key_project_refusal(request,key_projects):
     """Refuse, for a key bound to projects, a request that is not for one of them.
@@ -1290,13 +1321,20 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
         rows=cached_export_rows(root,path,run,name)
         members=None
         authority_state=None
+        # kittrial-5bb.454 r2: a project's attestation journal, for whether a decision counts; another project's is
+        # only asked for after the caller's read of it was allowed (others_loader).
+        def journal_of(other):
+            if other==name:return path
+            if project_path is None:return None
+            try:return project_path(other)
+            except ValueError:return None
         from http_authority import AuthorityDenied,read_state
         if authority_config is not None:
             try:authority_state=read_state(authority_config.store)
             except AuthorityDenied:authority_state={}
             members=((authority_state.get('memberships') or {}).get(name)) or {}
         else:
-            # kittrial-5bb.454: the host route reads the web state too, for who wrote an adoption (Q6); without one,
+            # kittrial-5bb.454: the host route reads the web state too, for who attested an adoption (Q6); without one,
             # no person owner counts.
             try:authority_state=read_state(root/'http-state.json')
             except Exception:authority_state=None
@@ -1322,7 +1360,8 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
         return ContextPointers(other_rows,other,configured_operators(root),governance=other_governance)
     result=trace_read.answer(rows,name,options,operators=configured_operators(root),verifiers=configured_verifiers(root),
                              members=members,governance=governance,
-                             others=trace_read.others_loader(readable,read_project),authority_state=authority_state)
+                             others=trace_read.others_loader(readable,read_project),authority_state=authority_state,
+                             journal_of=journal_of)
     return result,''.join(run_warnings)
 
 def program_answer(root,path,name,args,actor,authority_config=None,key_projects=None,by_service=False,project_path=None,
@@ -1384,7 +1423,7 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
             area_rows=cached_export_rows(root,area_path,runner(area_path,area),area)
             area_governance=trace_read.read_governance(area_rows,area_path,area)
         return area_path,area_rows,area_governance
-    areas,cited,pins,read_rows=[],{},[],{}
+    areas,cited,pins,read_rows,journals=[],{},[],{},{name:path}
     for area,own_item in page:
         # Review of .453, B1: the program's own side first, from its records alone. A side that is not in (proposed,
         # left, not accepted by an owner) reads nothing of the area, so a proposed entry tells nothing about whether
@@ -1414,6 +1453,7 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
                          comment_authority=comment_contact_authority(root,area_path,operators,authority_config))['flags']
         areas.append(program_view.area_row(area,link,program_view.area_details(area_rows,flags)))
         read_rows[area]=area_rows
+        journals[area]=area_path
         snap=trace_read.Snapshot(area_rows,area,now=when,operators=operators,verifiers=configured_verifiers(root),
                                  governance=area_governance)
         found,pinned=program_view.citations_to(snap,name,area)
@@ -1425,7 +1465,7 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
     states={area:('in' if area in on_page and (facts is None or area in facts) else 'not-checked')
             for area,side in sides.items() if side=='in'}
     decisions=program_decisions.decisions_section(rows,name,states,read_rows,state,operators,
-                                                  options['decisions_offset'])
+                                                  options['decisions_offset'],journals)
     suggestions=program_decisions.suggestions_section(rows,options['suggestions_offset'])
     result=program_view.answer(name,areas,len(entries),options['offset'],options['limit'],requirements,decisions,
                                suggestions)
@@ -1455,7 +1495,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
             raise ValueError('%s is available only to the web service'%answered)
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
-    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision','delegation'):
+    if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision','delegation','decision-attest'):
         denied=block_mismatch_denial(request,authority_config)
         if denied is not None:return denied
     # Two actions exist only for the web service and name no existing project
@@ -2938,6 +2978,72 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                                      runner=runner,identity_check=delegation_authority)
             except delegations.DelegationRefusal as error:
                 return refused(error)
+    if action=='decision-attest':
+        # An author's attestation of a decision row's exact text (kittrial-5bb.454 r2). `read` is for any member; `attest`
+        # only for the author's own web session or agent, its standing checked in the library call under the lock.
+        import decision_attest
+        from http_authority import CAP_READ,CAP_TASKS,read_state,server_time
+        args=request.get('args',[])
+        run_warnings=[]
+        def attest_run(argv):
+            stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
+            if warnings:run_warnings.append(warnings)
+            return stdout
+        runner=NativeRunner(attest_run,project=path)
+        def refused(error):
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','delegation_status':error.status}
+        if not isinstance(args,list) or len(args)!=2 or args[0] not in ('read','attest') or not isinstance(args[1],str):
+            return refused(decision_attest.AttestRefusal(422,'Use decision-attest read ID, or attest with one JSON payload. '
+                                                             'Nothing was written.'))
+        if args[0]=='read':
+            if not verified_web_authority(request,authority_config,CAP_READ,name):
+                return refused(decision_attest.AttestRefusal(403,'Verified read authority required in this project'))
+            try:
+                with held_coordination_lock(path,shared=True):
+                    row=decision_attest.read_issue(attest_run,args[1])
+                answer=decision_attest.read_answer(row,name,read_state(authority_config.store),configured_operators(root),path)
+            except decision_attest.AttestRefusal as error:
+                return refused(error)
+            return {'returncode':0,'stdout':json.dumps(answer,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
+        try:
+            try:
+                payload=record_json.loads(args[1])
+                decision_attest.validate_request(payload)
+            except ValueError as error:
+                raise decision_attest.AttestRefusal(422,'%s. Nothing was written.'%error) from None
+            if not request.get('operation_id') or payload['operation_id']!=request['operation_id']:
+                raise decision_attest.AttestRefusal(422,'An attestation needs the same stable operation identity in its '
+                                                        'envelope and body. Nothing was written.')
+        except decision_attest.AttestRefusal as error:
+            return refused(error)
+        authority=request.get('authority') if isinstance(request.get('authority'),dict) else {}
+        def attester():
+            # The author's own web session (never a credential), or the agent's own credential. A worker credential's
+            # actor has neither shape; the guarded write's identity check has proved the descriptor names this actor.
+            if authority.get('via')=='session' and not authority.get('credential_id') and actor==authority.get('user_id') \
+                    and decision_attest.PERSON.fullmatch(str(actor)):
+                return 'session'
+            if authority.get('via')=='credential' and decision_attest.AGENT.fullmatch(str(actor)):
+                return 'agent'
+            return None
+        def attest_authority():
+            if not verified_web_authority(request,authority_config,CAP_TASKS,name) or attester() is None:
+                raise decision_attest.AttestRefusal(403,'An attestation is written by the author\'s own web session or '
+                                                        'agent; a worker credential cannot write one. Nothing was written.')
+        def attest_effect():
+            try:
+                result=decision_attest.apply(payload,project=name,journal=path,run=runner,author=actor,via=attester(),
+                                             at=server_time(),state=read_state(authority_config.store),
+                                             operators=configured_operators(root))
+            except decision_attest.AttestRefusal as error:
+                return refused(error)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':warning_text(run_warnings)}
+        with held_coordination_lock(path):
+            try:
+                return guarded_write(root,request,journal_path(path),attest_effect,authority_config=authority_config,
+                                     require_authority=True,runner=runner,identity_check=attest_authority)
+            except decision_attest.AttestRefusal as error:
+                return refused(error)
     if action=='assignee-followon':
         # The web route's recorded hand-back (kittrial-5bb.343). It runs through the same
         # live-authority boundary every canonical web write uses, and then calls the SAME
@@ -3252,6 +3358,8 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
                     if not bound_raw_exemption():raise
             _guard_record_anchor_status(root,path,args,actor)
             _guard_record_anchor_title(root,path,args,actor,named)
+            denied=_guard_attested_decision(root,path,name,args,actor,authority_config)
+            if denied is not None:return denied
             _guard_reserved_labels(root,path,args,actor)
             def bd_dispatch(argv):
                 p=subprocess.run([str(root/'bin/bd'),'--directory',str(path),'--sandbox','--actor',actor,*argv],env=environment(root),capture_output=True,text=True,encoding='utf-8',timeout=120)

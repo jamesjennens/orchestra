@@ -897,8 +897,20 @@ project linked with it in a program, and the addressed agents are woken.
   section too (at most three reads; then the section reads `unsettled`).
 - **An area whose program side is not in** (proposed, left, not accepted by an owner) is never read.
 - **Decisions and suggestions** (kittrial-5bb.454): `decisions_offset` and `suggestions_offset` page them, 50 at a
-  time. Who wrote a decision or an adoption is its native author, decided live against this service's state; a host
-  route refuses any actor shaped like an account or agent id, and its look-alikes.
+  time. A decision or an adoption counts only with a live attestation of its exact text, decided against this service's
+  state at every read; a host route refuses any actor shaped like an account or agent id, and its look-alikes.
+- **Attesting a decision** (kittrial-5bb.454 r2): `GET /v1/projects/{id}/decisions/{did}/attestation` (`projects.read`)
+  gives the exact type, title and description, their digest and how the row reads now. `POST
+  /v1/projects/{id}/decisions/{did}/attest` (`tasks`, with an `Idempotency-Key`) takes `{"digest": ...}` and is written
+  only for the author's own web session or agent with owner or coordinator standing in the project now: 403 otherwise,
+  and for a coordinator over a text attested at an owner's level; 404 for a row that is not a decision; 409 when the text
+  changed since it was read. The server fills in the author, how it came and the time. `http_client.py
+  decision-attestation` and `decision-attest` call them, and the decision's page has the button. Any later edit reads
+  `attestation-stale` and binds nothing.
+- **Status, type and labels of an attested decision** (kittrial-5bb.454 r2): `PATCH .../tasks/{id}` with `status`, a claim,
+  and the same changes through any other web route answer 403 unless the caller has the standing the row's records ask
+  for (see "The gate" in docs/design/PROGRAM_DESIGN.md §6, as built). An edit of the title or description is not refused:
+  it makes the row stale, which removes a binding and never makes one.
 - **The Program page** is in the menu of a project with an accepted `program.area.*` side: a flag kept in the web
   state (`program_flags`), recomputed by every program read and by a web accept or retire of a `program.` key.
   An older kit leaves it untouched; a stale flag only shows or hides the link.
@@ -4405,7 +4417,8 @@ ungranted agents or worker credentials, or for the host route.
   `admin.py delegation-check --project P --state STATE.json`, which lists every agent holding the
   project's coordinator grant and whether a delegation in force covers it (`uncovered`).
 - **Backups** carry `.delegations/` with the other host journals; a restore that dropped it would
-  void every delegation.
+  void every delegation. They carry `.decision-attests/` the same way (kittrial-5bb.454 r2): without it every attested
+  decision reads `not-attested`.
 
 ### `points_to` and `pointers_validation` on capability records
 

@@ -2738,6 +2738,9 @@ BLOCK_CAPABILITIES = {
     # session and the live owner role.
     'delegation': {'list': CAP_READ, 'grant': CAP_PROJECT_ADMIN, 'narrow': CAP_PROJECT_ADMIN,
                    'revoke': CAP_PROJECT_ADMIN},
+    # An author's attestation of a decision's exact text (kittrial-5bb.454 r2): a read for any member; the write's
+    # capability only opens the route, and the action checks the author's own standing in the project under the lock.
+    'decision-attest': {'read': CAP_READ, 'attest': CAP_TASKS},
     'review': {'approve': CAP_APPROVE,     # reviews.add, operation approve
                None: CAP_REVIEWS},         # reviews.add, every other operation
     'proposal': {'submit': CAP_PROPOSALS, 'revise': CAP_PROPOSALS,     # proposals.submit

@@ -1541,7 +1541,8 @@ class InProcessBackend:
             state = copy.deepcopy(self.service.state)
         operators = list(getattr(self, 'operators', ()) or ())
         decisions = program_decisions.decisions_section(native.get(project_id) or [], project_id, states, read_rows,
-                                                        state, operators, decisions_offset)
+                                                        state, operators, decisions_offset,
+                                                        getattr(self, 'journals', None))
         suggestions = program_decisions.suggestions_section(native.get(project_id) or [], suggestions_offset)
         result = program_view.answer(project_id, areas, len(entries), offset, limit, requirements, decisions,
                                      suggestions)
@@ -2373,6 +2374,8 @@ class EndpointBackend:
         'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
         # Delegated decision rights (kittrial-5bb.407): the canonical `delegation` action.
         'delegations.grant', 'delegations.narrow', 'delegations.revoke',
+        # An author's attestation of a decision (kittrial-5bb.454 r2): the canonical `decision-attest` action.
+        'decisions.attest',
     )
     #: Routes with no canonical command yet, and why. Fails closed rather than
     #: pretending the service store is canonical.
@@ -2732,13 +2735,14 @@ class EndpointBackend:
                               (reply.get('stderr') or 'Release facts cannot be recorded').strip())
             error.nothing_done = True
             raise error
-        if action == 'delegation' and isinstance(reply, dict) and reply.get('returncode') == 2 and (
-                reply.get('delegation_status') or reply.get('records_status')):
-            # The delegation action's own refusal or its identity check's (kittrial-5bb.407):
+        if action in ('delegation', 'decision-attest', 'bd') and isinstance(reply, dict) \
+                and reply.get('returncode') == 2 and (reply.get('delegation_status') or reply.get('records_status')):
+            # The delegation action's own refusal or its identity check's (kittrial-5bb.407), and the same for an
+            # attestation and for the gate on an attested decision's status (kittrial-5bb.454 r2):
             # nothing was written, and the status is the one the action gave.
             status = reply.get('delegation_status') or reply.get('records_status')
             text = (reply.get('stderr') or 'Delegation refused').strip().split('\n')[-1]
-            for prefix in ('ValueError: ', 'DelegationRefusal: '):
+            for prefix in ('ValueError: ', 'DelegationRefusal: ', 'AttestRefusal: '):
                 if text.startswith(prefix):
                     text = text[len(prefix):]
                     break
@@ -3233,6 +3237,11 @@ class EndpointBackend:
                     if key not in ('schema_version', 'operation_id', 'action')}
             body.update(schema_version=1, operation_id=operation_id, action=operation)
             return 'delegation', project_id, [operation, json.dumps(body, ensure_ascii=False)], {}
+        if route == 'decisions.attest':
+            # Only what the author read travels; the endpoint fills the author, how it came and the time.
+            body = {'schema_version': 1, 'operation_id': operation_id, 'decision': payload['decision'],
+                    'digest': payload['digest']}
+            return 'decision-attest', project_id, ['attest', json.dumps(body, ensure_ascii=False)], {}
         if route.startswith('followons.'):
             # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
             # `assignee-followon` action derives every record fact under the project
@@ -3533,6 +3542,22 @@ class EndpointBackend:
         payload = self._checked(reply, reading=True)
         if not isinstance(payload, dict):
             raise uncertain('The canonical delegations read returned an unexpected shape')
+        return payload
+
+    def decision_attestation(self, project_id, principal, decision):
+        """The exact text of one decision, its digest and how it reads (kittrial-5bb.454 r2), through the endpoint's
+        ``decision-attest read``."""
+        reply = self._endpoint('decision-attest', project_id, self.service.bind_actor(principal, None), ['read', decision],
+                               authority=authority_request(principal, project_id, CAP_READ,
+                                                           now=self.service._expiry_now()),
+                               require_authority=True)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and reply.get('delegation_status'):
+            status = reply['delegation_status']
+            raise HttpError(status, {403: 'forbidden', 404: 'not_found'}.get(status, 'invalid'),
+                            (reply.get('stderr') or 'The attestation cannot be read').strip())
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('The canonical attestation read returned an unexpected shape')
         return payload
 
     def lanes_read(self, project_id, principal, args, actor, scope):
@@ -12351,6 +12376,45 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, route_name, pid, write, capability=CAP_PROJECT_ADMIN,
                             status=201, serialize=False, canonical=True)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/decisions/(?P<did>' + ID + r')/attestation')
+    def decision_attestation_read(self, ctx):
+        """The exact text of one decision, its digest and how it reads now (kittrial-5bb.454 r2), at CAP_READ: what a
+        person or an agent reads before attesting."""
+        self._project(ctx, CAP_READ)
+        if not hasattr(self.backend, 'decision_attestation'):
+            raise not_implemented('Attestations are unavailable on this server')
+        return 200, self.backend.decision_attestation(ctx.params['pid'], ctx.principal, ctx.params['did'])
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/decisions/(?P<did>' + ID + r')/attest')
+    def decision_attest_write(self, ctx):
+        """Attest the exact text of a decision (kittrial-5bb.454 r2).
+
+        The author's own web session or agent, with standing in the project now: the capability only opens the route,
+        and the endpoint checks who is writing and their standing under the lock. The body is ``digest``, what the
+        author read; a text that changed since is refused with 409. The author, how it came and the time are the
+        server's.
+        """
+        import decision_attest
+        pid = ctx.params['pid']
+        if not hasattr(self.backend, 'ROUTES') or 'decisions.attest' not in self.backend.ROUTES:
+            raise not_implemented('Attestations are unavailable on this server')
+        self._project(ctx, CAP_TASKS)
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, ('digest',), 'An attestation')
+        if not isinstance(payload.get('digest'), str) or not decision_attest.DIGEST.fullmatch(payload['digest']):
+            raise invalid('Supply digest, the 64 hex digits the attestation read gave for the text you read')
+        payload['decision'] = ctx.params['did']
+
+        def write():
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request '
+                              'after an uncertain outcome')
+            result = self.backend.invoke('decisions.attest', ctx.principal, pid, payload, ctx.idempotency_key,
+                                         target=ctx.route_target, authorize=ctx.authorize, capability=CAP_TASKS)
+            return result, result
+        return self._mutate(ctx, 'decisions.attest', pid, write, capability=CAP_TASKS, status=201, serialize=False,
+                            canonical=True)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):

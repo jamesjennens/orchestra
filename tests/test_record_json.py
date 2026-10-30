@@ -227,7 +227,7 @@ class NoUnguardedParseTests(unittest.TestCase):
     GUARDED_ONLY = ('artifacts.py', 'capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py',
                     'keyed_entries.py', 'project_creation.py', 'recovery.py', 'requirement_baseline_records.py',
                     'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py',
-                    'delegations.py', 'work.py')
+                    'decision_attest.py', 'delegations.py', 'work.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -281,7 +281,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             # interpreter's recursion limit, decides whether a nested sidecar reads.
             # The fourteenth (kittrial-5bb.426) reads deployment.private.json from the same
             # checked descriptor, with a damaged or nested document reading as a configuration fault.
-            'admin.py': 14,
+            # The fifteenth (kittrial-5bb.454 r2) reads a `.decision-attests` journal entry for a backup.
+            'admin.py': 15,
             # D2: bounded native history, review VOID and preserved target payload.
             'lifecycle_audit.py': 3,
             # kittrial-5bb.385: rooms.py parses the room record, the index, and each stored
@@ -325,7 +326,7 @@ class NoUnguardedParseTests(unittest.TestCase):
             # endpoint.py (kittrial-5bb.384): the framed task-file header line, and the request text read
             # whole (the same guarded parse the old reader made, now in two places: a pipe and a text stream).
             'task_files.py': 9,
-            'artifacts.py': 1, 'briefing.py': 4, 'coordination.py': 4, 'endpoint.py': 16,
+            'artifacts.py': 1, 'briefing.py': 4, 'coordination.py': 4, 'endpoint.py': 17,
             'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
             'handoff.py': 2, 'http_authority.py': 1, 'http_service.py': 5, 'keyed_records.py': 1,
             'lane_state.py': 1, 'lifecycle.py': 2, 'project_creation.py': 1, 'proposal_records.py': 1,
@@ -342,6 +343,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             'followon.py': 4,
             'fault_clear.py': 3,
             'delegations.py': 4,
+            # kittrial-5bb.454 r2: a comment's record, a journal entry and the comment-write receipt.
+            # endpoint.py's seventeenth is the same action's request body.
+            'decision_attest.py': 3,
             'review_recommendations.py': 2, 'review_workflow.py': 5, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

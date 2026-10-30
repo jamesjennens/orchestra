@@ -239,6 +239,10 @@ TASK_FILE_WITHDRAWN_PREFIX = 'Kind: task-file-withdrawn-v1\n'
 # entry (``<project>/.delegations/``), so one planted where the prefix is not reserved (an
 # older kit) grants nothing. Not a record-anchor family: every surface reads it as a comment.
 DELEGATION_PREFIX = 'Kind: delegation-v1\n'
+# kittrial-5bb.454 r2. An author's attestation of a decision row's exact text, written only by the dedicated operation
+# (decision_attest.py). Reserved so the raw `comments add` path can never plant one; honoured only with its host journal
+# entry (``<project>/.decision-attests/``). Not a record-anchor family: every surface reads it as a comment.
+DECISION_ATTEST_PREFIX = 'Kind: decision-attest-v1\n'
 # kittrial-5bb.418 (TRACEABILITY_DESIGN §5.1 step 2). The index of a design document, derived by
 # the server from the stored bytes and written by the propose or revise of a design.<scope>
 # reference entry (design_documents). Reserved, every version, so no raw `comments add` can plant
@@ -290,6 +294,9 @@ RESERVED = (
     (DELEGATION_PREFIX, 'delegation record',
      "the delegations route (a person owner's web session) or admin.py delegation-record on the "
      'coordination host'),
+    (DECISION_ATTEST_PREFIX, 'decision attestation',
+     "the attest route (POST /v1/projects/PID/decisions/ID/attest, the author's own web session or agent) or "
+     'admin.py decision-attest on the coordination host'),
     (DESIGN_INDEX_PREFIX, 'design document index',
      'ref propose|revise of a design.<scope> entry with its document (the server writes the index)'),
     (DESIGN_VERIFICATION_PREFIX, 'design document verification',

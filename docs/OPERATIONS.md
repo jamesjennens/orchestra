@@ -498,6 +498,10 @@ for `.assignee-followons/` above: restore with this kit or a newer one, or remov
 removes the delegation rule altogether: agents accept as they did before (the own-party
 refusal still holds), and the delegation records read as ordinary comments.
 
+**Attested decisions** (kittrial-5bb.454 r2). `admin.py backup` collects `<project>/.decision-attests/` the same way, and
+`restore-new` validates and restores it. Without the journal every attested decision reads `not-attested` and binds
+nothing (the comments stay, inert). An older kit refuses to restore a backup that holds it, as above.
+
 ### The claiming setting: restore and rollback
 
 `<project>/.claiming.json` holds whether workers may claim open tasks (`open`, the

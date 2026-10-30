@@ -485,15 +485,25 @@ For program and area owners and coordinators (kittrial-5bb.454; docs/design/PROG
 
 - **A program decision** is a decision issue of the program project with two lines of its own:
   `Binds: north, south` (the areas it applies to) and `Owner-only: yes` or `no`. An owner-only decision counts only
-  when a person owner of the program (or an operator) wrote it; another when a coordinator or owner of the program
+  when a person owner of the program (or an operator) attested it; another when a coordinator or owner of the program
   (or an operator) did.
+- **A decision counts only once its author has attested its exact text.** Read it, then attest what you read:
+  `GET /v1/projects/PROJECT/decisions/ID/attestation` gives the text and its digest, and
+  `POST /v1/projects/PROJECT/decisions/ID/attest` with `{"digest": "..."}` attests it, as your own web session (the
+  decision's page has the button) or your own agent. Who made the row does not matter. Any later edit reads
+  `attestation-stale` and binds nothing until it is attested again; a row nobody has attested reads `not-attested`.
 - **It binds an area only when the area adopts it:** a decision issue of the area with the line
   `Adopts: decision:PROGRAM/ID`.
   - A decision that is not owner-only is adopted by the area's coordinator, a person or an agent holding the grant.
   - An owner-only decision is adopted by a person owner of the area, or by an area coordinator whose adoption also
-    has the line `Per: decision:AREA/ID`, naming a decision of the area that a person owner wrote. An agent never
-    adopts an owner-only decision alone, and a `Per:` decision an agent wrote does not count.
-- **Who wrote a row is checked at every read:** someone who has since lost the role stops counting.
+    has the line `Per: decision:AREA/ID`, naming a decision of the area that a person owner attested and that says
+    `Authorises: decision:PROGRAM/ID` for this very decision. An agent never adopts an owner-only decision alone; a
+    `Per:` decision an agent attested, or one that does not authorise this decision, does not count.
+- **Who attested a row is checked at every read:** someone who has since lost the role stops counting.
+- **A closed decision or adoption binds nothing.** On an attested row, closing, reopening, retyping or relabelling it as
+  a decision needs standing: a person owner if the text is owner-only, carries `Authorises:` or is an owner's adoption,
+  otherwise an owner or a coordinator. Anyone else is refused, and so is every host route; an operator uses
+  `admin.py decision-change`. You can still edit the text, which only makes the row stale.
 - **A suggestion going up** is a task in the program project labelled `suggestion`, with a line `From:` citing its
   source (`From: decision:AREA/ID`). The program coordinator answers with a program decision, or closes the task with
   a reason.

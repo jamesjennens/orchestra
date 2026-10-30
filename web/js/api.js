@@ -627,6 +627,8 @@ export function createApi(transport, binaryTransport = fetchBinaryTransport) {
     clearRequirementCreation: (pid, body) => mutate('POST', `/v1/projects/${pid}/requirements/recoveries/clear`, body),
     setRequirementsGovernance: (pid, body) => mutate('PUT', `/v1/projects/${pid}/requirements/governance`, body),
     decisions: (pid) => call('GET', `/v1/projects/${pid}/decisions`),
+    decisionAttestation: (pid, did) => call('GET', `/v1/projects/${pid}/decisions/${did}/attestation`),
+    attestDecision: (pid, did, body) => mutate('POST', `/v1/projects/${pid}/decisions/${did}/attest`, body),
     record: (pid, id) => call('GET', `/v1/projects/${pid}/records/${id}`),
     // reference and capability records (kittrial-5bb.213)
     references: (pid, params) => call('GET', `/v1/projects/${encodeURIComponent(pid)}/references`, { params }),
