@@ -3477,6 +3477,9 @@ journal, not a second database. A configured operator may use
 (direct accepted first entry) or `accept` shapes, with interface content and F3
 acceptance. `--state` supplies current membership/accounts when program links were
 accepted by web owners; without it only operator-backed sides can be established.
+An otherwise active owner-backed admission with no loaded current authority
+view makes coverage incomplete and blocks retirement; it is not an inactive side.
+A loaded current view can establish that the old acceptor is no longer an owner.
 Web writes recheck the principal's own authority; a host actor label never grants
 coordinator permission. The new delegation scope is `interfaces`, not an expansion
 of an older reference/capability grant. Acceptance/retirement cannot fetch a URL or

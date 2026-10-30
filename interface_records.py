@@ -270,6 +270,21 @@ class ProgramContext:
             raise Refusal('Program snapshot is unavailable; no interface acceptance was written')
         return rows
 
+    def owner_view_missing(self,item):
+        """An active owner-backed side is unknown until current authority was loaded."""
+        if self.memberships is not None and self.users is not None:
+            return False
+        import program_links
+        by=item.get('accepted_by')
+        if item.get('state')!='accepted' or not isinstance(by,str) or not program_links.PERSON.fullmatch(by):
+            return False
+        side=program_links.side_of(item.get('key'))
+        try:
+            _,state=program_links.statement_lines((item.get('record') or {}).get('statement'),
+                'Area' if side and side[0]=='program' else 'Program')
+        except ValueError:return True
+        return state=='in'
+
     def areas(self):
         import program_links
         entries, incomplete = refs.KIND.catalog(self.own(), self.operators)
@@ -282,6 +297,7 @@ class ProgramContext:
             side = program_links.side_of(key)
             if not side or side[0] != 'program':
                 continue
+            if self.owner_view_missing(e):complete=False
             status, _ = program_links.side_status(e, self.project, side[1], self.memberships, self.users)
             if e['state'] in ('malformed', 'unsupported', 'conflicted'):
                 complete = False
@@ -298,6 +314,7 @@ class ProgramContext:
                 continue
             others, inc = refs.KIND.catalog(rows, self.operators)
             selected = [e for e in others if e.get('key') == program_links.MEMBER_OF]
+            if any(self.owner_view_missing(e) for e in selected):complete=False
             if inc or any(e['state'] in ('malformed', 'unsupported', 'conflicted') for e in others):
                 complete = False
             if len(selected) == 1 and program_links.side_status(selected[0], area, self.project, self.memberships, self.users)[0] == 'in':

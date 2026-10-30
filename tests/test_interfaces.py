@@ -53,11 +53,11 @@ class InterfaceCase(unittest.TestCase):
 
     def entry(self):return ir.get(self.native.rows,'iface.quotes.v1',[OPERATOR])
 
-    def accept(self,p=None,operation='accept-1'):
+    def accept(self,p=None,operation='accept-1',ctx=None):
         draft=self.entry()['proposed'] if p is None else p
         return self.apply({'schema_version':1,'operation':'accept','operation_id':operation,
             'key':draft['key'],'revision':draft['revision'],'record_sha256':draft['sha256'],
-            'acceptance_state':'accepted','acceptance':acceptance()},OPERATOR,True)
+            'acceptance_state':'accepted','acceptance':acceptance()},OPERATOR,True,ctx=ctx)
 
     def test_shared_anchor_draft_accept_exact_replay_and_reserved_visibility(self):
         from reserved_comments import is_record_anchor,is_record_comment,reserved_match
@@ -271,3 +271,56 @@ class InterfaceCase(unittest.TestCase):
                 acceptance_state='accepted',acceptance=acceptance()),OPERATOR,self.area,self.path.parent/'area',
                 operator=True,operators=[OPERATOR])
         self.assertFalse(self.context().usage()[1]['complete'])
+
+    def test_missing_owner_authority_cannot_prove_consumer_free_coverage(self):
+        # A valid owner-backed admission cannot be classified from a host view
+        # that loaded no current memberships/accounts. Keep the operator-backed
+        # defining area visible so retirement must reach the completeness check.
+        from unittest.mock import patch
+        self.apply(payload());self.accept();record=self.entry()['record']
+        self.native.actor=OPERATOR
+        rr.apply_native({'schema_version':1,'operation':'draft','operation_id':'other-owner-link',
+            'key':'program.area.ownerarea','title':'Owner-backed area','statement':'Area: ownerarea\nState: in',
+            'authority':{'type':'decision','id':'decision-42'},'owner':'person:example',
+            'review_by':payload()['review_by'],'tags':[],'decisions':[],
+            'acceptance_state':'accepted','acceptance':acceptance()},OPERATOR,self.native,self.path,
+            operator=True,operators=[OPERATOR])
+        original=rr.KIND.catalog
+        def owner_projection(rows,operators):
+            entries,incomplete=original(rows,operators)
+            for entry in entries:
+                if entry.get('key')=='program.area.ownerarea':entry['accepted_by']='usr_'+'b'*16
+            return entries,incomplete
+        with patch.object(rr.KIND,'catalog',side_effect=owner_projection):
+            self.apply(payload(operation='revise',operation_id='retire-owner-unknown',revision=3,
+                               expected_sha256=record['sha256'],state='retired'))
+            writes=len(self.native.writes())
+            with self.assertRaisesRegex(ValueError,'incomplete coverage'):
+                self.accept(operation='owner-authority-unknown')
+            self.assertEqual(writes,len(self.native.writes()))
+            uid='usr_'+'b'*16
+            visible_owner=ir.ProgramContext('prog',lambda name:self.projects.get(name),operators=[OPERATOR],
+                memberships={'prog':{uid:'owner'}},users={uid:{'disabled':False}})
+            with self.assertRaisesRegex(ValueError,'incomplete coverage'):
+                self.accept(operation='owner-area-unavailable',ctx=visible_owner)
+            # An authoritative current view proving that the old acceptor is no
+            # longer an owner makes the old admission inactive, not unknown.
+            inactive=ir.ProgramContext('prog',lambda name:self.projects.get(name),operators=[OPERATOR],
+                memberships={'prog':{uid:'viewer'}},users={uid:{'disabled':False}})
+            self.accept(operation='former-owner-inactive',ctx=inactive)
+            self.assertEqual('retired',self.entry()['lifecycle'])
+
+    def test_missing_area_owner_view_is_incomplete_until_current_roles_loaded(self):
+        from unittest.mock import patch
+        uid='usr_'+'c'*16;original=rr.KIND.catalog
+        def owner_projection(rows,operators):
+            entries,incomplete=original(rows,operators)
+            for entry in entries:
+                if entry.get('key')=='program.member-of':entry['accepted_by']=uid
+            return entries,incomplete
+        with patch.object(rr.KIND,'catalog',side_effect=owner_projection):
+            self.assertFalse(self.context().usage()[1]['complete'])
+            known=ir.ProgramContext('prog',lambda name:self.projects.get(name),operators=[OPERATOR],
+                memberships={'area':{uid:'owner'}},users={uid:{'disabled':False}})
+            self.assertTrue(known.usage()[1]['complete'])
+            self.assertEqual(['area'],known.areas()[0])
