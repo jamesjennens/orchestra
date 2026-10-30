@@ -1643,7 +1643,9 @@ sets `operation`.
   - `ref design SCOPE [--revision N]` reads the design page: the stored document as text, its index,
     `index_state` (`matches`, `missing` or `differs`), `heading_lines` (the line of each index heading,
     in the index's order, so a reader places anchors without its own heading rule), and the revision's
-    state. Anything that is not a readable repo-document revision answers `Design not found`.
+    state. Since kittrial-5bb.449 the index takes qualified `design:` tokens, and `req:/x`, `req:A/` and
+    `req:A/@3` (an empty project or key) are prose, so a document accepted before that holds either reads
+    `differs` until it is accepted again. Anything that is not a readable repo-document revision answers `Design not found`.
   - `trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]` (kittrial-5bb.425) is the
     trace read, answered by the server from records alone (no repository, no blob read); the client
     passes it to the endpoint action `trace` and prints the answer. Views: `summary` (the Coverage

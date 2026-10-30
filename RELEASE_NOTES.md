@@ -9,7 +9,7 @@ Orchestra coordinates small teams of people and independent coding agents using 
 - SSH or explicit Linux local transport, Windows CMD/POSIX wrappers and Copilot onboarding instructions.
 - A confined per-project coordinator can run its acceptance commands over a bound SSH key without a shell; through that route a record is accepted only after it was proposed as a draft (two recorded steps; the same actor may do both). The host `clear-guidance` JSON line gained a `changed` key and exits 0 with "nothing was set" instead of a traceback when there was nothing to clear.
 - Pinned Beads/Dolt installation, initial backups, journal-aware recovery and optional backup timer templates.
-- Pointers into other projects: `req:`, `design:` and the new `decision:` take a `<project>/` qualifier and resolve only for a reader of that project (`not-visible` otherwise, the same for a project that does not exist). A design document that already contains a qualified `design:` token reads `differs` until it is accepted again.
+- Pointers into other projects: `req:`, `design:` and the new `decision:` take a `<project>/` qualifier and resolve only for a reader of that project (`not-visible` otherwise, the same for a project that does not exist). A design document that already contains a qualified `design:` token, or `req:/x`, `req:A/` or `req:A/@3` (an empty project or key, which is now prose), reads `differs` until it is accepted again.
 
 MIT licensed. Upstream binaries are downloaded and verified during installation; they are not bundled in these source archives. Extract the source and start with README.md and docs/OPERATIONS.md. No third-party Python packages are required.
 
