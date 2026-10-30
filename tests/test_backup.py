@@ -604,10 +604,19 @@ class BackupTests(unittest.TestCase):
         self.save_bundle()
         phases = []
         def locked(phase):
-            # The source's backup lock is taken first and held to the end. From the moment
+            # The semantic mutex precedes the source's backup lock and remains held.
+            # http_authority.file_lock passes an integer descriptor to flock; the
+            # backup/restore locks below pass open file objects.
+            calls = self.flock.call_args_list
+            descriptors = [call for call in calls if isinstance(call.args[0], int)]
+            self.assertEqual(len(descriptors), 1, phase)
+            self.assertIs(calls[0], descriptors[0])
+            self.assertEqual(descriptors[0].args[1],
+                             self.fake_fcntl.LOCK_EX | self.fake_fcntl.LOCK_NB)
+            # From the moment
             # the destination starts to exist, its own restore lock is held too, so
             # retire-project cannot pull it away mid-restore (kittrial-5bb.85).
-            handles = [call.args[0] for call in self.flock.call_args_list]
+            handles = [call.args[0] for call in calls if not isinstance(call.args[0], int)]
             self.assertEqual([Path(handle.name).name for handle in handles],
                              ['source.lock', 'destination.restore.lock'][:1 if phase == 'validate-sidecar' else 2])
             self.assertFalse(any(handle.closed for handle in handles), phase)
@@ -627,7 +636,11 @@ class BackupTests(unittest.TestCase):
             admin.main()
         self.assertEqual(phases, ['validate-sidecar', 'create-destination', 'restore-native',
                                   'repoint-native', 'restore-sidecar', 'restore-native', 'restore-native'])
-        self.assertTrue(self.flock.call_args.args[0].closed)
+        handles = [call.args[0] for call in self.flock.call_args_list
+                   if not isinstance(call.args[0], int)]
+        self.assertTrue(all(handle.closed for handle in handles))
+        self.assertIsInstance(self.flock.call_args.args[0], int)
+        self.assertEqual(self.flock.call_args.args[1], self.fake_fcntl.LOCK_UN)
 
     def test_backup_rejects_symlink_journal_directory(self):
         outside = self.root / 'outside'
