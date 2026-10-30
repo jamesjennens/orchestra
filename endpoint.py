@@ -1289,10 +1289,17 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
     with held_coordination_lock(path,shared=True):
         rows=cached_export_rows(root,path,run,name)
         members=None
+        authority_state=None
+        from http_authority import AuthorityDenied,read_state
         if authority_config is not None:
-            from http_authority import AuthorityDenied,read_state
-            try:members=((read_state(authority_config.store).get('memberships') or {}).get(name)) or {}
-            except AuthorityDenied:members={}
+            try:authority_state=read_state(authority_config.store)
+            except AuthorityDenied:authority_state={}
+            members=((authority_state.get('memberships') or {}).get(name)) or {}
+        else:
+            # kittrial-5bb.454: the host route reads the web state too, for who wrote an adoption (Q6); without one,
+            # no person owner counts.
+            try:authority_state=read_state(root/'http-state.json')
+            except Exception:authority_state=None
         governance=trace_read.read_governance(rows,path,name)
     def read_project(other):
         # Another project, read like this one, under its own lock and after this one's is released; a name that is
@@ -1313,12 +1320,6 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
             other_governance=trace_read.read_governance(other_rows,other_path,other)
         from briefing import ContextPointers
         return ContextPointers(other_rows,other,configured_operators(root),governance=other_governance)
-    authority_state=None
-    try:
-        from http_authority import read_state as read_web_state
-        authority_state=read_web_state(authority_config.store if authority_config is not None else root/'http-state.json')
-    except Exception:                       # absent, unreadable or unsupported: no person owner counts
-        authority_state=None
     result=trace_read.answer(rows,name,options,operators=configured_operators(root),verifiers=configured_verifiers(root),
                              members=members,governance=governance,
                              others=trace_read.others_loader(readable,read_project),authority_state=authority_state)

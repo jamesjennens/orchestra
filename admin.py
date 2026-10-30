@@ -10818,11 +10818,15 @@ def main():
                    help='report the journal size (rows by state, bytes on disk, bounds); this is the default inspection')
     args=p.parse_args()
     # kittrial-5bb.454 (the trust boundary): no host command acts under an HTTP-shaped actor or a look-alike. Asked
-    # first, before the root or anything else is looked at.
-    if isinstance(getattr(args,'actor',None),str):
-        from reserved_comments import refuse_http_actor
-        try:refuse_http_actor(args.actor,False)
-        except ValueError as error:raise SystemExit('admin.py: %s'%error)
+    # first, before the root or anything else is looked at, of the value of the command's own --actor option however
+    # it was spelled (a command's positional name, such as the verifier that `verifiers add` names, is not its actor).
+    from reserved_comments import refuse_http_actor
+    chosen=p._subparsers._group_actions[0].choices.get(args.command)
+    for action in (chosen._actions if chosen is not None else []):
+        value=getattr(args,action.dest,None) if '--actor' in action.option_strings else None
+        if isinstance(value,str):
+            try:refuse_http_actor(value,False)
+            except ValueError as error:raise SystemExit('admin.py: %s'%error)
     root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
