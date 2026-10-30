@@ -3498,8 +3498,9 @@ SYSTEM_DESIGN "Kit lock order"; there is no route-specific reverse order.
 
 The semantic mutex covers only graph checks and effects: program-link reference
 writes, interface writes, capability writes whose payload or stored declarations
-touch interfaces (including v2-to-v1 withdrawal), and operator repairs or changes
-that can affect this graph's evidence. Decode/structural validation happens before
+touch interfaces (including v2-to-v1 withdrawal), native restores, and operator repairs or changes
+that can affect this graph's evidence. Verifier-only configuration bypasses it;
+host dispatch selects by command, never by an unrelated argument value. Decode/structural validation happens before
 it. Unrelated reference proposals and v1 capabilities bypass it. Membership and
 registration do not wait on it. Batches release it and the project lock between
 items; mixed batches conservatively select against the batch. Its five-second

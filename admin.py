@@ -10423,11 +10423,12 @@ def main():
     words=sys.argv[1:]
     root_parser=argparse.ArgumentParser(add_help=False)
     root_parser.add_argument('--root')
-    root_arg=root_parser.parse_known_args(words)[0].root
-    participating=any(v in words for v in ('interface-apply','interface-reconcile',
+    root_options,remaining=root_parser.parse_known_args(words)
+    root_arg=root_options.root
+    command=remaining[0] if remaining else None
+    participating=command in ('interface-apply','interface-reconcile',
         'record-reconcile','reference-reconcile','capability-reconcile',
-        'void-record','anchor-release','operators','verifiers',
-        '--restore-operators','--restore-verifiers','--restore-http-state'))
+        'void-record','anchor-release','operators','restore-new')
     if root_arg is not None and participating:
         with interface_lock.held(Path(root_arg)):
             return _main()

@@ -157,3 +157,34 @@ class InterfaceLockTests(unittest.TestCase):
                     job=pool.submit(endpoint.execute,root,request)
                     self.assertTrue(entered.wait(1),'unrelated reference waited for the interface mutex')
                 self.assertEqual(0,job.result(5)['returncode'])
+
+    @unittest.skipIf(os.name=='nt','host administration uses POSIX runtime paths')
+    def test_unrelated_host_verifier_configuration_bypasses_semantic_mutex(self):
+        import admin,json,io,contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);(root/'projects').mkdir()
+            (root/'deployment.private.json').write_text(json.dumps({'password':'synthetic','unit':'none','operators':[]}))
+            done=threading.Event()
+            def change():
+                try:admin.main()
+                finally:done.set()
+            with patch.object(sys,'argv',['admin.py','--root',str(root),'verifiers','add','operators']), \
+                 contextlib.redirect_stdout(io.StringIO()),ThreadPoolExecutor(1) as pool:
+                with interface_lock.held(root):
+                    job=pool.submit(change)
+                    self.assertTrue(done.wait(1),'unrelated verifier configuration waited for the interface mutex')
+                job.result(5)
+            self.assertIn('operators',json.loads((root/'deployment.private.json').read_text())['verifiers'])
+
+
+    @unittest.skipIf(os.name=='nt','host administration uses POSIX runtime paths')
+    def test_host_native_restore_takes_semantic_mutex_without_authority_restore_flags(self):
+        import admin
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            def effect():
+                with self.assertRaises(TimeoutError):
+                    with file_lock(root/'.interface-mutations.lock',timeout=.02):pass
+                return 0
+            with patch.object(sys,'argv',['admin.py','--root',str(root),'restore-new']),patch.object(admin,'_main',side_effect=effect):
+                self.assertEqual(0,admin.main())
