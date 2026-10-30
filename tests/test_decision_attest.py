@@ -637,6 +637,27 @@ class WebRouteTests(unittest.TestCase):
         self.assertNotIn(answer.status, (200, 201), answer.data)
         self.assertEqual('not-attested', self.read(issue)['attestation'])
 
+    def test_the_route_takes_the_digest_and_nothing_else(self):
+        # E6: the author, how it came and the time are the server's: naming them is refused, not ignored.
+        issue = self.make()
+        digest = self.read(issue)['digest']
+        for body in ({'digest': digest, 'author': self.ids['pat']}, {'digest': digest, 'via': 'operator'}, {}, {'digest': 'x'}):
+            with self.subTest(body=body):
+                answer = self.web.request('POST', '/v1/projects/pp/decisions/%s/attest' % issue, body,
+                                          token=self.tokens['carl'], key='body-' + uuid.uuid4().hex)
+                self.assertIn(answer.status, (400, 422), answer.data)
+        self.assertEqual('not-attested', self.read(issue)['attestation'])
+
+    def test_the_action_is_the_web_services_and_binds_its_operation_identity(self):
+        # E2 and E4.
+        self.assertIn('decision-attest', fixture.endpoint.SERVICE_ONLY_ACTIONS)
+        issue = self.make()
+        body = json.dumps({'schema_version': 1, 'operation_id': 'op-body', 'decision': issue,
+                           'digest': self.read(issue)['digest']})
+        answer = fixture.endpoint.execute(self.root, {'project': 'pp', 'actor': 'ops', 'action': 'decision-attest',
+                                                      'args': ['attest', body], 'operation_id': 'op-envelope'})
+        self.assertEqual((2, 422), (answer['returncode'], answer['delegation_status']), answer)
+
     def test_an_unbound_key_cannot_write_or_read_through_the_action(self):
         issue = self.make()
         row = self.read(issue)

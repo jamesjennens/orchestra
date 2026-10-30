@@ -156,7 +156,8 @@ class BoundEndpointTests(unittest.TestCase):
         # endpoint re-checks the signed-in owner/coordinator live. No bound key may name it.
         # `delegation` (kittrial-5bb.407) records a person owner's delegation from their own web
         # session; an operator uses the confined `coordinator delegation-record` instead.
-        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignee-followon', 'assignment-roster', 'create-project', 'creation-standing',
+        # `decision-attest` (kittrial-5bb.454 r2) likewise, the author's own session or agent; an operator uses admin.py.
+        self.assertEqual(sorted(endpoint.SERVICE_ONLY_ACTIONS), ['assignee-followon', 'assignment-roster', 'create-project', 'creation-standing', 'decision-attest',
                                                                  'delegation', 'host-coordination',
                                                                  'host-projects', 'project-creations', 'room-decision', 'task-assign', 'task-file', 'task-release', 'web-guidance',
                                                                  'web-lifecycle', 'web-merge-slot',

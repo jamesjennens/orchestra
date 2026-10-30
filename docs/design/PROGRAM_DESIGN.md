@@ -476,8 +476,8 @@ it), applied across levels.
   superuser who is only a viewer does not count), and its grant is in force. An operator's record counts while its exact
   actor is on the allowlist. A bare name counts for nothing.
 - **A program decision counts** when an owner-only one was attested by a person owner of the program or an operator
-  (`owner-only-not-by-owner` otherwise), and another by a coordinator, an owner or an operator (`not-by-coordinator`
-  otherwise). A coordinator agent's attestation counts as coordinator, never owner.
+  (`owner-only-not-by-owner` otherwise), and another by a coordinator, an owner or an operator (anyone else reads
+  `attester-not-authorised`). A coordinator agent's attestation counts as coordinator, never owner.
 - **An adoption**, per bound area: `adopted`, `not-adopted`, `adoption-invalid` (with the reason), what the row reads as
   when it does not count (`closed` when only closed adoptions remain, `not-attested`, `attestation-stale`,
   `attester-not-authorised`), `superseded-upstream` (a counting adoption of a decision this one supersedes, and none of

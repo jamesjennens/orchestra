@@ -15,7 +15,7 @@ clock; callers pass what they read.
 """
 import re
 
-from decision_attest import COORDINATORS, NOT_WORK_TYPES, OWNERS, is_decision, standing
+from decision_attest import NOT_WORK_TYPES, OWNERS, is_decision, standing
 
 AREA = r'[a-z][a-z0-9]{1,23}'
 ISSUE = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,160}'
@@ -76,8 +76,8 @@ def program_decision(row, program, state, operators, journals=None):
 
     It counts only without flags: one that does not read as attested (``closed``, ``not-attested``,
     ``attestation-stale``, ``attester-not-authorised``), an owner-only decision not attested by a person owner of the
-    program or an operator (``owner-only-not-by-owner``), another not attested by a coordinator of the program
-    (``not-by-coordinator``), or one whose lines do not read (``malformed-lines``) binds nothing."""
+    program or an operator (``owner-only-not-by-owner``), or one whose lines do not read (``malformed-lines``) binds
+    nothing. A row that counts has a coordinator's standing or better, so any other decision of that standing counts."""
     if not is_decision(row):
         return None
     found = lines(row)
@@ -92,15 +92,10 @@ def program_decision(row, program, state, operators, journals=None):
         flags.append(attested['state'])
         reasons.append(attested['reason'])
     elif not flags:
-        who = attested['role']
-        if found['owner_only'] and who not in OWNERS:
+        if found['owner_only'] and attested['role'] not in OWNERS:
             flags.append('owner-only-not-by-owner')
             reasons.append('an owner-only decision counts only when a person owner of %s or an operator attested it'
                            % program)
-        elif not found['owner_only'] and who not in COORDINATORS:
-            flags.append('not-by-coordinator')
-            reasons.append('a program decision counts only when a coordinator or an owner of %s, or an operator, '
-                           'attested it' % program)
     from trace_read import SUPERSEDES
     description = row.get('description') if isinstance(row.get('description'), str) else ''
     first = SUPERSEDES.fullmatch(description.split('\n')[0].rstrip('\r'))
@@ -119,15 +114,8 @@ def adoption(row, decision, program, area, area_rows, state, operators, journals
     attested = standing(row, area, state, operators, _journal(journals, area))
     if attested['state'] != 'counts':
         return attested['state'], attested['reason']
-    who = attested['role']
-    if not decision['owner_only']:
-        if who in COORDINATORS:
-            return 'adopted', None
-        return 'adoption-invalid', 'the adoption was not written by a coordinator or an owner of %s' % area
-    if who in OWNERS:
+    if not decision['owner_only'] or attested['role'] in OWNERS:
         return 'adopted', None
-    if who not in ('coordinator', 'agent-coordinator'):
-        return 'adoption-invalid', 'the adoption was not written by a coordinator or an owner of %s' % area
     if found['per'] is None:
         return 'adoption-invalid', ('an owner-only decision is adopted by a person owner of %s, or by a coordinator '
                                     'whose adoption cites the owner\'s decision with Per:' % area)

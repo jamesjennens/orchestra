@@ -281,6 +281,12 @@ class DecisionTests(unittest.TestCase):
             self.assertIn(word, reason)
         unattested = bare('north-6', 'Authorises: decision:prog/prog-1', created_by=OWNER)
         self.assertEqual('adoption-invalid', self.adopt(owner_only, row, unattested)[0])
+        # P11: an attested row that is no decision any more is no owner's decision.
+        not_one = decision('north-6', OWNER, 'Authorises: decision:prog/prog-1', labels=['decision'], issue_type='task')
+        self.assertEqual('adopted', self.adopt(owner_only, row, not_one)[0])
+        verdict, reason = self.adopt(owner_only, row, dict(not_one, labels=[]))
+        self.assertEqual('adoption-invalid', verdict)
+        self.assertIn('names no decision', reason)
         twice = decision('north-6', OWNER, 'Authorises: decision:prog/prog-1', 'Authorises: decision:prog/prog-2')
         verdict, reason = self.adopt(owner_only, row, twice)
         self.assertEqual('adoption-invalid', verdict)
