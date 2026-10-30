@@ -125,7 +125,7 @@ class EndpointDispatchTests(unittest.TestCase):
         written = self.execute(['propose', '@attachment:0'], attachments)
         self.assertEqual(written['returncode'], 0, written)
         self.assertEqual(json.loads(written['stdout'])['state'], 'draft')
-        self.assertEqual((self.locks.call_count, self.guarded), (1, ['ref']))
+        self.assertEqual((len(ordinary_calls(self.locks)), self.guarded), (1, ['ref']))
         self.locks.reset_mock()
         self.guarded.clear()
         got = self.execute(['get', 'calendar.trading', '--json'])
@@ -134,7 +134,7 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual(json.loads(listed['stdout'])['total'], 1)
         helped = self.execute(['--help'])
         self.assertEqual(json.loads(helped['stdout'])['action'], 'ref')
-        self.assertEqual((self.locks.call_count, self.guarded), (0, []))
+        self.assertEqual((len(ordinary_calls(self.locks)), self.guarded), (0, []))
 
     def test_the_payload_must_come_from_the_file_and_must_not_set_its_operation(self):
         for args, attachments, message in (

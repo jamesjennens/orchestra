@@ -428,7 +428,7 @@ class EndpointDispatchTests(unittest.TestCase):
         aliased = self.execute(['propose-alias', 'review.structured-contribution', 'reserved label guard'],
                                actor=OPERATOR)
         self.assertEqual((aliased['state'], aliased['identity']), ('proposed', 'unverified'))
-        self.assertEqual((self.locks.call_count, self.guarded), (2, ['capability', 'capability']))
+        self.assertEqual((len(ordinary_calls(self.locks)), self.guarded), (2, ['capability', 'capability']))
         self.locks.reset_mock()
         self.guarded.clear()
         flocked = []
@@ -474,13 +474,13 @@ class EndpointDispatchTests(unittest.TestCase):
         done = self.execute(['verify', '@attachment:0'], {'0': {'flag': '--file', 'text': json.dumps(check)}},
                             actor=OPERATOR)
         self.assertEqual((done['identity'], done['passed'], done['reconciled']), ('unverified', True, False))
-        self.assertEqual((self.locks.call_count, self.guarded), (1, ['capability']))
+        self.assertEqual((len(ordinary_calls(self.locks)), self.guarded), (1, ['capability']))
         self.locks.reset_mock()
         self.guarded.clear()
         view = self.execute(['get', item['key']])
         self.assertEqual((view['verification']['state'], view['verification']['verified_at']), ('reported', None))
         self.assertEqual(self.execute(['list'])['items'][0]['verification'], 'reported')
-        self.assertEqual((self.locks.call_count, self.guarded), (0, []))
+        self.assertEqual((len(ordinary_calls(self.locks)), self.guarded), (0, []))
 
 
 class OperatorCommandTests(unittest.TestCase):

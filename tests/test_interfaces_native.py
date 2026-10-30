@@ -113,6 +113,11 @@ class NativeInterfaceTests(fixture.NativeLinkTests):
         uid=h.create_account(self.owner,'iface-coord','iface-password-1')
         self.assertEqual(200,h.request('PUT','/v1/projects/pp/members/'+uid,{'role':'coordinator'},token=self.owner).status)
         limited=h.login('iface-coord','iface-password-1')[0]
+        unauthorized=h.request('POST','/v1/projects/pp/interfaces',dict(body,key='iface.unauthorized.v1'),
+                               token=limited,key='native-source-coordination-refused')
+        self.assertEqual(409,unauthorized.status,unauthorized.data)
+        self.assertIn('coordination',unauthorized.data['error']['message'])
+        self.assertEqual(before,self.r.bd('export','--all').stdout)
         hidden=h.request('POST','/v1/projects/pp/interfaces/iface.quotes.v1/accept',
                          {'expected_revision':3,'record_sha256':revised.data['sha256'],'evidence':'hidden'},
                          token=limited,key='native-retire-hidden')
@@ -135,3 +140,18 @@ class NativeInterfaceTests(fixture.NativeLinkTests):
                         token=self.owner,key='native-retire-complete')
         self.assertEqual(200,final.status,final.data)
         self.assertEqual('retired',h.request('GET','/v1/projects/pp/interfaces/iface.quotes.v1',token=self.owner).data['lifecycle'])
+
+        # The configured host operator route shares the native kind and F3 checks.
+        decision=json.loads(self.r.bd('create','Synthetic operator interface review','--type','decision','--json').stdout)['id']
+        operator_body=payload(operation='draft',operation_id='native-operator-interface',key='iface.operator.v1',
+                              acceptance_state='accepted',acceptance=acceptance(decision_id=decision))
+        file=self.root/'operator-interface.json';file.write_text(json.dumps(operator_body))
+        command=[sys.executable,str(Path(__file__).resolve().parents[1]/'admin.py'),'--root',str(self.root),
+                 'interface-apply','pp','--actor','ops','--file',str(file)]
+        result=subprocess.run(command,env=native_fixture.admin.environment(self.root),capture_output=True,text=True,timeout=90)
+        self.assertEqual(0,result.returncode,result.stderr)
+        self.assertEqual('accepted',json.loads(result.stdout)['lifecycle'])
+        before_retry=self.r.bd('export','--all').stdout
+        retry=subprocess.run(command,env=native_fixture.admin.environment(self.root),capture_output=True,text=True,timeout=90)
+        self.assertEqual(0,retry.returncode,retry.stderr)
+        self.assertEqual(before_retry,self.r.bd('export','--all').stdout)

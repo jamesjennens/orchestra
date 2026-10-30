@@ -47,6 +47,8 @@ def tree(path):
             if item.is_file() and item.suffix != '.lock'}       # lock files are empty and made on first use
 
 
+from tests.lock_fixture import ordinary_calls
+
 class RetireCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -219,7 +221,8 @@ class RetireCase(unittest.TestCase):
         self.assertIn('Unknown project', stderr)
         self.assertEqual(tree(self.root), before)
         self.assertEqual(self.bd, [])                               # refused before any native call
-        self.flock.assert_not_called()
+        # The deployment mutex precedes the operation; no project lock or receipt I/O occurs.
+        self.assertEqual(ordinary_calls(self.flock), [])
 
     def test_the_force_rule_fails_closed(self):
         # Review 01a10219, P2 and P3 (a): what cannot be read is treated as the dangerous
@@ -796,7 +799,8 @@ class ReconcileAllowlistCase(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Actor mallory is not a server-side configured operator'):
                     self.run_admin(command, flag, extra, 'mallory')
         self.native.assert_not_called()
-        self.flock.assert_not_called()
+        # The deployment mutex precedes the operation; no project lock or receipt I/O occurs.
+        self.assertEqual(ordinary_calls(self.flock), [])
         self.assertEqual(sorted(path.name for path in self.project.iterdir()), ['.beads'])   # no journal made
 
     def test_an_empty_allowlist_authorizes_nobody_and_says_what_to_do(self):

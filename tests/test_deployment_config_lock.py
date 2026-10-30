@@ -362,7 +362,7 @@ class PrivateWriteLeftoverTests(unittest.TestCase):
         # The fallback for an fcntl with no LOCK_NB: one blocking flock, then the same work.
         import types
         from unittest.mock import Mock
-        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
+        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
         (self.root / '.deployment.private.json.abcd1234').write_text('{}', encoding='utf-8')
         with patch.dict(sys.modules, {'fcntl': fake}):
             result, err = self.flip('on')

@@ -521,7 +521,7 @@ class RecordTests(MissLogCase):
             self.assertNotIn(forbidden, source.split('"""', 2)[2], forbidden)
 
     def test_without_flock_nothing_is_written(self):
-        for missing in (None, types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)):   # no fcntl; a stub without LOCK_NB
+        for missing in (None, types.SimpleNamespace(flock=Mock(), LOCK_EX=2)):   # no fcntl; a stub without LOCK_NB
             with patch.object(cm, 'fcntl', missing):
                 self.assertEqual(self.record('merge slot'), 'unsupported')
         self.assertEqual(os.listdir(self.project), [])
