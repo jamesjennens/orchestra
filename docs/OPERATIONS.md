@@ -3050,8 +3050,11 @@ weight.
   than today; the refusal names the UTC date.
 - **Past its review date.** An accepted attested entry whose `review_by` has passed
   still reads `state: accepted`, with `due: expired`, like any entry. Its
-  `authority_note` then says `PAST ITS REVIEW DATE`: check the fact again and revise or
-  re-accept the entry.
+  `authority_note` then says `PAST ITS REVIEW DATE`: check the fact again, revise the
+  entry with a fresh observation and review date, then accept that pending draft.
+  A fresh accept of an already live accepted revision is refused. Acceptance made
+  inert by removal of its operator is different: a currently listed operator may
+  accept the newest revision again to repair its acceptance evidence.
 - **Many at once.** Put the reviewed drafts in one batch (`items`) under one decision.
   An item that fails a rule above is reported `refused` with its reason, and the others
   are still accepted.

@@ -5,27 +5,30 @@ import { myContributionsPanel } from './proposals.js';
 
 function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
   if (!rows.length) return empty(emptyTitle, emptyBody);
-  return h('div', { class: 'table-wrap' }, h('table', null,
+  return h('div', { class: 'table-wrap' }, h('table', { class: 'task-list-work' },
     h('thead', null, h('tr', null,
-      h('th', { scope: 'col' }, 'Task'), showProject ? h('th', { scope: 'col', class: 'hide-narrow' }, 'Project') : null,
-      h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col' }, 'Next action'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Updated'))),
+      h('th', { scope: 'col', class: 'task-title-column' }, 'Task'),
+      showProject ? h('th', { scope: 'col', class: 'hide-narrow task-project-column' }, 'Project') : null,
+      h('th', { scope: 'col', class: 'task-state-column' }, 'State'),
+      h('th', { scope: 'col', class: 'task-next-column' }, 'Next action'),
+      h('th', { scope: 'col', class: 'hide-narrow task-updated-column' }, 'Updated'))),
     h('tbody', null, rows.map((t) => {
       const href = ctx.href(`/p/${t.project_id}/t/${t.id}`);
       return h('tr', { class: 'row-link', onclick: (e) => { if (e.target.tagName !== 'A') ctx.go(`/p/${t.project_id}/t/${t.id}`); } },
-        h('td', null,
+        h('td', { class: 'task-title-cell' },
           // A requirement record is not claimable work: marked plainly wherever a row is
           // shown, with the way to the page it is edited on (kittrial-5bb.277).
           t.requirement_record ? h('span', { class: 'chip', title: 'A requirement record, not claimable work' }, 'Requirement') : null,
-          h('a', { class: 'title', href }, t.title), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id),
+          h('a', { class: 'title task-list-title', href, title: t.title || t.id }, t.title || t.id), h('div', { class: 'sub' }, t.priority != null ? [priority(t.priority), ' · '] : null, h('span', { class: 'mono' }, t.id),
             t.requirement_record ? [' · ', h('a', { href: ctx.href(`/p/${t.project_id}/requirements`) }, 'Edit on Requirements')] : null)),
-        showProject ? h('td', { class: 'hide-narrow' }, t.project_name || '') : null,
-        h('td', null, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
-        h('td', null, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—'),
+        showProject ? h('td', { class: 'hide-narrow task-project-column' }, t.project_name || '') : null,
+        h('td', { class: 'task-state-column' }, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
+        h('td', { class: 'task-next-column' }, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—'),
           t.blocked ? [' ', h('span', { class: 'chip crit', title: 'The latest checkpoint lists unresolved items' }, 'Blocked')] : null,
           t.recommended ? [' ', h('span', { class: 'chip ok', title: 'A reviewer recommends approving this revision. An owner still decides.' }, 'Recommended')] : null,
           t.pending_request_ids && t.pending_request_ids.length ? h('div', { class: 'sub' }, 'Open requests: ', t.pending_request_ids.join(', ')) : null),
         // Canonical queue rows carry no update time; the review wait start is shown instead.
-        h('td', { class: 'hide-narrow muted' }, t.updated_at ? time(t.updated_at) : t.waiting_since ? time(t.waiting_since) : ''));
+        h('td', { class: 'hide-narrow muted task-updated-column' }, t.updated_at ? time(t.updated_at) : t.waiting_since ? time(t.waiting_since) : ''));
     }))));
 }
 
