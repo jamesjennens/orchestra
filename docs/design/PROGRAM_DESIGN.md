@@ -494,8 +494,8 @@ it), applied across levels.
   An owner's level (a person owner or an operator) for a text that says `Owner-only: yes`, that carries `Authorises:`, or
   an adoption a person owner or an operator attested; otherwise an owner or a coordinator, agents by the grant rule. That
   level comes from the record, not from the text now. The web refuses anyone else with 403. Every host route refuses
-  everyone, an operator included; an operator uses `admin.py decision-change`. Closed rows moving between `in_progress`
-  and `open` through task assign and release do not reach this gate, and neither changes what binds. A row with no
+  everyone, an operator included; an operator uses `admin.py decision-change`. A row moving from `in_progress` to
+  `open` through task assign or release does not reach this gate, and that changes nothing that binds. A row with no
   attestation is not gated: retyping a task as a decision only makes a row that reads `not-attested`.
 - **What a contributor can still do:** edit the text. That makes the row `attestation-stale`, which binds nothing and is
   visible, so it can only remove a binding, never create one. It is not refused.
