@@ -112,6 +112,20 @@ def assert_area_rows_hidden(test, request, program, area, missing, callers):
                          {key for key in absent if key not in ('area', 'state')}, label)
 
 
+def assert_adoptions_hidden(test, request, program, area, missing, callers):
+    """kittrial-5bb.454: in every decision of the program view, the entry of ``area`` (which the caller may not read)
+    equals the entry of ``missing`` (no such project, but bound): ``not-visible`` and nothing else, no adoption id and
+    no reason."""
+    for label, token in callers.items():
+        answer = request('GET', '/v1/projects/%s/program' % program, token=token)
+        test.assertEqual(200, answer.status, (label, answer.data))
+        for decision in answer.data['decisions']['items']:
+            areas = decision.get('areas') or {}
+            if area in areas or missing in areas:
+                test.assertEqual({'state': 'not-visible'}, areas.get(area), (label, decision['id']))
+                test.assertEqual(areas.get(area), areas.get(missing), (label, decision['id']))
+
+
 def assert_text_hidden(test, request, text, callers, projects):
     """``text`` appears in no answer any of ``callers`` ({label: token}) gets from every area read of each of
     ``projects`` and every personal read: a note's text is for the coordinators of its two projects only."""

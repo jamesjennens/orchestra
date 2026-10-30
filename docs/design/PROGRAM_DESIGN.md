@@ -372,7 +372,7 @@ for the caller, then reports:
     requirements section (review of .453, B2). After three reads that each lose a right, the requirements section
     is `unsettled`, with no row.
 - **Interfaces** read `not-available` until slice 3 (kittrial-5bb.450) is merged forward. **Decisions** and
-  **suggestions** read `unchecked` until slice 5.
+  **suggestions** are slice 5's (kittrial-5bb.454, as built under section 6).
 - **Requirements:** each accepted program requirement that no readable area of this read cites (`no-area-cites`),
   and each area design section pinning a superseded program revision (`cites-superseded-revision`), 50 rows a page.
   The coverage says they are counted over the readable areas of this read only.
@@ -443,6 +443,38 @@ At every level:
 
 This is .401's grant rule (a granting decision counts only if a person owner or operator wrote
 it), applied across levels.
+
+**As built (kittrial-5bb.454, slice 5):**
+- **One module:** `program_decisions.py` reads the four lines and decides who wrote each row. The program view
+  (endpoint action `program`, web route, `trace --program`) and the trace's decisions view use it alike.
+- **The lines:** `Binds: <area>, <area>`, `Owner-only: yes|no`, `Adopts: decision:<program>/<id>` and
+  `Per: decision:<area>/<id>`, each a whole line anywhere in the description, at most once. A repeat or a line that
+  does not read makes the row `malformed-lines`: it binds and adopts nothing. A binding decision has both a
+  `Binds:` and an `Owner-only:` line. An event or gate row is never a decision.
+- **Who wrote a row** is its native `created_by`, trusted only for what cannot be forged there:
+  - a bare `usr_` or `agent_` id reaches the tracker only from the web service, under a live descriptor naming it;
+  - every host route refuses that shape and its look-alikes: upper case, white space, `/label`, anything outside
+    plain ASCII, and any name that begins `usr_` or `agent_` once normalised (`reserved_comments.refuse_http_actor`,
+    asked in `execute` before any action and in `admin.py` before any command);
+  - any other name counts only as an operator on the allowlist, by its exact name;
+  - `created_by` is the first writer's: no contributor write takes an identity flag (`--actor`, `--author` and the
+    rest are refused) and bd has no command that rewrites it.
+- **Authority is decided live at every read** from the web state: a person by their role and an enabled account;
+  an agent only while it is enabled, holds the project, its account is enabled and is itself owner or coordinator
+  there (a superuser who is only a viewer does not count), and its grant is in force. An author who has lost the
+  role since stops counting at the next read.
+- **A program decision counts** when an owner-only one was written by a person owner of the program or an
+  operator (`owner-only-not-by-owner` otherwise), and another by a coordinator, an owner or an operator
+  (`not-by-coordinator` otherwise). One that does not count binds nothing.
+- **An adoption**, per bound area: `adopted`, `not-adopted`, `adoption-invalid` (with the reason),
+  `superseded-upstream` (an adoption of a decision this one supersedes, and none of this one), `not-visible` (not
+  readable or no such project: the same entry, nothing else), `not-in-program` (the program's side is not in: never
+  read) or `not-checked` (off this page of areas, or outside a bound key). An agent never satisfies an owner-only
+  rule: not alone, and not through a `Per:` decision an agent wrote.
+- **Suggestions:** the program's open tasks labelled `suggestion`, oldest first, 50 a page, with their `From:` line
+  as written; no area is read for them.
+- **The trace:** an area's decisions view marks each `Adopts:` decision with the same state when the caller may read
+  the program (.449's loader), and `not-visible` otherwise.
 
 ## 7. What is reused from .401, and what is new
 
@@ -517,7 +549,7 @@ web service's read (`program_links_read`), with no change to the records.
 4. **The program view and the Program page.**
    - `GET …/program`: areas, interfaces with the §4.4 flags, program requirements' coverage;
      bounds and the coverage block. The client `trace --program`.
-   - The decision and suggestion sections show `unchecked` until slice 5.
+   - The decision and suggestion sections are slice 5's (kittrial-5bb.454).
    - Depends on slices 1-3, and on .401 slice 4's trace read.
 5. **Decisions across levels.**
    - The `Binds:`, `Owner-only:`, `Adopts:` and `Per:` lines, checked live, with their flags.

@@ -10816,7 +10816,14 @@ def main():
                    help='set the high-water mark to the current clock and clear clock suspicion (after a clock correction)')
     a.add_argument('--stats',action='store_true',
                    help='report the journal size (rows by state, bytes on disk, bounds); this is the default inspection')
-    args=p.parse_args();root=root_path(args.root)
+    args=p.parse_args()
+    # kittrial-5bb.454 (the trust boundary): no host command acts under an HTTP-shaped actor or a look-alike. Asked
+    # first, before the root or anything else is looked at.
+    if isinstance(getattr(args,'actor',None),str):
+        from reserved_comments import refuse_http_actor
+        try:refuse_http_actor(args.actor,False)
+        except ValueError as error:raise SystemExit('admin.py: %s'%error)
+    root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
     elif args.command=='finish-project':

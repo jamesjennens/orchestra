@@ -2181,6 +2181,27 @@ def refuse_http_actor(actor, launched_by_service):
     start the endpoint however it likes; that caller is inside the trust boundary of
     every check in this kit.
     """
-    if not launched_by_service and isinstance(actor, str) and HTTP_ACTOR.fullmatch(actor):
+    if launched_by_service or not isinstance(actor, str):
+        return
+    if any(ord(character) < 0x21 or ord(character) > 0x7e for character in actor):
+        # kittrial-5bb.454 (the trust boundary): white space, a control character or anything outside printable
+        # ASCII (look-alikes and confusables of an HTTP id included) is never a host actor.
+        raise ValueError('Actor %s holds a space or a character outside plain ASCII; declare your own session actor '
+                         'in plain letters, digits and . _ @ / -' % ascii(actor[:40]))
+    if http_actor_like(actor):
         raise ValueError('Actor %s has the shape of an HTTP account or agent id, which only the HTTP service '
                          'acts under; declare your own session actor' % actor[:40])
+
+
+def http_actor_like(actor):
+    """Whether a name reads as an HTTP account or agent id: the exact shape (``usr_`` or ``agent_`` and 16 lowercase
+    hex, alone or with ``/label``), or, once normalised (NFKC, case folded, surrounding space removed), any name that
+    begins with ``usr_`` or ``agent_``, however the rest is written (kittrial-5bb.454, the trust boundary: an
+    HTTP-shaped ``created_by`` is trusted as written by the web service, so no host route may write a look-alike)."""
+    if not isinstance(actor, str):
+        return False
+    if HTTP_ACTOR.fullmatch(actor):
+        return True
+    import unicodedata
+    folded = unicodedata.normalize('NFKC', actor).strip().casefold()
+    return folded.startswith(('usr_', 'agent_'))

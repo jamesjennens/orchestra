@@ -22,8 +22,8 @@ NOT_WORK_TYPES = ('epic', 'event', 'gate')
 
 NOT_VISIBLE = 'not visible to you'
 INTERFACES_NOT_AVAILABLE = 'The interface register (kittrial-5bb.450, slice 3) is not in this build yet.'
-DECISIONS_UNCHECKED = 'Decisions across levels come with slice 5.'
-SUGGESTIONS_UNCHECKED = 'Suggestions from areas come with slice 5.'
+DECISIONS_SCOPE = ('Adoptions are read from the readable areas of this read only: an area that is not visible to '
+                   'you reads not-visible, and one not on this page of areas reads not-checked.')
 COORDINATORS_ON_THE_WEB = 'Coordinators are shown on the web Program page.'
 REQUIREMENTS_UNSETTLED = ('Rights changed while this page was read, so the program requirements are not shown: '
                           'read the page again.')
@@ -45,15 +45,19 @@ def parse_args(args):
     parser.add_argument('--limit', type=int, default=AREAS_MAX)
     parser.add_argument('--idle-minutes', type=int, default=lanes.DEFAULT_IDLE_MINUTES, dest='idle_minutes')
     parser.add_argument('--requirements-offset', type=int, default=0, dest='requirements_offset')
+    parser.add_argument('--decisions-offset', type=int, default=0, dest='decisions_offset')
+    parser.add_argument('--suggestions-offset', type=int, default=0, dest='suggestions_offset')
     parser.add_argument('--json', action='store_true')       # the answer is always JSON
     parsed = parser.parse_args(list(args))
-    if not 1 <= parsed.limit <= AREAS_MAX or parsed.offset < 0 or parsed.requirements_offset < 0:
+    if not 1 <= parsed.limit <= AREAS_MAX or min(parsed.offset, parsed.requirements_offset, parsed.decisions_offset,
+                                                 parsed.suggestions_offset) < 0:
         raise ValueError('Invalid program read: --limit must be 1..%d, and the offsets must be >= 0' % AREAS_MAX)
     if not lanes.IDLE_MINUTES_MIN <= parsed.idle_minutes <= lanes.IDLE_MINUTES_MAX:
         raise ValueError('Invalid program read: --idle-minutes must be %d..%d'
                          % (lanes.IDLE_MINUTES_MIN, lanes.IDLE_MINUTES_MAX))
     return {'offset': parsed.offset, 'limit': parsed.limit, 'idle_minutes': parsed.idle_minutes,
-            'requirements_offset': parsed.requirements_offset}
+            'requirements_offset': parsed.requirements_offset, 'decisions_offset': parsed.decisions_offset,
+            'suggestions_offset': parsed.suggestions_offset}
 
 
 def area_keys(items):
@@ -200,7 +204,11 @@ def coverage(areas, total_areas, offset, requirements):
             'areas_total': total_areas, 'rows_read': rows_read, 'cut': cut}
 
 
-def answer(program, areas, total_areas, offset, limit, requirements):
+def empty_section():
+    return {'items': [], 'total': 0, 'next_offset': None}
+
+
+def answer(program, areas, total_areas, offset, limit, requirements, decisions=None, suggestions=None):
     """The whole answer, from what the endpoint read (no I/O)."""
     following = offset + limit
     return {'schema': 'program-view-v1', 'program': program,
@@ -208,6 +216,6 @@ def answer(program, areas, total_areas, offset, limit, requirements):
                       'next_offset': following if following < total_areas else None},
             'interfaces': {'state': 'not-available', 'note': INTERFACES_NOT_AVAILABLE},
             'requirements': requirements,
-            'decisions': {'state': 'unchecked', 'note': DECISIONS_UNCHECKED},
-            'suggestions': {'state': 'unchecked', 'note': SUGGESTIONS_UNCHECKED},
+            'decisions': dict(decisions or empty_section(), scope=DECISIONS_SCOPE),
+            'suggestions': dict(suggestions or empty_section()),
             'coverage': coverage(areas, total_areas, offset, requirements)}

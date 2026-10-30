@@ -896,6 +896,9 @@ project linked with it in a program, and the addressed agents are woken.
   since hides the row, and the page is read again without that area, so its citations leave the requirements
   section too (at most three reads; then the section reads `unsettled`).
 - **An area whose program side is not in** (proposed, left, not accepted by an owner) is never read.
+- **Decisions and suggestions** (kittrial-5bb.454): `decisions_offset` and `suggestions_offset` page them, 50 at a
+  time. Who wrote a decision or an adoption is its native author, decided live against this service's state; a host
+  route refuses any actor shaped like an account or agent id, and its look-alikes.
 - **The Program page** is in the menu of a project with an accepted `program.area.*` side: a flag kept in the web
   state (`program_flags`), recomputed by every program read and by a web accept or retire of a `program.` key.
   An older kit leaves it untouched; a stale flag only shows or hides the link.

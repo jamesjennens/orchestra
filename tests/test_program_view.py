@@ -3,7 +3,7 @@
 GET /v1/projects/{program}/program and the client's `trace --program` read one page of a program's areas through the
 endpoint's `program` action, with .449's readable-set rule. Permission comes before counts: an area the caller may
 not read, and an area that does not exist, give the same row, "not visible to you", with no number. The interfaces
-section reads `not-available` until .450; decisions and suggestions read `unchecked` until slice 5.
+section reads `not-available` until .450; decisions and suggestions are kittrial-5bb.454's (test_program_decisions).
 """
 import json
 import subprocess
@@ -158,12 +158,13 @@ class CoverageTests(unittest.TestCase):
     def test_the_sections_of_later_slices_say_so(self):
         answer = program_view.answer('prog', [], 0, 0, 50, program_view.requirements_section(FakePointers([]), {}, [], 0))
         self.assertEqual({'state': 'not-available', 'note': program_view.INTERFACES_NOT_AVAILABLE}, answer['interfaces'])
-        self.assertEqual('unchecked', answer['decisions']['state'])
-        self.assertEqual('unchecked', answer['suggestions']['state'])
+        self.assertEqual((program_view.DECISIONS_SCOPE, [], []),
+                         (answer['decisions']['scope'], answer['decisions']['items'], answer['suggestions']['items']))
         self.assertIn('kittrial-5bb.450', program_view.INTERFACES_NOT_AVAILABLE)
 
     def test_the_arguments(self):
-        self.assertEqual({'offset': 0, 'limit': 50, 'idle_minutes': 15, 'requirements_offset': 0},
+        self.assertEqual({'offset': 0, 'limit': 50, 'idle_minutes': 15, 'requirements_offset': 0, 'decisions_offset': 0,
+                          'suggestions_offset': 0},
                          program_view.parse_args([]))
         for bad in (['--limit', '51'], ['--limit', '0'], ['--offset', '-1'], ['--idle-minutes', '0'],
                     ['--requirements-offset', '-1'], ['--view', 'x']):
@@ -260,7 +261,7 @@ class WebTests(LinkCase):
         # without north, so K1 reads no-area-cites and no row names north's design.
         seen = []
 
-        def program(project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=()):
+        def program(project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(), **_):
             seen.append(sorted(readable))
             north = 'north' in readable
             areas = [program_view.area_row('north', 'linked', {'open_tasks': 1, 'rows_read': 9,
@@ -293,7 +294,7 @@ class WebTests(LinkCase):
         # reads the row is hidden and the requirements section is unsettled, with no row at all.
         seen = []
 
-        def program(project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=()):
+        def program(project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(), **_):
             seen.append(sorted(readable))
             areas = [program_view.area_row('north', 'linked', {'open_tasks': 1, 'rows_read': 9,
                                                                 'lanes': {'waiting_too_long': 0, 'expect_by_passed': 0}})]
@@ -353,7 +354,7 @@ class WebTests(LinkCase):
     def test_the_sections_coverage_and_bounds(self):
         data = self.view(self.tokens['vera'])
         self.assertEqual('not-available', data['interfaces']['state'])
-        self.assertEqual(('unchecked', 'unchecked'), (data['decisions']['state'], data['suggestions']['state']))
+        self.assertEqual(([], []), (data['decisions']['items'], data['suggestions']['items']))
         self.assertEqual('1 of 2 linked areas readable; 0 rows read', data['coverage']['text'])
         for query in ('?limit=51', '?view=tasks', '?requirements_offset=x', '?idle_minutes=0'):
             self.assertIn(self.request('GET', '/v1/projects/prog/program' + query, token=self.tokens['vera']).status,
@@ -568,8 +569,8 @@ console.log(JSON.stringify({text:host.textContent,
                 'interfaces': {'state': 'not-available', 'note': program_view.INTERFACES_NOT_AVAILABLE},
                 'requirements': {'items': [{'key': 'K2', 'title': 'Queue', 'flags': ['no-area-cites']}],
                                  'scope': program_view.REQUIREMENTS_SCOPE},
-                'decisions': {'state': 'unchecked', 'note': program_view.DECISIONS_UNCHECKED},
-                'suggestions': {'state': 'unchecked', 'note': program_view.SUGGESTIONS_UNCHECKED}}
+                'decisions': {'items': [], 'scope': program_view.DECISIONS_SCOPE},
+                'suggestions': {'items': []}}
         done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
                                              (KIT / 'web/js/views/program.js').as_uri(), json.dumps(read))
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -578,7 +579,7 @@ console.log(JSON.stringify({text:host.textContent,
         self.assertEqual(['northlinked310<img src=x onerror=1>Nora (owner)', 'southlinkednot visible to you'],
                          out['rows'])
         for words in ('1 of 2 linked areas readable', program_view.INTERFACES_NOT_AVAILABLE,
-                      program_view.DECISIONS_UNCHECKED, 'no-area-cites'):
+                      program_view.DECISIONS_SCOPE, 'no-area-cites'):
             self.assertIn(words, out['text'])
         self.assertEqual([True, False, False, False], out['flags'])
 
@@ -608,7 +609,10 @@ console.log(JSON.stringify({text:host.textContent,made}));"""
                 'interfaces': {'state': 'not-available', 'note': 'n'},
                 'requirements': {'items': [{'key': 'K1', 'title': names['title'], 'flags': ['no-area-cites']}],
                                  'scope': 's'},
-                'decisions': {'state': 'unchecked', 'note': 'd'}, 'suggestions': {'state': 'unchecked', 'note': 's'}}
+                'decisions': {'items': [{'id': 'p-1', 'title': names['title'], 'owner_only': True, 'flags': [],
+                                         'areas': {'north': {'state': 'adoption-invalid', 'reason': names['person']}}}]},
+                'suggestions': {'items': [{'id': 'p-2', 'title': names['agent'], 'from': names['owner'],
+                                           'created_at': 'T'}]}}
         done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
                                              (KIT / 'web/js/views/program.js').as_uri(), json.dumps(read))
         self.assertEqual(done.returncode, 0, done.stderr)

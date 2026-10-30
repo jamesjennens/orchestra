@@ -1499,10 +1499,12 @@ class InProcessBackend:
         return {'schema_version': 1, 'items': [],
                 'coverage': 'the in-process backend holds no native reference records'}
 
-    def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=()):
-        """kittrial-5bb.453: the program view from this backend's own link reads. It holds no native rows, so a
-        readable area has no open task and no lane, and the program no requirement; the rules are the endpoint's
-        (program_view), over the same link facts."""
+    def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(),
+                decisions_offset=0, suggestions_offset=0):
+        """kittrial-5bb.453: the program view from this backend's own link reads. It holds no native rows (a test may
+        give some in ``native_rows``, {project: rows}), so a readable area has no open task and no lane, and the
+        program no requirement; the rules are the endpoint's (program_view, program_decisions), over the same link
+        facts and the service's own state."""
         import program_view
         items = self.reference_links(project_id).get('items') or []
         entries = program_view.area_keys(items)
@@ -1528,7 +1530,21 @@ class InProcessBackend:
             else:
                 areas.append(program_view.area_row(area, state, program_view.area_details([], {})))
         requirements = {'items': [], 'total': 0, 'next_offset': None, 'scope': program_view.REQUIREMENTS_SCOPE}
-        result = program_view.answer(project_id, areas, len(entries), offset, limit, requirements)
+        import copy
+        import program_decisions
+        native = getattr(self, 'native_rows', None) or {}
+        sides = {area: program_view.program_side(project_id, area, own, memberships, users) for area, own in entries}
+        on_page = {area for area, _ in page}
+        states = {area: ('in' if area in on_page else 'not-checked') for area, side in sides.items() if side == 'in'}
+        read_rows = {row['area']: list(native.get(row['area']) or []) for row in areas if row.get('visible')}
+        with self.service.store.lock:
+            state = copy.deepcopy(self.service.state)
+        operators = list(getattr(self, 'operators', ()) or ())
+        decisions = program_decisions.decisions_section(native.get(project_id) or [], project_id, states, read_rows,
+                                                        state, operators, decisions_offset)
+        suggestions = program_decisions.suggestions_section(native.get(project_id) or [], suggestions_offset)
+        result = program_view.answer(project_id, areas, len(entries), offset, limit, requirements, decisions,
+                                     suggestions)
         result['is_program'] = program_view.accepted_area(items, project_id, memberships, users)
         return result
 
@@ -3452,11 +3468,13 @@ class EndpointBackend:
             raise uncertain('Canonical switch read returned an unexpected shape')
         return payload
 
-    def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=()):
+    def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(),
+                decisions_offset=0, suggestions_offset=0):
         """kittrial-5bb.453: one page of the program view through the endpoint's read-only `program` action, with the
         caller's readable projects as the service's own --readable arguments (the .449 rule)."""
         args = ['--offset', str(offset), '--limit', str(limit), '--idle-minutes', str(idle_minutes),
-                '--requirements-offset', str(requirements_offset)]
+                '--requirements-offset', str(requirements_offset), '--decisions-offset', str(decisions_offset),
+                '--suggestions-offset', str(suggestions_offset)]
         args += ['--readable'] + [arg for project in sorted(readable) for arg in ('--readable', project)][1:] \
             if readable else ['--readable']
         reply = self._endpoint('program', project_id, self.actor_namespace + '/read', args)
@@ -12499,7 +12517,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                                    self.REF_RETIRE_FIELDS, 'A reference retirement',
                                    coordinator=True, key_param=True, status=200)
 
-    PROGRAM_QUERY = ('cursor', 'limit', 'idle_minutes', 'requirements_offset')
+    PROGRAM_QUERY = ('cursor', 'limit', 'idle_minutes', 'requirements_offset', 'decisions_offset', 'suggestions_offset')
     #: Reads of one page when rights change under it (review of .453, B2): each re-read leaves out the areas lost.
     PROGRAM_READS_MAX = 3
 
@@ -12532,13 +12550,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         if limit > program_view.AREAS_MAX:
             raise invalid('limit must be between 1 and %d' % program_view.AREAS_MAX)
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
-        raw = ctx.query.get('requirements_offset', '0')
-        if not isinstance(raw, str) or not raw.isdigit() or len(raw) > 6:
-            raise invalid('requirements_offset must be a whole number from 0 to 999999')
+        offsets = {}
+        for name in ('requirements_offset', 'decisions_offset', 'suggestions_offset'):
+            value = ctx.query.get(name, '0')
+            if not isinstance(value, str) or not value.isdigit() or len(value) > 6:
+                raise invalid('%s must be a whole number from 0 to 999999' % name)
+            offsets[name] = int(value)
+        raw = str(offsets['requirements_offset'])
         pid = ctx.params['pid']
         readable = list(self._readable_projects(ctx.principal))
         for attempt in range(self.PROGRAM_READS_MAX):
-            result = dict(reader(pid, state['o'], limit, idle_minutes, int(raw), readable=readable))
+            result = dict(reader(pid, state['o'], limit, idle_minutes, int(raw), readable=readable,
+                                 decisions_offset=offsets['decisions_offset'],
+                                 suggestions_offset=offsets['suggestions_offset']))
             lost = []
             for row in (result.get('areas') or {}).get('items') or []:
                 if not isinstance(row, dict) or not row.get('visible'):

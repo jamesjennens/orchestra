@@ -1650,7 +1650,10 @@ sets `operation`.
     is the program view of a program project, the endpoint action `program` (PROGRAM_DESIGN.md §5): `areas`
     (link state; for a readable area `open_tasks`, `lanes` and `rows_read`; otherwise `visible: false` and "not
     visible to you"), `interfaces` (`not-available` until slice 3), `requirements` (`no-area-cites`,
-    `cites-superseded-revision`, 50 rows a page), `decisions` and `suggestions` (`unchecked` until slice 5) and
+    `cites-superseded-revision`, 50 rows a page), `decisions` (kittrial-5bb.454: each program decision with a
+    `Binds:` line, its flags, and per bound area `adopted`, `not-adopted`, `adoption-invalid` with the reason,
+    `superseded-upstream`, `not-visible`, `not-in-program` or `not-checked`; `--decisions-offset N`), `suggestions`
+    (open tasks labelled `suggestion`, oldest first, with their `From:` line; `--suggestions-offset N`) and
     `coverage`. At most 50 areas a read. The readable areas are the key's projects, or any project for an
     operator's unbound key; an area outside a bound key's projects is `not-checked` and is never read.
   - `trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]` (kittrial-5bb.425) is the

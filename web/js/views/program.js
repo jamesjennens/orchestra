@@ -54,6 +54,34 @@ export function requirementsTable(requirements) {
       : h('p', { class: 'muted', 'data-empty': 'requirements' }, 'Nothing to show for the areas read.'));
 }
 
+// kittrial-5bb.454: the program's binding decisions, each with its bound areas' adoption states, as text.
+export function decisionsTable(decisions) {
+  const items = (decisions && decisions.items) || [];
+  const rows = items.map((d) => {
+    const areas = Object.entries(d.areas || {}).map(([area, entry]) =>
+      `${area}: ${entry.state}${entry.reason ? ` (${entry.reason})` : ''}`).join('; ');
+    const flags = (d.flags || []).concat(d.superseded ? ['superseded'] : []);
+    return h('tr', { 'data-decision': d.id }, h('td', null, d.id), h('td', null, d.title || ''),
+      h('td', null, d.owner_only ? 'owner-only' : ''), h('td', null, flags.join(', ') || areas));
+  });
+  return h('div', { class: 'stack' },
+    h('p', { class: 'small muted' }, (decisions && decisions.scope) || ''),
+    items.length ? h('table', { class: 'table', 'data-table': 'decisions' },
+      h('thead', null, h('tr', null, ...['Decision', 'Title', 'Kind', 'Areas'].map((label) => h('th', null, label)))),
+      h('tbody', null, ...rows))
+      : h('p', { class: 'muted', 'data-empty': 'decisions' }, 'No program decision binds an area.'));
+}
+
+// The open suggestions from areas, oldest first, with the From: line each cites, as written.
+export function suggestionsTable(suggestions) {
+  const items = (suggestions && suggestions.items) || [];
+  if (!items.length) return h('p', { class: 'muted', 'data-empty': 'suggestions' }, 'No open suggestion.');
+  return h('table', { class: 'table', 'data-table': 'suggestions' },
+    h('thead', null, h('tr', null, ...['Suggestion', 'Title', 'From', 'Raised'].map((label) => h('th', null, label)))),
+    h('tbody', null, ...items.map((s) => h('tr', { 'data-suggestion': s.id }, h('td', null, s.id),
+      h('td', null, s.title || ''), h('td', null, s.from || ''), h('td', null, s.created_at || '')))));
+}
+
 function section(name, title, body) {
   return h('section', { class: 'panel', 'data-panel': name },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, title)),
@@ -67,8 +95,8 @@ export function view(read) {
     section('areas', 'Areas', areasTable(read.areas)),
     section('interfaces', 'Interfaces', note(read.interfaces)),
     section('requirements', 'Program requirements', requirementsTable(read.requirements)),
-    section('decisions', 'Decisions', note(read.decisions)),
-    section('suggestions', 'Suggestions', note(read.suggestions)),
+    section('decisions', 'Decisions', decisionsTable(read.decisions)),
+    section('suggestions', 'Suggestions', suggestionsTable(read.suggestions)),
   ];
 }
 

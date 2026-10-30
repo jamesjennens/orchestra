@@ -479,6 +479,27 @@ line, "not visible to you", with no number; with a key bound to some projects, a
 `not-checked` and is not read at all. 50 areas a page (`--offset`, `--limit`); the coverage block says what was read.
 On the web it is the Program page, in the menu of a program project.
 
+### Decisions across levels and suggestions
+
+For program and area owners and coordinators (kittrial-5bb.454; docs/design/PROGRAM_DESIGN.md §6).
+
+- **A program decision** is a decision issue of the program project with two lines of its own:
+  `Binds: north, south` (the areas it applies to) and `Owner-only: yes` or `no`. An owner-only decision counts only
+  when a person owner of the program (or an operator) wrote it; another when a coordinator or owner of the program
+  (or an operator) did.
+- **It binds an area only when the area adopts it:** a decision issue of the area with the line
+  `Adopts: decision:PROGRAM/ID`.
+  - A decision that is not owner-only is adopted by the area's coordinator, a person or an agent holding the grant.
+  - An owner-only decision is adopted by a person owner of the area, or by an area coordinator whose adoption also
+    has the line `Per: decision:AREA/ID`, naming a decision of the area that a person owner wrote. An agent never
+    adopts an owner-only decision alone, and a `Per:` decision an agent wrote does not count.
+- **Who wrote a row is checked at every read:** someone who has since lost the role stops counting.
+- **A suggestion going up** is a task in the program project labelled `suggestion`, with a line `From:` citing its
+  source (`From: decision:AREA/ID`). The program coordinator answers with a program decision, or closes the task with
+  a reason.
+- **The program view** (`trace --program`, the Program page) lists each decision with its areas' states and the open
+  suggestions; an area you may not read reads `not-visible`, with nothing else.
+
 ## Propose a requirement instead of opening a task
 
 When you find something the product should do and it is not your task, do not open

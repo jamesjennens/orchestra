@@ -1313,9 +1313,15 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
             other_governance=trace_read.read_governance(other_rows,other_path,other)
         from briefing import ContextPointers
         return ContextPointers(other_rows,other,configured_operators(root),governance=other_governance)
+    authority_state=None
+    try:
+        from http_authority import read_state as read_web_state
+        authority_state=read_web_state(authority_config.store if authority_config is not None else root/'http-state.json')
+    except Exception:                       # absent, unreadable or unsupported: no person owner counts
+        authority_state=None
     result=trace_read.answer(rows,name,options,operators=configured_operators(root),verifiers=configured_verifiers(root),
                              members=members,governance=governance,
-                             others=trace_read.others_loader(readable,read_project))
+                             others=trace_read.others_loader(readable,read_project),authority_state=authority_state)
     return result,''.join(run_warnings)
 
 def program_answer(root,path,name,args,actor,authority_config=None,key_projects=None,by_service=False,project_path=None,
@@ -1361,6 +1367,9 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
     except Exception:                       # absent, unreadable or unsupported: no person owner counts
         state=None
     memberships,users=program_links.link_people(state,{name}|{area for area,_ in page})
+    # kittrial-5bb.454: the program's side of every entry, from its records alone, for the decisions section.
+    sides={area:program_view.program_side(name,area,own,memberships,users) for area,own in entries}
+    on_page={area for area,_ in page}
     def read_area(area):
         # An area's rows, read like the program's, or None for no project (no directory, not a project,
         # unfinished): a missing area and one the caller may not read give the same row.
@@ -1374,7 +1383,7 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
             area_rows=cached_export_rows(root,area_path,runner(area_path,area),area)
             area_governance=trace_read.read_governance(area_rows,area_path,area)
         return area_path,area_rows,area_governance
-    areas,cited,pins=[],{},[]
+    areas,cited,pins,read_rows=[],{},[],{}
     for area,own_item in page:
         # Review of .453, B1: the program's own side first, from its records alone. A side that is not in (proposed,
         # left, not accepted by an owner) reads nothing of the area, so a proposed entry tells nothing about whether
@@ -1403,6 +1412,7 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
                          journal=area_path,scope='all',
                          comment_authority=comment_contact_authority(root,area_path,operators,authority_config))['flags']
         areas.append(program_view.area_row(area,link,program_view.area_details(area_rows,flags)))
+        read_rows[area]=area_rows
         snap=trace_read.Snapshot(area_rows,area,now=when,operators=operators,verifiers=configured_verifiers(root),
                                  governance=area_governance)
         found,pinned=program_view.citations_to(snap,name,area)
@@ -1410,7 +1420,14 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
         pins.extend(pinned)
     requirements=program_view.requirements_section(ContextPointers(rows,name,operators,governance=governance),
                                                    cited,pins,options['requirements_offset'])
-    result=program_view.answer(name,areas,len(entries),options['offset'],options['limit'],requirements)
+    import program_decisions
+    states={area:('in' if area in on_page and (facts is None or area in facts) else 'not-checked')
+            for area,side in sides.items() if side=='in'}
+    decisions=program_decisions.decisions_section(rows,name,states,read_rows,state,operators,
+                                                  options['decisions_offset'])
+    suggestions=program_decisions.suggestions_section(rows,options['suggestions_offset'])
+    result=program_view.answer(name,areas,len(entries),options['offset'],options['limit'],requirements,decisions,
+                               suggestions)
     result['is_program']=program_view.accepted_area(reference_records.links(rows,operators).get('items'),name,
                                               memberships,users)
     if not by_service:
@@ -1420,6 +1437,9 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
 
 def execute(root,request,authority_config=None,require_authority=False,key_projects=None,key_principal=None,frame=None):
     key_project_refusal(request,key_projects)
+    # kittrial-5bb.454 (the trust boundary): an HTTP-shaped actor, or a look-alike, is refused on every action of a
+    # host route before any action is answered, so no native row a host route writes carries one.
+    refuse_http_actor(request.get('actor') if isinstance(request,dict) else None,authority_config is not None)
     if isinstance(request,dict) and request.get('action')=='delivery':
         from review_workflow import DELIVERY_SSH_ONLY_HTTP
         raise ValueError(DELIVERY_SSH_ONLY_HTTP)
@@ -1461,7 +1481,6 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     unfinished=project_creation.unfinished(root,name)
     if unfinished:raise ValueError('Unknown/uninitialized project: '+unfinished)
     actor=request.get('actor','')
-    refuse_http_actor(actor,authority_config is not None)
     # Rule 2 (kittrial-5bb.194): a key bound to a principal acts only as that principal's
     # actors in this project. Asked before any action runs; the registry is the only source.
     key_principal_refusal(request,path,key_principal)
