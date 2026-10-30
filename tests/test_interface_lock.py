@@ -144,3 +144,27 @@ class InterfaceLockTests(unittest.TestCase):
                             self.assertEqual(not touches,second_entered.wait(.2))
                         finally:release.set()
                         self.assertEqual(0,one.result(5)['returncode']);self.assertEqual(0,two.result(5)['returncode'])
+
+
+    @unittest.skipIf(os.name=='nt','endpoint is POSIX-only')
+    def test_capability_preflight_authority_refusal_is_403_before_any_native_read(self):
+        import endpoint
+        import http_authority
+        from types import SimpleNamespace
+        from contextlib import ExitStack
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as stack:
+            root=Path(temp);area=root/'projects/area';(area/'.beads').mkdir(parents=True)
+            (area/'.beads/metadata.json').write_text('{}')
+            config=SimpleNamespace(store=root/'state.json')
+            uid='usr_'+'d'*16
+            request={'project':'area','actor':uid,'action':'capability','args':['accept','@attachment:p'],
+                'authority':{'user_id':uid,'via':'session'}}
+            for name in ('http_actor_denial','descriptor_actor_denial','block_mismatch_denial'):
+                stack.enter_context(patch.object(endpoint,name,return_value=None))
+            stack.enter_context(patch.object(endpoint,'verified_web_authority',return_value=True))
+            stack.enter_context(patch.object(endpoint,'configured_coordinator_rules',return_value={}))
+            stack.enter_context(patch.object(endpoint,'configured_operators',return_value=[]))
+            stack.enter_context(patch.object(http_authority,'read_state',return_value={'memberships':{}}))
+            native=stack.enter_context(patch.object(endpoint.native,'run',side_effect=AssertionError('unauthorized native read')))
+            result=endpoint.execute(root,request,authority_config=config,require_authority=True)
+            self.assertEqual(403,result['records_status']);native.assert_not_called()
