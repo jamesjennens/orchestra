@@ -49,6 +49,7 @@ import json
 import re
 import time
 import unicodedata
+from pathlib import Path
 
 import capability_verification as verification
 import keyed_entries
@@ -308,9 +309,12 @@ def _validate_content(payload, collect=False):
     return errors
 
 
-def _pre_write(payload, run, operators=None):
+def _pre_write(payload, run, operators=None, project=None):
     """Reads before the journal: requirement links, and a retirement's successor."""
     if payload['operation'] in ('propose', 'revise', 'draft'):
+        if 'interfaces' in payload and project is not None:
+            from interface_records import valid_interfaces
+            valid_interfaces(payload['interfaces'],Path(project).name)
         check_requirements(payload.get('requirements') or [], run)
     if payload['operation'] == 'retire':
         check_successor(payload['key'], payload['successor'], read_key_and_retired(run, payload['successor']),
@@ -534,7 +538,7 @@ KIND = keyed_entries.AnchoredKind(
     validate_entry=lambda record: validate_entry(record),
     entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
     validate_content=_validate_content, collecting_content=True, write_time_rules=lambda record: None,
-    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators, project=None: _pre_write(payload, run, operators),
+    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators, project=None: _pre_write(payload, run, operators, project),
     extra_records={'capability-alias': _read_alias, 'capability-verification': verification.read_record},
     extra_parsers={'capability-alias': parse_alias, 'capability-verification': verification.parse},
     supports_retire=True,

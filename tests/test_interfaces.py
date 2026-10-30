@@ -199,7 +199,7 @@ class InterfaceCase(unittest.TestCase):
                        comments=[{'id':'future','author':OPERATOR,'text':'Kind: capability-entry-v99\n{}'}])
         self.assertFalse(self.context().usage()[1]['complete'])
         writes=len(self.native.writes())
-        with self.assertRaises(ValueError):self.accept(operation='unknown-capability-refusal')
+        with self.assertRaisesRegex(ValueError,'incomplete coverage'):self.accept(operation='unknown-capability-refusal')
         self.assertEqual(writes,len(self.native.writes()))
 
     def test_complete_transition_receipt_is_backed_up_validated_and_not_releasable(self):
@@ -252,3 +252,22 @@ class InterfaceCase(unittest.TestCase):
         writes=len(self.native.writes())
         with self.assertRaisesRegex(ValueError,'additive'):self.accept(operation='initial-again')
         self.assertEqual(writes,len(self.native.writes()))
+
+    def test_capability_local_and_qualified_alias_cannot_conflict(self):
+        links=[{'iface':'iface:iface.quotes.v1@2','role':'provides'},
+               {'iface':'iface:prog/iface.quotes.v1@3','role':'consumes'}]
+        writes=len(self.native.writes())
+        with self.assertRaisesRegex(ValueError,'Duplicate or conflicting'):
+            cr.apply_native(cap_entry(interfaces=links), 'author', self.native, self.path, operators=[OPERATOR])
+        self.assertEqual(writes,len(self.native.writes()))
+        # A foreign/raw historical record with the same semantic conflict is
+        # unknown coverage, not a missing consumer or a trusted provider.
+        from unittest.mock import patch
+        bad=[{'iface':'iface:iface.quotes.v1@2','role':'provides'},
+             {'iface':'iface:area/iface.quotes.v1@3','role':'consumes'}]
+        self.area.actor=OPERATOR
+        with patch.object(cr,'_pre_write',return_value=None):
+            cr.apply_native(cap_entry(operation='draft',operation_id='foreign-conflict',interfaces=bad,
+                acceptance_state='accepted',acceptance=acceptance()),OPERATOR,self.area,self.path.parent/'area',
+                operator=True,operators=[OPERATOR])
+        self.assertFalse(self.context().usage()[1]['complete'])

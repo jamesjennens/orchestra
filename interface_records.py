@@ -67,7 +67,7 @@ def token(value, here=None):
     return project, match[1], int(match[2])
 
 
-def valid_interfaces(value):
+def valid_interfaces(value, here=None):
     if not isinstance(value, list) or len(value) > MAX_INTERFACES:
         raise ValueError('interfaces must be a list of at most 32 entries')
     seen = set()
@@ -78,7 +78,7 @@ def valid_interfaces(value):
         if item['role'] not in ('provides', 'consumes'):
             raise ValueError('Interface role must be provides or consumes')
         # A capability cannot claim two minima or opposite roles for the same major.
-        project, key, _ = token(item['iface'])
+        project, key, _ = token(item['iface'],here)
         if (project, key) in seen:
             raise ValueError('Duplicate or conflicting interface major on one capability')
         seen.add((project, key))
@@ -315,6 +315,10 @@ class ProgramContext:
             for e in entries:
                 record = e.get('record')
                 if e['state'] == 'accepted' and record:
+                    try: valid_interfaces(record.get('interfaces',[]),area)
+                    except ValueError:
+                        complete=False
+                        continue
                     for item in record.get('interfaces', []):
                         project, key, revision = token(item['iface'], area)
                         if project == self.project:
@@ -390,8 +394,8 @@ class ProgramContext:
             usage, coverage = self.usage()
             consumers = [u for u in usage if u['key'] == record['key'] and u['role'] == 'consumes']
             if not coverage['complete'] or consumers:
-                raise Refusal('Retirement refused: %d areas not visible or incomplete; %d current consumers' %
-                              (coverage['unavailable_areas'], len(consumers)))
+                raise Refusal('Retirement refused: %s coverage; %d areas unavailable; %d known current consumers' %
+                              ('complete' if coverage['complete'] else 'incomplete',coverage['unavailable_areas'],len(consumers)))
 
 
 def flags(record, usage, complete):

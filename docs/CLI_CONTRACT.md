@@ -2604,7 +2604,9 @@ exact/native-identical retries retain the shared receipt contract.
 
 `capability-entry-v2` adds `interfaces`, at most 32 closed `{iface, role}` items:
 `iface` is `iface:<program>/<key>@<positive-revision>` and `role` is `provides` or
-`consumes`. A capability cannot declare duplicate/conflicting minima for one major.
+`consumes`. A capability cannot declare duplicate/conflicting minima for one major. Writes
+resolve the local qualifier for that duplicate check; conflicting historical
+declarations make program coverage incomplete.
 A v1 record's bytes and hash stay unchanged; an omitted field still writes v1,
 while an explicit list (including an empty list withdrawing declarations) writes
 v2. Older readers mark v2 unsupported; they must not accept/revise it as v1. Only
