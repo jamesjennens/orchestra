@@ -9,6 +9,8 @@ expired credential takes effect on the very next read. Every case below names on
 import json
 import sys
 import unittest
+from datetime import datetime, timezone
+from unittest.mock import patch
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
@@ -277,6 +279,12 @@ class ParityTests(ScopeCase):
                                        self.ids['olive'], scope)
 
     def test_the_routes_rows_are_the_canonical_reads_rows_for_the_scope_it_chose(self):
+        # Both reads must see the same instant, including every computed seconds field.
+        now = datetime.now(timezone.utc)
+        clock = patch('lanes.datetime', wraps=datetime)
+        mocked_clock = clock.start()
+        self.addCleanup(clock.stop)
+        mocked_clock.now.return_value = now
         every = self.lanes(self.tokens['olive']).data
         self.assertEqual('all', every['scope'])
         # the route adds only display fields to the canonical rows: display_name
