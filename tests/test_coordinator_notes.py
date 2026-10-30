@@ -359,6 +359,15 @@ class ReviewR1Tests(NoteCase):
         refused = self.send(self.tokens['nora'], 'north', 'south')
         self.assertEqual(404, refused.status, refused.data)
 
+    def test_a_sibling_that_has_left_its_program_is_refused(self):
+        # The area's own side: prog still lists south as in, and south's member-of still names prog, but south has
+        # left. The sender names south by the program's accepted entry, so this is the second area's link at work.
+        self.links['south'] = [item(pl.MEMBER_OF, statement('Program', 'prog', state='left'), self.ids['sam'])]
+        refused = self.send(self.tokens['nora'], 'north', 'south')
+        self.assertEqual(404, refused.status, refused.data)
+        self.links['south'] = [item(pl.MEMBER_OF, statement('Program', 'prog'), self.ids['sam'])]
+        self.assertEqual(201, self.send(self.tokens['nora'], 'north', 'south').status)
+
     def test_an_agent_of_a_coordinator_without_the_grant_coordinates_nothing(self):
         # B2: the role is the account's, but the agent still needs the grant: Moth is cleo's agent in prog with
         # no grant, so no route takes it and no note wakes it.
