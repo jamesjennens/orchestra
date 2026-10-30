@@ -2095,6 +2095,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
         import interface_lock
         import contextlib
         mutation=False
+        if identity_check is not None:identity_check()
         if args[0] in ('propose','revise','accept','retire'):
             candidate=capability_records.write_payload(args,request.get('attachments',{}),commands=(args[0],))
             mutation=capability_records.touches_interfaces(candidate,runner,operators)

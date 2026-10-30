@@ -11279,13 +11279,16 @@ def _main():
         payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
         authority=operators(root,strict=True)
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        if args.command in ('capability-apply','capability-retire'):
+            from keyed_records import require_configured_operator
+            require_configured_operator(args.actor,authority,'apply a capability')
         @contextlib.contextmanager
         def held():
             import interface_lock
             candidate=dict(payload) if isinstance(payload,dict) else payload
             if isinstance(candidate,dict) and 'operation' not in candidate:
                 candidate['operation']='retire' if args.command=='capability-retire' else 'accept'
-            mutation=capability_records.touches_interfaces(candidate,run,authority)
+            mutation=args.command in ('capability-apply','capability-retire') and capability_records.touches_interfaces(candidate,run,authority)
             with interface_lock.held(root) if mutation else contextlib.nullcontext():
                 with (path/'.coordination.lock').open('a') as lock:
                     fcntl.flock(lock,fcntl.LOCK_EX)

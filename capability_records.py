@@ -317,7 +317,9 @@ def touches_interfaces(payload, run, operators=None):
     """
     if not isinstance(payload,dict):return True
     if 'items' in payload:
-        return any(touches_interfaces(dict(item,operation='accept'),run,operators) for item in payload['items'])
+        items=payload['items']
+        if not isinstance(items,list) or any(not isinstance(item,dict) for item in items):return True
+        return any(touches_interfaces(dict(item,operation='accept'),run,operators) for item in items)
     if 'interfaces' in payload:return True
     if payload.get('operation')=='propose':return False
     if payload.get('operation') not in ('revise','accept','retire','draft'):return False

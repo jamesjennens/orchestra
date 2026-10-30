@@ -517,3 +517,10 @@ class InterfaceCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Stored interface revisions disagree'):
             self.accept(changed,operation='legacy-takeover-refused')
         self.assertIsNone(self.entry()['record'])
+
+
+    def test_malformed_batch_mutex_preflight_leaves_validation_to_writer_without_reads(self):
+        def forbidden(args):raise AssertionError('malformed batch performed a native read')
+        for items in (None,'bad',[None],['bad'],[1]):
+            with self.subTest(items=items):
+                self.assertTrue(cr.touches_interfaces({'items':items},forbidden,[OPERATOR]))

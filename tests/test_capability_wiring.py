@@ -531,8 +531,10 @@ class OperatorCommandTests(unittest.TestCase):
                  'acceptance': acceptance(),
                  'items': [{'key': key, 'revision': 1, 'record_sha256': self.sha(key)}
                            for key in ('review.structured-contribution', 'merge.slot')]}
+        before=list(self.native.calls)
         with self.assertRaisesRegex(ValueError, 'not a server-side configured operator'):
             self.admin('capability-apply', batch, actor='mallory')
+        self.assertEqual(before,self.native.calls,'operator refusal must precede mutex-selection native reads')
         self.flock.reset_mock()
         applied = self.admin('capability-apply', batch)
         self.assertEqual([item['result'] for item in applied['items']], ['accepted', 'accepted'])
