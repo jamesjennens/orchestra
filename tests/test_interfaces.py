@@ -46,7 +46,7 @@ class InterfaceCase(unittest.TestCase):
     def context(self,may=None):
         return ir.ProgramContext('prog',lambda name:self.projects.get(name),operators=[OPERATOR],may_propose=may)
 
-    def apply(self,p,actor='author',operator=False,ctx=None):
+    def apply(self,p,actor=OPERATOR,operator=False,ctx=None):
         self.native.actor=actor
         with ir.context(ctx or self.context()):
             return ir.apply_native(p,actor,self.native,self.path,operator=operator,operators=[OPERATOR])
@@ -304,11 +304,11 @@ class InterfaceCase(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'incomplete coverage'):
                 self.accept(operation='owner-area-unavailable',ctx=visible_owner)
             # An authoritative current view proving that the old acceptor is no
-            # longer an owner makes the old admission inactive, not unknown.
+            # longer an owner makes the accepted admission incomplete.
             inactive=ir.ProgramContext('prog',lambda name:self.projects.get(name),operators=[OPERATOR],
                 memberships={'prog':{uid:'viewer'}},users={uid:{'disabled':False}})
-            self.accept(operation='former-owner-inactive',ctx=inactive)
-            self.assertEqual('retired',self.entry()['lifecycle'])
+            with self.assertRaisesRegex(ValueError,'incomplete'):
+                self.accept(operation='former-owner-incomplete',ctx=inactive)
 
     def test_missing_area_owner_view_is_incomplete_until_current_roles_loaded(self):
         from unittest.mock import patch
@@ -324,3 +324,196 @@ class InterfaceCase(unittest.TestCase):
                 memberships={'area':{uid:'owner'}},users={uid:{'disabled':False}})
             self.assertTrue(known.usage()[1]['complete'])
             self.assertEqual(['area'],known.areas()[0])
+
+    def test_owner_takeover_cannot_replace_first_or_pending_accepted_draft(self):
+        other=RefNative();self.projects['other']=other.rows
+        for native,path,key,text in [(self.native,self.path,'program.area.other','Area: other\nState: in'),
+            (other,self.path.parent/'other','program.member-of','Program: prog\nState: in')]:
+            path.mkdir(exist_ok=True);native.seed('decision-42',issue_type='decision');native.actor=OPERATOR
+            rr.apply_native({'schema_version':1,'operation':'draft','operation_id':'takeover-link-'+key,
+                'key':key,'title':'Other link','statement':text,'authority':{'type':'decision','id':'decision-42'},
+                'owner':'person:example','review_by':payload()['review_by'],'tags':[],'decisions':[],
+                'acceptance_state':'accepted','acceptance':acceptance()},OPERATOR,native,path,operator=True,operators=[OPERATOR])
+        self.assertIn('other',self.context().areas()[0])
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                if not accepted:self.apply(payload())
+                else:self.accept()
+                current=self.entry()['record'] if accepted else self.entry()['proposed']
+                if accepted:
+                    self.apply(payload(operation='revise',operation_id='pending-owner',revision=3,
+                        expected_sha256=current['sha256'],compatibility={'rule':'additive-within-major','change':'additive'}))
+                    current=self.entry()['proposed']
+                before=copy.deepcopy(self.native.rows)
+                with self.assertRaisesRegex(ValueError,'defining area'):
+                    self.apply(payload(operation='revise',operation_id='takeover-'+str(accepted),
+                        revision=current['revision']+1,expected_sha256=current['sha256'],owner_project='other'),
+                        ctx=self.context(lambda area:area=='other'))
+                self.assertEqual(before,self.native.rows)
+
+    def test_accept_rechecks_stored_person_proposer_demotion_and_disabled_account(self):
+        uid='usr_'+'d'*16
+        state={'users':{uid:{'id':uid,'disabled':False}},'memberships':{'area':{uid:'coordinator'}}}
+        ctx=self.context();ctx.authority_state=state
+        self.apply(payload(),actor=uid,ctx=ctx)
+        for role,disabled in [('contributor',False),('coordinator',True)]:
+            state['memberships']['area'][uid]=role;state['users'][uid]['disabled']=disabled
+            with self.subTest(role=role,disabled=disabled),self.assertRaisesRegex(ValueError,'proposer no longer coordinates'):
+                self.accept(operation='live-person-'+role+str(disabled),ctx=ctx)
+        state['users'][uid]['disabled']=False;state['memberships']['area'][uid]='coordinator'
+        self.accept(operation='live-person-restored',ctx=ctx)
+        state['memberships']['area'][uid]='contributor'
+        with self.assertRaisesRegex(ValueError,'proposer no longer coordinates'):
+            self.accept(p=ir.KIND.existing_revisions(ir.KIND.live_row(next(r for r in self.native.rows if r.get('id')==self.entry()['native_id']),[OPERATOR])[0])[1],operation='live-person-restored',ctx=ctx)
+
+    def test_accept_rechecks_stored_agent_grant_and_live_issuer(self):
+        uid='usr_'+'d'*16;aid='agent_'+'e'*16
+        state={'users':{uid:{'id':uid,'disabled':False}},'memberships':{'area':{uid:'owner'}},
+            'agents':{aid:{'id':aid,'owner':uid,'enabled':True,'projects':['area']}},
+            'coordinator_grants':{'area':{aid:{'granted_by':uid,'granted_at':'2026-01-01T00:00:00Z'}}}}
+        ctx=self.context();ctx.authority_state=state
+        self.apply(payload(),actor=aid,ctx=ctx)
+        grant=state['coordinator_grants']['area'].pop(aid)
+        with self.assertRaisesRegex(ValueError,'proposer no longer coordinates'):self.accept(operation='revoked-agent',ctx=ctx)
+        state['coordinator_grants']['area'][aid]=grant;state['memberships']['area'][uid]='coordinator'
+        with self.assertRaisesRegex(ValueError,'proposer no longer coordinates'):self.accept(operation='demoted-issuer',ctx=ctx)
+        state['memberships']['area'][uid]='owner';self.accept(operation='restored-agent',ctx=ctx)
+
+    def test_program_project_consumer_blocks_retirement(self):
+        self.apply(payload());self.accept();record=self.entry()['record']
+        cap=cap_entry(operation='draft',operation_id='program-consumer',interfaces=[{'iface':'iface:iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        self.native.actor=OPERATOR
+        cr.apply_native(cap,OPERATOR,self.native,self.path,operator=True,operators=[OPERATOR])
+        self.apply(payload(operation='revise',operation_id='retire-local-consumer',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        with self.assertRaisesRegex(ValueError,'known current consumers'):self.accept(operation='local-consumer-refusal')
+
+    def test_retirement_owner_loss_or_disabled_accepted_link_is_incomplete(self):
+        from unittest.mock import patch
+        self.apply(payload());self.accept();record=self.entry()['record']
+        self.apply(payload(operation='revise',operation_id='retire-failed-live-side',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        # Keep the defining area linked; a second admitted side loses its live owner.
+        self.native.actor=OPERATOR
+        rr.apply_native({'schema_version':1,'operation':'draft','operation_id':'unreadable-admitted-side',
+            'key':'program.area.other','title':'Other','statement':'Area: other\nState: in',
+            'authority':{'type':'decision','id':'decision-42'},'owner':'person:example',
+            'review_by':payload()['review_by'],'tags':[],'decisions':[],
+            'acceptance_state':'accepted','acceptance':acceptance()},OPERATOR,self.native,self.path,operator=True,operators=[OPERATOR])
+        uid='usr_'+'b'*16;original=rr.KIND.catalog
+        def projected(rows,operators):
+            entries,inc=original(rows,operators)
+            for e in entries:
+                if e.get('key')=='program.area.other':e['accepted_by']=uid
+            return entries,inc
+        with patch.object(rr.KIND,'catalog',side_effect=projected):
+            for role,disabled in [('contributor',False),('owner',True)]:
+                ctx=self.context();ctx.memberships={'prog':{uid:role}};ctx.users={uid:{'disabled':disabled}}
+                with self.subTest(role=role,disabled=disabled),self.assertRaisesRegex(ValueError,'incomplete'):
+                    self.accept(operation='failed-live-side-'+role,ctx=ctx)
+
+    def test_v1_capability_rejects_v2_field_and_additive_stays_unverified(self):
+        record=cr.entry_record(cap_entry(),1,'draft');record['interfaces']=[]
+        record['sha256']=content_hash(record)
+        with self.assertRaises(ValueError):cr.validate_entry(record)
+        self.apply(payload());self.accept();old=self.entry()['record']
+        self.apply(payload(operation='revise',operation_id='additive-unverified',revision=3,
+            expected_sha256=old['sha256'],compatibility={'rule':'additive-within-major','change':'additive'}))
+        self.accept(operation='accept-additive-unverified')
+        self.assertEqual('compatibility-unverified',self.entry()['compatibility'])
+        self.assertIn('compatibility-unverified',ir.flags(self.entry()['record'],[],True))
+
+    def test_unreadable_area_does_not_assert_provider_absence_flags(self):
+        record=ir.entry_record(payload(),2,'accepted')
+        consumer={'role':'consumes','key':record['key'],'minimum':2}
+        self.assertIn('provider-behind',ir.flags(record,[consumer],True))
+        self.assertNotIn('provider-behind',ir.flags(record,[consumer],False))
+        self.apply(payload());self.accept();self.projects['area']=None
+        self.assertFalse(self.context().usage()[1]['complete'])
+
+    def test_provider_pin_without_live_accepted_revision_does_not_count(self):
+        self.apply(payload());self.accept()
+        self.area.actor=OPERATOR
+        cap=cap_entry(operation='draft',operation_id='unaccepted-provider-pin',interfaces=[{'iface':'iface:prog/iface.quotes.v1@99','role':'provides'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(cap,OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        links,coverage=self.context().usage();self.assertTrue(coverage['complete']);self.assertEqual([],links)
+
+
+    def test_operator_reconcile_completes_pending_second_leg_of_completed_accept(self):
+        from unittest.mock import patch
+        self.apply(payload());self.accept()
+        self.apply(payload(key='iface.quotes.v2',replaces='iface.quotes.v1',operation_id='recover-major2'))
+        proposed=ir.get(self.native.rows,'iface.quotes.v2',[OPERATOR])['proposed']
+        original=self.native.__class__.__call__
+        def cut(native,args):
+            if args[:2]==['comments','add'] and len(args)>3 and args[3].startswith(ir.ENTRY_PREFIX):
+                record=ir.parse_entry(args[3])
+                if record and record['state']=='deprecated':raise RuntimeError('cut before predecessor revision')
+            return original(native,args)
+        with patch.object(self.native.__class__,'__call__',cut):
+            with self.assertRaisesRegex(RuntimeError,'cut before'):self.accept(proposed,operation='recover-accept2')
+        self.native.actor=OPERATOR
+        with ir.context(self.context()):
+            result=ir.reconcile(self.path,'recover-accept2',OPERATOR,'finish state-only leg','complete',self.native,operators=[OPERATOR])
+        self.assertTrue(result['transition_complete']);self.assertEqual('deprecated',self.entry()['record']['state'])
+        count=len(self.native.writes())
+        with ir.context(self.context()):
+            ir.reconcile(self.path,'recover-accept2',OPERATOR,'finish state-only leg','complete',self.native,operators=[OPERATOR])
+        self.assertEqual(count,len(self.native.writes()))
+
+    def test_retirement_member_of_owner_demotion_or_disabled_acceptor_is_incomplete(self):
+        from unittest.mock import patch
+        self.apply(payload());self.accept();record=self.entry()['record']
+        other=RefNative();self.projects['other']=other.rows
+        for native,path,key,text in [(self.native,self.path,'program.area.other','Area: other\nState: in'),
+            (other,self.path.parent/'other','program.member-of','Program: prog\nState: in')]:
+            path.mkdir(exist_ok=True);native.seed('decision-42',issue_type='decision');native.actor=OPERATOR
+            rr.apply_native({'schema_version':1,'operation':'draft','operation_id':'accepted-side-'+key,
+                'key':key,'title':'Other link','statement':text,'authority':{'type':'decision','id':'decision-42'},
+                'owner':'person:example','review_by':payload()['review_by'],'tags':[],'decisions':[],
+                'acceptance_state':'accepted','acceptance':acceptance()},OPERATOR,native,path,operator=True,operators=[OPERATOR])
+        self.apply(payload(operation='revise',operation_id='retire-failed-member-of',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        uid='usr_'+'b'*16;original=rr.KIND.catalog
+        def projected(rows,operators):
+            entries,inc=original(rows,operators)
+            if rows is other.rows:
+                for e in entries:
+                    if e.get('key')=='program.member-of':e['accepted_by']=uid
+            return entries,inc
+        with patch.object(rr.KIND,'catalog',side_effect=projected):
+            for role,disabled in [('contributor',False),('owner',True)]:
+                ctx=self.context();ctx.memberships={'other':{uid:role}};ctx.users={uid:{'disabled':disabled}}
+                with self.subTest(role=role,disabled=disabled),self.assertRaisesRegex(ValueError,'incomplete'):
+                    self.accept(operation='failed-member-of-'+role,ctx=ctx)
+
+    def test_only_stored_defining_area_coordinator_can_revise_same_owner(self):
+        self.apply(payload());draft=self.entry()['proposed']
+        with self.assertRaisesRegex(ValueError,'coordination'):
+            self.apply(payload(operation='revise',operation_id='same-owner-wrong-coordinator',revision=2,
+                expected_sha256=draft['sha256']),ctx=self.context(lambda area:False))
+        self.assertEqual(draft,self.entry()['proposed'])
+
+    def test_capability_mutex_selection_includes_implicit_withdrawals_and_pinned_accept(self):
+        native=RefNative();native.actor=OPERATOR
+        path=self.path.parent/'caps';path.mkdir()
+        plain=cap_entry()
+        self.assertFalse(cr.touches_interfaces(plain,native,[OPERATOR]))
+        v2=cap_entry(operation='draft',operation_id='cap-mutex-v2',interfaces=[],acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(v2,OPERATOR,native,path,operator=True,operators=[OPERATOR])
+        self.assertTrue(cr.touches_interfaces(dict(plain,operation='revise'),native,[OPERATOR]))
+        self.assertTrue(cr.touches_interfaces(dict(plain,operation='accept'),native,[OPERATOR]))
+        self.assertTrue(cr.touches_interfaces(dict(plain,operation='retire'),native,[OPERATOR]))
+
+    def test_legacy_stored_draft_owner_disagreement_cannot_be_accepted(self):
+        made=self.apply(payload());draft=self.entry()['proposed']
+        changed=copy.deepcopy(draft);changed.update(revision=2,owner_project='other')
+        changed['sha256']=content_hash(changed)
+        # Simulate a pre-fix owner takeover already present in native history.
+        self.native.actor=OPERATOR
+        self.native(['comments','add',made['native_id'],ir.KIND.entry_comment(changed),'--json'])
+        with self.assertRaisesRegex(ValueError,'Stored interface revisions disagree'):
+            self.accept(changed,operation='legacy-takeover-refused')
+        self.assertIsNone(self.entry()['record'])

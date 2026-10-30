@@ -170,6 +170,18 @@ def write_time_rules(record):
 
 
 def pre_write(payload, run, operators=None, project=None):
+    ctx = _CONTEXT.get()
+    if ctx is None:
+        raise Refusal('Interface writes need an authorized project context')
+    if payload['operation'] == 'accept':
+        entry = KIND.find_entry(ctx.own(), payload['key'], ctx.operators)
+        row = next(r for r in ctx.own() if r.get('id') == entry['native_id'])
+        row = KIND.live_row(row, ctx.operators)[0]
+        record = KIND.existing_revisions(row).get(payload['revision'])
+        if record is not None:
+            ctx.check_stored_authority(record)
+            if record['owner_project'] not in ctx.areas()[0]:
+                raise Refusal('Defining area is not a currently linked readable program member')
     if payload['operation'] in ('propose', 'revise', 'draft'):
         ctx = _CONTEXT.get()
         if ctx is None:
@@ -245,11 +257,12 @@ class ProgramContext:
     read_project must check the caller BEFORE I/O; it returns a complete exported snapshot.
     The outer deployment mutation lock serializes graph/capability changes with accept.
     """
-    def __init__(self, project, read_project, *, operators=(), memberships=None, users=None, may_propose=None):
+    def __init__(self, project, read_project, *, operators=(), memberships=None, users=None, may_propose=None, authority_state=None):
         self.project, self.read_project = project, read_project
         self.operators = operators
         self.memberships, self.users = memberships, users
         self.may_propose = may_propose
+        self.authority_state = authority_state
         self.cache = {}
 
     def rows(self, project):
@@ -285,6 +298,17 @@ class ProgramContext:
         except ValueError:return True
         return state=='in'
 
+    @staticmethod
+    def accepted_side_requires_coverage(item, label):
+        if item.get('state') != 'accepted':
+            return False
+        import program_links
+        try:
+            _,state=program_links.statement_lines((item.get('record') or {}).get('statement'),label)
+        except ValueError:
+            return True
+        return state != 'left'
+
     def areas(self):
         import program_links
         entries, incomplete = refs.KIND.catalog(self.own(), self.operators)
@@ -298,7 +322,9 @@ class ProgramContext:
             if not side or side[0] != 'program':
                 continue
             if self.owner_view_missing(e):complete=False
-            status, _ = program_links.side_status(e, self.project, side[1], self.memberships, self.users)
+            status, reason = program_links.side_status(e, self.project, side[1], self.memberships, self.users)
+            if self.accepted_side_requires_coverage(e,'Area') and status is None:
+                complete = False
             if e['state'] in ('malformed', 'unsupported', 'conflicted'):
                 complete = False
             if status == 'in':
@@ -317,15 +343,19 @@ class ProgramContext:
             if any(self.owner_view_missing(e) for e in selected):complete=False
             if inc or any(e['state'] in ('malformed', 'unsupported', 'conflicted') for e in others):
                 complete = False
-            if len(selected) == 1 and program_links.side_status(selected[0], area, self.project, self.memberships, self.users)[0] == 'in':
-                linked.append(area)
+            if len(selected) == 1:
+                status, reason = program_links.side_status(selected[0], area, self.project, self.memberships, self.users)
+                if self.accepted_side_requires_coverage(selected[0],'Program') and status is None:
+                    complete = False
+                if status == 'in':
+                    linked.append(area)
         return linked, complete, unavailable
 
     def usage(self):
         import capability_records
         areas, complete, hidden = self.areas()
         links = []
-        for area in areas:
+        for area in [self.project, *areas]:
             entries, incomplete = capability_records.catalog(self.rows(area), self.operators)
             if incomplete or any(e['state'] in ('malformed', 'unsupported', 'conflicted') for e in entries):
                 complete = False
@@ -355,8 +385,54 @@ class ProgramContext:
             return bool(rec and rec['acceptance_state']=='accepted' and evidence and evidence['record_sha256']==rec['sha256'])
         except (ValueError,StopIteration):return False
 
+    def stored_owner(self, key):
+        entries, incomplete = catalog(self.own(), self.operators)
+        if incomplete or any(e['state'] in ('malformed','unsupported','conflicted') for e in entries):
+            raise Refusal('Interface catalog is incomplete; authority cannot be established')
+        entry = next((e for e in entries if e['key'] == key), {})
+        records = [entry.get('record'), entry.get('proposed')]
+        if entry.get('native_id') is not None:
+            row = next(r for r in self.own() if r.get('id') == entry['native_id'])
+            live = KIND.live_row(row,self.operators)[0]
+            records = list(KIND.existing_revisions(live).values())
+        owners = {r['owner_project'] for r in records if r is not None}
+        if len(owners) > 1:
+            raise Refusal('Stored interface revisions disagree about the defining area')
+        return next(iter(owners), None)
+
+    def proposer_holds(self, actor, area):
+        from http_authority import http_actor_id, still_coordinates
+        head = http_actor_id(actor)
+        if head is None:
+            return actor in self.operators
+        state = self.authority_state or {}
+        if head.startswith('agent_'):
+            agent = (state.get('agents') or {}).get(head) or {}
+            descriptor = {'kind':'agent', 'agent_id':head, 'user_id':agent.get('owner')}
+        else:
+            descriptor = {'kind':'person', 'user_id':head}
+        role = ((state.get('memberships') or {}).get(area) or {}).get(descriptor.get('user_id'))
+        return role in ('owner','coordinator') and still_coordinates(state, descriptor, area)
+
+    def check_stored_authority(self, record, revision=None):
+        owner = self.stored_owner(record['key'])
+        if owner is not None and owner != record['owner_project']:
+            raise Refusal('An interface revision cannot change its defining area')
+        entries, _ = catalog(self.own(), self.operators)
+        selected = next((e for e in entries if e['key'] == record['key']), {})
+        if selected.get('native_id') is not None:
+            row = next(r for r in self.own() if r.get('id') == selected['native_id'])
+            row = KIND.live_row(row, self.operators)[0]
+            existing = KIND.existing_revisions(row)
+            authors = KIND.draft_authors_for(row, revision or record['revision'], existing)
+            if not authors or any(not self.proposer_holds(a, record['owner_project']) for a in authors):
+                raise Refusal('The stored draft proposer no longer coordinates its defining area')
+
     def propose(self, payload):
         area = payload['owner_project']
+        owner = self.stored_owner(payload['key'])
+        if owner is not None and owner != area:
+            raise Refusal('An interface revision cannot change its defining area')
         if self.may_propose is not None and not self.may_propose(area):
             raise Refusal('Proposing an interface needs coordination in its defining area')
         areas, complete, _ = self.areas()
@@ -367,6 +443,10 @@ class ProgramContext:
         entries, incomplete = catalog(self.own(), self.operators)
         if incomplete or any(e['state'] in ('malformed', 'unsupported', 'conflicted') for e in entries):
             raise Refusal('Interface catalog is incomplete; acceptance refused')
+        self.check_stored_authority(record)
+        areas, _complete, _hidden = self.areas()
+        if record['owner_project'] not in areas:
+            raise Refusal('Defining area is not a currently linked readable program member')
         selected = next((e for e in entries if e['key'] == record['key']), None)
         if selected is not None:
             row = next((r for r in self.own() if r.get('id') == selected['native_id']), None)
@@ -483,6 +563,8 @@ def _finish_deprecation(payload,actor,run,project,operators,accepted):
         rows=KIND.read_key_rows(run,key)
         predecessor=KIND.find_entry(rows,key,operators or ())
         previous=predecessor.get('record')
+        if previous is not None and previous['owner_project']!=accepted['owner_project']:
+            raise Refusal('Predecessor defining area differs; deprecation remains pending')
         if previous is None or predecessor['state']!='accepted':
             raise Refusal('Predecessor is not readable and accepted; deprecation is pending')
         if previous['state'] in ('deprecated','retired'):
@@ -556,7 +638,33 @@ def reconcile(project,operation_id,actor,reason,disposition,run,issue_id=None,op
         raise Refusal('Interface transition receipt identity does not match its path')
     if plan is not None and disposition!='complete':
         raise Refusal('A compound interface transition must be completed, never released or discarded')
-    result=KIND.reconcile(project,operation_id,actor,reason,disposition,run,issue_id=issue_id,operators=operators)
+    if plan is not None:
+        if not isinstance(reason,str) or not reason.strip():
+            raise ValueError('A reconciliation reason is required')
+        receipt_path=core.receipt_path(Path(project)/'.interface-requests',
+            content_hash({'operation_id':operation_id}),KIND.noun)
+        receipt=core.read_host_json(receipt_path)
+        core.validate_receipt(receipt)
+        if receipt.get('status')!='complete' or receipt.get('operation') not in ('accept','draft'):
+            raise Refusal('The compound transition requires its matching completed first leg')
+        if issue_id is not None and issue_id!=receipt.get('id'):
+            raise Refusal('The issue ID must name the completed new-major first leg')
+        rows=KIND.shown(run,[receipt['id']])
+        live=KIND.live_row(rows[0],operators or ())[0] if len(rows)==1 else None
+        first=KIND.existing_revisions(live).get(receipt['revision']) if live is not None else None
+        evidence=KIND.live_acceptances(live,operators or ()).get(receipt['revision']) if live is not None else None
+        if (first is None or first.get('replaces')!=plan['record']['key'] or evidence is None
+                or evidence['record_sha256']!=first['sha256']
+                or (receipt.get('acceptance') or {}).get('record_sha256')!=first['sha256']):
+            raise Refusal('The completed first leg no longer has its bound live acceptance')
+        ctx=_CONTEXT.get()
+        if ctx is None:
+            raise Refusal('Interface recovery needs current stored authority and program coverage')
+        ctx.accept(first)
+        result={'operation_id':operation_id,'status':'complete','id':receipt['id'],
+                'reconciled':False,'transition_complete':plan['status']=='complete'}
+    else:
+        result=KIND.reconcile(project,operation_id,actor,reason,disposition,run,issue_id=issue_id,operators=operators)
     if plan is not None and plan['status']!='complete':
         old=KIND.parse_acceptance(plan['evidence'])
         bound=core.bind_acceptance(old['decision'],plan['record'])

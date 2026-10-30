@@ -309,6 +309,28 @@ def _validate_content(payload, collect=False):
     return errors
 
 
+def touches_interfaces(payload, run, operators=None):
+    """Conservative pre-lock selector; the writer rechecks immutable revisions and CAS.
+
+    A stale v1 selection cannot replace an intervening v2 draft: ordinary project-
+    locked CAS refuses it. Withdrawals (including v2 -> v1) participate as well.
+    """
+    if not isinstance(payload,dict):return True
+    if 'items' in payload:
+        return any(touches_interfaces(dict(item,operation='accept'),run,operators) for item in payload['items'])
+    if 'interfaces' in payload:return True
+    if payload.get('operation')=='propose':return False
+    if payload.get('operation') not in ('revise','accept','retire','draft'):return False
+    if not isinstance(payload.get('key'),str):return True
+    try:
+        rows=KIND.read_key_rows(run,payload['key'])
+        entries,incomplete=KIND.catalog(rows,operators or ())
+        if incomplete or any(e['state'] in ('malformed','unsupported','conflicted') for e in entries):return True
+        return any('interfaces' in record for entry in entries
+                   for record in (entry.get('record'),entry.get('proposed')) if record is not None)
+    except (ValueError,OSError,RuntimeError):return True
+
+
 def _pre_write(payload, run, operators=None, project=None):
     """Reads before the journal: requirement links, and a retirement's successor."""
     if payload['operation'] in ('propose', 'revise', 'draft'):

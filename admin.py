@@ -10424,8 +10424,8 @@ def main():
     root_parser=argparse.ArgumentParser(add_help=False)
     root_parser.add_argument('--root')
     root_arg=root_parser.parse_known_args(words)[0].root
-    participating=any(v in words for v in ('interface-apply','interface-reconcile','reference-apply','capability-apply',
-        'capability-retire','record-reconcile','reference-reconcile','capability-reconcile',
+    participating=any(v in words for v in ('interface-apply','interface-reconcile','reference-apply',
+        'record-reconcile','reference-reconcile','capability-reconcile',
         'void-record','anchor-release','operators','verifiers',
         '--restore-operators','--restore-verifiers','--restore-http-state'))
     if root_arg is not None and participating:
@@ -10522,6 +10522,7 @@ def _main():
         a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
         a.add_argument('--issue-id',dest='issue_id',default=None,
                        help='with --disposition complete, the exact native record to confirm')
+        if name in ('interface-reconcile','record-reconcile'):a.add_argument('--state',help='existing web service authority state for interface recovery')
         if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability','interface','proposal'],required=True)
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('attest-delivery',help='a listed verifier reads a delivered BUNDLE file ON THIS HOST (its bytes, '
@@ -11242,7 +11243,7 @@ def _main():
         from http_authority import read_state
         state=read_state(args.state) if args.state else {}
         context=interface_records.ProgramContext(args.project,read_project,operators=authority,
-            memberships=state.get('memberships'),users=state.get('users'))
+            authority_state=state,memberships=state.get('memberships'),users=state.get('users'))
         with file_lock(path/'.coordination.lock'):
             with interface_records.context(context):
                 print(json.dumps(interface_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)))
@@ -11280,10 +11281,15 @@ def _main():
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         @contextlib.contextmanager
         def held():
-            # One hold of the project's coordination lock; closing the file releases it.
-            with (path/'.coordination.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_EX)
-                yield
+            import interface_lock
+            candidate=dict(payload) if isinstance(payload,dict) else payload
+            if isinstance(candidate,dict) and 'operation' not in candidate:
+                candidate['operation']='retire' if args.command=='capability-retire' else 'accept'
+            mutation=capability_records.touches_interfaces(candidate,run,authority)
+            with interface_lock.held(root) if mutation else contextlib.nullcontext():
+                with (path/'.coordination.lock').open('a') as lock:
+                    fcntl.flock(lock,fcntl.LOCK_EX)
+                    yield
         if args.command=='capability-apply' and isinstance(payload,dict) and 'items' in payload:
             # A batch takes the lock once per item and releases it between items, so
             # another writer waits behind at most one item (kittrial-5bb.67 review 01a0fc55).
@@ -11420,8 +11426,26 @@ def _main():
             # only to decide which operator voids apply when `complete` confirms the anchor
             # holds a live record (kittrial-5bb.74 review); requirements do not take it.
             extra={'operators':operators(root,strict=True)} if kind in ('proposal','reference','capability','interface') else {}
-            print(json.dumps(record_reconcile(path,args.operation_id,args.actor,args.reason,
-                                              args.disposition,run,issue_id=args.issue_id,**extra)))
+            import contextlib
+            if kind=='interface':
+                import interface_records
+                from http_authority import read_state,file_lock
+                state=read_state(args.state) if args.state else {}
+                def read_project(other):
+                    other_path=project_dir(root,other)
+                    if not (other_path/'.beads/metadata.json').is_file():return None
+                    def exported():
+                        return [record_json.loads_row(line) for line in run_bd(root,other,
+                            ['--actor',args.actor,'export','--all']).splitlines() if line.strip()]
+                    if other==args.project:return exported()
+                    with file_lock(other_path/'.coordination.lock',shared=True):return exported()
+                context=interface_records.ProgramContext(args.project,read_project,operators=extra['operators'],
+                    authority_state=state,memberships=state.get('memberships'),users=state.get('users'))
+                held_context=interface_records.context(context)
+            else:held_context=contextlib.nullcontext()
+            with held_context:
+                print(json.dumps(record_reconcile(path,args.operation_id,args.actor,args.reason,
+                                                  args.disposition,run,issue_id=args.issue_id,**extra)))
     elif args.command=='anchor-release':
         # kittrial-5bb.74: an anchor whose propose stopped before its first record, or whose
         # every record an operator void names, holds its key for good once the original

@@ -1,8 +1,9 @@
 """Deployment-wide interface mutation order: this lock, then project locks.
 
-No POSIX import at module scope. All canonical record mutations participate, including
-capability versions without interfaces (which can withdraw an old consumer) and program
-link mutations. A bounded acquisition refuses busy rather than waiting indefinitely.
+No POSIX import at module scope. Interface and program-link mutations participate. Capability mutations select
+this lock when their payload or stored revisions touch interfaces, including an
+implicit withdrawal by a v1 revision. Unrelated v1 capability writes use only
+their project lock. A bounded acquisition refuses busy rather than waiting indefinitely.
 """
 from contextlib import contextmanager, ExitStack
 from pathlib import Path

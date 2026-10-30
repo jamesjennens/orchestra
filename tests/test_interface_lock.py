@@ -15,7 +15,7 @@ class InterfaceLockTests(unittest.TestCase):
     def test_two_participating_routes_in_both_orders_before_project_locks(self):
         import endpoint
         routes=[{'action':'interface','args':['accept'],'project':'program'},
-                {'action':'capability','args':['accept'],'project':'area'}]
+                {'action':'ref','args':['accept'],'project':'area'}]
         for first,second in (routes,list(reversed(routes))):
             with self.subTest(first=first['action']),tempfile.TemporaryDirectory() as temp:
                 root=Path(temp);entered=threading.Event();second_entered=threading.Event();release=threading.Event()
@@ -101,3 +101,46 @@ class InterfaceLockTests(unittest.TestCase):
                                      key_projects=frozenset({'public'}))
                 mutex.assert_not_called();dispatch.assert_not_called()
                 self.assertEqual([],list(Path(temp).iterdir()))
+
+
+    @unittest.skipIf(os.name=='nt','endpoint is POSIX-only')
+    def test_actual_capability_route_mutex_only_for_interface_changes_in_both_orders(self):
+        import endpoint
+        import capability_records as cr
+        from contextlib import ExitStack
+        from test_capability_records import entry
+        import json
+        for touches in (False,True):
+            for first in ('interface','capability'):
+                with self.subTest(touches=touches,first=first),tempfile.TemporaryDirectory() as temp:
+                    root=Path(temp);area=root/'projects/area';(area/'.beads').mkdir(parents=True)
+                    (area/'.beads/metadata.json').write_text('{}')
+                    entered=threading.Event();second_entered=threading.Event();release=threading.Event()
+                    def effect(name):
+                        if name==first:
+                            entered.set();self.assertTrue(release.wait(5))
+                        else:second_entered.set()
+                        return {'returncode':0}
+                    cap=entry();cap.pop('operation',None)
+                    if touches:cap['interfaces']=[]
+                    request={'project':'area','actor':'fixture','action':'capability',
+                        'args':['propose','@attachment:p'],'attachments':{'p':{'flag':'--file','text':json.dumps(cap)}}}
+                    dispatch=endpoint._execute
+                    def route(root,request,*args):
+                        if request['action']=='interface':return effect('interface')
+                        return dispatch(root,request,*args)
+                    with ExitStack() as stack:
+                        stack.enter_context(patch.object(endpoint,'_execute',route))
+                        stack.enter_context(patch.object(endpoint,'guarded_write',lambda root,req,journal,fn,**kw:fn()))
+                        stack.enter_context(patch.object(cr,'write',lambda *a,**kw:effect('capability')))
+                        stack.enter_context(patch.object(endpoint,'configured_operators',return_value=[]))
+                        stack.enter_context(patch.object(endpoint,'configured_verifiers',return_value=[]))
+                        pool=stack.enter_context(ThreadPoolExecutor(2))
+                        calls={'interface':lambda:endpoint.execute(root,{'action':'interface','args':['accept'],'project':'prog'}),
+                               'capability':lambda:endpoint.execute(root,request)}
+                        try:
+                            one=pool.submit(calls[first]);self.assertTrue(entered.wait(5))
+                            two=pool.submit(calls['capability' if first=='interface' else 'interface'])
+                            self.assertEqual(not touches,second_entered.wait(.2))
+                        finally:release.set()
+                        self.assertEqual(0,one.result(5)['returncode']);self.assertEqual(0,two.result(5)['returncode'])

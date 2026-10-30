@@ -155,3 +155,57 @@ class NativeInterfaceTests(fixture.NativeLinkTests):
         retry=subprocess.run(command,env=native_fixture.admin.environment(self.root),capture_output=True,text=True,timeout=90)
         self.assertEqual(0,retry.returncode,retry.stderr)
         self.assertEqual(before_retry,self.r.bd('export','--all').stdout)
+
+
+class NativeInterfaceAuthorityTests(NativeInterfaceTests):
+    test_http_interface_capability_v2_complete_retirement_and_host_read=None
+
+    def test_http_accept_rechecks_live_stored_proposer_and_blocks_payload_owner_takeover(self):
+        self.deployment(operators=['ops'],coordinator_writes=True,independent_approval=False)
+        h=self.harness
+        area=self.root/'projects'/'area';area.mkdir()
+        init=subprocess.run([str(self.r.bd_path),'init','--server','--external','--server-host','127.0.0.1',
+             '--server-port',str(self.runtime.port),'--server-user','root','--prefix','area','--database','area',
+             '--skip-agents','--skip-hooks','--non-interactive'],cwd=area,env=native_fixture.admin.environment(self.root),capture_output=True,text=True,timeout=90)
+        self.assertEqual(0,init.returncode,init.stderr)
+        made=h.request('POST','/v1/projects',{'project_id':'area','name':'Synthetic area'},token=self.owner)
+        self.assertEqual(201,made.status,made.data)
+        for project,key,text in [('pp','program.area.area','Area: area\nState: in'),
+                                 ('area','program.member-of','Program: pp\nState: in')]:
+            run=lambda args,project=project:native_fixture.admin.run_bd(self.root,project,['--actor','ops',*args])
+            decision=json.loads(run(['create','Join program','--type','decision','--json']))['id']
+            body={'schema_version':1,'operation':'draft','operation_id':'native-'+key,'key':key,
+                  'title':'Synthetic link','statement':text,'authority':{'type':'decision','id':decision},
+                  'owner':'person:maintainer','review_by':(datetime.date.today()+datetime.timedelta(days=90)).isoformat(),
+                  'tags':[],'decisions':[],'acceptance_state':'accepted','acceptance':acceptance(decision_id=decision)}
+            refs.apply_native(body,'ops',run,self.root/'projects'/project,operator=True,operators=['ops'])
+        body=payload(owner_project='area')
+        for key in ('operation','operation_id','schema_version','revision','expected_sha256'):body.pop(key,None)
+
+        uid=h.create_account(self.owner,'stored-proposer','stored-password-1')
+        for project in ('pp','area'):
+            self.assertEqual(200,h.request('PUT','/v1/projects/'+project+'/members/'+uid,
+                {'role':'coordinator'},token=self.owner).status)
+        token=h.login('stored-proposer','stored-password-1')[0]
+        proposed=h.request('POST','/v1/projects/pp/interfaces',body,token=token,key='live-stored-proposer')
+        self.assertEqual(201,proposed.status,proposed.data)
+        before=h.request('GET','/v1/projects/pp/interfaces/iface.quotes.v1',token=self.owner).data
+        stolen=dict(body,revision=2,expected_sha256=proposed.data['sha256'],owner_project='pp')
+        refused=h.request('POST','/v1/projects/pp/interfaces/iface.quotes.v1/revisions',stolen,
+            token=self.owner,key='take-over-owner')
+        self.assertEqual(409,refused.status,refused.data)
+        after=h.request('GET','/v1/projects/pp/interfaces/iface.quotes.v1',token=self.owner).data
+        self.assertEqual(before['proposed'],after['proposed'])
+        self.assertEqual(200,h.request('PUT','/v1/projects/area/members/'+uid,
+            {'role':'contributor'},token=self.owner).status)
+        accept={'expected_revision':1,'record_sha256':proposed.data['sha256'],'evidence':'live check'}
+        refused=h.request('POST','/v1/projects/pp/interfaces/iface.quotes.v1/accept',accept,
+            token=self.owner,key='demoted-source-proposer')
+        self.assertEqual(409,refused.status,refused.data)
+        self.assertIn('proposer',str(refused.data))
+        self.assertEqual('draft',h.request('GET','/v1/projects/pp/interfaces/iface.quotes.v1',token=self.owner).data['lifecycle'])
+        self.assertEqual(200,h.request('PUT','/v1/projects/area/members/'+uid,
+            {'role':'coordinator'},token=self.owner).status)
+        accepted=h.request('POST','/v1/projects/pp/interfaces/iface.quotes.v1/accept',accept,
+            token=self.owner,key='restored-source-proposer')
+        self.assertEqual(200,accepted.status,accepted.data)

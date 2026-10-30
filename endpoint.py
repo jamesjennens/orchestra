@@ -1322,7 +1322,7 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
     import interface_lock
     action = request.get('action') if isinstance(request, dict) else None
     args = request.get('args', []) if isinstance(request, dict) else []
-    participating = action in ('interface', 'ref', 'capability') and args[:1] and args[0] in (
+    participating = action in ('interface', 'ref') and args[:1] and args[0] in (
         'propose', 'revise', 'draft', 'accept', 'retire', 'web-verify')
     try:
         if participating:
@@ -2002,7 +2002,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
                 if writing and other==name: return exported()
                 with held_coordination_lock(other_path,shared=True): return exported()
             return interface_records.ProgramContext(name,read_project,operators=configured_operators(root),
-                memberships=state.get('memberships'),users=state.get('users'),
+                authority_state=state,memberships=state.get('memberships'),users=state.get('users'),
                 may_propose=(lambda area:allowed(area,CAP_COORDINATE)) if writing else None)
         if not writing:
             context=ctx_for(False)
@@ -2090,12 +2090,21 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             except RecordsRefusal as error:
                 return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
-        with (path/'.coordination.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            return guarded_write(root,request,journal_path(path),capability_effect,
-                                 authority_config=authority_config,
-                                 require_authority=require_authority,runner=runner,
-                                 identity_check=identity_check)
+        # Decode and select before the deployment mutex; authorization/CAS are
+        # checked again by the project-locked writer. Unrelated v1 writes bypass it.
+        import interface_lock
+        import contextlib
+        mutation=False
+        if args[0] in ('propose','revise','accept','retire'):
+            candidate=capability_records.write_payload(args,request.get('attachments',{}),commands=(args[0],))
+            mutation=capability_records.touches_interfaces(candidate,runner,operators)
+        with interface_lock.held(root) if mutation else contextlib.nullcontext():
+            with (path/'.coordination.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                return guarded_write(root,request,journal_path(path),capability_effect,
+                                     authority_config=authority_config,
+                                     require_authority=require_authority,runner=runner,
+                                     identity_check=identity_check)
     if action=='proposal':
         # Contributed requirement proposals (.58 slices 1a and 1b, kittrial-5bb.68/.70).
         # get, list, mine and help are reads (no lock, not run_guarded); submit and

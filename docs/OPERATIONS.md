@@ -3479,8 +3479,8 @@ acceptance. `--state` supplies current membership/accounts when program links we
 accepted by web owners; without it only operator-backed sides can be established.
 An otherwise active owner-backed admission with no loaded current authority
 view makes coverage incomplete and blocks retirement; it is not an inactive side.
-A loaded current view can establish that the old acceptor is no longer an owner.
-Web writes recheck the principal's own authority; a host actor label never grants
+An accepted side whose acceptor is no longer an enabled owner also makes coverage incomplete; only a side actually withdrawn or never accepted is outside scope. The program project itself is included in the consumer inventory.
+The defining area is immutable for an existing entry, including its first and subsequent pending drafts. Revisions authorize against that stored area. Every acceptance and retirement, including receipt retries, rechecks all stored draft proposers against live defining-area roles, enabled accounts and, for agents, their current grant and its issuer. Web writes recheck the principal's own authority; a host actor label never grants
 coordinator permission. The new delegation scope is `interfaces`, not an expansion
 of an older reference/capability grant. Acceptance/retirement cannot fetch a URL or
 run a schema. Compatibility is unverified until the separately reviewed verifier
@@ -3488,8 +3488,7 @@ slice ships.
 
 **Lock order:** the deployment's `.interface-mutations.lock` first, then ordinary
 project coordination locks, then the existing authority/journal locks. Canonical
-reference/capability/interface write entry points participate, including v1
-capability revisions that withdraw prior v2 consumers. The relevant operator
+reference/interface write entry points participate. Capability writes participate when an explicit interfaces field or their stored current/pending revision touches interface declarations, including v2-to-v1 withdrawal. Unrelated v1 capability writes bypass the deployment mutex; project CAS still prevents a stale v1 write from replacing an intervening v2 revision. The relevant operator
 apply/retire/reconcile/void/release/allowlist and authority-restore CLI paths
 participate too. Web account/member/agent authority changes and project
 creation/registration/confirmation participate before their store mutation,
@@ -3500,9 +3499,7 @@ retry the identical operation later. The lock is held for the check and write,
 including its authorized per-area reads; it is not held across a worker's whole
 plan, human review, network calls to another installation, or a test suite. A
 process exiting releases the OS lock; the file itself is not a reservation.
-A reference/capability batch releases its project lock between items but holds
-the deployment mutex for the batch; other participating mutations can receive
-503 busy while it runs.
+A reference batch holds the deployment mutex for the batch. A capability batch selects and holds it per participating item, before the project lock, and releases both between items. Other participating mutations can receive 503 busy while an item runs.
 Direct edits, raw operator bd commands and other programs outside these entry
 points bypass this discipline, just as they bypass the kit's project locks.
 
@@ -3525,9 +3522,9 @@ missing revision. Never infer cross-entry atomicity, release that operation or
 allocate a new identity to get around it. If the original authorized actor cannot
 retry, a configured operator completes it with
 `interface-reconcile PROGRAM --operation-id ID --actor OPERATOR --reason TEXT
---disposition complete`; its own new evidence re-attests the same state-only plan.
+--disposition complete --state /path/to/existing-web-state.json`; its own new evidence re-attests the same state-only plan. Recovery rechecks the stored new-major proposer and current defining-area membership from that authority view; a host without it cannot approve an HTTP proposer or prove owner-backed coverage. The completed first-leg receipt remains intact and is not reconciled again.
 Conflicting predecessor content/revision remains a refusal requiring inspection,
-not an automatic overwrite. `record-reconcile --kind interface` is the equivalent
+not an automatic overwrite. If a predecessor draft landed between the first commit and creation of the second-leg plan, inspect that draft with its owner. A configured operator can void that unaccepted draft with `void-record` (only after confirming it carries no live acceptance evidence), then retry the original new-major acceptance identity to create and finish the state-only plan. Never discard or overwrite the draft automatically. If the draft was accepted or changes cannot safely be voided, stop for operator/owner repair; both majors remain visible and the missing deprecation is not complete. `record-reconcile --kind interface` is the equivalent
 operator entry point. Ordinary anchor release and void repair include interfaces;
 a void cannot erase a revision that still carries live acceptance evidence.
 
