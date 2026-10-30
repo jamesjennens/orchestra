@@ -1510,6 +1510,11 @@ class InProcessBackend:
         memberships, users = self.service.program_link_people({project_id} | {area for area, _ in page})
         areas = []
         for area, own in page:
+            side = program_view.program_side(project_id, area, own, memberships, users)
+            if side != 'in':
+                # Review of .453, B1: the program's side first; a side that is not in reads nothing of the area.
+                areas.append(program_view.area_row(area, program_links.link_state(side, False)))
+                continue
             try:
                 member = next((i for i in self.reference_links(area).get('items') or []
                                if isinstance(i, dict) and i.get('key') == program_links.MEMBER_OF), None)
@@ -12495,6 +12500,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                    coordinator=True, key_param=True, status=200)
 
     PROGRAM_QUERY = ('cursor', 'limit', 'idle_minutes', 'requirements_offset')
+    #: Reads of one page when rights change under it (review of .453, B2): each re-read leaves out the areas lost.
+    PROGRAM_READS_MAX = 3
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/program')
     def program_view_read(self, ctx):
@@ -12529,17 +12536,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not isinstance(raw, str) or not raw.isdigit() or len(raw) > 6:
             raise invalid('requirements_offset must be a whole number from 0 to 999999')
         pid = ctx.params['pid']
-        result = dict(reader(pid, state['o'], limit, idle_minutes, int(raw),
-                             readable=self._readable_projects(ctx.principal)))
-        for row in (result.get('areas') or {}).get('items') or []:
-            if not isinstance(row, dict) or not row.get('visible'):
-                continue
-            try:
-                row['coordinators'] = self.service.coordinators_of(ctx.principal, row['area'])
-            except HttpError:
-                hidden = program_view.area_row(row['area'], row['state'])
-                row.clear()
-                row.update(hidden)
+        readable = list(self._readable_projects(ctx.principal))
+        for attempt in range(self.PROGRAM_READS_MAX):
+            result = dict(reader(pid, state['o'], limit, idle_minutes, int(raw), readable=readable))
+            lost = []
+            for row in (result.get('areas') or {}).get('items') or []:
+                if not isinstance(row, dict) or not row.get('visible'):
+                    continue
+                try:
+                    row['coordinators'] = self.service.coordinators_of(ctx.principal, row['area'])
+                except HttpError:
+                    lost.append(row['area'])
+                    hidden = program_view.area_row(row['area'], row['state'])
+                    row.clear()
+                    row.update(hidden)
+            if not lost:
+                break
+            # Review of .453, B2 (N1): a right lost after the read. The row is hidden above, and the page is read
+            # again without that area, so none of its citations (no-area-cites, cites-superseded-revision) stay.
+            readable = [project for project in readable if project not in lost]
+        else:
+            # Rights kept changing on every read: the rows are hidden, and no requirement row is shown at all.
+            result['requirements'] = program_view.unsettled()
         result['coverage'] = program_view.coverage(result['areas']['items'], result['areas']['total'], state['o'],
                                                    result['requirements'])
         self.service.set_program_flag(pid, bool(result.pop('is_program', False)))

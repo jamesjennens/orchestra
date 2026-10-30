@@ -892,7 +892,10 @@ project linked with it in a program, and the addressed agents are woken.
 - **Under the caller's permissions:** the service checks each project the caller can name and passes those as its
   own `--readable`; the endpoint honours that set only from the service's launch. An area outside it, and one that
   does not exist, give the same row: the link state and "not visible to you", with no number.
-- **Coordinators** of a readable area come from `coordinators_of`, which checks the caller again.
+- **Coordinators** of a readable area come from `coordinators_of`, which checks the caller again. A right lost
+  since hides the row, and the page is read again without that area, so its citations leave the requirements
+  section too (at most three reads; then the section reads `unsettled`).
+- **An area whose program side is not in** (proposed, left, not accepted by an owner) is never read.
 - **The Program page** is in the menu of a project with an accepted `program.area.*` side: a flag kept in the web
   state (`program_flags`), recomputed by every program read and by a web accept or retire of a `program.` key.
   An older kit leaves it untouched; a stale flag only shows or hides the link.

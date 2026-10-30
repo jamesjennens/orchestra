@@ -361,10 +361,16 @@ for the caller, then reports:
   you": a missing area gives the same row.
   - **Open tasks:** open, in progress or blocked, not an epic, not a requirement record (`requirement`,
     `brd-section`), and nothing the queue never lists as work (event and gate rows, the merge slot, record anchors).
+  - **The program's side first** (review of .453, B1): an area whose program side is not in (proposed, left, not
+    accepted by an owner) is never read, by any caller, so a proposed entry tells nothing about whether a project of
+    that name exists. Only an area whose program side is in is read for the one fact, and only a readable one for
+    numbers.
   - **A key bound to projects** reads nothing of a project it is not bound to (rule 1 of
     COORDINATORS_PER_PROJECT_DESIGN), so there an area outside the key reads `not-checked`, with no read at all.
   - **A right lost after the read:** the web route asks `coordinators_of`, which checks the caller again; the row
-    becomes the hidden one and its rows stop counting.
+    becomes the hidden one, and the page is read again without that area, so none of its citations stay in the
+    requirements section (review of .453, B2). After three reads that each lose a right, the requirements section
+    is `unsettled`, with no row.
 - **Interfaces** read `not-available` until slice 3 (kittrial-5bb.450) is merged forward. **Decisions** and
   **suggestions** read `unchecked` until slice 5.
 - **Requirements:** each accepted program requirement that no readable area of this read cites (`no-area-cites`),

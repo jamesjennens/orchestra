@@ -1376,6 +1376,13 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
         return area_path,area_rows,area_governance
     areas,cited,pins=[],{},[]
     for area,own_item in page:
+        # Review of .453, B1: the program's own side first, from its records alone. A side that is not in (proposed,
+        # left, not accepted by an owner) reads nothing of the area, so a proposed entry tells nothing about whether
+        # a project of that name exists; .446 reads the other side only when this one is in.
+        side=program_view.program_side(name,area,own_item,memberships,users)
+        if side!='in':
+            areas.append(program_view.area_row(area,program_links.link_state(side,False)))
+            continue
         if facts is not None and area not in facts:
             areas.append(program_view.area_row(area,'not-checked'))
             continue

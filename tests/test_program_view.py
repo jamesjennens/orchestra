@@ -240,6 +240,94 @@ class WebTests(LinkCase):
         rows = {row['area']: row for row in self.view(self.tokens['vera'])['areas']['items']}
         self.assertEqual(program_view.area_row('north', 'linked'), rows['north'])
 
+    def test_a_proposed_or_left_area_is_never_read(self):
+        # Review of .453, B1: the program's side first. east is proposed (no accepted revision) and west has left;
+        # neither is read, by any caller, whatever it may read: a proposed entry tells nothing about a project.
+        self.admit('east', state='draft-only')
+        self.admit('west', text=statement('Area', 'west', state='left'))
+        for name in ('vera', 'carl', 'pat'):
+            self.reads.clear()
+            rows = {row['area']: row for row in self.view(self.tokens[name])['areas']['items']}
+            self.assertNotIn('east', self.reads, name)
+            self.assertNotIn('west', self.reads, name)
+            self.assertIn('north', self.reads, name)                  # an area whose program side is in
+            self.assertEqual(program_view.area_row('east', 'proposed'), rows['east'], name)
+            self.assertEqual(program_view.area_row('west', 'left'), rows['west'], name)
+
+    def test_a_lost_right_drops_the_areas_citations(self):
+        # Review of .453, B2 (N1), with injected rows: while north is readable, K1 is cited by it and north pins a
+        # superseded revision; when vera loses north between the read and coordinators_of, the page is read again
+        # without north, so K1 reads no-area-cites and no row names north's design.
+        seen = []
+
+        def program(project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=()):
+            seen.append(sorted(readable))
+            north = 'north' in readable
+            areas = [program_view.area_row('north', 'linked', {'open_tasks': 1, 'rows_read': 9,
+                                                                'lanes': {'waiting_too_long': 0, 'expect_by_passed': 0}})
+                     if north else program_view.area_row('north', 'linked')]
+            rows = ([{'key': 'K1', 'token': 'req:prog/K1@1', 'area': 'north', 'design': 'api', 'heading': 'h',
+                      'flags': ['cites-superseded-revision']}] if north
+                    else [{'key': 'K1', 'title': 'Queue', 'reference': 'prog-1', 'flags': ['no-area-cites']}])
+            requirements = {'items': rows, 'total': len(rows), 'next_offset': None,
+                            'scope': program_view.REQUIREMENTS_SCOPE}
+            return dict(program_view.answer(project_id, areas, 1, offset, limit, requirements), is_program=True)
+        self.backend.program = program
+        calls = []
+        inner = self.service.coordinators_of
+
+        def once(principal, project):
+            calls.append(project)
+            if len(calls) == 1:
+                raise forbidden('no longer readable')
+            return inner(principal, project)
+        with patch.object(self.service, 'coordinators_of', once):
+            answer = self.view(self.tokens['vera'])
+        self.assertEqual([['north', 'prog'], ['prog']], seen)
+        self.assertEqual(program_view.area_row('north', 'linked'), answer['areas']['items'][0])
+        self.assertEqual([('K1', ['no-area-cites'])], [(row['key'], row['flags']) for row in answer['requirements']['items']])
+        self.assertNotIn('north', json.dumps(answer['requirements']))
+
+    def test_rights_that_keep_changing_show_no_requirement(self):
+        # A backend that keeps answering north as readable, and a right that is lost on every read: after three
+        # reads the row is hidden and the requirements section is unsettled, with no row at all.
+        seen = []
+
+        def program(project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=()):
+            seen.append(sorted(readable))
+            areas = [program_view.area_row('north', 'linked', {'open_tasks': 1, 'rows_read': 9,
+                                                                'lanes': {'waiting_too_long': 0, 'expect_by_passed': 0}})]
+            requirements = {'items': [{'key': 'K1', 'area': 'north', 'flags': ['cites-superseded-revision']}],
+                            'total': 1, 'next_offset': None, 'scope': program_view.REQUIREMENTS_SCOPE}
+            return dict(program_view.answer(project_id, areas, 1, offset, limit, requirements), is_program=True)
+        self.backend.program = program
+
+        def refuse(principal, project):
+            raise forbidden('no longer readable')
+        with patch.object(self.service, 'coordinators_of', refuse):
+            answer = self.view(self.tokens['vera'])
+        self.assertEqual(3, len(seen))
+        self.assertEqual(program_view.area_row('north', 'linked'), answer['areas']['items'][0])
+        self.assertEqual(('unsettled', []), (answer['requirements']['state'], answer['requirements']['items']))
+
+    def test_the_program_flag_never_reaches_a_non_member(self):
+        # Review of .453, B2 (N2): the flag is set for prog, and no one outside prog sees it, in a list or a view.
+        self.view(self.tokens['carl'])
+        self.assertTrue(self.request('GET', '/v1/projects/prog', token=self.tokens['carl']).data['program'])
+        north_only = self.request('POST', '/v1/agents', {'name': 'Gull', 'working_directory': '/home/x/gull',
+                                                         'projects': ['north']}, token=self.tokens['vera'])
+        self.assertEqual(201, north_only.status, north_only.data)
+        callers = {'nobody': self.tokens['otto'], 'owner of north only': self.tokens['nora'],
+                   'agent without prog': north_only.data['credential']['secret']}
+        for label, token in callers.items():
+            listed = self.request('GET', '/v1/projects', token=token)
+            self.assertEqual(200, listed.status, (label, listed.data))
+            self.assertNotIn('prog', [item.get('id') for item in listed.data['items']], label)
+            self.assertFalse(any(item.get('program') for item in listed.data['items']), label)
+            view = self.request('GET', '/v1/projects/prog', token=token)
+            self.assertEqual(404, view.status, label)
+            self.assertNotIn('program', json.dumps(view.data), label)
+
     def test_a_right_lost_after_the_read_hides_the_row(self):
         # coordinators_of checks the caller again: a role removed after the endpoint's read makes the row the
         # hidden one, and its rows no longer count.
@@ -361,11 +449,13 @@ class NativeProgramTests(unittest.TestCase):
         self.assertEqual(0, made.returncode, made.stderr)
         return json.loads(made.stdout)['id']
 
+    PP_ITEMS = [item('program.area.qq', statement('Area', 'qq'), 'ops'),
+                item('program.area.zz', statement('Area', 'zz'), 'ops')]
+
     def fake_links(self, rows, operators):
         ids = {str(row.get('id', '')).split('-', 1)[0] for row in rows if isinstance(row, dict)}
         if 'pp' in ids:
-            return {'items': [item('program.area.qq', statement('Area', 'qq'), 'ops'),
-                              item('program.area.zz', statement('Area', 'zz'), 'ops')]}
+            return {'items': list(getattr(self, 'pp_items', self.PP_ITEMS))}
         if 'qq' in ids:
             return {'items': [item(pl.MEMBER_OF, statement('Program', 'pp'), 'ops')]}
         return {'items': []}
@@ -383,10 +473,36 @@ class NativeProgramTests(unittest.TestCase):
             cited.append(sorted(found))
             return inner_section(pointers, found, pins, offset)
         request = {'action': 'program', 'project': 'pp', 'actor': kw.pop('actor', 'op'), 'args': list(args)}
+        self.resolved = []
+        inner_dir = fixture.endpoint.project_dir
+
+        def resolving(root, name):
+            self.resolved.append(name)
+            return inner_dir(root, name)
         with patch('reference_records.links', self.fake_links), patch('read_cache.cached_export_rows', counted), \
-                patch('program_view.requirements_section', section):
+                patch('program_view.requirements_section', section), \
+                patch.object(fixture.endpoint, 'project_dir', resolving):
             answer = fixture.endpoint.execute(self.root, request, **kw)
         return json.loads(answer['stdout']), reads, cited
+
+    def test_native_a_proposed_or_left_area_is_never_read(self):
+        # Review of .453, B1, on the real endpoint with a counting backend: qq exists but its entry is only proposed,
+        # and zz has left; neither is resolved nor read, on any route, so the time of a read says nothing about them.
+        self.created('pp', 'The program, again')
+        self.pp_items = [item('program.area.qq', statement('Area', 'qq'), 'ops', state='draft-only'),
+                         item('program.area.zz', statement('Area', 'zz', state='left'), 'ops')]
+        try:
+            config = fixture.endpoint.AuthorityConfig(str(self.root / 'unread-authority.json'))
+            for args, kw in (((), {}), ((), {'key_projects': frozenset({'pp', 'qq', 'zz'})}),
+                             (['--readable', 'qq', '--readable', 'zz'], {'actor': 'http/read', 'authority_config': config})):
+                view, reads, _ = self.run_view(args, **kw)
+                rows = {row['area']: row for row in view['areas']['items']}
+                self.assertEqual((program_view.area_row('qq', 'proposed'), program_view.area_row('zz', 'left')),
+                                 (rows['qq'], rows['zz']), kw)
+                self.assertEqual(['pp'], reads, kw)
+                self.assertEqual(['pp'], self.resolved, kw)
+        finally:
+            del self.pp_items
 
     def test_native_the_view_over_real_projects_on_every_route(self):
         self.created('pp', 'The program itself')
@@ -465,6 +581,41 @@ console.log(JSON.stringify({text:host.textContent,
                       program_view.DECISIONS_UNCHECKED, 'no-area-cites'):
             self.assertIn(words, out['text'])
         self.assertEqual([True, False, False, False], out['flags'])
+
+    def test_markup_in_a_name_renders_as_literal_text(self):
+        # Review of .453, B2 (3): every name the page shows is set as text. A person's, an agent's, its owner's and a
+        # requirement's title, each holding markup, come out literally, and no element is made from them. Needs node.
+        import shutil
+        import test_http_web
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed')
+        code = """await import(process.argv[1]);
+const view=await import(process.argv[2]);
+const read=JSON.parse(process.argv[3]);
+const host=document.createElement('div');
+for (const node of view.view(read)) host.appendChild(node);
+const made=['img','script','b','svg','iframe'].map((tag)=>host.querySelectorAll(tag).length).reduce((a,b)=>a+b,0);
+console.log(JSON.stringify({text:host.textContent,made}));"""
+        names = {'person': '<b>Nora</b>', 'agent': '<img src=x onerror=alert(1)>', 'owner': '<script>x()</script>',
+                 'title': '<svg onload=1>Queue'}
+        read = {'coverage': {'text': 'c'},
+                'areas': {'items': [{'area': 'north', 'state': 'linked', 'visible': True, 'open_tasks': 0,
+                                     'lanes': {'waiting_too_long': 0, 'expect_by_passed': 0}, 'rows_read': 0,
+                                     'coordinators': {'people': [{'display_name': names['person'], 'role': 'owner'}],
+                                                      'agents': [{'name': names['agent'],
+                                                                  'owner_display_name': names['owner']}]}}]},
+                'interfaces': {'state': 'not-available', 'note': 'n'},
+                'requirements': {'items': [{'key': 'K1', 'title': names['title'], 'flags': ['no-area-cites']}],
+                                 'scope': 's'},
+                'decisions': {'state': 'unchecked', 'note': 'd'}, 'suggestions': {'state': 'unchecked', 'note': 's'}}
+        done = test_http_web.run_node_module(self, node, code, (KIT / 'tests/web_dom_shim.mjs').as_uri(),
+                                             (KIT / 'web/js/views/program.js').as_uri(), json.dumps(read))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(0, out['made'])
+        for label, name in names.items():
+            self.assertIn(name, out['text'], label)
 
     def test_the_rail_shows_program_only_by_the_flag(self):
         source = (KIT / 'web/js/app.js').read_text(encoding='utf-8')

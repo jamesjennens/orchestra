@@ -25,6 +25,8 @@ INTERFACES_NOT_AVAILABLE = 'The interface register (kittrial-5bb.450, slice 3) i
 DECISIONS_UNCHECKED = 'Decisions across levels come with slice 5.'
 SUGGESTIONS_UNCHECKED = 'Suggestions from areas come with slice 5.'
 COORDINATORS_ON_THE_WEB = 'Coordinators are shown on the web Program page.'
+REQUIREMENTS_UNSETTLED = ('Rights changed while this page was read, so the program requirements are not shown: '
+                          'read the page again.')
 REQUIREMENTS_SCOPE = ('Program requirements are checked against the readable areas of this read only: an area '
                       'that is not visible to you, or not on this page, is not counted.')
 
@@ -65,14 +67,27 @@ def area_keys(items):
     return [(area, found[area]) for area in sorted(found)]
 
 
+def program_side(program, area, own_item, memberships, users):
+    """The program's own side of an area's link: 'in', 'left' or None (proposed, not accepted by an owner, ...).
+    Decided from the program's records alone, before anything of the area is read (review of .453, B1)."""
+    import program_links
+    return program_links.side_status(own_item, program, area, memberships, users)[0]
+
+
 def link_state(program, area, own_item, member_item, memberships, users):
     """The link state the program-links read gives this area (kittrial-5bb.446): the program's side, then the one
-    fact about the area's side, read for every reader alike."""
+    fact about the area's side, read for every reader alike, and only when the program's side is in."""
     import program_links
-    status, _reason = program_links.side_status(own_item, program, area, memberships, users)
+    status = program_side(program, area, own_item, memberships, users)
     other = (program_links.side_status(member_item, area, program, memberships, users)[0] == 'in'
              if status == 'in' else False)
     return program_links.link_state(status, other)
+
+
+def unsettled():
+    """The requirements section when rights kept changing while the page was read: no row at all."""
+    return {'items': [], 'total': 0, 'next_offset': None, 'scope': REQUIREMENTS_SCOPE,
+            'state': 'unsettled', 'note': REQUIREMENTS_UNSETTLED}
 
 
 def accepted_area(items, program, memberships, users):
