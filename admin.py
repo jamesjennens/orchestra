@@ -10826,7 +10826,7 @@ def main():
         value=getattr(args,action.dest,None) if '--actor' in action.option_strings else None
         if isinstance(value,str):
             try:refuse_http_actor(value,False)
-            except ValueError as error:raise SystemExit('admin.py: %s'%error)
+            except ValueError as error:raise ValueError('Invalid operator identity: %s'%error) from None
     root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)

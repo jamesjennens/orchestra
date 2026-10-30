@@ -367,17 +367,17 @@ class HostActorTests(unittest.TestCase):
                                            '--actor', actor, '--file', 'missing.json'], capture_output=True, text=True,
                                           encoding='utf-8', errors='replace', env=dict(os.environ, PYTHONUTF8='1'))
                     self.assertNotEqual(0, done.returncode)
-                    self.assertIn('admin.py: Actor', done.stderr)
+                    self.assertIn('Invalid operator identity: Actor', done.stderr)
             # The command's own --actor option, however it is spelled (an abbreviation reaches the same option), and
             # never a positional name: `verifiers add NAME` names a verifier, whose own refusal answers for it.
             abbreviated = subprocess.run([sys.executable, str(KIT / 'admin.py'), '--root', root, 'handoff', 'alpha',
                                           '--acto', 'usr_' + HEX, '--file', 'missing.json'], capture_output=True,
                                          text=True, encoding='utf-8', errors='replace', env=dict(os.environ, PYTHONUTF8='1'))
-            self.assertIn('admin.py: Actor', abbreviated.stderr)
+            self.assertIn('Invalid operator identity: Actor', abbreviated.stderr)
             named = subprocess.run([sys.executable, str(KIT / 'admin.py'), '--root', root, 'verifiers', 'add',
                                     'usr_' + HEX, '--actor', 'ops'], capture_output=True, text=True, encoding='utf-8',
                                    errors='replace', env=dict(os.environ, PYTHONUTF8='1'))
-            self.assertNotIn('admin.py: Actor', named.stderr)
+            self.assertNotIn('Invalid operator identity: Actor', named.stderr)
 
 
 @unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
