@@ -501,7 +501,9 @@ refusal still holds), and the delegation records read as ordinary comments.
 **Attested decisions** (kittrial-5bb.454 r2). `admin.py backup` collects `<project>/.decision-attests/` the same way, and
 `restore-new` validates and restores it. `restore-new` always makes a new name, as it refuses the same one, and a record
 binds its project's name: a new name is a new project. So every row it restores reads `not-attested`, on purpose, and stands
-gated, until a person owner of the new project attests it again (the decision's page, or `admin.py decision-attest`).
+gated, until a person owner of the new project attests it again (the decision's page, or `admin.py decision-attest`). A
+coordinator cannot do that for them, here or after a lost journal: only an owner or an operator attests a row whose old
+attestation can no longer be read.
 Adoptions elsewhere that pin the old name stay on the old name. An older kit refuses to restore a backup that holds the
 journal, as above.
 

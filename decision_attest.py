@@ -11,6 +11,11 @@ and description, a reserved prefix a raw comment cannot write, honoured only wit
   the attestation is refused and never attested by mistake;
 - the operator's host path (``admin.py decision-attest``), for an actor on the installation's allowlist.
 
+A row with an attestation comment no journal honours (the journal was lost, or the project restored under a new name) is
+attested again only at an owner's level, and that record keeps the level: whoever wrote that comment and whatever it said
+cannot be known, and a contributor can have edited the text. So a lost journal never lets a coordinator lower an owner's
+row, and never locks an owner out.
+
 A row whose text carries ``Adopts:`` or ``Authorises:`` pins the program decision's attestation id. It is attested only by
 someone who can read that decision now, and only with the id it has now: an area must not read ``adopted`` for text it
 never saw. The same refusal answers an unreadable program, no such project and no such decision. The id is the sha256 of
@@ -431,12 +436,18 @@ def apply(payload, *, project, journal, run, author, via, at, state, operators, 
     if role not in OWNERS and any(record['owner_gated'] for record in _newest_run(records)):
         raise AttestRefusal(403, 'This decision was attested at an owner\'s level: only a person owner of %s, or an '
                                  'operator, attests it again. Nothing was written.' % project)
+    unhonoured = has_unhonoured_comment(row, project, journal)
+    if role not in OWNERS and unhonoured:
+        raise AttestRefusal(403, 'This decision carries an attestation that can no longer be read as one (its journal entry '
+                                 'is gone, or the project was restored): only a person owner of %s, or an operator, attests '
+                                 'it again. Nothing was written.' % project)
     current = digest(row)
     if payload['digest'] != current:
         raise AttestRefusal(409, 'The text changed since you read it. Read it again before you attest it. Nothing was '
                                  'written.')
     check_pins(row, pinned)
-    record = make_record(payload, project=project, author=author, via=via, gated=owner_gated(row, role), at=at)
+    # An owner recovering such a row keeps the level, so that nobody below it can replace this record while the words stand.
+    record = make_record(payload, project=project, author=author, via=via, gated=unhonoured or owner_gated(row, role), at=at)
     open_journal(journal)
     comment = record_json.loads(run(['comments', 'add', payload['decision'], body(record), '--json']))
     if not isinstance(comment, dict) or not comment.get('id'):
@@ -512,11 +523,28 @@ def carries_lines(row):
     return any(line.startswith(GATED_LINES) for line in description.split('\n'))
 
 
+def _attestation_comments(row):
+    """The comments of a row with the reserved prefix, and no other kind of comment."""
+    comments = row.get('comments') if isinstance(row, dict) else None
+    return [comment for comment in comments or [] if isinstance(comment, dict) and str(comment.get('text') or '').startswith(PREFIX)]
+
+
 def carries_attestation_comment(row):
     """Whether a row has a comment with the reserved prefix, honoured or not (review of r3, b1): with its journal entry gone
     a row's lines can be edited out, so the lines alone cannot say that an owner once attested it."""
-    comments = row.get('comments') if isinstance(row, dict) else None
-    return any(isinstance(comment, dict) and str(comment.get('text') or '').startswith(PREFIX) for comment in comments or [])
+    return bool(_attestation_comments(row))
+
+
+def has_unhonoured_comment(row, project, journal):
+    """Whether a row has an attestation comment that no journal honours here: its entry is gone, it names another project
+    (a restore under a new name), or it does not read. What it said cannot be relied on, so nobody may act below an owner's
+    level on the row (review of r4)."""
+    decision = row.get('id') if isinstance(row, dict) else None
+    for comment in _attestation_comments(row):
+        record = parse_comment(comment, project=project, decision=decision)
+        if record is None or not journaled(journal, record):
+            return True
+    return False
 
 
 def gate(row, *, project, journal, actor, state, by_service, command, change):
@@ -536,8 +564,9 @@ def gate(row, *, project, journal, actor, state, by_service, command, change):
         return AttestRefusal(403, 'Refusing to %s %s: it is a decision that binds. On the host, an operator does this '
                                   'with admin.py decision-change. Nothing was written.' % (what, row.get('id')))
     # With a record, the record says. A comment no journal honours says nothing to rely on and the text can be edited, so it
-    # needs an owner. With neither, the text is all there is, and nobody attested it.
-    needed = OWNERS if (needs_owner(records) if records else (marked or owner_gated(row, None))) else COORDINATORS
+    # needs an owner, beside any record that is honoured too. With neither, the text is all there is, and nobody attested it.
+    needed = (OWNERS if needs_owner(records) or has_unhonoured_comment(row, project, journal)
+              or (not records and owner_gated(row, None)) else COORDINATORS)
     if authority(actor, project, state) in needed:
         return None
     who = 'a person owner' if needed is OWNERS else 'an owner or a coordinator'

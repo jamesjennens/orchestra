@@ -424,6 +424,84 @@ class ApplyTests(Case):
         self.assertEqual({'pin': None, 'state': 'not-attested'},
                          da.pin_fact(row_of(), 'prog', web_state(), OPS, self.journal))
 
+    def lost(self, text, status='open', author=OWNER, gated=True):
+        """A row its author attested, with the journal entry gone, as a contributor then left its text."""
+        native = Native(row_of('Binds: north\nOwner-only: yes', status=status))
+        record = self.write(native, author)['record']
+        (self.journal / da.JOURNAL_DIR / (record['sha256'] + '.json')).unlink()
+        native.rows['north-1']['description'] = text
+        return native, record
+
+    def test_a_coordinator_cannot_attest_over_an_attestation_no_journal_honours(self):
+        # Review of r4, b1, the reviewer's matrix: open and closed, a person and a granted agent.
+        for status in ('open', 'closed'):
+            for author in (COORD, AGENT):
+                with self.subTest(status=status, author=author):
+                    native, _ = self.lost('Binds: north\nOwner-only: no', status)
+                    before = len(native.rows['north-1']['comments'])
+                    with self.assertRaises(da.AttestRefusal) as refused:
+                        self.write(native, author)
+                    self.assertEqual(403, refused.exception.status)
+                    self.assertIn('can no longer be read', str(refused.exception))
+                    self.assertEqual(before, len(native.rows['north-1']['comments']))
+                    self.assertEqual('closed' if status == 'closed' else 'not-attested', self.reads(native.rows['north-1'])['state'])
+
+    def test_an_owner_or_an_operator_recovers_it_and_the_record_keeps_the_level(self):
+        # Make sure a lost journal does not lock the owner out: the words themselves would not ask for an owner.
+        for author, role in ((OWNER, 'owner'), ('ops', 'operator')):
+            for status in ('open', 'closed'):
+                with self.subTest(author=author, status=status):
+                    native, _ = self.lost('Binds: north\nOwner-only: no', status)
+                    record = self.write(native, author)['record']
+                    self.assertTrue(record['owner_gated'], 'the words alone would not')
+                    row = native.rows['north-1']
+                    if status == 'closed':
+                        row = dict(row, status='open')
+                    self.assertEqual(('counts', role), (self.reads(row)['state'], self.reads(row)['role']))
+                    with self.assertRaises(da.AttestRefusal):
+                        self.write(native, COORD)
+
+    def test_the_journal_coming_back_does_not_lower_the_row(self):
+        # The old record is honoured again and the coordinator never wrote one, so nothing newer can stand below it.
+        native, record = self.lost('Binds: north\nOwner-only: no')
+        with self.assertRaises(da.AttestRefusal):
+            self.write(native, COORD)
+        da.publish(self.journal, record)
+        row = native.rows['north-1']
+        self.assertEqual('attestation-stale', self.reads(row)['state'], 'the edited text was never attested')
+        with self.assertRaises(da.AttestRefusal) as refused:
+            self.write(native, COORD)
+        self.assertIn("owner's level", str(refused.exception))
+        recovered = self.write(native, OWNER)['record']
+        self.assertEqual(('counts', 'owner', recovered['sha256']), tuple(self.reads(row)[key] for key in ('state', 'role', 'id')))
+
+    def test_a_program_decision_is_not_lowered_and_an_adoption_stays_with_the_old_run(self):
+        import program_decisions as pd
+        native, record = self.lost('Binds: south\nOwner-only: no')
+        row = native.rows['north-1']
+        with self.assertRaises(da.AttestRefusal):
+            self.write(native, COORD)
+        found = pd.program_decision(row, PROJECT, web_state(), OPS, {PROJECT: self.journal})
+        self.assertEqual(['not-attested'], found['flags'])
+        self.write(native, OWNER)
+        found = pd.program_decision(row, PROJECT, web_state(), OPS, {PROJECT: self.journal})
+        self.assertEqual(([], 'owner', True), (found['flags'], found['attested_as'], found['owner_level']))
+        self.assertNotEqual(record['sha256'], found['attestation_id'], 'an adoption of the old run reads stale')
+
+    def test_only_an_unhonoured_comment_asks_for_an_owner(self):
+        # A coordinator's own ordinary work goes on where every comment is honoured, or where there is none.
+        native = Native(row_of('Binds: north\nOwner-only: no'))
+        self.write(native, COORD)
+        self.assertFalse(da.has_unhonoured_comment(native.rows['north-1'], PROJECT, self.journal))
+        self.write(native, AGENT)
+        self.assertFalse(da.has_unhonoured_comment(row_of(), PROJECT, self.journal))
+        # And each way a comment cannot be honoured.
+        row = native.rows['north-1']
+        self.assertTrue(da.has_unhonoured_comment(row, 'another-project', self.journal))
+        self.assertTrue(da.has_unhonoured_comment(row, PROJECT, None))
+        spoiled = dict(row, comments=row['comments'] + [{'id': 'x', 'author': OWNER, 'text': da.PREFIX + '{not a record'}])
+        self.assertTrue(da.has_unhonoured_comment(spoiled, PROJECT, self.journal))
+
     def test_a_journal_that_cannot_be_used_stops_it_before_the_comment(self):
         native = Native(row_of())
         (self.journal / da.JOURNAL_DIR).write_text('a file', encoding='utf-8')
@@ -588,6 +666,27 @@ class GateTests(Case):
         self.assertIsNone(self.gate(task, 'plain', by_service=False))
         start = {'status': False, 'type': 'decision', 'add': [], 'remove': [], 'set': None}
         self.assertEqual(403, self.gate(task, 'plain', start, by_service=False).status)
+
+    def test_another_kind_of_comment_marks_nothing(self):
+        # Review of r4, c1: only the reserved prefix. The kit's ordinary records must not gate a decision row.
+        for text in ('Kind: task-checkpoint-v1\n{}', 'Kind: delegation-v1\n{}', 'Kind: decision-attest-v2\n{}', 'Kind: lane-state-v1\n{}',
+                     'Kind: decision-attest-v1', 'A comment about Kind: decision-attest-v1\n'):
+            with self.subTest(text=text):
+                row = row_of('Plain prose.', comments=[{'id': 'c', 'author': OWNER, 'text': text}])
+                self.assertFalse(da.carries_attestation_comment(row))
+                self.assertFalse(da.has_unhonoured_comment(row, PROJECT, self.journal))
+                self.assertIsNone(self.gate(row, 'w1', by_service=False))
+                self.assertIsNone(self.gate(row, CONTRIB))
+
+    def test_a_partly_lost_journal_keeps_the_owners_level(self):
+        # The coordinator's older record is still honoured, and the owner's newer one is not: the row needs an owner.
+        row = row_of('Binds: north\nOwner-only: no')
+        self.attest(row, COORD)
+        self.assertIsNone(self.gate(row, COORD))
+        self.attest(row, OWNER, journal=False, gated=True)
+        self.assertEqual(403, self.gate(row, COORD).status)
+        self.assertEqual(403, self.gate(row, AGENT).status)
+        self.assertIsNone(self.gate(row, OWNER))
 
     def test_the_level_of_a_row_with_no_record_comes_from_its_text(self):
         for text, coordinator in (('Binds: north\nOwner-only: yes', 403), ('Authorises: decision:prog/prog-1' + PIN, 403),
@@ -940,6 +1039,38 @@ class WebRouteTests(unittest.TestCase):
         self.patch_task(issue, 'pat', {'status': 'open'})
         self.assertEqual('counts', self.read(issue)['attestation'])
 
+    def journal_away(self):
+        journal = self.project / da.JOURNAL_DIR
+        aside = self.project / (da.JOURNAL_DIR + '-aside')
+        journal.rename(aside)
+        self.addCleanup(lambda: aside.rename(journal) if aside.exists() else None)
+        return lambda: aside.rename(journal)
+
+    def test_after_journal_loss_a_contributor_and_a_coordinator_cannot_lower_an_owners_row(self):
+        # Review of r4, b1, the reviewer's sequence over HTTP: closed and open, for a person and a granted agent, and the
+        # owner recovers every one, the journal back or not.
+        for status, name in (('closed', 'cleo'), ('closed', 'kite'), ('open', 'cleo'), ('open', 'kite')):
+            with self.subTest(status=status, name=name):
+                issue = self.make('Binds: pp\nOwner-only: yes')
+                made = self.attest(issue, 'pat')['record']
+                self.assertTrue(made['owner_gated'])
+                if status == 'closed':
+                    self.patch_task(issue, 'pat', {'status': 'closed'})
+                back = self.journal_away()
+                self.patch_task(issue, 'carl', {'description': 'Binds: pp\nOwner-only: no'})
+                answer = self.attest(issue, name, expected=403)
+                self.assertIn('can no longer be read', answer['error']['message'])
+                self.patch_task(issue, name, {'status': 'open' if status == 'closed' else 'closed'}, expected=403)
+                self.assertEqual(status, self.status(issue))
+                # The owner recovers it, and it keeps the owner's level though the words no longer ask for it.
+                recovered = self.attest(issue, 'pat')['record']
+                self.assertTrue(recovered['owner_gated'])
+                back()
+                if status == 'closed':
+                    self.patch_task(issue, 'pat', {'status': 'open'})
+                self.assertEqual(('counts', 'owner'), (self.read(issue)['attestation'], self.read(issue)['attested_as']))
+                self.attest(issue, name, expected=403)
+
     def test_a_bound_key_is_refused_like_an_unbound_one(self):
         # Reviewer's note: bound keys were not in their matrix. A key bound to a person and one bound to a lane, each with its
         # own actor in this project's registry, on an attested row and on an unattested one with the lines.
@@ -1147,6 +1278,21 @@ class WebRouteTests(unittest.TestCase):
         answer = fixture.endpoint.execute(self.root, {'project': 'pq', 'actor': 'w1', 'action': 'bd',
                                                       'args': ['close', issue, '--json']})
         self.assertEqual((2, 403), (answer['returncode'], answer['delegation_status']), answer)
+        # Review of r4: a coordinator cannot attest the restored row, a contributor's edit or not, and an owner can.
+        def run(argv, actor='ops'):
+            return fixture.admin.run_bd(self.root, 'pq', ['--actor', actor, *argv])
+        cleo, pat = self.ids['cleo'], self.ids['pat']
+        state = {'users': {cleo: {'disabled': False}, pat: {'disabled': False}}, 'memberships': {'pq': {cleo: 'coordinator', pat: 'owner'}}}
+        request = {'schema_version': 1, 'operation_id': 'op-pq', 'decision': issue, 'digest': da.digest(row)}
+        with self.assertRaises(da.AttestRefusal) as refused:
+            da.apply(request, project='pq', journal=restored, run=lambda argv: run(argv, cleo), author=cleo, via='session',
+                     at=AT[50], state=state, operators=['ops'])
+        self.assertEqual(403, refused.exception.status)
+        record = da.apply(request, project='pq', journal=restored, run=lambda argv: run(argv, pat), author=pat, via='session',
+                          at=AT[51], state=state, operators=['ops'])['record']
+        self.assertTrue(record['owner_gated'], 'the words Owner-only: no would not ask for it')
+        row = next(item for item in json.loads(run(['show', issue, '--json', '--include-comments'])) if item.get('id') == issue)
+        self.assertEqual(('counts', 'owner'), tuple(da.standing(row, 'pq', state, ['ops'], restored)[key] for key in ('state', 'role')))
 
     # -- the operator's own route ---------------------------------------------------------------------------------
     def admin(self, *args):

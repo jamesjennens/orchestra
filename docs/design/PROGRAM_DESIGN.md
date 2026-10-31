@@ -465,7 +465,11 @@ it), applied across levels.
   owner or coordinator standing in that project now; a contributor, a viewer, a worker credential or an unbound key is
   refused. Or an operator with `admin.py decision-attest`. The body names the digest the author read
   (`GET .../attestation`), and a text that changed since is refused with 409. A text attested at an owner's level (see
-  the gate) is attested again only by a person owner or an operator.
+  the gate) is attested again only by a person owner or an operator. So is a row with an attestation comment no journal
+  honours: its journal entry is gone, or the project was restored. What it said cannot be known and a contributor can have
+  edited the text, so a coordinator's attestation could otherwise lower an owner's row. An owner or an operator always can
+  recover it, and that record keeps the owner's level. The comment stays, so a coordinator does not attest that row again:
+  a coordinator's later choice is a new decision.
 - **How a row reads, at every read, in this order:** `closed`; `not-attested`; `attestation-stale`, when the newest
   record's digest is not the row's now (the newest, not any: going back to replaced text stays stale);
   `attester-not-authorised`, when the author's standing has gone. Each of these binds nothing, and the row is listed so
@@ -497,7 +501,7 @@ it), applied across levels.
   An owner's level (a person owner or an operator) for a text that says `Owner-only: yes`, that carries `Authorises:`, or
   an adoption a person owner or an operator attested; otherwise an owner or a coordinator, agents by the grant rule. Where
   there is a record that level comes from the record, not from the text now. An attestation comment no journal honours
-  needs an owner, because its text can have been edited. Prose such as `Per: the meeting of Tuesday` is not one of these
+  needs an owner, beside any record that is honoured, because its text can have been edited. Prose such as `Per: the meeting of Tuesday` is not one of these
   lines, and an ordinary decision carrying it closes as it always did. The web refuses anyone else with 403. Every host route refuses
   everyone, an operator included; an operator uses `admin.py decision-change`. A row moving from `in_progress` to
   `open` through task assign or release does not reach this gate, and that changes nothing that binds. A decision row
