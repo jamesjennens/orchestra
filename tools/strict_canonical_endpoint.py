@@ -32,6 +32,8 @@ import argparse
 import inspect
 import json
 import os
+import time
+import uuid
 from pathlib import Path
 
 CODE_DIR = Path(os.environ.get('STRICT_ENDPOINT_CODE_DIR') or
@@ -57,11 +59,33 @@ def load(path):
     return {'rows': [], 'seq': 0, 'comments': 0, 'journal': {}}
 
 
+#: How many times ``save`` offers the finished file to ``os.replace`` (kittrial-5bb.86). On
+#: Windows the replace fails with ``PermissionError`` while another process has the destination
+#: open, which a loaded machine makes common; the wait is short and bounded (well under a second).
+SAVE_REPLACE_TRIES = 5
+SAVE_REPLACE_WAIT = 0.02
+
+
 def save(path, state):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text(json.dumps(state), encoding='utf-8')
-    temporary.replace(path)
+    # Unique per writer, and ``with_name`` keeps the drive letter and the directory (Windows).
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        temporary.write_text(json.dumps(state), encoding='utf-8')
+        for attempt in range(SAVE_REPLACE_TRIES):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                if attempt + 1 >= SAVE_REPLACE_TRIES:
+                    raise
+                time.sleep(SAVE_REPLACE_WAIT * (attempt + 1))
+    finally:
+        # A failed save leaves nothing behind; after a successful replace this is already gone.
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
 
 
 class Canonical:

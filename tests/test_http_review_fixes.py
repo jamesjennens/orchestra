@@ -795,6 +795,37 @@ class CanonicalProtocolCase(EndpointCase):
         self.assertTrue(history.data['items'])
         self.assertIn('activity_cursor', history.data)
 
+    def test_a_124_cause_is_logged_but_never_in_the_response(self):
+        """kittrial-5bb.86: the operator log gets the cause; the caller keeps the sentence."""
+        import contextlib
+        import io
+        from unittest.mock import patch
+        alex, project = self.setup_project()
+        task_id = self.create_task(alex, project, 'cause').data['id']
+        sentinel = '/srv/other-project/private'
+        reply = {'returncode': 124, 'stdout': '',
+                 'stderr': 'Effect raised after the reservation (ValueError: %s token=secretvalue123); '
+                           'outcome unknown. Reconcile canonical state before retrying.\n' % sentinel}
+        real = self.backend._endpoint
+
+        def failing(action, project_id, actor, args, *rest, **more):
+            if action == 'bd' and args[:1] == ['update']:
+                return reply
+            return real(action, project_id, actor, args, *rest, **more)
+
+        log = io.StringIO()
+        with patch.object(self.backend, '_endpoint', failing), contextlib.redirect_stderr(log):
+            answer = self.request('PATCH', '/v1/projects/%s/tasks/%s' % (project, task_id),
+                                  {'title': 'changed'}, token=alex, key='cause-124')
+        self.assertEqual(503, answer.status, answer.data)
+        self.assertEqual('The operation may have committed; reconcile with the same idempotency key',
+                         answer.data['error']['message'])
+        body = json.dumps(answer.data)
+        for leak in (sentinel, 'secretvalue123', 'ValueError', '<path>', '<redacted>', 'canonical:'):
+            self.assertNotIn(leak, body)
+        self.assertIn('<path>', log.getvalue())
+        self.assertIn('<redacted>', log.getvalue())
+
     def test_complete_create_claim_checkpoint_contribute_approve_flow(self):
         alex, project = self.setup_project()
         task_id = self.create_task(alex, project, 'flow task').data['id']

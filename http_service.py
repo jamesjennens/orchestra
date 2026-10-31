@@ -53,6 +53,7 @@ import bd_refusals
 from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
 import claim_limit
 import handover_steps
+import native
 import project_setup
 import project_coordination
 import nudges
@@ -78,6 +79,18 @@ import program_links
 #: kittrial-5bb.449: a requirement key with `/` is kept, and said how it is cited (PROGRAM_DESIGN §3.1).
 QUALIFY_KEY_WARNING = ('The key %(key)s contains "/": cite it as req:%(project)s/%(key)s, even in this project, '
                        'because the part before the first "/" of a token is a project')
+#: A credential-shaped value in an endpoint line (kittrial-5bb.86). The usual 124 lines carry
+#: none (an exception type and text), but the line is kept for an operator, so a value that
+#: looks like a credential must not be readable there.
+_CREDENTIAL_VALUE = re.compile(r'(?i)\bBearer\s+(?!<redacted>)\S+')
+_CREDENTIAL_FIELD = re.compile(r'(?i)\b(token|secret|password|api[_-]?key|authorization)\b'
+                               r'(\s*[:=]\s*)(?:Bearer\s+)?\S+')
+
+
+def _mask_credentials(text):
+    """Replace credential-shaped values in one endpoint line with ``<redacted>`` (kittrial-5bb.86)."""
+    said = _CREDENTIAL_VALUE.sub('Bearer <redacted>', text)
+    return _CREDENTIAL_FIELD.sub(lambda match: match.group(1) + match.group(2) + '<redacted>', said)
 
 KIT_VERSION = '0.1.0'
 #: Where the installed kit is: the documents this service shows are read from it.
@@ -2799,6 +2812,7 @@ class EndpointBackend:
                 raise unauthenticated(detail or 'Authentication is no longer valid')
             raise forbidden(detail or 'Authority was revoked before the canonical write')
         if code == 124:
+            cls._log_canonical_failure(action, stderr)
             if reading:
                 raise cls._unread()
             # 124 is "the identity is reserved and the outcome is unknown" (run_guarded):
@@ -2945,6 +2959,25 @@ class EndpointBackend:
         said = (stderr or '').strip().split('\n')
         print('busy: the endpoint answered return code 75 for %s: %s'
               % (action or 'a request', ascii(said[-1][:400]) if said else '(nothing)'), file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _log_canonical_failure(action, stderr):
+        """The endpoint's own line for an uncertain canonical command, for the operator only.
+
+        Return code 124 means the operation identity is reserved and its outcome is
+        unknown: a real timeout OR any other exception after a possible write
+        (kittrial-5bb.173 item 3, kittrial-5bb.86). The caller keeps the classified 503
+        sentence; the cause is written here, to the service's log only, never to the
+        HTTP answer. Bounded (``native.redact`` caps one diagnostic line), with paths
+        replaced and credentials masked, and control characters shown (``ascii``): the
+        line is the endpoint's, and a hostile one must not drive the terminal.
+        """
+        said = [line for line in (stderr or '').splitlines() if line.strip()]
+        if not said:
+            return
+        excerpt = native.redact(_mask_credentials(said[-1]))
+        print('canonical: the endpoint answered return code 124 for %s: %s'
+              % (action or 'a request', ascii(excerpt)), file=sys.stderr, flush=True)
 
     def _settle_actor_rows(self, principal, project_id):
         """Judge an unmarked credential's name by the tracker once and keep the outcome.
