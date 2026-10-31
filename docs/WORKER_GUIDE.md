@@ -503,7 +503,8 @@ For program and area owners and coordinators (kittrial-5bb.454; docs/design/PROG
     `Authorises: decision:PROGRAM/ID@ATTESTATION` for this very decision and text. An agent never adopts an owner-only decision alone; a
     `Per:` decision an agent attested, or one that does not authorise this decision, does not count.
 - **Who attested a row is checked at every read:** someone who has since lost the role stops counting.
-- **A closed decision or adoption binds nothing.** On an attested row, and on any decision row with one of these lines,
+- **A closed decision or adoption binds nothing.** On an attested row, and on any decision row with one of these lines
+  (prose such as `Per: the meeting of Tuesday` is not one),
   closing, reopening, retyping or relabelling it as
   a decision needs standing: a person owner if the text is owner-only, carries `Authorises:` or is an owner's adoption,
   otherwise an owner or a coordinator. Anyone else is refused, and so is every host route; an operator uses

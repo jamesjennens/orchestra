@@ -543,14 +543,12 @@ class GateTests(Case):
             for change in (self.STATUS, self.RETYPE):
                 self.assertIsNone(self.gate(row, CONTRIB, change))
                 self.assertIsNone(self.gate(row, 'w1', change, by_service=False))
-        forged = row_of()
-        self.attest(forged, OWNER, journal=False)
-        self.assertIsNone(self.gate(forged, CONTRIB))
 
     def test_a_decision_row_carrying_any_of_the_lines_is_gated_attested_or_not(self):
         # Review of r2: a row reading not-attested stood open, so a host actor closed a restored decision for good.
         lines = ['Binds: north', 'Adopts: decision:prog/prog-1' + PIN, 'Owner-only: no', 'Per: decision:north/north-2',
-                 'Authorises: decision:prog/prog-1' + PIN, 'Binds: Not A Project', 'Owner-only: maybe']
+                 'Authorises: decision:prog/prog-1' + PIN, 'Binds: Not A Project', 'Owner-only: maybe', 'Per: decision:north',
+                 'Adopts: decision:', 'Authorises: decision:prog/prog-1']
         for line in lines:
             with self.subTest(line=line):
                 row = row_of('Some prose.\n' + line)
@@ -558,6 +556,38 @@ class GateTests(Case):
                 self.assertEqual(403, self.gate(row, 'ops', by_service=False).status)
                 self.assertIsNone(self.gate(row, OWNER))
                 self.assertEqual(403, self.gate(row, 'w1', self.RETYPE, by_service=False).status)
+
+    def test_prose_that_starts_like_a_line_is_not_one(self):
+        # Review of r3, c1: an ordinary decision that says this closes as it always did, on the host too.
+        for text in ('Per: the meeting of Tuesday', 'Adopts: the queue from last year', 'Authorises: nothing yet',
+                     'Per decision:north/north-2', 'per: decision:north/north-2'):
+            with self.subTest(text=text):
+                self.assertFalse(da.carries_lines(row_of(text)))
+                self.assertIsNone(self.gate(row_of(text), 'w1', by_service=False))
+                self.assertIsNone(self.gate(row_of(text), CONTRIB))
+        # An attestation of such a row is still an attestation.
+        attested = row_of('Per: the meeting of Tuesday')
+        self.attest(attested, OWNER, gated=True)
+        self.assertEqual(403, self.gate(attested, 'w1', by_service=False).status)
+
+    def test_an_attestation_comment_no_journal_honours_gates_the_row_at_an_owners_level(self):
+        # Review of r3, b1: with the journal gone the lines can be edited out, and the row must still not reopen.
+        row = row_of('Plain prose, with the lines edited out.', status='closed')
+        self.attest(row, OWNER, journal=False)
+        self.assertEqual('closed', self.reads(row)['state'])
+        self.assertTrue(da.carries_attestation_comment(row))
+        self.assertFalse(da.carries_lines(row))
+        self.assertEqual(403, self.gate(row, 'plain', by_service=False).status)
+        self.assertEqual(403, self.gate(row, 'ops', by_service=False).status)
+        for actor in (CONTRIB, COORD, AGENT):
+            self.assertEqual(403, self.gate(row, actor).status, actor)
+        self.assertIsNone(self.gate(row, OWNER))
+        # A comment that only quotes the words, not at its start, is not one; a task's is the gate's only as a decision.
+        self.assertFalse(da.carries_attestation_comment(row_of(comments=[{'id': 'c', 'text': 'see ' + da.PREFIX}])))
+        task = row_of('Prose.', issue_type='task', comments=row['comments'])
+        self.assertIsNone(self.gate(task, 'plain', by_service=False))
+        start = {'status': False, 'type': 'decision', 'add': [], 'remove': [], 'set': None}
+        self.assertEqual(403, self.gate(task, 'plain', start, by_service=False).status)
 
     def test_the_level_of_a_row_with_no_record_comes_from_its_text(self):
         for text, coordinator in (('Binds: north\nOwner-only: yes', 403), ('Authorises: decision:prog/prog-1' + PIN, 403),
@@ -883,6 +913,50 @@ class WebRouteTests(unittest.TestCase):
                                                            'w1', None)
         self.assertEqual((2, 422), (answer['returncode'], answer['delegation_status']), answer)
 
+    def test_prose_on_a_decision_closes_on_the_host_as_it_always_did(self):
+        issue = self.make('Per: the meeting of Tuesday')
+        self.assertEqual(0, self.host('w1', 'close', issue, '--json')['returncode'])
+        self.assertEqual(0, self.host('w1', 'reopen', issue, '--json')['returncode'])
+
+    def test_journal_loss_does_not_open_the_gate_to_the_edit_and_reopen_sequence(self):
+        # Review of r3, b1, the reviewer's sequence on real bd: the owner retires a decision, the journal goes, a plain host
+        # actor edits the lines out, reopens and puts the text back, and the journal returns.
+        text = 'Binds: pp\nOwner-only: yes'
+        issue = self.make(text)
+        self.attest(issue, 'pat')
+        self.patch_task(issue, 'pat', {'status': 'closed'})
+        journal = self.project / da.JOURNAL_DIR
+        aside = self.project / (da.JOURNAL_DIR + '-aside')
+        journal.rename(aside)
+        self.addCleanup(lambda: aside.rename(journal) if aside.exists() else None)
+        self.assertEqual(0, self.host('plain', 'update', issue, '--description', 'Prose only.', '--json')['returncode'])
+        for args in (('reopen', issue), ('update', issue, '--status', 'open'), ('update', issue, '--type', 'task')):
+            answer = self.host('plain', *args, '--json')
+            self.assertEqual((2, 403), (answer['returncode'], answer['delegation_status']), (args, answer))
+        self.assertEqual(0, self.host('plain', 'update', issue, '--description', text, '--json')['returncode'])
+        aside.rename(journal)
+        found = self.read(issue)
+        self.assertEqual(('closed', 'closed'), (found['status'], found['attestation']))
+        self.patch_task(issue, 'pat', {'status': 'open'})
+        self.assertEqual('counts', self.read(issue)['attestation'])
+
+    def test_a_bound_key_is_refused_like_an_unbound_one(self):
+        # Reviewer's note: bound keys were not in their matrix. A key bound to a person and one bound to a lane, each with its
+        # own actor in this project's registry, on an attested row and on an unattested one with the lines.
+        registry = self.project / '.sessions.json'
+        registry.write_text(json.dumps({'schema_version': 1, 'records': {},
+                                        'owners': {'ops': 'person:ops', 'w1': 'lane:w1'}}), encoding='utf-8')
+        self.addCleanup(lambda: registry.unlink() if registry.exists() else None)
+        attested = self.make()
+        self.attest(attested, 'pat')
+        for issue in (attested, self.make()):
+            for actor, principal in (('ops', 'person:ops'), ('w1', 'lane:w1')):
+                for args in (('close', issue), ('update', issue, '--status', 'closed'), ('update', issue, '--type', 'task')):
+                    with self.subTest(actor=actor, args=args):
+                        answer = self.host(actor, *args, '--json', key_principal=principal, key_projects=['pp'])
+                        self.assertEqual((2, 403), (answer['returncode'], answer['delegation_status']), answer)
+        self.assertEqual('open', self.status(attested))
+
     def test_a_write_the_gate_cannot_stop_reads_no_row_for_it(self):
         with tempfile.TemporaryDirectory() as empty, patch.object(fixture.endpoint, '_native_anchor_rows',
                                                                   side_effect=AssertionError('read a row')):
@@ -1029,6 +1103,44 @@ class WebRouteTests(unittest.TestCase):
         done = self.admin(*attest, right, '--digest', read['digest'], '--state', state)
         self.assertEqual(0, done.returncode, done.stderr)
         self.assertEqual('counts', self.read(right)['attestation'])
+        # The operator's true pin of a decision an operator attested needs no web state.
+        answer = fixture.endpoint.execute(self.root, {'project': 'oo', 'actor': 'ops', 'action': 'bd',
+                                                      'args': ['create', 'An operator decision', '--type', 'decision',
+                                                               '--description', 'Binds: pp\nOwner-only: yes', '--json']})
+        decided = json.loads(answer['stdout'])['id']
+        read = json.loads(self.admin('decision-attest-read', '--project', 'oo', '--decision', decided).stdout)
+        done = self.admin('decision-attest', '--project', 'oo', '--actor', 'ops', '--decision', decided, '--digest', read['digest'])
+        self.assertEqual(0, done.returncode, done.stderr)
+        line = json.loads(self.admin('decision-attest-read', '--project', 'oo', '--decision', decided).stdout)['adopt_line']
+        adoption = self.make(line)
+        read = json.loads(self.admin('decision-attest-read', '--project', 'pp', '--decision', adoption).stdout)
+        done = self.admin(*attest, adoption, '--digest', read['digest'])
+        self.assertEqual(0, done.returncode, done.stderr)
+
+    # -- restore, through the real command -------------------------------------------------------------------------
+    def test_restore_new_refuses_the_same_name_and_a_new_name_fails_closed(self):
+        # Review of r3, b2: what the documents say, through admin.py itself. An attested row of pp, a backup, and restore-new.
+        issue = self.make('Binds: pp\nOwner-only: no')
+        made = self.attest(issue, 'pat')['record']
+        done = self.admin('backup', 'pp')
+        self.assertEqual(0, done.returncode, done.stderr)
+        same = self.admin('restore-new', 'pp', 'pp')
+        self.assertNotEqual(0, same.returncode)
+        self.assertIn('different destination', same.stderr)
+        done = self.admin('restore-new', 'pp', 'pq')
+        self.assertEqual(0, done.returncode, done.stderr)
+        restored = self.root / 'projects' / 'pq'
+        self.assertTrue(da.journaled(restored, made), 'the entry came back')
+        shown = subprocess.run([str(self.runtime.bd_path), '--directory', str(restored), '--sandbox', 'show', issue, '--json',
+                                '--include-comments'], env=fixture.admin.environment(self.root), capture_output=True, text=True,
+                               timeout=120)
+        row = next(item for item in json.loads(shown.stdout) if item.get('id') == issue)
+        self.assertTrue(da.carries_attestation_comment(row), 'the comment came back')
+        self.assertEqual('not-attested', da.standing(row, 'pq', None, ['ops'], restored)['state'])
+        # And it stands gated, for everyone on a host route.
+        answer = fixture.endpoint.execute(self.root, {'project': 'pq', 'actor': 'w1', 'action': 'bd',
+                                                      'args': ['close', issue, '--json']})
+        self.assertEqual((2, 403), (answer['returncode'], answer['delegation_status']), answer)
 
     # -- the operator's own route ---------------------------------------------------------------------------------
     def admin(self, *args):
@@ -1170,7 +1282,7 @@ class BackupTests(unittest.TestCase):
         sidecar = json.loads(self.bundle.read_text(encoding='utf-8'))
         self.assertIn(da.JOURNAL_DIR + '/' + self.record['sha256'] + '.json', sidecar['files'])
 
-    def test_a_restore_under_a_new_name_fails_closed_and_an_owner_attests_again(self):
+    def test_a_new_name_fails_closed_and_an_owner_attests_again(self):
         self.admin.restore_coordination(self.root, 'source', 'destination')
         self.assertTrue(da.journaled(self.destination, self.record), 'the entry came back')
         row = copy.deepcopy(self.row)
@@ -1195,7 +1307,9 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(('counts', 'owner'), tuple(da.standing(row, 'destination', self.state_of('destination'), OPS,
                                                                 self.destination)[key] for key in ('state', 'role')))
 
-    def test_a_restore_under_the_same_name_honours_the_records(self):
+    def test_the_library_honours_a_record_under_its_own_name(self):
+        # No command does this today: restore-new refuses the same name (test_restore_new_refuses_the_same_name_...). This is
+        # the record's own rule, that it is its project's name that decides, for whatever route ever restores one.
         other = Path(self.temp.name) / 'two'
         (other / 'projects' / 'source').mkdir(parents=True)
         (other / 'backups').mkdir()

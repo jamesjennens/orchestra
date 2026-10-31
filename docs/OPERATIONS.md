@@ -499,10 +499,11 @@ removes the delegation rule altogether: agents accept as they did before (the ow
 refusal still holds), and the delegation records read as ordinary comments.
 
 **Attested decisions** (kittrial-5bb.454 r2). `admin.py backup` collects `<project>/.decision-attests/` the same way, and
-`restore-new` validates and restores it. Under the same name the records are honoured. Under a new name they are not, on
-purpose: a record binds its project's name and a new name is a new project, so the rows read `not-attested` until an owner
-attests them again. Without the journal the same is true under any name (the comments stay, inert). An older kit refuses to
-restore a backup that holds it, as above.
+`restore-new` validates and restores it. `restore-new` always makes a new name, as it refuses the same one, and a record
+binds its project's name: a new name is a new project. So every row it restores reads `not-attested`, on purpose, and stands
+gated, until a person owner of the new project attests it again (the decision's page, or `admin.py decision-attest`).
+Adoptions elsewhere that pin the old name stay on the old name. An older kit refuses to restore a backup that holds the
+journal, as above.
 
 ### The claiming setting: restore and rollback
 

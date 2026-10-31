@@ -25,9 +25,9 @@ as the highest live standing among the unbroken run of newest records over this 
 same words cannot lower an owner's attestation.
 
 A status change, or a type or label change that starts or stops a row being a decision, needs standing too (the gate
-below), on a row with an honoured attestation and on any decision row carrying these lines, attested or not: a reopen would
-otherwise bring an owner's retired decision back, and a row whose journal entry is gone, or that was restored under a new
-name, would stand open to a plain host actor. An owner's level is needed for a text that says ``Owner-only: yes``, that
+below), on a row with an honoured attestation and on any decision row carrying these lines or an attestation comment,
+honoured or not: a reopen would otherwise bring an owner's retired decision back, and a row whose journal entry is gone, or
+that was restored under a new name, would stand open to a plain host actor. An owner's level is needed for a text that says ``Owner-only: yes``, that
 carries ``Authorises:``, or an adoption a person owner or an operator attested. Where there is a record that comes from the
 record (``owner_gated``), not from the row's text now, which any contributor can edit. A text edit is not gated: it only
 makes the row stale, which removes a binding and never makes one.
@@ -499,24 +499,35 @@ def needs_owner(records):
     return any(record['owner_gated'] for record in _newest_run(records))
 
 
+#: What makes a line of section 6 for the gate, well formed or not. The three that point at a decision name one, so prose
+#: such as ``Per: the meeting of Tuesday`` on an ordinary decision is not one of them, and closes as it always did.
+GATED_LINES = ('Binds:', 'Owner-only:', 'Adopts: decision:', 'Per: decision:', 'Authorises: decision:')
+
+
 def carries_lines(row):
-    """Whether a row's text has any line of section 6, well formed or not."""
-    from program_decisions import LINES
+    """Whether a row's text has any line of section 6."""
     description = row.get('description') if isinstance(row, dict) else None
     if not isinstance(description, str):
         return False
-    labels = tuple(label for label, _, _ in LINES)
-    return any(line.startswith(labels) for line in description.split('\n'))
+    return any(line.startswith(GATED_LINES) for line in description.split('\n'))
+
+
+def carries_attestation_comment(row):
+    """Whether a row has a comment with the reserved prefix, honoured or not (review of r3, b1): with its journal entry gone
+    a row's lines can be edited out, so the lines alone cannot say that an owner once attested it."""
+    comments = row.get('comments') if isinstance(row, dict) else None
+    return any(isinstance(comment, dict) and str(comment.get('text') or '').startswith(PREFIX) for comment in comments or [])
 
 
 def gate(row, *, project, journal, actor, state, by_service, command, change):
     """Refuse a gated change, or None: to a row with an honoured attestation, or to a decision row carrying the lines of
-    section 6, attested or not (review of r2: a row with no honoured record must not stand open, and a task these lines
-    would turn into a decision is the same). On the web, the standing the row needs; every host route refuses everyone, an
-    operator included: an operator goes through admin.py decision-change."""
+    section 6 or an attestation comment (reviews of r2 and r3: a row with no honoured record must not stand open, and a task
+    these would turn into a decision is the same). On the web, the standing the row needs; every host route refuses everyone,
+    an operator included: an operator goes through admin.py decision-change."""
     records = history(row, project, journal)
     flips = changes_decision(row, change)
-    if not records and not (carries_lines(row) and (is_decision(row) or flips)):
+    marked = carries_attestation_comment(row)
+    if not records and not ((marked or carries_lines(row)) and (is_decision(row) or flips)):
         return None
     if not change['status'] and not flips:
         return None
@@ -524,7 +535,9 @@ def gate(row, *, project, journal, actor, state, by_service, command, change):
     if not by_service:
         return AttestRefusal(403, 'Refusing to %s %s: it is a decision that binds. On the host, an operator does this '
                                   'with admin.py decision-change. Nothing was written.' % (what, row.get('id')))
-    needed = OWNERS if (needs_owner(records) if records else owner_gated(row, None)) else COORDINATORS
+    # With a record, the record says. A comment no journal honours says nothing to rely on and the text can be edited, so it
+    # needs an owner. With neither, the text is all there is, and nobody attested it.
+    needed = OWNERS if (needs_owner(records) if records else (marked or owner_gated(row, None))) else COORDINATORS
     if authority(actor, project, state) in needed:
         return None
     who = 'a person owner' if needed is OWNERS else 'an owner or a coordinator'

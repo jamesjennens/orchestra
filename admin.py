@@ -4956,9 +4956,9 @@ def backup_project(root,name):
         for record in delegation_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Delegation journal entry must not be a symlink')
             files['.delegations/'+record.name]=record_json.loads(read_regular_text(record))
-        # The attestation journal (kittrial-5bb.454 r2). A restore under the same name honours its records. Under a new
-        # name it does not, on purpose: a record binds its project's name and a new name is a new project, so the rows read
-        # not-attested until an owner attests them again. Without the journal the same name reads not-attested too.
+        # The attestation journal (kittrial-5bb.454 r2). restore-new always makes a new name, and a record binds its
+        # project's name, so the rows it restores read not-attested and stand gated until an owner attests them again. The
+        # journal is carried as the evidence of what was attested, and for a record's own name should a route ever restore it.
         attest_journal=path/'.decision-attests'
         if attest_journal.is_symlink():raise ValueError('Attestation journal must not be a symlink')
         for record in attest_journal.glob('*.json'):
