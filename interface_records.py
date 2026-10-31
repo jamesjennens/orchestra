@@ -270,6 +270,30 @@ def retained_interface_declarations(kind, row, project, approved=None):
     return declarations
 
 
+def release_interface_declarations(kind,row,project,operators,*,preserving=False):
+    """The release side keeps uncertain history; a remaining side must still read it.
+
+    A canonical honoured retirement is irreversible withdrawal. An inert retirement
+    cannot withdraw history. A historical or voided copy alone is not preservation:
+    the newest retained approval must be unambiguous and still the current record.
+    """
+    approved=kind.retained_approved_revisions(row)
+    historical=retained_interface_declarations(kind,row,project,approved=approved)
+    view=kind.entry_view(row,operators);current=view.get('record')
+    if (view.get('state')=='superseded' and current is not None
+            and current.get('acceptance_state')=='superseded'):
+        return set()
+    if not preserving:
+        return historical
+    if view.get('state')!='accepted' or current is None or not approved:
+        return set()
+    newest=max(record['revision'] for record in approved)
+    hashes={record['sha256'] for record in approved if record['revision']==newest}
+    if len(hashes)!=1 or current['revision']!=newest or current['sha256'] not in hashes:
+        return set()
+    return retained_interface_declarations(kind,row,project,approved=[current])
+
+
 class ProgramContext:
     """Authorized read adapter. None means unreadable, failed or unavailable, never empty.
 
@@ -285,6 +309,8 @@ class ProgramContext:
         self.may_read = may_read
         self.frozen = False
         self.cache = {}
+        self._anchor_indexes = {}
+        self._row_indexes = {}
 
     def rows(self, project):
         if self.may_read is not None and not self.may_read(project):return None
@@ -299,6 +325,34 @@ class ProgramContext:
             except (ValueError, OSError, RuntimeError):
                 self.cache[project] = None
         return self.cache[project]
+
+    def row(self,project,native_id):
+        rows=self.rows(project)  # Re-gate current read authority, even with an index.
+        if rows is None or not isinstance(native_id,str):return None
+        cached=self._row_indexes.get(project)
+        if cached is None or cached[0] is not rows or cached[1]!=len(rows):
+            index={}
+            for item in rows:
+                identity=item.get('id')
+                if isinstance(identity,str):
+                    index[identity]=None if identity in index else item
+            self._row_indexes[project]=(rows,len(rows),index)
+        return self._row_indexes[project][2].get(native_id)
+
+    def anchors_by_key(self,kind,project):
+        rows=self.rows(project)
+        if rows is None:return None
+        key=(project,kind.key_prefix);cached=self._anchor_indexes.get(key)
+        if cached is None or cached[0] is not rows or cached[1]!=len(rows):
+            try:
+                index={}
+                for item in rows:
+                    for label in kind.key_labels(item):
+                        index.setdefault(label,[]).append(item)
+            except (ValueError,TypeError,KeyError,AttributeError):
+                index=None  # Unknown inventory is cached as unknown, never empty.
+            self._anchor_indexes[key]=(rows,len(rows),index)
+        return self._anchor_indexes[key][2]
 
     def own(self):
         rows = self.rows(self.project)
@@ -355,8 +409,10 @@ class ProgramContext:
             return 'incomplete'
         try:
             label = kind.key_label(entry['key'])
-            for row in rows:
-                if label not in kind.key_labels(row) or row.get('id') == entry.get('native_id'):
+            index=self.anchors_by_key(kind,project)
+            if index is None:return 'incomplete'
+            for row in index.get(label,()):
+                if row.get('id') == entry.get('native_id') or label not in kind.key_labels(row):
                     continue
                 other = kind.entry_view(row, self.operators)
                 # Match the canonical key-anchor rule for a readable slug collision.
@@ -383,7 +439,7 @@ class ProgramContext:
         if entry.get('state') in ('malformed','unsupported','conflicted'):
             return 'incomplete'
         rows=self.rows(project)
-        row=next((r for r in rows or [] if r.get('id')==entry.get('native_id')),None)
+        row=self.row(project,entry.get('native_id'))
         if row is None:return 'incomplete'
         try:
             live=kind.live_row(row,self.operators)[0]

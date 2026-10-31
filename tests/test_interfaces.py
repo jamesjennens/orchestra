@@ -477,6 +477,113 @@ class InterfaceCase(unittest.TestCase):
                 self.assertIsNotNone(cr.KIND.parse_acceptance(comment['text']))
                 self.assertEqual([],cr.KIND.retained_approved_revisions(row))
 
+    def _append_duplicate_approval(self,row,**changes):
+        record=copy.deepcopy(cr.KIND.existing_revisions(row)[1])
+        record.update(revision=2,**changes);record['sha256']=content_hash(record)
+        bound=rr.core.bind_acceptance(acceptance(),record)
+        _,body=cr.KIND.acceptance_evidence(bound,row['id'],2,record,OPERATOR)
+        row['comments'] += [{'id':'second-entry','author':OPERATOR,'text':cr.KIND.entry_comment(record)},
+                            {'id':'second-approval','author':OPERATOR,'text':body}]
+        return record
+
+    def test_withdrawn_historical_copy_cannot_preserve_live_consumer_or_write_false_audit(self):
+        source=self._duplicate_consumer()
+        other=self._approved_duplicate(source,interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}])
+        self._append_duplicate_approval(other,interfaces=[])
+        before=copy.deepcopy(self.area.rows)
+        with self.assertRaisesRegex(ValueError,'withdrawn historical copy'):
+            cr.KIND.release(self.path.parent/'area',source,OPERATOR,'A withdrawn copy is not preservation',self.area,
+                operators=[OPERATOR],duplicate=True,set_aside_evidence=True)
+        self.assertEqual(before,self.area.rows)
+        self.assertFalse(any('interface declarations preserved' in c['text'] for c in self.area.row(source)['comments']))
+        # The refusal's next step really works: release B and retain declaring A.
+        cr.KIND.release(self.path.parent/'area',other['id'],OPERATOR,'Retain the declaring anchor',self.area,
+            operators=[OPERATOR],duplicate=True,set_aside_evidence=True)
+        usage,coverage=self.context().usage();self.assertTrue(coverage['complete']);self.assertEqual(1,len(usage))
+        self.assertIn('interface declarations preserved on remaining anchors: 1',self.area.row(other['id'])['comments'][-1]['text'])
+        current=self.entry()['record']
+        self.apply(payload(operation='revise',operation_id='still-live-consumer',revision=3,expected_sha256=current['sha256'],state='retired'))
+        with self.assertRaisesRegex(ir.Refusal,'current consumers'):self.accept(operation='still-live-consumer-accept')
+
+    def test_voided_newer_copy_is_not_preservation_of_a_current_consumer(self):
+        from test_record_voids import void_payload
+        source=self._duplicate_consumer();other=self._approved_duplicate(source)
+        self._append_duplicate_approval(other,interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],schema_version=2)
+        # Only an inert approval may be voided; an honoured acceptance is not
+        # withdrawn by the repair API. Retain its exact author/operator binding.
+        approval=other['comments'][-1]
+        evidence=cr.KIND.parse_acceptance(approval['text'])
+        evidence['operator']='departed-operator';evidence['sha256']=content_hash(evidence)
+        approval.update(author='departed-operator',text=cr.KIND.acceptance_prefix+rr.canonical_bytes(evidence).decode())
+        self.area.actor=OPERATOR
+        cr.KIND.apply_void(void_payload(other['id'],approval['id'],approval['text'],kind='capability-acceptance'),OPERATOR,self.area,[OPERATOR])
+        before=copy.deepcopy(self.area.rows)
+        with self.assertRaisesRegex(ValueError,'retained approved interface declaration'):
+            cr.KIND.release(self.path.parent/'area',source,OPERATOR,'A voided copy is not preservation',self.area,
+                operators=[OPERATOR],duplicate=True,set_aside_evidence=True)
+        self.assertEqual(before,self.area.rows)
+
+    def _retire_before_duplicate(self,source,actor=OPERATOR):
+        self.area.actor=OPERATOR
+        cr.apply_native(cap_entry(key='release.successor',operation_id='release-successor'),OPERATOR,self.area,
+            self.path.parent/'area',operators=[OPERATOR,actor])
+        current=cr.KIND.find_entry(self.area.rows,'review.structured-contribution',[OPERATOR,actor])['record']
+        self.area.actor=actor
+        cr.apply_native({'schema_version':1,'operation':'retire','operation_id':'release-source-retirement',
+            'key':current['key'],'revision':current['revision'],'record_sha256':current['sha256'],
+            'successor':'release.successor','acceptance_state':'superseded','acceptance':acceptance()},
+            actor,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR,actor])
+
+    def test_honoured_retired_anchor_release_does_not_claim_historical_preservation(self):
+        source=self._duplicate_consumer();self._retire_before_duplicate(source)
+        other=self._approved_duplicate(source);self.area.actor=OPERATOR
+        result=cr.KIND.release(self.path.parent/'area',source,OPERATOR,'Already retired before the duplicate',self.area,
+            operators=[OPERATOR],duplicate=True,set_aside_evidence=True)
+        self.assertEqual(other['id'],result['selected_after'])
+        audit=self.area.row(source)['comments'][-1]['text']
+        self.assertIn('honoured retirement',audit);self.assertNotIn('interface declarations preserved',audit)
+        usage,coverage=self.context().usage();self.assertTrue(coverage['complete']);self.assertEqual([],usage)
+
+    def test_inert_retirement_does_not_waive_retained_declaration_preservation(self):
+        source=self._duplicate_consumer(actor='departed-operator');self._retire_before_duplicate(source,actor='departed-operator')
+        self._approved_duplicate(source);self.area.actor=OPERATOR
+        before=copy.deepcopy(self.area.rows)
+        with self.assertRaisesRegex(ValueError,'retained approved interface declaration'):
+            cr.KIND.release(self.path.parent/'area',source,OPERATOR,'An inert retirement is not withdrawal',self.area,
+                operators=[OPERATOR],duplicate=True,set_aside_evidence=True)
+        self.assertEqual(before,self.area.rows);self.assertFalse(self.context().usage()[1]['complete'])
+
+    def test_key_label_inventory_is_built_once_per_read_not_per_capability(self):
+        from unittest.mock import patch
+        for i in range(20000):self.area.rows.append({'id':'ordinary-%d'%i,'labels':[],'comments':[]})
+        entries=[]
+        for i in range(200):
+            record=cr.entry_record(cap_entry(key='scale.item%d'%i),1,'accepted');identity='scale-%d'%i
+            _,body=cr.KIND.acceptance_evidence(rr.core.bind_acceptance(acceptance(),record),identity,1,record,OPERATOR)
+            row={'id':identity,'labels':['capability','capability:accepted',cr.KIND.key_label(record['key'])],
+                 'comments':[{'id':'e%d'%i,'author':OPERATOR,'text':cr.KIND.entry_comment(record)},
+                             {'id':'a%d'%i,'author':OPERATOR,'text':body}]}
+            self.area.rows.append(row);entries.append(cr.KIND.entry_view(row,[OPERATOR]))
+        original=cr.KIND.key_labels;calls=[0]
+        def counted(row):calls[0]+=1;return original(row)
+        size=len(self.area.rows)
+        with patch.object(cr.KIND,'key_labels',new=counted):
+            context=self.context()
+            for entry in entries:self.assertEqual('never-accepted',context.coverage_state(cr.KIND,entry,'area'))
+            first=calls[0];self.assertGreaterEqual(first,size);self.assertLessEqual(first,size+20*len(entries))
+            for entry in entries:context.coverage_state(cr.KIND,entry,'area')
+            self.assertLessEqual(calls[0]-first,20*len(entries))
+            before=calls[0];fresh=self.context()
+            for entry in entries:fresh.coverage_state(cr.KIND,entry,'area')
+            self.assertGreaterEqual(calls[0]-before,size);self.assertLessEqual(calls[0]-before,size+20*len(entries))
+            context.may_read=lambda project:False
+            self.assertEqual('incomplete',context.coverage_state(cr.KIND,entries[0],'area'))
+
+    def test_inventory_row_lookup_with_unreadable_identity_is_incomplete(self):
+        source=self._duplicate_consumer();entry=cr.KIND.entry_view(self.area.row(source),[OPERATOR])
+        entry['native_id']=['not-an-id']
+        self.assertEqual('incomplete',self.context().coverage_state(cr.KIND,entry,'area'))
+
     def _probe_capability_retire_reconcile(self,after):
         from unittest.mock import patch
         self.apply(payload());self.accept();self.area.actor=OPERATOR

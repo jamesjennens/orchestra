@@ -1528,16 +1528,18 @@ class AnchoredKind:
         after = self.selected_anchor(remaining, operators)
         retained = set()
         if self.noun == 'capability':
-            from interface_records import retained_interface_declarations
-            retained = retained_interface_declarations(self, row, current_project)
-            preserved = set().union(*(retained_interface_declarations(self, other, current_project)
+            from interface_records import release_interface_declarations
+            retained = release_interface_declarations(self, row, current_project, operators)
+            preserved = set().union(*(release_interface_declarations(self, other, current_project, operators, preserving=True)
                                       for other in remaining))
             missing = sorted(retained - preserved)
             if missing:
                 shown = ', '.join('%s iface:%s/%s@%d' % item for item in missing[:5])
                 raise ValueError('Releasing %s would discard %d retained approved interface declaration(s) '
                                  'that no remaining anchor preserves (%s). --set-aside-evidence cannot '
-                                 'remove them. Release a non-declaring duplicate instead; retain the '
+                                 'remove them. A withdrawn historical copy does not preserve a declaration: '
+                                 'a remaining anchor must still read its newest approved declaring revision. '
+                                 'Release a non-declaring duplicate instead; retain the '
                                  'declaring anchor, then use an explicitly reviewed capability revision '
                                  'to withdraw its declarations if that is intended.'
                                  % (issue_id, len(missing), shown))
@@ -1577,6 +1579,8 @@ class AnchoredKind:
                    ', '.join('%d %s' % (count, kind) for kind, count in sorted(others.items())) or 'none', reason))
         if retained:
             note += ' Retained approved interface declarations preserved on remaining anchors: %d.' % len(retained)
+        elif self.noun=='capability' and view.get('state')=='superseded' and view.get('record') is not None:
+            note += ' The released anchor has an honoured retirement; its interface declarations were already withdrawn.'
         return note, {'duplicate': True, 'key': shown_key,
                       'remaining': [item.get('id') for item in remaining],
                       'selected_before': before, 'selected_after': after, 'records': revisions,

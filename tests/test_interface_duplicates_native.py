@@ -59,7 +59,7 @@ class NativeDuplicateInterfaceTests(fixture.NativeInterfaceTests):
                 '--reason',reason,'--duplicate','--set-aside-evidence'],
                 env=fixture.native_fixture.admin.environment(self.root),capture_output=True,text=True,timeout=180)
 
-        for case in ('release','equivalent','demotion'):
+        for case in ('release','withdrawn','equivalent','demotion'):
             with self.subTest(case=case):
                 self.deployment(operators=['ops','ops2'],coordinator_writes=True,independent_approval=False)
                 key='iface.'+case+'.v1';capkey='dp.'+case
@@ -72,7 +72,7 @@ class NativeDuplicateInterfaceTests(fixture.NativeInterfaceTests):
                     {'expected_revision':1,'record_sha256':draft.data['sha256'],'evidence':'Synthetic review'},
                     token=self.owner,key='iface-accept-'+case)
                 self.assertEqual(200,accepted.status,accepted.data)
-                cap_actor='ops' if case=='release' else 'ops2'
+                cap_actor='ops' if case in ('release','withdrawn') else 'ops2'
                 dec=decision('area','Consumer '+case)
                 declaration=[{'iface':'iface:pp/'+key+'@2','role':'consumes'}]
                 cap=cap_entry(key=capkey,operation='draft',operation_id='consumer-'+case,
@@ -84,13 +84,22 @@ class NativeDuplicateInterfaceTests(fixture.NativeInterfaceTests):
                 b=json.loads(run('area',['create','Duplicate '+case,'--type','task','--labels',
                     ','.join(['capability','capability:accepted',caps.KIND.key_label(capkey)]),'--json']))['id']
                 other=cap_entry(key=capkey)
-                if case=='equivalent':other['interfaces']=declaration
+                if case in ('equivalent','withdrawn'):other['interfaces']=declaration
                 record=caps.entry_record(other,1,'accepted')
                 bound=keyed_records.bind_acceptance(fixture.acceptance(decision_id=dec),record)
                 _evidence,comment=caps.KIND.acceptance_evidence(bound,b,1,record,'ops')
                 run('area',['comments','add',b,caps.KIND.entry_comment(record),'--json'])
                 run('area',['comments','add',b,comment,'--json'])
                 run('area',['update',b,'--status','closed','--json'])
+                if case=='withdrawn':
+                    # B's retained rev1 consumes, but its current approved rev2
+                    # explicitly withdraws. History cannot preserve A's consumer.
+                    plain=cap_entry(key=capkey)
+                    record=caps.entry_record(plain,2,'accepted')
+                    bound=keyed_records.bind_acceptance(fixture.acceptance(decision_id=dec),record)
+                    _,comment=caps.KIND.acceptance_evidence(bound,b,2,record,'ops')
+                    run('area',['comments','add',b,caps.KIND.entry_comment(record),'--json'])
+                    run('area',['comments','add',b,comment,'--json'])
                 retirement=h.request('POST','/v1/projects/pp/interfaces/'+key+'/revisions',
                     dict(body,revision=3,expected_sha256=accepted.data['sha256'],state='retired'),
                     token=self.owner,key='retire-draft-'+case)
@@ -102,12 +111,16 @@ class NativeDuplicateInterfaceTests(fixture.NativeInterfaceTests):
                 denied=h.request('POST',route,accept,token=self.owner,key='before-'+case)
                 self.assertEqual(409,denied.status,denied.data)
 
-                if case=='release':
+                if case in ('release','withdrawn'):
                     before=run('area',['export','--all'])
                     failed=release(a['native_id'],'Attempt to discard the consumer')
                     self.assertNotEqual(0,failed.returncode)
                     self.assertIn('retained approved interface declaration',failed.stderr)
                     self.assertEqual(before,run('area',['export','--all']))
+                    if case=='withdrawn':
+                        self.assertIn('withdrawn historical copy',failed.stderr)
+                        comments=json.loads(run('area',['comments',a['native_id'],'--json']))
+                        self.assertFalse(any('interface declarations preserved' in c['text'] for c in comments))
                     complete,_=graph(capkey);self.assertFalse(complete)
                     safe=release(b,'Keep the approved declaration')
                     self.assertEqual(0,safe.returncode,safe.stdout+safe.stderr)
