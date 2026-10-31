@@ -429,6 +429,20 @@ while True: time.sleep(1)
 
 
 class ParserTests(unittest.TestCase):
+    def test_private_frames_are_bounded_complete_and_have_unique_fields(self):
+        self.assertEqual({}, hn.frame(io.BytesIO(b'{}\n')))
+        for wire, limit in ((b'{}    \n', 5), (b'{}', hn.FRAME_MAX),
+                            (b'{"actor":"one","actor":"two"}\n', hn.FRAME_MAX)):
+            with self.subTest(wire=wire), self.assertRaises(hn.Refusal):
+                hn.frame(io.BytesIO(wire), limit)
+
+    def test_wait_and_page_limits_reject_nonfinite_or_out_of_range_values(self):
+        for flags in (['--timeout=-1'], ['--timeout=51'], ['--timeout=nan'],
+                      ['--timeout=inf'], ['--offset=-1'], ['--limit=0'], ['--limit=51']):
+            with self.subTest(flags=flags), self.assertRaises(hn.Refusal):
+                hn.parse(['wait'] + flags, {})
+        self.assertEqual(50, hn.parse(['wait', '--timeout=50', '--limit=50'], {})['limit'])
+
     def test_help_requires_no_config_or_transport(self):
         import client
         with mock.patch.object(sys,'argv',['client.py','coordinator','notes','--help']), \
