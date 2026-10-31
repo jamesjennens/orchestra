@@ -227,7 +227,7 @@ class NoUnguardedParseTests(unittest.TestCase):
     GUARDED_ONLY = ('artifacts.py', 'capability_records.py', 'capability_verification.py', 'feedback.py', 'guidance.py',
                     'keyed_entries.py', 'project_creation.py', 'recovery.py', 'requirement_baseline_records.py',
                     'requirement_baselines.py', 'reserved_comments.py', 'rooms.py', 'task_assignment.py',
-                    'delegations.py', 'work.py')
+                    'delegations.py', 'host_notes.py', 'work.py')
 
     def bare(self, path):
         return len(re.findall(r'(?<![A-Za-z_.])json\.loads\(', path.read_text(encoding='utf-8')))
@@ -342,6 +342,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             'followon.py': 4,
             'fault_clear.py': 3,
             'delegations.py': 4,
+            'host_notes.py': 4,  # enrollment, private frames, durable-store preflight and save reconciliation
+
             'review_recommendations.py': 2, 'review_workflow.py': 5, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):

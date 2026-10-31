@@ -87,3 +87,22 @@ def assert_text_hidden(test, request, text, callers, projects):
         for path in reads:
             answer = request('GET', path, token=token)
             test.assertNotIn(text, json.dumps(answer.data), (label, path))
+
+
+#: Private host adapter reads, each separately subject to enrollment and actor ownership.
+HOST_NOTE_READS = ('inbox', 'sent', 'wait')
+
+
+def assert_host_notes_hidden(test, read, principals, area, missing, text):
+    """A host outsider gets the same refusal for an existing and missing project.
+
+    ``read(principal, project, operation)`` returns (status, JSON value); this keeps
+    transport authentication in the caller's harness rather than bypassing it here.
+    """
+    for principal in principals:
+        for operation in HOST_NOTE_READS:
+            seen = read(principal, area, operation)
+            absent = read(principal, missing, operation)
+            test.assertEqual(seen, absent, (principal, operation))
+            test.assertEqual(403, seen[0], (principal, operation))
+            test.assertNotIn(text, json.dumps(seen[1]))

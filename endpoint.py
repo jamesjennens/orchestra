@@ -1331,6 +1331,24 @@ def execute(root,request,authority_config=None,require_authority=False,key_proje
         answered=request.get('action') if isinstance(request,dict) else None
         if answered in SERVICE_ONLY_ACTIONS:
             raise ValueError('%s is available only to the web service'%answered)
+    if request.get('action')=='coordinator' and isinstance(request.get('args'),list) and request['args'][:1]==['notes']:
+        import host_notes
+        try:
+            if authority_config is not None or key_principal is None or key_projects is None:
+                raise host_notes.Refusal(403,host_notes.FORBIDDEN)
+            if set(request)-{'project','actor','action','args','attachments'}:
+                raise host_notes.Refusal(422,'Host note identity comes only from the confined launcher')
+            if any(not isinstance(token,str) or '\0' in token for token in request['args']):
+                raise host_notes.Refusal(422,'Invalid host notes arguments')
+            payload=host_notes.parse(request['args'][1:],request.get('attachments',{}))
+            forwarded={'project':request.get('project'),'actor':request.get('actor'),'principal':key_principal,
+                       'projects':sorted(key_projects),'payload':payload}
+            host_notes.authorize(root,forwarded)
+            result=host_notes.call(root,forwarded)
+            return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''}
+        except host_notes.Refusal as error:
+            return {'returncode':2,'stdout':'','stderr':str(error)+'\n','host_notes_status':error.status}
+    # Host notes repeat registry ownership at the private service before any read/effect.
     # Slot requests bind the block before project, tracker, or authority reads.
     # The shared table is the sole endpoint action/operation capability mapping.
     if request.get('action') in ('coordinate','web-merge-slot','web-lifecycle','web-release','web-guidance','assignee-followon','task-assign','assignment-roster','task-release','task-file','room-decision','delegation'):

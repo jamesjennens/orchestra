@@ -8,6 +8,7 @@ DOCUMENTS = {
     'start': 'docs/WORKER_START.md',
     'workflow': 'docs/WORKFLOW.md',
     'worker-guide': 'docs/WORKER_GUIDE.md',
+    'host-notes': 'docs/HOST_NOTES.md',
     'sessions': 'docs/SESSIONS.md',
     'reviews': 'docs/REVIEWS.md',
     'contribution-template': 'templates/CONTRIBUTION.json',

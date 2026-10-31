@@ -329,6 +329,19 @@ def _wire(project,actor,args,action,path,document=None):
         if registering:actor=actor or ''
     if not registering and (not isinstance(actor,str) or not ACTOR.fullmatch(actor)):
         raise ValueError('Supply a short contributor/session actor')
+    if action=='coordinator' and args[:1]==['notes']:
+        # Only this new namespace accepts -fPATH; existing command wires stay byte-identical.
+        normalized=[]; position=0
+        values={'--file','-f','--to','--request-id','--since','--timeout','--offset','--limit'}
+        while position<len(args):
+            token=args[position]
+            if token in values and position+1<len(args):
+                normalized.extend(args[position:position+2]);position+=2;continue
+            if token.startswith('-f') and not token.startswith('-f=') and len(token)>2:
+                normalized.extend(['-f',token[2:]])
+            else:normalized.append(token)
+            position+=1
+        args=normalized
     converted,attachments = _attachments(args)
     if document is not None:
         # The design document's exact text (kittrial-5bb.418), never read through a text-mode file.
@@ -1971,6 +1984,14 @@ def main():
     if not args or args[:1]==['help']:
         print(contributor_help_text())
         return 0
+    if args[:2]==['coordinator','notes'] and help_requested(args[2:]):
+        sys.stdout.write('usage: coordinator notes send|inbox|sent|reply|noted|wait [options]\n\n'
+                         'send/reply: --to PROJECT --file LOCAL-FILE --request-id ID\n'
+                         'reply/noted: name the cnote-ID; noted also needs --request-id ID\n'
+                         'inbox/sent: --offset N --limit 1..50\n'
+                         'wait: --since FINGERPRINT --timeout 0..50\n'
+                         'Requires operator enrollment for this confined SSH principal; docs host-notes.\n')
+        return 0
     if args[:1]==['capability'] and not (len(args)>1 and args[1] in CAPABILITY_ENDPOINT):
         if len(args)>1 and args[1]=='lookup' and a.config and a.project:
             return _capability_lookup(args[2:],json.loads(Path(a.config).read_text()),a.project,a.actor,a.out)
@@ -2022,6 +2043,10 @@ def main():
     finally:
         if temporary:
             Path(temporary).unlink(missing_ok=True)
+    if action=='coordinator' and args[:1]==['notes'] and result.get('returncode') and (
+            'Unknown coordinator command' in (result.get('stderr') or '') or
+            'outside the contributor interface' in (result.get('stderr') or '')):
+        result['stderr']='Host notes require an updated endpoint and the enabled private service adapter.\n'
     output = result['stdout']
     # The server's time of a write that was carried out (kittrial-5bb.97): one line on standard
     # error, so that standard output is exactly what it was. An older endpoint sends none.

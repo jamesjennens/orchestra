@@ -3604,7 +3604,49 @@ class Service:
             recent.append(now)
             self._note_times[pair] = recent
 
-    def write_note(self, principal, from_project, to_project, text, reply_to, linked, unlinked_sentence):
+    def _note_identity(self, principal, project):
+        # A HostIdentity is created only by the authenticated private listener. It never
+        # confers authority on another service method or on a web request.
+        from host_notes import HostIdentity, authorize, Refusal, FORBIDDEN
+        if isinstance(principal, HostIdentity):
+            if principal.manager is not getattr(self, 'host_notes_manager', None) or principal.request['project'] != project:
+                raise Refusal(403, FORBIDDEN)
+            authorize(principal.manager.root, principal.request)
+            return {'project': project, 'user_id': None, 'agent_id': None, 'kind': 'host',
+                    'actor': principal.actor, 'name': principal.principal}
+        self._refresh_authority(principal)
+        if getattr(self, 'host_notes_manager', None) is not None:
+            self.check_authority(principal, project, CAP_COORDINATE)
+            if ((self.state.get('memberships') or {}).get(project) or {}).get(principal.user_id) not in ('owner','coordinator'):
+                raise forbidden('Coordinator notes require a live project coordinator')
+        agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
+        return {'project': project, 'user_id': principal.user_id, 'agent_id': principal.agent_id,
+                'kind': 'agent' if principal.agent_id else 'person', 'actor': principal.actor,
+                'name': (agent.get('name') if isinstance(agent, dict) else None) or self._owner_name(principal.user_id)}
+
+    def mark_notes_fetched(self, project, notes, principal=None):
+        """A fetch receipt, only after the route has proved the receiving coordinator."""
+        if getattr(self, 'host_notes_manager', None) is None:
+            return
+        from host_notes import state_change
+        with self.store.lock, state_change(self):
+            if principal is not None: self._note_identity(principal,project)
+            changed = False
+            for view in notes:
+                note = next((n for n in self._notes() if n['id'] == view['id'] and n['to']['project'] == project), None)
+                if note is None:
+                    continue
+                delivery = note.setdefault('delivery', {'accepted_at': note['created_at']})
+                if not delivery.get('fetched_at'):
+                    delivery['fetched_at'] = now_iso(self._now()); changed = True
+                view['delivery'] = dict(delivery)
+            if changed:
+                try:
+                    self.store.save()
+                except Exception:
+                    raise HttpError(503, 'unavailable', 'Coordinator note receipt unavailable; retry later') from None
+
+    def write_note(self, principal, from_project, to_project, text, reply_to, linked, unlinked_sentence, *, persist=True):
         """Keep one note from ``from_project``'s coordinator to ``to_project``'s coordinator role.
 
         The route holds CAP_COORDINATE in ``from_project`` and passes ``linked``, its live program-link check.
@@ -3625,8 +3667,9 @@ class Service:
             raise invalid(str(error)) from None
         if reserved_match(text) is not None:
             raise invalid('A note cannot start with a reserved machine-record prefix')
-        with self.store.lock:
-            self._refresh_authority(principal)
+        from host_notes import state_change
+        with self.store.lock, state_change(self):
+            attribution = self._note_identity(principal, from_project)
             store = self._note_store(write=True)
             notes = [note for note in store['notes'] if self._note_ok(note)]
             parent = None
@@ -3635,20 +3678,26 @@ class Service:
                 if (parent is None or parent['to']['project'] != from_project
                         or parent['from']['project'] != to_project):
                     raise not_found('There is no note %s to this project from %s' % (reply_to, to_project))
+            manager = getattr(self, 'host_notes_manager', None)
+            ready = None
+            if manager is not None:
+                if sum(n['to']['project'] == to_project and n['settled'] is None for n in notes) >= self.NOTES_KEPT:
+                    raise HttpError(503, 'unavailable', 'Coordinator inbox is full; nothing was accepted')
+                ready = manager.active(to_project)
             now = now_iso(self._now())
-            agent = self.state['agents'].get(principal.agent_id) if principal.agent_id else None
             note = {'schema_version': 1, 'id': 'cnote-' + secrets.token_hex(12),
-                    'from': {'project': from_project, 'user_id': principal.user_id, 'agent_id': principal.agent_id,
-                             'kind': 'agent' if principal.agent_id else 'person', 'actor': principal.actor,
-                             'name': (agent.get('name') if isinstance(agent, dict) else None)
-                             or self._owner_name(principal.user_id)},
+                    'from': attribution,
                     'to': {'project': to_project, 'role': 'coordinator', 'installation': None},
                     'text': text, 'reply_to': reply_to, 'thread': parent['thread'] if parent else None,
                     'created_at': now, 'settled': None}
             note['thread'] = note['thread'] or note['id']
             if parent is not None and parent['settled'] is None:
-                parent['settled'] = {'by': principal.user_id, 'actor': principal.actor, 'at': now, 'how': 'replied',
+                parent['settled'] = {'by': principal.user_id or getattr(principal, 'principal', None), 'actor': principal.actor, 'at': now, 'how': 'replied',
                                      'reply': note['id']}
+            if manager is not None:
+                note['delivery'] = {'accepted_at': now, 'receiver_enrolled': ready}
+                if not ready:
+                    note['delivery']['warning'] = 'No receiver enrolled; accepted does not mean read'
             notes.append(note)
             addressed = [n for n in notes if n['to']['project'] == to_project]
             excess = max(0, len(addressed) - self.NOTES_KEPT)
@@ -3661,7 +3710,7 @@ class Service:
             if victims:
                 dropped = store['dropped'].get(to_project)
                 store['dropped'][to_project] = (dropped if type(dropped) is int else 0) + len(victims)
-            self.store.save()
+            if persist: self.store.save()
             return dict(note), len(victims)
 
     def notes_for(self, project_id, box, unsettled_only=False):
@@ -3674,10 +3723,11 @@ class Service:
         found.sort(key=lambda note: (note['created_at'], note['id']), reverse=True)
         return found, dropped if type(dropped) is int else 0
 
-    def settle_note(self, principal, project_id, note_id):
+    def settle_note(self, principal, project_id, note_id, *, persist=True):
         """Mark a note to ``project_id`` noted: nothing is owed. A settled one is 409 with how it was settled."""
-        with self.store.lock:
-            self._refresh_authority(principal)
+        from host_notes import state_change
+        with self.store.lock, state_change(self):
+            self._note_identity(principal, project_id)
             self._note_store(write=True)
             note = next((n for n in self._notes() if n['id'] == note_id and n['to']['project'] == project_id), None)
             if note is None:
@@ -3685,9 +3735,9 @@ class Service:
             if note['settled'] is not None:
                 raise conflict('This note is already settled (%s)' % note['settled']['how'],
                                {'settled': dict(note['settled'])})
-            note['settled'] = {'by': principal.user_id, 'actor': principal.actor, 'at': now_iso(self._now()),
+            note['settled'] = {'by': principal.user_id or getattr(principal, 'principal', None), 'actor': principal.actor, 'at': now_iso(self._now()),
                                'how': 'noted'}
-            self.store.save()
+            if persist: self.store.save()
             return dict(note)
 
     def note_projects(self, principal):
