@@ -2336,7 +2336,23 @@ class NativeDelegationTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
 class NativeCapabilityRetirementTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCase):
     """Own native runtime: retirement delegations must not leak into the delegation suite."""
 
-    setUp = NativeDelegationTests.setUp
+    def setUp(self):
+        RulesHelpers.setUp(self)
+        self.pid = 'pp'
+        root = self.root
+
+        class Harness(fixes.Harness):
+            def make_backend(h):
+                return http_service.EndpointBackend(
+                    sys.executable, str(KIT / 'endpoint.py'), str(root), service=h.service)
+
+        self.harness = Harness(methodName='runTest')
+        self.harness.setUp()
+        self.addCleanup(self.harness._stop_server)
+        self.owner_token = self.harness.admin_token()
+        reg = self.harness.request('POST', '/v1/projects', {'project_id': self.pid, 'name': 'Native Delegations'},
+                                   token=self.owner_token)
+        self.assertEqual(reg.status, 201, reg.data)
 
     def test_native_capability_retirement_requires_live_acceptance_delegation_and_party(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
