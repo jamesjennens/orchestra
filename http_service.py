@@ -51,6 +51,7 @@ import actor_names
 import agent_prompts
 import bd_refusals
 from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
+from review_workflow import TEXT_LIMITS
 import claim_limit
 import handover_steps
 import project_setup
@@ -6800,7 +6801,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: Added to the summary of an approval that only this setting let through, so the record says so.
     SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
                             '(project setting agent_approval: by-agent).')
-    SUMMARY_MAX = 1200                 # review_workflow.TEXT_LIMITS['summary']
+    SUMMARY_MAX = TEXT_LIMITS['summary']
 
     def _another_agent_only(self, agent_id, names, parties, project):
         """Whether every one of ``parties`` of the approver's party is ANOTHER agent of its person (kittrial-5bb.438).
@@ -14106,6 +14107,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         def add():
             delivered = (current.get('review') or {}).get('contribution') or {} if current else {}
             pid = ctx.params['pid']
+            setting = None
             if judged:
                 # Nobody approves work of their own party: the account that approves, against the
                 # account behind the contribution's author and behind the task's assignee. A
@@ -14119,23 +14121,28 @@ class ApiHandler(BaseHTTPRequestHandler):
                     # project's owner chose the strict rule. Read here, inside the mutation, every time.
                     refusal, setting = self._agent_approval_refusal(ctx.principal, names, assignee,
                                                                     delivered.get('author'), pid)
-                    if refusal is None:
-                        summary = payload.get('summary')
-                        if isinstance(summary, str):
-                            joined = (summary.rstrip() + ' ' if summary.strip() else '') + self.SAME_PERSON_APPROVAL
-                            over = len(joined) - self.SUMMARY_MAX
-                            if over > 0:
-                                raise invalid('This approval is allowed by the project\'s agent-approval setting, and '
-                                              'its summary must then say so in a sentence of %d characters; shorten '
-                                              'the summary by %d characters and send it again'
-                                              % (len(self.SAME_PERSON_APPROVAL), over))
-                            payload['summary'] = joined
-                        same_person.update(same_person_coordinator=True, author=delivered.get('author'),
-                                           assignee=assignee, agent_approval=setting['mode'],
-                                           agent_approval_set_by=setting.get('set_by') or 'default',
-                                           agent_approval_set_at=setting.get('set_at'))
                 if refusal:
                     raise forbidden(refusal)
+            if payload.get('operation') == 'approve':
+                summary = payload.get('summary')
+                if isinstance(summary, str) and self.SAME_PERSON_APPROVAL in summary:
+                    raise invalid('The approval summary may not contain %r; the server adds that sentence itself'
+                                  % self.SAME_PERSON_APPROVAL)
+                if setting is not None:
+                    if isinstance(summary, str):
+                        joined = (summary.rstrip() + ' ' if summary.strip() else '') + self.SAME_PERSON_APPROVAL
+                        over = len(joined) - self.SUMMARY_MAX
+                        if over > 0:
+                            raise invalid('This approval is allowed by the project\'s agent-approval setting, and '
+                                          'its summary must then say so in a sentence of %d characters; shorten '
+                                          'the summary by %d characters and send it again'
+                                          % (len(self.SAME_PERSON_APPROVAL), over))
+                        payload['summary'] = joined
+                    same_person.update(same_person_coordinator=True, author=delivered.get('author'),
+                                       assignee=(current.get('task') or {}).get('assignee'),
+                                       agent_approval=setting['mode'],
+                                       agent_approval_set_by=setting.get('set_by') or 'default',
+                                       agent_approval_set_at=setting.get('set_at'))
             if recommending:
                 # Independence by PERSON, which only the web service can know; the
                 # canonical write then applies the name rule and every other rule.

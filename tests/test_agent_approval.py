@@ -8,7 +8,7 @@ agent without an effective grant cannot approve at all; people are judged as bef
 the setting let through says so in its summary and in the audit.
 
 Through the real routes of the web service (the in-process backend); the canonical binding is in
-EndpointAgentApprovalTests below.
+tests/test_coordinator_grant_real.py.
 """
 import sys
 import unittest
@@ -18,6 +18,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import http_service
+import review_workflow
 import test_coordinator_grant
 
 API = http_service.ApiHandler
@@ -149,6 +150,71 @@ class DefaultTests(SamePerson):
             'operation': 'approve', 'contribution': contribution, 'summary': 'x' * room}, token=self.agent)
         self.assertEqual(201, fits.status, fits.data)
         self.assertEqual(len(self.approval_summary(task)), API.SUMMARY_MAX)
+
+    def test_a_caller_cannot_write_the_basis_sentence_itself_and_similar_words_are_allowed(self):
+        forged_summaries = (
+            API.SAME_PERSON_APPROVAL,
+            API.SAME_PERSON_APPROVAL + ' Looks good.',
+            'Prefix. ' + API.SAME_PERSON_APPROVAL + ' Suffix.',
+            'Looks good. ' + API.SAME_PERSON_APPROVAL,
+        )
+        # 1. Forged by an ordinary person or independent coordinator agent on independent work:
+        ind_task, ind_cid = self.deliver(self.tokens['carl'])
+        for who in (self.tokens['olive'], self.agent):
+            for text in forged_summaries:
+                with self.subTest(who=who, summary=text):
+                    refused = self.request('POST', self.base(ind_task) + '/reviews', {
+                        'operation': 'approve', 'contribution': ind_cid, 'summary': text}, token=who)
+                    self.assertEqual(422, refused.status, refused.data)
+                    self.assertIn(API.SAME_PERSON_APPROVAL, refused.data['error']['message'])
+                    self.assertEqual(self.state_of(ind_task), 'awaiting-review')
+        # 2. Forged by a same-person coordinator agent on a sibling agent's delivery:
+        sib_task, sib_cid = self.deliver(self.other)
+        for text in forged_summaries:
+            with self.subTest(same_person=True, summary=text):
+                refused = self.request('POST', self.base(sib_task) + '/reviews', {
+                    'operation': 'approve', 'contribution': sib_cid, 'summary': text}, token=self.agent)
+                self.assertEqual(422, refused.status, refused.data)
+                self.assertIn(API.SAME_PERSON_APPROVAL, refused.data['error']['message'])
+                self.assertEqual(self.state_of(sib_task), 'awaiting-review')
+        self.assertFalse(any(e.get('same_person_coordinator') for e in self.events('reviews.add')))
+        # 3. Legitimate summaries with similar words are accepted, and the server-written sentence still works:
+        similar = 'Approved by a coordinator agent of the same person after checking agent_approval: by-agent.'
+        ok_ind = self.request('POST', self.base(ind_task) + '/reviews', {
+            'operation': 'approve', 'contribution': ind_cid, 'summary': similar}, token=self.tokens['olive'])
+        self.assertEqual(201, ok_ind.status, ok_ind.data)
+        self.assertEqual(self.approval_summary(ind_task), similar)
+        ok_sib = self.request('POST', self.base(sib_task) + '/reviews', {
+            'operation': 'approve', 'contribution': sib_cid, 'summary': similar}, token=self.agent)
+        self.assertEqual(201, ok_sib.status, ok_sib.data)
+        self.assertEqual(self.approval_summary(sib_task), similar + ' ' + API.SAME_PERSON_APPROVAL)
+        event = [e for e in self.events('reviews.add') if e.get('same_person_coordinator')][-1]
+        self.assertEqual(event['author'], self.other_id)
+
+    def test_next_actions_keep_a_siblings_work_out_for_an_agent_without_a_grant(self):
+        by_heron, _ = self.deliver(self.agent)
+        by_egret, _ = self.deliver(self.other)
+        by_carl, _ = self.deliver(self.tokens['carl'])
+
+        def offered_to(token):
+            data = self.request('GET', '/v1/agents/me/next', token=token).data
+            return {a['task']: a for a in data['next_actions'] if a['kind'] == 'to-review'}
+
+        # Egret has no coordinator grant: Heron's sibling delivery is kept out, while Carl's is offered.
+        egret_actions = offered_to(self.other)
+        self.assertNotIn(by_heron, egret_actions)
+        self.assertNotIn(by_egret, egret_actions)
+        self.assertIn(by_carl, egret_actions)
+        # Once Heron's coordinator grant is removed, Egret's sibling delivery is kept out for Heron too.
+        self.assertEqual(200, self.grant(method='DELETE').status)
+        heron_actions = offered_to(self.agent)
+        self.assertNotIn(by_egret, heron_actions)
+        self.assertNotIn(by_heron, heron_actions)
+        self.assertIn(by_carl, heron_actions)
+
+    def test_summary_max_comes_from_review_workflow_text_limits(self):
+        self.assertIs(http_service.TEXT_LIMITS, review_workflow.TEXT_LIMITS)
+        self.assertEqual(API.SUMMARY_MAX, review_workflow.TEXT_LIMITS['summary'])
 
 
 class StrictTests(SamePerson):
