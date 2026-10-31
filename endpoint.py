@@ -2230,7 +2230,7 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             stdout,warnings=native.split(native.run(native.argv(root,path,actor,argv),environment(root)))
             if warnings: run_warnings.append(warnings)
             return stdout
-        writing=args[:1] and args[0] in ('propose','revise','accept')
+        writing=args[:1] and args[0] in ('propose','revise','accept','web-verify','report','web-verify-check','report-check')
         if writing and not by_service:
             return {'returncode':2,'stdout':'','stderr':'Interface writes need authenticated web authority or the operator interface-apply command.\n','records_status':403}
         def ctx_for(writing):
@@ -2276,13 +2276,78 @@ def _execute(root,request,authority_config=None,require_authority=False,key_proj
             return context
         if not writing:
             context=ctx_for(False)
-            result=interface_records.read(args,run,configured_operators(root))
+            configuration=deployment_document(root/'deployment.private.json') if (root/'deployment.private.json').is_file() else {}
+            listed=configured_verifiers(root)
+            result=interface_records.read(args,run,configured_operators(root),verification=lambda entry:
+                context.compatibility(entry,verifiers=listed,config=configuration,journal=path))
             usage,coverage=context.usage()
             result['program_coverage']=coverage
             for item in result.get('items', [result] if 'record' in result else []):
                 if item.get('record'):
-                    item['flags']=interface_records.flags(item['record'],usage,coverage['complete'])
+                    item['flags']=interface_records.flags(item['record'],usage,coverage['complete'],item['compatibility'])
             return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+        if args[0] in ('web-verify','report','web-verify-check','report-check'):
+            import interface_verification as checks
+            import interface_lock
+            from http_authority import read_state
+            from admin import deployment_config_lock
+            trusted_check=args[0] in ('web-verify','web-verify-check')
+            replay_only=args[0].endswith('-check')
+            payload=interface_records.KIND.write_payload(args,request.get('attachments',{}),commands=('web-verify','report','web-verify-check','report-check'))
+            payload.pop('operation')
+            version=payload.pop('schema_version',1)
+            if type(version) is not int or version!=1:raise ValueError('Interface check schema_version must be 1')
+            claimed=payload.pop('claimed','unknown') if not trusted_check else None
+            payload.setdefault('decision_id',None)
+            checks.request(payload)
+            base_identity,party_check,_=_records_http_context(trusted_check,run_warnings,run,'interfaces')
+            runner=NativeRunner(run,project=path)
+            def check_options():
+                if base_identity is not None:base_identity()
+                state=read_state(authority_config.store) if authority_config is not None else {}
+                configuration=deployment_document(root/'deployment.private.json')
+                authority=configured_operators(root);listed=configured_verifiers(root)
+                bindings=checks.configured_bindings(configuration)
+                rows=interface_records.KIND.read_key_rows(run,payload['key'])
+                interface_records.KIND.require_unique_key(rows,payload['key'])
+                entry=interface_records.KIND.find_entry(rows,payload['key'],authority)
+                row=next(r for r in rows if r.get('id')==entry['native_id'])
+                _,new=checks.pair(row,payload,authority)
+                repository=checks.configured_repository(configuration,new['owner_project'])
+                independent=bool(configuration.get('independent_approval') or (state.get('settings_seen') or {}).get('approval_by_another_party'))
+                if trusted_check:
+                    if payload['decision_id']:
+                        import delegations
+                        decision=delegations.read_issue(run,payload['decision_id'])
+                        if decision is not None:rows.append(decision)
+                    if not checks.authority(actor,name,authority,listed,state,rows,path,payload['decision_id'],bindings=bindings,http_only=True):
+                        raise RecordsRefusal(403,'Current configured interface verifier binding and authority required')
+                    ledger=interface_records.KIND.existing_revisions(interface_records.KIND.live_row(row,authority)[0])
+                    authors=interface_records.KIND.draft_authors_for(row,new['revision'],ledger)
+                    if not checks.party_allows(actor,authors,state,name,independent):
+                        raise RecordsRefusal(403,'Current verifier/proposer party rule refuses this check')
+                    for proposer in authors:party_check(proposer,payload['decision_id'])
+                return dict(operators=authority,verifiers=listed,repository=repository,state=state,bindings=bindings,independent=independent,http_only=True)
+            def live_check():
+                with deployment_config_lock(root):check_options()
+            def check_effect():
+                with deployment_config_lock(root):
+                    try:
+                        options=check_options()
+                        result=checks.record(payload,actor,runner,path,trusted=trusted_check,claimed=claimed,check_only=replay_only,**options)
+                        return {'returncode':0,'stdout':json.dumps(result,ensure_ascii=False)+'\n','stderr':''.join(run_warnings)}
+                    except RecordsRefusal as error:
+                        return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':error.status}
+                    except ValueError as error:
+                        return {'returncode':2,'stdout':'','stderr':str(error)+'\n','records_status':409}
+            with interface_lock.held(root):
+                with held_coordination_lock(path):
+                    # This hook's immutable native check record is its own replay
+                    # receipt. Re-enter the effect on canonical retries so current
+                    # pins/binding/authority and source evidence are always judged.
+                    uncached=dict(request,operation_id=None)
+                    return guarded_write(root,uncached,journal_path(path),check_effect,authority_config=authority_config,
+                        require_authority=require_authority,runner=runner,identity_check=live_check)
         coordinator=args[0]=='accept'
         identity_check,party_check,user_id=_records_http_context(coordinator,run_warnings,run,'interfaces')
         runner=NativeRunner(run,project=path)

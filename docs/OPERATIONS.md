@@ -3565,8 +3565,9 @@ An accepted side whose acceptor is no longer an enabled owner also makes coverag
 The defining area is immutable for an existing entry, including its first and subsequent pending drafts. Revisions authorize against that stored area. Every acceptance and retirement, including receipt retries, rechecks all stored draft proposers against live defining-area roles, enabled accounts and, for agents, their current grant and its issuer. Web writes recheck the principal's own authority; a host actor label never grants
 coordinator permission. The new delegation scope is `interfaces`, not an expansion
 of an older reference/capability grant. Acceptance/retirement cannot fetch a URL or
-run a schema. Compatibility is unverified until the separately reviewed verifier
-slice ships.
+run a schema. Compatibility remains unverified unless a current configured verifier
+check proves the supported subset described in the compatibility hook section below.
+Acceptance itself never computes or promotes a schema compatibility claim.
 
 **One kit-wide lock order:** optional deployment semantic mutex
 (`.interface-mutations.lock`), then a project coordination lock, then the live
@@ -3637,3 +3638,162 @@ record/evidence and identity/path binding. Backup/restore retains incomplete
 plans instead of pretending only the first entry exists. Keep normal private
 sidecar permissions. The deployment mutex file needs no restoration of ownership
 state. No schema cache, interface verifier or runtime registry is introduced here.
+
+### Offline interface compatibility checks
+
+An interface's declared `compatibility.change: additive` is contributor data. A
+trusted check compares the pinned schema bytes of two exact revisions; it does
+not promote the declaration. The register exposes the derived result as
+`compatibility` and `compatibility_evidence`. A supported break inside the same
+interface major reads `breaking-without-version`; an incomplete proof reads
+`compatibility-unverified`.
+
+Merge the following fields into this installation's existing
+`deployment.private.json` (the paths and identities below are examples):
+
+```json
+{
+  "verifiers": ["schema-checker"],
+  "interface_schema_repositories": {
+    "billing-area": "/srv/schema-repositories/billing"
+  },
+  "interface_verifier_bindings": {
+    "agent_0123456789abcdef": "schema-checker"
+  }
+}
+```
+
+The repository map is keyed by the interface's defining `owner_project`, not the
+calling program. It names a configured absolute local repository path. A report
+cannot choose that root. The verifier reads raw Git commit/tree/blob objects,
+checks their hash chain and the schema's SHA-256, and reads only the pinned
+relative path. It does not check out the tree, run schema extensions, filters or
+hooks, fetch objects, or follow a schema reference or URL. Partial/promisor clones,
+Git symlink/submodule entries, schema anchors/fragments and unavailable objects
+are unverified. Existing checkout edits do not change a pinned object.
+
+`operators` and `verifiers` remain native identity lists. An HTTP account/agent id
+belongs in `interface_verifier_bindings`, whose value names an eligible native
+verifier/operator. The authenticated service binds the actual HTTP author; the
+host CLI cannot impersonate that id. An agent additionally needs its current
+project grant, a live `interfaces` delegation, an enabled account/agent and the
+normal proposer/party checks. A delegation does not lift independence policy or
+allow an agent to verify a draft it wrote itself. An ambiguous party attribution
+under independence policy remains unverified. Removing the binding or its native
+issuer's authority invalidates the derived trust; transferring the binding to a
+different issuer needs a new check.
+The existing `verifiers remove` impact preview lists capability verification
+changes only; it does not enumerate these interface checks. Removing an issuer
+also makes checks through its interface bindings unverified unless that issuer
+still has operator authority. Review interface compatibility after a revocation.
+Local schema repositories and `interface_verifier_bindings` are installation
+configuration, outside the coordination sidecar's operators/verifiers lists.
+Retained native check records survive native backup, but a restored installation
+must deliberately configure its source roots and HTTP bindings before they can
+establish trust; restoring a record alone grants no authority.
+
+The check request contains exactly these fields:
+
+| Field | Value |
+| --- | --- |
+| `operation_id` | Stable identity for this attempt; use a new one for a new check |
+| `key` | One `iface.<name>.v<major>` key |
+| `old_revision`, `old_record_sha256` | The preceding reader-approved revision and its exact interface record hash |
+| `new_revision`, `new_record_sha256` | The current accepted record or current draft, and its exact interface record hash |
+| `direction` | `request` or `response` |
+| `decision_id` | The agent's delegation decision, otherwise `null` |
+
+The record hashes differ from the schema byte hashes in the schema pointers.
+A caller cannot skip an intervening approved revision to choose a more favourable
+baseline. A check of a draft is bound to that draft's hash; accepting it creates a
+new revision/hash and needs a new check. Public compatibility describes the
+accepted record when one exists. Neither a reported pass nor a check of another
+revision clears its drift.
+
+A native verifier/operator runs:
+
+```sh
+python3 admin.py --root ROOT interface-verify PROGRAM --actor schema-checker --file check.json
+```
+
+The host hook computes its result from the configured repository. It accepts no
+caller-supplied trusted classification. For an ordinary reported claim use
+`interface-report` with the same request and `--claimed additive|breaking|unknown`;
+that route always records untrusted data.
+
+The authenticated HTTP equivalents are
+`POST /v1/projects/PROGRAM/interfaces/KEY/verify` and `/report`. The route supplies
+`key` and the operation identity from the normal Idempotency-Key; submit the other
+request fields. `/report` additionally accepts `claimed`. `/verify` needs current
+coordination authority plus the configured verifier binding; an agent names its
+delegation in `decision_id`. `/report` needs ordinary record-writing membership
+and cannot grant trust. Neither route accepts actor, repository, result, proof or
+trusted-status overrides.
+
+An exact retry returns its existing immutable check record without a native
+write. Both HTTP replay caches run a read-only native evidence/current-caller-authority
+check first. Missing or voided evidence, stale revision hashes or an obsolete
+algorithm refuses the old success. Trusted checks additionally recheck source
+configuration, the exact verifier binding, and current verifier/delegation/party
+authority. Reports grant no verifier authority and remain untrusted. The read-only
+guard does not repair evidence. Use a new operation identity for
+a new authorized assessment; a lost delegation restriction is repaired by a fresh
+owner decision, as in the delegation recovery section. Existing damaged decisions
+stay inert.
+
+A trusted route can still report `unknown`: missing source objects/configuration
+or an unsupported schema never becomes additive. Configure a usable pinned local
+repository and retry with a new operation identity. URL pointers require a normal
+reviewed revision to a supported repo-path pointer before this hook can prove
+them. Reads inspect retained evidence and current authority/configuration; they
+do not fetch schemas or continuously reread Git object contents. Evidence binds
+algorithm version, both interface revision hashes, both schema digests/source
+commits, source proof and verifier binding. A changed pin/version/binding remains
+unverified until rechecked. Raw record `trusted` marks the producer route; the
+derived compatibility block is the current trust decision.
+
+#### Supported comparison subset
+
+For standalone `application/schema+json`, both roots explicitly name JSON Schema
+draft 2020-12. Supported assertions are one simple `type`, object
+`properties`/`required`/boolean `additionalProperties`, `enum` or `const`, homogeneous
+array `items`, numeric minimum/maximum and exclusive bounds, and string/array
+minimum/maximum lengths. Metadata is limited to `$schema`, title, description and
+`$comment`. Numeric comparisons accept JSON integers and finite binary-exact
+fractions such as `0.5`. An inexact decimal such as `0.1`, or a lexeme whose float
+conversion would change its value or turn it into an integer, is unknown.
+
+Request comparison proves that NEW accepts every value OLD accepted. Response
+comparison proves that OLD accepts every value NEW may return. An unqualified
+standalone JSON Schema additive flag requires both directions. A single directional
+proof remains visible as scoped evidence while the overall flag stays unverified.
+A break requires a checked bounded counterexample; failure to prove containment
+alone is unknown. Reasons include the direction and, for value counterexamples,
+a SHA-256 of the deterministic checked witness.
+
+For OpenAPI 3.1.0/3.1.1 JSON (`application/vnd.oai.openapi+json` or
+`application/vnd.oai.openapi`), the subset is static ASCII paths (letters, digits, slash, underscore, dot and hyphen), explicit HTTP methods,
+inline application/json request and response schemas from the subset above, and
+explicit numeric response status codes. Each operation is checked in both request
+and response directions. Added operations are supported; removed operations,
+new response statuses and newly required bodies are breaking where the supported
+contract proves that result. Parameters, templated paths, components, security,
+servers, headers, links, callbacks and other operation contexts are unknown.
+Duplicate operation IDs and changed SDK operation identifiers are also unknown.
+HEAD/TRACE, bodies on methods other than POST/PUT/PATCH, interim/no-body
+response statuses, repeated slashes and dot path segments remain unknown; this
+subset does not infer ambiguous HTTP body or path normalization semantics.
+Structural removals/new statuses need a bounded reachable value witness; an empty
+or unproved domain never invents a break.
+
+All `$ref`/`$dynamicRef` constructs, including local references, YAML, unknown
+assertions, unions/composition, mismatched dialects, duplicate JSON keys and
+ambiguous or invalid constructs remain unverified, even when otherwise unchanged.
+The whole pair is validated before a positive inference. Limits are 1 MiB per
+schema, 32 JSON nesting levels, 10,000 JSON nodes, 1,000 combined paths/operations
+and 10,000 comparison steps. Source proof additionally bounds path depth, object
+bytes/total bytes and elapsed Git-read time. Evidence text is bounded. Exhaustion
+is unknown, not an additive inference.
+
+The hook writes evidence and flags. Existing acceptance, retirement and program
+coverage rules continue to govern lifecycle changes.

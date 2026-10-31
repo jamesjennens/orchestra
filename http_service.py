@@ -2639,7 +2639,7 @@ class EndpointBackend:
         'followons.record', 'followons.withdraw',
         # Files attached to a task (kittrial-5bb.370): the canonical `task-file` action.
         'files.record', 'files.withdraw',
-        'interfaces.propose', 'interfaces.revise', 'interfaces.accept',
+        'interfaces.propose', 'interfaces.revise', 'interfaces.accept', 'interfaces.verify', 'interfaces.report',
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
         'references.verify',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
@@ -3336,6 +3336,17 @@ class EndpointBackend:
                 return                          # a cheap rule again: leave it unmarked
             self.service.store.save()
 
+    def interface_verification_replay_guard(self,principal,project_id,body,*,trusted=True,key=None,target=None):
+        capability=CAP_COORDINATE if trusted else CAP_RECORDS
+        body=dict(body)
+        original_route='interfaces.verify' if trusted else 'interfaces.report'
+        body['operation_id']=body.get('operation_id') or (self._result_key(principal,project_id,original_route,key,target) if key else None)
+        command='web-verify-check' if trusted else 'report-check'
+        attachments={'0':{'flag':'--file','text':json.dumps(body,ensure_ascii=False)}}
+        return self._run('interface',project_id,self._actor(principal),[command,'@attachment:0'],attachments,
+            authority=authority_request(principal,project_id,capability,now=self.service._expiry_now()),
+            require_authority=True,route='interfaces.verify-replay' if trusted else 'interfaces.report-replay')
+
     # -- mutations -------------------------------------------------------------
     def invoke(self, route, principal, project_id, payload, key, target=None, authorize=None,
                capability=None):
@@ -3356,6 +3367,9 @@ class EndpointBackend:
                 self.lifecycle_replay_guard(principal, project_id, payload['task_id'], payload['dimension'])
             elif route == 'merge-slot.acquire':
                 self.lifecycle_replay_guard(principal, project_id, payload['task_id'], 'merge-acquire')
+            elif route in ('interfaces.verify','interfaces.report'):
+                body=dict(payload['body']);body['operation_id']=body.get('operation_id') or result_key
+                self.interface_verification_replay_guard(principal,project_id,body,trusted=route=='interfaces.verify')
             # Keep the original time and response after the current native hold check.
             WRITTEN.at = cached[1] or False
             return cached[0]
@@ -13246,9 +13260,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self._enrich_record_view(ctx, pid, capabilities, result,
                                                   record_kind=route_name.split('.')[0])
             return result, result
+        def replay_check():
+            guard=getattr(self.backend,'interface_verification_replay_guard',None)
+            if guard is None:raise not_implemented('Interface check replay needs the canonical backend')
+            guard(ctx.principal,pid,body,trusted=route_name=='interfaces.verify',key=ctx.idempotency_key,target=ctx.route_target)
         answer = self._mutate(ctx, route_name, pid, mutate_record, status=status,
                               capability=needed, serialize=False, canonical=True,
-                              reason='%s %s' % (command, body.get('key') or ''))
+                              reason='%s %s' % (command, body.get('key') or ''),
+                              replay_check=replay_check if route_name in ('interfaces.verify','interfaces.report') else None)
         if (route_name in ('references.accept', 'references.retire')
                 and str(ctx.params.get('key') or '').startswith(program_links.PREFIX)):
             # kittrial-5bb.453 (Q1 at VERIFIED): the Program menu link's cached flag follows a web accept or retire
@@ -13813,6 +13832,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         import interface_records
         fields=interface_records.CONTENT_FIELDS+('revision','expected_revision','expected_sha256')
         return self._records_write(ctx,'interfaces.revise','revise',fields,'An interface revision')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')/verify')
+    def interfaces_verify(self,ctx):
+        fields=('old_revision','old_record_sha256','new_revision','new_record_sha256','direction','decision_id')
+        return self._records_write(ctx,'interfaces.verify','web-verify',fields,'An interface compatibility check',coordinator=True)
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')/report')
+    def interfaces_report(self,ctx):
+        fields=('old_revision','old_record_sha256','new_revision','new_record_sha256','direction','decision_id','claimed')
+        return self._records_write(ctx,'interfaces.report','report',fields,'An untrusted interface compatibility report')
 
     @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')/accept')
     def interfaces_accept(self,ctx):

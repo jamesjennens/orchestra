@@ -197,6 +197,7 @@ CAPABILITY_ENTRY_PREFIX = 'Kind: capability-entry-v1\n'
 CAPABILITY_ENTRY_V2_PREFIX = 'Kind: capability-entry-v2\n'
 INTERFACE_ENTRY_PREFIX = 'Kind: interface-entry-v1\n'
 INTERFACE_ACCEPTANCE_PREFIX = 'Kind: interface-acceptance-v1\n'
+INTERFACE_VERIFICATION_PREFIX = 'Kind: interface-verification-v1\n'
 CAPABILITY_ACCEPTANCE_PREFIX = 'Kind: capability-acceptance-v1\n'
 CAPABILITY_VERIFICATION_PREFIX = 'Kind: capability-verification-v1\n'
 CAPABILITY_ALIAS_PREFIX = 'Kind: capability-alias-v1\n'
@@ -282,6 +283,7 @@ RESERVED = (
     (CAPABILITY_ENTRY_V2_PREFIX, 'capability entry', 'capability propose|revise'),
     (INTERFACE_ENTRY_PREFIX, 'interface entry', 'interface propose|revise'),
     (INTERFACE_ACCEPTANCE_PREFIX, 'interface acceptance', 'admin.py interface-apply'),
+    (INTERFACE_VERIFICATION_PREFIX, 'interface compatibility verification', 'admin.py interface-verify'),
     (CAPABILITY_ACCEPTANCE_PREFIX, 'capability acceptance evidence', 'admin.py capability-apply'),
     (CAPABILITY_VERIFICATION_PREFIX, 'capability verification', 'capability check --record (capability verify)'),
     (CAPABILITY_ALIAS_PREFIX, 'capability alias', 'capability propose-alias|alias-reject'),
@@ -326,6 +328,7 @@ _RECORD_KIND_RESERVATIONS = {
     'capability-entry': ('capability entry', 'capability propose|revise'),
     'capability-acceptance': ('capability acceptance evidence', 'admin.py capability-apply'),
     'capability-verification': ('capability verification', 'capability check --record (capability verify)'),
+    'interface-verification': ('interface compatibility verification', 'admin.py interface-verify'),
     'capability-alias': ('capability alias', 'capability propose-alias|alias-reject'),
     'review-recommendation': ('review recommendation', 'review TASK --file payload.json (operation recommend)'),
     'open-item': ('open item', 'items add|revise|block|unblock|resolve|reopen or questions ask'),
@@ -957,7 +960,7 @@ RECORD_ANCHOR_FAMILIES = {
                   REFERENCE_ACCEPTANCE_PREFIX),
     'proposal': (PROPOSAL_PREFIX, PROPOSAL_DISPOSITION_PREFIX),
     'contribution-settings': (CONTRIBUTION_SETTINGS_PREFIX,),
-    'interface': (INTERFACE_ENTRY_PREFIX, INTERFACE_ACCEPTANCE_PREFIX),
+    'interface': (INTERFACE_ENTRY_PREFIX, INTERFACE_ACCEPTANCE_PREFIX, INTERFACE_VERIFICATION_PREFIX),
     'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ENTRY_V2_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
                    CAPABILITY_VERIFICATION_PREFIX, CAPABILITY_ALIAS_PREFIX),
     # kittrial-5bb.126. There is deliberately no family for coordinator-decision: its

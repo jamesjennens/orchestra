@@ -653,8 +653,12 @@ web service's read (`program_links_read`), with no change to the records.
 
 The interface record/catalog, capability v2 declarations, pinned `iface:` tokens,
 acceptance/deprecation and strict complete-view retirement are slice 3a. The schema
-compatibility verifier in §4.3/§9.3 is the separately reviewed slice 3b; slice 3a
-reports compatibility-unverified and does not fetch/parse schemas. The initial
+compatibility verifier in §4.3/§9.3 is slice 3b: the bounded offline hook compares
+pinned schema bytes and records exact revision-bound evidence through configured
+verifier authority. Unsupported or incomplete proofs stay compatibility-unverified.
+See OPERATIONS "Offline interface compatibility checks" for the supported subset,
+source proof, authority bindings and replay rules. Slice 3a itself does not
+fetch/parse schemas. The initial
 accepted content declares `initial`; subsequent content changes within a major
 must declare `additive`. A new major names the predecessor; state-only deprecation
 is journaled across two entries and replayable, not atomically committed with it.

@@ -1,7 +1,7 @@
 """Program interface-v1 register (PROGRAM_DESIGN §4, slice 3a).
 
-Schema compatibility verification belongs to slice 3b. Every revision is explicitly
-compatibility-unverified here. Reads never fetch a schema or follow a URL.
+Slice 3b derives compatibility only from current exact-pin trusted evidence.
+Unproved contexts stay compatibility-unverified. Reads never fetch schemas or URLs.
 """
 import contextvars
 import json
@@ -13,6 +13,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import keyed_entries
+import interface_verification
 import keyed_records as core
 import reference_records as refs
 from export_requirements import parse_json
@@ -207,30 +208,32 @@ KIND = keyed_entries.AnchoredKind(
     close_reason='interface register anchor (not a work item)', valid_key=valid_key,
     parse_entry=parse_entry, validate_entry=validate_entry, entry_record=entry_record,
     validate_content=validate_content, content_fields=CONTENT_FIELDS,
-    write_time_rules=write_time_rules, pre_write=pre_write, acceptance_rules=acceptance_rules)
+    write_time_rules=write_time_rules, pre_write=pre_write, acceptance_rules=acceptance_rules,
+    extra_records={'interface-verification':interface_verification.read_record})
 
 
 def catalog(rows, operators=None):
     return KIND.catalog(rows, operators or ())
 
 
-def view(entry, entries=()):
+def view(entry, entries=(), verification=None):
     record = entry.get('record') or entry.get('proposed')
     replacement=next((e['key'] for e in entries if e.get('state')=='accepted'
                       and e.get('record',{}).get('replaces')==entry.get('key')),None)
+    evidence=verification(entry) if verification is not None else {'state':'compatibility-unverified','classification':'unknown','checked_directions':[]}
     return dict(entry, replacement=replacement, lifecycle=(record['state'] if entry.get('record') else 'draft') if record else None,
-                compatibility='compatibility-unverified', trust='data')
+                compatibility=evidence['state'], compatibility_evidence=evidence, trust='data')
 
 
-def get(rows, key, operators=None):
+def get(rows, key, operators=None, verification=None):
     entries,_=catalog(rows,operators)
-    return view(KIND.find_entry(rows, key, operators or ()),entries)
+    return view(KIND.find_entry(rows, key, operators or ()),entries,verification)
 
 
-def read(args, run, operators=None):
+def read(args, run, operators=None, verification=None):
     rest = [v for v in args if v != '--json']
     if rest[:1] == ['get'] and len(rest) == 2:
-        return get(KIND.read_rows(run), valid_key(rest[1]), operators)
+        return get(KIND.read_rows(run), valid_key(rest[1]), operators, verification)
     if not rest or rest[0] != 'list':
         raise ValueError('interface get KEY | list [--offset N --limit N] | propose|revise --file FILE')
     opts = {'offset': 0, 'limit': 20}
@@ -245,7 +248,7 @@ def read(args, run, operators=None):
     entries, incomplete = catalog(KIND.read_rows(run), operators)
     entries = sorted(entries, key=lambda e: e.get('key') or '')
     page = entries[opts['offset']:opts['offset'] + opts['limit']]
-    return {'schema_version': 1, 'items': [view(e,entries) for e in page], 'total': len(entries),
+    return {'schema_version': 1, 'items': [view(e,entries,verification) for e in page], 'total': len(entries),
             'next_offset': opts['offset'] + len(page) if opts['offset'] + len(page) < len(entries) else None,
             'coverage': {'complete': not incomplete and all(e['state'] not in ('malformed', 'unsupported', 'conflicted') for e in entries),
                          'incomplete': incomplete}, 'compatibility': 'compatibility-unverified'}
@@ -393,6 +396,19 @@ class ProgramContext:
         for area in candidates:self.rows(area)
         self.frozen=True
         return self
+
+    def compatibility(self,entry,*,verifiers=(),config=None,journal=None,owners=None):
+        fallback={'state':'compatibility-unverified','classification':'unknown','checked_directions':[]}
+        if not entry.get('interface_verifications'):return fallback
+        try:
+            rows=self.own();row=next(r for r in rows if r.get('id')==entry.get('native_id'))
+            record=entry.get('record') or entry.get('proposed')
+            if not record:return fallback
+            repository=interface_verification.configured_repository(config,record['owner_project'])
+            return interface_verification.derive(entry,row,self.project,operators=self.operators,
+                verifiers=verifiers,repository=repository,state=self.authority_state,rows=rows,journal=journal,owners=owners,
+                bindings=interface_verification.configured_bindings(config),independent=bool((config or {}).get('independent_approval') or ((self.authority_state or {}).get('settings_seen') or {}).get('approval_by_another_party')))
+        except (ValueError,TypeError,KeyError,OSError,StopIteration):return fallback
 
     def set_authority(self,state):
         self.authority_state=state
@@ -674,11 +690,11 @@ class ProgramContext:
                               ('complete' if coverage['complete'] else 'incomplete',coverage['unavailable_areas'],len(consumers)))
 
 
-def flags(record, usage, complete):
+def flags(record, usage, complete, compatibility='compatibility-unverified'):
     same = [u for u in usage if u['key'] == record['key']]
     consumers = [u for u in same if u['role'] == 'consumes']
     providers = [u for u in same if u['role'] == 'provides']
-    result = ['compatibility-unverified']
+    result = [] if compatibility=='additive' else [compatibility]
     if consumers and record['state'] in ('deprecated', 'retired'):
         result.append('consumes-' + record['state'])
     if complete:
@@ -864,4 +880,4 @@ def help_payload():
             'limits':{'page':PAGE_MAX,'areas':AREA_MAX,'capability_interfaces':MAX_INTERFACES},
             'writes':'Propose/revise require authenticated web authority; a program coordinator accepts; configured host operators use interface-apply.',
             'retirement':'Revise only state to retired and accept with a complete, consumer-free view.',
-            'compatibility':'compatibility-unverified; schema verifier is a later slice'}
+            'compatibility':'Configured verifier checks pinned JSON Schema/OpenAPI sources within a bounded subset; unsupported, untrusted or stale evidence remains compatibility-unverified.'}

@@ -332,6 +332,8 @@ class NoUnguardedParseTests(unittest.TestCase):
             'task_files.py': 9,
             'artifacts.py': 1, 'briefing.py': 4, 'coordination.py': 4, 'endpoint.py': 17,
             'export_requirements.py': 1, 'feedback.py': 3, 'guidance.py': 3,
+            # Bounded schema bytes with duplicate keys refused and exact float lexemes.
+            'interface_compatibility.py': 1,
             'handoff.py': 2, 'http_authority.py': 1, 'http_service.py': 5, 'keyed_records.py': 1,
             'lane_state.py': 1, 'lifecycle.py': 2, 'project_creation.py': 1, 'proposal_records.py': 1,
             'recovery.py': 1, 'requirements.py': 1, 'requirement_governance.py': 1, 'requirement_records.py': 1,

@@ -3011,7 +3011,8 @@ BLOCK_CAPABILITIES = {
     # kittrial-5bb.418: `verify` is a design-document report (unverified), filed by any member who may propose.
     'ref': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS, 'verify': CAP_RECORDS,
             'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE},
-    'interface': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS, 'accept': CAP_COORDINATE},
+    'interface': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS, 'accept': CAP_COORDINATE,
+                  'report': CAP_RECORDS, 'report-check': CAP_RECORDS, 'web-verify': CAP_COORDINATE, 'web-verify-check': CAP_COORDINATE},
     'capability': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
                    'propose-alias': CAP_RECORDS, 'verify': CAP_RECORDS,
                    'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE,

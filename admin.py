@@ -2240,11 +2240,11 @@ def stored_operators(cfg):
     return [identity(item,'Invalid operator identity in the deployment allowlist') for item in value]
 
 def verifiers(root, strict=False):
-    """Server-side `verifiers` list for capability verifications (.60 section 5.2).
+    """Server-side `verifiers` list for capability and interface compatibility checks.
 
     A second, narrow deployment-wide authority beside `operators`: an actor listed here
-    may record a capability check that readers count as `verified`
-    (`capability-verify`), and nothing else. `deployment.private.json`'s `verifiers` is
+    may record a capability check (`capability-verify`) or an offline pinned interface
+    compatibility check (`interface-verify`). It grants no record acceptance or lifecycle right. `deployment.private.json`'s `verifiers` is
     the single authority source, and the list is empty by default. Like `operators`,
     `ORCHESTRA_VERIFIERS` is never an authority source: with `strict=True` (host-side
     write commands) a shell value that disagrees with the file is refused loudly.
@@ -10899,7 +10899,7 @@ def main():
     root_options,remaining=root_parser.parse_known_args(words)
     root_arg=root_options.root
     command=remaining[0] if remaining else None
-    participating=command in ('interface-apply','interface-reconcile',
+    participating=command in ('interface-apply','interface-reconcile','interface-verify','interface-report',
         'record-reconcile','reference-reconcile','capability-reconcile',
         'void-record','anchor-release','operators','restore-new')
     if root_arg is not None and participating:
@@ -10987,6 +10987,10 @@ def _main():
     a.add_argument('--dry-run',action='store_true',dest='dry_run',help='name the files without removing them')
     a.add_argument('--min-age-minutes',type=int,dest='min_age_minutes',default=60,
                    help='only remove a temporary at least this old (default 60; minimum 5)')
+    for command in ('interface-verify','interface-report'):
+        a=sub.add_parser(command,help='offline pinned interface compatibility check; reports remain untrusted',allow_abbrev=False)
+        a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+        if command=='interface-report':a.add_argument('--claimed',choices=['additive','breaking','unknown'],default='unknown')
     a=sub.add_parser('interface-apply',help='apply an interface draft/acceptance (operator only)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True);a.add_argument('--state',help='HTTP authority state for live owner-backed program links')
     a=sub.add_parser('reference-apply',help='accept a reference catalog entry, or a batch of them with items (operator allowlist, F3 evidence)')
@@ -11795,6 +11799,32 @@ def _main():
                     raise ValueError('Owner requirement recovery needs --state with the existing web service state document')
                 print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
                                            args.disposition,run,issue_id=args.issue_id)))
+    elif args.command in ('interface-verify','interface-report'):
+        import interface_records
+        import interface_verification
+        from http_authority import file_lock
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        interface_verification.request(payload)
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        # The common --actor validator above keeps host identities native-only,
+        # including these new subcommands and hand-edited legacy allowlists.
+        # Global mutation gate is acquired by main before project -> config.
+        with file_lock(path/'.coordination.lock'):
+            with deployment_config_lock(root):
+                authority=operators(root,strict=True);listed=verifiers(root,strict=True)
+                if args.command=='interface-verify' and args.actor not in set(authority)|set(listed):raise ValueError('Current configured interface verifier authority required')
+                rows=interface_records.KIND.read_key_rows(run,payload['key'])
+                interface_records.KIND.require_unique_key(rows,payload['key'])
+                entry=interface_records.KIND.find_entry(rows,payload['key'],authority)
+                target=entry.get('record') or entry.get('proposed')
+                if not target:raise ValueError('No readable interface revision')
+                configuration=deployment_document(root/'deployment.private.json') if (root/'deployment.private.json').is_file() else {}
+                repository=interface_verification.configured_repository(configuration,target['owner_project'])
+                print(json.dumps(interface_verification.record(payload,args.actor,run,path,operators=authority,
+                    verifiers=listed,repository=repository,trusted=args.command=='interface-verify',
+                    independent=bool(configuration.get('independent_approval')),claimed=getattr(args,'claimed',None))))
     elif args.command=='interface-apply':
         import interface_records
         from http_authority import file_lock
