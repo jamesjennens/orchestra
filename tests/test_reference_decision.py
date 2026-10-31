@@ -484,8 +484,8 @@ class LaterAuthorityTypeTests(DecisionCase):
         import capability_records as cr
         self.assertIsNone(cr.KIND.unsupported_reason)
         self.assertIsNone(cr.KIND.unsupported_record('Kind: capability-entry-v1\n{"authority": {"type": "oracle"}}'))
-        self.assertEqual(cr.KIND.unsupported_record('Kind: capability-entry-v2\n{}'),
-                         'capability-entry-v2 is newer than this kit')
+        self.assertEqual(cr.KIND.unsupported_record('Kind: capability-entry-v3\n{}'),
+                         'capability-entry-v3 is newer than this kit')
 
 
 if __name__ == '__main__':

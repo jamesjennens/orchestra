@@ -1787,3 +1787,14 @@ def design_page(rows, scope, project, operators, verifiers=None, revision=None):
             'index': derived, 'index_state': index_state, 'heading_lines': heading_lines, 'document': text,
             'trust': 'data',
             'revisions': sorted(number for number, item in revisions.items() if documented(item))}
+
+
+def touches_program_links(payload):
+    """Only program-link records mutate the interface membership graph."""
+    if not isinstance(payload,dict):return True
+    if 'items' in payload:
+        items=payload['items']
+        return (not isinstance(items,list) or not 1 <= len(items) <= keyed_entries.BATCH_MAX
+                or any(not isinstance(item,dict) or touches_program_links(item) for item in items))
+    key=payload.get('key')
+    return not isinstance(key,str) or key.startswith('program.')

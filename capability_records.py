@@ -49,6 +49,7 @@ import json
 import re
 import time
 import unicodedata
+from pathlib import Path
 
 import capability_verification as verification
 import keyed_entries
@@ -100,8 +101,9 @@ SESSION_MARKER = re.compile(r'session-[0-9a-f]{4}|/session[0-9]*(?:$|/)|(?:^|[^A
 REQUIREMENT_KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}')
 ENTRY_FIELDS = ('schema_version', 'key', 'revision', 'name', 'aliases', 'summary', 'requirements', 'anchors',
                 'code', 'tests', 'owner', 'tags', 'acceptance_state', 'successor', 'sha256')
+ENTRY_V2_PREFIX = 'Kind: capability-entry-v2\n'
 CONTENT_FIELDS = ('key', 'name', 'aliases', 'summary', 'requirements', 'anchors', 'code', 'tests', 'owner',
-                  'tags')
+                  'tags', 'interfaces')
 ALIAS_FIELDS = ('schema_version', 'key', 'alias', 'normalized', 'action', 'evidence', 'reason', 'submitter',
                 'at', 'sha256')
 SUBMITTER_FIELDS = ('actor', 'person', 'identity', 'submitted_by_agent')
@@ -205,10 +207,13 @@ def valid_aliases(value):
 
 def validate_entry(record):
     """The closed `capability-entry-v1` schema (.60 section 3.2), time-independent."""
-    if not isinstance(record, dict) or set(record) != set(ENTRY_FIELDS):
+    if not isinstance(record, dict) or set(record) != (set(ENTRY_FIELDS) | ({'interfaces'} if record.get('schema_version') == 2 else set())):
         raise ValueError('capability entry has the wrong field set')
-    if type(record['schema_version']) is not int or record['schema_version'] != 1:
-        raise ValueError('schema_version must be the integer 1')
+    if type(record['schema_version']) is not int or record['schema_version'] not in (1, 2):
+        raise ValueError('schema_version must be the integer 1 or 2')
+    if record['schema_version'] == 2:
+        from interface_records import valid_interfaces
+        valid_interfaces(record['interfaces'])
     valid_key(record['key'])
     core.positive_int(record['revision'], 'revision')
     _bounded_text(record['name'], 'name', NAME_MAX)
@@ -233,11 +238,14 @@ def validate_entry(record):
 
 
 def parse_entry(body):
-    if not isinstance(body, str) or not body.startswith(ENTRY_PREFIX):
+    if not isinstance(body, str) or not body.startswith((ENTRY_PREFIX, ENTRY_V2_PREFIX)):
         return None
-    rest = body[len(ENTRY_PREFIX):]
+    prefix = ENTRY_V2_PREFIX if body.startswith(ENTRY_V2_PREFIX) else ENTRY_PREFIX
+    rest = body[len(prefix):]
     try:
         record = parse_json(rest)
+        if record.get('schema_version') != (2 if prefix == ENTRY_V2_PREFIX else 1):
+            return None
         validate_entry(record)
         if canonical_bytes(record).decode('utf-8') != rest:
             return None
@@ -253,6 +261,8 @@ def entry_record(payload, revision, acceptance_state):
               'code': list(payload.get('code', [])), 'tests': list(payload.get('tests', [])),
               'owner': payload.get('owner'), 'tags': list(payload.get('tags', [])),
               'acceptance_state': acceptance_state, 'successor': None}
+    if 'interfaces' in payload:
+        record.update(schema_version=2, interfaces=payload['interfaces'])
     record['sha256'] = content_hash(record)
     validate_entry(record)
     return record
@@ -293,12 +303,43 @@ def _validate_content(payload, collect=False):
           lambda: valid_owner(payload.get('owner'), required=payload.get('operation') == 'draft'))
     check('tags', 'Use at most %d unique lowercase slugs.' % TAGS_MAX,
           lambda: valid_tags(payload.get('tags', [])))
+    if 'interfaces' in payload:
+        from interface_records import valid_interfaces
+        check('interfaces', 'Use at most 32 pinned {iface, role} links.', lambda: valid_interfaces(payload['interfaces']))
     return errors
 
 
-def _pre_write(payload, run, operators=None):
+def touches_interfaces(payload, run, operators=None):
+    """Conservative pre-lock selector; the writer rechecks immutable revisions and CAS.
+
+    A stale v1 selection cannot replace an intervening v2 draft: ordinary project-
+    locked CAS refuses it. Withdrawals (including v2 -> v1) participate as well.
+    """
+    if not isinstance(payload,dict):return True
+    if 'items' in payload:
+        items=payload['items']
+        if (not isinstance(items,list) or not 1 <= len(items) <= keyed_entries.BATCH_MAX
+                or any(not isinstance(item,dict) for item in items)):return True
+        return any(touches_interfaces(dict(item,operation='accept'),run,operators) for item in items)
+    if 'interfaces' in payload:return True
+    if payload.get('operation')=='propose':return False
+    if payload.get('operation') not in ('revise','accept','retire','draft'):return False
+    if not isinstance(payload.get('key'),str):return True
+    try:
+        rows=KIND.read_key_rows(run,payload['key'])
+        entries,incomplete=KIND.catalog(rows,operators or ())
+        if incomplete or any(e['state'] in ('malformed','unsupported','conflicted') for e in entries):return True
+        return any('interfaces' in record for entry in entries
+                   for record in (entry.get('record'),entry.get('proposed')) if record is not None)
+    except (ValueError,OSError,RuntimeError):return True
+
+
+def _pre_write(payload, run, operators=None, project=None):
     """Reads before the journal: requirement links, and a retirement's successor."""
     if payload['operation'] in ('propose', 'revise', 'draft'):
+        if 'interfaces' in payload and project is not None:
+            from interface_records import valid_interfaces
+            valid_interfaces(payload['interfaces'],Path(project).name)
         check_requirements(payload.get('requirements') or [], run)
     if payload['operation'] == 'retire':
         check_successor(payload['key'], payload['successor'], read_key_and_retired(run, payload['successor']),
@@ -512,6 +553,8 @@ def alias_state(view, operators):
 KIND = keyed_entries.AnchoredKind(
     noun='capability', title='Capability', command='capability', type_label=TYPE_LABEL, state_labels=STATE_LABEL,
     key_prefix=KEY_LABEL, family='capability-', entry_prefix=ENTRY_PREFIX, acceptance_prefix=ACCEPTANCE_PREFIX,
+    entry_prefixes=(ENTRY_PREFIX, ENTRY_V2_PREFIX),
+    entry_prefix_for=lambda record: ENTRY_V2_PREFIX if record['schema_version'] == 2 else ENTRY_PREFIX,
     journal=JOURNAL, source='capability-apply', accept_action='accept a capability',
     apply_command='admin.py capability-apply', reconcile_command='admin.py capability-reconcile',
     anchor_title=ANCHOR_TITLE, anchor_description=ANCHOR_DESCRIPTION,
@@ -520,7 +563,7 @@ KIND = keyed_entries.AnchoredKind(
     validate_entry=lambda record: validate_entry(record),
     entry_record=lambda payload, revision, state: entry_record(payload, revision, state),
     validate_content=_validate_content, collecting_content=True, write_time_rules=lambda record: None,
-    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators, project=None: _pre_write(payload, run, operators),
+    content_fields=CONTENT_FIELDS, pre_write=lambda payload, run, operators, project=None: _pre_write(payload, run, operators, project),
     extra_records={'capability-alias': _read_alias, 'capability-verification': verification.read_record},
     extra_parsers={'capability-alias': parse_alias, 'capability-verification': verification.parse},
     supports_retire=True,

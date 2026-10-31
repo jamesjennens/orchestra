@@ -124,7 +124,7 @@ class EndpointRefusalTests(unittest.TestCase):
 
     def test_the_refusal_is_what_execute_raises(self):
         import inspect
-        source = inspect.getsource(endpoint.execute)
+        source = inspect.getsource(endpoint.execute) + inspect.getsource(endpoint._execute)
         self.assertIn('if args[0] not in ALLOWED:', source)
         self.assertIn('outside_contributor_interface(args[0])', source)
 
@@ -181,7 +181,7 @@ class EndpointRefusalTests(unittest.TestCase):
     def test_the_endpoint_still_refuses_everything_outside_the_contributor_interface(self):
         """Only the ANSWER changed: the interface itself is the same, and its commands still pass."""
         import inspect
-        source = inspect.getsource(endpoint.execute)
+        source = inspect.getsource(endpoint.execute) + inspect.getsource(endpoint._execute)
         self.assertIn("if args[0] not in ALLOWED:", source)
         self.assertEqual(endpoint.ALLOWED, {'list', 'show', 'ready', 'search', 'count', 'create',
                                             'update', 'close', 'reopen', 'comments', 'dep', 'state', 'lint'})

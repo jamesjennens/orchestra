@@ -1137,7 +1137,7 @@ class DesignVerifyCommandTests(DesignCase):
             argv = ['admin.py', '--root', str(root), 'design-verify', 'trial', '--actor', VERIFIER, '--file', str(path)]
             with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=root), \
                     patch.object(admin, 'run_bd', side_effect=run_native), \
-                    patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+                    patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}), \
                     patch.dict(os.environ, {'ORCHESTRA_OPERATORS': '', 'ORCHESTRA_VERIFIERS': ''}), \
                     contextlib.redirect_stdout(io.StringIO()) as out:
                 try:

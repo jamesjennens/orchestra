@@ -321,9 +321,13 @@ class ReservationCase(ProposalHarness):
             with self.assertRaisesRegex(ValueError, 'only the HTTP service acts under'):
                 reserved_comments.refuse_http_actor(actor, False)
             reserved_comments.refuse_http_actor(actor, True)             # launched by the service
-        for actor in ('usr_short', 'user_0123456789abcdef', 'usr_0123456789ABCDEF', 'alice', 'http/read',
+        for actor in ('user_0123456789abcdef', 'alice', 'http/read',
                       'session-00000000-0000-4000-8000-000000000001', 'xusr_0123456789abcdef', None):
             reserved_comments.refuse_http_actor(actor, False)
+        # kittrial-5bb.454 (the trust boundary): a name that reads as an HTTP id once normalised is refused too.
+        for actor in ('usr_short', 'usr_0123456789ABCDEF'):
+            with self.assertRaisesRegex(ValueError, 'only the HTTP service acts under'):
+                reserved_comments.refuse_http_actor(actor, False)
         # The ids the service really allocates have the reserved shapes.
         self.assertTrue(pr.HTTP_ACCOUNT.fullmatch(self.uid('alex')))
         made = self.request('POST', '/v1/agents', {'name': 'Kestrel', 'working_directory': '/h/k'},

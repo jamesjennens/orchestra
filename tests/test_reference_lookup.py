@@ -237,7 +237,7 @@ class MissLogTests(unittest.TestCase):
         (root / 'backups' / 'source').mkdir(parents=True)
         cm.record_find(project, 'office printer', False, T0, which=cm.REFERENCE)
         (project / cm.REFERENCE.temp).write_text('{}', encoding='utf-8')
-        with patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+        with patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}), \
                 patch.object(admin, 'run_bd', return_value='synced'):
             admin.backup_project(root, 'source')
         sidecar = json.loads((root / 'backups' / 'source.coordination.json').read_text(encoding='utf-8'))
@@ -261,7 +261,7 @@ class MissLogTests(unittest.TestCase):
         with patch.object(sys, 'argv', ['admin.py', '--root', str(root), 'reference-misses-clear', 'trial']), \
                 patch.object(admin, 'root_path', return_value=root), \
                 patch.object(admin, 'run_bd', side_effect=AssertionError('bd was called')), \
-                patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=flock, LOCK_EX=2)}), \
+                patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             admin.main()
         result = json.loads(out.getvalue())

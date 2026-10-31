@@ -1106,7 +1106,7 @@ class OperatorClearTests(MissLogCase):
         with patch.object(sys, 'argv', ['admin.py', '--root', str(self.root), *argv]), \
                 patch.object(admin, 'root_path', return_value=self.root), \
                 patch.object(admin, 'run_bd', side_effect=AssertionError('bd was called')), \
-                patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=flock, LOCK_EX=2)}), \
+                patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             admin.main()
         return json.loads(out.getvalue())
@@ -1143,7 +1143,7 @@ class NotBackedUpTests(MissLogCase):
         (project / cm.TEMP_NAME).write_text('{}', encoding='utf-8')
         self.assertTrue(self.file.exists() and (project / cm.LOCK_NAME).exists())
         before = self.file.read_bytes()
-        with patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+        with patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}), \
                 patch.object(admin, 'run_bd', return_value='synced'):
             admin.backup_project(root, 'source')
         sidecar = json.loads((root / 'backups' / 'source.coordination.json').read_text(encoding='utf-8'))

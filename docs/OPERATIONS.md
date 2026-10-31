@@ -498,6 +498,15 @@ for `.assignee-followons/` above: restore with this kit or a newer one, or remov
 removes the delegation rule altogether: agents accept as they did before (the own-party
 refusal still holds), and the delegation records read as ordinary comments.
 
+**Attested decisions** (kittrial-5bb.454 r2). `admin.py backup` collects `<project>/.decision-attests/` the same way, and
+`restore-new` validates and restores it. `restore-new` always makes a new name, as it refuses the same one, and a record
+binds its project's name: a new name is a new project. So every row it restores reads `not-attested`, on purpose, and stands
+gated, until a person owner of the new project attests it again (the decision's page, or `admin.py decision-attest`). A
+coordinator cannot do that for them, here or after a lost journal: only an owner or an operator attests a row whose old
+attestation can no longer be read.
+Adoptions elsewhere that pin the old name stay on the old name. An older kit refuses to restore a backup that holds the
+journal, as above.
+
 ### The claiming setting: restore and rollback
 
 `<project>/.claiming.json` holds whether workers may claim open tasks (`open`, the
@@ -1299,8 +1308,8 @@ history](#malformed-structured-history) (`void-record`).
 | `reference-apply PROJECT --actor OPERATOR --file acceptance.json` | accept a reference catalog entry: the payload names the newest draft `revision` and its `record_sha256`, and the command writes the next revision as accepted, after the F3 evidence (`operation: "draft"` with full content writes a direct accepted revision 1). An entry whose authority is an attestation is accepted only under the [extra rules below](#attested-reference-entries) | the deployment operator allowlist, checked before any write, and F3 evidence (`acceptance`: owners, approvers, policy, decision id, evidence) |
 | `reference-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of reference entries under one F3 decision: the payload has `items` of `{key, revision, record_sha256}` (each the newest draft reviewed) in place of the single entry's fields. It behaves exactly as the `capability-apply` batch below: one receipt per item keyed `(operation_id, key)`, `accepted`, `already-accepted`, `refused` or `uncertain` per item, a refused item does not stop the others, the coordination lock is taken per item, at most 100 items, and re-running the same batch resumes it. Read the totals, not the exit code: see the `capability-apply` row | the deployment operator allowlist, checked before any write, and F3 evidence |
 | `reference-reconcile PROJECT --operation-id ID --actor ACTOR --reason TEXT --disposition ...` | finish a reference operation whose real write was uncertain; `complete` needs `--issue-id` and refuses an anchor that has no live revision record, because its propose stopped or every record it held is voided (re-run the original `ref propose` with its `operation_id` first; if that payload is lost, use `anchor-release`) | the deployment operator allowlist, checked before the receipt is read; then confirmation of the native record state |
-| `capability-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of capabilities under one F3 decision: `items` of `{key, revision, record_sha256}` (each the newest draft reviewed). The command writes one acceptance record and one receipt per item, keyed `(operation_id, key)`, in list order. It reports `accepted`, `already-accepted`, `refused` or `uncertain` per item; an uncertain item stops the batch, and re-running the same batch resumes it. The command exits 0 when the batch ran, even if items were refused, so read the totals it prints: `accepted`, `refused`, `stopped` (an uncertain write stopped the batch) and `complete`, which is true only when every item was accepted. A changed list needs a new `operation_id`. The coordination lock is taken per item and released between items, with a 50 ms pause while it is free, so other writers wait behind at most one item; each item re-checks its `revision` and `record_sha256` under its own hold. An item takes about 3 seconds (two reads and four writes), so 100 items take 5 to 6 minutes: prefer batches of about 20. `operation: "draft"` with full content writes a direct accepted revision 1 | the deployment operator allowlist, checked before any write, and F3 evidence |
-| `capability-retire PROJECT --actor OPERATOR --file retire.json` | supersede the newest revision of a key by a `successor` key, with evidence. The successor must exist, and a cycle is refused. A retired key refuses `revise` and acceptance. This is the only route that withdraws an accepted entry: the design has no demotion, so an accepted revision is never weakened or withdrawn in place (design section 4) | the deployment operator allowlist and F3 evidence |
+| `capability-apply PROJECT --actor OPERATOR --file batch.json` | accept a batch of capabilities under one F3 decision: `items` of `{key, revision, record_sha256}` (each the newest draft reviewed). The command writes one acceptance record and one receipt per item, keyed `(operation_id, key)`, in list order. It reports `accepted`, `already-accepted`, `refused` or `uncertain` per item; an uncertain item stops the batch, and re-running the same batch resumes it. The command exits 0 when the batch ran, even if items were refused, so read the totals it prints: `accepted`, `refused`, `stopped` (an uncertain write stopped the batch) and `complete`, which is true only when every item was accepted. A changed list needs a new `operation_id`. The coordination lock is taken per item and released between items, with a 50 ms pause while it is free, so writers that do not need the deployment interface mutex wait behind at most one item. Participating record mutations also need that mutex, which is held for the batch and returns 503 busy at its acquisition bound; each item re-checks its `revision` and `record_sha256` under its own hold. An item takes about 3 seconds (two reads and four writes), so 100 items take 5 to 6 minutes: prefer batches of about 20. `operation: "draft"` with full content writes a direct accepted revision 1 | the deployment operator allowlist, checked before any write, and F3 evidence |
+| `capability-retire PROJECT --actor OPERATOR --file retire.json` | supersede the newest live accepted revision of a key by a `successor` key, with evidence. The successor must exist, and a cycle is refused. A retired key refuses `revise` and acceptance. This is the only route that withdraws an accepted entry: the design has no demotion, so an accepted revision is never weakened or withdrawn in place (design section 4) | the deployment operator allowlist and F3 evidence |
 | `capability-alias-reject PROJECT --actor OPERATOR --file reject.json` | reject a pending alias (`{schema_version, key, alias, reason}`); lookup then ignores it | the deployment operator allowlist |
 | `capability-alias-propose PROJECT --actor OPERATOR --file alias.json` | propose an alias as a verified operator (`{schema_version, key, alias, evidence?}`). This is the only route that writes `identity: verified`; `capability propose-alias` through the endpoint always writes `unverified`, even for an operator's actor name | the deployment operator allowlist |
 | `capability-verify PROJECT --actor ACTOR --file payloads.json` | record capability checks as **verified**. The file is what `capability check --repo . --payloads payloads.json` wrote at the commit being verified (one payload, or `{schema_version, items}` of up to 500). Each item is one capability and takes the coordination lock on its own; the result is `recorded`, `already-recorded` or `refused` per item, and re-running the file is safe. This is the only route that writes a verified check: `capability check --record` through the endpoint always writes an unverified report | the deployment operator allowlist or the `verifiers` list, both checked before any read |
@@ -3467,3 +3476,91 @@ before the first new-family write. Do not use an older kit to take backups of a
 project with baselines: that kit does not enumerate this family and cannot preserve
 it. Keep the compatible kit and complete sidecar/native backup together. This
 feature does not authorize deployment or restoration of a live project.
+
+### Interface register mutations and recovery
+
+The program interface register uses native closed anchors and the shared record
+journal, not a second database. A configured operator may use
+`admin.py --root ROOT interface-apply PROGRAM --actor OPERATOR --file payload.json
+[--state PRIVATE_HTTP_STATE]`. Payloads are the shared `draft`
+(direct accepted first entry) or `accept` shapes, with interface content and F3
+acceptance. `--state` supplies current membership/accounts when program links were
+accepted by web owners; without it only operator-backed sides can be established.
+An otherwise active owner-backed admission with no loaded current authority
+view makes coverage incomplete and blocks retirement; it is not an inactive side.
+An accepted side whose acceptor is no longer an enabled owner also makes coverage incomplete; only a side actually withdrawn or never accepted is outside scope. The program project itself is included in the consumer inventory.
+The defining area is immutable for an existing entry, including its first and subsequent pending drafts. Revisions authorize against that stored area. Every acceptance and retirement, including receipt retries, rechecks all stored draft proposers against live defining-area roles, enabled accounts and, for agents, their current grant and its issuer. Web writes recheck the principal's own authority; a host actor label never grants
+coordinator permission. The new delegation scope is `interfaces`, not an expansion
+of an older reference/capability grant. Acceptance/retirement cannot fetch a URL or
+run a schema. Compatibility is unverified until the separately reviewed verifier
+slice ships.
+
+**One kit-wide lock order:** optional deployment semantic mutex
+(`.interface-mutations.lock`), then a project coordination lock, then the live
+authority/store lock, then journal/receipt locks and the native effect. Never take
+an area/project lock while holding authority. Cross-project snapshots take one
+project at a time and release it before the next; the final write locks only its
+own project. Store-only account/member/agent and project registration mutations
+use their authority transaction alone, and release it before invoking a canonical
+backend. Host recovery/restore follows project-before-authority too. See
+SYSTEM_DESIGN "Kit lock order"; there is no route-specific reverse order.
+
+The semantic mutex covers only graph checks and effects: program-link reference
+writes, interface writes, capability writes whose payload or stored declarations
+touch interfaces (including v2-to-v1 withdrawal), native restores, and operator repairs or changes
+that can affect this graph's evidence. Verifier-only configuration bypasses it;
+host dispatch selects by command, never by an unrelated argument value. Decode/structural validation happens before
+it. Unrelated reference proposals and v1 capabilities bypass it. Membership and
+registration do not wait on it. Batches release it and the project lock between
+items; mixed batches conservatively select against the batch. Its five-second
+acquisition bound still returns 503 busy before an effect; relevant simultaneous
+mutations can contend, but unrelated writes do not join that queue.
+
+An interface write prepares authorized graph snapshots before its final project
+and authority boundary. A snapshot acquires its project first and checks permission
+under shared authority before export. The effect refreshes live roles/accounts/grants
+under exclusive authority and gates even cached rows again. The frozen reader
+cannot fetch another project there: a missing or newly readable area is incomplete,
+never silently fetched or treated as empty. Drafts and non-retirement acceptance
+need only the defining pair; accepting retirement inventories all possible consumers
+within the area budget. The lock is not held across human review or a whole plan.
+Direct edits, raw operator bd commands and other programs outside these entry
+points bypass this discipline, just as they bypass the kit's project locks.
+
+Retirement is a state-only draft followed by acceptance, not a successor-key
+retirement. A capability successor-key retirement is a record acceptance decision: it requires a live accepted source revision (accept any pending draft first), the same party rule as acceptance, and for a web agent a named in-force record-acceptance delegation covering capabilities. The HTTP route requires the delegation decision and the canonical endpoint rechecks it under the write lock. A coordinator grant alone is insufficient. Host operator retirement retains its allowlist/F3 checks and exact replay; it can no longer retire a draft or inert acceptance. The request shape is unchanged; callers must pass the accepted revision/hash and agents must supply decision_id. The complete-view check runs **as the acceptor**, with no privileged
+fallback and no decision override in slice 3a. An unreadable, absent, unsupported,
+malformed or truncated area/catalog is not evidence of zero consumers. A single
+coverage classifier applies to sides and capabilities. A well-formed capability with no retained approved interface declaration is outside the interface inventory, including v1 records and retired interface-free records; staff turnover on those records does not affect coverage. Historical declarations are checked comment by comment: an applied void repairs malformed comments, but voiding inert evidence cannot hide a formerly accepted consumer. A capability retirement honoured by the canonical reader is also outside scope even if it once declared interfaces; later staff turnover does not reactivate it. An inert or unauthorised retirement remains incomplete. A non-retirement withdrawal still needs live approval. For records in scope, an acceptance that exists
+but is now inert for any reason (operator removed, role lost, account disabled or
+grant no longer effective) makes coverage incomplete, even when the ordinary
+catalog calls it draft-only. Only never-accepted records or an actual withdrawal whose approval is still live
+are outside scope; an inert withdrawal needs current reaffirmation too. A known
+consumer blocks regardless of the minor revision it pins. A later capability may
+still declare consumption of a retired major; the register then reports
+`consumes-retired`. The mutex prevents it racing the retirement check; it does not
+silently rewrite that later declaration or claim the consumer vanished.
+
+New-major acceptance and predecessor deprecation are two native entries. The
+new-major F3/G1 check runs first. Deprecation changes only predecessor `state`,
+with its own bound acceptance evidence, and preserves its schema/meaning/owner.
+A pending predecessor draft blocks a new-major acceptance. A cut after the new
+major commits can leave deprecation pending; the operation has not completed.
+Exact retries reconcile the immutable plan and evidence before appending the
+missing revision. Never infer cross-entry atomicity, release that operation or
+allocate a new identity to get around it. If the original authorized actor cannot
+retry, a configured operator completes it with
+`interface-reconcile PROGRAM --operation-id ID --actor OPERATOR --reason TEXT
+--disposition complete --state /path/to/existing-web-state.json`; its own new evidence re-attests the same state-only plan. Recovery confirms the exact live first-leg approval and immutable stored owner areas. It is an explicit fresh proposal of the planned state-only deprecation by the currently listed operator, with new bound operator evidence and a native reason audit; it does not re-accept the first leg or borrow its original proposer's lost rights. The defining area must still be linked in the current authority view. Ordinary retry remains refused after proposer demotion, but this explicit recovery can finish even if that proposer never returns. A program coordinator requests this configured-operator recovery; no new web reconciliation route is introduced. A host without the needed authority view cannot prove owner-backed links. The completed first-leg receipt remains intact and is not reconciled again.
+Conflicting predecessor content/revision remains a refusal requiring inspection,
+not an automatic overwrite. If a predecessor draft landed between the first commit and creation of the second-leg plan, inspect that draft with its owner. A configured operator can void that unaccepted draft with `void-record` (only after confirming it carries no live acceptance evidence), then retry the original new-major acceptance identity to create and finish the state-only plan. Never discard or overwrite the draft automatically. If the draft was accepted or changes cannot safely be voided, stop for operator/owner repair; both majors remain visible and the missing deprecation is not complete. `record-reconcile --kind interface` is the equivalent
+operator entry point. Ordinary anchor release and void repair include interfaces;
+a void cannot erase a revision that still carries live acceptance evidence.
+
+Back up `.interface-requests/` **and** `.interface-transitions/` with the native
+project directory. Both join the validated coordination sidecar and pending-
+reservation inventory; transition bodies additionally validate the exact planned
+record/evidence and identity/path binding. Backup/restore retains incomplete
+plans instead of pretending only the first entry exists. Keep normal private
+sidecar permissions. The deployment mutex file needs no restoration of ownership
+state. No schema cache, interface verifier or runtime registry is introduced here.

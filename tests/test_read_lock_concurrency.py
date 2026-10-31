@@ -217,7 +217,7 @@ _DISPATCH = re.compile(r"(?<![\w.'\"])action\s*(?:==|!=|in)\s*(\([^)]*\)|'[^']*'
 
 
 def dispatched_actions():
-    source = inspect.getsource(endpoint.execute).replace("request.get('action')", 'action')
+    source = (inspect.getsource(endpoint.execute) + inspect.getsource(endpoint._execute)).replace("request.get('action')", 'action')
     names = set()
     for match in _DISPATCH.finditer(source):
         names.update(re.findall(r"'([^']+)'", match.group(1)))

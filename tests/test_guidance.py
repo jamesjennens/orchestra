@@ -1277,7 +1277,7 @@ class GuidanceBackupTests(unittest.TestCase):
             admin.validate_coordination_files({'.guidance.json': meta})
 
     def backup(self, names=(), all_projects=False):
-        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
+        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         with patch.dict(sys.modules, {'fcntl': fake}), patch.object(admin, 'run_bd', return_value='synced'):
             admin.backup_projects(self.root, list(names), all_projects=all_projects)
 
@@ -1296,7 +1296,7 @@ class GuidanceBackupTests(unittest.TestCase):
         (self.root / 'backups' / 'example').mkdir(parents=True)
         (self.project / 'GUIDANCE.md').write_text('hand edited text\n', encoding='utf-8')
         err = io.StringIO()
-        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2)
+        fake = types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         with patch.dict(sys.modules, {'fcntl': fake}), patch.object(admin, 'run_bd', return_value='synced'), \
                 contextlib.redirect_stderr(err):
             self.assertEqual(admin.backup_project(self.root, 'example'), 'synced')

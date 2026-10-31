@@ -1646,6 +1646,18 @@ sets `operation`.
     state. Since kittrial-5bb.449 the index takes qualified `design:` tokens, and `req:/x`, `req:A/` and
     `req:A/@3` (an empty project or key) are prose, so a document accepted before that holds either reads
     `differs` until it is accepted again. Anything that is not a readable repo-document revision answers `Design not found`.
+  - `trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N]` (kittrial-5bb.453)
+    is the program view of a program project, the endpoint action `program` (PROGRAM_DESIGN.md §5): `areas`
+    (link state; for a readable area `open_tasks`, `lanes` and `rows_read`; otherwise `visible: false` and "not
+    visible to you"), `interfaces` (`not-available` until slice 3), `requirements` (`no-area-cites`,
+    `cites-superseded-revision`, 50 rows a page), `decisions` (kittrial-5bb.454: each program decision with a
+    `Binds:` line, its `attestation_id`, its flags (`closed`, `not-attested`, `attestation-stale`, `attester-not-authorised`, or why it does
+    not count), and per bound area `adopted`, `not-adopted`, `adoption-invalid` with the reason, `adoption-stale`, what an adoption reads
+    as when it does not count, `superseded-upstream`, `not-visible`, `not-in-program` or `not-checked`;
+    `--decisions-offset N`), `suggestions`
+    (open tasks labelled `suggestion`, oldest first, with their `From:` line; `--suggestions-offset N`) and
+    `coverage`. At most 50 areas a read. The readable areas are the key's projects, or any project for an
+    operator's unbound key; an area outside a bound key's projects is `not-checked` and is never read.
   - `trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]` (kittrial-5bb.425) is the
     trace read, answered by the server from records alone (no repository, no blob read); the client
     passes it to the endpoint action `trace` and prints the answer. Views: `summary` (the Coverage
@@ -2034,7 +2046,7 @@ route. Every refusal ends "Nothing was written."
 
 **`delegation-record` (kittrial-5bb.407).** Records a delegation of a decision right on a
 decision issue: the payload is the closed request
-`{"schema_version":1,"operation_id":"...","decision":"ISSUE"|null,"title":null|"...","action":"grant|narrow|revoke","right":"record-acceptance","grantee":"agent_<16hex>|coordinator-grant","scope":["capabilities","references"],"escalate":"...","reason":"..."}`
+`{"schema_version":1,"operation_id":"...","decision":"ISSUE"|null,"title":null|"...","action":"grant|narrow|revoke","right":"record-acceptance","grantee":"agent_<16hex>|coordinator-grant","scope":["capabilities","interfaces","references"],"escalate":"...","reason":"..."}`
 (a grant with `decision: null` creates the decision issue from `title`; a revocation carries an
 empty `scope` and `escalate`). The record is a `Kind: delegation-v1` comment on the decision with
 a host journal entry in `<project>/.delegations/<sha256>.json`; without the entry it grants
@@ -2046,6 +2058,19 @@ and a person owner records one on the web (`POST /v1/projects/{id}/delegations`)
 agent holding the project's coordinator grant and whether a delegation in force covers it. An
 agent's web acceptance of a reference or capability record names its delegation as
 `decision_id` (docs/HTTP_DEPLOYMENT.md, "Delegated record acceptance").
+
+**Attested decisions** (kittrial-5bb.454 r2; `decision_attest.py`). An operator's host routes are:
+`python3 admin.py --root ROOT decision-attest-read --project PROJECT --decision ID [--state STATE.json]` (read-only: the
+exact text, its digest and how it reads now), `python3 admin.py --root ROOT decision-attest --project PROJECT --actor
+OPERATOR --decision ID --digest DIGEST [--state STATE.json]` (attests what was read; a text that changed since is
+refused, and a row carrying `Adopts:` or `Authorises:` needs the pinned decision to count, judged against the web state, the
+deployment's own unless `--state` names one) and `python3
+admin.py --root ROOT decision-change --project PROJECT --actor OPERATOR --decision ID --change
+close|reopen|type-decision|type-task|add-decision-label|remove-decision-label [--reason TEXT]`. The last is the only
+host route for those changes on a row with an honoured attestation, or on any decision row carrying an attestation comment or a `Binds:`, `Owner-only:`, `Adopts: decision:`, `Per: decision:` or `Authorises: decision:` line: `bd close`, `reopen` and `update` with a status, type or decision-label flag are refused on every other host route, an operator's included. Any other row is unaffected, and a text edit is never refused. There is no coordinator command for these, and a raw comment cannot
+write the record: the `Kind: decision-attest-v1` prefix is reserved and is honoured only with its journal entry in
+`<project>/.decision-attests/<sha256>.json`. The web's routes and `http_client.py decision-attestation` and
+`decision-attest` are in docs/HTTP_DEPLOYMENT.md.
 
 ## `files`: a task's files over SSH
 
@@ -2549,3 +2574,80 @@ comment now skip these extra projections; candidate tasks still pay that cost.
 The 50-entry output limit does not
 mean only 50 candidates are examined. An opt-in public request flag would need
 a separate protocol change; this additive response retains the current route.
+
+## Program interface register
+
+`interface-v1` is the third closed anchored kind. `interface list --limit N
+--offset N` (N up to 50) and `interface get iface.<name>.v<major>` read it; the web
+catalog is `GET /v1/projects/{project}/interfaces`, at `CAP_READ`, with ordinary
+page cursors. Detail is `GET .../interfaces/{key}`. All returned meaning/schema
+text is data, never an instruction. No catalog read fetches a schema or URL.
+
+An entry's content fields are exactly `key`, `name` (200 characters), `meaning`
+(2,000), `owner_project`, `owner`, `schema`, `compatibility`, `replaces`, `state`,
+`review_by` and `tags`. The key is `iface.<name>.v<positive-major>`, at most 80
+characters. `schema` is a pinned repo-path (`path`, full `commit`, `anchor`, which
+may be null) or HTTPS URL (`url`, `retrieved`), plus `media_type` and a lowercase
+SHA-256 of the schema bytes. The schema bytes are not downloaded or checked by
+slice 3a. Unsupported compatibility verification is **compatibility-unverified**;
+JSON Schema/OpenAPI checking is the separate slice 3b, not a hidden dependency.
+
+Propose with `POST .../interfaces` and revise with `PATCH .../interfaces/{key}` or
+`POST .../interfaces/{key}/revisions`; their bodies are the content fields, and a
+revision additionally has `revision` and `expected_sha256`. The caller needs the
+ordinary proposal standing in the program project AND live coordination in the
+linked defining area. A program coordinator accepts through
+`POST .../interfaces/{key}/accept`, naming the reviewed revision and hash with the
+ordinary F3 acceptance fields and `Idempotency-Key`. An agent also needs the
+person owner's live `record-acceptance` delegation scoped to **interfaces**;
+reference/capability delegations do not grant it. Both authority checks run again
+at the endpoint under its canonical write guard. A self-declared host actor is
+not proof of coordinator standing: SSH interface writes are refused. A configured
+operator uses `admin.py interface-apply` instead. The HTTP SDK provides
+`list_interfaces`, `get_interface`, `propose_interface`, `revise_interface` and
+`accept_interface`; the SSH client recognizes `interface` and its read/help forms.
+
+The internal shared `acceptance_state` is separate from the desired content
+`state`. A proposed record can request `state: accepted`, but reads show
+`lifecycle: draft` until live acceptance evidence exists. Initial acceptance uses
+`compatibility: {rule: additive-within-major, change: initial}`; a later schema or
+meaning revision within that major must declare `additive`. Drafts and accepts
+retain the shared kind's revision numbering, CAS, native evidence and receipt
+replay rules. No accepted bytes are edited in place. A new major names the prior
+major in `replaces`; its acceptance subsequently appends a state-only deprecated
+revision to that predecessor (a retired predecessor stays retired). This is a
+retryable **two-entry** operation, not a native transaction: do not treat an
+uncertain result as complete; retry the exact operation. Never re-use its identity
+with different bytes. Recovery is described in OPERATIONS.
+
+To retire, revise **only** the content `state` to `retired`, then accept that draft.
+There is no override in this slice. The acceptor must read every currently linked
+area, with complete supported catalogs, and no current accepted capability there
+may consume the major. Unreadable/failed/malformed/unsupported/incomplete data or
+more than 50 admitted areas refuses retirement. Draft capability revisions do not
+withdraw accepted consumers. Refusal makes no native mutation. A retired major
+cannot be reactivated. Fresh reacceptance of a live accepted revision is refused;
+exact/native-identical retries retain the shared receipt contract.
+
+`capability-entry-v2` adds `interfaces`, at most 32 closed `{iface, role}` items:
+`iface` is `iface:<program>/<key>@<positive-revision>` and `role` is `provides` or
+`consumes`. A capability cannot declare duplicate/conflicting minima for one major. Writes
+resolve the local qualifier for that duplicate check; conflicting historical
+declarations make program coverage incomplete.
+A v1 record's bytes and hash stay unchanged; an omitted field still writes v1,
+while an explicit list (including an empty list withdrawing declarations) writes
+v2. Older readers mark v2 unsupported; they must not accept/revise it as v1. Only
+current accepted capability records count. A provider's pinned interface revision
+must itself carry live acceptance evidence before it can satisfy a consumer.
+
+`iface:<key>@<revision>` means this project; with `/`, the first component is the
+project, using slice 2's existing splitter. Briefs do not introduce cross-project
+I/O. The trace's authorized loader resolves foreign tokens, with identical
+`not-visible` rows/no target reads for missing and inaccessible projects. A host
+caller cannot supply the web service's `--readable` set. The register reports
+coverage alongside `no-provider`, `consumes-retired`, `consumes-deprecated`,
+`provider-behind`, `orphan` and `compatibility-unverified`. A deprecated major
+names its accepted replacement in `replacement` (or null when none is readable); absence flags are not
+asserted when coverage is incomplete. No field grants a role, a read or runtime
+registration. Interface schema verification and `breaking-without-version` evidence
+arrive only with slice 3b.

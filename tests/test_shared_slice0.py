@@ -151,7 +151,9 @@ class GuardTests(unittest.TestCase):
                         rc.check_comment_body(body, 'positional', actor='alice', task='kit-1')
         self.assertTrue(rc.is_record_comment('Kind: capability-entry-v2\n{}'))
         self.assertEqual(rc.record_comment_kind('Kind: capability-entry-v2\n{}'),
-                         ('capability-entry', 2, 'unsupported'))
+                         ('capability-entry', 2, 'supported'))
+        self.assertEqual(rc.record_comment_kind('Kind: capability-entry-v3\n{}'),
+                         ('capability-entry', 3, 'unsupported'))
         self.assertEqual(rc.record_comment_kind('Kind: reference-entry-v1\n{}'),
                          ('reference-entry', 1, 'supported'))
         self.assertEqual(rc.record_comment_kind('Kind: capability-gizmo-v1\n{}'),
@@ -211,7 +213,7 @@ class JournalTests(unittest.TestCase):
         self.destination.mkdir()
         (self.root / 'backups' / 'source').mkdir(parents=True)
         self.bundle = self.root / 'backups' / 'source.coordination.json'
-        patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)})
+        patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -877,7 +879,7 @@ class NoWriterTests(unittest.TestCase):
             project = root / 'projects' / 'source'
             project.mkdir(parents=True)
             (root / 'backups' / 'source').mkdir(parents=True)
-            with patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}), \
+            with patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}), \
                     patch.object(admin, 'run_bd', return_value='synced'):
                 admin.backup_project(root, 'source')
             self.assertFalse(any((project / journal).exists() for journal in JOURNALS))

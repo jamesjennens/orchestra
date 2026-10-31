@@ -3423,7 +3423,7 @@ class JournalBackupCase(unittest.TestCase):
         self.source = self.root / 'projects' / 'source'
         self.source.mkdir(parents=True)
         (self.root / 'backups' / 'source').mkdir(parents=True)
-        self._fake_fcntl = _types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2)
+        self._fake_fcntl = _types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         self._modules = patch.dict(sys.modules, {'fcntl': self._fake_fcntl})
         self._modules.start()
         self.addCleanup(self._modules.stop)

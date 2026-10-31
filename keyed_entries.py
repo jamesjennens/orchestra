@@ -875,6 +875,22 @@ class AnchoredKind:
         If its receipt is lost, an identical native result remains a legacy no-op,
         even for an indistinguishable fresh identity (kittrial-5bb.424 boundary 2).
         """
+        if payload['operation'] == 'retire' and self.noun == 'capability':
+            reviewed = existing.get(payload['revision'])
+            evidence = self.live_acceptances(row, operators)
+            source = evidence.get(payload['revision'])
+            completed = evidence.get(revision)
+            # A native-identical honoured retirement can still be replayed after
+            # its original source acceptor leaves. Current party/delegation checks
+            # below still apply; this cannot create a retirement from a draft.
+            replay = (existing.get(revision) == record and completed is not None
+                      and completed['record_sha256'] == record['sha256']
+                      and completed['acceptance_state'] == 'superseded')
+            if (reviewed is None or reviewed['acceptance_state'] != 'accepted'
+                    or (not replay and (source is None or source['record_sha256'] != reviewed['sha256']
+                                        or source['acceptance_state'] != 'accepted'))):
+                raise ValueError('Capability retirement requires a live accepted revision; accept the draft first')
+            return
         if payload['operation'] != 'accept':
             return
         if prior is not None:
@@ -969,7 +985,8 @@ class AnchoredKind:
             seen['proposer'] = proposer
             seen['draft_authors'] = draft_authors
             seen['record'] = record
-        if party_check is not None and payload.get('operation') == 'accept':
+        if party_check is not None and (payload.get('operation') == 'accept'
+                or (self.noun == 'capability' and payload.get('operation') == 'retire')):
             # The acceptance's decision_id goes with every call: for an agent it must name a
             # live delegation of record acceptance (kittrial-5bb.407, the endpoint's check).
             decision_id = (payload.get('acceptance') or {}).get('decision_id') \

@@ -385,7 +385,7 @@ class JournalTests(unittest.TestCase):
         self.destination.mkdir()
         (self.root / 'backups' / 'source').mkdir(parents=True)
         self.bundle = self.root / 'backups' / 'source.coordination.json'
-        patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)})
+        patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})
         patcher.start()
         self.addCleanup(patcher.stop)
 

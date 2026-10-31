@@ -70,7 +70,7 @@ class AttestDeliveryCase(unittest.TestCase):
         self.configure(operators=[OPERATOR], verifiers=[VERIFIER, W1B, W2B, AUTHOR])
         self.flock = mock.Mock()
         patcher = mock.patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock,
-                                                                              LOCK_EX=2)})
+                                                                              LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})
         patcher.start()
         self.addCleanup(patcher.stop)
         for name in ('ORCHESTRA_OPERATORS', 'ORCHESTRA_VERIFIERS'):

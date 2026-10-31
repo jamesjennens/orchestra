@@ -109,7 +109,7 @@ latency figures are rollout targets, not measurements supplied by this change.
 
 ## Relationship to .457
 
-At the checked main base `eae51cb`, .457's HTTP blocking wait is not integrated.
+At the checked main base `8f84798`, .457's HTTP blocking wait is not integrated.
 This version uses the same bounded-pass approach in `host_notes.Manager.wait`: a
 monotonic deadline, five-second unlocked waits, cancellation and live authorization
 on every pass. The reusable boundary is that pass/deadline/cancellation loop and
