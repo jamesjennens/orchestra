@@ -1122,7 +1122,12 @@ class WebRouteTests(unittest.TestCase):
         # Review of r3, b2: what the documents say, through admin.py itself. An attested row of pp, a backup, and restore-new.
         issue = self.make('Binds: pp\nOwner-only: no')
         made = self.attest(issue, 'pat')['record']
-        (self.root / 'backups').mkdir(exist_ok=True)     # the scratch deployment has never been backed up
+        # The scratch deployment has never been backed up: its destination, as add-project records it (admin.py).
+        (self.root / 'backups').mkdir(exist_ok=True)
+        init = subprocess.run([str(self.runtime.bd_path), '--directory', str(self.project), '--sandbox', 'backup', 'init',
+                               str(self.root / 'backups' / 'pp')], env=fixture.admin.environment(self.root),
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, init.returncode, init.stderr)
         done = self.admin('backup', 'pp')
         self.assertEqual(0, done.returncode, done.stderr)
         same = self.admin('restore-new', 'pp', 'pp')
