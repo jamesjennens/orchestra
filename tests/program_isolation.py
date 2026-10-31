@@ -31,6 +31,7 @@ PERSONAL_READS = (
     ('agent-next', '/v1/agents/me/next'),
     ('agent-wait', '/v1/agents/me/wait'),
     ('agent-wait-coordinator', '/v1/agents/me/wait?form=coordinator'),
+    ('agent-wait-coordinator-comments', '/v1/agents/me/wait?form=coordinator&comments=others'),   # kittrial-5bb.457
 )
 #: Every route handler whose pattern mentions "program", with the read above that covers it.
 PROGRAM_ROUTES = {'program_links_read': 'program-links', 'notes_read': 'notes', 'notes_write': 'notes',

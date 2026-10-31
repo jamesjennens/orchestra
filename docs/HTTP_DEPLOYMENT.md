@@ -24,11 +24,39 @@ names exactly the authorized projects covered.
 
 Send `since=FINGERPRINT` from the previous reply to receive `changed: false` when
 the fact is unchanged, or `true` when it differs. Invalid fingerprints or forms
-are refused. This does not block, sleep, acknowledge any work or schedule a poll:
-the Bridge or caller decides when to read again. The coordinator projection and
+are refused. Without `timeout` this does not block, sleep, acknowledge any work or
+schedule a poll: the Bridge or caller decides when to read again. The coordinator projection and
 its trigger rules are shared with the CLI unchanged. The default worker form
 remains the agent's own work read. The generated `.orchestra/AGENT.md` describes
 both roles and uses the existing secret-safe curl credential file.
+
+### Blocking form and comment wakes (kittrial-5bb.457)
+
+`timeout=SECONDS` (whole seconds, 0..50, default 0 = today's read) holds the request on the
+server until the fingerprint differs from `since`, then answers at once with `changed: true`;
+at the bound it answers `changed: false`. The reply carries `wait`: `blocked`, `timed_out` and
+`seconds`. A read without `since` (a baseline) never blocks. The server re-reads every 5 seconds
+and holds no lock, transaction or backend connection between passes, so writers are never kept
+waiting. Each pass judges the credential and the grant afresh: a revoked credential or a lost
+grant ends the wait with that refusal and nothing further is read. A client that hangs up ends
+the loop at once (the socket is watched while it sleeps). At most 20 waits are held per service
+and one per credential; beyond either the route answers at once with today's read and
+`wait: {blocked: false, reason: busy}`, and the caller waits itself and calls again. Each held
+wait occupies one of the service's 200 connection slots and one request thread, so 20 waiters
+leave 180 slots for everything else.
+
+`comments=others` adds the newest 20 comments by anybody but the caller to the answer and
+folds them into the fingerprint: `comments` lists pointers (`task`, `comment`, `author`, `at`;
+never the text) for every task of the project, unassigned and closed ones included, and for the
+projects the caller coordinates only. "Own" is the caller's actor and its sub-labels; another
+actor of the same person wakes it. Reference, proposal and lane-state record comments are not
+comments anybody wrote to the coordinator. The pointers are read from the same export rows as
+the rest of the wait, never from the paged history. Without the parameter the fingerprint is
+byte-identical to the CLI's. Unsettled notes (kittrial-5bb.447) fold into the fingerprint as
+before, so a note wakes a blocked wait. To read a pointed-at comment use
+`GET /v1/projects/PROJECT/tasks/TASK/history?recent=10` (newest first): the default order of
+`/history` is oldest first, a long comment is several entries and a page holds at most 75
+entries, so reading only its first page misses new comments on a busy task.
 
 ## Guidance and onboarding disclosure
 

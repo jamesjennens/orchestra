@@ -1498,7 +1498,11 @@ def execute(path,actor,action,args,attachments,run,operators=None,verifiers=None
                                     verifiers=verifiers,independent_approval=independent_approval,
                                     owners=owners,provenance_writes=provenance_writes,
                                     identity_names=identity_names,comment_authority=comment_authority)
-                return coordinator_view(queue_payload.get('items') or [],lanes_payload)
+                pointers=None
+                if parsed.comments_others:
+                    from waiting import comment_pointers
+                    pointers=comment_pointers(rows,actor)
+                return coordinator_view(queue_payload.get('items') or [],lanes_payload,pointers)
             queue_payload=queue(rows,actor,['--mine','--limit',str(WORK_LIMIT_MAX)],path/'.handoff-requests',
                                 operators=operators,journal=path,reference_attention=False,
                                 verifiers=verifiers,independent_approval=independent_approval,

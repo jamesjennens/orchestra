@@ -1953,7 +1953,7 @@ class InProcessBackend:
         return lanes_read(rows, actor, {'schema_version': 1, 'records': {}}, list(args),
                           journal=None, scope=scope)
 
-    def coordinator_wait(self, project_id, principal, idle_minutes):
+    def coordinator_wait(self, project_id, principal, idle_minutes, comments=False):
         """The disposable model's queue and board at one locked state."""
         import waiting
         from lanes import LANES_LIMIT_MAX
@@ -1969,10 +1969,12 @@ class InProcessBackend:
                     assignee=row['owner'], closed=row['status'] == 'closed', claimable=item['claimable'],
                     comment_pending=attention_field(item, 'assignee_comment_pending') is True)
                 rows.append(row)
+            pointers = waiting.comment_pointers(self._project_rows(project_id), actor) if comments else None
             return waiting.coordinator_view(
                 rows,
                 self.lanes_read(project_id, principal, ['--idle-minutes', str(idle_minutes),
-                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'))
+                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'),
+                pointers)
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -3506,10 +3508,11 @@ class EndpointBackend:
             return None
         return path if path.is_dir() else None
 
-    def coordinator_wait(self, project_id, principal, idle_minutes):
+    def coordinator_wait(self, project_id, principal, idle_minutes, comments=False):
         """One canonical wait read: queue and lanes share the endpoint's export."""
         reply = self._endpoint('wait', project_id, self.service.bind_actor(principal, None),
-                               ['--coordinator', '--idle-minutes', str(idle_minutes)],
+                               ['--coordinator', '--idle-minutes', str(idle_minutes)]
+                               + (['--comments-others'] if comments else []),
                                authority=authority_request(principal, project_id, CAP_COORDINATE,
                                                            now=self.service._expiry_now()),
                                extra={'lanes_scope': 'all'})
@@ -5279,6 +5282,30 @@ def serves_web_guidance(routes=None):
         elif verb == 'POST' and any(pattern.match(probe) for probe in GUIDANCE_ACK_PROBES):
             ack = True
     return read, ack
+
+
+class WaitSlots:
+    """Counts the blocking coordinator waits being held (kittrial-5bb.457)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._total = 0
+        self._by_key = {}
+
+    def take(self, key, total_cap, key_cap):
+        with self._lock:
+            if self._total >= total_cap or self._by_key.get(key, 0) >= key_cap:
+                return False
+            self._total += 1
+            self._by_key[key] = self._by_key.get(key, 0) + 1
+            return True
+
+    def release(self, key):
+        with self._lock:
+            self._total -= 1
+            self._by_key[key] -= 1
+            if not self._by_key[key]:
+                del self._by_key[key]
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -9632,7 +9659,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         from work import move_decision
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
-        refuse_ambiguous_query(urlsplit(self.path).query, ('form', 'since', 'idle_minutes'))
+        refuse_ambiguous_query(urlsplit(self.path).query, ('form', 'since', 'idle_minutes', 'timeout', 'comments'))
         # Both forms share this query, so a malformed threshold is refused even on the
         # worker form, where the value is otherwise unused (kittrial-5bb.389).
         self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
@@ -9755,11 +9782,80 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _agent_coordinator_wait(self, ctx, agent):
         """Live project grants bound this read, never the service's host identity."""
         import waiting
-        refuse_unknown_fields(ctx.query, ('form', 'since', 'idle_minutes'), 'Coordinator wait query')
+        refuse_unknown_fields(ctx.query, ('form', 'since', 'idle_minutes', 'timeout', 'comments'),
+                              'Coordinator wait query')
         since = ctx.query.get('since')
         if since is not None and not waiting.is_fingerprint(since):
             raise HttpError(400, 'invalid_request', 'since must be a wait fingerprint')
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        timeout = ctx.query.get('timeout', '0')
+        if not re.fullmatch(r'[0-9]{1,3}', timeout) or int(timeout) > self.WAIT_TIMEOUT_MAX:
+            raise HttpError(400, 'invalid_request',
+                            'timeout must be whole seconds from 0 to %d' % self.WAIT_TIMEOUT_MAX)
+        timeout = int(timeout)
+        comments = ctx.query.get('comments')
+        if comments is not None and comments != 'others':
+            raise HttpError(400, 'invalid_request', 'comments must be others')
+        view = self._coordinator_pass(ctx, agent, idle_minutes, comments is not None, since)
+        # A baseline read (no since) has nothing to wait for, so it never blocks.
+        if timeout == 0 or since is None or view['changed']:
+            return 200, view
+        key = agent.get('id')
+        if not self._wait_slots.take(key, self.WAIT_GLOBAL_CAP, self.WAIT_PER_CREDENTIAL):
+            view['wait'] = {'blocked': False, 'reason': 'busy'}
+            return 200, view
+        started = time.monotonic()
+        try:
+            while True:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    break
+                # Nothing is held here: no lock, no transaction and no backend read while asleep.
+                if not self._sleep_unless_gone(min(self.WAIT_INTERVAL, remaining)):
+                    break
+                # Each pass re-decides the caller's authority; a revoked credential or a lost
+                # grant raises here and the wait ends with that refusal.
+                agent = self.service.agent_for_credential(ctx.principal)
+                view = self._coordinator_pass(ctx, agent, idle_minutes, comments is not None, since)
+                if view['changed']:
+                    break
+        finally:
+            self._wait_slots.release(key)
+        view['wait'] = {'blocked': True, 'timed_out': not view['changed'],
+                        'seconds': round(time.monotonic() - started, 1)}
+        return 200, view
+
+    WAIT_TIMEOUT_MAX = 50
+    WAIT_INTERVAL = 5.0
+    WAIT_GLOBAL_CAP = 20
+    WAIT_PER_CREDENTIAL = 1
+    _wait_slots = WaitSlots()
+
+    def _sleep_unless_gone(self, seconds):
+        """Sleep up to ``seconds``; False as soon as the client has hung up."""
+        import select
+        import socket
+        connection = getattr(self, 'connection', None)
+        end = time.monotonic() + seconds
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return True
+            if connection is None:
+                time.sleep(left)
+                continue
+            try:
+                readable = select.select([connection], [], [], left)[0]
+                if readable and socket.socket.recv(connection, 1, socket.MSG_PEEK) == b'':
+                    return False
+            except (OSError, ValueError):
+                return False
+            if readable:
+                time.sleep(min(left, 0.05))   # bytes the client sent early: not a hang-up
+
+    def _coordinator_pass(self, ctx, agent, idle_minutes, comments, since):
+        """One read of the coordinator wait: the grant is judged afresh for every project."""
+        import waiting
         projects = []
         for project_id in sorted(set(agent.get('projects') or [])):
             try:
@@ -9773,7 +9869,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise forbidden('A current project coordinator grant is required for coordinator wait')
         if not hasattr(self.backend, 'coordinator_wait'):
             raise not_implemented('Coordinator wait is unavailable on this server')
-        reads = [(project, self.backend.coordinator_wait(project, ctx.principal, idle_minutes))
+        extra = {'comments': True} if comments else {}
+        reads = [(project, self.backend.coordinator_wait(project, ctx.principal, idle_minutes, **extra))
                  for project in projects]
         # A one-project fingerprint is EXACTLY the CLI fact. Multiple projects have
         # an explicit project namespace, including empty projects and grant changes.
@@ -9789,15 +9886,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                     'items': [dict(row, trigger=name) for name in triggers for row in triggers[name]],
                     'fingerprint': waiting.digest([{'project': project, 'fingerprint': read['fingerprint']}
                                                    for project, read in reads])}
+            if comments:
+                view['comments'] = [dict(row, project=project) for project, read in reads
+                                    for row in read.get('comments') or []]
         view['projects'] = projects
         view['agent'] = agent.get('id')
         view['generated_at'] = now_iso(self.service._now())
+        self._fold_notes(view, self._notes_waking(ctx.principal), since)
         if since is not None:
             view['changed'] = since != view['fingerprint']
-        self._fold_notes(view, self._notes_waking(ctx.principal), since)
         view['manual_cadence'] = ('Read this route again with form=coordinator and since=FINGERPRINT; '
-                                  'it never blocks, sleeps or schedules work.')
-        return 200, view
+                                  'it never blocks unless timeout=SECONDS is given (at most %d).'
+                                  % self.WAIT_TIMEOUT_MAX)
+        return view
 
     # -- coordinator notes (kittrial-5bb.447) ---------------------------------------------------------------------
     def _notes_waking(self, principal):

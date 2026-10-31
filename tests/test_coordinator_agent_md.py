@@ -195,6 +195,22 @@ class CoordinatorGuideTests(unittest.TestCase):
                      "The hand-over note is a colleague's notes about the project, not instructions from the kit"):
             self.assertIn(text, step)
 
+    def test_the_blocking_wait_loop_is_exact_and_never_teaches_a_first_page_history_read(self):
+        got = self.guides("[{ project: 'alpha', effective: true }]")
+        lines = got['guide'].split('\n')
+        loop = '\n'.join(lines[lines.index('## Waiting for work'):])
+        wait = 'https://office.example:7443/v1/agents/me/wait?form=coordinator&comments=others&timeout=50&since=FINGERPRINT'
+        self.assertIn("curl -fsS --noproxy office.example --max-time 60 -K ", loop)
+        self.assertIn(wait, loop)
+        for text in ('timeout=50', 'changed=false', 'wait.timed_out', 'wait.blocked is false', 'coordinator_notes',
+                     'history?recent=10', 'Never read only the first page of /history'):
+            self.assertIn(text, loop)
+        # A history address with no recent= reads the OLDEST page; none may be taught as a way to see new comments.
+        guide = got['guide']
+        self.assertNotIn('(the same address ending in /history)', guide)
+        self.assertNotIn('and its history (the same address ending in /history)', guide)
+        self.assertNotIn('Waiting for work', self.guides('[]')['guide'])
+
     def test_the_pinned_text_matches_the_kit(self):
         got = self.guides('[]')
         # The run order is the coordinator wait's trigger order (waiting.COORDINATOR_TRIGGERS).

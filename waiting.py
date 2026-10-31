@@ -642,7 +642,41 @@ def _fault_fingerprinted(row):
     return {name: row.get(name) for name in ('lane', 'actor', 'task', 'raised_on', 'record', 'since')}
 
 
-def coordinator_view(queue_items, lanes_payload):
+COMMENT_POINTER_LIMIT = 20
+
+
+def comment_pointers(rows, caller):
+    """The newest comments by anybody but ``caller``, as pointers (kittrial-5bb.457).
+
+    Read from the export rows' own ``comments``, never from a paged history: a long comment is
+    several history entries, so a first page can go blind on a busy task. Every task of the
+    project counts, unassigned and closed included. The caller's own actor and its sub-labels
+    (same activity actor) never wake it, and machine records (reference/proposal records and
+    lane-state records) are not comments anybody wrote to it.
+    """
+    from briefing import same_activity_actor
+    from lane_state import is_record as is_lane_state_record
+    from reserved_comments import is_record_comment
+    found = []
+    for row in rows or []:
+        if not isinstance(row, dict) or row.get('issue_type') == 'event':
+            continue
+        for comment in row.get('comments') or []:
+            if not isinstance(comment, dict) or comment.get('id') is None:
+                continue
+            text = comment.get('text')
+            if is_record_comment(text) or is_lane_state_record(text):
+                continue
+            author = comment.get('author') or ''
+            if caller and same_activity_actor(author, caller):
+                continue
+            found.append({'task': str(row.get('id')), 'comment': str(comment['id']),
+                          'author': author, 'at': comment.get('created_at') or ''})
+    found.sort(key=lambda item: (item['at'], item['task'], item['comment']))
+    return found[-COMMENT_POINTER_LIMIT:]
+
+
+def coordinator_view(queue_items, lanes_payload, comment_pointers=None):
     """The coordinator form's answer: the four trigger groups plus a fingerprint.
 
     ``queue_items`` are the canonical ``work`` rows of one read (any review state);
@@ -697,8 +731,16 @@ def coordinator_view(queue_items, lanes_payload):
     fingerprinted = {name: _sorted_rows([_fault_fingerprinted(row) if name == 'needs-investigation'
                                          else _fingerprinted(row) for row in rows])
                      for name, rows in triggers.items() if rows or name not in OPTIONAL_TRIGGERS}
-    return {'schema': WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped,
-            'items': flat, 'fingerprint': digest(fingerprinted)}
+    answer = {'schema': WAIT_SCHEMA, 'form': 'coordinator', 'triggers': grouped, 'items': flat}
+    if comment_pointers is not None:
+        # Opt-in (kittrial-5bb.457): the group joins the fingerprint only when asked for, so a
+        # read without it keeps the fingerprint the CLI has always printed. Pointers carry ids,
+        # never comment text.
+        fingerprinted['comments'] = [{'task': row['task'], 'comment': row['comment']}
+                                     for row in comment_pointers]
+        answer['comments'] = list(comment_pointers)
+    answer['fingerprint'] = digest(fingerprinted)
+    return answer
 
 
 def parse_read_args(args):
@@ -711,8 +753,11 @@ def parse_read_args(args):
     # read the wait already makes can also record an empty wake. An old endpoint that
     # does not know the flag is unaffected: the client sends it only to this kit.
     parser.add_argument('--since')
+    parser.add_argument('--comments-others', action='store_true', dest='comments_others')
     parser.add_argument('--json', action='store_true')  # the output is always JSON
     parsed = parser.parse_args(args)
+    if parsed.comments_others and not parsed.coordinator:
+        raise ValueError('Invalid wait read: --comments-others belongs to --coordinator')
     if not IDLE_MINUTES_MIN <= parsed.idle_minutes <= IDLE_MINUTES_MAX:
         raise ValueError('Invalid wait read: --idle-minutes must be %d..%d'
                          % (IDLE_MINUTES_MIN, IDLE_MINUTES_MAX))
