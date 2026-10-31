@@ -107,7 +107,17 @@ def snapshot(run, project, *, repair=False):
                             (not isinstance(state['holder'], str) or len(state['holder']) > 96))):
         raise SlotError(503, 'The native merge-slot state is invalid; ask an installation operator to inspect it.')
     if not missing:
-        slot_id = Path(project).name + coordination.MERGE_SLOT_SUFFIX
+        # The row bd's own check answered for, not one named after the project folder
+        # (kittrial-5bb.463). bd names the slot from the tracker's issue prefix, and a project
+        # restored under a new name (`admin.py restore-new SOURCE NEW`) keeps the SOURCE's
+        # prefix and its slot `SOURCE-merge-slot`. Naming `NEW-merge-slot` here made every
+        # read of a healthy slot on such a project 503: the merge-slot page, and every
+        # coordinator assign, which reads the slot before it judges the row. An answer
+        # without an id keeps the folder name; an id that is not a slot id is refused.
+        from reserved_comments import is_merge_slot_id
+        slot_id = state.get('id', Path(project).name + coordination.MERGE_SLOT_SUFFIX)
+        if not is_merge_slot_id(slot_id):
+            raise SlotError(503, 'The native merge-slot state is invalid; ask an installation operator to inspect it.')
         try:
             rows = record_json.loads(run(['show', slot_id, '--json']))
             row = rows[0] if isinstance(rows, list) and len(rows) == 1 else rows
