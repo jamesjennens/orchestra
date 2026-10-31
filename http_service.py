@@ -440,11 +440,14 @@ def _pack_history_cursor(cursor, project_id, task_id, recent):
         snap_b64 = base64.urlsafe_b64encode(snap_bytes).decode('ascii').rstrip('=')
         packed = [snap_b64, c['index'], c['offset']]
         scp = c.get('scp')
-        if scp is not None:
+        mcp = bool(c.get('mcp'))
+        if scp is not None or mcp:
             prefix = str(task_id) + '-'
             if isinstance(scp, str) and scp.startswith(prefix):
                 scp = '~' + scp[len(prefix):]
             packed.append(scp)
+            if mcp:
+                packed.append(True)
         return packed
     except Exception:
         return cursor
@@ -454,7 +457,7 @@ def _unpack_history_cursor(packed, project_id, task_id, recent):
     """Restore a canonical ``briefing.history_page`` token from :func:`_pack_history_cursor`."""
     if packed is None or isinstance(packed, str):
         return packed
-    if not isinstance(packed, list) or len(packed) not in (3, 4):
+    if not isinstance(packed, list) or len(packed) not in (3, 4, 5):
         raise conflict('Invalid cursor')
     snap_b64, index, start = packed[0], packed[1], packed[2]
     if not isinstance(snap_b64, str) or type(index) is not int or type(start) is not int:
@@ -469,13 +472,17 @@ def _unpack_history_cursor(packed, project_id, task_id, recent):
              'snapshot': digest, 'since': None, 'index': index, 'offset': start}
         if recent:
             c['order'] = 'newest'
-        if len(packed) == 4 and packed[3] is not None:
+        if len(packed) >= 4 and packed[3] is not None:
             scp = packed[3]
             if not isinstance(scp, str):
                 raise ValueError('bad scp')
             if scp.startswith('~'):
                 scp = str(task_id) + '-' + scp[1:]
             c['scp'] = scp
+        if len(packed) == 5:
+            if packed[4] is not True:
+                raise ValueError('bad mcp')
+            c['mcp'] = True
         return token(c)
     except Exception:
         raise conflict('Invalid cursor') from None
@@ -1648,31 +1655,54 @@ class InProcessBackend:
         raise not_found('Contribution not found')
 
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
-                     recent=False, since_checkpoint=False):
+                     recent=False, since_checkpoint=False, kind=None,
+                     since_my_checkpoint=False, my_actor=None, latest_checkpoint=False,
+                     authority=None):
         """The task's events, oldest first or (``recent``) newest first. This backend has no
         continuation cursor, so only the first page is reachable: the route says so in
         ``truncated`` when more exists (kittrial-5bb.353). ``since_checkpoint`` keeps the
-        events after the newest ``checkpoint-added`` (all of them when there is none)."""
+        events after the newest ``checkpoint-added`` (all of them when there is none);
+        ``since_my_checkpoint`` uses only a checkpoint of ``my_actor`` and
+        ``latest_checkpoint`` answers the checkpoint keys with no entries
+        (kittrial-5bb.244)."""
         self._task(project_id, task_id)
         events = [e for e in self.state.get('events', [])
                   if e.get('project') == project_id and e.get('task') == task_id]
         checkpoint = None
-        if since_checkpoint:
-            marks = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added']
+        if since_checkpoint or since_my_checkpoint or latest_checkpoint:
+            marks = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
+                     and (not since_my_checkpoint or e.get('actor') == my_actor)]
             if marks:
                 checkpoint = events[marks[-1]]
                 events = events[marks[-1] + 1:]
+        selection = {}
+        if since_checkpoint or since_my_checkpoint or latest_checkpoint:
+            if checkpoint:
+                who = ('your newest valid checkpoint: ' if since_my_checkpoint
+                       else 'newest valid checkpoint, by anyone: ')
+                note = who + str(checkpoint.get('time')) + ' by ' + str(checkpoint.get('actor'))
+            elif since_my_checkpoint:
+                note = ('you have no checkpoint of your own on this task, so --since-my-checkpoint returned the '
+                        'whole history with a null baseline; write a checkpoint to make this a delta read.')
+            else:
+                note = None
+            selection = {'since_checkpoint': checkpoint.get('time') if checkpoint else None,
+                         'checkpoint_author': checkpoint.get('actor') if checkpoint else None,
+                         'checkpoint_timestamp': checkpoint.get('time') if checkpoint else None,
+                         'checkpoint_coverage': None, 'unverified_entries': 0,
+                         'checkpoint_note': note}
+        if latest_checkpoint:
+            return dict({'items': [], 'total': 0, 'canonical_cursor': None,
+                         'activity_cursor': None}, **selection)
+        if kind is not None:
+            events = [e for e in events if (e.get('action') == 'comment') == (kind == 'comment')]
         logical = _logical_entries(events)
         if recent:
             logical = logical[::-1]
         selected = [item for group in logical[offset:offset + limit] for item in group]
         result = {'items': selected, 'total': len(logical),
                   'canonical_cursor': None, 'activity_cursor': None}
-        if since_checkpoint:
-            result.update({'since_checkpoint': checkpoint.get('time') if checkpoint else None,
-                           'checkpoint_author': checkpoint.get('actor') if checkpoint else None,
-                           'checkpoint_timestamp': checkpoint.get('time') if checkpoint else None,
-                           'checkpoint_coverage': None, 'unverified_entries': 0})
+        result.update(selection)
         return result
 
     def list_feedback(self, project_id, limit, offset):
@@ -3925,14 +3955,24 @@ class EndpointBackend:
                 return item
         raise not_found('Contribution not found')
 
+    #: The checkpoint keys every checkpoint-relative history answer carries.
+    HISTORY_CHECKPOINT_KEYS = ('since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
+                               'checkpoint_coverage', 'unverified_entries', 'checkpoint_note')
+
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
-                     recent=False, since_checkpoint=False):
+                     recent=False, since_checkpoint=False, kind=None,
+                     since_my_checkpoint=False, my_actor=None, latest_checkpoint=False,
+                     authority=None):
         """Page the canonical snapshot cursor, never asking for more than its limit.
 
         ``recent`` reads the same snapshot newest first (the canonical ``--recent``, whose
         cursor walks toward older entries and keeps a long comment's fragments together in
         body order); ``since_checkpoint`` passes ``--since-checkpoint``, whose boundary the
-        canonical cursor carries (kittrial-5bb.353).
+        canonical cursor carries (kittrial-5bb.353). ``kind`` filters comment/event,
+        ``since_my_checkpoint`` reads from the caller's own newest checkpoint (the
+        canonical ``--since-my-checkpoint`` requires that caller as its actor), and
+        ``latest_checkpoint`` returns the newest checkpoint's keys with no entries
+        (kittrial-5bb.244 G1/G2/G4 and the HTTP read).
 
         The canonical ``history`` action accepts 1..20 entries per call and binds its
         continuation cursor to a snapshot digest. Accumulating exact-size canonical
@@ -3952,13 +3992,29 @@ class EndpointBackend:
         fall at a different character than a whole read does; concatenating the fragments
         in page order reconstructs the body exactly, whatever page size a walk uses.
         """
+        actor = my_actor if since_my_checkpoint and my_actor else self.actor_namespace + '/read'
+        # A caller-account actor is an HTTP-shaped actor, so the canonical endpoint needs
+        # the verified live-authority descriptor that the rest of the HTTP surface sends
+        # for it; the fixed read actor needs none (kittrial-5bb.70).
+        run_options = {'authority': authority, 'require_authority': True} if authority else {}
+        activity = None
+        selection = {}
+        if latest_checkpoint:
+            # One canonical checkpoint-relative read is the only read that returns the
+            # baseline's identity and coverage; discard its one entry (kittrial-5bb.244).
+            reply = self._run('history', project_id, actor,
+                              [str(task_id), '--limit', '1', '--json', '--since-checkpoint'],
+                              **run_options)
+            if isinstance(reply, dict):
+                selection = {key: reply.get(key) for key in self.HISTORY_CHECKPOINT_KEYS}
+                activity = reply.get('activity_cursor')
+            return dict({'items': [], 'total': 0, 'canonical_cursor': None,
+                         'activity_cursor': activity}, **selection)
         needed = limit if canonical else offset + limit
         collected = []
         completed = 0
         cursor = _unpack_history_cursor(canonical, project_id, task_id, recent)
         total = 0
-        activity = None
-        selection = {}
         pages = 0
         while completed < needed and pages < 500:
             pages += 1
@@ -3966,9 +4022,13 @@ class EndpointBackend:
                     str(min(20, needed - completed)), '--json']
             if since_checkpoint:
                 argv.append('--since-checkpoint')
+            if since_my_checkpoint:
+                argv.append('--since-my-checkpoint')
+            if kind is not None:
+                argv += ['--kind', kind]
             if cursor:
                 argv += ['--cursor', cursor]
-            reply = self._run('history', project_id, self.actor_namespace + '/read', argv)
+            reply = self._run('history', project_id, actor, argv, **run_options)
             if isinstance(reply, list):
                 collected.extend(reply)
                 total = len(_logical_entries(reply))
@@ -3977,10 +4037,8 @@ class EndpointBackend:
             entries = reply.get('entries') or []
             if reply.get('activity_cursor'):
                 activity = reply['activity_cursor']
-            if since_checkpoint:
-                selection = {key: reply.get(key) for key in (
-                    'since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
-                    'checkpoint_coverage', 'unverified_entries')}
+            if since_checkpoint or since_my_checkpoint:
+                selection = {key: reply.get(key) for key in self.HISTORY_CHECKPOINT_KEYS}
             collected.extend(entries)
             completed = _logical_entry_count(collected)
             total = reply.get('total_entries', len(_logical_entries(collected)))
@@ -14584,20 +14642,42 @@ class ApiHandler(BaseHTTPRequestHandler):
         query, so it continues only the same direction and selection. ``order`` says
         which direction a page is in, and ``truncated`` is true when entries exist that
         this answer neither returned nor can continue to (a backend that cannot page).
+
+        ``kind=comment|event`` is the client's ``history --kind``. ``since_my_checkpoint=
+        true`` is the client's ``--since-my-checkpoint``: only the caller's own newest
+        valid checkpoint is the baseline (the same CAP_READ gate as the rest of this
+        read). ``latest_checkpoint=true`` answers the newest checkpoint's keys
+        (``since_checkpoint``, ``checkpoint_author``, ``checkpoint_timestamp``,
+        ``checkpoint_coverage``, ``unverified_entries``, ``checkpoint_note``) with no
+        entries, and takes no other selector (kittrial-5bb.244).
         """
         self._project(ctx, CAP_READ)
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        refuse_ambiguous_query(urlsplit(self.path).query,
+                               ('kind', 'since_my_checkpoint', 'latest_checkpoint'))
         scope_id = ctx.params['pid'] + '/' + ctx.params['tid']
-        recent, since_checkpoint = self._history_selection(ctx.query)
-        if recent is not None:
+        selection = self._history_selection(ctx.query)
+        recent = selection['recent']
+        since_checkpoint = selection['since_checkpoint']
+        since_my_checkpoint = selection['since_my_checkpoint']
+        latest_checkpoint = selection['latest_checkpoint']
+        if latest_checkpoint:
+            limit, state = 1, {'o': 0, 'x': None}
+        elif recent is not None:
             limit = recent
             state = read_cursor(ctx.principal, scope_id, ctx.query, ctx.query.get('cursor'),
                                 key=self.service.cursor_key())
         else:
             limit, state = self._page(ctx, ctx.query, project_id=scope_id)
-        result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
-                                           state['o'], canonical=state['x'],
-                                           recent=recent is not None, since_checkpoint=since_checkpoint)
+        authority = (authority_request(ctx.principal, ctx.params['pid'], CAP_READ,
+                                       now=self.service._expiry_now())
+                     if since_my_checkpoint else None)
+        result = self.backend.task_history(
+            ctx.params['pid'], ctx.params['tid'], limit, state['o'], canonical=state['x'],
+            recent=recent is not None, since_checkpoint=since_checkpoint,
+            kind=selection['kind'], since_my_checkpoint=since_my_checkpoint,
+            my_actor=ctx.principal.actor or ctx.principal.user_id,
+            latest_checkpoint=latest_checkpoint, authority=authority)
         who = lambda e: (e.get('user_id') or e.get('author')) if isinstance(e, dict) else None
         # (A canonical entry's author may be structured; ActorNames.get ignores it.)
         names = self._actor_names([who(e) for e in result['items']], ctx.params['pid'])
@@ -14611,7 +14691,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             make_cursor(ctx.principal, scope_id, ctx.query,
                         returned, continuation, key=self.service.cursor_key())
             if continuation else None)
-        body['order'] = 'newest-first' if recent is not None else 'oldest-first'
+        body['order'] = None if latest_checkpoint else ('newest-first' if recent is not None else 'oldest-first')
+        body['kind'] = selection['kind']
         # Entries this answer neither returned nor can continue to: a backend without a
         # continuation cursor (the in-process one) cannot page past its first page, so the
         # answer says so instead of looking complete (kittrial-5bb.353).
@@ -14620,15 +14701,27 @@ class ApiHandler(BaseHTTPRequestHandler):
             body['truncated_note'] = (
                 '%d of %d entries are not in this answer and this server cannot page to them: '
                 'read them with the client\'s history command.' % (result['total'] - returned, result['total']))
-        if since_checkpoint:
-            for key in ('since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
-                        'checkpoint_coverage', 'unverified_entries'):
-                body[key] = result.get(key)
+        # The ten additive history keys are on every answer, as on the CLI: a plain read
+        # carries the checkpoint keys as null/0 rather than omitting them
+        # (kittrial-5bb.244 G3).
+        checkpoint_defaults = {'since_checkpoint': None, 'checkpoint_author': None,
+                               'checkpoint_timestamp': None, 'checkpoint_coverage': None,
+                               'unverified_entries': 0, 'checkpoint_note': None}
+        for key in EndpointBackend.HISTORY_CHECKPOINT_KEYS:
+            body[key] = result.get(key, checkpoint_defaults[key])
+        if latest_checkpoint:
+            body['latest_checkpoint'] = True
         return 200, body
 
     @staticmethod
     def _history_selection(query):
-        """``recent`` (1..MAX_PAGE, or None) and ``since_checkpoint`` (a bool) of a history read."""
+        """The validated selectors of a history read (kittrial-5bb.244).
+
+        ``recent`` is 1..MAX_PAGE (or None); ``since_checkpoint``, ``since_my_checkpoint``
+        and ``latest_checkpoint`` are booleans spelled ``true``/``false`` only; ``kind`` is
+        ``comment`` or ``event`` (or None). ``latest_checkpoint`` is a read of its own and
+        refuses every other selector instead of silently combining them.
+        """
         recent = query.get('recent')
         if recent is not None:
             if 'limit' in query:
@@ -14639,10 +14732,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise invalid('recent must be an integer')
             if not 1 <= recent <= MAX_PAGE:
                 raise invalid('recent must be between 1 and %d' % MAX_PAGE)
-        since = query.get('since_checkpoint', 'false')
-        if since not in ('true', 'false'):
-            raise invalid('since_checkpoint must be true or false')
-        return recent, since == 'true'
+        kind = query.get('kind')
+        if kind is not None and kind not in ('comment', 'event'):
+            raise invalid('kind must be comment or event')
+
+        def flag(name):
+            value = query.get(name, 'false')
+            if value not in ('true', 'false'):
+                raise invalid('%s must be true or false' % name)
+            return value == 'true'
+
+        since = flag('since_checkpoint')
+        since_my = flag('since_my_checkpoint')
+        latest = flag('latest_checkpoint')
+        if latest:
+            conflicts = [name for name in ('recent', 'limit', 'cursor', 'kind') if name in query]
+            if since:
+                conflicts.append('since_checkpoint=true')
+            if since_my:
+                conflicts.append('since_my_checkpoint=true')
+            if conflicts:
+                raise invalid('latest_checkpoint takes no other selector: %s' % ', '.join(conflicts))
+        return {'recent': recent, 'since_checkpoint': since,
+                'since_my_checkpoint': since_my, 'latest_checkpoint': latest, 'kind': kind}
 
     # -- review queue and personal work ---------------------------------------
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/queue')

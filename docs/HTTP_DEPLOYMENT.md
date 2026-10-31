@@ -1977,10 +1977,24 @@ previous page did not return, at any page size).
 - **`since_checkpoint=true`** selects the entries the task's newest valid checkpoint
   did not incorporate (the client's `history --since-checkpoint`), in either order. The
   answer then also names the checkpoint: `since_checkpoint`, `checkpoint_author`,
-  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A legacy
-  record (no per-entry digests) reports `timestamp`: the released timestamp rule selects
-  the entries, so a backdated arrival or an older edit can be missed. A checkpoint by
-  the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
+  `checkpoint_timestamp`, `checkpoint_coverage`, `unverified_entries` and
+  `checkpoint_note`. A legacy record (no per-entry digests) reports `timestamp`: the
+  released timestamp rule selects the entries, so a backdated arrival or an older edit
+  can be missed.
+- **`kind=comment|event`** is the client's `history --kind`, and combines with either
+  direction and with either checkpoint selector.
+- **`since_my_checkpoint=true`** is the client's `--since-my-checkpoint`: the baseline is
+  the caller's own newest valid checkpoint, not the newest one by anyone. It needs the
+  caller's canonical actor, so it runs under the same `CAP_READ` gate and the same
+  refusals as the rest of this read, and the answer's `checkpoint_note` says "your newest
+  valid checkpoint" (or says plainly that the caller has none and the whole history was
+  returned).
+- **`latest_checkpoint=true`** answers the newest checkpoint's keys
+  (`since_checkpoint`, `checkpoint_author`, `checkpoint_timestamp`,
+  `checkpoint_coverage`, `unverified_entries`, `checkpoint_note`) with `items: []`,
+  `total: 0`, `latest_checkpoint: true` and no entries. It takes no other selector;
+  giving `recent`, `limit`, `cursor`, `kind`, `since_checkpoint=true` or
+  `since_my_checkpoint=true` with it is refused.
 - **The cursor** is bound to the caller, the project (and task) and the query, and is
   signed with a per-installation HMAC key (`cursor_key`) kept in the service's state file
   (`http-state.json`, or the `--state` path). When an upgraded installation loads a state
@@ -2000,7 +2014,8 @@ previous page did not return, at any page size).
   compact binding digest and packs the canonical history token without repeating route
   identifiers, staying well under the 512-character `MAX_CURSOR` limit even for the
   longest valid project and task IDs (kittrial-5bb.368).
-- **Every answer** says `order` (`oldest-first` or `newest-first`) and `truncated`.
+- **Every answer** says `order` (`oldest-first` or `newest-first`; `null` for the
+  `latest_checkpoint=true` read, which has no entries) and `truncated`.
   `truncated` is true, with one sentence in `truncated_note`, when entries exist that the
   answer neither returned nor can continue to. That is the in-process backend
   (`--backend inprocess`), which has no continuation cursor, past its first page.
