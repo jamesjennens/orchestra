@@ -1222,9 +1222,9 @@ class InProcessBackend:
             task['version'] += 1
             self._event(project_id, task['id'], 'contribution', principal, record['actor'])
             # The canonical answer's additive `open_items` and `open_items_total` (kittrial-5bb.431,
-            # .435). This backend caps each request at 20 items but not their sum, so more than 20 can be
-            # open: it counts and words the warning from every one, with this task's route, and cuts only
-            # the list.
+            # .435, .436). Like the canonical projection, this backend refuses a request-changes that
+            # would leave more than 20 unresolved blocking items on the task; `open_items_total` is
+            # still counted before slicing to `OPEN_ITEMS_MAX`.
             from review_state import OPEN_ITEMS_MAX, open_items_warnings
             every = [{'request': r['request'], 'item': r['id'], 'contribution': r['contribution']}
                      for r in still_open]
@@ -1244,21 +1244,35 @@ class InProcessBackend:
             raise conflict('A newer contribution arrived; reread the task before reviewing',
                            {'current_contribution': current[-1]['id']})
         actor = payload.get('actor') or principal.actor
+        summary = (payload.get('summary') or '')[:1200]
+        operation_id = payload.get('operation_id')
         items, resolutions = [], []
         if operation == 'request-changes':
-            items = self._review_items(payload.get('items'))
+            items = self._review_items(payload.get('items'), allow_severity=True)
+            if isinstance(operation_id, str) and operation_id:
+                for stored in contributions:
+                    if stored.get('kind') != 'request-changes' or stored.get('operation_id') != operation_id:
+                        continue
+                    if stored.get('actor') == actor and stored.get('contribution_id') == current[-1]['id'] \
+                            and stored.get('summary') == summary and stored.get('items') == items:
+                        return {'review': stored, 'task_version': task['version']}
+                    raise invalid('Operation ID already used with different payload or actor')
+            blocking = [i for i in items if i.get('severity') != 'note'] if items else (
+                [{'id': 'item-1', 'text': summary}] if summary else [])
+            if len(self._requests(contributions, True)) + len(blocking) > 20:
+                raise invalid('At most 20 unresolved review items are allowed')
         elif operation == 'respond':
             # Canonical rule (review_workflow.execute): only the current assignee may
             # respond, and every resolution must name a still-open request item.
             if not task.get('assignee') or actor != task['assignee']:
                 raise forbidden('Only the task assignee may respond to requested changes')
             resolutions = self._resolutions(payload.get('resolutions'),
-                                            self._requests(contributions, True))
+                                            [r for r in self._requests(contributions) if r['status'] == 'open'])
         elif operation == 'approve' and self._requests(contributions, True):
             raise conflict('Cannot approve while requested changes remain unresolved')
         record = {'id': 'rev_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': operation,
                   'contribution_id': current[-1]['id'],
-                  'summary': (payload.get('summary') or '')[:1200],
+                  'summary': summary,
                   'items': items,
                   'actor': actor,
                   'created_at': now_iso(self.service._now())}
@@ -1268,6 +1282,8 @@ class InProcessBackend:
             # rule (a later revision resolves them), so older disposable state reads
             # the same as before.
             record['needs_respond'] = True
+            if isinstance(operation_id, str) and operation_id:
+                record['operation_id'] = operation_id
         if operation == 'respond':
             record['resolutions'] = resolutions
         contributions.append(record)
@@ -1412,6 +1428,8 @@ class InProcessBackend:
                 entry = {'id': item['id'], 'request': record['id'], 'text': item['text'],
                          'contribution': record['contribution_id'], 'author': record['actor'],
                          'at': record['created_at'], 'status': 'open', 'resolution': None}
+                if item.get('severity') == 'note':
+                    entry['severity'] = 'note'
                 answer = resolved.get((record['id'], item['id']))
                 if answer is not None:
                     entry.update(status='resolved', resolution=answer['reason'],
@@ -1421,7 +1439,7 @@ class InProcessBackend:
                     entry.update(status='resolved', resolution='Addressed in revision %d'
                                  % (contributions.index(later[0]) + 1))
                 found.append(entry)
-        return [r for r in found if r['status'] == 'open'] if open_only else found
+        return [r for r in found if r['status'] == 'open' and r.get('severity') != 'note'] if open_only else found
 
     @staticmethod
     def _resolutions(raw, open_requests):
@@ -1453,7 +1471,7 @@ class InProcessBackend:
         return clean
 
     @staticmethod
-    def _review_items(raw):
+    def _review_items(raw, allow_severity=False):
         """Normalize requested-change items: plain strings or canonical ``{id, text}``."""
         if raw is None:
             return []
@@ -1467,7 +1485,13 @@ class InProcessBackend:
                     not item['text'].strip() or len(item['text']) > 1000 or \
                     not isinstance(item.get('id'), str) or not SAFE_ID.fullmatch(item['id']):
                 raise invalid('Each review item needs an id and 1-1000 characters of text')
-            items.append({'id': item['id'], 'text': item['text'].strip()})
+            entry = {'id': item['id'], 'text': item['text'].strip()}
+            if allow_severity and item.get('severity') is not None:
+                if item.get('severity') not in ('blocking', 'note'):
+                    raise invalid('Review item severity must be blocking or note')
+                if item['severity'] == 'note':
+                    entry['severity'] = 'note'
+            items.append(entry)
         return items
 
     def _feedback_add(self, principal, project_id, payload):
@@ -1709,7 +1733,7 @@ class InProcessBackend:
                 'recommendation_keys': [{'author': record['actor'], 'operation_id': record.get('operation_id')}
                                         for record in records_standing],
                 'requests': requests,
-                'open_requests': sum(1 for r in requests if r['status'] == 'open'),
+                'open_requests': sum(1 for r in requests if r['status'] == 'open' and r.get('severity') != 'note'),
                 'latest_id': records[-1]['id'] if records else None,
                 'latest_at': records[-1]['created_at'] if records else None,
                 'revisions': len(contributions)}
@@ -14194,6 +14218,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
                         and refusal.detail.startswith('ValueError: '):
                     raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
+                if refusal.status == 422 and refusal.detail == 'ValueError: At most 20 unresolved review items are allowed':
+                    raise invalid('At most 20 unresolved review items are allowed', refusal.detail) from None
                 # So does a refused follow-on base (kittrial-5bb.158): the sentence says which
                 # base is acceptable, why this one is not and what an operator does about it.
                 sentence = EndpointBackend.base_refusal(refusal.detail) if refusal.status == 422 else None
