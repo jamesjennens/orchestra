@@ -346,8 +346,8 @@ export async function list(ctx) {
     accountError ? h('p', { class: 'banner', role: 'status' }, 'Could not load other accounts. Reload this page to choose another account; your draft stays here until creation succeeds.') : null,
     h('div', { class: 'form-row' },
       field({ id: 'a-name', label: 'Agent name', hint: 'How colleagues will see it, e.g. “Kestrel”.', required: true, maxlength: 40 }),
-      field({ id: 'a-tool', label: 'Runs in', value: 'GitHub Copilot in VS Code' })),
-    field({ id: 'a-dir', label: 'Folder on your computer', placeholder: 'C:\\Users\\you\\agents\\kestrel', hint: 'The folder you open in VS Code to run this agent. Its setup file goes here. Only you and administrators can see it.' }),
+      field({ id: 'a-tool', label: 'Runs in', placeholder: 'GitHub Copilot in VS Code', hint: 'Optional. Only a label, for example GitHub Copilot in VS Code, Claude Code, Codex, or a Linux command-line agent. It does not choose how the agent runs.' })),
+    field({ id: 'a-dir', label: 'Folder on your computer', placeholder: 'C:\\Users\\you\\agents\\kestrel', hint: 'The folder this agent works in (any agent’s folder; for VS Code, the folder you open). Its setup file goes here. Only you and administrators can see it.' }),
     h('fieldset', { class: 'checks' }, h('legend', null, 'Projects it can work on'),
       projects.length ? projects.map((p) => h('label', { class: 'check', for: 'ap-' + p.id }, h('input', { type: 'checkbox', id: 'ap-' + p.id, name: 'project', value: p.id }), p.name)) :
         h('p', { class: 'small muted' }, 'You need contributor access to a project first.'),
