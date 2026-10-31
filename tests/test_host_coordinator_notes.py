@@ -310,6 +310,21 @@ greeting=json.loads(f.readline());f.write((json.dumps({'request':json.loads(sys.
         self.assertEqual(503,e.exception.status);self.assertNotIn(secret,str(e.exception))
         self.assertNotEqual(first['id'],other['id'])
 
+    def test_a_damaged_noted_replay_cannot_substitute_another_settled_note(self):
+        first = self.send_host()['note']
+        second = self.send_host(key='second')['note']
+        for note, request in ((first, 'noted-first'), (second, 'noted-second')):
+            self.host(['noted', note['id'], '--request-id', request], project='north')
+        replay = ['noted', first['id'], '--request-id', 'noted-first']
+        self.assertEqual(first['id'], self.host(replay, project='north')['note']['id'])
+        key = hashlib.sha256(hn.encoded(['lane:north', 'north', 'noted-first'])).hexdigest()
+        self.service.state['host_note_requests'][key]['note'] = second['id']
+        self.service.store.save()
+        with self.assertRaises(hn.Refusal) as e:
+            self.host(replay, project='north')
+        self.assertEqual(503, e.exception.status)
+        self.assertEqual(2, len(self.service._notes()))
+
     def test_a_role_lost_during_a_web_fetch_returns_no_text_or_receipt(self):
         self.send_host()
         real=self.service.notes_for

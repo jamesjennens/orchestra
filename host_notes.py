@@ -451,7 +451,8 @@ class Manager:
             note = next((n for n in self.service._notes() if n['id'] == old['note']), None)
             if note is None: raise Refusal(410, 'Request was already handled; its note is no longer retained')
             if op == 'noted':
-                matches = note['to']['project'] == project and note.get('settled') is not None
+                matches = (note['id'] == p['note'] and note['to']['project'] == project
+                           and note.get('settled') is not None)
             else:
                 matches = (note['from']['project'] == project and note['to']['project'] == p['to']
                            and note['text'] == p['text'] and note.get('reply_to') == p['note'])
