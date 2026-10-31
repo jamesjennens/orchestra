@@ -306,6 +306,9 @@ class Slice5PageTests(unittest.TestCase):
         self.assertIn('1 need you', seen['workFull']['text'])
         self.assertEqual(1, seen['workFull']['agentSections'])
         self.assertEqual(['No revisions requested.'], seen['workFull']['empty'])
+        for view in ('workFull', 'workEmpty'):
+            self.assertIn('Only work you may approve is listed; own-party contributions are left out in every review state.',
+                          seen[view]['text'])
         self.assertEqual(['No revisions requested.', 'Nothing to review.', 'Nothing assigned.'],
                          seen['workEmpty']['empty'])
 
