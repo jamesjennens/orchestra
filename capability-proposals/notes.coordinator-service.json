@@ -3,7 +3,6 @@
   "operation_id": "kittrial-5bb.458-notes-coordinator-service-r1",
   "key": "notes.coordinator-service",
   "revision": 1,
-  "expected_sha256": null,
   "name": "Coordinator notes on the web service",
   "aliases": [
     "coordinator notes wait",
