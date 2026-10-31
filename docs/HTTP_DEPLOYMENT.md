@@ -38,8 +38,8 @@ at the bound it answers `changed: false`. The bound is soft: it counts from the 
 read (not from authentication or admission, which come before it), and the server only starts a
 pass when the slowest pass so far still fits in the time left, but it cannot interrupt a read
 that is running. A read that is slower than every earlier one, or a loaded backend, can
-therefore make the request last longer than `timeout`; `wait.seconds` reports how long the
-request really held. The reply carries `wait`: `blocked`, `timed_out` and `seconds`. A read
+therefore make the request last longer than `timeout` (no new pass starts after the bound, but
+the last read can run past it); `wait.seconds` reports how long the request really held. The reply carries `wait`: `blocked`, `timed_out` and `seconds`. A read
 without `since` (a baseline) never blocks. The server re-reads every 5 seconds, or every four
 times the cost of a read when that is longer, so a slow backend is read less often, never more.
 It holds no lock, transaction or backend connection between passes, so writers are never kept

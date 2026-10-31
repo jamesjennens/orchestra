@@ -287,6 +287,8 @@ class BlockingWaitTests(grants.Grants):
         docs = (root / 'docs' / 'HTTP_DEPLOYMENT.md').read_text(encoding='utf-8')
         page = (root / 'web' / 'js' / 'agentSetup.js').read_text(encoding='utf-8')
         self.assertIn('The bound is soft', docs)
+        self.assertIn('no new pass starts after the bound', docs)
+        self.assertIn('not from authentication or admission', ' '.join(docs.split()))
         self.assertNotIn('holds for up to 50 seconds', page)
         self.assertIn('a loaded server can take longer', page)
 
