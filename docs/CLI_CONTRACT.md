@@ -1646,10 +1646,12 @@ sets `operation`.
     state. Since kittrial-5bb.449 the index takes qualified `design:` tokens, and `req:/x`, `req:A/` and
     `req:A/@3` (an empty project or key) are prose, so a document accepted before that holds either reads
     `differs` until it is accepted again. Anything that is not a readable repo-document revision answers `Design not found`.
-  - `trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N]` (kittrial-5bb.453)
+  - `trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N] [--interfaces-offset N]` (kittrial-5bb.453)
     is the program view of a program project, the endpoint action `program` (PROGRAM_DESIGN.md §5): `areas`
     (link state; for a readable area `open_tasks`, `lanes` and `rows_read`; otherwise `visible: false` and "not
-    visible to you"), `interfaces` (`not-available` until slice 3), `requirements` (`no-area-cites`,
+    visible to you"), `interfaces` (kittrial-5bb.467: the register's entries by key, 50 a page, `--interfaces-offset N`, each
+    with its state, revision, flags and its providers and consumers from the READABLE areas only; no count of the
+    areas left out, and the flags that need every area are withheld when one was not read), `requirements` (`no-area-cites`,
     `cites-superseded-revision`, 50 rows a page), `decisions` (kittrial-5bb.454: each program decision with a
     `Binds:` line, its `attestation_id`, its flags (`closed`, `not-attested`, `attestation-stale`, `attester-not-authorised`, or why it does
     not count), and per bound area `adopted`, `not-adopted`, `adoption-invalid` with the reason, `adoption-stale`, what an adoption reads

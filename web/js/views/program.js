@@ -82,6 +82,29 @@ export function suggestionsTable(suggestions) {
       h('td', null, s.title || ''), h('td', null, s.from || ''), h('td', null, s.created_at || '')))));
 }
 
+// kittrial-5bb.467: the register, as text. Providers and consumers are the readable areas only (the server's scope
+// sentence says so); every cell is a text node, so a name or meaning with markup or bidi controls shows as written.
+const roles = (list) => (list || []).map((u) => `${u.area}@${u.minimum}`).join(', ');
+
+export function interfacesTable(interfaces) {
+  const part = interfaces || {};
+  if (part.state !== 'ok') {
+    return h('p', { class: 'muted', 'data-state': part.state || '' }, part.note || '');
+  }
+  const items = part.items || [];
+  const rows = items.map((row) => h('tr', { 'data-interface': row.key },
+    h('td', null, row.key), h('td', null, row.name || ''), h('td', null, `${row.lifecycle || ''} r${row.revision}`),
+    h('td', null, roles(row.providers)), h('td', null, roles(row.consumers)),
+    h('td', null, (row.flags || []).join(', '))));
+  return h('div', { class: 'stack' },
+    h('p', { class: 'small muted', 'data-scope': 'interfaces' }, part.scope || ''),
+    items.length ? h('table', { class: 'table', 'data-table': 'interfaces' },
+      h('thead', null, h('tr', null, ...['Interface', 'Name', 'State', 'Provided by', 'Consumed by', 'Flags']
+        .map((label) => h('th', null, label)))),
+      h('tbody', null, ...rows))
+      : h('p', { class: 'muted', 'data-empty': 'interfaces' }, 'The register holds no interface.'));
+}
+
 function section(name, title, body) {
   return h('section', { class: 'panel', 'data-panel': name },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, title)),
@@ -89,11 +112,10 @@ function section(name, title, body) {
 }
 
 export function view(read) {
-  const note = (part) => h('p', { class: 'muted', 'data-state': part && part.state }, (part && part.note) || '');
   return [
     h('p', { class: 'coverage', 'data-coverage': '' }, (read.coverage && read.coverage.text) || ''),
     section('areas', 'Areas', areasTable(read.areas)),
-    section('interfaces', 'Interfaces', note(read.interfaces)),
+    section('interfaces', 'Interfaces', interfacesTable(read.interfaces)),
     section('requirements', 'Program requirements', requirementsTable(read.requirements)),
     section('decisions', 'Decisions', decisionsTable(read.decisions)),
     section('suggestions', 'Suggestions', suggestionsTable(read.suggestions)),
@@ -105,15 +127,18 @@ export async function page(ctx, { pid }) {
   const head = () => pageHead({
     crumbs: [{ label: 'Projects', href: ctx.href('/projects') }, { label: pid, href: ctx.href('/p/' + pid) }, { label: 'Program' }],
     title: 'Program', lede: 'The areas linked with this program, read under your own permissions. A link grants nothing.' });
-  async function draw(cursor) {
+  async function draw(cursor, interfacesOffset) {
     let read;
-    try { read = await ctx.api.programView(pid, cursor); } catch (error) {
-      host.replaceChildren(head(), errorState(error, () => draw(cursor)));
+    try { read = await ctx.api.programView(pid, cursor, interfacesOffset); } catch (error) {
+      host.replaceChildren(head(), errorState(error, () => draw(cursor, interfacesOffset)));
       return;
     }
     const next = read.areas && read.areas.next_cursor;
+    const moreInterfaces = read.interfaces && read.interfaces.next_offset;
     host.replaceChildren(head(), ...view(read),
-      next ? h('div', { class: 'toolbar' }, h('button', { type: 'button', onclick: () => draw(next) }, 'Next areas')) : null);
+      next || moreInterfaces ? h('div', { class: 'toolbar' },
+        next ? h('button', { type: 'button', onclick: () => draw(next, interfacesOffset) }, 'Next areas') : null,
+        moreInterfaces ? h('button', { type: 'button', onclick: () => draw(cursor, moreInterfaces) }, 'Next interfaces') : null) : null);
   }
   await draw(null);
   return host;

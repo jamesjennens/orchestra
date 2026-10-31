@@ -1366,6 +1366,27 @@ def trace_answer(root,path,name,args,actor,authority_config=None,key_projects=No
                              journal_of=journal_of)
     return result,''.join(run_warnings)
 
+def interface_section(name,operators,readable,state,read_rows_of,rows,offset):
+    """The program view's interfaces section (kittrial-5bb.467): the register entries of ``interface list`` and the
+    usage the ProgramContext reads, where ``readable`` (None: any project, an operator's unbound key) is the only gate
+    on an area, checked before it is read. An area outside it reads None, so the coverage is incomplete and the flags
+    that need every area are withheld."""
+    import interface_records
+    import program_view
+    def allowed(other):
+        return readable is None or other in readable or other==name
+    held=state or {}
+    context=interface_records.ProgramContext(name,read_rows_of,operators=operators,authority_state=held,
+        memberships=held.get('memberships'),users=held.get('users'),may_read=allowed)
+    entries,incomplete=interface_records.catalog(rows,operators)
+    views=[interface_records.view(entry,entries) for entry in entries]
+    usage,coverage=context.usage()
+    complete=bool(coverage['complete']) and not incomplete and all(
+        entry['state'] not in ('malformed','unsupported','conflicted') for entry in entries)
+    return program_view.interfaces_section(
+        views,usage,complete,lambda record:interface_records.flags(record,usage,complete),offset)
+
+
 def program_answer(root,path,name,args,actor,authority_config=None,key_projects=None,by_service=False,project_path=None,
                    now=None):
     """(answer, warnings) of one page of the program view (kittrial-5bb.453; PROGRAM_DESIGN.md section 5).
@@ -1463,6 +1484,14 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
         pins.extend(pinned)
     requirements=program_view.requirements_section(ContextPointers(rows,name,operators,governance=governance),
                                                    cited,pins,options['requirements_offset'])
+    # kittrial-5bb.467: the register, through the same context the `interface` read uses, gated by this read's
+    # readable set. Its areas' rows are the ones read above when they were, so the page is one snapshot.
+    def interface_rows(other):
+        if other==name:return rows
+        if other in read_rows:return read_rows[other]
+        loaded=read_area(other)
+        return None if loaded is None else loaded[1]
+    interfaces=interface_section(name,operators,readable,state,interface_rows,rows,options['interfaces_offset'])
     import program_decisions
     states={area:('in' if area in on_page and (facts is None or area in facts) else 'not-checked')
             for area,side in sides.items() if side=='in'}
@@ -1470,7 +1499,7 @@ def program_answer(root,path,name,args,actor,authority_config=None,key_projects=
                                                   options['decisions_offset'],journals)
     suggestions=program_decisions.suggestions_section(rows,options['suggestions_offset'])
     result=program_view.answer(name,areas,len(entries),options['offset'],options['limit'],requirements,decisions,
-                               suggestions)
+                               suggestions,interfaces)
     result['is_program']=program_view.accepted_area(reference_records.links(rows,operators).get('items'),name,
                                               memberships,users)
     if not by_service:
@@ -3594,7 +3623,7 @@ CONTRIBUTOR_COMMANDS = (
      'the trace read, answered by the server: summary, requirements, tasks, tokens, decisions, designs, round'),
     ('trace --verify [--repo DIR] [--record | --payloads FILE]',
      "check each accepted design document against git at its pinned commit (verified, design-drift)"),
-    ('trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N]',
+    ('trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N] [--interfaces-offset N]',
      "the program view of a program project: its areas, interfaces and requirements' coverage"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),

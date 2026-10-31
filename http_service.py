@@ -1504,7 +1504,7 @@ class InProcessBackend:
                 'coverage': 'the in-process backend holds no native reference records'}
 
     def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(),
-                decisions_offset=0, suggestions_offset=0):
+                decisions_offset=0, suggestions_offset=0, interfaces_offset=0):
         """kittrial-5bb.453: the program view from this backend's own link reads. It holds no native rows (a test may
         give some in ``native_rows``, {project: rows}), so a readable area has no open task and no lane, and the
         program no requirement; the rules are the endpoint's (program_view, program_decisions), over the same link
@@ -3484,12 +3484,12 @@ class EndpointBackend:
         return payload
 
     def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(),
-                decisions_offset=0, suggestions_offset=0):
+                decisions_offset=0, suggestions_offset=0, interfaces_offset=0):
         """kittrial-5bb.453: one page of the program view through the endpoint's read-only `program` action, with the
         caller's readable projects as the service's own --readable arguments (the .449 rule)."""
         args = ['--offset', str(offset), '--limit', str(limit), '--idle-minutes', str(idle_minutes),
                 '--requirements-offset', str(requirements_offset), '--decisions-offset', str(decisions_offset),
-                '--suggestions-offset', str(suggestions_offset)]
+                '--suggestions-offset', str(suggestions_offset), '--interfaces-offset', str(interfaces_offset)]
         args += ['--readable'] + [arg for project in sorted(readable) for arg in ('--readable', project)][1:] \
             if readable else ['--readable']
         reply = self._endpoint('program', project_id, self.actor_namespace + '/read', args)
@@ -12607,7 +12607,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                                    self.REF_RETIRE_FIELDS, 'A reference retirement',
                                    coordinator=True, key_param=True, status=200)
 
-    PROGRAM_QUERY = ('cursor', 'limit', 'idle_minutes', 'requirements_offset', 'decisions_offset', 'suggestions_offset')
+    PROGRAM_QUERY = ('cursor', 'limit', 'idle_minutes', 'requirements_offset', 'decisions_offset', 'suggestions_offset',
+                     'interfaces_offset')
     #: Reads of one page when rights change under it (review of .453, B2): each re-read leaves out the areas lost.
     PROGRAM_READS_MAX = 3
 
@@ -12641,7 +12642,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise invalid('limit must be between 1 and %d' % program_view.AREAS_MAX)
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
         offsets = {}
-        for name in ('requirements_offset', 'decisions_offset', 'suggestions_offset'):
+        for name in ('requirements_offset', 'decisions_offset', 'suggestions_offset', 'interfaces_offset'):
             value = ctx.query.get(name, '0')
             if not isinstance(value, str) or not value.isdigit() or len(value) > 6:
                 raise invalid('%s must be a whole number from 0 to 999999' % name)
@@ -12652,7 +12653,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         for attempt in range(self.PROGRAM_READS_MAX):
             result = dict(reader(pid, state['o'], limit, idle_minutes, int(raw), readable=readable,
                                  decisions_offset=offsets['decisions_offset'],
-                                 suggestions_offset=offsets['suggestions_offset']))
+                                 suggestions_offset=offsets['suggestions_offset'],
+                                 interfaces_offset=offsets['interfaces_offset']))
             lost = []
             for row in (result.get('areas') or {}).get('items') or []:
                 if not isinstance(row, dict) or not row.get('visible'):
@@ -12672,6 +12674,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         else:
             # Rights kept changing on every read: the rows are hidden, and no requirement row is shown at all.
             result['requirements'] = program_view.unsettled()
+            if (result.get('interfaces') or {}).get('state') == 'ok':
+                result['interfaces'] = program_view.interfaces_unsettled()
         result['coverage'] = program_view.coverage(result['areas']['items'], result['areas']['total'], state['o'],
                                                    result['requirements'])
         self.service.set_program_flag(pid, bool(result.pop('is_program', False)))

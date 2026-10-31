@@ -130,6 +130,39 @@ def assert_adoptions_hidden(test, request, program, area, missing, callers):
                 test.assertEqual(areas.get(area), areas.get(missing), (label, decision['id']))
 
 
+#: What an interfaces section may carry (kittrial-5bb.467). A count of the areas left out is not among them: with one
+#: other area a count would name it.
+INTERFACES_KEYS = {'state', 'items', 'total', 'next_offset', 'complete', 'scope', 'note'}
+INTERFACE_ROW_KEYS = {'key', 'name', 'lifecycle', 'revision', 'replacement', 'flags', 'providers', 'consumers'}
+
+
+def assert_interfaces_section_hidden(test, section, hidden, label=''):
+    """The interfaces section a caller got names none of ``hidden`` (areas it may not read, or that do not exist) as a
+    provider or consumer, carries no count of areas left out, and shows no flag that needs every area when it says it
+    is not complete."""
+    test.assertLessEqual(set(section), INTERFACES_KEYS, label)
+    for row in section.get('items') or []:
+        test.assertEqual(INTERFACE_ROW_KEYS, set(row), label)
+        for side in ('providers', 'consumers'):
+            for use in row[side]:
+                test.assertNotIn(use['area'], hidden, (label, row['key']))
+        if not section.get('complete'):
+            test.assertFalse({'orphan', 'no-provider', 'provider-behind'} & set(row['flags']), (label, row['key']))
+
+
+def assert_interfaces_hidden(test, request, program, hidden, callers):
+    """kittrial-5bb.467: for each ``{label: token}`` that may read ``program``, its interfaces section passes
+    ``assert_interfaces_section_hidden`` for ``hidden`` (the areas it may not read and a missing one), on every page."""
+    for label, token in callers.items():
+        offset = 0
+        while offset is not None:
+            answer = request('GET', '/v1/projects/%s/program?interfaces_offset=%d' % (program, offset), token=token)
+            test.assertEqual(200, answer.status, (label, answer.data))
+            section = answer.data['interfaces']
+            assert_interfaces_section_hidden(test, section, hidden, label)
+            offset = section.get('next_offset')
+
+
 def assert_text_hidden(test, request, text, callers, projects):
     """``text`` appears in no answer any of ``callers`` ({label: token}) gets from every area read of each of
     ``projects`` and every personal read: a note's text is for the coordinators of its two projects only."""

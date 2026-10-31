@@ -877,6 +877,52 @@ class InterfaceCase(unittest.TestCase):
             self.assertTrue(visible['program_coverage']['complete']);self.assertEqual(1,calls.count('area'))
             self.assertIn('no-provider',visible['items'][0]['flags'])
 
+    @unittest.skipIf(__import__('os').name=='nt','endpoint is POSIX-only')
+    def test_the_program_view_section_gates_areas_like_the_interface_read(self):
+        # kittrial-5bb.467: the same ProgramContext, the readable set is the only gate on an area.
+        import endpoint
+        import program_isolation
+        self.apply(payload());self.accept()
+        self.area.actor=OPERATOR
+        cap=cap_entry(operation='draft',operation_id='view-consumer',interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(cap,OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        calls=[]
+        def read(other):
+            calls.append(other);return self.projects.get(other)
+        def section(readable,rows=None):
+            del calls[:]
+            return endpoint.interface_section('prog',[OPERATOR],readable,{},read,self.native.rows if rows is None else rows,0)
+        whole=section({'prog','area'})
+        self.assertEqual(('ok',True,1),(whole['state'],whole['complete'],whole['total']))
+        row=whole['items'][0]
+        self.assertEqual(('iface.quotes.v1','accepted',2),(row['key'],row['lifecycle'],row['revision']))
+        self.assertEqual([{'area':'area','minimum':2}],row['consumers'])
+        self.assertIn('no-provider',row['flags'])
+        cut=section({'prog'})
+        self.assertNotIn('area',calls)                       # an area outside the readable set is never read
+        self.assertFalse(cut['complete'])
+        self.assertEqual([],cut['items'][0]['consumers'])
+        for flag in ('orphan','no-provider','provider-behind'):
+            self.assertNotIn(flag,cut['items'][0]['flags'])
+        program_isolation.assert_interfaces_section_hidden(self,cut,{'area'},'unreadable')
+        self.assertNotIn('"area": "area"',json.dumps(cut))
+        # An unreadable area and a missing one give the same section.
+        self.projects['area']=None
+        self.assertEqual(cut,section({'prog','area'}))
+        # No gate at all: an operator's unbound key reads every area.
+        self.projects['area']=self.area.rows
+        self.assertEqual(whole,section(None))
+
+    @unittest.skipIf(__import__('os').name=='nt','endpoint is POSIX-only')
+    def test_the_program_view_section_shows_a_draft_and_nothing_for_an_unreadable_entry(self):
+        import endpoint
+        self.apply(payload(state='draft'))
+        read=lambda other:self.projects.get(other)
+        shown=endpoint.interface_section('prog',[OPERATOR],{'prog','area'},{},read,self.native.rows,0)
+        self.assertEqual([('iface.quotes.v1','draft',['compatibility-unverified'])],
+                         [(row['key'],row['lifecycle'],row['flags']) for row in shown['items']])
+
     def test_frozen_graph_rechecks_cached_read_gate_without_backend_io_under_authority(self):
         self.apply(payload());self.accept();record=self.entry()['record'];calls=[];authority=[False]
         def read(project):
