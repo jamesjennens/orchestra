@@ -9807,9 +9807,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             view['wait'] = {'blocked': False, 'reason': 'busy'}
             return 200, view
         try:
-            # The timeout bounds the whole request: it counts from before the first read, and a
-            # pass is only started when the slowest pass so far still fits in what is left. A pass
-            # that runs slower than every earlier one can still overrun; nothing interrupts a read.
+            # A soft bound, not a hard one: the deadline counts from before the first read (not from
+            # authentication or admission), and a pass only starts when the slowest pass so far
+            # still fits in what is left. A pass slower than every earlier one, or a loaded
+            # backend, can overrun it because nothing interrupts a read. wait.seconds says so.
             deadline = began + timeout
             pause = self._wait_pause(deadline, cost)
             while pause > 0:

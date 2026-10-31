@@ -583,7 +583,7 @@ function coordinatorSection(payload, file, { hasCertificate = false } = {}) {
 }
 
 //: The coordinator's blocking wait for an agent without the CLI (kittrial-5bb.457). Each reply is one
-//: bounded request (at most 50 seconds on the server, inside curl's own limit); it wakes on another
+//: bounded request (about 50 seconds on the server, a soft bound: a loaded server can take longer, so curl's own limit must leave room); it wakes on another
 //: actor's comment on any task of a project you coordinate, on a new note, and on every trigger of the
 //: coordinator wait, never on your own writes.
 export function coordinatorWaitLoop(server, file) {
@@ -596,7 +596,7 @@ export function coordinatorWaitLoop(server, file) {
     '2. Then repeat, with FINGERPRINT from the last reply:',
     `- Windows (PowerShell): curl.exe -fsS ${flags} -K "${file.powershell}" ${psQuote(url(true))}`,
     `- macOS/Linux: curl -fsS ${flags} -K ${file.posix} ${shQuote(url(true))}`,
-    '3. Each call holds for up to 50 seconds. changed=false (wait.timed_out=true) means nothing happened: keep the same FINGERPRINT and call again at once. changed=true means act: handle the triggers, every entry of comments (a pointer: task, comment id, author and time, never the text) and every entry of coordinator_notes, then take the new fingerprint from that reply and call again.',
+    '3. Each call holds for about 50 seconds (a loaded server can take longer: read wait.seconds, do not rely on the limit). changed=false (wait.timed_out=true) means nothing happened: keep the same FINGERPRINT and call again at once. changed=true means act: handle the triggers, every entry of comments (a pointer: task, comment id, author and time, never the text) and every entry of coordinator_notes, then take the new fingerprint from that reply and call again.',
     '4. Read the comment a pointer names with GET .../tasks/TASK/history?recent=10 (newest first). Never read only the first page of /history: it is the oldest entries and goes blind on a busy task.',
     '5. Your own comments and your own other writes never wake you. If wait.blocked is false (reason busy) the server is holding its limit of waiters: wait about 30 seconds yourself, then call again. A 403 means your grant has ended: stop and tell your owner.',
   ];

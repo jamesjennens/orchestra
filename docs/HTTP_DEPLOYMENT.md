@@ -34,9 +34,15 @@ both roles and uses the existing secret-safe curl credential file.
 
 `timeout=SECONDS` (whole seconds, 0..50, default 0 = today's read) holds the request on the
 server until the fingerprint differs from `since`, then answers at once with `changed: true`;
-at the bound it answers `changed: false`. The reply carries `wait`: `blocked`, `timed_out` and
-`seconds`. A read without `since` (a baseline) never blocks. The server re-reads every 5 seconds
-and holds no lock, transaction or backend connection between passes, so writers are never kept
+at the bound it answers `changed: false`. The bound is soft: it counts from the first backend
+read (not from authentication or admission, which come before it), and the server only starts a
+pass when the slowest pass so far still fits in the time left, but it cannot interrupt a read
+that is running. A read that is slower than every earlier one, or a loaded backend, can
+therefore make the request last longer than `timeout`; `wait.seconds` reports how long the
+request really held. The reply carries `wait`: `blocked`, `timed_out` and `seconds`. A read
+without `since` (a baseline) never blocks. The server re-reads every 5 seconds, or every four
+times the cost of a read when that is longer, so a slow backend is read less often, never more.
+It holds no lock, transaction or backend connection between passes, so writers are never kept
 waiting. Each pass judges the credential and the grant afresh: a revoked credential or a lost
 grant ends the wait with that refusal and nothing further is read. A client that hangs up ends
 the loop at once (the socket is watched while it sleeps). At most 20 waits are held per service

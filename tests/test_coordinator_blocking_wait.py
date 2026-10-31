@@ -263,6 +263,33 @@ class BlockingWaitTests(grants.Grants):
         # The interval grows with the cost of a read (four times it), so a slow backend is read less often.
         self.assertLessEqual(len(calls), 3)
 
+    def test_a_read_slower_than_every_earlier_one_can_overrun_and_the_wait_reports_it_truthfully(self):
+        since = self.baseline()['fingerprint']
+        real = self.backend.coordinator_wait
+        calls = []
+
+        def varied(*args, **kwargs):
+            calls.append(time.monotonic())
+            time.sleep(0.05 if len(calls) == 1 else 2.5)   # the second read is far slower than the first
+            return real(*args, **kwargs)
+        with mock.patch.object(self.backend, 'coordinator_wait', side_effect=varied):
+            answer = self.wait(query='&comments=others&timeout=2&since=' + since)
+        self.assertEqual(200, answer.status, answer.data)
+        self.assertIs(True, answer.data['wait']['timed_out'])
+        # The documented soft bound: the slow read overran the 2 seconds, nothing started another
+        # pass after it, and wait.seconds tells the caller how long the request really held.
+        self.assertEqual(2, len(calls))
+        self.assertGreater(answer.data['wait']['seconds'], 2.0)
+        self.assertLess(answer.data['wait']['seconds'], 2.0 + 2.5 + 0.5)
+
+    def test_the_public_text_does_not_promise_a_hard_bound(self):
+        root = Path(__file__).resolve().parent.parent
+        docs = (root / 'docs' / 'HTTP_DEPLOYMENT.md').read_text(encoding='utf-8')
+        page = (root / 'web' / 'js' / 'agentSetup.js').read_text(encoding='utf-8')
+        self.assertIn('The bound is soft', docs)
+        self.assertNotIn('holds for up to 50 seconds', page)
+        self.assertIn('a loaded server can take longer', page)
+
     def test_comments_of_a_project_the_caller_does_not_coordinate_never_appear(self):
         beta = self.create_project(self.admin, 'Beta')
         self.assertEqual(200, self.member('cora', 'coordinator', project=beta, token=self.admin).status)
