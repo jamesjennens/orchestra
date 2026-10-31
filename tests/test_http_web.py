@@ -1670,11 +1670,12 @@ class AgentSetupDialogCase(unittest.TestCase):
         # on the "Save your secret" screen; everything else is built from the secretless payload.
         uses = [line.strip() for line in dialog.splitlines()
                 if not line.strip().startswith('//') and re.search(r'\bsecret\b', self.unquoted(line))]
-        self.assertIn('function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {', code)
+        self.assertIn('function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {', code)
         # (the second line is the screen's own name, the key of its builder, not the value)
         self.assertEqual(['secretValue: secret,', 'secret: () => ['], uses)
         # (the first line only opens the dialog on the screen that shows a fresh secret)
-        self.assertEqual(['if (state.secretValue) {', 'state.secretValue = value;', 'state.secretValue',
+        self.assertEqual(['if (state.secretValue) {', 'state.secretValue = value;',
+                          'state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,', 'state.secretValue',
                           '? secretLinesBlock(payload, state.secretValue, state.os)'],
                          [line.strip() for line in dialog.splitlines() if 'secretValue' in line and not line.strip().startswith('//')
                           and not line.strip().startswith('secretValue:')])
@@ -1719,8 +1720,10 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertEqual(['if (!credential.secret) {', 'wizard.secretIssued(credential.secret, credential, agent);'], uses)
         # An error is shown inside the wizard, never as a toast behind it.
         self.assertIn("{ success: 'New secret issued', onError: wizard.showError }", reissue)
-        # Opened without a secret, the screen says why in one line, with the issue button right there.
-        self.assertIn("'The secret is shown only once, when it is issued; issue a new one to continue.'", reissue)
+        # Opened without a secret, the screen says the page cannot show it again and that issuing adds a
+        # NEW credential (kittrial-5bb.456), with the issue button right there.
+        self.assertIn("'data-secret-note': 'true'", reissue)
+        self.assertIn('This page cannot show the secret again. Issuing adds a NEW credential', reissue)
         # What the new credential carries is shown with it (kittrial-5bb.208), and the confirmation
         # says what a renewal keeps.
         dialog = self.function_body(code, 'setupDialog')
@@ -1729,7 +1732,8 @@ class AgentSetupDialogCase(unittest.TestCase):
         self.assertIn('It carries what the agent has now${scopeList(agent.scopes)}.', reissue)
         # What the agent may do is on its card, and "What it may do" on the Agents page is the one place
         # that sends a list (the page is run in tests/test_http_agents.py AgentsPageTests).
-        self.assertIn('    compact ? null : scopesLine(raw),\n', self.function_body(code, 'agentCard'))
+        self.assertIn('    compact || lean ? null : scopesLine(raw),\n', self.function_body(code, 'agentCard'))
+        self.assertIn('scopesLine(raw), projectsLine(agent)]', self.function_body(code, 'agentCardMore'))
         self.assertNotIn('before this was fixed', code)
         self.assertIn('agent.scopes === null', reissue)
         self.assertIn("issueAgentCredential: (aid, scopes) => mutate('POST', `/v1/agents/${aid}/credentials`, "
@@ -2119,9 +2123,10 @@ console.log(JSON.stringify({
         agents = self.AGENTS_JS.read_text(encoding='utf-8')
         for code in ('2', '60', '35', '26', '401'):
             self.assertIn("  %s: '" % code, agents)
-        # kittrial-5bb.348: the first screen asks whether this computer's VS Code has the Bridge 0.14+.
-        self.assertIn("choice('setup-bridge', 'yes', 'Orchestra Bridge 0.14 or later'", agents)
-        self.assertIn("choice('setup-bridge', 'no', 'An older extension, or none'", agents)
+        # kittrial-5bb.348/.456: the first screen asks what the agent runs in (three routes).
+        self.assertIn("['yes', 'bridge', 'VS Code with Orchestra Bridge 0.14 or later']", agents)
+        self.assertIn("['no', 'older', 'VS Code with an older Bridge, or none yet']", agents)
+        self.assertIn("['none', 'none', 'No Bridge: Claude Code, Codex, a command-line agent']", agents)
         node = shutil.which('node')
         if not node:
             self.skipTest('node is not installed; the static checks above still apply')
@@ -2271,6 +2276,30 @@ console.log(JSON.stringify({
             'refusedAddressSaidAndNotUsed',
             'reloadResumesTheScreen',
             'reloadShowsNoSecret',
+            # kittrial-5bb.456: what the agent runs in, the secret screens, the older credentials.
+            'bridgeRoutePreselected',
+            'cancelledRevokeAllRevokesNothing',
+            'firstScreenAsksWhatTheAgentRunsIn',
+            'issuedScreenSaysHowManyWorkNow',
+            'issuedSecretIsNotTheCreateNotice',
+            'noBridgePlanHasNoVsCodeScreen',
+            'noBridgeResumeSaysPasteIntoTheChat',
+            'noBridgeRouteStoredWithoutASecret',
+            'noBridgeWalkSkipsVsCode',
+            'noSecretScreenCountsWorkingCredentials',
+            'noSecretScreenSaysItCannotBeShownAgain',
+            'oldStoredFalseMeansOlderBridge',
+            'oldStoredResumesTheStoredScreen',
+            'oldStoredTrueMeansBridge',
+            'olderCredentialsOfferedOutsideMoreAbout',
+            'olderRouteStillHasVsCode',
+            'pastedSecretRuleInTheGuideAndPrompt',
+            'reloadOnTheSecretScreenIssuesNothing',
+            'revokeAllAsksAndNamesTheCount',
+            'revokeAllRevokesOnlyThisAgentsOlderCredentials',
+            'revokedRowsShowRevoked',
+            'saveNowAndNeverInAChatOnTheSecretScreen',
+            'threeRoutesNamedPlainly',
             # kittrial-5bb.364: the Bridge path's last screen has no prompt to paste; both
             # paths say what the waiting count includes.
             'bridgeResumeHasNoPromptToPaste',

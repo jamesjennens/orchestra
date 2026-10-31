@@ -59,6 +59,7 @@ globalThis.window = {
 
 const { createApi } = await import(apiUrl);
 const { setupWizardPage, WIZARD_STORAGE_KEY, clearWizardStorage } = await import(agentsUrl);
+const setupText = await import(new URL('../agentSetup.js', agentsUrl).href);
 const { SESSION_IDLE_WARNING_EVENT } = await import(apiUrl);
 const { toast } = await import(domUrl);
 
@@ -70,6 +71,9 @@ const server = {
   issued: 0,
   roles: [],
   scopes: ['read', 'tasks', 'reviews'],
+  credentials: [],
+  revoked: [],
+  posts: [],
 };
 let sessionReads = 0;
 let agentReads = 0;
@@ -82,13 +86,21 @@ const api = createApi(async (method, path, _headers, text) => {
   if (method === 'GET' && path === '/v1/agents/agent_1') {
     agentReads += 1;
     return { status: 200, data: { id: 'agent_1', name: 'Kestrel', owner: 'u1', role: 'worker', scopes: server.scopes, scopes_source: 'stored',
-      working_directory: 'C:\\Users\\olive\\kestrel', projects: ['p1'], last_seen_at: server.lastSeen, credentials: [],
+      working_directory: 'C:\\Users\\olive\\kestrel', projects: ['p1'], last_seen_at: server.lastSeen, credentials: server.credentials,
       ...(server.coordinates ? { coordinates: server.coordinates } : {}) } };
   }
   if (method === 'POST' && path === '/v1/agents/agent_1/credentials') {
     if (server.failIssue) return { status: 0, data: { error: { code: 'network', message: 'The server could not be reached.' } } };
     server.issued += 1;
+    server.posts.push(path);
     return { status: 201, data: { credential: { id: 'cred_' + server.issued, secret: SECRET, scopes: ['read', 'tasks'] } } };
+  }
+  const revoke = /^\/v1\/agents\/(agent_[0-9]+)\/credentials\/(cred_[a-z0-9]+)\/revoke$/.exec(path);
+  if (method === 'POST' && revoke) {
+    server.revoked.push(revoke[1] + '/' + revoke[2]);
+    const found = server.credentials.find((c) => c.id === revoke[2]);
+    if (found) { found.revoked = true; found.working = false; }
+    return { status: 200, data: {} };
   }
   if (method === 'PATCH' && path === '/v1/agents/agent_1') {
     if (server.failRole) return { status: 403, data: { error: { code: 'forbidden', message: 'Only the agent’s owner may change its role.' } } };
@@ -165,7 +177,7 @@ out.reviewerSaidInOneLine = /A reviewer is also offered other people’s deliver
 await d.wizard.next();
 out.secretScreenThird = screenOf(d) === 'secret';
 out.noSecretOneLineWhy = attr(d, 'data-secret-note', 'true').length === 1
-  && attr(d, 'data-secret-note', 'true')[0].textContent === 'The secret is shown only once, when it is issued; issue a new one to continue.';
+  && attr(d, 'data-secret-note', 'true')[0].textContent === 'This page cannot show the secret again. Issuing adds a NEW credential; the others keep working until revoked.';
 out.issueButtonRightThere = Boolean(button(d, 'issue-secret'));
 out.noSecretShownYet = !JSON.stringify(shownText(d)).includes('orc_') && attr(d, 'data-secret-file-text', 'true').length === 0;
 
@@ -422,5 +434,75 @@ out.noEffectGrantIsAWorker = attr(d, 'data-role-coordinator', 'true').length ===
 out.noEffectGrantShowsCoordinatorHint = attr(d, 'data-role-coordinator-help', 'true').length === 1;
 server.coordinates = undefined;
 for (const open of openDialogs()) await open.close();   // a dialog left open keeps its online check going
+
+// ---- kittrial-5bb.456: what the agent runs in, the secret screens and the credentials -------------
+store.clear();
+d = await openWizard();
+out.firstScreenAsksWhatTheAgentRunsIn = /What does this agent run in\?/.test(shownText(d));
+out.threeRoutesNamedPlainly = ['yes', 'no', 'none'].every((v) => windowsChoice(d, 'setup-bridge', v))
+  && /No Bridge: Claude Code, Codex, a command-line agent/.test(d.textContent);
+out.bridgeRoutePreselected = windowsChoice(d, 'setup-bridge', 'yes').checked === true;
+await windowsChoice(d, 'setup-bridge', 'none').dispatch('change');
+out.noBridgePlanHasNoVsCodeScreen = !d.wizard.plan().includes('vscode') && d.wizard.plan().at(-1) === 'resume';
+out.noBridgeRouteStoredWithoutASecret = JSON.parse(store.get(WIZARD_STORAGE_KEY)).runs === 'none';
+out.noBridgeWalkSkipsVsCode = !(await walk(d)).includes('vscode');
+out.noBridgeResumeSaysPasteIntoTheChat = /Paste this into the agent’s chat/.test(shownText(d)) && /never the secret/.test(shownText(d));
+out.olderRouteStillHasVsCode = setupText.screenPlan({ bridge: false, os: 'windows', vscode: true }).includes('vscode');
+// An older stored state (only the boolean) maps to a route: true to Bridge, false to older.
+store.clear();
+store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'role', bridge: false, os: 'windows', role: 'worker' }));
+d = await openWizard();
+out.oldStoredResumesTheStoredScreen = screenOf(d) === 'role';
+await d.wizard.show('system');
+out.oldStoredFalseMeansOlderBridge = windowsChoice(d, 'setup-bridge', 'no').checked === true && d.wizard.plan().includes('vscode');
+store.clear();
+store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'role', bridge: true, os: 'windows', role: 'worker' }));
+d = await openWizard();
+await d.wizard.show('system');
+out.oldStoredTrueMeansBridge = windowsChoice(d, 'setup-bridge', 'yes').checked === true;
+// Reopening or reloading on the secret screen never issues a secret by itself.
+store.clear();
+store.set(WIZARD_STORAGE_KEY, JSON.stringify({ agentId: 'agent_1', screen: 'secret', runs: 'bridge', bridge: true, os: 'windows', role: 'worker' }));
+const issuedBefore = server.issued;
+d = await openWizard();
+out.reloadOnTheSecretScreenIssuesNothing = screenOf(d) === 'secret' && server.issued === issuedBefore && attr(d, 'data-secret-file-text', 'true').length === 0;
+out.noSecretScreenSaysItCannotBeShownAgain = /This page cannot show the secret again\./.test(shownText(d)) && /the agent keeps using it/.test(shownText(d));
+// Issue a new secret three times: the page says how many credentials work and offers to revoke the older ones.
+server.credentials.push({ id: 'cred_old1', label: 'one', scopes: ['read'], working: true, created_at: '2026-10-01T00:00:00Z' },
+  { id: 'cred_old2', label: 'two', scopes: ['read'], working: true, created_at: '2026-10-02T00:00:00Z' });
+store.clear();
+d = await openWizard();
+await d.wizard.show('secret');
+out.noSecretScreenCountsWorkingCredentials = /It has 2 working credentials now\./.test(shownText(d));
+let issueNew = button(d, 'issue-secret').dispatch('click');
+await tick();
+confirm = openDialogs().find((x) => x !== d);
+await confirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
+await issueNew; await tick(); await tick();
+const olderBlock = attr(d, 'data-older-credentials', '2')[0];
+out.issuedScreenSaysHowManyWorkNow = Boolean(olderBlock) && /This agent now has 3 working credentials/.test(olderBlock.textContent);
+out.olderCredentialsOfferedOutsideMoreAbout = Boolean(olderBlock) && !d.all((e) => e.tagName === 'DETAILS' && e.all((x) => x === olderBlock).length).length;
+out.saveNowAndNeverInAChatOnTheSecretScreen = /Save this secret now, in the file named below\. Never paste it into a chat\./.test(shownText(d));
+out.issuedSecretIsNotTheCreateNotice = attr(d, 'data-secret-later', 'true').length === 0;
+const revokeAll = attr(d, 'data-action', 'revoke-older')[0];
+let pendingRevoke = revokeAll.dispatch('click');
+await tick();
+confirm = openDialogs().find((x) => x !== d);
+out.revokeAllAsksAndNamesTheCount = /Revoke the 2 older credentials\?/.test(confirm.textContent);
+await confirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Cancel')[0].dispatch('click');
+await pendingRevoke; await tick();
+out.cancelledRevokeAllRevokesNothing = server.revoked.length === 0;
+pendingRevoke = revokeAll.dispatch('click');
+await tick();
+confirm = openDialogs().find((x) => x !== d);
+await confirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Revoke 2')[0].dispatch('click');
+await pendingRevoke; await tick(); await tick();
+out.revokeAllRevokesOnlyThisAgentsOlderCredentials = JSON.stringify(server.revoked) === JSON.stringify(['agent_1/cred_old1', 'agent_1/cred_old2']);
+out.revokedRowsShowRevoked = d.all((e) => e.tagName === 'SPAN' && e.textContent === 'Revoked').length === 2;
+const rulePayload = setupText.secretlessPayload({ agent: { id: 'agent_1', name: 'Kestrel', owner: 'u1', owner_display_name: 'Olive', role: 'worker', projects: [] } }, 'https://127.0.0.1:8765');
+out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).includes(setupText.PASTED_SECRET_RULE)
+  && setupText.setupPrompt(rulePayload, { role: 'worker' }).includes(setupText.PASTED_SECRET_RULE)
+  && /do not use it and do not save it: say that it is now exposed and ask your owner to issue a new one/.test(setupText.PASTED_SECRET_RULE);
+for (const open of openDialogs()) await open.close();
 
 console.log(JSON.stringify(out));

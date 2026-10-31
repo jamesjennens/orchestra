@@ -2674,8 +2674,10 @@ screen at a time: a short title, at most two short sentences, the screen's one a
 choice, or one command with its Copy button) and `Back` / `Next`; any explanation is behind a
 collapsed "More about this". Only the current screen is in the dialog, so another screen's command
 is absent, not hidden. The first screen chooses the **operating system** (`Windows (PowerShell)`,
-`macOS`, `Linux`, auto-detected from `navigator`) and whether that computer's VS Code has
-**Orchestra Bridge 0.14 or later**; the second chooses what the agent does (worker first; reviewer
+`macOS`, `Linux`, auto-detected from `navigator`) and what the agent runs in (`kittrial-5bb.456`:
+VS Code with **Orchestra Bridge 0.14 or later**, VS Code with an older Bridge or none yet, or **No Bridge**:
+Claude Code, Codex, a command-line agent, which takes the longer path without the *Set up in VS Code*
+screen; `screenPlan({vscode: false})`); the second chooses what the agent does (worker first; reviewer
 also gets other people's deliveries). The rest of the screens are `screenPlan()` in
 `web/js/agentSetup.js`:
 

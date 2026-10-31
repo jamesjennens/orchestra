@@ -108,12 +108,44 @@ export function scopesLine(raw) {
       ' “What it may do” on the Agents page shows each one and can revoke it.') : null);
 }
 
+// kittrial-5bb.456 item 7: every working credential is findable from the agent's row. The list with each
+// Revoke is under "What it may do", which opens by itself when more than one works.
+export function credentialCountLine(raw) {
+  const working = credentialsOf(raw).filter(works).length;
+  if (!working || raw.enabled === false) return null;
+  return h('div', { class: 'small', 'data-credential-count': String(working) },
+    working === 1 ? '1 working credential.' : `${working} working credentials: each is listed under “What it may do” below, with its Revoke.`);
+}
+
 // One agent's card: status, what is waiting, and exactly where to go to resume it.
 // Slice 5 (kittrial-5bb.427, design 2.5): the card leads with the next step, read
 // from the server's attention summary, and who acts on it; nothing is decided
 // here. The compact row on My work keeps DIV[data-agent] with the name as its
 // first H3 (pinned); only the lead line is added.
-export function agentCard(ctx, raw, { compact = false } = {}) {
+function resumeBlock(agent, folder, compact) {
+  return h('div', { class: 'resume' },
+    h('div', { class: 'resume-row' },
+      h('span', { class: 'resume-label' }, 'Folder'),
+      folder ? h('code', { class: 'path', title: 'Open this folder in VS Code' }, folder) : h('span', { class: 'muted small' }, 'Not recorded'),
+      folder ? h('button', { type: 'button', class: 'ghost', onclick: () => copy(folder, 'Folder path') }, 'Copy') : null),
+    compact ? null : h('div', { class: 'resume-row' },
+      h('span', { class: 'resume-label' }, 'Resume prompt (after setup)'),
+      h('span', { class: 'small prompt' }, resumePrompt(agent)),
+      h('button', { type: 'button', class: 'ghost', 'aria-label': 'Copy the resume prompt', onclick: () => copy(resumePrompt(agent), 'Resume prompt') }, 'Copy')),
+    compact ? null : h('p', { class: 'small muted resume-hint' }, 'Needs .orchestra/agent.json in the folder; use Set up folder first.'));
+}
+const createdByNote = (raw) => (raw.created_by && raw.created_by !== raw.owner ? h('p', { class: 'small muted', 'data-created-by': raw.created_by },
+  'Created by ', raw.created_by_display_name || raw.created_by, '. That superuser saw the first secret. Issue a new secret if this matters to you.') : null);
+const projectsLine = (agent) => h('div', { class: 'small muted' }, 'Projects: ', agent.projects.map((p) => `${p.name} (${p.role})`).join(', ') || 'none');
+
+// What the My agents page keeps behind "Details" for each agent (kittrial-5bb.456 item 1): the parts of
+// the full card that the one-line row leaves out.
+export function agentCardMore(ctx, raw) {
+  const agent = normalize(ctx, raw);
+  return [resumeBlock(agent, agent.working_directory, false), createdByNote(raw), scopesLine(raw), projectsLine(agent)];
+}
+
+export function agentCard(ctx, raw, { compact = false, lean = false } = {}) {
   const agent = normalize(ctx, raw);
   const folder = agent.working_directory;
   // The next step is the server's own words (attention.summary); the actor is the
@@ -138,27 +170,26 @@ export function agentCard(ctx, raw, { compact = false } = {}) {
       agent.items && agent.items.length ? null :
       agent.summary && nextText !== agent.summary ? h('p', { class: 'small muted' }, agent.summary) :
       agent.attention === 'idle' && !nextText ? h('p', { class: 'small muted' }, `${agent.claimable} unclaimed task(s) in its projects.`) : null,
-    h('div', { class: 'resume' },
-      h('div', { class: 'resume-row' },
-        h('span', { class: 'resume-label' }, 'Folder'),
-        folder ? h('code', { class: 'path', title: 'Open this folder in VS Code' }, folder) : h('span', { class: 'muted small' }, 'Not recorded'),
-        folder ? h('button', { type: 'button', class: 'ghost', onclick: () => copy(folder, 'Folder path') }, 'Copy') : null),
-      compact ? null : h('div', { class: 'resume-row' },
-        h('span', { class: 'resume-label' }, 'Resume prompt (after setup)'),
-        h('span', { class: 'small prompt' }, resumePrompt(agent)),
-        h('button', { type: 'button', class: 'ghost', 'aria-label': 'Copy the resume prompt', onclick: () => copy(resumePrompt(agent), 'Resume prompt') }, 'Copy')),
-      compact ? null : h('p', { class: 'small muted resume-hint' }, 'Needs .orchestra/agent.json in the folder; use Set up folder first.')),
-    raw.created_by && raw.created_by !== raw.owner ? h('p', { class: 'small muted', 'data-created-by': raw.created_by },
-      'Created by ', raw.created_by_display_name || raw.created_by, '. That superuser saw the first secret. Issue a new secret if this matters to you.') : null,
+    lean ? null : resumeBlock(agent, folder, compact),
+    lean ? null : createdByNote(raw),
     credentialsOf(raw).some((c) => c.expires_soon && works(c)) ? h('div', { class: 'banner warn', role: 'status' }, 'A credential expires within seven days. Extend it under What it may do; its existing secret keeps working.') : null,
-    compact ? null : scopesLine(raw),
+    compact || lean ? null : scopesLine(raw),
+    compact ? null : credentialCountLine(raw),
     manages(ctx, raw) ? h('div', { class: 'copy-row' },
       h('button', { type: 'button', 'aria-label': 'Set up the folder for ' + agent.display_name, onclick: (event) => reopenSetup(ctx, raw.id, event.currentTarget) }, 'Set up folder')) : null,
-    compact ? null : h('div', { class: 'small muted' }, 'Projects: ', agent.projects.map((p) => `${p.name} (${p.role})`).join(', ') || 'none'));
+    compact || lean ? null : projectsLine(agent));
 }
 
+// Open by itself when the agent has something the owner must see: more than one working credential
+// (each with its Revoke), one about to expire, or scopes that differ.
+const needsDetails = (raw) => credentialsOf(raw).filter(works).length > 1
+  || credentialsOf(raw).some((c) => c.expires_soon && works(c)) || otherCredentials(raw).length > 0;
+
 export async function list(ctx) {
-  const host = h('div', { class: 'stack' });
+  // The page's structure is there at once, in its final order; the agents and the accounts fill in
+  // their own places (kittrial-5bb.456 item 1), so nothing below them is pushed down later.
+  const host = h('div', { class: 'stack', 'data-agents-host': '', 'aria-busy': 'true' },
+    h('div', { class: 'panel', 'data-agents-loading': '', role: 'status', style: 'min-height: 6rem' }, h('div', { class: 'panel-body muted' }, 'Loading your agents…')));
   let unconfirmedOnly = false;
   let cursor = null;
   const previous = [];
@@ -173,8 +204,12 @@ export async function list(ctx) {
     let data;
     try { data = await ctx.api.agents({ limit: 20, cursor, unconfirmed: unconfirmedOnly ? 'true' : 'false' }); } catch (error) { host.replaceChildren(errorState(error, load)); return; }
     const items = data.items;
-    host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null,
-      manages(ctx, a) ? historyPanel(() => ctx.api.agentHistory(a.id)) : null))) :
+    host.removeAttribute('aria-busy');
+    host.replaceChildren(items.length ? h('div', { class: 'agent-grid' }, items.map((a) => h('div', { class: 'stack', 'data-agent': a.id }, agentCard(ctx, a, { lean: true }),
+      h('details', { class: 'agent-details', 'data-agent-details': a.id, open: needsDetails(a) ? true : null },
+        h('summary', null, 'Details and settings'),
+        h('div', { class: 'stack' }, ...agentCardMore(ctx, a), manages(ctx, a) ? editClaimLimit(a) : null, editFolder(a), manages(ctx, a) ? editProjects(a) : null, manages(ctx, a) ? editScopes(a) : null,
+          manages(ctx, a) ? historyPanel(() => ctx.api.agentHistory(a.id)) : null))))) :
       h('div', { class: 'panel' }, empty('No agents yet', 'Add an agent for each assistant you run — for example a GitHub Copilot chat working in its own folder.')));
     host.append(h('div', { class: 'copy-row', 'data-agent-pages': '' },
       h('span', { class: 'small muted' }, `${items.length} shown of ${data.total} agents`),
@@ -277,7 +312,7 @@ export async function list(ctx) {
     const inferredWarning = agent.scopes_source === 'inferred' ? 'These scopes are inferred. Saving confirms the chosen list as this agent’s stored scopes. ' : '';
     const has = known ? agent.scopes : [];
     const other = otherCredentials(agent);
-    const details = h('details', { class: 'deliver', 'data-panel': 'agent-scopes', open: !known || other.length ? true : null });
+    const details = h('details', { class: 'deliver', 'data-panel': 'agent-scopes', open: !known || other.length || credentialsOf(agent).filter(works).length > 1 ? true : null });
     const rows = credentialsOf(agent).slice().reverse().map((c) => {
       const working = works(c);
       const row = h('li', { class: 'copy-row', 'data-credential': c.id, 'data-working': String(working), 'data-differs': String(other.includes(c)) },
@@ -317,7 +352,8 @@ export async function list(ctx) {
       let result;
       try { result = await act(form.querySelector('button'), () => ctx.api.issueAgentCredential(agent.id, chosen), { success: 'New secret issued' }); } catch { return; }
       const fresh = await ctx.api.agent(agent.id).catch(() => agent);
-      setupDialog(ctx, { agent: fresh, setup: result && result.setup }, { secret: result && result.credential && result.credential.secret, certificate: await agentCertificate(ctx) });
+      setupDialog(ctx, { agent: fresh, setup: result && result.setup }, { secret: result && result.credential && result.credential.secret, certificate: await agentCertificate(ctx),
+        issued: result && result.credential ? { credential: result.credential, agent } : null });
       load();
     });
     details.append(h('summary', null, known ? 'What it may do' : 'What it may do (choose)'),
@@ -333,17 +369,13 @@ export async function list(ctx) {
     return ctx.projects.filter((p) => !p.archived && ['owner', 'coordinator', 'contributor', 'superuser'].includes(p.role));
   }
   const projects = grantable();
-  let accounts = [];
-  let accountError = null;
-  if (ctx.me && ctx.me.superuser) {
-    try { accounts = (await ctx.api.accounts()).items.filter((u) => !u.disabled); } catch (error) { accountError = error; }
-  }
+  const accountOptions = (accounts) => accounts.map((u) => [u.id, (u.display_name || u.username || u.id) + (u.id === ctx.me.id ? ' (you)' : '')]);
   const ownerField = ctx.me && ctx.me.superuser ? field({ id: 'a-owner', type: 'select', label: 'Account that owns this agent', value: ctx.me.id,
-    options: accounts.length ? accounts.map((u) => [u.id, (u.display_name || u.username || u.id) + (u.id === ctx.me.id ? ' (you)' : '')]) : [[ctx.me.id, 'Your account']],
+    options: [[ctx.me.id, 'Your account']],
     hint: 'A superuser may create for another account. You see its first secret; that account can issue a new one. Projects must be available to that account.' }) : null;
   const form = h('form', { class: 'form', novalidate: true },
     ownerField,
-    accountError ? h('p', { class: 'banner', role: 'status' }, 'Could not load other accounts. Reload this page to choose another account; your draft stays here until creation succeeds.') : null,
+    h('p', { class: 'banner', role: 'status', 'data-account-error': '', hidden: true }, 'Could not load other accounts. Reload this page to choose another account; your draft stays here until creation succeeds.'),
     h('div', { class: 'form-row' },
       field({ id: 'a-name', label: 'Agent name', hint: 'How colleagues will see it, e.g. “Kestrel”.', required: true, maxlength: 40 }),
       field({ id: 'a-tool', label: 'Runs in', placeholder: 'GitHub Copilot in VS Code', hint: 'Optional. Only a label, for example GitHub Copilot in VS Code, Claude Code, Codex, or a Linux command-line agent. It does not choose how the agent runs.' })),
@@ -368,14 +400,26 @@ export async function list(ctx) {
     }).catch(() => null);
     if (!created) return;
     form.reset();
-    setupDialog(ctx, created, { secret: created.credential && created.credential.secret, certificate: await agentCertificate(ctx) });
+    setupDialog(ctx, created, { secret: created.credential && created.credential.secret, certificate: await agentCertificate(ctx), created: true });
     load();
   });
 
-  return h('div', { class: 'stack' },
-    pageHead({ title: 'My agents', lede: 'Agents you run on your own computer. Nothing checks in automatically: look here, see which agent has something to do, then open its folder in VS Code and start it.' }),
+  const page = h('div', { class: 'stack' },
+    pageHead({ title: 'My agents', lede: 'One line per agent: see which has something to do, then open its folder and start it. Nothing checks in automatically.' }),
     filter, host,
     h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Add an agent')), h('div', { class: 'panel-body' }, form)));
+  if (ownerField) {
+    // The accounts fill the owner choice in place; the form is already on the page.
+    ctx.api.accounts().then((data) => {
+      const accounts = data.items.filter((u) => !u.disabled);
+      const select = form.querySelector('#a-owner');
+      if (!accounts.length || !select) return;
+      const chosen = select.value;
+      select.replaceChildren(...accountOptions(accounts).map(([value, label]) => h('option', { value, selected: value === chosen }, label)));
+      select.value = chosen;
+    }).catch(() => { form.querySelector('[data-account-error]').hidden = false; });
+  }
+  return page;
 }
 
 // ---- one-time setup dialog ---------------------------------------------------
@@ -508,16 +552,37 @@ function scopeList(scopes) {
 function olderCredentials(ctx, agent, newId) {
   const live = credentialsOf(agent).filter((c) => c.id !== newId && works(c));
   if (!live.length) return h('p', { class: 'small muted' }, 'Any earlier credential for this agent keeps working until it is revoked.');
-  return h('div', { class: 'setup-block' },
-    h('p', { class: 'small' }, `The agent’s earlier ${live.length === 1 ? 'credential still works' : 'credentials still work'} until revoked. Revoke once the agent uses the new secret.`),
+  const pending = new Map();   // credential id -> its Revoke button; only this agent's own credentials
+  const revoked = (button) => button.replaceWith(h('span', { class: 'chip plain' }, 'Revoked'));
+  const revokeOne = async (c, button) => {
+    await act(button, () => ctx.api.revokeAgentCredential(agent.id, c.id), { success: 'Credential revoked' });
+    pending.delete(c.id);
+    revoked(button);
+  };
+  const all = live.length > 1 ? h('button', { type: 'button', class: 'danger', 'data-action': 'revoke-older',
+    'aria-label': `Revoke the ${live.length} older credentials`, onclick: async () => {
+      if (!(await confirmDialog({ title: `Revoke the ${live.length} older credentials?`,
+        body: `${agent.name || agent.display_name} keeps only the new credential. Anything still using the secret of an older one stops working immediately.`,
+        confirmLabel: `Revoke ${live.length}`, danger: true }))) return;
+      for (const c of live) {
+        const button = pending.get(c.id);
+        if (!button) continue;
+        try { await revokeOne(c, button); } catch { return; }
+      }
+      all.remove();
+    } }, `Revoke the ${live.length} older credentials`) : null;
+  return h('div', { class: 'setup-block', 'data-older-credentials': String(live.length) },
+    h('p', { class: 'small', 'data-credential-total': String(live.length + 1) },
+      `This agent now has ${live.length + 1} working credentials: the new one and ${live.length} earlier ${live.length === 1 ? 'one' : 'ones'}. The earlier ${live.length === 1 ? 'one keeps' : 'ones keep'} working until revoked. Revoke ${live.length === 1 ? 'it' : 'them'} once the agent uses the new secret.`),
+    all,
     h('ul', { class: 'open-items' }, live.map((c) => {
       const row = h('li', { class: 'copy-row' }, h('span', null, c.label || c.id, ' ', h('span', { class: 'small muted' }, 'issued ', time(c.created_at), ' · allows ', scopeNames(c.scopes))));
-      row.append(h('button', { type: 'button', class: 'danger', 'aria-label': 'Revoke credential ' + (c.label || c.id), onclick: async (event) => {
-        const button = event.currentTarget;
+      const button = h('button', { type: 'button', class: 'danger', 'aria-label': 'Revoke credential ' + (c.label || c.id), onclick: async (event) => {
         if (!(await confirmDialog({ title: 'Revoke this credential?', body: 'Anything still using its secret stops working immediately.', confirmLabel: 'Revoke', danger: true }))) return;
-        try { await act(button, () => ctx.api.revokeAgentCredential(agent.id, c.id), { success: 'Credential revoked' }); } catch { return; }
-        button.replaceWith(h('span', { class: 'chip plain' }, 'Revoked'));
-      } }, 'Revoke'));
+        try { await revokeOne(c, event.currentTarget); } catch { /* act() showed the error */ }
+      } }, 'Revoke');
+      pending.set(c.id, button);
+      row.append(button);
       return row;
     })));
 }
@@ -545,6 +610,7 @@ function writeWizardStorage(state) {
       agentId: state.agentId,
       screen: state.screen,
       bridge: state.bridge !== false,
+      runs: state.runs,
       os: state.os,
       role: state.role || 'worker',
     }));
@@ -574,6 +640,12 @@ export function clearWizardStorage() {
 // sessionStorage holds the agent id, the path, the screen, the system and the role), never written
 // to the folder files or the prompts, and never put on a command line: the commands only name the
 // file.
+
+const RUNS_CHOICES = Object.freeze([
+  ['yes', 'bridge', 'VS Code with Orchestra Bridge 0.14 or later'],
+  ['no', 'older', 'VS Code with an older Bridge, or none yet'],
+  ['none', 'none', 'No Bridge: Claude Code, Codex, a command-line agent'],
+]);
 
 const SCREEN_TITLES = Object.freeze({
   system: 'Your computer',
@@ -637,6 +709,16 @@ function commandLine(text, what) {
 // The body of the "Save your secret" screen with a secret in hand. `secretValue` is the fresh
 // secret: the dialog's own (straight after creation) or a credential issued on this screen. This is
 // the ONLY place a secret is rendered: in the lines to paste, behind their Copy button.
+// kittrial-5bb.456 items 3, 4 and 6: the secret screen says that the secret must be saved now and how,
+// that it is never pasted into a chat, and, straight after creation, that nothing is lost if it is not.
+function secretNotice(justCreated) {
+  return h('div', { class: 'stack', 'data-secret-notice': 'true' },
+    h('p', { class: 'small', 'data-secret-save': 'true' }, 'Save this secret now, in the file named below. Never paste it into a chat.'),
+    h('p', { class: 'small muted', 'data-secret-once': 'true' }, 'It is shown once and this page does not keep it.'),
+    justCreated ? h('p', { class: 'small muted', 'data-secret-later': 'true' },
+      'You do not need to save this now. “Set up folder” on the agent’s card can issue a new secret later. If this agent will coordinate, give it the coordinator grant on the project’s Members & settings page first.') : null);
+}
+
 function secretLinesBlock(payload, secretValue, os) {
   const meta = PAYLOAD_META.get(payload) || {};
   const address = meta.bridgeServer || payload.server;
@@ -662,6 +744,7 @@ function issueBlock(ctx, agent, payload, wizard) {
       'The secret is shown only once, when it is issued, and a new one cannot be issued here: choose under “What it may do” on the agent’s card.'));
     return block;
   }
+  const working = credentialsOf(agent).filter(works).length;
   const issue = h('button', { type: 'button', class: 'primary', 'data-action': 'issue-secret', onclick: async () => {
     wizard.clearError();
     const ok = await confirmDialog({
@@ -680,12 +763,14 @@ function issueBlock(ctx, agent, payload, wizard) {
     wizard.secretIssued(credential.secret, credential, agent);
   } }, 'Issue a new secret');
   block.append(
-    h('p', { class: 'small', 'data-secret-note': 'true' }, 'The secret is shown only once, when it is issued; issue a new one to continue.'),
+    h('p', { class: 'small', 'data-secret-note': 'true' }, 'This page cannot show the secret again. Issuing adds a NEW credential; the others keep working until revoked.'),
+    h('p', { class: 'small muted', 'data-secret-reuse': 'true' },
+      'If the folder already has its credential file, the agent keeps using it.', working ? ` It has ${working} working ${working === 1 ? 'credential' : 'credentials'} now.` : ''),
     h('div', { class: 'copy-row' }, issue));
   return block;
 }
 
-function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
+function setupDialog(ctx, source, { secret = null, certificate = null, created = false, issued = null } = {}) {
   const payload = setupText.secretlessPayload(source, location.origin);
   const hasCertificate = Boolean(certificate);
   const files = [['agent.json', setupText.agentJson(payload)], ['AGENT.md', setupText.agentGuide(payload, { hasCertificate })]];
@@ -699,7 +784,8 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   const same = saved && saved.agentId === payload.agentId ? saved : null;
   const state = {
     os: (same && same.os) || setupText.detectOs(),
-    bridge: same && typeof same.bridge === 'boolean' ? same.bridge : true,
+    runs: setupText.runsFromStored(same),
+    bridge: setupText.runsFromStored(same) === 'bridge',
     role: (same && setupText.BRIDGE_ROLES.includes(same.role) && same.role) || (agent.role === 'reviewer' ? 'reviewer' : 'worker'),
     screen: 'system',
     stepStartedAt: Date.now(),
@@ -707,17 +793,18 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
     // The fresh secret, while this dialog is open: never stored, never put anywhere but the
     // "Save your secret" screen. Straight after creation it is the dialog's own.
     secretValue: secret,
-    issued: null,
+    createdHere: created,
+    issued,
   };
   if (!setupText.OS_CHOICES.some(([v]) => v === state.os)) state.os = 'windows';
   const prompt = setupText.setupPrompt(payload, { role: state.role, certificate, bridgeServer });
-  const plan = () => setupText.screenPlan({ bridge: state.bridge, os: state.os, hasCertificate });
+  const plan = () => setupText.screenPlan({ bridge: state.bridge, vscode: state.runs !== 'none', os: state.os, hasCertificate });
   if (state.secretValue) {
     // A fresh secret exists only while this dialog is open: open where it is saved (Back reaches the
     // system and role screens), never two clicks away from it.
     state.screen = 'secret';
   } else if (same) {
-    const wanted = same.screen || oldStepScreen(same.step, state.bridge);
+    const wanted = same.screen || oldStepScreen(same.step, state.bridge, state.runs !== 'none');
     if (wanted && plan().includes(wanted)) state.screen = wanted;
   }
 
@@ -770,12 +857,12 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   }
   const screens = {
     system: () => [
-      h('p', { class: 'small' }, 'Choose this computer’s system, and say whether its VS Code has Orchestra Bridge 0.14 or later.'),
+      h('p', { class: 'small' }, 'What does this agent run in? Also choose this computer’s system.'),
       h('div', { class: 'copy-row', 'data-os-choice': 'true' }, setupText.OS_CHOICES.map(([value, label]) =>
         choice('setup-os', value, label, state.os === value, () => { state.os = value; persist(); showProgress(); }))),
       h('div', { class: 'copy-row', 'data-bridge-choice': 'true' },
-        choice('setup-bridge', 'yes', 'Orchestra Bridge 0.14 or later', state.bridge, () => { state.bridge = true; persist(); showProgress(); }),
-        choice('setup-bridge', 'no', 'An older extension, or none', !state.bridge, () => { state.bridge = false; persist(); showProgress(); })),
+        ...RUNS_CHOICES.map(([value, runs, label]) => choice('setup-bridge', value, label, state.runs === runs, () => {
+          state.runs = runs; state.bridge = runs === 'bridge'; persist(); showProgress(); }))),
       setupText.osKind(state.os) === 'windows'
         ? h('p', { class: 'small muted', 'data-windows-policy': 'true' }, 'On Windows, if VS Code terminals hang or the agent gets no command output, see “Windows: VS Code terminals hang or show no output” in docs/ONBOARDING.md.')
         : null,
@@ -813,12 +900,13 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
       ];
     },
     secret: () => [
+      state.secretValue ? secretNotice(state.createdHere && !state.issued) : null,
       state.secretValue
         ? secretLinesBlock(payload, state.secretValue, state.os)
         : issueBlock(ctx, agent, payload, wizard),
       state.issued ? more(h('p', { class: 'small', 'data-scopes': ((state.issued.credential && state.issued.credential.scopes) || []).join(' ') },
-        'This credential carries' + (scopeList(state.issued.credential && state.issued.credential.scopes) || ': nothing beyond reading') + '.'),
-      olderCredentials(ctx, state.issued.agent, state.issued.credential && state.issued.credential.id)) : null,
+        'This credential carries' + (scopeList(state.issued.credential && state.issued.credential.scopes) || ': nothing beyond reading') + '.')) : null,
+      state.issued ? olderCredentials(ctx, state.issued.agent, state.issued.credential && state.issued.credential.id) : null,
     ],
     restrict: () => [
       h('p', { class: 'small' }, 'Run this in a terminal, so that only you can read the file.'),
@@ -873,11 +961,11 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
     resume: () => [
       ...(state.bridge
         ? [h('p', { class: 'small', 'data-bridge-prompt': 'true' }, 'Orchestra Bridge starts the agent with its own prompt: nothing needs pasting here.')]
-        : [h('p', { class: 'small' }, 'Paste this into the agent’s chat in VS Code.'),
+        : [h('p', { class: 'small' }, state.runs === 'none' ? 'Paste this into the agent’s chat (its terminal session or window). It is a prompt, never the secret.' : 'Paste this into the agent’s chat in VS Code. It is a prompt, never the secret.'),
           commandLine(setupText.resumePrompt(payload.name), 'resume prompt')]),
       h('p', { class: 'small muted', 'data-waiting-count': 'true' }, setupText.WAITING_COUNT_SENTENCE),
       onlineStatus,
-      more(h('p', { class: 'small muted', 'data-screen-reader-tip': 'true' }, 'If VS Code makes sounds while the agent works, click the screen reader button in the bottom right of VS Code to switch it off.')),
+      state.runs === 'none' ? null : more(h('p', { class: 'small muted', 'data-screen-reader-tip': 'true' }, 'If VS Code makes sounds while the agent works, click the screen reader button in the bottom right of VS Code to switch it off.')),
     ],
   };
 
@@ -923,7 +1011,7 @@ function setupDialog(ctx, source, { secret = null, certificate = null } = {}) {
   // ---- moving between screens ----------------------------------------------------------------
   function persist() {
     touchKeepAlive();
-    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, os: state.os, role: state.role });
+    writeWizardStorage({ agentId: payload.agentId, screen: state.screen, bridge: state.bridge, runs: state.runs, os: state.os, role: state.role });
   }
 
   // The badge counts the screens of the chosen path; the heading below it is the screen's one title
