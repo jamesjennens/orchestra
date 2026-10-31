@@ -10,6 +10,7 @@ import signal
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
@@ -302,6 +303,105 @@ class DelegationTests(unittest.TestCase):
         result = self.write(request())
         (self.project / d.JOURNAL_DIR / (result['record']['sha256'] + '.json')).unlink()
         self.refused('no delegation is recorded')
+
+    def test_lost_revoke_receipt_does_not_restore_grant(self):
+        self.write(request())
+        revoked = self.write(request(action='revoke', operation_id='revoke'), at=AT[2])
+        self.refused('was revoked')
+        (self.project / d.JOURNAL_DIR / (revoked['record']['sha256'] + '.json')).unlink()
+        self.refused('unhonoured comment')
+        self.assertFalse(d.listing([self.row()], PROJECT, state(), self.project, ['ops'])[0]['in_force'])
+
+    def test_lost_narrow_receipt_does_not_restore_scope(self):
+        self.write(request())
+        narrowed = self.write(request(action='narrow', scope=('references',), operation_id='narrow'), at=AT[2])
+        self.assertEqual(['references'], self.check()['scope'])
+        (self.project / d.JOURNAL_DIR / (narrowed['record']['sha256'] + '.json')).unlink()
+        self.refused('unhonoured comment', kind='capabilities')
+        self.refused('unhonoured comment', kind='references')
+
+    def test_crash_after_revoke_comment_fails_closed_and_same_decision_cannot_regrant(self):
+        self.write(request())
+        with mock.patch.object(d, 'publish', side_effect=OSError('interrupted')):
+            with self.assertRaisesRegex(OSError, 'interrupted'):
+                self.write(request(action='revoke', operation_id='crash'), at=AT[2])
+        self.refused('unhonoured comment')
+        before = json.dumps(self.row(), sort_keys=True)
+        for payload in (request(operation_id='another-grant'),
+                        request(action='narrow', scope=('references',), operation_id='another-narrow'),
+                        request(action='revoke', operation_id='another-revoke')):
+            with self.assertRaisesRegex(d.DelegationRefusal, 'record a new decision'):
+                self.write(payload, at=AT[3])
+            self.assertEqual(before, json.dumps(self.row(), sort_keys=True))
+
+    def test_malformed_or_wrong_project_newer_comment_refuses_without_mutation(self):
+        self.write(request())
+        later = d.make_record(request(action='revoke', operation_id='later'), project='other',
+                              recorded_by=OWNER, via='session', account=OWNER, at=AT[2])
+        for text in (d.body(later), d.PREFIX + '{', d.PREFIX + '{"at":"not-a-time"}'):
+            with self.subTest(text=text):
+                self.native.comment('pp-dec', text, author=OWNER)
+                before = json.dumps(self.row(), sort_keys=True)
+                self.refused('unhonoured comment')
+                self.assertEqual(before, json.dumps(self.row(), sort_keys=True))
+                self.row()['comments'].pop()
+
+    def test_older_unhonoured_history_does_not_override_later_honoured_restriction(self):
+        old = d.make_record(request(action='revoke', operation_id='old'), project=PROJECT,
+                            recorded_by=OWNER, via='session', account=OWNER, at=AT[0])
+        self.write(request(), at=AT[1])
+        self.write(request(action='narrow', scope=('references',), operation_id='narrow'), at=AT[2])
+        self.native.comment('pp-dec', d.body(old), author=OWNER)
+        live, reason = d.current(self.row(), PROJECT, state(), self.project, ['ops'])
+        self.assertIsNotNone(live, reason)
+        self.assertEqual(['references'], live['scope'])
+        self.refused('covers references, not capabilities', kind='capabilities')
+        self.assertEqual((True, False), d.reading(self.row(), PROJECT, self.project)[1:])
+
+    def test_tied_timestamp_native_id_and_reordered_comments_agree(self):
+        self.write(request())
+        revoked = self.write(request(action='revoke', operation_id='tied'), at=AT[1])
+        (self.project / d.JOURNAL_DIR / (revoked['record']['sha256'] + '.json')).unlink()
+        self.refused('unhonoured comment')
+        self.row()['comments'].reverse()
+        self.refused('unhonoured comment')
+        # An unreadable ordering never becomes authority because export order changed.
+        self.native.comment('pp-dec', d.PREFIX + '{}', author=OWNER)
+        self.row()['comments'].reverse()
+        self.refused('unhonoured comment')
+
+    def test_equivalent_utc_spellings_use_comment_order_not_lexical_time(self):
+        self.write(request(), at=AT[1])
+        revoked = self.write(request(action='revoke', operation_id='utc-tie'),
+                             at=AT[1].replace('Z', '+00:00'))
+        self.refused('was revoked')
+        (self.project / d.JOURNAL_DIR / (revoked['record']['sha256'] + '.json')).unlink()
+        self.refused('unhonoured comment')
+        self.row()['comments'].reverse()
+        self.refused('unhonoured comment')
+
+    def test_ambiguous_same_time_and_comment_id_never_restores_authority(self):
+        self.write(request())
+        last = self.row()['comments'][-1]
+        bad = dict(last, text=last['text'].replace('"grant"', '"revoke"'))
+        self.row()['comments'].append(bad)
+        self.refused('unhonoured comment')
+
+    def test_fresh_decision_recovery_does_not_lock_out_a_legitimate_agent(self):
+        self.write(request())
+        revoked = self.write(request(action='revoke', operation_id='lost'), at=AT[2])
+        (self.project / d.JOURNAL_DIR / (revoked['record']['sha256'] + '.json')).unlink()
+        self.refused('unhonoured comment')
+        self.native.rows['pp-fresh'] = {'id': 'pp-fresh', 'issue_type': 'decision', 'labels': [], 'comments': []}
+        self.write(request(decision='pp-fresh', operation_id='recovered'), at=AT[3])
+        self.assertEqual(['capabilities', 'references'], self.check(issue='pp-fresh')['scope'])
+        self.refused('unhonoured comment')
+
+    def test_lost_grant_cannot_be_replaced_on_the_same_decision(self):
+        granted = self.write(request())
+        (self.project / d.JOURNAL_DIR / (granted['record']['sha256'] + '.json')).unlink()
+        with self.assertRaisesRegex(d.DelegationRefusal, 'record a new decision'):
+            self.write(request(operation_id='replacement'), at=AT[2])
 
     def test_a_planted_lookalike_grants_nothing(self):
         # A lane writes the exact body a person owner's record would have, under its own name

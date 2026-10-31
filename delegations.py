@@ -268,20 +268,47 @@ def is_decision_issue(row):
     return isinstance(row, dict) and (row.get('issue_type') == 'decision' or 'decision' in (row.get('labels') or []))
 
 
-def history(row, project, journal):
-    """The honoured delegation records on one issue, oldest first.
+def reading(row, project, journal):
+    """One interpretation of delegation comments: honoured records, unhonoured, newer.
 
     A record counts only when it parses exactly, is bound to its comment author, project and
     issue, AND its host journal entry exists under ``journal`` (the project directory).
     Ordered by the record's own server time, then the native comment id, so the order never
-    depends on how a native read happens to list comments."""
+    depends on how a native read happens to list comments. An unhonoured comment is
+    evidence of uncertainty, never authority. One newer than the last honoured record
+    blocks reliance on that record; an unreadable time/order is conservatively newer.
+    Losing a restriction's receipt must not restore the earlier grant or scope.
+    """
     decision = row.get('id') if isinstance(row, dict) else None
-    out = []
+    out, others = [], []
     for comment in (row.get('comments') or []) if isinstance(row, dict) else []:
+        if not isinstance(comment, dict) or not isinstance(comment.get('text'), str) \
+                or not comment['text'].startswith(PREFIX):
+            continue
         record = parse_comment(comment, project=project, decision=decision)
         if record is not None and journaled(journal, record):
-            out.append((record['at'], str(comment.get('id') or ''), record))
-    return [record for _, _, record in sorted(out, key=lambda item: (item[0], item[1]))]
+            moment = datetime.datetime.fromisoformat(record['at'].replace('Z', '+00:00'))
+            out.append((moment, str(comment.get('id') or ''), record))
+        else:
+            # Read only enough untrusted data to place a possible later restriction.
+            # These fields are NEVER used as a delegation or a scope.
+            try:
+                stated = record_json.loads(comment['text'][len(PREFIX):], object_pairs_hook=_unique)
+                at = stated.get('at') if isinstance(stated, dict) else None
+                moment = datetime.datetime.fromisoformat(at.replace('Z', '+00:00'))
+                if moment.tzinfo is None or moment.utcoffset() != datetime.timedelta(0):
+                    raise ValueError('unusable delegation time')
+                others.append((moment, str(comment.get('id') or '')))
+            except (ValueError, TypeError, AttributeError, UnicodeError):
+                others.append(None)
+    out.sort(key=lambda item: (item[0], item[1]))
+    newer = bool(out) and any(item is None or not item[1] or item >= out[-1][:2] for item in others)
+    return [item[2] for item in out], bool(others), newer
+
+
+def history(row, project, journal):
+    """The honoured records, oldest first; authority checks use ``reading`` too."""
+    return reading(row, project, journal)[0]
 
 
 def recorder_live(record, state, project, operators=None, owners=None):
@@ -319,7 +346,10 @@ def current(row, project, state, journal, operators=None, owners=None):
     restricting a right never needs current standing, so a demoted owner's revocation holds.
     A narrowing must name the same right and grantee and a strict subset of the scope.
     """
-    records = history(row, project, journal)
+    records, _unhonoured, newer = reading(row, project, journal)
+    if newer:
+        return None, ('the delegation on decision %s has a newer or unreadable unhonoured comment; '
+                      'record a new decision to delegate again' % row.get('id'))
     if not records:
         return None, 'no delegation is recorded on decision %s' % row.get('id')
     grant = records[0]
@@ -396,7 +426,10 @@ def check_write(payload, row, *, project, journal):
     if not is_decision_issue(row):
         raise DelegationRefusal(422, 'Issue %s is not a decision issue; record the delegation on a decision'
                                 % payload['decision'])
-    records = history(row, project, journal)
+    records, unhonoured, newer = reading(row, project, journal)
+    if newer or (unhonoured and not records):
+        raise DelegationRefusal(409, 'Decision %s has unhonoured delegation evidence; '
+                                'record a new decision to delegate again' % payload['decision'])
     if payload['action'] == 'grant':
         if records:
             raise DelegationRefusal(409, 'Decision %s already carries a delegation; record a new decision to grant again'

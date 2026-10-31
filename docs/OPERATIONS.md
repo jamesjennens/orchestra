@@ -482,12 +482,21 @@ python3 admin.py --root /path/to/root delegation-check --project PROJECT --state
 
 `uncovered` lists the agents still without one.
 
-**A narrowing or revocation that did not finish is not in force.** Each grant, narrowing and
-revocation is a comment plus its host journal entry, and only the pair counts. If the journal
-write fails after the comment (a full disk, a permission change), the answer is an error or an
-unknown outcome, and that narrowing or revocation does **not** apply: the delegation stays as it
-was. Retry it (the same request on the web, or `delegation-record` again) until it succeeds, and
-confirm with `delegation-check` or the Settings page that the delegation reads as intended.
+**A missing or unfinished restriction never restores authority.** Each grant, narrowing and
+revocation is a comment plus its host journal entry; only the pair grants authority. If a
+newer delegation comment has no matching journal entry (loss, damage, or failure between
+comment and publication), the decision grants nothing, including its earlier wider scope.
+An unreadable ordering also fails closed. The list and `delegation-check` explain the
+unhonoured evidence. Older unhonoured evidence does not supersede a later honoured restriction.
+
+**Recovery:** first read the decision and reconcile the error/unknown outcome; do not delete
+its comments or fabricate a receipt to resurrect the old grant. A current person owner uses
+the web delegation form with a NEW decision (or a configured operator uses
+`delegation-record` with a new decision), explicitly choosing the intended current scope and
+grantee. Confirm that new decision with Settings or `delegation-check`, and supply its ID on
+future agent acceptances. The damaged decision stays inert; a fresh legitimate delegation
+does not require repairing it. A write to an ambiguous/unhonoured decision returns 409 with
+this recovery instruction, rather than silently creating a second grant on it.
 
 **Backups.** `admin.py backup` collects `<project>/.delegations/` with the coordination
 sidecar and `restore-new` validates and restores it. A delegation is honoured only with
