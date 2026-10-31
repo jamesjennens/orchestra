@@ -269,6 +269,90 @@ class InterfaceCase(unittest.TestCase):
         self.assertEqual(OPERATOR,cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR])['accepted_by'])
         usage,coverage=self.context().usage();self.assertTrue(coverage['complete']);self.assertEqual(1,len(usage))
 
+    def test_refused_capability_retirement_keeps_consumer_and_blocks_interface_retirement(self):
+        self.apply(payload());self.accept();record=self.entry()['record'];self.area.actor=OPERATOR
+        cap=cap_entry(operation='draft',operation_id='party-protected-consumer',
+            interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(cap,OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        cr.apply_native(cap_entry(operation_id='party-protected-successor',key='party.successor'),OPERATOR,self.area,self.path.parent/'area',operators=[OPERATOR])
+        old=cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR])['record'];before=copy.deepcopy(self.area.rows)
+        def denied(*args):raise ValueError('only within a delegation')
+        with self.assertRaisesRegex(ValueError,'delegation'):
+            cr.apply_native({'schema_version':1,'operation':'retire','operation_id':'refused-party-consumer','key':cap['key'],
+                'revision':old['revision'],'record_sha256':old['sha256'],'successor':'party.successor',
+                'acceptance_state':'superseded','acceptance':acceptance()},OPERATOR,self.area,self.path.parent/'area',
+                operator=True,operators=[OPERATOR],party_check=denied)
+        self.assertEqual(before,self.area.rows);self.assertEqual(1,len(self.context().usage()[0]))
+        # An unaccepted empty withdrawal draft cannot be retired to evade its live consumer.
+        cr.apply_native(cap_entry(operation='revise',operation_id='pending-withdrawal-retire',
+            revision=old['revision']+1,expected_sha256=old['sha256'],interfaces=[]),
+            OPERATOR,self.area,self.path.parent/'area',operators=[OPERATOR])
+        draft=cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR])['proposed'];before=copy.deepcopy(self.area.rows)
+        with self.assertRaisesRegex(ValueError,'live accepted revision'):
+            cr.apply_native({'schema_version':1,'operation':'retire','operation_id':'refuse-pending-withdrawal',
+                'key':cap['key'],'revision':draft['revision'],'record_sha256':draft['sha256'],
+                'successor':'party.successor','acceptance_state':'superseded','acceptance':acceptance()},
+                OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        self.assertEqual(before,self.area.rows);self.assertEqual(1,len(self.context().usage()[0]))
+        self.apply(payload(operation='revise',operation_id='interface-after-refused-party',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        with self.assertRaisesRegex(ValueError,'current consumers'):self.accept(operation='interface-still-protected')
+
+    def test_duplicate_release_cannot_drop_the_only_accepted_consumer(self):
+        self.apply(payload());self.accept();self.area.actor=OPERATOR
+        cap=cap_entry(operation='draft',operation_id='duplicate-protected-consumer',
+            interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        result=cr.apply_native(cap,OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        with self.assertRaisesRegex(ValueError,'not duplicated'):
+            cr.KIND.release(self.path.parent/'area',result['native_id'],OPERATOR,'probe duplicate',self.area,
+                operators=[OPERATOR],duplicate=True)
+        other=RefNative();other.actor='other';other_path=self.path.parent/'duplicate';other_path.mkdir()
+        made=cr.apply_native(cap_entry(operation_id='other-duplicate'), 'other',other,other_path,operators=[OPERATOR])
+        duplicate=copy.deepcopy(other.row(made['native_id']));duplicate['id']='cap-duplicate-1';self.area.rows.append(duplicate)
+        before=copy.deepcopy(self.area.rows)
+        for override in (False,True):
+            with self.subTest(set_aside_evidence=override),self.assertRaises(ValueError):
+                cr.KIND.release(self.path.parent/'area',result['native_id'],OPERATOR,'probe duplicate',self.area,
+                    operators=[OPERATOR],duplicate=True,set_aside_evidence=override)
+            self.assertEqual(before,self.area.rows)
+        cr.KIND.release(self.path.parent/'area',duplicate['id'],OPERATOR,'remove draft duplicate',self.area,
+            operators=[OPERATOR],duplicate=True)
+        usage,coverage=self.context().usage();self.assertTrue(coverage['complete']);self.assertEqual(1,len(usage))
+
+    def _probe_capability_retire_reconcile(self,after):
+        from unittest.mock import patch
+        self.apply(payload());self.accept();self.area.actor=OPERATOR
+        cap=cap_entry(operation='draft',operation_id='reconcile-consumer',
+            interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        made=cr.apply_native(cap,OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        cr.apply_native(cap_entry(operation_id='reconcile-successor',key='reconcile.successor'),OPERATOR,self.area,self.path.parent/'area',operators=[OPERATOR])
+        old=cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR])['record'];original=self.area.__class__.__call__
+        def cut(native,args):
+            if args[:2]==['comments','add'] and len(args)>3:
+                record=cr.parse_entry(args[3])
+                if record and record['acceptance_state']=='superseded':
+                    if after:original(native,args)
+                    raise RuntimeError('retirement revision cut')
+            return original(native,args)
+        with patch.object(self.area.__class__,'__call__',cut),self.assertRaisesRegex(RuntimeError,'retirement revision cut'):
+            cr.apply_native({'schema_version':1,'operation':'retire','operation_id':'probe-retire-reconcile','key':cap['key'],
+                'revision':old['revision'],'record_sha256':old['sha256'],'successor':'reconcile.successor',
+                'acceptance_state':'superseded','acceptance':acceptance()},OPERATOR,self.area,self.path.parent/'area',
+                operator=True,operators=[OPERATOR])
+        before=copy.deepcopy(self.area.rows);count=len(self.context().usage()[0]);self.assertEqual(0 if after else 1,count)
+        cr.reconcile(self.path.parent/'area','probe-retire-reconcile',OPERATOR,'confirm native state','complete',self.area,
+            issue_id=made['native_id'],operators=[OPERATOR])
+        self.assertEqual(before,self.area.rows);self.assertEqual(count,len(self.context().usage()[0]))
+
+    def test_retire_reconcile_cannot_hide_consumer_when_revision_never_landed(self):
+        self._probe_capability_retire_reconcile(False)
+
+    def test_retire_reconcile_only_confirms_already_landed_retirement(self):
+        self._probe_capability_retire_reconcile(True)
+
     def test_consumer_capability_acceptor_role_loss_is_incomplete_and_refuses_retirement(self):
         self.apply(payload());self.accept();record=self.entry()['record']
         uid='usr_'+'d'*16

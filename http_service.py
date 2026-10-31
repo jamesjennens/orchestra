@@ -12201,7 +12201,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = dict(fields, schema_version=1, operation_id=operation_id)
         if key_param:
             body['key'] = ctx.params['key']
-        if coordinator and command in ('accept', 'web-verify') and ctx.principal.via == 'credential':
+        if (coordinator and (command in ('accept', 'web-verify') or route_name == 'capabilities.retire')
+                and ctx.principal.via == 'credential'):
             # kittrial-5bb.407: an agent accepts or verifies only within a person owner's
             # delegation, named here; the default operation id would name no decision. The
             # endpoint checks the delegation itself, live, under the write's lock.
@@ -12209,8 +12210,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if named is None and isinstance(body.get('acceptance'), dict):
                 named = body['acceptance'].get('decision_id')
             if not isinstance(named, str) or not named.strip():
-                raise forbidden('An agent accepts or verifies a record only within a delegation: name the person '
-                              "owner's delegation decision as decision_id")
+                action = 'retires a capability' if route_name == 'capabilities.retire' else 'accepts or verifies a record'
+                raise forbidden('An agent %s only within a delegation: name the person ' % action +
+                                "owner's delegation decision as decision_id")
         body = self._normalize_record_payload(ctx, command, body, operation_id)
 
         def mutate_record():

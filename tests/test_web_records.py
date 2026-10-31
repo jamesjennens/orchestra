@@ -1074,6 +1074,76 @@ class _RecordsScenarioMixin:
         self.assertTrue(parsed.pointers)
         self.assertTrue(parsed.waiting)
 
+    def run_capability_retirement_authority_suite(self):
+        harness=self.harness;people=self._setup_actors(harness);pid=self.pid
+        coord1,coord2=people['coord1'],people['coord2'];agent=people['coord1_agent']
+        granted=harness.request('PUT',f'/v1/projects/{pid}/agents/{agent["id"]}/coordinator',{},token=self.owner_token)
+        self.assertEqual(200,granted.status,granted.data)
+        def propose(key,token=None):
+            body=_valid_cap_propose(key,name=key);body['aliases']=[key+'.alias']
+            body['interfaces']=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}]
+            r=harness.request('POST',f'/v1/projects/{pid}/capabilities',body,token=token or coord1['token'],key='propose-'+key)
+            self.assertEqual(201,r.status,r.data);return r.data
+        def accept(key,draft):
+            r=harness.request('POST',f'/v1/projects/{pid}/capabilities/{key}/accept',
+                {'expected_revision':draft['revision'],'record_sha256':draft['sha256'],'evidence':'Reviewed consumer.'},
+                token=coord2['token'],key='accept-'+key)
+            self.assertEqual(200,r.status,r.data);return r.data
+        def retire(key,record,token,label,decision=None):
+            body={'expected_revision':record['revision'],'record_sha256':record['sha256'],
+                  'successor':'retire.successor','evidence':'Reviewed retirement.'}
+            if decision is not None:body['decision_id']=decision
+            return harness.request('POST',f'/v1/projects/{pid}/capabilities/{key}/retire',body,token=token,key=label)
+        def snapshot():
+            if (self.root/'canonical.json').exists():
+                return json.dumps(json.loads((self.root/'canonical.json').read_text())['rows'],sort_keys=True)
+            import record_json
+            raw=self.r.bd('export','--all');self.assertEqual(0,raw.returncode,raw.stderr)
+            return json.dumps(sorted(record_json.loads_rows(raw.stdout),key=lambda r:r['id']),sort_keys=True)
+        propose('retire.successor')
+        draft=propose('retire.draft');before=snapshot()
+        refused=retire('retire.draft',draft,coord2['token'],'refuse-draft')
+        self.assertEqual(422,refused.status,refused.data);self.assertIn('live accepted revision',refused.data['error']['message'])
+        self.assertEqual(before,snapshot())
+        live=accept('retire.draft',draft);before=snapshot()
+        from unittest.mock import patch
+        with patch.object(harness.backend,'invoke',wraps=harness.backend.invoke) as invoked:
+            refused=retire('retire.draft',live,agent['token'],'refuse-no-delegation')
+            invoked.assert_not_called()
+        self.assertEqual(403,refused.status,refused.data);self.assertIn('within a delegation',refused.data['error']['message'])
+        self.assertEqual(before,snapshot())
+        # Bypass the HTTP route and ask the canonical backend directly.
+        with self.assertRaises(http_service.HttpError) as denied:
+            harness.backend.invoke('capabilities.retire',harness.service.authenticate(agent['token']),pid,
+                {'command':'retire','body':{'schema_version':1,'operation_id':'direct-retire-no-delegation',
+                 'key':'retire.draft','revision':live['revision'],'record_sha256':live['sha256'],
+                 'successor':'retire.successor','acceptance_state':'superseded',
+                 'acceptance':{'decision_id':'not-a-delegation','owners':['account:'+coord1['uid']],
+                  'approvers':['account:'+coord1['uid']],'policy':'any-owner','evidence':'Direct refusal.'}}},
+                'direct-retire-no-delegation',capability=http_service.CAP_COORDINATE)
+        self.assertEqual(403,denied.exception.status);self.assertIn('delegat',str(denied.exception).lower())
+        self.assertEqual(before,snapshot())
+        decision=self._delegate(harness,title='Delegated capability retirement',scope=('capabilities',))
+        allowed=retire('retire.draft',live,agent['token'],'delegated-retire',decision)
+        self.assertEqual(200,allowed.status,allowed.data);self.assertEqual('superseded',allowed.data['state'])
+        before=snapshot();replayed=retire('retire.draft',live,agent['token'],'delegated-retire',decision)
+        self.assertEqual(200,replayed.status,replayed.data);self.assertEqual(before,snapshot())
+        own=accept('retire.agent-own',propose('retire.agent-own',agent['token']));before=snapshot()
+        refused=retire('retire.agent-own',own,agent['token'],'agent-own-retire',decision)
+        self.assertEqual(403,refused.status,refused.data);self.assertEqual(before,snapshot())
+        # People face exactly the acceptance independence rule on retirement too.
+        live=accept('retire.party',propose('retire.party'))
+        with harness.service.store.lock:
+            harness.service.approval_by_another_party=True
+            harness.service.state.setdefault('settings_seen',{})['approval_by_another_party']=True
+            harness.service.store.save()
+        before=snapshot();refused=retire('retire.party',live,coord1['token'],'person-own-party-retire')
+        self.assertEqual(403,refused.status,refused.data);self.assertEqual(before,snapshot())
+        refused=retire('retire.party',live,agent['token'],'delegated-own-party-retire',decision)
+        self.assertEqual(403,refused.status,refused.data);self.assertEqual(before,snapshot())
+        allowed=retire('retire.party',live,coord2['token'],'person-independent-retire')
+        self.assertEqual(200,allowed.status,allowed.data);self.assertEqual('superseded',allowed.data['state'])
+
     def run_delegation_suite(self, plant=None):
         """Delegated decision rights (kittrial-5bb.407), one case per adversarial condition.
 
@@ -2106,6 +2176,9 @@ class StrictWebRecordsTests(_RecordsScenarioMixin, unittest.TestCase):
     def test_delegated_record_acceptance(self):
         self.run_delegation_suite()
 
+    def test_capability_retirement_requires_live_acceptance_delegation_and_party(self):
+        self.run_capability_retirement_authority_suite()
+
     def test_design_document_upload_and_its_body_limits(self):
         self.run_design_document_suite()
 
@@ -2241,6 +2314,10 @@ class NativeDelegationTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
         reg = self.harness.request('POST', '/v1/projects', {'project_id': self.pid, 'name': 'Native Delegations'},
                                    token=self.owner_token)
         self.assertEqual(reg.status, 201, reg.data)
+
+    def test_native_capability_retirement_requires_live_acceptance_delegation_and_party(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_capability_retirement_authority_suite()
 
     def test_native_delegated_record_acceptance(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
