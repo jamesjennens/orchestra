@@ -264,15 +264,21 @@ greeting=json.loads(f.readline());f.write((json.dumps({'request':json.loads(sys.
         self.assertEqual(422,result['host_notes_status'])
 
     def test_cached_notes_are_not_a_fallback_for_an_unreadable_store(self):
-        self.send_host()
+        note = self.send_host()['note']
         state = self.service.store.path; mode = state.stat().st_mode & 0o777
         state.chmod(0)
         try:
-            for operation in ('inbox','sent','wait'):
-                with self.subTest(operation=operation), self.assertRaises(hn.Refusal) as e:
-                    self.host([operation] + (['--timeout','0'] if operation=='wait' else []),project='north')
+            operations = [['inbox'], ['sent'], ['wait', '--timeout', '0'],
+                          ['send', '--to', 'prog', '--request-id', 'unreadable-send'],
+                          ['reply', note['id'], '--to', 'prog', '--request-id', 'unreadable-reply'],
+                          ['noted', note['id'], '--request-id', 'unreadable-noted']]
+            for args in operations:
+                with self.subTest(operation=args[0]), self.assertRaises(hn.Refusal) as e:
+                    self.host(args, project='north', text=TEXT if args[0] in ('send', 'reply') else None)
                 self.assertEqual(503,e.exception.status);self.assertNotIn(TEXT,str(e.exception))
         finally:state.chmod(mode)
+        self.assertEqual(1, len(self.service._notes()))
+        self.assertIsNone(self.service._notes()[0]['settled'])
         self.assertEqual(TEXT,self.host(['inbox'],project='north')['items'][0]['text'])
 
     def test_failure_logs_errors_audit_and_adapter_files_never_copy_text_or_receipts(self):
