@@ -2315,10 +2315,6 @@ class NativeDelegationTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
                                    token=self.owner_token)
         self.assertEqual(reg.status, 201, reg.data)
 
-    def test_native_capability_retirement_requires_live_acceptance_delegation_and_party(self):
-        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
-        self.run_capability_retirement_authority_suite()
-
     def test_native_delegated_record_acceptance(self):
         self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
 
@@ -2333,6 +2329,18 @@ class NativeDelegationTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCa
             self.assertEqual(planted.returncode, 0, planted.stderr)
             return issue
         self.run_delegation_suite(plant=plant)
+
+
+@unittest.skipIf(fixture.endpoint is None, 'endpoint imports fcntl (POSIX-only)')
+@unittest.skipIf(fixture.BD is None, 'no real bd binary (set ORCHESTRA_BD_BIN or put bd on PATH)')
+class NativeCapabilityRetirementTests(_RecordsScenarioMixin, RulesHelpers, unittest.TestCase):
+    """Own native runtime: retirement delegations must not leak into the delegation suite."""
+
+    setUp = NativeDelegationTests.setUp
+
+    def test_native_capability_retirement_requires_live_acceptance_delegation_and_party(self):
+        self.deployment(operators=['ops'], coordinator_writes=True, independent_approval=False)
+        self.run_capability_retirement_authority_suite()
 
 
 class DeriveAttestedVsTrustedTests(unittest.TestCase):
