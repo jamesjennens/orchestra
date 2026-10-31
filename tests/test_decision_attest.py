@@ -552,11 +552,12 @@ class ApplyTests(Case):
 
     def test_a_recovery_is_the_newest_even_if_the_clock_went_back(self):
         native = Native(row_of('T1.'))
+        self.seq = 30
         record = self.write(native, OWNER)['record']
         (self.journal / da.JOURNAL_DIR / (record['sha256'] + '.json')).unlink()
-        self.seq = 0            # the next record's time is earlier than the comment's
+        self.seq = 0            # the next record's time is well before the comment's
         recovered = self.write(native, OWNER)['record']
-        self.assertEqual(record['at'], recovered['at'])
+        self.assertEqual(record['at'], recovered['at'], 'it takes the newest time the row states')
         self.assertEqual('counts', self.reads(native.rows['north-1'])['state'])
 
     def test_only_an_unhonoured_comment_asks_for_an_owner(self):
