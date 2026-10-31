@@ -595,6 +595,18 @@ class RespondRouteCase(TeamHarness):
                                contribution=brief['review']['contribution']['id'])
         self.assertEqual(201, approved.status, approved.data)
 
+    def test_approval_refusal_names_assignee_response_and_reread(self):
+        from review_workflow import unresolved_changes_approval_refusal
+        brief = self.brief()
+        refused = self.review(self.olive, 'approve',
+                              contribution=brief['review']['contribution']['id'])
+        self.assertEqual(409, refused.status, refused.data)
+        expected = ('Cannot approve while requested changes remain unresolved: the task assignee (%s) '
+                    'must use operation respond for every open item, then the reviewer must reread the current '
+                    'review before approving.' % self.ids['carl'])
+        self.assertEqual(expected, refused.data['error']['message'])
+        self.assertEqual(expected, unresolved_changes_approval_refusal(self.ids['carl']))
+
     def test_respond_before_a_revision_is_allowed(self):
         brief = self.brief()
         done = self.respond(self.carl, brief, brief['review']['requests'],
