@@ -537,8 +537,11 @@ class InterfaceCase(unittest.TestCase):
     def test_honoured_retired_anchor_release_does_not_claim_historical_preservation(self):
         source=self._duplicate_consumer();self._retire_before_duplicate(source)
         other=self._approved_duplicate(source);self.area.actor=OPERATOR
-        result=cr.KIND.release(self.path.parent/'area',source,OPERATOR,'Already retired before the duplicate',self.area,
-            operators=[OPERATOR],duplicate=True,set_aside_evidence=True)
+        try:
+            result=cr.KIND.release(self.path.parent/'area',source,OPERATOR,'Already retired before the duplicate',self.area,
+                operators=[OPERATOR],duplicate=True,set_aside_evidence=True)
+        except ValueError as error:
+            self.fail('An honoured retirement must permit duplicate repair: %s'%error)
         self.assertEqual(other['id'],result['selected_after'])
         audit=self.area.row(source)['comments'][-1]['text']
         self.assertIn('honoured retirement',audit);self.assertNotIn('interface declarations preserved',audit)
