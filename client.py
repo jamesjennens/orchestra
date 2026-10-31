@@ -218,6 +218,15 @@ def _trace_command(args,config,project,actor,out):
     object and compare its sha256 with the stored document's. `--record` files each result as an unverified
     report (`ref verify`); `--payloads FILE` writes them for `admin.py design-verify`, the trusted host route."""
     import tempfile
+    if '--program' in args:
+        # kittrial-5bb.453: the program view (PROGRAM_DESIGN.md section 5), the endpoint's `program` action; on this
+        # route the readable areas are the key's projects, or any project for an operator's unbound key.
+        if '--verify' in args:raise ValueError('trace --program and trace --verify are separate reads')
+        answer=_answer(request(config,project,actor,[token for token in args if token!='--program'],'program'))
+        text=json.dumps(answer,indent=2,ensure_ascii=False)+'\n'
+        if out:Path(out).write_text(text,encoding='utf-8')
+        else:sys.stdout.write(text)
+        return 0
     if '--verify' not in args:
         # kittrial-5bb.425: every view is answered by the server's trace read; this is a convenience over it.
         answer=_answer(request(config,project,actor,list(args),'trace'))
@@ -1617,6 +1626,8 @@ CONTRIBUTOR_COMMANDS = (
      'the trace read, answered by the server: summary, requirements, tasks, tokens, decisions, designs, round'),
     ('trace --verify [--repo DIR] [--record | --payloads FILE]',
      "check each accepted design document against git at its pinned commit (verified, design-drift)"),
+    ('trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N]',
+     "the program view of a program project: its areas, interfaces and requirements' coverage"),
     ('capability ...', 'capability records: find, get, list, validate, propose, revise, verify'),
     ('proposal ...', 'proposal records and their review'),
     ('coordinator ...', 'the coordinator reads for this project'),

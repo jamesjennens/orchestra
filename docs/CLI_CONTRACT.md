@@ -1646,6 +1646,18 @@ sets `operation`.
     state. Since kittrial-5bb.449 the index takes qualified `design:` tokens, and `req:/x`, `req:A/` and
     `req:A/@3` (an empty project or key) are prose, so a document accepted before that holds either reads
     `differs` until it is accepted again. Anything that is not a readable repo-document revision answers `Design not found`.
+  - `trace --program [--offset N] [--limit N] [--idle-minutes N] [--requirements-offset N]` (kittrial-5bb.453)
+    is the program view of a program project, the endpoint action `program` (PROGRAM_DESIGN.md §5): `areas`
+    (link state; for a readable area `open_tasks`, `lanes` and `rows_read`; otherwise `visible: false` and "not
+    visible to you"), `interfaces` (`not-available` until slice 3), `requirements` (`no-area-cites`,
+    `cites-superseded-revision`, 50 rows a page), `decisions` (kittrial-5bb.454: each program decision with a
+    `Binds:` line, its `attestation_id`, its flags (`closed`, `not-attested`, `attestation-stale`, `attester-not-authorised`, or why it does
+    not count), and per bound area `adopted`, `not-adopted`, `adoption-invalid` with the reason, `adoption-stale`, what an adoption reads
+    as when it does not count, `superseded-upstream`, `not-visible`, `not-in-program` or `not-checked`;
+    `--decisions-offset N`), `suggestions`
+    (open tasks labelled `suggestion`, oldest first, with their `From:` line; `--suggestions-offset N`) and
+    `coverage`. At most 50 areas a read. The readable areas are the key's projects, or any project for an
+    operator's unbound key; an area outside a bound key's projects is `not-checked` and is never read.
   - `trace VIEW [--scope SCOPE] [--offset N] [--limit N] [--generation G]` (kittrial-5bb.425) is the
     trace read, answered by the server from records alone (no repository, no blob read); the client
     passes it to the endpoint action `trace` and prints the answer. Views: `summary` (the Coverage
@@ -2046,6 +2058,19 @@ and a person owner records one on the web (`POST /v1/projects/{id}/delegations`)
 agent holding the project's coordinator grant and whether a delegation in force covers it. An
 agent's web acceptance of a reference or capability record names its delegation as
 `decision_id` (docs/HTTP_DEPLOYMENT.md, "Delegated record acceptance").
+
+**Attested decisions** (kittrial-5bb.454 r2; `decision_attest.py`). An operator's host routes are:
+`python3 admin.py --root ROOT decision-attest-read --project PROJECT --decision ID [--state STATE.json]` (read-only: the
+exact text, its digest and how it reads now), `python3 admin.py --root ROOT decision-attest --project PROJECT --actor
+OPERATOR --decision ID --digest DIGEST [--state STATE.json]` (attests what was read; a text that changed since is
+refused, and a row carrying `Adopts:` or `Authorises:` needs the pinned decision to count, judged against the web state, the
+deployment's own unless `--state` names one) and `python3
+admin.py --root ROOT decision-change --project PROJECT --actor OPERATOR --decision ID --change
+close|reopen|type-decision|type-task|add-decision-label|remove-decision-label [--reason TEXT]`. The last is the only
+host route for those changes on a row with an honoured attestation, or on any decision row carrying an attestation comment or a `Binds:`, `Owner-only:`, `Adopts: decision:`, `Per: decision:` or `Authorises: decision:` line: `bd close`, `reopen` and `update` with a status, type or decision-label flag are refused on every other host route, an operator's included. Any other row is unaffected, and a text edit is never refused. There is no coordinator command for these, and a raw comment cannot
+write the record: the `Kind: decision-attest-v1` prefix is reserved and is honoured only with its journal entry in
+`<project>/.decision-attests/<sha256>.json`. The web's routes and `http_client.py decision-attestation` and
+`decision-attest` are in docs/HTTP_DEPLOYMENT.md.
 
 ## `files`: a task's files over SSH
 

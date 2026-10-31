@@ -4,6 +4,7 @@ import { h, time } from '../dom.js';
 import { pageHead, empty } from '../ui.js';
 import { markdown, section, mentions } from '../md.js';
 import * as ownerView from './owner_requirements.js';
+import { attestationPanel } from './decision_attest.js';
 
 const STATE = { accepted: ['Accepted', 'ok'], draft: ['Draft', 'warn'], proposed: ['Proposed', 'accent'], rejected: ['Rejected', 'crit'] };
 const stateChip = (s) => { const [label, tone] = STATE[s] || [s, '']; return h('span', { class: 'chip ' + tone }, label); };
@@ -131,7 +132,8 @@ export async function decisions(ctx, { pid }) {
 }
 
 export async function decision(ctx, { pid, did }) {
-  const [project, data] = await Promise.all([ctx.api.project(pid), ctx.api.record(pid, did)]);
+  const [project, data, attested] = await Promise.all([ctx.api.project(pid), ctx.api.record(pid, did),
+    ctx.api.decisionAttestation(pid, did).catch(() => null)]);
   const d = data.record;
   const known = new Set(data.known || []);
   const link = linker(ctx, pid, known, data.keys);
@@ -145,6 +147,7 @@ export async function decision(ctx, { pid, did }) {
           parts.length ? parts.map(([name, v]) => h('section', { class: 'req-part' }, h('h3', { class: 'small' }, name.replace(' Considered', '')), markdown(v, { link }))) : markdown(d.description, { link }))),
         recordComments(d, link)),
       h('aside', { class: 'side', 'aria-label': 'Connections' },
+        attested ? attestationPanel(attested, async (digest) => { await ctx.api.attestDecision(pid, did, { digest }); ctx.render(); }) : null,
         data.references.length ? h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Refers to')),
           h('ul', { class: 'panel-body open-items' }, data.references.map((m) => h('li', null, link(m.id) || m.id, h('div', { class: 'small muted' }, m.title))))) : null,
         data.mentioned_by.length ? h('section', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Mentioned by')),

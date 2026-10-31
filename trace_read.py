@@ -103,12 +103,16 @@ class Snapshot:
     rule plugs in."""
 
     def __init__(self, rows, project, *, now, operators=None, verifiers=None, governance=None,
-                 members=None, exclude=None, others=None):
+                 members=None, exclude=None, others=None, authority_state=None, journal_of=None):
         from briefing import ContextPointers
         self.project = project
         #: kittrial-5bb.449: ``others(project)`` gives the resolver of a project this caller may read, None for one
         #: it may not read or that does not exist (the same answer), or 'not-checked' past the bound of targets.
         self.others = others
+        #: kittrial-5bb.454: the web state, read live, for who wrote a decision or an adoption (program_decisions).
+        self.authority_state = authority_state
+        #: kittrial-5bb.454 r2: ``journal_of(project)`` is the directory of a project's attestation journal, or None.
+        self.journal_of = journal_of
         self.now = now
         self.operators = list(operators or [])
         self.verifiers = list(verifiers or [])
@@ -204,6 +208,25 @@ class Snapshot:
 
     def requirement(self, key):
         return self.pointers.requirement(key)
+
+    def adopts(self, row):
+        """kittrial-5bb.454 (Q6): the state of a decision issue's Adopts: line, by the program view's rules. The program
+        is read only where this caller may read it (.449's loader); otherwise not-visible, with nothing else."""
+        import program_decisions
+        found = program_decisions.lines(row)['adopts']
+        if found is None:
+            return None
+        program = found[0]
+        if program == self.project:
+            program_rows = self.rows
+        else:
+            other = self.others(program) if self.others is not None else None
+            if other == 'not-checked':
+                return {'pointer': 'decision:%s/%s' % found[:2], 'state': 'not-checked'}
+            program_rows = other.loaded() if other is not None else None
+        journals = {name: self.journal_of(name) for name in (self.project, program)} if self.journal_of else None
+        return program_decisions.trace_adopts(row, self.project, self.rows, program_rows, self.authority_state,
+                                              self.operators, journals)
 
     def requirement_keys(self):
         return self.pointers.requirement_keys()
@@ -570,6 +593,9 @@ def decisions_view(snap):
         shown_designs, more_designs = bounded(cited_by)
         rows.append({'kind': 'decision', 'id': task, 'title': label(row.get('title')), 'status': row.get('status'),
                      'supersedes': supersedes, 'designs': shown_designs, 'designs_omitted': more_designs, 'flags': []})
+        adopts = snap.adopts(row)
+        if adopts is not None:
+            rows[-1]['adopts'] = adopts
     # Q5: owners' prose on work items; a structured record ("Kind: ...") is never prose. The owner filter comes
     # BEFORE the bound (review note 4), so nobody else's comments can push an owner's out of the scan.
     scan = []
@@ -942,13 +968,14 @@ def read_governance(rows, journal, project):
 
 
 def answer(rows, project, options, *, operators=None, verifiers=None, members=None, governance=None, now=None,
-           others=None):
+           others=None, authority_state=None, journal_of=None):
     """One page for the endpoint action, from rows and state already read: no I/O, so the caller builds it after
     releasing the project lock (review b2). A page asked for at another generation is refused. ``others`` reads the
     projects that this page's qualified tokens name, each under its own lock, only where the caller may read it
     (kittrial-5bb.449)."""
     snap = Snapshot(rows, project, now=snapshot_now(now), operators=operators, verifiers=verifiers,
-                    governance=governance, members=members, others=others)
+                    governance=governance, members=members, others=others, authority_state=authority_state,
+                    journal_of=journal_of)
     current = generation(snap)
     if options['generation'] is not None and options['generation'] != current:
         raise ValueError(STALE)

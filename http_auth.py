@@ -2252,6 +2252,9 @@ class Service:
         view['repository_warning'] = self.repository_warning(value) if value else None
         view['role'] = role
         view['members'] = sorted(self.state['memberships'].get(project_id, {}))
+        # kittrial-5bb.453 (Q1 at VERIFIED): whether the project has an accepted program.area side, a cached flag
+        # that only shows or hides the Program link; the page itself always checks.
+        view['program'] = bool((self.state.get('program_flags') or {}).get(project_id))
         return view
 
     def require_project(self, principal, project_id, minimum='viewer'):
@@ -3919,15 +3922,26 @@ class Service:
             return (isinstance(user, dict) and not user.get('disabled')
                     and ((self.state.get('memberships') or {}).get(project_id) or {}).get(principal.user_id) == 'owner')
 
+    def set_program_flag(self, project_id, value):
+        """The cached "this project is a program" flag of kittrial-5bb.453 (Q1 at VERIFIED): set by every program
+        read and by a web accept or retire of a program key. A stale flag only shows or hides the Program link, so
+        it is saved soon and only when it changes."""
+        with self.store.lock:
+            flags = self.state.setdefault('program_flags', {})
+            if bool(flags.get(project_id)) == bool(value):
+                return
+            if value:
+                flags[project_id] = True
+            else:
+                flags.pop(project_id, None)
+        self.store.save_soon('the program menu flag')
+
     def program_link_people(self, project_ids):
         """``(memberships, users)`` for the live owner check of program links: the roles in ``project_ids`` and each
         account's disabled flag, read in one lock. Nothing else about anyone."""
+        import program_links
         with self.store.lock:
-            everyone = self.state.get('memberships') or {}
-            memberships = {pid: dict(everyone.get(pid) or {}) for pid in project_ids}
-            users = {uid: {'disabled': bool(user.get('disabled'))}
-                     for uid, user in self.state['users'].items() if isinstance(user, dict)}
-        return memberships, users
+            return program_links.link_people(self.state, project_ids)
 
     def _may_coordinate(self, project_id, agent):
         """Whether the agent's account holds the coordinator's capabilities in the project now."""

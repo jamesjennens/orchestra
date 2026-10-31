@@ -4316,7 +4316,7 @@ OWNER_ANSWERS_JOURNAL='.owner-answers'
 #: ``<name>.tmp`` does not match the sweep's shape, so sweeping it is a no-op.
 ATOMIC_SWEEP_DIRECTORIES=('.',)+RESERVATION_JOURNALS+( '.handoffs','.handoff-recoveries',
     '.requirement-backfills','.integration-reverts','.assignee-followons','.lane-fault-clears','.lifecycle-voids',
-    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL,'.delegations')
+    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL,'.delegations','.decision-attests')
 
 def sweep_project_temporaries(root,name,*,dry_run=False,min_age_seconds=None):
     """Sweep the project directory and every atomic family in it; never touches a live write.
@@ -4377,7 +4377,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.interface-requests|\.interface-transitions|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.interface-requests|\.interface-transitions|\.open-item-requests|\.owner-answers|\.decision-attests)/[a-f0-9]{64}\.json',name)
         baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
         if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
@@ -4961,6 +4961,14 @@ def backup_project(root,name):
         for record in delegation_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Delegation journal entry must not be a symlink')
             files['.delegations/'+record.name]=record_json.loads(read_regular_text(record))
+        # The attestation journal (kittrial-5bb.454 r2). restore-new always makes a new name, and a record binds its
+        # project's name, so the rows it restores read not-attested and stand gated until an owner attests them again. The
+        # journal is carried as the evidence of what was attested, and for a record's own name should a route ever restore it.
+        attest_journal=path/'.decision-attests'
+        if attest_journal.is_symlink():raise ValueError('Attestation journal must not be a symlink')
+        for record in attest_journal.glob('*.json'):
+            if record.is_symlink():raise ValueError('Attestation journal entry must not be a symlink')
+            files['.decision-attests/'+record.name]=record_json.loads(read_regular_text(record))
         # The per-project claiming setting (kittrial-5bb.352). It lives outside the
         # tracker, so a backup that dropped it would silently open claiming again after
         # a restore. A damaged file is carried byte for byte and reads back restrictive.
@@ -6404,6 +6412,18 @@ def resolve_http_state_path(root, named=None):
         return default,'default'
     return None,None
 
+def decision_web_state(root,named):
+    """The web state an attestation is judged against (kittrial-5bb.454 r2), or None where the deployment has none, and
+    then no person's attestation counts. A file the operator named has to be there."""
+    from http_authority import read_state
+    path,_=resolve_http_state_path(root,named)
+    if path is None:return None
+    if named is not None:
+        if path.is_symlink() or not path.is_file():raise ValueError('Use the existing web service state document')
+        return read_state(path)
+    try:return read_state(path)
+    except Exception:return None
+
 def copy_sqlite_consistently(source, destination):
     """Copy a SQLite database consistently while others may use it; None or the reason.
 
@@ -7200,6 +7220,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name.startswith('.delegations/'):
             from delegations import validate_entry as validate_delegation_entry
             validate_delegation_entry(record,name.partition('/')[2])
+        elif name.startswith('.decision-attests/'):
+            from decision_attest import validate_entry as validate_attest_entry
+            validate_attest_entry(record,name.partition('/')[2])
         elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])
@@ -10469,6 +10492,17 @@ def _main():
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('delegation-record',help='grant, narrow or revoke a delegation of a decision right (operator allowlist, host journal)')
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('decision-attest',help="attest a decision's exact text (operator allowlist, host journal)")
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--decision',required=True)
+    a.add_argument('--digest',required=True,help='the digest decision-attest-read printed for the text you read')
+    a.add_argument('--state',help='the web service state document, read only, if it is not the deployment\'s own')
+    a=sub.add_parser('decision-attest-read',help="read-only: a decision's exact text, its digest and how it reads now")
+    a.add_argument('--project',required=True);a.add_argument('--decision',required=True)
+    a.add_argument('--state',help='the web service state document, read only, if it is not the deployment\'s own')
+    a=sub.add_parser('decision-change',help='close, reopen, retype or relabel a decision that carries an attestation (operator allowlist)')
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--decision',required=True)
+    a.add_argument('--change',required=True,choices=('close','reopen','type-decision','type-task','add-decision-label','remove-decision-label'))
+    a.add_argument('--reason')
     a=sub.add_parser('delegation-check',help='read-only: the delegations of a project and which granted coordinator agents they cover')
     a.add_argument('--project',required=True)
     a.add_argument('--state',required=True,help='the existing web service state document (read only)')
@@ -10841,7 +10875,18 @@ def _main():
                    help='set the high-water mark to the current clock and clear clock suspicion (after a clock correction)')
     a.add_argument('--stats',action='store_true',
                    help='report the journal size (rows by state, bytes on disk, bounds); this is the default inspection')
-    args=p.parse_args();root=root_path(args.root)
+    args=p.parse_args()
+    # kittrial-5bb.454 (the trust boundary): no host command acts under an HTTP-shaped actor or a look-alike. Asked
+    # first, before the root or anything else is looked at, of the value of the command's own --actor option however
+    # it was spelled (a command's positional name, such as the verifier that `verifiers add` names, is not its actor).
+    from reserved_comments import refuse_http_actor
+    chosen=p._subparsers._group_actions[0].choices.get(args.command)
+    for action in (chosen._actions if chosen is not None else []):
+        value=getattr(args,action.dest,None) if '--actor' in action.option_strings else None
+        if isinstance(value,str):
+            try:refuse_http_actor(value,False)
+            except ValueError as error:raise ValueError('Invalid operator identity: %s'%error) from None
+    root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
     elif args.command=='finish-project':
@@ -11154,6 +11199,66 @@ def _main():
             require_configured_operator(args.actor,operators(root,strict=True),'record a delegation')
             print(json.dumps(delegations.apply(payload,project=args.project,journal=path,run=run,recorded_by=args.actor,
                                                via='operator',account=None,at=server_time()),ensure_ascii=False))
+    elif args.command=='decision-attest':
+        # The operator's host route for an attestation (kittrial-5bb.454 r2); the SAME decision_attest.apply the web route
+        # calls, under the same project lock, after the same operator check. The record says via operator.
+        import fcntl
+        import decision_attest
+        from keyed_records import require_configured_operator
+        from http_authority import server_time
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        require_configured_operator(args.actor,operators(root,strict=True),'attest a decision')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        payload={'schema_version':1,'operation_id':'operator-'+secrets.token_hex(16),'decision':args.decision,'digest':args.digest}
+        # An operator reads any project. Before this project's lock, so that no lock is held across projects.
+        state=decision_web_state(root,args.state)
+        def pinned_decision(other,issue):
+            try:other_path=project_dir(root,other)
+            except ValueError:return None
+            if not (other_path/'.beads/metadata.json').is_file():return None
+            def run_other(argv):return run_bd(root,other,argv)
+            return decision_attest.pin_fact(decision_attest.read_issue(run_other,issue),other,state,operators(root),other_path)
+        before=decision_attest.read_issue(lambda argv:run_bd(root,args.project,argv),args.decision)
+        pinned=decision_attest.read_pins(before,pinned_decision) if isinstance(before,dict) else {}
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            # Read again under the lock: the library's own check refuses an actor taken off the list since.
+            listed=operators(root,strict=True)
+            print(json.dumps(decision_attest.apply(payload,project=args.project,journal=path,run=run,author=args.actor,
+                                                   via='operator',at=server_time(),state=state,operators=listed,
+                                                   pinned=pinned),ensure_ascii=False))
+    elif args.command=='decision-attest-read':
+        # Read-only (kittrial-5bb.454 r2): what an operator reads before attesting. Nothing is written; no lock is taken.
+        import decision_attest
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        state=decision_web_state(root,args.state)
+        def run(argv):return run_bd(root,args.project,argv)
+        print(json.dumps(decision_attest.read_answer(decision_attest.read_issue(run,args.decision),args.project,state,
+                                                     operators(root),path),ensure_ascii=False))
+    elif args.command=='decision-change':
+        # The one route on the host for what the gate refuses every other host route (kittrial-5bb.454 r2, Q1). An operator
+        # only, under the project lock. A retype changes the digest, so it reads attestation-stale until it is attested again.
+        import fcntl
+        from keyed_records import require_configured_operator
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        require_configured_operator(args.actor,operators(root,strict=True),'change an attested decision')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        argv={'close':['close',args.decision]+(['--reason',args.reason] if args.reason else []),
+              'reopen':['reopen',args.decision]+(['--reason',args.reason] if args.reason else []),
+              'type-decision':['update',args.decision,'--type','decision'],
+              'type-task':['update',args.decision,'--type','task'],
+              'add-decision-label':['update',args.decision,'--add-label','decision'],
+              'remove-decision-label':['update',args.decision,'--remove-label','decision']}[args.change]
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            require_configured_operator(args.actor,operators(root,strict=True),'change an attested decision')
+            print(run_bd(root,args.project,['--actor',args.actor,*argv,'--json']))
     elif args.command=='delegation-check':
         # Read-only (kittrial-5bb.407): before a release that requires a delegation for every
         # agent acceptance, list each agent holding this project's coordinator grant and the

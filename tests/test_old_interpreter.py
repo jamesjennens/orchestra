@@ -56,6 +56,9 @@ MODULES = ('actor_names.py', 'agent_prompts.py', 'artifacts.py', 'assignee_names
            'host_reads.py', 'http_auth.py', 'http_authority.py', 'interface_lock.py', 'interface_records.py',
            'keyed_entries.py', 'keyed_records.py', 'lane_state.py', 'lanes.py', 'lifecycle_audit.py', 'nudges.py', 'lifecycle_voids.py', 'native.py', 'nudge_messages.py', 'onboarding.py', 'open_items.py',
            'program_links.py',  # kittrial-5bb.446: library-only (no __main__ block); imported by reference_records and http_service
+           'decision_attest.py',  # kittrial-5bb.454 r2: library-only
+           'program_decisions.py',  # kittrial-5bb.454: library-only (no __main__ block); imported by program_view's callers and trace_read
+           'program_view.py',  # kittrial-5bb.453: library-only (no __main__ block); imported by endpoint and http_service
            'project_coordination.py', 'project_creation.py', 'project_setup.py', 'proposal_records.py', 'raw_lifecycle.py', 'read_cache.py', 'record_acceptance.py', 'record_json.py', 'recovery.py', 'regular_file.py',
            'reference_records.py', 'render.py', 'requirement_baseline_http.py', 'requirement_baseline_records.py',
            'requirement_baselines.py', 'requirement_brd.py', 'requirement_governance.py', 'requirement_http.py',

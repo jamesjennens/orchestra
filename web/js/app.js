@@ -14,6 +14,7 @@ import * as agents from './views/agents.js';
 import * as setup from './views/setup.js';
 import * as handover from './views/handover.js';
 import * as notes from './views/notes.js';
+import * as program from './views/program.js';
 import * as how from './views/how.js';
 import * as rooms from './views/rooms.js';
 import * as releases from './views/releases.js';
@@ -23,7 +24,7 @@ import * as trace from './views/trace.js';
 // Route name -> view. Patterns live in routes.js (shared ID pattern, testable).
 const VIEWS = {
   home: work.home, welcome: work.welcome, projects: work.directory, agents: agents.list, agentSetup: agents.setupWizardPage,
-  project: project.overview, reviews: project.reviews, releases: releases.page, feedback: project.feedback, settings: project.settings, setup: setup.page, handover: handover.page, notes: notes.page, how: how.page,
+  project: project.overview, reviews: project.reviews, releases: releases.page, feedback: project.feedback, settings: project.settings, setup: setup.page, handover: handover.page, notes: notes.page, program: program.page, how: how.page,
   newTask: task.create, task: task.detail,
   lanes: project.lanesPage,
   requirements: reqs.brd, requirement: reqs.requirement, decisions: reqs.decisions, decision: reqs.decision, record: reqs.record,
@@ -113,6 +114,8 @@ export async function start(root, options = {}) {
             ctx.features.records ? link('/p/' + pid + '/decisions', 'Decisions') : null,
             link('/p/' + pid + '/rooms', 'Rooms'),
             link('/p/' + pid + '/lanes', 'Lanes'),
+            // kittrial-5bb.453: only on a project with an accepted program.area side (the server's cached flag).
+            program.showsProgram(current) ? link('/p/' + pid + '/program', 'Program') : null,
             link('/p/' + pid + '/feedback', 'Orchestra feedback'),
             link('/p/' + pid + '/settings', 'Members & settings'),
             ['owner', 'superuser'].includes(current.role) ? link('/p/' + pid + '/setup', 'Set up') : null,
