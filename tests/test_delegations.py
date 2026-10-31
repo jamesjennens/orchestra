@@ -346,17 +346,38 @@ class DelegationTests(unittest.TestCase):
                 self.assertEqual(before, json.dumps(self.row(), sort_keys=True))
                 self.row()['comments'].pop()
 
-    def test_older_unhonoured_history_does_not_override_later_honoured_restriction(self):
+    def test_older_unhonoured_history_cannot_be_assumed_harmless(self):
         old = d.make_record(request(action='revoke', operation_id='old'), project=PROJECT,
                             recorded_by=OWNER, via='session', account=OWNER, at=AT[0])
         self.write(request(), at=AT[1])
         self.write(request(action='narrow', scope=('references',), operation_id='narrow'), at=AT[2])
         self.native.comment('pp-dec', d.body(old), author=OWNER)
         live, reason = d.current(self.row(), PROJECT, state(), self.project, ['ops'])
-        self.assertIsNotNone(live, reason)
-        self.assertEqual(['references'], live['scope'])
-        self.refused('covers references, not capabilities', kind='capabilities')
+        self.assertIsNone(live)
+        self.assertIn('unhonoured', reason)
+        self.refused('unhonoured comment', kind='capabilities')
         self.assertEqual((True, False), d.reading(self.row(), PROJECT, self.project)[1:])
+
+    def test_lost_older_grant_never_turns_an_ambiguous_history_into_authority(self):
+        first = self.write(request())
+        second = d.make_record(request(operation_id='second'), project=PROJECT, recorded_by=OWNER,
+                               via='session', account=OWNER, at=AT[2])
+        self.native.comment('pp-dec', d.body(second), author=OWNER)
+        d.publish(self.project, second)
+        self.refused('more than one delegation grant')
+        (self.project / d.JOURNAL_DIR / (first['record']['sha256'] + '.json')).unlink()
+        self.refused('unhonoured comment')
+
+    def test_lost_older_revoke_never_revives_a_later_legacy_narrowing(self):
+        self.write(request())
+        revoked = self.write(request(action='revoke', operation_id='revoke'), at=AT[2])
+        later = d.make_record(request(action='narrow', operation_id='legacy', scope=('references',)),
+                              project=PROJECT, recorded_by=OWNER, via='session', account=OWNER, at=AT[3])
+        self.native.comment('pp-dec', d.body(later), author=OWNER)
+        d.publish(self.project, later)
+        self.refused('was revoked')
+        (self.project / d.JOURNAL_DIR / (revoked['record']['sha256'] + '.json')).unlink()
+        self.refused('unhonoured comment')
 
     def test_tied_timestamp_native_id_and_reordered_comments_agree(self):
         self.write(request())

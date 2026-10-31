@@ -275,9 +275,10 @@ def reading(row, project, journal):
     issue, AND its host journal entry exists under ``journal`` (the project directory).
     Ordered by the record's own server time, then the native comment id, so the order never
     depends on how a native read happens to list comments. An unhonoured comment is
-    evidence of uncertainty, never authority. One newer than the last honoured record
-    blocks reliance on that record; an unreadable time/order is conservatively newer.
-    Losing a restriction's receipt must not restore the earlier grant or scope.
+    evidence of uncertainty, never authority. The ordering flag diagnoses newer
+    evidence; authorization refuses ANY unhonoured record, since losing an older
+    grant or revoke can also restore authority in an ambiguous/legacy history.
+    An unreadable time/order is conservatively newer.
     """
     decision = row.get('id') if isinstance(row, dict) else None
     out, others = [], []
@@ -346,9 +347,12 @@ def current(row, project, state, journal, operators=None, owners=None):
     restricting a right never needs current standing, so a demoted owner's revocation holds.
     A narrowing must name the same right and grantee and a strict subset of the scope.
     """
-    records, _unhonoured, newer = reading(row, project, journal)
-    if newer:
-        return None, ('the delegation on decision %s has a newer or unreadable unhonoured comment; '
+    records, unhonoured, _newer = reading(row, project, journal)
+    # Even an older missing grant can turn a two-grant ambiguity into authority;
+    # an older revoke must not disappear behind a later (legacy) narrowing.
+    # No unhonoured delegation comment can be proved harmless from its own text.
+    if unhonoured and records:
+        return None, ('the delegation on decision %s has an unhonoured comment; '
                       'record a new decision to delegate again' % row.get('id'))
     if not records:
         return None, 'no delegation is recorded on decision %s' % row.get('id')
@@ -426,8 +430,8 @@ def check_write(payload, row, *, project, journal):
     if not is_decision_issue(row):
         raise DelegationRefusal(422, 'Issue %s is not a decision issue; record the delegation on a decision'
                                 % payload['decision'])
-    records, unhonoured, newer = reading(row, project, journal)
-    if newer or (unhonoured and not records):
+    records, unhonoured, _newer = reading(row, project, journal)
+    if unhonoured:
         raise DelegationRefusal(409, 'Decision %s has unhonoured delegation evidence; '
                                 'record a new decision to delegate again' % payload['decision'])
     if payload['action'] == 'grant':

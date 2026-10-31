@@ -484,10 +484,12 @@ python3 admin.py --root /path/to/root delegation-check --project PROJECT --state
 
 **A missing or unfinished restriction never restores authority.** Each grant, narrowing and
 revocation is a comment plus its host journal entry; only the pair grants authority. If a
-newer delegation comment has no matching journal entry (loss, damage, or failure between
+delegation comment has no matching journal entry (loss, damage, or failure between
 comment and publication), the decision grants nothing, including its earlier wider scope.
 An unreadable ordering also fails closed. The list and `delegation-check` explain the
-unhonoured evidence. Older unhonoured evidence does not supersede a later honoured restriction.
+unhonoured evidence. Older evidence is not assumed harmless: losing an older grant from an
+ambiguous two-grant history, or an older revoke before a legacy narrowing, must not grant
+authority either. A damaged decision therefore stays inert regardless of comment order.
 
 **Recovery:** first read the decision and reconcile the error/unknown outcome; do not delete
 its comments or fabricate a receipt to resurrect the old grant. A current person owner uses
