@@ -77,7 +77,7 @@ class RecordVersionTests(AttestationCase):
         # This kit reads both versions as supported records, and a v2-only row is an anchor.
         self.assertEqual(reserved_comments.record_comment_kind(body), ('reference-entry', 2, 'supported'))
         self.assertEqual(reserved_comments.record_comment_kind('Kind: reference-entry-v4\n{}')[2], 'unsupported')
-        self.assertEqual(reserved_comments.record_comment_kind('Kind: capability-entry-v2\n{}')[2], 'unsupported')
+        self.assertEqual(reserved_comments.record_comment_kind('Kind: capability-entry-v2\n{}')[2], 'supported')
         self.assertTrue(reserved_comments.is_record_anchor(self.native.row('ref-1')))
 
     def test_one_form_per_content_the_version_and_the_authority_must_agree(self):
@@ -360,7 +360,7 @@ class VoidTests(AttestationCase):
         self.assertEqual(self.get()['state'], 'draft-only')
         self.assertTrue(recovery.claims_kind(V2 + '{}', 'reference-entry'))
         self.assertFalse(recovery.claims_kind('Kind: reference-entry-v4\n{}', 'reference-entry'))
-        self.assertFalse(recovery.claims_kind('Kind: capability-entry-v2\n{}', 'capability-entry'))
+        self.assertFalse(recovery.claims_kind('Kind: capability-entry-v3\n{}', 'capability-entry'))
 
 
 class BatchTests(AttestationCase):

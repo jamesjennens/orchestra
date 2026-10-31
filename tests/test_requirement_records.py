@@ -1038,7 +1038,7 @@ class RequirementOperatorAllowlistTests(unittest.TestCase):
         self.addCleanup(env.stop)
         self.flock = Mock()
         self.patcher = patch.dict(sys.modules,
-                                  {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)})
+                                  {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
 

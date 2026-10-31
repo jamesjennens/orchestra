@@ -683,3 +683,14 @@ b list --label review-ready --limit 0 --json
 This label means ready for review, not reviewed, accepted, integrated or deployed. Record the six lifecycle facts independently. If changes are requested, evidence fails or the deliverable becomes inaccessible, append the reason, remove the label with `update TASK --remove-label review-ready --json`, and checkpoint the next action. Remove it after integration too. A separately scoped implementation task may close only under the project's agreement with a linked remaining review/integration task; label that open task so it stays discoverable.
 
 Report/label/checkpoint writes are separate operations. After interruption, inspect and reconcile partial updates; never infer a complete handoff merely from the label.
+
+For a program's interface register, use the JSON catalog/`interface list|get` and
+pinned `iface:<program>/<key>@<revision>` tokens. Declare provides/consumes on
+capability v2 records with the `interfaces` list; v1 history remains byte-identical.
+A pending capability draft does not withdraw an accepted consumer. Schema checking
+is not implemented in slice 3a: `compatibility-unverified` is explicit, not a pass.
+Retiring an interface needs the acceptor's complete readable area view and no
+consumer; no owner-decision override exists yet. A busy write is retried with the
+same identity. Cross-entry new-major/deprecation recovery is an operator concern;
+never hide an uncertain result by sending a new operation id. None of this grants
+access to another area's private records or registers a running process.

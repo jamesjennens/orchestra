@@ -4720,3 +4720,20 @@ nothing from disk).
   (`"The delivered bundle does not match its recorded checksum."`) with zero bytes sent. Every
   bundle download and every post-authorization refusal records a `delivery.bundle.read` entry in
   the HTTP audit log.
+
+### Program interfaces (slice 3a)
+
+The canonical backend serves `GET /v1/projects/{pid}/interfaces` (paged at 50)
+and `GET .../interfaces/{key}` at CAP_READ. Proposal/revision are
+`POST .../interfaces`, `PATCH .../interfaces/{key}` or
+`POST .../interfaces/{key}/revisions`; acceptance is
+`POST .../interfaces/{key}/accept`. All writes use Idempotency-Key and the shared
+record body's revision/hash/F3 conventions. See CLI_CONTRACT's **Program interface
+register** for the closed fields, lifecycle distinction and pinned `iface:` syntax.
+The defining area's coordinator proposes with program proposal standing; the
+program coordinator accepts, with an interfaces-scoped owner delegation for agents.
+No link adds membership or read permission. A complete readable, consumer-free view
+is required to accept a state-only retirement; no override is implemented. Schemas
+are pointers/digests, never automatically fetched, and compatibility reads unverified.
+The deployment mutation lock precedes project locks; busy is 503, not an indefinite
+wait. The isolation harness includes catalog/detail and all interface route names.

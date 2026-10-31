@@ -730,6 +730,8 @@ lane: the worker carries the payload as a file in the delivery, the reviewer jud
 the coordinator writes it after integration (§13.1). Nothing else in the index is a
 contributor's to write.
 
+Capability retirement now requires the newest live accepted source revision; a pending draft must be accepted first. Web retirement applies the same independence and delegation checks as acceptance. A coordinator-granted agent must name an in-force record-acceptance delegation for capabilities; its grant alone is not a retirement right. Host operators keep their existing allowlist and F3 requirements, but drafts and inert acceptances are no longer valid retirement sources. No payload field changed.
+
 ### 13.4 After a rollback
 
 A rollback is a lifecycle event (`docs/OPERATIONAL_WORKFLOW.md`), not a record operation.

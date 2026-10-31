@@ -35,7 +35,7 @@ from requirements import canonical_bytes, content_hash
 PREFIX = 'Kind: delegation-v1\n'
 LABEL = 'delegation'
 RIGHTS = ('record-acceptance',)
-SCOPES = ('references', 'capabilities')
+SCOPES = ('references', 'capabilities', 'interfaces')
 ACTIONS = ('grant', 'narrow', 'revoke')
 VIA = ('session', 'operator')
 GRANTEE = re.compile(r'(?:agent_[0-9a-f]{16}|coordinator-grant)\Z')
@@ -356,7 +356,7 @@ def check_acceptance(row, *, project, state, journal, agent, kind, operators=Non
     failing reason. ``kind`` is ``references`` or ``capabilities``.
     """
     if kind not in SCOPES:
-        raise DelegationRefusal(403, 'Delegations cover only references and capabilities')
+        raise DelegationRefusal(403, 'Delegations cover only references, capabilities and interfaces')
     if not isinstance(row, dict):
         raise DelegationRefusal(403, 'The named delegation decision does not exist in this project')
     if row.get('malformed'):

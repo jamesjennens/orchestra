@@ -47,6 +47,8 @@ def tree(path):
             if item.is_file() and item.suffix != '.lock'}       # lock files are empty and made on first use
 
 
+from tests.lock_fixture import ordinary_calls
+
 class RetireCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -75,7 +77,7 @@ class RetireCase(unittest.TestCase):
         self.probes = []
         self.server = '1'                      # what the Dolt server answers the probe, or an exception
         for patcher in (patch.object(admin, 'sql', side_effect=self.sql),
-                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)}),
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}),
                         patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
                         patch.object(admin, 'root_path', return_value=self.root),
                         patch.object(admin, 'run_bd', side_effect=self.run_bd)):
@@ -219,7 +221,8 @@ class RetireCase(unittest.TestCase):
         self.assertIn('Unknown project', stderr)
         self.assertEqual(tree(self.root), before)
         self.assertEqual(self.bd, [])                               # refused before any native call
-        self.flock.assert_not_called()
+        # The deployment mutex precedes the operation; no project lock or receipt I/O occurs.
+        self.assertEqual(ordinary_calls(self.flock), [])
 
     def test_the_force_rule_fails_closed(self):
         # Review 01a10219, P2 and P3 (a): what cannot be read is treated as the dangerous
@@ -709,7 +712,7 @@ class RestoreNoticeCase(unittest.TestCase):
                 with self.subTest(command=command), patch.object(sys, 'argv', argv), \
                         patch.object(admin, 'root_path', return_value=root), \
                         patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}), \
-                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)}), \
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}), \
                         patch.object(admin, 'run_bd') as native, self.assertRaises(SystemExit) as refused:
                     admin.run_main()
                 self.assertEqual(refused.exception.code.count('\n'), 0)
@@ -738,7 +741,7 @@ class RestoreNoticeCase(unittest.TestCase):
             before = signal.getsignal(signal.SIGTERM)
             argv = ['admin.py', '--root', str(root), 'restore-new', 'alpha', 'beta']
             with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=root), \
-                    patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)}), \
+                    patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}), \
                     patch.object(admin, 'coordination_backup'), patch.object(admin, 'add_project', add_project), \
                     patch.object(admin, 'run_bd') as native, contextlib.redirect_stderr(stderr), \
                     self.assertRaises(SystemExit) as stopped:
@@ -770,7 +773,7 @@ class ReconcileAllowlistCase(unittest.TestCase):
         self.project = make_project(self.root, 'trial')
         self.flock = Mock()
         self.native = Mock(return_value='[]')
-        for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)}),
+        for patcher in (patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}),
                         patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
                         patch.object(admin, 'root_path', return_value=self.root),
                         patch.object(admin, 'run_bd', self.native)):
@@ -796,7 +799,8 @@ class ReconcileAllowlistCase(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Actor mallory is not a server-side configured operator'):
                     self.run_admin(command, flag, extra, 'mallory')
         self.native.assert_not_called()
-        self.flock.assert_not_called()
+        # The deployment mutex precedes the operation; no project lock or receipt I/O occurs.
+        self.assertEqual(ordinary_calls(self.flock), [])
         self.assertEqual(sorted(path.name for path in self.project.iterdir()), ['.beads'])   # no journal made
 
     def test_an_empty_allowlist_authorizes_nobody_and_says_what_to_do(self):

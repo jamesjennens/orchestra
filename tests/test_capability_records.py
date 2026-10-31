@@ -414,8 +414,11 @@ class RetireTests(CapabilityCase):
         return cr.apply_native(payload, OPERATOR, self.native, self.project, operator=True, operators=[OPERATOR])
 
     def test_retire_supersedes_with_a_successor_and_replaces_is_derived(self):
-        self.propose(key='a.old', name='Old')
-        self.propose(operation_id='p2', key='a.new', name='New')
+        self.native.actor = OPERATOR
+        for key, name, operation in [('a.old', 'Old', 'p1'), ('a.new', 'New', 'p2')]:
+            cr.apply_native(entry(operation='draft', operation_id=operation, key=key, name=name,
+                acceptance_state='accepted', acceptance=acceptance()), OPERATOR, self.native,
+                self.project, operator=True, operators=[OPERATOR])
         with self.assertRaisesRegex(ValueError, 'Unknown successor'):
             self.retire('a.old', 'a.missing', 1)
         result = self.retire('a.old', 'a.new', 1)
@@ -432,6 +435,56 @@ class RetireTests(CapabilityCase):
             self.retire('a.new', 'a.old', 1, operation_id='retire-2')
         with self.assertRaisesRegex(ValueError, 'operation must be one of propose, revise'):
             cr.apply_native(dict(entry(operation='retire', key='a.new')), 'alice', self.native, self.project)
+
+    def test_retirement_refuses_pending_draft_and_inert_acceptance_without_writes(self):
+        import copy
+        self.propose(key='a.old');self.propose(operation_id='successor',key='a.new')
+        before=copy.deepcopy(self.native.rows)
+        with self.assertRaisesRegex(ValueError,'live accepted revision'):self.retire('a.old','a.new',1)
+        self.assertEqual(before,self.native.rows)
+        self.native.actor='ops2'
+        cr.apply_native({'schema_version':1,'operation':'accept','operation_id':'old-accept','key':'a.old',
+            'revision':1,'record_sha256':self.sha(1,'a.old'),'acceptance_state':'accepted','acceptance':acceptance()},
+            'ops2',self.native,self.project,operator=True,operators=[OPERATOR,'ops2'])
+        before=copy.deepcopy(self.native.rows)
+        with self.assertRaisesRegex(ValueError,'live accepted revision'):
+            self.retire('a.old','a.new',2,operation_id='inert-source')
+        self.assertEqual(before,self.native.rows)
+
+    def test_retirement_applies_acceptance_party_check_and_replays_accepted_operator_flow(self):
+        import copy
+        self.native.actor=OPERATOR
+        cr.apply_native(entry(operation='draft',key='a.old',acceptance_state='accepted',acceptance=acceptance()),
+            OPERATOR,self.native,self.project,operator=True,operators=[OPERATOR])
+        self.propose(operation_id='successor',key='a.new')
+        body={'schema_version':1,'operation':'retire','operation_id':'party-retire','key':'a.old',
+            'revision':1,'record_sha256':self.sha(1,'a.old'),'successor':'a.new',
+            'acceptance_state':'superseded','acceptance':acceptance()}
+        calls=[]
+        def refuse(proposer,decision):
+            calls.append((proposer,decision));raise ValueError('independent party required')
+        self.native.actor=OPERATOR;before=copy.deepcopy(self.native.rows)
+        with self.assertRaisesRegex(ValueError,'independent party'):
+            cr.apply_native(body,OPERATOR,self.native,self.project,operator=True,operators=[OPERATOR],party_check=refuse)
+        self.assertTrue(calls);self.assertEqual(before,self.native.rows)
+        result=cr.apply_native(body,OPERATOR,self.native,self.project,operator=True,operators=[OPERATOR])
+        self.assertEqual('superseded',result['state']);before=copy.deepcopy(self.native.rows)
+        cr.apply_native(body,OPERATOR,self.native,self.project,operator=True,operators=[OPERATOR])
+        self.assertEqual(before,self.native.rows)
+
+    def test_honoured_retirement_replay_survives_original_source_operator_removal(self):
+        import copy
+        self.native.actor='ops2'
+        cr.apply_native(entry(operation='draft',key='a.old',acceptance_state='accepted',acceptance=acceptance()),
+            'ops2',self.native,self.project,operator=True,operators=[OPERATOR,'ops2'])
+        self.propose(operation_id='successor',key='a.new');self.native.actor=OPERATOR
+        body={'schema_version':1,'operation':'retire','operation_id':'honoured-replay','key':'a.old',
+            'revision':1,'record_sha256':self.sha(1,'a.old'),'successor':'a.new',
+            'acceptance_state':'superseded','acceptance':acceptance()}
+        cr.apply_native(body,OPERATOR,self.native,self.project,operator=True,operators=[OPERATOR,'ops2'])
+        before=copy.deepcopy(self.native.rows)
+        cr.apply_native(body,OPERATOR,self.native,self.project,operator=True,operators=[OPERATOR])
+        self.assertEqual(before,self.native.rows)
 
 
 class AliasTests(CapabilityCase):

@@ -68,6 +68,8 @@ def broken_review(cid='c2', text='not-json'):
     return dict(id=cid, text=w.PREFIX + text, author='worker', created_at=STAMP)
 
 
+from tests.lock_fixture import ordinary_calls
+
 class ReviewRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {'ORCHESTRA_OPERATORS': OPERATORS})
@@ -397,7 +399,9 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(recovery.KEYED_KIND_PREFIXES, {
             'reference-entry': (r.REFERENCE_ENTRY_PREFIX, r.REFERENCE_ENTRY_V2_PREFIX, r.REFERENCE_ENTRY_V3_PREFIX),
             'reference-acceptance': r.REFERENCE_ACCEPTANCE_PREFIX,
-            'capability-entry': r.CAPABILITY_ENTRY_PREFIX,
+            'capability-entry': (r.CAPABILITY_ENTRY_PREFIX, r.CAPABILITY_ENTRY_V2_PREFIX),
+            'interface-entry': r.INTERFACE_ENTRY_PREFIX,
+            'interface-acceptance': r.INTERFACE_ACCEPTANCE_PREFIX,
             'capability-acceptance': r.CAPABILITY_ACCEPTANCE_PREFIX,
             'capability-verification': r.CAPABILITY_VERIFICATION_PREFIX,
             'capability-alias': r.CAPABILITY_ALIAS_PREFIX})
@@ -420,7 +424,7 @@ class AdminVoidRecordTests(unittest.TestCase):
         (self.root / 'deployment.private.json').write_text(
             json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}), encoding='utf-8')
         self.flock = Mock()
-        self.patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)})
+        self.patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
         self.writes = []
@@ -431,7 +435,7 @@ class AdminVoidRecordTests(unittest.TestCase):
             return '\n'.join(json.dumps(row) for row in self.rows)
         argv = args[2:] if args[:1] == ['--actor'] else args
         self.assertEqual(argv[:3], ['comments', 'add', TASK])
-        self.assertEqual(self.flock.call_count, 1)
+        self.assertEqual(len(ordinary_calls(self.flock)), 1)
         self.writes.append(argv)
         self.rows[0]['comments'].append(dict(id='w1', text=argv[3], author='operator', created_at=STAMP))
         return json.dumps({'id': 'w1'})
@@ -800,7 +804,7 @@ class AdminRevertRecordTests(unittest.TestCase):
             self.skipTest('nested temporary directory unavailable: ' + str(exc))
         (self.root / 'deployment.private.json').write_text(
             json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}), encoding='utf-8')
-        self.patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)})
+        self.patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
         self.writes = []
@@ -1109,7 +1113,7 @@ class AdminRevertJournalBackupTests(unittest.TestCase):
             self.skipTest('nested temporary directory unavailable: ' + str(exc))
         (self.root / 'deployment.private.json').write_text(
             json.dumps({'password': 'x', 'unit': 'none', 'operators': ['operator']}), encoding='utf-8')
-        self.patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)})
+        self.patcher = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
         self.entry = self.journal_entry()

@@ -48,7 +48,7 @@ class BaselineBackupTests(unittest.TestCase):
             admin.validate_coordination_files(bad)
 
     def test_actual_admin_restore_dispatch_keeps_all_three_named_files_exact_and_lineage_separate(self):
-        windows_lock = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(LOCK_EX=2, flock=lambda *args: None)}) if os.name == 'nt' else contextlib.nullcontext()
+        windows_lock = patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(LOCK_EX=2, flock=lambda *args: None, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}) if os.name == 'nt' else contextlib.nullcontext()
         with windows_lock, patch.object(admin, 'coordination_backup', return_value=self.files), \
                 patch.object(admin, 'using_last_complete_sidecar', return_value=False), \
                 patch.object(admin, 'report_native_backup_change'), \

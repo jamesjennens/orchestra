@@ -1494,6 +1494,10 @@ class InProcessBackend:
     def reference(self, project_id, key):
         raise not_found('Reference not found')
 
+    def interfaces(self,project_id,args,readable=()):
+        if args[:1]==['get']:raise not_found('Interface not found')
+        return {'schema_version':1,'items':[],'total':0,'next_offset':None,'coverage':{'complete':False},'program_coverage':{'complete':False}}
+
     def reference_links(self, project_id):
         """kittrial-5bb.446: the in-process backend holds no native records, so no program links."""
         return {'schema_version': 1, 'items': [],
@@ -2318,6 +2322,7 @@ class EndpointBackend:
         'followons.record', 'followons.withdraw',
         # Files attached to a task (kittrial-5bb.370): the canonical `task-file` action.
         'files.record', 'files.withdraw',
+        'interfaces.propose', 'interfaces.revise', 'interfaces.accept',
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
         'references.verify',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
@@ -2697,7 +2702,7 @@ class EndpointBackend:
                                       422: 'invalid'}.get(status, 'unavailable'), text)
             error.nothing_done = True
             raise error
-        if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
+        if action in ('ref', 'capability', 'interface') and isinstance(reply, dict) and reply.get('records_status'):
             status = reply['records_status']
             text = (reply.get('stderr') or 'Record operation refused').strip().split('\n')[-1]
             for prefix in ('ValueError: ', 'RecordsRefusal: '):
@@ -2843,7 +2848,7 @@ class EndpointBackend:
                 if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str) \
                         and detail.startswith('ValueError: '):
                     raise invalid(detail[len('ValueError: '):], detail)
-                if action in ('ref', 'capability') and isinstance(detail, str):
+                if action in ('ref', 'capability', 'interface') and isinstance(detail, str):
                     clean = detail
                     for prefix in ('ValueError: ', 'RecordsRefusal: '):
                         if clean.startswith(prefix):
@@ -3042,7 +3047,7 @@ class EndpointBackend:
             authority = authority_request(principal, project_id, capability,
                                           now=self.service._expiry_now())
             if self.service.approval_by_another_party and (
-                    route.startswith('references.') or route.startswith('capabilities.')):
+                    route.startswith('references.') or route.startswith('capabilities.') or route.startswith('interfaces.')):
                 authority['approval_by_another_party'] = True
         try:
             result = self._run(action, project, payload.get('actor') or self._actor(principal),
@@ -3345,14 +3350,15 @@ class EndpointBackend:
                 raise invalid('Send an Idempotency-Key header or an operation_id')
             return ('proposal', project_id, [payload['command'], '@attachment:0'],
                     {'0': {'flag': '--file', 'text': json.dumps(body)}})
-        if route.startswith('references.') or route.startswith('capabilities.'):
+        if route.startswith('references.') or route.startswith('capabilities.') or route.startswith('interfaces.'):
             body = dict(payload['body'])
             body['operation_id'] = body.get('operation_id') or operation_id
             if not body['operation_id']:
                 raise invalid('Send an Idempotency-Key header or an operation_id')
             if isinstance(body.get('acceptance'), dict) and not body['acceptance'].get('decision_id'):
                 body['acceptance'] = dict(body['acceptance'], decision_id=body['operation_id'])
-            action_name = 'ref' if route.startswith('references.') else 'capability'
+            action_name = ('ref' if route.startswith('references.') else
+                           'interface' if route.startswith('interfaces.') else 'capability')
             document = body.pop('document', None) if action_name == 'ref' else None
             args = [payload['command'], '@attachment:0']
             attachments = {'0': {'flag': '--file', 'text': json.dumps(body, ensure_ascii=False)}}
@@ -3650,6 +3656,14 @@ class EndpointBackend:
         if not isinstance(payload, dict):
             raise uncertain('Canonical proposal read returned an unexpected shape')
         return payload
+
+    def interfaces(self, project_id, args, readable=()):
+        extra=['--readable']
+        for project in sorted(readable): extra += ['--readable', project]
+        reply=self._endpoint('interface',project_id,self.actor_namespace+'/read',list(args)+extra)
+        if reply.get('returncode')==2 and 'Unknown interface key' in (reply.get('stderr') or ''):
+            raise not_found('Interface not found')
+        return self._checked(reply,'interface',reading=True)
 
     def _ref_read(self, project_id, args, missing=False):
         reply = self._endpoint('ref', project_id, self.actor_namespace + '/read', args)
@@ -5938,7 +5952,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('Set-Cookie', attributes)
 
     # -- mutation helper -------------------------------------------------------
-    def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
+    def _mutate(self, ctx, route_name, project_id, fn, **kwargs):
+        # Store-only mutations serialize on authority; they never take the semantic mutex.
+        return self._mutate_unlocked(ctx,route_name,project_id,fn,**kwargs)
+
+    def _mutate_unlocked(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
                 canonical=False, reason=None, refused_reason=None,
                 audit_success=True, state_saved=None, audit_metadata=None, replay_check=None):
@@ -11708,9 +11726,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                          'evidence', 'reason', 'decision_id', 'owners', 'approvers', 'policy')
 
     CAP_PROPOSE_FIELDS = ('key', 'revision', 'expected_sha256', 'name', 'aliases', 'summary',
-                          'requirements', 'anchors', 'code', 'tests', 'owner', 'tags')
+                          'requirements', 'anchors', 'code', 'tests', 'owner', 'tags', 'interfaces')
     CAP_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'name', 'aliases',
-                         'summary', 'requirements', 'anchors', 'code', 'tests', 'owner', 'tags')
+                         'summary', 'requirements', 'anchors', 'code', 'tests', 'owner', 'tags', 'interfaces')
     CAP_ACCEPT_FIELDS = REF_ACCEPT_FIELDS
     CAP_RETIRE_FIELDS = REF_RETIRE_FIELDS
     CAP_VERIFY_FIELDS = ('key', 'revision', 'entry_revision', 'record_sha256', 'expected_sha256',
@@ -11768,7 +11786,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         item r2-field-references).
         """
         import record_acceptance
-        if record_kind not in ('references', 'capabilities'):
+        if record_kind not in ('references', 'capabilities', 'interfaces'):
             return False, 'The record family could not be read.'
         by_agent = getattr(ctx.principal, 'via', None) == 'credential'
         entry_state = item.get('state')
@@ -12183,7 +12201,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = dict(fields, schema_version=1, operation_id=operation_id)
         if key_param:
             body['key'] = ctx.params['key']
-        if coordinator and command in ('accept', 'web-verify') and ctx.principal.via == 'credential':
+        if (coordinator and (command in ('accept', 'web-verify') or route_name == 'capabilities.retire')
+                and ctx.principal.via == 'credential'):
             # kittrial-5bb.407: an agent accepts or verifies only within a person owner's
             # delegation, named here; the default operation id would name no decision. The
             # endpoint checks the delegation itself, live, under the write's lock.
@@ -12191,8 +12210,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if named is None and isinstance(body.get('acceptance'), dict):
                 named = body['acceptance'].get('decision_id')
             if not isinstance(named, str) or not named.strip():
-                raise forbidden('An agent accepts or verifies a record only within a delegation: name the person '
-                              "owner's delegation decision as decision_id")
+                action = 'retires a capability' if route_name == 'capabilities.retire' else 'accepts or verifies a record'
+                raise forbidden('An agent %s only within a delegation: name the person ' % action +
+                                "owner's delegation decision as decision_id")
         body = self._normalize_record_payload(ctx, command, body, operation_id)
 
         def mutate_record():
@@ -12526,6 +12546,52 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'accepted_at': item.get('accepted_at'),
                 'decision': (record.get('authority') or {}).get('id'),
                 'proposed_revision': item.get('proposed_revision')}
+
+    def _interface_read(self, ctx, args):
+        self._project(ctx,CAP_READ)
+        read=getattr(self.backend,'interfaces',None)
+        if read is None: raise not_implemented('Interface records need the canonical endpoint backend')
+        readable=set()
+        with self.service.store.lock:
+            projects=list(self.service.state.get('projects') or {})
+        for project in projects:
+            try:
+                self.service.check_authority(ctx.principal,project,CAP_READ)
+                readable.add(project)
+            except HttpError: pass
+        return read(ctx.params['pid'],args,readable=readable)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/interfaces')
+    def interfaces_list(self,ctx):
+        self._project(ctx,CAP_READ)
+        limit,state=self._page(ctx,ctx.query)
+        result=self._interface_read(ctx,['list','--limit',str(limit),'--offset',str(state['o'])])
+        if result.get('next_offset') is not None:
+            result['next_cursor']=make_cursor(ctx.principal,ctx.params['pid'],ctx.query,result['next_offset'],key=self.service.cursor_key())
+        else: result['next_cursor']=None
+        return 200,result
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')')
+    def interfaces_get(self,ctx):
+        return 200,self._interface_read(ctx,['get',ctx.params['key']])
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/interfaces')
+    def interfaces_propose(self,ctx):
+        import interface_records
+        return self._records_write(ctx,'interfaces.propose','propose',interface_records.CONTENT_FIELDS,
+                                   'An interface',key_param=False,status=201)
+
+    @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')/revisions')
+    def interfaces_revise(self,ctx):
+        import interface_records
+        fields=interface_records.CONTENT_FIELDS+('revision','expected_revision','expected_sha256')
+        return self._records_write(ctx,'interfaces.revise','revise',fields,'An interface revision')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')/accept')
+    def interfaces_accept(self,ctx):
+        return self._records_write(ctx,'interfaces.accept','accept',self.REF_ACCEPT_FIELDS,
+                                   'An interface acceptance',coordinator=True)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
     def capabilities_list(self, ctx):

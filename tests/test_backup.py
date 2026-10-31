@@ -36,7 +36,7 @@ class BackupTests(unittest.TestCase):
         self.flock = Mock()
         # ``add-project`` takes the creation lock too (kittrial-5bb.176), so the stand-in
         # needs the whole fcntl surface ``http_authority.file_lock`` uses.
-        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         self.patcher = patch.dict(sys.modules, {'fcntl': self.fake_fcntl})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
@@ -601,13 +601,35 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(calls[3][1], ['merge-slot', 'create', '--json'])
 
     def test_restore_holds_source_backup_lock_across_entire_pair(self):
+        import interface_lock, http_authority
         self.save_bundle()
         phases = []
+        semantic = [False]
+        original = interface_lock.held
+        @contextlib.contextmanager
+        def outer(root):
+            with original(root):
+                semantic[0] = True
+                try:
+                    yield
+                finally:
+                    semantic[0] = False
         def locked(phase):
-            # The source's backup lock is taken first and held to the end. From the moment
+            # The semantic mutex precedes the source's backup lock and remains held.
+            # http_authority.file_lock passes an integer descriptor to flock; the
+            # backup/restore locks below pass open file objects.
+            calls = self.flock.call_args_list
+            descriptors = [call for call in calls if isinstance(call.args[0], int)]
+            self.assertTrue(semantic[0], phase)
+            if http_authority.os.name != 'nt':  # Windows file_lock uses msvcrt, not fcntl.
+                self.assertEqual(len(descriptors), 1, phase)
+                self.assertIs(calls[0], descriptors[0])
+                self.assertEqual(descriptors[0].args[1],
+                                 self.fake_fcntl.LOCK_EX | self.fake_fcntl.LOCK_NB)
+            # From the moment
             # the destination starts to exist, its own restore lock is held too, so
             # retire-project cannot pull it away mid-restore (kittrial-5bb.85).
-            handles = [call.args[0] for call in self.flock.call_args_list]
+            handles = [call.args[0] for call in calls if not isinstance(call.args[0], int)]
             self.assertEqual([Path(handle.name).name for handle in handles],
                              ['source.lock', 'destination.restore.lock'][:1 if phase == 'validate-sidecar' else 2])
             self.assertFalse(any(handle.closed for handle in handles), phase)
@@ -623,11 +645,32 @@ class BackupTests(unittest.TestCase):
             return 'restored'
         def restore(*args, **kwargs): locked('restore-sidecar')
         argv = ['admin.py', '--root', str(self.root), 'restore-new', 'source', 'destination']
-        with patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), patch.object(admin, 'coordination_backup', side_effect=read), patch.object(admin, 'add_project', side_effect=create), patch.object(admin, 'run_bd', side_effect=native), patch.object(admin, 'restore_coordination', side_effect=restore), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(interface_lock, 'held', side_effect=outer), patch.object(sys, 'argv', argv), patch.object(admin, 'root_path', return_value=self.root), patch.object(admin, 'coordination_backup', side_effect=read), patch.object(admin, 'add_project', side_effect=create), patch.object(admin, 'run_bd', side_effect=native), patch.object(admin, 'restore_coordination', side_effect=restore), contextlib.redirect_stdout(io.StringIO()):
             admin.main()
         self.assertEqual(phases, ['validate-sidecar', 'create-destination', 'restore-native',
                                   'repoint-native', 'restore-sidecar', 'restore-native', 'restore-native'])
-        self.assertTrue(self.flock.call_args.args[0].closed)
+        handles = [call.args[0] for call in self.flock.call_args_list
+                   if not isinstance(call.args[0], int)]
+        self.assertTrue(all(handle.closed for handle in handles))
+        self.assertFalse(semantic[0])
+        if http_authority.os.name != 'nt':
+            self.assertIsInstance(self.flock.call_args.args[0], int)
+            self.assertEqual(self.flock.call_args.args[1], self.fake_fcntl.LOCK_UN)
+
+    def test_restore_pair_lock_probe_with_windows_file_lock_backend(self):
+        import http_authority
+        # Exercise the Windows branch on Linux too; this is a backend simulation,
+        # not a claim of a Windows execution. Backup file locks retain their fake
+        # fcntl probe, while the outer mutex goes through msvcrt.
+        class WindowsOS:
+            name = 'nt'
+            def __getattr__(self, name):
+                return getattr(os, name)
+        locking = Mock()
+        windows = types.SimpleNamespace(locking=locking, LK_NBLCK=2, LK_UNLCK=0)
+        with patch.object(http_authority, 'os', WindowsOS()), patch.dict(sys.modules, {'msvcrt': windows}):
+            self.test_restore_holds_source_backup_lock_across_entire_pair()
+        self.assertEqual([call.args[1:] for call in locking.call_args_list], [(2, 1), (0, 1)])
 
     def test_backup_rejects_symlink_journal_directory(self):
         outside = self.root / 'outside'
@@ -829,7 +872,7 @@ class RequirementJournalBackupTests(unittest.TestCase):
                          'evidence': {'source-1.1': 'decision-bf'}}
         self.flock = Mock()
         # As above: the creation lock ``add-project`` now takes uses the same surface.
-        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        self.fake_fcntl = types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         self.patcher = patch.dict(sys.modules, {'fcntl': self.fake_fcntl})
         self.patcher.start()
         self.addCleanup(self.patcher.stop)

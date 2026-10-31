@@ -2746,6 +2746,7 @@ BLOCK_CAPABILITIES = {
     # kittrial-5bb.418: `verify` is a design-document report (unverified), filed by any member who may propose.
     'ref': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS, 'verify': CAP_RECORDS,
             'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE},
+    'interface': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS, 'accept': CAP_COORDINATE},
     'capability': {'propose': CAP_RECORDS, 'revise': CAP_RECORDS,
                    'propose-alias': CAP_RECORDS, 'verify': CAP_RECORDS,
                    'accept': CAP_COORDINATE, 'retire': CAP_COORDINATE,
@@ -2776,7 +2777,7 @@ def required_capability(request):
         if len(args) != 1:
             return None
         item = {'text': args[0]}
-    elif action in ('ref', 'capability'):
+    elif action in ('ref', 'capability', 'interface'):
         if len(args) < 2:
             return None
         return needed.get(args[0])
@@ -2869,6 +2870,11 @@ def run_guarded(request, journal_path, effect, authority_config=None,
     * ``journal_options`` are optional :class:`OperationJournal` constructor overrides
       (limits, retention, skew allowance) for tests and operator tooling; the
       canonical endpoint passes none, so production uses the module defaults.
+    * Kit lock order is semantic deployment mutex (when relevant), project coordination,
+      authority/store, then operation journals. Effects may not acquire another project
+      lock. Cross-project snapshots are prepared before this boundary; cached reads
+      recheck current authority without project I/O. Store-only service mutations take
+      authority alone and release it before invoking a canonical backend.
     * The authority lock is held across re-validation and the effect, so an HTTP-side
       revocation that committed first is observed here and the effect never runs.
     * ``account_identity`` is a server adapter option, never a request field. The

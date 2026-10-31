@@ -225,7 +225,7 @@ class DelegationTests(unittest.TestCase):
         self.refused('granted to %s, not to %s' % (AGENT, SIBLING), agent=SIBLING)
         self.refused('covers references, not capabilities', kind='capabilities')
         self.refused('holds no coordinator grant', live=state(grants=(SIBLING,)))
-        self.refused('only references and capabilities', kind='tasks')
+        self.refused('only references, capabilities and interfaces', kind='tasks')
 
     def test_the_agent_grant_must_be_in_effect_under_the_issuer_rule(self):
         # kittrial-5bb.410 merged into r3: a coordinator grant counts only while its issuer may
@@ -485,7 +485,7 @@ class HostCommandTests(unittest.TestCase):
         self.project = self.root / 'projects' / PROJECT
         (self.project / '.beads').mkdir(parents=True)
         (self.project / '.beads' / 'metadata.json').write_text('{}', encoding='utf-8')
-        fake = types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        fake = types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         patcher = mock.patch.dict(sys.modules, {'fcntl': fake})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -573,7 +573,7 @@ class BackupTests(unittest.TestCase):
         self.destination.mkdir()
         (self.root / 'backups' / 'source').mkdir(parents=True)
         self.bundle = self.root / 'backups' / 'source.coordination.json'
-        fake = types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        fake = types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         patcher = patch.dict(sys.modules, {'fcntl': fake})
         patcher.start()
         self.addCleanup(patcher.stop)
