@@ -42,6 +42,8 @@ def _endpoint_module(case):
     return endpoint
 
 
+from tests.lock_fixture import ordinary_calls
+
 class ClientRoutingTests(unittest.TestCase):
     def test_the_client_routes_the_ref_action(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,7 +125,7 @@ class EndpointDispatchTests(unittest.TestCase):
         written = self.execute(['propose', '@attachment:0'], attachments)
         self.assertEqual(written['returncode'], 0, written)
         self.assertEqual(json.loads(written['stdout'])['state'], 'draft')
-        self.assertEqual((self.locks.call_count, self.guarded), (1, ['ref']))
+        self.assertEqual((len(ordinary_calls(self.locks)), self.guarded), (1, ['ref']))
         self.locks.reset_mock()
         self.guarded.clear()
         got = self.execute(['get', 'calendar.trading', '--json'])
@@ -132,7 +134,7 @@ class EndpointDispatchTests(unittest.TestCase):
         self.assertEqual(json.loads(listed['stdout'])['total'], 1)
         helped = self.execute(['--help'])
         self.assertEqual(json.loads(helped['stdout'])['action'], 'ref')
-        self.assertEqual((self.locks.call_count, self.guarded), (0, []))
+        self.assertEqual((len(ordinary_calls(self.locks)), self.guarded), (0, []))
 
     def test_the_payload_must_come_from_the_file_and_must_not_set_its_operation(self):
         for args, attachments, message in (
@@ -161,7 +163,7 @@ class OperatorCommandTests(unittest.TestCase):
             json.dumps({'password': 'x', 'unit': 'none', 'operators': [OPERATOR]}), encoding='utf-8')
         self.native = RefNative()
         for patcher in (patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
-                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2)}),
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=Mock(), LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)}),
                         patch('time.gmtime', return_value=TODAY)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -233,7 +235,7 @@ class OperatorCommandTests(unittest.TestCase):
         self.assertEqual((result['complete'], result['stopped'], result['accepted'], result['refused']),
                          (False, False, 2, 1))
         # The batch receipt, three items, the batch receipt again: five separate holds.
-        self.assertEqual(flock.call_count, 5)
+        self.assertEqual(len(ordinary_calls(flock)), 5)
         for key in ('calendar.trading', 'office.server.check'):
             view = rr.get(rr.read_key_rows(self.native, key), key, [OPERATOR])
             self.assertEqual((view['state'], view['acceptance']['operator']), ('accepted', OPERATOR))

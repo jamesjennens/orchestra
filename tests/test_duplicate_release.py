@@ -44,6 +44,8 @@ def evidence_by(module, row, operator, author=None):
     return row
 
 
+from tests.lock_fixture import ordinary_calls
+
 class ReleaseCase(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -620,7 +622,7 @@ class AdminCommandTests(ReleaseCase):
             json.dumps({'password': 'x', 'unit': 'none', 'operators': [OPERATOR]}), encoding='utf-8')
         self.flock = Mock()
         for patcher in (patch.dict(os.environ, {'ORCHESTRA_OPERATORS': ''}),
-                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)})):
+                        patch.dict(sys.modules, {'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.store = self.native(anchor(cr, 'one'), anchor(cr, 'two'))
@@ -649,7 +651,7 @@ class AdminCommandTests(ReleaseCase):
             self.admin('--issue-id', 'two', '--actor', OPERATOR, '--duplicate')
         self.flock.reset_mock()
         result = self.admin('--issue-id', 'two', '--actor', OPERATOR, '--duplicate', '--set-aside-evidence')
-        self.assertEqual((result['released'], result['selected_after'], self.flock.call_count), ('two', 'one', 1))
+        self.assertEqual((result['released'], result['selected_after'], len(ordinary_calls(self.flock))), ('two', 'one', 1))
         self.assertEqual(self.store.row('two')['comments'][-1]['author'], OPERATOR)
 
 

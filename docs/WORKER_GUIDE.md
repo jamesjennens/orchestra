@@ -470,6 +470,51 @@ The coordinators of linked projects write to each other and are woken, without t
 - **A brief resolves only this project's tokens.** It names another project's as `cross-project`, and the trace
   resolves it.
 
+### The program view
+
+`trace --program` reads a program project's view (kittrial-5bb.453; docs/design/PROGRAM_DESIGN.md §5): each area
+with its link state and, for an area your key may read, its open tasks and lanes waiting long; program requirements
+no readable area cites, and area designs pinning a superseded program revision. An area you may not read is one
+line, "not visible to you", with no number; with a key bound to some projects, an area outside them reads
+`not-checked` and is not read at all. 50 areas a page (`--offset`, `--limit`); the coverage block says what was read.
+On the web it is the Program page, in the menu of a program project.
+
+### Decisions across levels and suggestions
+
+For program and area owners and coordinators (kittrial-5bb.454; docs/design/PROGRAM_DESIGN.md §6).
+
+- **A program decision** is a decision issue of the program project with two lines of its own:
+  `Binds: north, south` (the areas it applies to) and `Owner-only: yes` or `no`. An owner-only decision counts only
+  when a person owner of the program (or an operator) attested it; another when a coordinator or owner of the program
+  (or an operator) did.
+- **A decision counts only once its author has attested its exact text.** Read it, then attest what you read:
+  `GET /v1/projects/PROJECT/decisions/ID/attestation` gives the text and its digest, and
+  `POST /v1/projects/PROJECT/decisions/ID/attest` with `{"digest": "..."}` attests it, as your own web session (the
+  decision's page has the button) or your own agent. Who made the row does not matter. Any later edit reads
+  `attestation-stale` and binds nothing until it is attested again; a row nobody has attested reads `not-attested`.
+- **It binds an area only when the area adopts it:** a decision issue of the area with the line
+  `Adopts: decision:PROGRAM/ID@ATTESTATION`, copied from `GET /v1/projects/PROGRAM/decisions/ID/attestation`. It pins the
+  text you read: if the program attests other text, your adoption reads `adoption-stale` and binds nothing until you
+  adopt again. You need to be able to read the program decision to attest this line; otherwise nothing is written, and you
+  ask for read of the program.
+  - A decision that is not owner-only is adopted by the area's coordinator, a person or an agent holding the grant.
+  - An owner-only decision is adopted by a person owner of the area, or by an area coordinator whose adoption also
+    has the line `Per: decision:AREA/ID`, naming a decision of the area that a person owner attested and that says
+    `Authorises: decision:PROGRAM/ID@ATTESTATION` for this very decision and text. An agent never adopts an owner-only decision alone; a
+    `Per:` decision an agent attested, or one that does not authorise this decision, does not count.
+- **Who attested a row is checked at every read:** someone who has since lost the role stops counting.
+- **A closed decision or adoption binds nothing.** On an attested row, and on any decision row with one of these lines
+  (prose such as `Per: the meeting of Tuesday` is not one),
+  closing, reopening, retyping or relabelling it as
+  a decision needs standing: a person owner if the text is owner-only, carries `Authorises:` or is an owner's adoption,
+  otherwise an owner or a coordinator. Anyone else is refused, and so is every host route; an operator uses
+  `admin.py decision-change`. You can still edit the text, which only makes the row stale.
+- **A suggestion going up** is a task in the program project labelled `suggestion`, with a line `From:` citing its
+  source (`From: decision:AREA/ID`). The program coordinator answers with a program decision, or closes the task with
+  a reason.
+- **The program view** (`trace --program`, the Program page) lists each decision with its areas' states and the open
+  suggestions; an area you may not read reads `not-visible`, with nothing else.
+
 ## Propose a requirement instead of opening a task
 
 When you find something the product should do and it is not your task, do not open
@@ -683,3 +728,14 @@ b list --label review-ready --limit 0 --json
 This label means ready for review, not reviewed, accepted, integrated or deployed. Record the six lifecycle facts independently. If changes are requested, evidence fails or the deliverable becomes inaccessible, append the reason, remove the label with `update TASK --remove-label review-ready --json`, and checkpoint the next action. Remove it after integration too. A separately scoped implementation task may close only under the project's agreement with a linked remaining review/integration task; label that open task so it stays discoverable.
 
 Report/label/checkpoint writes are separate operations. After interruption, inspect and reconcile partial updates; never infer a complete handoff merely from the label.
+
+For a program's interface register, use the JSON catalog/`interface list|get` and
+pinned `iface:<program>/<key>@<revision>` tokens. Declare provides/consumes on
+capability v2 records with the `interfaces` list; v1 history remains byte-identical.
+A pending capability draft does not withdraw an accepted consumer. Schema checking
+is not implemented in slice 3a: `compatibility-unverified` is explicit, not a pass.
+Retiring an interface needs the acceptor's complete readable area view and no
+consumer; no owner-decision override exists yet. A busy write is retried with the
+same identity. Cross-entry new-major/deprecation recovery is an operator concern;
+never hide an uncertain result by sending a new operation id. None of this grants
+access to another area's private records or registers a running process.

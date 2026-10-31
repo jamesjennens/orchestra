@@ -98,6 +98,8 @@ PAIRS += [('server-limit', 'merge-authority'), ('merge-authority', 'server-limit
           ('server-limit', 'merge-operators'), ('merge-verifiers', 'server-limit')]
 
 
+from tests.lock_fixture import ordinary_calls
+
 @unittest.skipIf(sys.platform == 'win32', 'flock is POSIX-only')
 class DeploymentWritersShareOneLockTests(unittest.TestCase):
 
@@ -365,8 +367,8 @@ class PrivateWriteLeftoverTests(unittest.TestCase):
         with patch.dict(sys.modules, {'fcntl': fake}):
             result, err = self.flip('on')
         self.assertTrue(result['checkpoint_provenance_writes'])
-        self.assertEqual(fake.flock.call_count, 1)
-        self.assertEqual(fake.flock.call_args[0][1], 2)
+        self.assertEqual(len(ordinary_calls(fake.flock)), 1)
+        self.assertEqual(ordinary_calls(fake.flock)[-1].args[1], 2)
         self.assertFalse((self.root / '.deployment.private.json.abcd1234').exists())
         self.assertIn('Removed 1 temporary copy', err)
 

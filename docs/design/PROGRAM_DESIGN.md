@@ -349,6 +349,41 @@ for the caller, then reports:
 - **The coverage block** says what was read: "4 of 5 linked areas readable; 3,120 rows".
 - **Permission comes before counts:** an unreadable area adds one line and no numbers.
 
+**As built (kittrial-5bb.453, slice 4):**
+- **One module, one action:** `program_view.py` builds the answer; the endpoint action `program` reads it, one call a
+  page. The web route `GET /v1/projects/{program}/program` and the client's `trace --program` both use it.
+- **The readable set** is .449's rule: the web service's own `--readable` (each project checked for this caller),
+  honoured only from its launch; on the host the key's projects, or any for an operator's unbound key. Every other
+  project's path is resolved by `execute`, after the gate.
+- **Areas:** each `program.area.*` entry with its link state, the same as the program-links read gives (.446's one
+  fact). For a readable area: open tasks, lanes `waiting_too_long` and `expect_by_passed` (from `lanes.read`,
+  `idle_minutes` passed through as on the Lanes page) and, on the web, its coordinators. Otherwise "not visible to
+  you": a missing area gives the same row.
+  - **Open tasks:** open, in progress or blocked, not an epic, not a requirement record (`requirement`,
+    `brd-section`), and nothing the queue never lists as work (event and gate rows, the merge slot, record anchors).
+  - **The program's side first** (review of .453, B1): an area whose program side is not in (proposed, left, not
+    accepted by an owner) is never read, by any caller, so a proposed entry tells nothing about whether a project of
+    that name exists. Only an area whose program side is in is read for the one fact, and only a readable one for
+    numbers.
+  - **A key bound to projects** reads nothing of a project it is not bound to (rule 1 of
+    COORDINATORS_PER_PROJECT_DESIGN), so there an area outside the key reads `not-checked`, with no read at all.
+  - **A right lost after the read:** the web route asks `coordinators_of`, which checks the caller again; the row
+    becomes the hidden one, and the page is read again without that area, so none of its citations stay in the
+    requirements section (review of .453, B2). After three reads that each lose a right, the requirements section
+    is `unsettled`, with no row.
+- **Interfaces** read `not-available` until slice 3 (kittrial-5bb.450) is merged forward. **Decisions** and
+  **suggestions** are slice 5's (kittrial-5bb.454, as built under section 6).
+- **Requirements:** each accepted program requirement that no readable area of this read cites (`no-area-cites`),
+  and each area design section pinning a superseded program revision (`cites-superseded-revision`), 50 rows a page.
+  The coverage says they are counted over the readable areas of this read only.
+- **Coordinators** are on the web route only (Q2): the host route says "Coordinators are shown on the web Program
+  page."
+- **The menu:** "Program" shows only on a project with an accepted `program.area.*` side, from a flag kept in the
+  web state (`program_flags`). Every program read recomputes it, and so does a web accept or retire of a
+  `program.` key; no menu render reads anything. The page itself always reads the view.
+- **The harness** covers the read twice: as an area read (an outsider's view of an area is a missing project's
+  404) and as the program's own read (`assert_area_rows_hidden`).
+
 ## 6. Decisions across levels (Q4 A)
 
 ### 6.1 A program decision that binds areas
@@ -358,7 +393,8 @@ A program decision is a decision issue in the program project, with fixed lines 
 - `Owner-only: yes` or `no`. It is `yes` when the choice is the owner's under .401 §4.3:
   requirements, cost or scope bounds, or what only the owner can know.
 
-**Who may write it:** an owner-only program decision counts only if its native author is a person
+**Who may write it** (revision 2 of .454 replaced "native author" with an attestation; see the as-built below): an
+owner-only program decision counts only if its native author is a person
 owner of the program project or a deployment operator. This is .401's rule as approved: an agent
 never writes an owner's decision. Other program decisions may be written by the program
 coordinator.
@@ -409,6 +445,102 @@ At every level:
 This is .401's grant rule (a granting decision counts only if a person owner or operator wrote
 it), applied across levels.
 
+**As built (kittrial-5bb.454, slice 5, revision 2):**
+- **Where this differs from §6.1 and §6.2:** they say "native author". That does not hold. A row's `created_by` says
+  who made the row, not who wrote the text now in it: a contributor's edit keeps it, and over the host route the name
+  is only an `--actor` label. A row counts only with an attestation. Wherever §6 says who "writes" a row, read who
+  attests its exact text.
+- **The modules:** `decision_attest.py` is the record and how a row counts; `program_decisions.py` reads the lines and
+  applies §6. The program view (endpoint action `program`, web route, `trace --program`) and the trace's decisions view
+  use them alike.
+- **The lines:** `Binds: <area>, <area>`, `Owner-only: yes|no`, `Adopts: decision:<program>/<id>@<attestation id>`,
+  `Per: decision:<area>/<id>` and `Authorises: decision:<program>/<id>@<attestation id>`, each a whole line anywhere in the description,
+  at most once. A repeat or a line that does not read makes the row `malformed-lines`: it binds and adopts nothing. A
+  binding decision has both a `Binds:` and an `Owner-only:` line. An event or gate row is never a decision.
+- **The record:** `Kind: decision-attest-v1`, a reserved comment prefix no raw comment can write, honoured only with its
+  journal entry `<project>/.decision-attests/<sha256>.json` (in backups, validated on restore). It names the project,
+  the decision, `via` (`session`, `agent` or `operator`), the author, the time, a server-random nonce and a digest of the
+  row's exact type, title and description. Status and labels are outside the digest.
+- **Who writes it:** `POST /v1/projects/{id}/decisions/{did}/attest`, for the author's own web session or agent with
+  owner or coordinator standing in that project now; a contributor, a viewer, a worker credential or an unbound key is
+  refused. Or an operator with `admin.py decision-attest`. The body names the digest the author read
+  (`GET .../attestation`), and a text that changed since is refused with 409. A text attested at an owner's level (see
+  the gate) is attested again only by a person owner or an operator. So is a row with an attestation comment no journal
+  honours: its journal entry is gone, or the project was restored. What it said cannot be known and a contributor can have
+  edited the text, so a coordinator's attestation could otherwise lower an owner's row. An owner or an operator always can
+  recover it, and that record keeps the owner's level. The comment stays, so a coordinator does not attest that row again:
+  a coordinator's later choice is a new decision.
+- **How a row reads, at every read, in this order:** `closed`; `not-attested`; `attestation-stale`, when the newest
+  record's digest is not the row's now (the newest, not any: going back to replaced text stays stale), or when an attestation
+  comment no journal honours is newer than the newest honoured record, which is then not the last word (a lost entry, or a
+  write that stopped between the comment and its entry);
+  `attester-not-authorised`, when the author's standing has gone. Each of these binds nothing, and the row is listed so
+  an owner can see what needs attesting. Otherwise it counts, as the highest live standing among the unbroken run of
+  newest records over this text, so a coordinator attesting the same words cannot lower an owner's attestation.
+- **Authority is decided live at every read** from the web state: a person by their role and an enabled account; an
+  agent only while it is enabled, holds the project, its account is enabled and is itself owner or coordinator there (a
+  superuser who is only a viewer does not count), and its grant is in force. An operator's record counts while its exact
+  actor is on the allowlist. A bare name counts for nothing.
+- **A program decision counts** when an owner-only one was attested by a person owner of the program or an operator
+  (`owner-only-not-by-owner` otherwise), and another by a coordinator, an owner or an operator (anyone else reads
+  `attester-not-authorised`). A coordinator agent's attestation counts as coordinator, never owner.
+- **An adoption**, per bound area: `adopted`, `not-adopted`, `adoption-invalid` (with the reason), `adoption-stale` (below), what the row reads as
+  when it does not count (`closed` when only closed adoptions remain, `not-attested`, `attestation-stale`,
+  `attester-not-authorised`), `superseded-upstream` (a counting adoption of a decision this one supersedes, and none of
+  this one), `not-visible` (not readable or no such project: the same entry, nothing else), `not-in-program` (the
+  program's side is not in: never read) or `not-checked` (off this page of areas, or outside a bound key).
+- **`Per:` has to relate:** a coordinator's or agent's adoption of an owner-only decision counts only when `Per:` names a
+  decision of the area that counts as a person owner's or an operator's and whose `Authorises:` line is exactly the
+  adoption's `Adopts:` pointer. An unrelated owner decision does not satisfy it. An agent never satisfies an owner-only
+  rule on its own.
+- **Superseded:** only a counting row marks another superseded, and a chain does not pass through a row that does not
+  count. A row that supersedes owner-level text needs owner-level attestation: from a coordinator or an agent it reads
+  `supersedes-owner-level`, marks nothing and binds nothing. The level is the same one the gate uses, and an attestation
+  comment no journal honours makes a row owner-level too. `decision_attest.reading` is the one place all of these read from.
+- **The gate on status, type and labels:** on a row with an honoured attestation, and on any decision row carrying an
+  attestation comment, honoured or not, or a `Binds:`, `Owner-only:`, `Adopts: decision:`, `Per: decision:` or
+  `Authorises: decision:` line, a status change (close, reopen, or any
+  flag that moves status), or a type or label change that would start or stop the row being a decision, needs standing.
+  An owner's level (a person owner or an operator) for a text that says `Owner-only: yes`, that carries `Authorises:`, or
+  an adoption a person owner or an operator attested; otherwise an owner or a coordinator, agents by the grant rule. Where
+  there is a record that level comes from the record, not from the text now. An attestation comment no journal honours
+  needs an owner, beside any record that is honoured, because its text can have been edited. Prose such as `Per: the meeting of Tuesday` is not one of these
+  lines, and an ordinary decision carrying it closes as it always did. The web refuses anyone else with 403. Every host route refuses
+  everyone, an operator included; an operator uses `admin.py decision-change`. A row moving from `in_progress` to
+  `open` through task assign or release does not reach this gate, and that changes nothing that binds. A decision row
+  with none of these lines and no attestation is not gated, and a task with none of them may be retyped: it reads
+  `not-attested`. A status write uses the row the status guard already read, and a label other than `decision` reads
+  nothing for this gate, so an ordinary write stays one read. Only a type change or a `decision` label change costs one more.
+- **Backup and restore:** the journal is in the backup. `restore-new` always makes a new name, as it refuses the same one,
+  and a record binds its project's name: a new name is a new project. So its rows read `not-attested`, on purpose, their
+  gate still stands, and adoptions elsewhere that pin the old name are not read as this one. A person owner of the new
+  project attests them again.
+- **What a contributor can still do:** edit the text. That makes the row `attestation-stale`, which binds nothing and is
+  visible, so it can only remove a binding, never create one. It is not refused.
+- **An adoption pins the text it saw:** the pin on an `Adopts:` or `Authorises:` line is the program decision's attestation
+  id, and `GET /v1/projects/{program}/decisions/{id}/attestation` gives the line to copy. The id is the sha256 of the first
+  record of the unbroken run of newest records over this text. When the program decision is attested with other text, a
+  new run starts and the adoption reads `adoption-stale`, binding nothing until the area adopts again; an `Authorises:`
+  line that names this decision but pinned another attestation makes the `Per:` adoption read the same. Another attester
+  of the same words does not change the id.
+  - **At write:** a row carrying either line is attested only by someone who can read that decision now, decided live for
+    that project, and only with the id it has now while it counts. Otherwise nothing is written: 403 with the same
+    words for an unreadable program, no such project and no such decision, and 409 to a reader for other text or a
+    decision that does not count. An area owner who may not read the program cannot adopt; they ask for read of it. An
+    operator on `admin.py` reads any project.
+  - **Later:** an adopter who loses read of the program keeps the adoption. It was read at write, and it goes stale if the
+    text changes.
+  - **What it discloses:** nothing about the text. The id is a hash over the record's random nonce, so a reader of the area
+    cannot derive it from the text or confirm a guess of it.
+- **The boundary:** anyone with a shell on the host can forge bd rows with `--actor` or `BEADS_ACTOR`, and can write the
+  journal. Only the attestation journal and the live checks defend, and only against the routes the kit exposes. An
+  HTTP-shaped actor and its look-alikes are still refused on every host route (`reserved_comments.refuse_http_actor`), so
+  no host route writes a web identity's name.
+- **Suggestions:** the program's open tasks labelled `suggestion`, oldest first, 50 a page, with their `From:` line
+  as written; no area is read for them.
+- **The trace:** an area's decisions view marks each `Adopts:` decision with the same state when the caller may read
+  the program (.449's loader), and `not-visible` otherwise.
+
 ## 7. What is reused from .401, and what is new
 
 | need | reused | new | why new |
@@ -433,7 +565,7 @@ is conventions over records that exist.
 | a program member reads an area by accident | no grant from a link; every read is the caller's per-project check | program member, non-member, agent without the grant, host key without the area: identical answers, no rows, no counts (slice 1) |
 | a token reveals that a private project exists | `not-visible` for both cases, as the 404 | tokens to a missing project and to an unreadable one give byte-identical rows |
 | a one-sided link is taken as membership | `linked` needs both accepted records | accept only the program side: the area is `one-sided`, absent from counts |
-| an agent adopts an owner-only decision | the adoption author check of §6.2, live | agent adoption alone: `adoption-invalid`; with a `Per:` decision written by an agent: invalid; with one written by a person owner: valid |
+| an agent adopts an owner-only decision | the live attestation and `Authorises:` checks of the as-built under §6 | agent adoption alone: `adoption-invalid`; with a `Per:` decision an agent attested: invalid; with one a person owner attested that authorises another decision: invalid; with one that authorises this one: valid |
 | a breaking change slips into a minor revision | accept refuses non-additive revisions; the verifier check; `compatibility-unverified` | a revision declaring `breaking` is refused; a verifier's breaking report flags `breaking-without-version` |
 | a major is retired while still consumed | retirement needs a complete view and no consumer, or a program decision | an acceptor missing one area is refused with "1 area not visible to you" |
 | cross-project reads cost too much | one warm export per distinct project, at most 50; check first | a trace citing 3 projects makes 3 reads; a token to an unreadable project makes none |
@@ -482,7 +614,7 @@ web service's read (`program_links_read`), with no change to the records.
 4. **The program view and the Program page.**
    - `GET …/program`: areas, interfaces with the §4.4 flags, program requirements' coverage;
      bounds and the coverage block. The client `trace --program`.
-   - The decision and suggestion sections show `unchecked` until slice 5.
+   - The decision and suggestion sections are slice 5's (kittrial-5bb.454).
    - Depends on slices 1-3, and on .401 slice 4's trace read.
 5. **Decisions across levels.**
    - The `Binds:`, `Owner-only:`, `Adopts:` and `Per:` lines, checked live, with their flags.
@@ -495,3 +627,15 @@ web service's read (`program_links_read`), with no change to the records.
 - Slice 3's register is useful as a catalog even before the view.
 - Slice 4 shows whatever slices 1-3 recorded.
 - Slice 5 adds the decision columns.
+
+## Slice 3a implementation boundary
+
+The interface record/catalog, capability v2 declarations, pinned `iface:` tokens,
+acceptance/deprecation and strict complete-view retirement are slice 3a. The schema
+compatibility verifier in §4.3/§9.3 is the separately reviewed slice 3b; slice 3a
+reports compatibility-unverified and does not fetch/parse schemas. The initial
+accepted content declares `initial`; subsequent content changes within a major
+must declare `additive`. A new major names the predecessor; state-only deprecation
+is journaled across two entries and replayable, not atomically committed with it.
+An already retired predecessor stays retired. No decision override of retirement
+is implemented in this slice. See SYSTEM_DESIGN "Kit lock order" and OPERATIONS: optional semantic deployment mutex, then a single project coordination lock, then authority/store, then journals. Cross-project snapshots finish before the final authority boundary; frozen cached rows are gated against refreshed live authority and never acquire an area lock there. Only the defining pair is needed for draft publication and ordinary acceptance; retirement needs the complete bounded inventory. Unrelated references, v1 capability writes and store-only membership changes do not acquire the semantic mutex. Capabilities with no retained approved interface declarations (including retired interface-free capabilities) are outside the interface inventory. A canonically honoured capability retirement is also outside scope even with interface history; later staff turnover does not undo retirement. Inert or unauthorised retirement still fails closed. Historical decisions are parsed per retained comment, so a valid void repairs malformed content and operator re-acceptance can restore coverage without hiding former declarations. For other records in scope, an existing but currently inert acceptance makes coverage incomplete; only never-accepted records or actual withdrawals whose approval is still live are outside scope.

@@ -1494,10 +1494,64 @@ class InProcessBackend:
     def reference(self, project_id, key):
         raise not_found('Reference not found')
 
+    def interfaces(self,project_id,args,readable=()):
+        if args[:1]==['get']:raise not_found('Interface not found')
+        return {'schema_version':1,'items':[],'total':0,'next_offset':None,'coverage':{'complete':False},'program_coverage':{'complete':False}}
+
     def reference_links(self, project_id):
         """kittrial-5bb.446: the in-process backend holds no native records, so no program links."""
         return {'schema_version': 1, 'items': [],
                 'coverage': 'the in-process backend holds no native reference records'}
+
+    def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(),
+                decisions_offset=0, suggestions_offset=0):
+        """kittrial-5bb.453: the program view from this backend's own link reads. It holds no native rows (a test may
+        give some in ``native_rows``, {project: rows}), so a readable area has no open task and no lane, and the
+        program no requirement; the rules are the endpoint's (program_view, program_decisions), over the same link
+        facts and the service's own state."""
+        import program_view
+        items = self.reference_links(project_id).get('items') or []
+        entries = program_view.area_keys(items)
+        page = entries[offset:offset + limit]
+        memberships, users = self.service.program_link_people({project_id} | {area for area, _ in page})
+        areas = []
+        for area, own in page:
+            side = program_view.program_side(project_id, area, own, memberships, users)
+            if side != 'in':
+                # Review of .453, B1: the program's side first; a side that is not in reads nothing of the area.
+                areas.append(program_view.area_row(area, program_links.link_state(side, False)))
+                continue
+            try:
+                member = next((i for i in self.reference_links(area).get('items') or []
+                               if isinstance(i, dict) and i.get('key') == program_links.MEMBER_OF), None)
+            except HttpError:
+                member = None
+            with self.service.store.lock:
+                exists = area in self.service.state['projects']
+            state = program_view.link_state(project_id, area, own, member, memberships, users)
+            if not exists or area not in set(readable or ()):
+                areas.append(program_view.area_row(area, state))
+            else:
+                areas.append(program_view.area_row(area, state, program_view.area_details([], {})))
+        requirements = {'items': [], 'total': 0, 'next_offset': None, 'scope': program_view.REQUIREMENTS_SCOPE}
+        import copy
+        import program_decisions
+        native = getattr(self, 'native_rows', None) or {}
+        sides = {area: program_view.program_side(project_id, area, own, memberships, users) for area, own in entries}
+        on_page = {area for area, _ in page}
+        states = {area: ('in' if area in on_page else 'not-checked') for area, side in sides.items() if side == 'in'}
+        read_rows = {row['area']: list(native.get(row['area']) or []) for row in areas if row.get('visible')}
+        with self.service.store.lock:
+            state = copy.deepcopy(self.service.state)
+        operators = list(getattr(self, 'operators', ()) or ())
+        decisions = program_decisions.decisions_section(native.get(project_id) or [], project_id, states, read_rows,
+                                                        state, operators, decisions_offset,
+                                                        getattr(self, 'journals', None))
+        suggestions = program_decisions.suggestions_section(native.get(project_id) or [], suggestions_offset)
+        result = program_view.answer(project_id, areas, len(entries), offset, limit, requirements, decisions,
+                                     suggestions)
+        result['is_program'] = program_view.accepted_area(items, project_id, memberships, users)
+        return result
 
     def references_find(self, project_id, phrase, limit=5):
         return {'schema_version': 1, 'phrase': phrase, 'total': 0, 'items': [],
@@ -2320,12 +2374,15 @@ class EndpointBackend:
         'followons.record', 'followons.withdraw',
         # Files attached to a task (kittrial-5bb.370): the canonical `task-file` action.
         'files.record', 'files.withdraw',
+        'interfaces.propose', 'interfaces.revise', 'interfaces.accept',
         'references.propose', 'references.revise', 'references.accept', 'references.retire',
         'references.verify',
         'capabilities.propose', 'capabilities.revise', 'capabilities.accept', 'capabilities.retire',
         'capabilities.verify', 'capabilities.alias.propose', 'capabilities.alias.reject',
         # Delegated decision rights (kittrial-5bb.407): the canonical `delegation` action.
         'delegations.grant', 'delegations.narrow', 'delegations.revoke',
+        # An author's attestation of a decision (kittrial-5bb.454 r2): the canonical `decision-attest` action.
+        'decisions.attest',
     )
     #: Routes with no canonical command yet, and why. Fails closed rather than
     #: pretending the service store is canonical.
@@ -2685,13 +2742,14 @@ class EndpointBackend:
                               (reply.get('stderr') or 'Release facts cannot be recorded').strip())
             error.nothing_done = True
             raise error
-        if action == 'delegation' and isinstance(reply, dict) and reply.get('returncode') == 2 and (
-                reply.get('delegation_status') or reply.get('records_status')):
-            # The delegation action's own refusal or its identity check's (kittrial-5bb.407):
+        if action in ('delegation', 'decision-attest', 'bd') and isinstance(reply, dict) \
+                and reply.get('returncode') == 2 and (reply.get('delegation_status') or reply.get('records_status')):
+            # The delegation action's own refusal or its identity check's (kittrial-5bb.407), and the same for an
+            # attestation and for the gate on an attested decision's status (kittrial-5bb.454 r2):
             # nothing was written, and the status is the one the action gave.
             status = reply.get('delegation_status') or reply.get('records_status')
             text = (reply.get('stderr') or 'Delegation refused').strip().split('\n')[-1]
-            for prefix in ('ValueError: ', 'DelegationRefusal: '):
+            for prefix in ('ValueError: ', 'DelegationRefusal: ', 'AttestRefusal: '):
                 if text.startswith(prefix):
                     text = text[len(prefix):]
                     break
@@ -2699,7 +2757,7 @@ class EndpointBackend:
                                       422: 'invalid'}.get(status, 'unavailable'), text)
             error.nothing_done = True
             raise error
-        if action in ('ref', 'capability') and isinstance(reply, dict) and reply.get('records_status'):
+        if action in ('ref', 'capability', 'interface') and isinstance(reply, dict) and reply.get('records_status'):
             status = reply['records_status']
             text = (reply.get('stderr') or 'Record operation refused').strip().split('\n')[-1]
             for prefix in ('ValueError: ', 'RecordsRefusal: '):
@@ -2845,7 +2903,7 @@ class EndpointBackend:
                 if reply.get('refused') == 'coordinator-rule' and isinstance(detail, str) \
                         and detail.startswith('ValueError: '):
                     raise invalid(detail[len('ValueError: '):], detail)
-                if action in ('ref', 'capability') and isinstance(detail, str):
+                if action in ('ref', 'capability', 'interface') and isinstance(detail, str):
                     clean = detail
                     for prefix in ('ValueError: ', 'RecordsRefusal: '):
                         if clean.startswith(prefix):
@@ -3044,7 +3102,7 @@ class EndpointBackend:
             authority = authority_request(principal, project_id, capability,
                                           now=self.service._expiry_now())
             if self.service.approval_by_another_party and (
-                    route.startswith('references.') or route.startswith('capabilities.')):
+                    route.startswith('references.') or route.startswith('capabilities.') or route.startswith('interfaces.')):
                 authority['approval_by_another_party'] = True
         try:
             result = self._run(action, project, payload.get('actor') or self._actor(principal),
@@ -3186,6 +3244,11 @@ class EndpointBackend:
                     if key not in ('schema_version', 'operation_id', 'action')}
             body.update(schema_version=1, operation_id=operation_id, action=operation)
             return 'delegation', project_id, [operation, json.dumps(body, ensure_ascii=False)], {}
+        if route == 'decisions.attest':
+            # Only what the author read travels; the endpoint fills the author, how it came and the time.
+            body = {'schema_version': 1, 'operation_id': operation_id, 'decision': payload['decision'],
+                    'digest': payload['digest']}
+            return 'decision-attest', project_id, ['attest', json.dumps(body, ensure_ascii=False)], {}
         if route.startswith('followons.'):
             # The coordinator's recorded hand-back (kittrial-5bb.343): the canonical
             # `assignee-followon` action derives every record fact under the project
@@ -3347,14 +3410,15 @@ class EndpointBackend:
                 raise invalid('Send an Idempotency-Key header or an operation_id')
             return ('proposal', project_id, [payload['command'], '@attachment:0'],
                     {'0': {'flag': '--file', 'text': json.dumps(body)}})
-        if route.startswith('references.') or route.startswith('capabilities.'):
+        if route.startswith('references.') or route.startswith('capabilities.') or route.startswith('interfaces.'):
             body = dict(payload['body'])
             body['operation_id'] = body.get('operation_id') or operation_id
             if not body['operation_id']:
                 raise invalid('Send an Idempotency-Key header or an operation_id')
             if isinstance(body.get('acceptance'), dict) and not body['acceptance'].get('decision_id'):
                 body['acceptance'] = dict(body['acceptance'], decision_id=body['operation_id'])
-            action_name = 'ref' if route.startswith('references.') else 'capability'
+            action_name = ('ref' if route.startswith('references.') else
+                           'interface' if route.startswith('interfaces.') else 'capability')
             document = body.pop('document', None) if action_name == 'ref' else None
             args = [payload['command'], '@attachment:0']
             attachments = {'0': {'flag': '--file', 'text': json.dumps(body, ensure_ascii=False)}}
@@ -3421,6 +3485,21 @@ class EndpointBackend:
             raise uncertain('Canonical switch read returned an unexpected shape')
         return payload
 
+    def program(self, project_id, offset=0, limit=50, idle_minutes=15, requirements_offset=0, readable=(),
+                decisions_offset=0, suggestions_offset=0):
+        """kittrial-5bb.453: one page of the program view through the endpoint's read-only `program` action, with the
+        caller's readable projects as the service's own --readable arguments (the .449 rule)."""
+        args = ['--offset', str(offset), '--limit', str(limit), '--idle-minutes', str(idle_minutes),
+                '--requirements-offset', str(requirements_offset), '--decisions-offset', str(decisions_offset),
+                '--suggestions-offset', str(suggestions_offset)]
+        args += ['--readable'] + [arg for project in sorted(readable) for arg in ('--readable', project)][1:] \
+            if readable else ['--readable']
+        reply = self._endpoint('program', project_id, self.actor_namespace + '/read', args)
+        payload = self._checked(reply, 'program', reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('Canonical program read returned an unexpected shape')
+        return payload
+
     def trace(self, project_id, view, scope=None, offset=0, limit=50, generation=None, readable=()):
         """kittrial-5bb.425: one page of the trace read through the endpoint's read-only `trace` action. ``readable`` is
         the caller's readable projects (kittrial-5bb.449), passed as the service's own --readable arguments."""
@@ -3471,6 +3550,22 @@ class EndpointBackend:
         payload = self._checked(reply, reading=True)
         if not isinstance(payload, dict):
             raise uncertain('The canonical delegations read returned an unexpected shape')
+        return payload
+
+    def decision_attestation(self, project_id, principal, decision):
+        """The exact text of one decision, its digest and how it reads (kittrial-5bb.454 r2), through the endpoint's
+        ``decision-attest read``."""
+        reply = self._endpoint('decision-attest', project_id, self.service.bind_actor(principal, None), ['read', decision],
+                               authority=authority_request(principal, project_id, CAP_READ,
+                                                           now=self.service._expiry_now()),
+                               require_authority=True)
+        if isinstance(reply, dict) and reply.get('returncode') == 2 and reply.get('delegation_status'):
+            status = reply['delegation_status']
+            raise HttpError(status, {403: 'forbidden', 404: 'not_found'}.get(status, 'invalid'),
+                            (reply.get('stderr') or 'The attestation cannot be read').strip())
+        payload = self._checked(reply, reading=True)
+        if not isinstance(payload, dict):
+            raise uncertain('The canonical attestation read returned an unexpected shape')
         return payload
 
     def lanes_read(self, project_id, principal, args, actor, scope):
@@ -3653,6 +3748,14 @@ class EndpointBackend:
         if not isinstance(payload, dict):
             raise uncertain('Canonical proposal read returned an unexpected shape')
         return payload
+
+    def interfaces(self, project_id, args, readable=()):
+        extra=['--readable']
+        for project in sorted(readable): extra += ['--readable', project]
+        reply=self._endpoint('interface',project_id,self.actor_namespace+'/read',list(args)+extra)
+        if reply.get('returncode')==2 and 'Unknown interface key' in (reply.get('stderr') or ''):
+            raise not_found('Interface not found')
+        return self._checked(reply,'interface',reading=True)
 
     def _ref_read(self, project_id, args, missing=False):
         reply = self._endpoint('ref', project_id, self.actor_namespace + '/read', args)
@@ -5965,7 +6068,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header('Set-Cookie', attributes)
 
     # -- mutation helper -------------------------------------------------------
-    def _mutate(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
+    def _mutate(self, ctx, route_name, project_id, fn, **kwargs):
+        # Store-only mutations serialize on authority; they never take the semantic mutex.
+        return self._mutate_unlocked(ctx,route_name,project_id,fn,**kwargs)
+
+    def _mutate_unlocked(self, ctx, route_name, project_id, fn, *, capability, allow_self_user=None,
                 status=200, idempotent=True, replay_status=None, serialize=True,
                 canonical=False, reason=None, refused_reason=None,
                 audit_success=True, state_saved=None, audit_metadata=None, replay_check=None):
@@ -11852,9 +11959,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                          'evidence', 'reason', 'decision_id', 'owners', 'approvers', 'policy')
 
     CAP_PROPOSE_FIELDS = ('key', 'revision', 'expected_sha256', 'name', 'aliases', 'summary',
-                          'requirements', 'anchors', 'code', 'tests', 'owner', 'tags')
+                          'requirements', 'anchors', 'code', 'tests', 'owner', 'tags', 'interfaces')
     CAP_REVISE_FIELDS = ('key', 'revision', 'expected_revision', 'expected_sha256', 'name', 'aliases',
-                         'summary', 'requirements', 'anchors', 'code', 'tests', 'owner', 'tags')
+                         'summary', 'requirements', 'anchors', 'code', 'tests', 'owner', 'tags', 'interfaces')
     CAP_ACCEPT_FIELDS = REF_ACCEPT_FIELDS
     CAP_RETIRE_FIELDS = REF_RETIRE_FIELDS
     CAP_VERIFY_FIELDS = ('key', 'revision', 'entry_revision', 'record_sha256', 'expected_sha256',
@@ -11912,7 +12019,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         item r2-field-references).
         """
         import record_acceptance
-        if record_kind not in ('references', 'capabilities'):
+        if record_kind not in ('references', 'capabilities', 'interfaces'):
             return False, 'The record family could not be read.'
         by_agent = getattr(ctx.principal, 'via', None) == 'credential'
         entry_state = item.get('state')
@@ -12327,7 +12434,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = dict(fields, schema_version=1, operation_id=operation_id)
         if key_param:
             body['key'] = ctx.params['key']
-        if coordinator and command in ('accept', 'web-verify') and ctx.principal.via == 'credential':
+        if (coordinator and (command in ('accept', 'web-verify') or route_name == 'capabilities.retire')
+                and ctx.principal.via == 'credential'):
             # kittrial-5bb.407: an agent accepts or verifies only within a person owner's
             # delegation, named here; the default operation id would name no decision. The
             # endpoint checks the delegation itself, live, under the write's lock.
@@ -12335,8 +12443,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if named is None and isinstance(body.get('acceptance'), dict):
                 named = body['acceptance'].get('decision_id')
             if not isinstance(named, str) or not named.strip():
-                raise forbidden('An agent accepts or verifies a record only within a delegation: name the person '
-                              "owner's delegation decision as decision_id")
+                action = 'retires a capability' if route_name == 'capabilities.retire' else 'accepts or verifies a record'
+                raise forbidden('An agent %s only within a delegation: name the person ' % action +
+                                "owner's delegation decision as decision_id")
         body = self._normalize_record_payload(ctx, command, body, operation_id)
 
         def mutate_record():
@@ -12351,9 +12460,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self._enrich_record_view(ctx, pid, capabilities, result,
                                                   record_kind=route_name.split('.')[0])
             return result, result
-        return self._mutate(ctx, route_name, pid, mutate_record, status=status,
-                            capability=needed, serialize=False, canonical=True,
-                            reason='%s %s' % (command, body.get('key') or ''))
+        answer = self._mutate(ctx, route_name, pid, mutate_record, status=status,
+                              capability=needed, serialize=False, canonical=True,
+                              reason='%s %s' % (command, body.get('key') or ''))
+        if (route_name in ('references.accept', 'references.retire')
+                and str(ctx.params.get('key') or '').startswith(program_links.PREFIX)):
+            # kittrial-5bb.453 (Q1 at VERIFIED): the Program menu link's cached flag follows a web accept or retire
+            # of a program key. Read once here, at the write, never per menu render; a failed read keeps the flag.
+            self._refresh_program_flag(pid)
+        return answer
+
+    def _refresh_program_flag(self, pid):
+        import program_view
+        try:
+            items = self.backend.reference_links(pid).get('items') or []
+        except HttpError:
+            return
+        memberships, users = self.service.program_link_people({pid})
+        self.service.set_program_flag(pid, program_view.accepted_area(items, pid, memberships, users))
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/delegations')
     def delegations_list(self, ctx):
@@ -12416,6 +12540,45 @@ class ApiHandler(BaseHTTPRequestHandler):
             return result, result
         return self._mutate(ctx, route_name, pid, write, capability=CAP_PROJECT_ADMIN,
                             status=201, serialize=False, canonical=True)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/decisions/(?P<did>' + ID + r')/attestation')
+    def decision_attestation_read(self, ctx):
+        """The exact text of one decision, its digest and how it reads now (kittrial-5bb.454 r2), at CAP_READ: what a
+        person or an agent reads before attesting."""
+        self._project(ctx, CAP_READ)
+        if not hasattr(self.backend, 'decision_attestation'):
+            raise not_implemented('Attestations are unavailable on this server')
+        return 200, self.backend.decision_attestation(ctx.params['pid'], ctx.principal, ctx.params['did'])
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/decisions/(?P<did>' + ID + r')/attest')
+    def decision_attest_write(self, ctx):
+        """Attest the exact text of a decision (kittrial-5bb.454 r2).
+
+        The author's own web session or agent, with standing in the project now: the capability only opens the route,
+        and the endpoint checks who is writing and their standing under the lock. The body is ``digest``, what the
+        author read; a text that changed since is refused with 409. The author, how it came and the time are the
+        server's.
+        """
+        import decision_attest
+        pid = ctx.params['pid']
+        if not hasattr(self.backend, 'ROUTES') or 'decisions.attest' not in self.backend.ROUTES:
+            raise not_implemented('Attestations are unavailable on this server')
+        self._project(ctx, CAP_TASKS)
+        payload = dict(ctx.payload or {})
+        refuse_unknown_fields(payload, ('digest',), 'An attestation')
+        if not isinstance(payload.get('digest'), str) or not decision_attest.DIGEST.fullmatch(payload['digest']):
+            raise invalid('Supply digest, the 64 hex digits the attestation read gave for the text you read')
+        payload['decision'] = ctx.params['did']
+
+        def write():
+            if ctx.idempotency_key is None:
+                raise invalid('Send an Idempotency-Key and reuse it with the identical request '
+                              'after an uncertain outcome')
+            result = self.backend.invoke('decisions.attest', ctx.principal, pid, payload, ctx.idempotency_key,
+                                         target=ctx.route_target, authorize=ctx.authorize, capability=CAP_TASKS)
+            return result, result
+        return self._mutate(ctx, 'decisions.attest', pid, write, capability=CAP_TASKS, status=201, serialize=False,
+                            canonical=True)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/references')
     def references_list(self, ctx):
@@ -12588,6 +12751,82 @@ class ApiHandler(BaseHTTPRequestHandler):
                                    self.REF_RETIRE_FIELDS, 'A reference retirement',
                                    coordinator=True, key_param=True, status=200)
 
+    PROGRAM_QUERY = ('cursor', 'limit', 'idle_minutes', 'requirements_offset', 'decisions_offset', 'suggestions_offset')
+    #: Reads of one page when rights change under it (review of .453, B2): each re-read leaves out the areas lost.
+    PROGRAM_READS_MAX = 3
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/program')
+    def program_view_read(self, ctx):
+        """The program view, the program manager's dashboard (kittrial-5bb.453; PROGRAM_DESIGN.md sections 5, 9.4).
+
+        CAP_READ in the program, with one 404 for every caller who may not read it and every project that is not
+        there, as the trace. One endpoint call with this caller's readable projects, each checked on its own
+        (``_readable_projects``, the .449 rule). An area outside them, and an area that does not exist, give the
+        same row: its link state and "not visible to you", no number (permission before counts). The coordinators
+        of a readable area are added here through ``coordinators_of``, which checks the caller again; a right lost
+        since makes the row the hidden one. Areas page 50 at a time; requirement rows 50 at a time.
+        """
+        import program_view
+        absent = not_found('Project not found')
+        try:
+            self._project(ctx, CAP_READ)
+        except HttpError as error:
+            if error.status == 401:
+                raise
+            raise absent from None
+        reader = getattr(self.backend, 'program', None)
+        if reader is None:
+            raise absent
+        unknown = sorted(set(ctx.query) - set(self.PROGRAM_QUERY))
+        if unknown:
+            raise invalid('program takes %s; not %s' % (', '.join(self.PROGRAM_QUERY), ', '.join(unknown)))
+        limit, state = self._page(ctx, ctx.query)
+        if limit > program_view.AREAS_MAX:
+            raise invalid('limit must be between 1 and %d' % program_view.AREAS_MAX)
+        idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        offsets = {}
+        for name in ('requirements_offset', 'decisions_offset', 'suggestions_offset'):
+            value = ctx.query.get(name, '0')
+            if not isinstance(value, str) or not value.isdigit() or len(value) > 6:
+                raise invalid('%s must be a whole number from 0 to 999999' % name)
+            offsets[name] = int(value)
+        raw = str(offsets['requirements_offset'])
+        pid = ctx.params['pid']
+        readable = list(self._readable_projects(ctx.principal))
+        for attempt in range(self.PROGRAM_READS_MAX):
+            result = dict(reader(pid, state['o'], limit, idle_minutes, int(raw), readable=readable,
+                                 decisions_offset=offsets['decisions_offset'],
+                                 suggestions_offset=offsets['suggestions_offset']))
+            lost = []
+            for row in (result.get('areas') or {}).get('items') or []:
+                if not isinstance(row, dict) or not row.get('visible'):
+                    continue
+                try:
+                    row['coordinators'] = self.service.coordinators_of(ctx.principal, row['area'])
+                except HttpError:
+                    lost.append(row['area'])
+                    hidden = program_view.area_row(row['area'], row['state'])
+                    row.clear()
+                    row.update(hidden)
+            if not lost:
+                break
+            # Review of .453, B2 (N1): a right lost after the read. The row is hidden above, and the page is read
+            # again without that area, so none of its citations (no-area-cites, cites-superseded-revision) stay.
+            readable = [project for project in readable if project not in lost]
+        else:
+            # Rights kept changing on every read: the rows are hidden, and no requirement row is shown at all.
+            result['requirements'] = program_view.unsettled()
+        result['coverage'] = program_view.coverage(result['areas']['items'], result['areas']['total'], state['o'],
+                                                   result['requirements'])
+        self.service.set_program_flag(pid, bool(result.pop('is_program', False)))
+        result.pop('coordinators', None)        # the host route's sentence; here they are on each readable row
+        following = result['areas'].pop('next_offset', None)
+        result['areas']['next_cursor'] = (make_cursor(ctx.principal, pid, ctx.query, following,
+                                                      key=self.service.cursor_key())
+                                          if following is not None else None)
+        result['generated_at'] = now_iso(self.service._now())
+        return 200, result
+
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/program-links')
     def program_links_read(self, ctx):
         """The program links of a project (kittrial-5bb.446; PROGRAM_DESIGN.md sections 2.2, 2.3, 9.1), at CAP_READ.
@@ -12670,6 +12909,52 @@ class ApiHandler(BaseHTTPRequestHandler):
                 'accepted_at': item.get('accepted_at'),
                 'decision': (record.get('authority') or {}).get('id'),
                 'proposed_revision': item.get('proposed_revision')}
+
+    def _interface_read(self, ctx, args):
+        self._project(ctx,CAP_READ)
+        read=getattr(self.backend,'interfaces',None)
+        if read is None: raise not_implemented('Interface records need the canonical endpoint backend')
+        readable=set()
+        with self.service.store.lock:
+            projects=list(self.service.state.get('projects') or {})
+        for project in projects:
+            try:
+                self.service.check_authority(ctx.principal,project,CAP_READ)
+                readable.add(project)
+            except HttpError: pass
+        return read(ctx.params['pid'],args,readable=readable)
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/interfaces')
+    def interfaces_list(self,ctx):
+        self._project(ctx,CAP_READ)
+        limit,state=self._page(ctx,ctx.query)
+        result=self._interface_read(ctx,['list','--limit',str(limit),'--offset',str(state['o'])])
+        if result.get('next_offset') is not None:
+            result['next_cursor']=make_cursor(ctx.principal,ctx.params['pid'],ctx.query,result['next_offset'],key=self.service.cursor_key())
+        else: result['next_cursor']=None
+        return 200,result
+
+    @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')')
+    def interfaces_get(self,ctx):
+        return 200,self._interface_read(ctx,['get',ctx.params['key']])
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/interfaces')
+    def interfaces_propose(self,ctx):
+        import interface_records
+        return self._records_write(ctx,'interfaces.propose','propose',interface_records.CONTENT_FIELDS,
+                                   'An interface',key_param=False,status=201)
+
+    @route('PATCH', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')')
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')/revisions')
+    def interfaces_revise(self,ctx):
+        import interface_records
+        fields=interface_records.CONTENT_FIELDS+('revision','expected_revision','expected_sha256')
+        return self._records_write(ctx,'interfaces.revise','revise',fields,'An interface revision')
+
+    @route('POST', r'/v1/projects/(?P<pid>' + ID + r')/interfaces/(?P<key>' + CAPABILITY_KEY + r')/accept')
+    def interfaces_accept(self,ctx):
+        return self._records_write(ctx,'interfaces.accept','accept',self.REF_ACCEPT_FIELDS,
+                                   'An interface acceptance',coordinator=True)
 
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/capabilities')
     def capabilities_list(self, ctx):

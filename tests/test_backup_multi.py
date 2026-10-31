@@ -926,7 +926,7 @@ class InterruptedRunAndCopyLockCase(unittest.TestCase):
             make_project(self.root, name)
         self.flock = Mock()
         patcher = patch.dict(sys.modules, {
-            'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2)})
+            'fcntl': types.SimpleNamespace(flock=self.flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.destination = Path(self.temp.name) / 'off-machine'
@@ -984,7 +984,7 @@ class InterruptedRunAndCopyLockCase(unittest.TestCase):
         def fake_flock(handle, operation):
             if str(getattr(handle, 'name', '')).endswith('.coordination.lock'):
                 handles.append(handle)
-        return types.SimpleNamespace(flock=fake_flock, LOCK_EX=2)
+        return types.SimpleNamespace(flock=fake_flock, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
 
     def test_the_pair_is_rechecked_and_the_sidecar_copied_under_the_coordination_lock(self):
         self.record()

@@ -542,7 +542,7 @@ class FollowonBackupRestoreTests(unittest.TestCase):
         self.destination.mkdir()
         (self.root / 'backups' / 'source').mkdir(parents=True)
         self.bundle = self.root / 'backups' / 'source.coordination.json'
-        fake = types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        fake = types.SimpleNamespace(flock=lambda *a, **k: None, LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, LOCK_SH=1)
         self.patch_fcntl = patch.dict(sys.modules, {'fcntl': fake})
         self.patch_fcntl.start()
         self.addCleanup(self.patch_fcntl.stop)

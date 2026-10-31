@@ -194,6 +194,9 @@ PROPOSAL_PREFIX = 'Kind: requirement-proposal-v1\n'
 PROPOSAL_DISPOSITION_PREFIX = 'Kind: proposal-disposition-v1\n'
 CONTRIBUTION_SETTINGS_PREFIX = 'Kind: contribution-settings-v1\n'
 CAPABILITY_ENTRY_PREFIX = 'Kind: capability-entry-v1\n'
+CAPABILITY_ENTRY_V2_PREFIX = 'Kind: capability-entry-v2\n'
+INTERFACE_ENTRY_PREFIX = 'Kind: interface-entry-v1\n'
+INTERFACE_ACCEPTANCE_PREFIX = 'Kind: interface-acceptance-v1\n'
 CAPABILITY_ACCEPTANCE_PREFIX = 'Kind: capability-acceptance-v1\n'
 CAPABILITY_VERIFICATION_PREFIX = 'Kind: capability-verification-v1\n'
 CAPABILITY_ALIAS_PREFIX = 'Kind: capability-alias-v1\n'
@@ -239,6 +242,10 @@ TASK_FILE_WITHDRAWN_PREFIX = 'Kind: task-file-withdrawn-v1\n'
 # entry (``<project>/.delegations/``), so one planted where the prefix is not reserved (an
 # older kit) grants nothing. Not a record-anchor family: every surface reads it as a comment.
 DELEGATION_PREFIX = 'Kind: delegation-v1\n'
+# kittrial-5bb.454 r2. An author's attestation of a decision row's exact text, written only by the dedicated operation
+# (decision_attest.py). Reserved so the raw `comments add` path can never plant one; honoured only with its host journal
+# entry (``<project>/.decision-attests/``). Not a record-anchor family: every surface reads it as a comment.
+DECISION_ATTEST_PREFIX = 'Kind: decision-attest-v1\n'
 # kittrial-5bb.418 (TRACEABILITY_DESIGN §5.1 step 2). The index of a design document, derived by
 # the server from the stored bytes and written by the propose or revise of a design.<scope>
 # reference entry (design_documents). Reserved, every version, so no raw `comments add` can plant
@@ -272,6 +279,9 @@ RESERVED = (
     (PROPOSAL_DISPOSITION_PREFIX, 'proposal disposition', 'admin.py proposal-review|proposal-decide on the coordination host'),
     (CONTRIBUTION_SETTINGS_PREFIX, 'contribution settings', 'admin.py proposal-settings on the coordination host'),
     (CAPABILITY_ENTRY_PREFIX, 'capability entry', 'capability propose|revise'),
+    (CAPABILITY_ENTRY_V2_PREFIX, 'capability entry', 'capability propose|revise'),
+    (INTERFACE_ENTRY_PREFIX, 'interface entry', 'interface propose|revise'),
+    (INTERFACE_ACCEPTANCE_PREFIX, 'interface acceptance', 'admin.py interface-apply'),
     (CAPABILITY_ACCEPTANCE_PREFIX, 'capability acceptance evidence', 'admin.py capability-apply'),
     (CAPABILITY_VERIFICATION_PREFIX, 'capability verification', 'capability check --record (capability verify)'),
     (CAPABILITY_ALIAS_PREFIX, 'capability alias', 'capability propose-alias|alias-reject'),
@@ -290,6 +300,9 @@ RESERVED = (
     (DELEGATION_PREFIX, 'delegation record',
      "the delegations route (a person owner's web session) or admin.py delegation-record on the "
      'coordination host'),
+    (DECISION_ATTEST_PREFIX, 'decision attestation',
+     "the attest route (POST /v1/projects/PID/decisions/ID/attest, the author's own web session or agent) or "
+     'admin.py decision-attest on the coordination host'),
     (DESIGN_INDEX_PREFIX, 'design document index',
      'ref propose|revise of a design.<scope> entry with its document (the server writes the index)'),
     (DESIGN_VERIFICATION_PREFIX, 'design document verification',
@@ -821,7 +834,7 @@ def raw_file_flag_in_args(args):
 # either before a later slice turns writes on.
 RESERVED_LABEL_PREFIXES = ('request:', 'request-content:', 'requirement:',
                            'reference:', 'reference-key:', 'proposal:', 'proposal-key:',
-                           'capability:', 'capability-key:', 'open-item:')
+                           'capability:', 'capability-key:', 'interface:', 'interface-key:', 'open-item:')
 # `gt:slot` marks a project's merge slot (coordination.MERGE_SLOT_LABEL). One
 # `--remove-label gt:slot` by a contributor put the slot back among claimable work
 # and a claim then jammed it (kittrial-5bb.113 review), so no contributor adds,
@@ -944,7 +957,8 @@ RECORD_ANCHOR_FAMILIES = {
                   REFERENCE_ACCEPTANCE_PREFIX),
     'proposal': (PROPOSAL_PREFIX, PROPOSAL_DISPOSITION_PREFIX),
     'contribution-settings': (CONTRIBUTION_SETTINGS_PREFIX,),
-    'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
+    'interface': (INTERFACE_ENTRY_PREFIX, INTERFACE_ACCEPTANCE_PREFIX),
+    'capability': (CAPABILITY_ENTRY_PREFIX, CAPABILITY_ENTRY_V2_PREFIX, CAPABILITY_ACCEPTANCE_PREFIX,
                    CAPABILITY_VERIFICATION_PREFIX, CAPABILITY_ALIAS_PREFIX),
     # kittrial-5bb.126. There is deliberately no family for coordinator-decision: its
     # native decision issue is a real work item and stays visible; only the comment hides.
@@ -953,12 +967,12 @@ RECORD_ANCHOR_FAMILIES = {
 RECORD_ANCHOR_LABELS = frozenset(RECORD_ANCHOR_FAMILIES)
 RECORD_COMMENT_FAMILIES = ('Kind: reference-', 'Kind: requirement-proposal-',
                            'Kind: proposal-disposition-', 'Kind: contribution-settings-',
-                           'Kind: capability-', 'Kind: open-item-', 'Kind: item-resolution-',
+                           'Kind: capability-', 'Kind: interface-', 'Kind: open-item-', 'Kind: item-resolution-',
                            'Kind: owner-answer-', 'Kind: coordinator-decision-', 'Kind: design-index-',
                            'Kind: design-verification-')
 _RECORD_KIND = re.compile(r'Kind: ([a-z][a-z-]*?)-v([1-9][0-9]{0,5})\n')
 # Versions after 1 that this kit reads, as (kind, version).
-SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3)})
+SUPPORTED_LATER_VERSIONS = frozenset({('reference-entry', 2), ('reference-entry', 3), ('capability-entry', 2)})
 
 
 def carries_record_label(row):
@@ -2181,6 +2195,27 @@ def refuse_http_actor(actor, launched_by_service):
     start the endpoint however it likes; that caller is inside the trust boundary of
     every check in this kit.
     """
-    if not launched_by_service and isinstance(actor, str) and HTTP_ACTOR.fullmatch(actor):
+    if launched_by_service or not isinstance(actor, str):
+        return
+    if any(ord(character) < 0x21 or ord(character) > 0x7e for character in actor):
+        # kittrial-5bb.454 (the trust boundary): white space, a control character or anything outside printable
+        # ASCII (look-alikes and confusables of an HTTP id included) is never a host actor.
+        raise ValueError('Actor %s holds a space or a character outside plain ASCII; declare your own session actor '
+                         'in plain letters, digits and . _ @ / -' % ascii(actor[:40]))
+    if http_actor_like(actor):
         raise ValueError('Actor %s has the shape of an HTTP account or agent id, which only the HTTP service '
                          'acts under; declare your own session actor' % actor[:40])
+
+
+def http_actor_like(actor):
+    """Whether a name reads as an HTTP account or agent id: the exact shape (``usr_`` or ``agent_`` and 16 lowercase
+    hex, alone or with ``/label``), or, once normalised (NFKC, case folded, surrounding space removed), any name that
+    begins with ``usr_`` or ``agent_``, however the rest is written (kittrial-5bb.454, the trust boundary: an
+    HTTP-shaped ``created_by`` is trusted as written by the web service, so no host route may write a look-alike)."""
+    if not isinstance(actor, str):
+        return False
+    if HTTP_ACTOR.fullmatch(actor):
+        return True
+    import unicodedata
+    folded = unicodedata.normalize('NFKC', actor).strip().casefold()
+    return folded.startswith(('usr_', 'agent_'))

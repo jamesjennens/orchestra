@@ -919,6 +919,43 @@ project linked with it in a program, and the addressed agents are woken.
   and an older kit keeps it untouched. Each record has a random id and `to.installation` (null), so a later relay
   between installations can carry it.
 
+**The program view** (kittrial-5bb.453; docs/design/PROGRAM_DESIGN.md section 5): the program manager's dashboard.
+- **The route:** `GET /v1/projects/{id}/program?cursor=&limit=&idle_minutes=&requirements_offset=`, at `CAP_READ` in
+  the program, with one 404 for a caller who may not read it and a project that is not there. 50 areas a page,
+  50 requirement rows a page.
+- **Under the caller's permissions:** the service checks each project the caller can name and passes those as its
+  own `--readable`; the endpoint honours that set only from the service's launch. An area outside it, and one that
+  does not exist, give the same row: the link state and "not visible to you", with no number.
+- **Coordinators** of a readable area come from `coordinators_of`, which checks the caller again. A right lost
+  since hides the row, and the page is read again without that area, so its citations leave the requirements
+  section too (at most three reads; then the section reads `unsettled`).
+- **An area whose program side is not in** (proposed, left, not accepted by an owner) is never read.
+- **Decisions and suggestions** (kittrial-5bb.454): `decisions_offset` and `suggestions_offset` page them, 50 at a
+  time. A decision or an adoption counts only with a live attestation of its exact text, decided against this service's
+  state at every read; a host route refuses any actor shaped like an account or agent id, and its look-alikes.
+- **Attesting a decision** (kittrial-5bb.454 r2): `GET /v1/projects/{id}/decisions/{did}/attestation` (`projects.read`)
+  gives the exact type, title and description, their digest and how the row reads now. `POST
+  /v1/projects/{id}/decisions/{did}/attest` (`tasks`, with an `Idempotency-Key`) takes `{"digest": ...}` and is written
+  only for the author's own web session or agent with owner or coordinator standing in the project now: 403 otherwise,
+  for a coordinator over a text attested at an owner's level, and for a coordinator over a row whose old attestation can no
+  longer be read (a lost journal, or a restore), which only an owner or an operator attests again; 404 for a row that is
+  not a decision; 409 when the text
+  changed since it was read. A row carrying `Adopts:` or `Authorises:` pins the program decision's attestation id: it
+  needs that decision readable by the caller now (the same 403 for an unreadable program, no such project and no such
+  decision), and 409 for another attestation or a decision that does not count. For a decision that counts, the read also
+  gives `attestation_id`, `adopt_line` and `authorise_line` to copy.
+  The server fills in the author, how it came and the time. `http_client.py
+  decision-attestation` and `decision-attest` call them, and the decision's page has the button. Any later edit reads
+  `attestation-stale` and binds nothing.
+- **Status, type and labels of an attested decision**, and of any decision row carrying an attestation comment or a `Binds:`,
+  `Owner-only:`, `Adopts: decision:`, `Per: decision:` or `Authorises: decision:` line (kittrial-5bb.454 r2): `PATCH .../tasks/{id}` with `status`, a claim,
+  and the same changes through any other web route answer 403 unless the caller has the standing the row's records ask
+  for (see "The gate" in docs/design/PROGRAM_DESIGN.md §6, as built). An edit of the title or description is not refused:
+  it makes the row stale, which removes a binding and never makes one.
+- **The Program page** is in the menu of a project with an accepted `program.area.*` side: a flag kept in the web
+  state (`program_flags`), recomputed by every program read and by a web accept or retire of a `program.` key.
+  An older kit leaves it untouched; a stale flag only shows or hides the link.
+
 ### Creating a project from the web interface
 
 An operator creates a project on the host (`admin.py add-project NAME`) and a superuser
@@ -4421,7 +4458,8 @@ ungranted agents or worker credentials, or for the host route.
   `admin.py delegation-check --project P --state STATE.json`, which lists every agent holding the
   project's coordinator grant and whether a delegation in force covers it (`uncovered`).
 - **Backups** carry `.delegations/` with the other host journals; a restore that dropped it would
-  void every delegation.
+  void every delegation. They carry `.decision-attests/` the same way (kittrial-5bb.454 r2): without it every attested
+  decision reads `not-attested`.
 
 ### `points_to` and `pointers_validation` on capability records
 
@@ -4754,3 +4792,20 @@ nothing from disk).
   (`"The delivered bundle does not match its recorded checksum."`) with zero bytes sent. Every
   bundle download and every post-authorization refusal records a `delivery.bundle.read` entry in
   the HTTP audit log.
+
+### Program interfaces (slice 3a)
+
+The canonical backend serves `GET /v1/projects/{pid}/interfaces` (paged at 50)
+and `GET .../interfaces/{key}` at CAP_READ. Proposal/revision are
+`POST .../interfaces`, `PATCH .../interfaces/{key}` or
+`POST .../interfaces/{key}/revisions`; acceptance is
+`POST .../interfaces/{key}/accept`. All writes use Idempotency-Key and the shared
+record body's revision/hash/F3 conventions. See CLI_CONTRACT's **Program interface
+register** for the closed fields, lifecycle distinction and pinned `iface:` syntax.
+The defining area's coordinator proposes with program proposal standing; the
+program coordinator accepts, with an interfaces-scoped owner delegation for agents.
+No link adds membership or read permission. A complete readable, consumer-free view
+is required to accept a state-only retirement; no override is implemented. Schemas
+are pointers/digests, never automatically fetched, and compatibility reads unverified.
+The deployment mutation lock precedes project locks; busy is 503, not an indefinite
+wait. The isolation harness includes catalog/detail and all interface route names.

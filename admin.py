@@ -3837,7 +3837,7 @@ RETIRED_DIR='retired'
 RETIRE_JOURNAL='journal.jsonl'
 #: The receipt journals whose ``pending`` entries are reservations still in flight.
 RESERVATION_JOURNALS=('.coordination-requests','.requirement-requests','.handoff-requests',
-                      '.reference-requests','.proposal-requests','.capability-requests',
+                      '.reference-requests','.proposal-requests','.capability-requests','.interface-requests','.interface-transitions',
                       '.open-item-requests','.requirement-owner-requests')
 
 def retired_entries(root):
@@ -4301,7 +4301,7 @@ def backup_lock(root,name):
 # kittrial-5bb.126 (open items design, slice 0) adds `.open-item-requests`, which no
 # kit writes yet either. The host-issued `.owner-answers` journal is not a receipt
 # journal: see OWNER_ANSWERS_JOURNAL.
-RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.open-item-requests','.requirement-owner-requests')
+RECORD_JOURNALS=('.reference-requests','.proposal-requests','.capability-requests','.interface-requests','.interface-transitions','.open-item-requests','.requirement-owner-requests')
 #: The host-issued owner answer and owner decision journal of the open items design
 #: (kittrial-5bb.126, slice 0). Nothing writes it yet. It is backed up when present and
 #: validated by its reader's own validator, open_items.validate_owner_entry, exactly
@@ -4316,7 +4316,7 @@ OWNER_ANSWERS_JOURNAL='.owner-answers'
 #: ``<name>.tmp`` does not match the sweep's shape, so sweeping it is a no-op.
 ATOMIC_SWEEP_DIRECTORIES=('.',)+RESERVATION_JOURNALS+( '.handoffs','.handoff-recoveries',
     '.requirement-backfills','.integration-reverts','.assignee-followons','.lane-fault-clears','.lifecycle-voids',
-    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL,'.delegations')
+    '.web-lifecycle-marks','.history-snapshots',OWNER_ANSWERS_JOURNAL,'.delegations','.decision-attests')
 
 def sweep_project_temporaries(root,name,*,dry_run=False,min_age_seconds=None):
     """Sweep the project directory and every atomic family in it; never touches a live write.
@@ -4351,6 +4351,11 @@ def validate_record_receipt(name,record):
     """
     from requirement_records import validate_receipt
     validate_receipt(record)
+    if name.startswith('.interface-transitions/'):
+        from interface_records import validate_transition
+        validate_transition(record)
+        if name!='.interface-transitions/'+content_hash({'operation_id':record['operation_id']})+'.json':
+            raise ValueError('Interface transition receipt path mismatch')
     if name.startswith('.requirement-owner-requests/'):
         from requirement_http import validate_receipt as validate_owner_receipt
         validate_owner_receipt(record)
@@ -4372,7 +4377,7 @@ def validate_coordination_files(files):
     if not isinstance(files,dict):raise ValueError('Invalid coordination files map')
     for name,record in files.items():
         quarantine = isinstance(name,str) and re.fullmatch(r'\.feedback\.jsonl\.(?:[a-f0-9]{16}|[a-f0-9]{64})\.incomplete',name)
-        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.open-item-requests|\.owner-answers)/[a-f0-9]{64}\.json',name)
+        journal = isinstance(name,str) and re.fullmatch(r'(?:\.coordination-requests|\.handoffs|\.handoff-requests|\.handoff-recoveries|\.requirement-requests|\.requirement-owner-requests|\.requirement-backfills|\.integration-reverts|\.assignee-followons|\.lane-fault-clears|\.delegations|\.lifecycle-voids|\.web-lifecycle-marks|\.reference-requests|\.proposal-requests|\.capability-requests|\.interface-requests|\.interface-transitions|\.open-item-requests|\.owner-answers|\.decision-attests)/[a-f0-9]{64}\.json',name)
         baseline = isinstance(name,str) and name.startswith('.requirements-baselines/')
         if name not in ('.merge-context.json','.claiming.json','ONBOARDING.md','GUIDANCE.md','.guidance.json','.guidance-clear.json','.sessions.json','.feedback.jsonl','.requirements-governance.json','.requirements-governance-source.json','.lifecycle-voids-manifest.json','.web-lifecycle-marks-manifest.json','.lifecycle-void-abandons.json') and not quarantine and not journal and not baseline:raise ValueError('Invalid coordination backup path')
         if not isinstance(record,dict):raise ValueError('Invalid coordination record')
@@ -4956,6 +4961,14 @@ def backup_project(root,name):
         for record in delegation_journal.glob('*.json'):
             if record.is_symlink():raise ValueError('Delegation journal entry must not be a symlink')
             files['.delegations/'+record.name]=record_json.loads(read_regular_text(record))
+        # The attestation journal (kittrial-5bb.454 r2). restore-new always makes a new name, and a record binds its
+        # project's name, so the rows it restores read not-attested and stand gated until an owner attests them again. The
+        # journal is carried as the evidence of what was attested, and for a record's own name should a route ever restore it.
+        attest_journal=path/'.decision-attests'
+        if attest_journal.is_symlink():raise ValueError('Attestation journal must not be a symlink')
+        for record in attest_journal.glob('*.json'):
+            if record.is_symlink():raise ValueError('Attestation journal entry must not be a symlink')
+            files['.decision-attests/'+record.name]=record_json.loads(read_regular_text(record))
         # The per-project claiming setting (kittrial-5bb.352). It lives outside the
         # tracker, so a backup that dropped it would silently open claiming again after
         # a restore. A damaged file is carried byte for byte and reads back restrictive.
@@ -5319,7 +5332,7 @@ def revoked_keyed_voids(root,actor,limit=5):
     allowlist and the allowlist without `actor`, read by the reader every other read
     uses. Read-only and best-effort, like `revoked_revert_records`.
     """
-    import capability_records,reference_records
+    import capability_records,reference_records,interface_records
     authority=operators(root)
     remaining=frozenset(item for item in authority if item!=actor)
     count=0;changed=[];unreadable=0
@@ -5329,7 +5342,7 @@ def revoked_keyed_voids(root,actor,limit=5):
         except (OSError,ValueError,TypeError,KeyError,subprocess.CalledProcessError):
             unreadable+=1
             continue
-        for kind in (reference_records.KIND,capability_records.KIND):
+        for kind in (reference_records.KIND,capability_records.KIND,interface_records.KIND):
             for row in rows:
                 if not isinstance(row,dict) or kind.type_label not in (row.get('labels') or []):continue
                 mine=[payload for payload,comment in kind.applied_voids(row,authority)[0] if comment.get('author')==actor]
@@ -6399,6 +6412,18 @@ def resolve_http_state_path(root, named=None):
         return default,'default'
     return None,None
 
+def decision_web_state(root,named):
+    """The web state an attestation is judged against (kittrial-5bb.454 r2), or None where the deployment has none, and
+    then no person's attestation counts. A file the operator named has to be there."""
+    from http_authority import read_state
+    path,_=resolve_http_state_path(root,named)
+    if path is None:return None
+    if named is not None:
+        if path.is_symlink() or not path.is_file():raise ValueError('Use the existing web service state document')
+        return read_state(path)
+    try:return read_state(path)
+    except Exception:return None
+
 def copy_sqlite_consistently(source, destination):
     """Copy a SQLite database consistently while others may use it; None or the reason.
 
@@ -7195,6 +7220,9 @@ def restore_coordination(root,source,destination,restore_operators=False,restore
         elif name.startswith('.delegations/'):
             from delegations import validate_entry as validate_delegation_entry
             validate_delegation_entry(record,name.partition('/')[2])
+        elif name.startswith('.decision-attests/'):
+            from decision_attest import validate_entry as validate_attest_entry
+            validate_attest_entry(record,name.partition('/')[2])
         elif name.startswith(OWNER_ANSWERS_JOURNAL+'/'):
             from open_items import validate_owner_entry
             validate_owner_entry(record,name.partition('/')[2])
@@ -10414,6 +10442,23 @@ class _OnceFlag(argparse.Action):
         setattr(namespace,self.dest,values)
 
 def main():
+    import interface_lock
+    words=sys.argv[1:]
+    root_parser=argparse.ArgumentParser(add_help=False)
+    root_parser.add_argument('--root')
+    root_options,remaining=root_parser.parse_known_args(words)
+    root_arg=root_options.root
+    command=remaining[0] if remaining else None
+    participating=command in ('interface-apply','interface-reconcile',
+        'record-reconcile','reference-reconcile','capability-reconcile',
+        'void-record','anchor-release','operators','restore-new')
+    if root_arg is not None and participating:
+        with interface_lock.held(Path(root_arg)):
+            return _main()
+    return _main()
+
+
+def _main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True)
     sub=p.add_subparsers(dest='command',required=True)
     a=sub.add_parser('install');a.add_argument('--port',type=int,default=13317);a.add_argument('--unit',default='beads-team.service')
@@ -10447,6 +10492,17 @@ def main():
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('delegation-record',help='grant, narrow or revoke a delegation of a decision right (operator allowlist, host journal)')
     a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
+    a=sub.add_parser('decision-attest',help="attest a decision's exact text (operator allowlist, host journal)")
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--decision',required=True)
+    a.add_argument('--digest',required=True,help='the digest decision-attest-read printed for the text you read')
+    a.add_argument('--state',help='the web service state document, read only, if it is not the deployment\'s own')
+    a=sub.add_parser('decision-attest-read',help="read-only: a decision's exact text, its digest and how it reads now")
+    a.add_argument('--project',required=True);a.add_argument('--decision',required=True)
+    a.add_argument('--state',help='the web service state document, read only, if it is not the deployment\'s own')
+    a=sub.add_parser('decision-change',help='close, reopen, retype or relabel a decision that carries an attestation (operator allowlist)')
+    a.add_argument('--project',required=True);a.add_argument('--actor',required=True);a.add_argument('--decision',required=True)
+    a.add_argument('--change',required=True,choices=('close','reopen','type-decision','type-task','add-decision-label','remove-decision-label'))
+    a.add_argument('--reason')
     a=sub.add_parser('delegation-check',help='read-only: the delegations of a project and which granted coordinator agents they cover')
     a.add_argument('--project',required=True)
     a.add_argument('--state',required=True,help='the existing web service state document (read only)')
@@ -10477,6 +10533,8 @@ def main():
     a.add_argument('--dry-run',action='store_true',dest='dry_run',help='name the files without removing them')
     a.add_argument('--min-age-minutes',type=int,dest='min_age_minutes',default=60,
                    help='only remove a temporary at least this old (default 60; minimum 5)')
+    a=sub.add_parser('interface-apply',help='apply an interface draft/acceptance (operator only)')
+    a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True);a.add_argument('--state',help='HTTP authority state for live owner-backed program links')
     a=sub.add_parser('reference-apply',help='accept a reference catalog entry, or a batch of them with items (operator allowlist, F3 evidence)')
     a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('proposal-review',help='record a coordinator disposition on a requirement proposal (operator allowlist)')
@@ -10493,13 +10551,14 @@ def main():
     a.add_argument('--to',metavar='IDENTITY',help='account:<uid> or person:<name>')
     a.add_argument('--unmap-actor',dest='unmap_actor',metavar='ACTOR');a.add_argument('--unmap-namespace',dest='unmap_namespace',metavar='NAME')
     a.add_argument('--add-decider',dest='add_decider',metavar='IDENTITY');a.add_argument('--remove-decider',dest='remove_decider',metavar='IDENTITY')
-    for name in ('reference-reconcile','capability-reconcile','proposal-reconcile','record-reconcile'):
+    for name in ('reference-reconcile','capability-reconcile','interface-reconcile','proposal-reconcile','record-reconcile'):
         a=sub.add_parser(name);a.add_argument('project');a.add_argument('--operation-id',required=True)
         a.add_argument('--actor',required=True);a.add_argument('--reason',required=True)
         a.add_argument('--disposition',choices=['failed','released','complete'],default='released')
         a.add_argument('--issue-id',dest='issue_id',default=None,
                        help='with --disposition complete, the exact native record to confirm')
-        if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability','proposal'],required=True)
+        if name in ('interface-reconcile','record-reconcile'):a.add_argument('--state',help='existing web service authority state for interface recovery')
+        if name=='record-reconcile':a.add_argument('--kind',choices=['requirement','reference','capability','interface','proposal'],required=True)
     a=sub.add_parser('void-record');a.add_argument('project');a.add_argument('--actor',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('attest-delivery',help='a listed verifier reads a delivered BUNDLE file ON THIS HOST (its bytes, '
                                             'SHA-256 and advertised heads) and writes the verifier attestation from '
@@ -10519,7 +10578,7 @@ def main():
     a.add_argument('--operation-id',dest='operation_id',default=None,
                    help='a stable id so an interrupted run retries as the same record')
     a=sub.add_parser('anchor-release',help='close a reference or capability anchor that holds no record and free its key, or with --duplicate release a named duplicate anchor of a key (operator allowlist)')
-    a.add_argument('project');a.add_argument('--kind',choices=['reference','capability'],required=True)
+    a.add_argument('project');a.add_argument('--kind',choices=['reference','capability','interface'],required=True)
     a.add_argument('--issue-id',dest='issue_id',required=True);a.add_argument('--actor',required=True)
     a.add_argument('--reason',required=True)
     a.add_argument('--duplicate',action='store_true',
@@ -10816,7 +10875,18 @@ def main():
                    help='set the high-water mark to the current clock and clear clock suspicion (after a clock correction)')
     a.add_argument('--stats',action='store_true',
                    help='report the journal size (rows by state, bytes on disk, bounds); this is the default inspection')
-    args=p.parse_args();root=root_path(args.root)
+    args=p.parse_args()
+    # kittrial-5bb.454 (the trust boundary): no host command acts under an HTTP-shaped actor or a look-alike. Asked
+    # first, before the root or anything else is looked at, of the value of the command's own --actor option however
+    # it was spelled (a command's positional name, such as the verifier that `verifiers add` names, is not its actor).
+    from reserved_comments import refuse_http_actor
+    chosen=p._subparsers._group_actions[0].choices.get(args.command)
+    for action in (chosen._actions if chosen is not None else []):
+        value=getattr(args,action.dest,None) if '--actor' in action.option_strings else None
+        if isinstance(value,str):
+            try:refuse_http_actor(value,False)
+            except ValueError as error:raise ValueError('Invalid operator identity: %s'%error) from None
+    root=root_path(args.root)
     if args.command=='install':install(root,args.port,args.unit)
     elif args.command=='add-project':add_project(root,args.project)
     elif args.command=='finish-project':
@@ -11129,6 +11199,66 @@ def main():
             require_configured_operator(args.actor,operators(root,strict=True),'record a delegation')
             print(json.dumps(delegations.apply(payload,project=args.project,journal=path,run=run,recorded_by=args.actor,
                                                via='operator',account=None,at=server_time()),ensure_ascii=False))
+    elif args.command=='decision-attest':
+        # The operator's host route for an attestation (kittrial-5bb.454 r2); the SAME decision_attest.apply the web route
+        # calls, under the same project lock, after the same operator check. The record says via operator.
+        import fcntl
+        import decision_attest
+        from keyed_records import require_configured_operator
+        from http_authority import server_time
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        require_configured_operator(args.actor,operators(root,strict=True),'attest a decision')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        payload={'schema_version':1,'operation_id':'operator-'+secrets.token_hex(16),'decision':args.decision,'digest':args.digest}
+        # An operator reads any project. Before this project's lock, so that no lock is held across projects.
+        state=decision_web_state(root,args.state)
+        def pinned_decision(other,issue):
+            try:other_path=project_dir(root,other)
+            except ValueError:return None
+            if not (other_path/'.beads/metadata.json').is_file():return None
+            def run_other(argv):return run_bd(root,other,argv)
+            return decision_attest.pin_fact(decision_attest.read_issue(run_other,issue),other,state,operators(root),other_path)
+        before=decision_attest.read_issue(lambda argv:run_bd(root,args.project,argv),args.decision)
+        pinned=decision_attest.read_pins(before,pinned_decision) if isinstance(before,dict) else {}
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            # Read again under the lock: the library's own check refuses an actor taken off the list since.
+            listed=operators(root,strict=True)
+            print(json.dumps(decision_attest.apply(payload,project=args.project,journal=path,run=run,author=args.actor,
+                                                   via='operator',at=server_time(),state=state,operators=listed,
+                                                   pinned=pinned),ensure_ascii=False))
+    elif args.command=='decision-attest-read':
+        # Read-only (kittrial-5bb.454 r2): what an operator reads before attesting. Nothing is written; no lock is taken.
+        import decision_attest
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        state=decision_web_state(root,args.state)
+        def run(argv):return run_bd(root,args.project,argv)
+        print(json.dumps(decision_attest.read_answer(decision_attest.read_issue(run,args.decision),args.project,state,
+                                                     operators(root),path),ensure_ascii=False))
+    elif args.command=='decision-change':
+        # The one route on the host for what the gate refuses every other host route (kittrial-5bb.454 r2, Q1). An operator
+        # only, under the project lock. A retype changes the digest, so it reads attestation-stale until it is attested again.
+        import fcntl
+        from keyed_records import require_configured_operator
+        path=project_dir(root,args.project)
+        if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
+        require_configured_operator(args.actor,operators(root,strict=True),'change an attested decision')
+        if (path/'.coordination.lock').is_symlink():
+            raise ValueError('Coordination lock must not be a symlink')
+        argv={'close':['close',args.decision]+(['--reason',args.reason] if args.reason else []),
+              'reopen':['reopen',args.decision]+(['--reason',args.reason] if args.reason else []),
+              'type-decision':['update',args.decision,'--type','decision'],
+              'type-task':['update',args.decision,'--type','task'],
+              'add-decision-label':['update',args.decision,'--add-label','decision'],
+              'remove-decision-label':['update',args.decision,'--remove-label','decision']}[args.change]
+        with (path/'.coordination.lock').open('a') as lock, deployment_config_lock(root):
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            require_configured_operator(args.actor,operators(root,strict=True),'change an attested decision')
+            print(run_bd(root,args.project,['--actor',args.actor,*argv,'--json']))
     elif args.command=='delegation-check':
         # Read-only (kittrial-5bb.407): before a release that requires a delegation for every
         # agent acceptance, list each agent holding this project's coordinator grant and the
@@ -11200,6 +11330,33 @@ def main():
                     raise ValueError('Owner requirement recovery needs --state with the existing web service state document')
                 print(json.dumps(reconcile(path,args.operation_id,args.actor,args.reason,
                                            args.disposition,run,issue_id=args.issue_id)))
+    elif args.command=='interface-apply':
+        import interface_records
+        from http_authority import file_lock
+        path=project_dir(root,args.project)
+        payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
+        payload.setdefault('operation','accept')
+        authority=operators(root,strict=True)
+        core_actor=args.actor
+        if core_actor not in authority: raise ValueError('Only a configured operator applies interfaces')
+        def run(argv): return run_bd(root,args.project,['--actor',args.actor,*argv])
+        def read_project(other):
+            other_path=project_dir(root,other)
+            if not (other_path/'.beads/metadata.json').is_file():return None
+            def rows():return [record_json.loads_row(line) for line in run_bd(root,other,['export','--all']).splitlines() if line.strip()]
+            with file_lock(other_path/'.coordination.lock',shared=True):return rows()
+        from http_authority import read_state
+        state=read_state(args.state) if args.state else {}
+        context=interface_records.ProgramContext(args.project,read_project,operators=authority,
+            authority_state=state,memberships=state.get('memberships'),users=state.get('users'))
+        interface_records.KIND.validate_payload(payload,operator=True)
+        context.prepare(payload)
+        import contextlib
+        with file_lock(path/'.coordination.lock'):
+            with file_lock(str(args.state)+'.lock') if args.state else contextlib.nullcontext():
+                context.set_authority(read_state(args.state) if args.state else {})
+                with interface_records.context(context):
+                    print(json.dumps(interface_records.apply_native(payload,args.actor,run,path,operator=True,operators=authority)))
     elif args.command=='reference-apply':
         import contextlib
         import fcntl
@@ -11211,10 +11368,11 @@ def main():
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
         @contextlib.contextmanager
         def held():
-            # One hold of the project's coordination lock; closing the file releases it.
-            with (path/'.coordination.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_EX)
-                yield
+            import interface_lock
+            with interface_lock.held(root) if reference_records.touches_program_links(payload) else contextlib.nullcontext():
+                with (path/'.coordination.lock').open('a') as lock:
+                    fcntl.flock(lock,fcntl.LOCK_EX)
+                    yield
         if isinstance(payload,dict) and 'items' in payload:
             # A batch (kittrial-5bb.98) takes the lock once per item and releases it between
             # items, exactly as capability-apply does.
@@ -11232,12 +11390,20 @@ def main():
         payload=read_json_file(args.file,'Payload file',encoding='utf-8-sig')
         authority=operators(root,strict=True)
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        if args.command in ('capability-apply','capability-retire'):
+            from keyed_records import require_configured_operator
+            require_configured_operator(args.actor,authority,'apply a capability')
         @contextlib.contextmanager
         def held():
-            # One hold of the project's coordination lock; closing the file releases it.
-            with (path/'.coordination.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_EX)
-                yield
+            import interface_lock
+            candidate=dict(payload) if isinstance(payload,dict) else payload
+            if isinstance(candidate,dict) and 'operation' not in candidate:
+                candidate['operation']='retire' if args.command=='capability-retire' else 'accept'
+            mutation=args.command in ('capability-apply','capability-retire') and capability_records.touches_interfaces(candidate,run,authority)
+            with interface_lock.held(root) if mutation else contextlib.nullcontext():
+                with (path/'.coordination.lock').open('a') as lock:
+                    fcntl.flock(lock,fcntl.LOCK_EX)
+                    yield
         if args.command=='capability-apply' and isinstance(payload,dict) and 'items' in payload:
             # A batch takes the lock once per item and releases it between items, so
             # another writer waits behind at most one item (kittrial-5bb.67 review 01a0fc55).
@@ -11352,10 +11518,12 @@ def main():
                 result=proposal_records.dispose(payload,args.actor,run,path,operators=authority,
                                                 route='decide' if args.command=='proposal-decide' else 'review')
         print(json.dumps(result))
-    elif args.command in ('reference-reconcile','capability-reconcile','proposal-reconcile','record-reconcile'):
+    elif args.command in ('reference-reconcile','capability-reconcile','interface-reconcile','proposal-reconcile','record-reconcile'):
         import fcntl
-        kind={'reference-reconcile':'reference','capability-reconcile':'capability','proposal-reconcile':'proposal'}.get(args.command) or args.kind
-        if kind=='reference':from reference_records import reconcile as record_reconcile
+        kind={'reference-reconcile':'reference','capability-reconcile':'capability','interface-reconcile':'interface','proposal-reconcile':'proposal'}.get(args.command) or args.kind
+        if kind=='interface':
+            from interface_records import reconcile as record_reconcile
+        elif kind=='reference':from reference_records import reconcile as record_reconcile
         elif kind=='capability':from capability_records import reconcile as record_reconcile
         elif kind=='proposal':from proposal_records import reconcile as record_reconcile
         else:from requirement_records import reconcile as record_reconcile
@@ -11365,21 +11533,43 @@ def main():
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
         def run(argv):return run_bd(root,args.project,['--actor',args.actor,*argv])
+        import contextlib
+        extra={'operators':operators(root,strict=True)} if kind in ('proposal','reference','capability','interface') else {}
+        if kind=='interface':
+            import interface_records
+            from http_authority import read_state,file_lock
+            state=read_state(args.state) if args.state else {}
+            def read_project(other):
+                other_path=project_dir(root,other)
+                if not (other_path/'.beads/metadata.json').is_file():return None
+                def exported():
+                    return [record_json.loads_row(line) for line in run_bd(root,other,
+                        ['--actor',args.actor,'export','--all']).splitlines() if line.strip()]
+                with file_lock(other_path/'.coordination.lock',shared=True):return exported()
+            from keyed_records import read_host_json
+            plan_path=path/'.interface-transitions'/(content_hash({'operation_id':args.operation_id})+'.json')
+            plan=interface_records.validate_transition(read_host_json(plan_path)) if plan_path.exists() or plan_path.is_symlink() else None
+            context=interface_records.ProgramContext(args.project,read_project,operators=extra['operators'],
+                authority_state=state,memberships=state.get('memberships'),users=state.get('users')).prepare(
+                    {'operation':'propose','owner_project':plan['record']['owner_project'] if plan else None})
+            held_context=interface_records.context(context)
+            held_authority=file_lock(str(args.state)+'.lock') if args.state else contextlib.nullcontext()
+        else:
+            held_context=contextlib.nullcontext();held_authority=contextlib.nullcontext()
         with (path/'.coordination.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            # A proposal reconcile checks the operator allowlist strictly (kittrial-5bb.68
-            # review 01a10180). A reference or capability reconcile reads it strictly too,
-            # only to decide which operator voids apply when `complete` confirms the anchor
-            # holds a live record (kittrial-5bb.74 review); requirements do not take it.
-            extra={'operators':operators(root,strict=True)} if kind in ('proposal','reference','capability') else {}
-            print(json.dumps(record_reconcile(path,args.operation_id,args.actor,args.reason,
-                                              args.disposition,run,issue_id=args.issue_id,**extra)))
+            with held_authority:
+                if kind=='interface':context.set_authority(read_state(args.state) if args.state else {})
+                with held_context:
+                    print(json.dumps(record_reconcile(path,args.operation_id,args.actor,args.reason,
+                        args.disposition,run,issue_id=args.issue_id,**extra)))
     elif args.command=='anchor-release':
         # kittrial-5bb.74: an anchor whose propose stopped before its first record, or whose
         # every record an operator void names, holds its key for good once the original
         # payload is lost. Host route only: the allowlist is the authority.
         import fcntl
         if args.kind=='reference':import reference_records as records
+        elif args.kind=='interface':import interface_records as records
         else:import capability_records as records
         path=project_dir(root,args.project)
         if not (path/'.beads/metadata.json').is_file():raise ValueError('Unknown/uninitialized project')
@@ -11403,8 +11593,8 @@ def main():
             if payload.get('target_kind') in KEYED_KIND_PREFIXES:
                 # A record on a reference or capability anchor (kittrial-5bb.74): the anchor's
                 # kind owns the void and reads only that anchor.
-                import capability_records,reference_records
-                kind=next((k for k in (reference_records.KIND,capability_records.KIND)
+                import capability_records,reference_records,interface_records
+                kind=next((k for k in (reference_records.KIND,capability_records.KIND,interface_records.KIND)
                            if payload['target_kind'].startswith(k.family)),None)
                 if kind is None:raise ValueError('Unsupported operator void target kind')
                 print(json.dumps(kind.apply_void(payload,args.actor,run,authority)))
