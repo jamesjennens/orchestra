@@ -281,17 +281,28 @@ export function credentialFileLines(server, fingerprint, secretValue = SECRET_PL
   return [...credentialCommentLines(server, fingerprint), headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue)].join('\n') + '\n';
 }
 
+// kittrial-5bb.456 item 6: a secret pasted into a chat is exposed. The agent must not use or keep it.
+export const PASTED_SECRET_RULE = 'If anyone pastes a secret into your chat, do not use it and do not save it: say that it is now exposed and ask your owner to issue a new one and revoke the old one.';
+
 // The wizard's screens, in order, for one path (kittrial-5bb.348: one action per screen). `bridge`
 // is a computer whose VS Code has Orchestra Bridge 0.14 or later: its Set up fetches and checks the
 // certificate, tests the connection and writes the agent's files, so that path skips the
 // certificate, rewrite, self-check and save-files screens. On Windows the file needs no chmod.
 export const WIZARD_SCREENS = Object.freeze(['system', 'role', 'cert-save', 'cert-move', 'secret', 'restrict',
   'rewrite', 'test', 'files', 'vscode', 'resume']);
-export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false } = {}) {
+// `vscode` is false for an agent that does not run in VS Code (Claude Code, Codex, a command-line
+// agent): no VS Code screen is shown on that path (kittrial-5bb.456 item 2).
+export const RUNS_IN = Object.freeze(['bridge', 'older', 'none']);
+// An older stored wizard state has only the boolean `bridge`.
+export function runsFromStored(stored) {
+  if (stored && RUNS_IN.includes(stored.runs)) return stored.runs;
+  return stored && stored.bridge === false ? 'older' : 'bridge';
+}
+export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false, vscode = true } = {}) {
   const posix = osKind(os) === 'posix';
   if (bridge) return ['system', 'role', 'secret', ...(posix ? ['restrict'] : []), 'vscode', 'resume'];
   return ['system', 'role', ...(hasCertificate ? ['cert-save', 'cert-move'] : []), 'secret',
-    ...(hasCertificate ? ['rewrite'] : (posix ? ['restrict'] : [])), 'test', 'files', 'vscode', 'resume'];
+    ...(hasCertificate ? ['rewrite'] : (posix ? ['restrict'] : [])), 'test', 'files', ...(vscode ? ['vscode'] : []), 'resume'];
 }
 
 // Browsers strip the leading dot when saving .orchestra-agent-<slug>.crt into Downloads
@@ -423,7 +434,7 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     '',
     '## Your secret',
     '',
-    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. ${holds} Hand that file to curl with -K on every call. Apart from the set-up step that rewrote that one file in place to put the comment lines above the header line (nothing was shown), never open, print or copy it, and never put the secret on a command line, in this folder, in a commit or in any other file.`,
+    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. ${holds} Hand that file to curl with -K on every call. Apart from the set-up step that rewrote that one file in place to put the comment lines above the header line (nothing was shown), never open, print or copy it, and never put the secret on a command line, in this folder, in a commit or in any other file. ${PASTED_SECRET_RULE}`,
     '',
     '## Every call',
     '',
@@ -638,7 +649,7 @@ export function setupPrompt(payload, { role = 'worker', certificate = null, brid
     agentGuide(payload, { hasCertificate }).trimEnd(),
     '~~~',
     `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file in this folder.`,
-    `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line -- with the single exception of step 6: that one command reads the credential file only to rewrite that same file in place, and it shows nothing.`,
+    `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line -- with the single exception of step 6: that one command reads the credential file only to rewrite that same file in place, and it shows nothing. ${PASTED_SECRET_RULE}`,
     `6. Make the credential file ${payload.secretFile.windows} (macOS/Linux ${payload.secretFile.posix}) hold these comment lines as its FIRST lines, each on its own line ending with a newline, followed by whatever it already held (its curl options and header line):`,
     '~~~',
     ...comments,
