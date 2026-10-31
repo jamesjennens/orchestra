@@ -1308,7 +1308,8 @@ class AnchoredKind:
                              % (issue_id, self.type_label, self.key_prefix, self.noun))
         extra = {}
         if duplicate:
-            note, extra = self.duplicate_release(row, keys, actor, reason, run, operators, set_aside_evidence)
+            note, extra = self.duplicate_release(row, keys, actor, reason, run, operators,
+                                                 set_aside_evidence, current_project=Path(project).name)
             close_reason = '%s anchor released by the operator (duplicate of its key)' % self.title
         else:
             live, _ = self.live_row(row, operators)
@@ -1425,6 +1426,31 @@ class AnchoredKind:
                           'at': record['at'], 'live': evidence_is_live(record, author, allowlist)})
         return found
 
+    def retained_approved_revisions(self, row):
+        """Retained revisions with matching, author-bound F3 approval, live or inert.
+
+        This inventories history, including voided comments. It does not establish
+        today's authority or make an inert acceptance live. Readers and duplicate
+        repair use the same binding rule before treating a declaration as absent.
+        """
+        records, decisions = [], set()
+        for comment in row.get('comments') or []:
+            if not isinstance(comment, dict):
+                continue
+            text = comment.get('text')
+            revision = self.parse_entry(text)
+            if revision is not None and self.entry_belongs(revision, row):
+                records.append(revision)
+            decision = self.parse_acceptance(text)
+            if (decision is not None and decision['id'] == row.get('id')
+                    and self.key_label(decision['key']) in self.key_labels(row)
+                    and decision['operator'] == comment.get('author')):
+                decisions.add((decision['key'], decision['revision'],
+                               decision['record_sha256'], decision['acceptance_state']))
+        return [record for record in records if record.get('acceptance_state') != 'draft'
+                and (record['key'], record['revision'], record['sha256'],
+                     record['acceptance_state']) in decisions]
+
     def selected_anchor(self, anchors, operators):
         """The native id of the anchor a reader selects for the key among `anchors`, or None
         when it reads conflicted (or nothing is left)."""
@@ -1432,7 +1458,8 @@ class AnchoredKind:
         chosen = [entry for entry in entries if entry['state'] not in ('conflicted', 'incomplete')]
         return chosen[0]['native_id'] if len(entries) == 1 and chosen else None
 
-    def duplicate_release(self, row, keys, actor, reason, run, operators, set_aside_evidence):
+    def duplicate_release(self, row, keys, actor, reason, run, operators, set_aside_evidence,
+                          current_project=None):
         """The checks of `anchor-release --duplicate` (kittrial-5bb.91): (audit note, result fields).
 
         Since kittrial-5bb.83 every write on a key with more than one anchor is refused. A
@@ -1459,6 +1486,9 @@ class AnchoredKind:
           anchor reads one, so the key would lose its only accepted record. Live evidence
           on a remaining anchor is not enough: an accept that died after its evidence and
           before the accepted revision leaves evidence and a draft (review of febaad7).
+        - a capability's retained, author-bound approved interface declaration is not
+          preserved by an approved revision on another anchor. Even set-aside evidence
+          cannot erase this history; local and explicit tokens resolve to the same pin.
 
         At least one other anchor always remains: that is what "duplicated" means, and the
         caller holds the project coordination lock from this read to the label removal.
@@ -1496,6 +1526,21 @@ class AnchoredKind:
                              'really holds' % (self.title, issue_id, shown_key))
         before = self.selected_anchor(anchors, operators)
         after = self.selected_anchor(remaining, operators)
+        retained = set()
+        if self.noun == 'capability':
+            from interface_records import retained_interface_declarations
+            retained = retained_interface_declarations(self, row, current_project)
+            preserved = set().union(*(retained_interface_declarations(self, other, current_project)
+                                      for other in remaining))
+            missing = sorted(retained - preserved)
+            if missing:
+                shown = ', '.join('%s iface:%s/%s@%d' % item for item in missing[:5])
+                raise ValueError('Releasing %s would discard %d retained approved interface declaration(s) '
+                                 'that no remaining anchor preserves (%s). --set-aside-evidence cannot '
+                                 'remove them. Release a non-declaring duplicate instead; retain the '
+                                 'declaring anchor, then use an explicitly reviewed capability revision '
+                                 'to withdraw its declarations if that is intended.'
+                                 % (issue_id, len(missing), shown))
         if evidence and not set_aside_evidence:
             raise ValueError('%s anchor %s carries acceptance evidence (%s)%s. It is released only with '
                              '--set-aside-evidence, which sets that evidence aside for good and lists it in the '
@@ -1530,6 +1575,8 @@ class AnchoredKind:
                              % (item['revision'], item['record_sha256'], item['operator'], item['decision_id'],
                                 'live' if item['live'] else 'inert') for item in evidence) or 'none',
                    ', '.join('%d %s' % (count, kind) for kind, count in sorted(others.items())) or 'none', reason))
+        if retained:
+            note += ' Retained approved interface declarations preserved on remaining anchors: %d.' % len(retained)
         return note, {'duplicate': True, 'key': shown_key,
                       'remaining': [item.get('id') for item in remaining],
                       'selected_before': before, 'selected_after': after, 'records': revisions,

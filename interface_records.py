@@ -251,6 +251,25 @@ def read(args, run, operators=None):
                          'incomplete': incomplete}, 'compatibility': 'compatibility-unverified'}
 
 
+def retained_interface_declarations(kind, row, project, approved=None):
+    """Identity of every retained approved declaration, never today's authority.
+
+    Resolve local and explicit tokens through the ordinary interface grammar so
+    equivalent duplicates preserve the same pinned project/key/revision and role.
+    """
+    approved = kind.retained_approved_revisions(row) if approved is None else approved
+    declarations = set()
+    for record in approved:
+        items = record.get('interfaces', [])
+        valid_interfaces(items, project)
+        for item in items:
+            target, key, revision = token(item['iface'], project)
+            if target is None:
+                raise ValueError('The project is required to judge a local interface declaration')
+            declarations.add((item['role'], target, key, revision))
+    return declarations
+
+
 class ProgramContext:
     """Authorized read adapter. None means unreadable, failed or unavailable, never empty.
 
@@ -327,6 +346,34 @@ class ProgramContext:
         self.users=state.get('users')
 
     def coverage_state(self, kind, entry, project, *, link=False):
+        """Inventory every capability anchor, including those selection hides."""
+        selected = self._anchor_coverage_state(kind, entry, project, link=link)
+        if link or selected == 'incomplete':
+            return selected
+        rows = self.rows(project)
+        if rows is None or not entry.get('key'):
+            return 'incomplete'
+        try:
+            label = kind.key_label(entry['key'])
+            for row in rows:
+                if label not in kind.key_labels(row) or row.get('id') == entry.get('native_id'):
+                    continue
+                other = kind.entry_view(row, self.operators)
+                # Match the canonical key-anchor rule for a readable slug collision.
+                # An unreadable row cannot prove it belongs to another key.
+                if (other.get('state') not in ('malformed', 'unsupported', 'incomplete')
+                        and other.get('key') not in (None, entry['key'])):
+                    continue
+                status = self._anchor_coverage_state(kind, other, project)
+                if status in ('live', 'incomplete'):
+                    # A non-selected live declaration must not vanish from usage;
+                    # resolve the duplicate first rather than claiming completeness.
+                    return 'incomplete'
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return 'incomplete'
+        return selected
+
+    def _anchor_coverage_state(self, kind, entry, project, *, link=False):
         """One retirement rule for sides and capabilities, including inert approvals.
 
         A historical approval is not a never-accepted draft merely because today's
@@ -345,25 +392,13 @@ class ProgramContext:
             # operator's evidence can coexist with a current re-acceptance.
             # Parse individual retained comments, leaving malformed void targets
             # out without losing a well-formed former declaration.
-            records=[];decisions=set()
-            for comment in row.get('comments') or []:
-                if not isinstance(comment,dict):continue
-                text=comment.get('text')
-                revision=kind.parse_entry(text)
-                if revision is not None and kind.entry_belongs(revision,row):records.append(revision)
-                decision=kind.parse_acceptance(text)
-                if (decision is not None and decision['id']==row.get('id')
-                        and kind.key_label(decision['key']) in kind.key_labels(row)
-                        and decision['operator']==comment.get('author')):
-                    decisions.add((decision['key'],decision['revision'],decision['record_sha256'],decision['acceptance_state']))
-            approved=[r for r in records if r.get('acceptance_state')!='draft'
-                      and (r['key'],r['revision'],r['sha256'],r['acceptance_state']) in decisions]
+            approved = kind.retained_approved_revisions(row)
             if not link:
                 # Ordinary capabilities never admitted to the interface graph do
                 # not become unknown consumers when their staff leave. Inspect
                 # retained approvals too: an inert/voided former declaration must
                 # still fail closed, including a later empty withdrawal.
-                declared=any(r.get('interfaces') for r in approved)
+                declared=bool(retained_interface_declarations(kind,row,project,approved=approved))
                 if not declared:return 'never-accepted'
             if entry.get('acceptance_inert'):return 'incomplete'
             record=entry.get('record')
