@@ -2234,11 +2234,16 @@ that account made, and every worker credential that account issued. From the nex
   agent of the account that issued a worker credential can no longer recommend work
   delivered under it (with the setting off that work is nobody's, and it can). My work's
   `to_review` holds only work the caller may actually approve: a contribution of the
-  caller's own party is left out of that list, since approving it would be refused
-  (the project's review queue still lists every row for everybody, with no per-caller
-  mark). The refusal of a recommendation names the worker credential as one of its reasons,
-  in both directions: work delivered under a credential the person issued, and a credential
-  the person issued recommending that person's own work.
+  caller's own party is left out of that list in every review state (`awaiting-review`,
+  `legacy-review-ready`, `awaiting-integration` and `approved`), since approving it would
+  be refused. The response's `to_review_note` and the page disclose that omission (the
+  field is null with the setting off). The project's review queue still lists every row
+  for everybody, with no per-caller mark, so the owner can open an own-party row there
+  and request changes on it. The refusal of a recommendation ends by refusing "anything
+  else of the same party as the author or the assignee": that covers a credential of the
+  agent owner's account, another credential of the account whose credential delivered the
+  work, and every account, agent or credential of the assignee's party, as well as the two
+  worker-credential directions named earlier in the sentence.
 
 **Whose party a name is.**
 

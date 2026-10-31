@@ -6757,7 +6757,10 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: your own work (round 2, N6).
     NOT_INDEPENDENT_PARTY = (NOT_INDEPENDENT + '; and on this server neither can the account that issued the worker '
                              'credential it was delivered under, nor that account\'s agents, nor a worker credential '
-                             'issued by the contribution\'s author or by the task\'s assignee')
+                             'issued by the contribution\'s author or by the task\'s assignee, nor anything else of '
+                             'the same party as the author or the assignee')
+    ME_WORK_PARTY_NOTE = ('Only work you may approve is listed; own-party contributions are left out in every review '
+                          'state. Open the project review queue to request changes on one.')
 
     #: Said to an approver of the party the work belongs to (the setting of kittrial-5bb.199). Which of
     #: the three is said depends on what is true; each ends with OWN_PARTY_NEXT.
@@ -14975,9 +14978,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         one queue read per project and at most :data:`ME_WORK_MAX_PROJECTS` projects.
         ``to_review`` lists contributions only in projects where the caller holds the
         approval capability. With the party rule on it holds only work the caller may
-        actually approve: a row of the caller's own party is left out, since approving it
-        would be refused (kittrial-5bb.199 review, N4). Computed at read time; nothing is
-        scheduled or marked.
+        actually approve: a row of the caller's own party is left out in every review state,
+        since approving it would be refused (kittrial-5bb.199 review, N4). ``to_review_note``
+        discloses that omission and points to the project queue for requesting changes;
+        it is null with the party rule off. Computed at read time; nothing is scheduled or marked.
         """
         principal = ctx.principal
         if principal.via == 'credential':
@@ -15064,6 +15068,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             for agent in agents if agent.get('owner') == principal.user_id]
         return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
                      'to_review': self._task_views(to_review[:MAX_PAGE]),
+                     'to_review_note': (self.ME_WORK_PARTY_NOTE
+                                        if self.service.approval_by_another_party else None),
                      'agents': agents, 'agent_prompts': prompts,
                      'truncated': truncated, 'unavailable': unavailable,
                      'generated_at': generated_at}
