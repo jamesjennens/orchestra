@@ -471,7 +471,9 @@ it), applied across levels.
   recover it, and that record keeps the owner's level. The comment stays, so a coordinator does not attest that row again:
   a coordinator's later choice is a new decision.
 - **How a row reads, at every read, in this order:** `closed`; `not-attested`; `attestation-stale`, when the newest
-  record's digest is not the row's now (the newest, not any: going back to replaced text stays stale);
+  record's digest is not the row's now (the newest, not any: going back to replaced text stays stale), or when an attestation
+  comment no journal honours is newer than the newest honoured record, which is then not the last word (a lost entry, or a
+  write that stopped between the comment and its entry);
   `attester-not-authorised`, when the author's standing has gone. Each of these binds nothing, and the row is listed so
   an owner can see what needs attesting. Otherwise it counts, as the highest live standing among the unbroken run of
   newest records over this text, so a coordinator attesting the same words cannot lower an owner's attestation.
@@ -493,7 +495,8 @@ it), applied across levels.
   rule on its own.
 - **Superseded:** only a counting row marks another superseded, and a chain does not pass through a row that does not
   count. A row that supersedes owner-level text needs owner-level attestation: from a coordinator or an agent it reads
-  `supersedes-owner-level`, marks nothing and binds nothing. The level is the same one the gate uses.
+  `supersedes-owner-level`, marks nothing and binds nothing. The level is the same one the gate uses, and an attestation
+  comment no journal honours makes a row owner-level too. `decision_attest.reading` is the one place all of these read from.
 - **The gate on status, type and labels:** on a row with an honoured attestation, and on any decision row carrying an
   attestation comment, honoured or not, or a `Binds:`, `Owner-only:`, `Adopts: decision:`, `Per: decision:` or
   `Authorises: decision:` line, a status change (close, reopen, or any

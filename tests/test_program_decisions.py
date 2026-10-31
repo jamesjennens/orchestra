@@ -451,6 +451,7 @@ class DecisionTests(unittest.TestCase):
 
 
 class SectionTests(unittest.TestCase):
+    adopt = DecisionTests.adopt
 
     def test_the_decisions_section_and_its_area_states(self):
         state = web_state()
@@ -564,6 +565,71 @@ class SectionTests(unittest.TestCase):
                 by_id = {i['id']: i for i in section['items']}
                 self.assertEqual(['supersedes-owner-level'], by_id['prog-2']['flags'])
                 self.assertFalse(by_id['prog-0']['superseded'])
+
+    def lost_owner_row(self, issue, *lines):
+        """An owner's row with its journal entry gone, as a contributor then edited it to read below an owner."""
+        row = decision(issue, P_OWNER, 'Binds: north', 'Owner-only: yes')
+        record = da.parse_comment(row['comments'][-1], project='prog', decision=issue)
+        (J['prog'] / da.JOURNAL_DIR / (record['sha256'] + '.json')).unlink()
+        row['description'] = '\n'.join(lines)
+        return row
+
+    def test_a_coordinator_cannot_supersede_an_owners_row_during_journal_loss(self):
+        # Review of r5, b2: the words read below an owner and no record is honoured, and the comment still says so.
+        says = 'Supersedes: decision:prog-0'
+        for author in (P_COORD, P_AGENT):
+            with self.subTest(author=author):
+                target = self.lost_owner_row('prog-0', 'Binds: north', 'Owner-only: no')
+                self.assertTrue(pd.program_decision(target, 'prog', web_state(), OPS, J)['owner_level'])
+                row = decision('prog-2', author, 'Binds: north', 'Owner-only: no', first=says)
+                north = [decision('north-1', COORD, 'Adopts: decision:prog/prog-0@' + 'c' * 64)]
+                section = pd.decisions_section([target, row], 'prog', {'north': 'in'}, {'north': north}, web_state(), OPS, journals=J)
+                by_id = {i['id']: i for i in section['items']}
+                self.assertEqual((['supersedes-owner-level'], {}), (by_id['prog-2']['flags'], by_id['prog-2']['areas']))
+                self.assertFalse(by_id['prog-0']['superseded'])
+        # An owner may, the comment notwithstanding.
+        target = self.lost_owner_row('prog-0', 'Binds: north', 'Owner-only: no')
+        row = decision('prog-2', P_OWNER, 'Binds: north', 'Owner-only: no', first=says)
+        by_id = {i['id']: i for i in pd.decisions_section([target, row], 'prog', {}, {}, web_state(), OPS, journals=J)['items']}
+        self.assertEqual(([], True), (by_id['prog-2']['flags'], by_id['prog-0']['superseded']))
+
+    def test_an_adoption_gone_stale_does_not_read_adopted_when_old_text_comes_back(self):
+        # Review of r5, b1, on a program decision: T1 adopted, T2 attested, T2's entry lost, the text back to T1.
+        words = 'Binds: north\nOwner-only: no'
+        program_row = decision('prog-1', P_OWNER, words)
+        adopted = decision('north-1', OWNER, 'Adopts: decision:prog/prog-1')
+        self.assertEqual('adopted', self.adopt(program_row, adopted)[0])
+        program_row['description'] = words + '\nThe second text.'
+        attest(program_row, P_OWNER)
+        self.assertEqual('adoption-stale', self.adopt(program_row, adopted)[0])
+        second = da.parse_comment(program_row['comments'][-1], project='prog', decision='prog-1')
+        (J['prog'] / da.JOURNAL_DIR / (second['sha256'] + '.json')).unlink()
+        program_row['description'] = words
+        found = pd.program_decision(program_row, 'prog', web_state(), OPS, J)
+        self.assertEqual((['attestation-stale'], None), (found['flags'], found['attestation_id']))
+        section = pd.decisions_section([program_row], 'prog', {'north': 'in'}, {'north': [adopted]}, web_state(), OPS, journals=J)
+        self.assertEqual({}, section['items'][0]['areas'], 'it binds nothing, so nothing reads adopted')
+        rows = trace_read.decisions_view(trace_read.Snapshot([adopted], 'north', now=datetime(2026, 1, 2, tzinfo=timezone.utc), operators=OPS,
+                                                             others=lambda project: SimpleNamespace(loaded=lambda: [program_row]),
+                                                             authority_state=web_state(), journal_of=J.get))
+        self.assertEqual('decision-does-not-count', next(r for r in rows if r['id'] == 'north-1')['adopts']['state'])
+
+    def test_a_cited_owners_decision_with_a_lost_newer_entry_does_not_authorise(self):
+        # Per: reads the same way: the owner's authorisation is not the last word.
+        owner_only = decision('prog-1', P_OWNER, 'Binds: north', 'Owner-only: yes')
+        line = 'Authorises: decision:prog/prog-1'
+        cited = decision('north-6', OWNER, line)
+        words = cited['description']
+        row = decision('north-1', COORD, 'Adopts: decision:prog/prog-1', 'Per: decision:north/north-6')
+        self.assertEqual('adopted', self.adopt(owner_only, row, cited)[0])
+        cited['description'] = words + '\nThe owner withdrew this.'
+        attest(cited, OWNER)
+        newer = da.parse_comment(cited['comments'][-1], project='north', decision='north-6')
+        (J['north'] / da.JOURNAL_DIR / (newer['sha256'] + '.json')).unlink()
+        cited['description'] = words
+        verdict, reason = self.adopt(owner_only, row, cited)
+        self.assertEqual('adoption-invalid', verdict)
+        self.assertIn('attestation-stale', reason)
 
     def test_a_coordinator_may_supersede_a_coordinators_decision(self):
         old = decision('prog-0', P_COORD, 'Binds: north', 'Owner-only: no')

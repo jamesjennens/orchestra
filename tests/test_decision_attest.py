@@ -213,6 +213,50 @@ class StandingTests(Case):
         row['status'] = 'open'
         self.assertEqual('counts', self.reads(row)['state'])
 
+    def test_old_text_does_not_come_back_when_a_newer_entry_is_lost(self):
+        # Review of r5, b1: T1, then T2 replacing it, only T2's entry lost, and the row edited back to T1.
+        row = row_of('T1.')
+        first = self.attest(row, OWNER)
+        row['description'] = 'T2.'
+        second = self.attest(row, OWNER)
+        (self.journal / da.JOURNAL_DIR / (second['sha256'] + '.json')).unlink()
+        row['description'] = 'T1.'
+        self.assertEqual([first], da.history(row, PROJECT, self.journal))
+        found = self.reads(row)
+        self.assertEqual(('attestation-stale', None, None, True), (found['state'], found['role'], found['id'], found['owner_level']))
+        # The entry coming back says the same thing another way: T2 is newest, and the text is not T2.
+        da.publish(self.journal, second)
+        self.assertEqual('attestation-stale', self.reads(row)['state'])
+
+    def test_an_older_unhonoured_comment_does_not_stale_a_newer_record(self):
+        # A recovered row works: the owner's new record comes after the old comment.
+        row = row_of('T1.')
+        self.attest(row, OWNER, journal=False)
+        self.assertEqual('not-attested', self.reads(row)['state'])
+        record = self.attest(row, OWNER)
+        found = self.reads(row)
+        self.assertEqual(('counts', 'owner', record['sha256'], True), (found['state'], found['role'], found['id'], found['owner_level']))
+
+    def test_a_comment_that_states_no_time_is_placed_by_where_it_is_listed(self):
+        bad = {'id': 'zz', 'author': OWNER, 'text': da.PREFIX + '{not a record'}
+        row = row_of('T1.')
+        self.attest(row, OWNER)
+        comments = row['comments']
+        self.assertEqual('attestation-stale', self.reads(dict(row, comments=comments + [bad]))['state'])
+        self.assertEqual('counts', self.reads(dict(row, comments=[bad] + comments))['state'])
+        for listing in (comments + [bad], [bad] + comments):
+            self.assertTrue(self.reads(dict(row, comments=listing))['owner_level'])
+
+    def test_a_tie_in_time_goes_by_the_comment_id(self):
+        row = row_of('T1.')
+        record = self.attest(row, OWNER)
+        other = da.make_record({'schema_version': 1, 'operation_id': 'other', 'decision': row['id'], 'digest': da.digest(row)},
+                               project=PROJECT, author=OWNER, via='session', gated=False, at=record['at'])
+        text = da.body(other)
+        low, high = {'id': 'a', 'author': OWNER, 'text': text}, {'id': 'zz', 'author': OWNER, 'text': text}
+        self.assertEqual('counts', self.reads(dict(row, comments=row['comments'] + [low]))['state'])
+        self.assertEqual('attestation-stale', self.reads(dict(row, comments=row['comments'] + [high]))['state'])
+
     def test_a_coordinator_on_the_same_text_cannot_lower_an_owner(self):
         row = row_of()
         self.attest(row, OWNER)
@@ -487,6 +531,33 @@ class ApplyTests(Case):
         found = pd.program_decision(row, PROJECT, web_state(), OPS, {PROJECT: self.journal})
         self.assertEqual(([], 'owner', True), (found['flags'], found['attested_as'], found['owner_level']))
         self.assertNotEqual(record['sha256'], found['attestation_id'], 'an adoption of the old run reads stale')
+
+    def test_a_write_that_stopped_between_the_comment_and_its_entry_is_the_same_state(self):
+        # Review of r5: it does not need journal loss. T1 then T2, the entry of T2 never written, and the text back to T1.
+        native = Native(row_of('T1.'))
+        first = self.write(native, OWNER)['record']
+        native.rows['north-1']['description'] = 'T2.'
+        with patch.object(da, 'publish', side_effect=OSError('stopped here')), self.assertRaises(OSError):
+            self.write(native, OWNER)
+        row = native.rows['north-1']
+        self.assertEqual(2, len(row['comments']), 'the comment was written')
+        row['description'] = 'T1.'
+        self.assertEqual([first], da.history(row, PROJECT, self.journal))
+        self.assertEqual('attestation-stale', self.reads(row)['state'])
+        with self.assertRaises(da.AttestRefusal):
+            self.write(native, COORD)
+        # The owner recovers it.
+        self.write(native, OWNER)
+        self.assertEqual(('counts', 'owner'), (self.reads(row)['state'], self.reads(row)['role']))
+
+    def test_a_recovery_is_the_newest_even_if_the_clock_went_back(self):
+        native = Native(row_of('T1.'))
+        record = self.write(native, OWNER)['record']
+        (self.journal / da.JOURNAL_DIR / (record['sha256'] + '.json')).unlink()
+        self.seq = 0            # the next record's time is earlier than the comment's
+        recovered = self.write(native, OWNER)['record']
+        self.assertEqual(record['at'], recovered['at'])
+        self.assertEqual('counts', self.reads(native.rows['north-1'])['state'])
 
     def test_only_an_unhonoured_comment_asks_for_an_owner(self):
         # A coordinator's own ordinary work goes on where every comment is honoured, or where there is none.
@@ -1075,6 +1146,31 @@ class WebRouteTests(unittest.TestCase):
                 self.assertEqual(('counts', 'owner'), (self.read(issue)['attestation'], self.read(issue)['attested_as']))
                 self.attest(issue, name, expected=403)
 
+    def test_after_a_newer_entry_is_lost_old_text_does_not_count_again(self):
+        # Review of r5, b1, the reviewer's sequence on real bd: a host actor and a contributor's web PATCH alike.
+        for how in ('host', 'web'):
+            with self.subTest(how=how):
+                issue = self.make('Binds: pp\nOwner-only: yes')
+                self.attest(issue, 'pat')
+                self.patch_task(issue, 'pat', {'description': 'Binds: pp\nOwner-only: yes\nThe second text.'})
+                second = self.attest(issue, 'pat')['record']
+                entry = self.project / da.JOURNAL_DIR / (second['sha256'] + '.json')
+                aside = entry.with_name(entry.name + '.aside')
+                entry.rename(aside)
+                self.addCleanup(lambda p=aside, q=entry: p.rename(q) if p.exists() else None)
+                if how == 'host':
+                    self.assertEqual(0, self.host('plain', 'update', issue, '--description', 'Binds: pp\nOwner-only: yes', '--json')['returncode'])
+                else:
+                    self.patch_task(issue, 'carl', {'description': 'Binds: pp\nOwner-only: yes'})
+                found = self.read(issue)
+                self.assertEqual(('attestation-stale', None, None), (found['attestation'], found['attested_as'], found['adopt_line']))
+                self.attest(issue, 'cleo', expected=403)
+                # The owner recovers it, with the entry away or back.
+                self.attest(issue, 'pat')
+                self.assertEqual(('counts', 'owner'), (self.read(issue)['attestation'], self.read(issue)['attested_as']))
+                aside.rename(entry)
+                self.assertEqual(('counts', 'owner'), (self.read(issue)['attestation'], self.read(issue)['attested_as']))
+
     def test_a_bound_key_is_refused_like_an_unbound_one(self):
         # Reviewer's note: bound keys were not in their matrix. A key bound to a person and one bound to a lane, each with its
         # own actor in this project's registry, on an attested row and on an unattested one with the lines.
@@ -1287,13 +1383,15 @@ class WebRouteTests(unittest.TestCase):
             return fixture.admin.run_bd(self.root, 'pq', ['--actor', actor, *argv])
         cleo, pat = self.ids['cleo'], self.ids['pat']
         state = {'users': {cleo: {'disabled': False}, pat: {'disabled': False}}, 'memberships': {'pq': {cleo: 'coordinator', pat: 'owner'}}}
+        from http_authority import server_time
+        at = server_time()
         request = {'schema_version': 1, 'operation_id': 'op-pq', 'decision': issue, 'digest': da.digest(row)}
         with self.assertRaises(da.AttestRefusal) as refused:
             da.apply(request, project='pq', journal=restored, run=lambda argv: run(argv, cleo), author=cleo, via='session',
-                     at=AT[50], state=state, operators=['ops'])
+                     at=at, state=state, operators=['ops'])
         self.assertEqual(403, refused.exception.status)
         record = da.apply(request, project='pq', journal=restored, run=lambda argv: run(argv, pat), author=pat, via='session',
-                          at=AT[51], state=state, operators=['ops'])['record']
+                          at=at, state=state, operators=['ops'])['record']
         self.assertTrue(record['owner_gated'], 'the words Owner-only: no would not ask for it')
         row = next(item for item in json.loads(run(['show', issue, '--json', '--include-comments'])) if item.get('id') == issue)
         self.assertEqual(('counts', 'owner'), tuple(da.standing(row, 'pq', state, ['ops'], restored)[key] for key in ('state', 'role')))

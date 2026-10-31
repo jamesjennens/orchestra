@@ -11,10 +11,12 @@ and description, a reserved prefix a raw comment cannot write, honoured only wit
   the attestation is refused and never attested by mistake;
 - the operator's host path (``admin.py decision-attest``), for an actor on the installation's allowlist.
 
-A row with an attestation comment no journal honours (the journal was lost, or the project restored under a new name) is
-attested again only at an owner's level, and that record keeps the level: whoever wrote that comment and whatever it said
-cannot be known, and a contributor can have edited the text. So a lost journal never lets a coordinator lower an owner's
-row, and never locks an owner out.
+A row with an attestation comment no journal honours (the journal was lost, a write stopped between the comment and its
+entry, or the project was restored under a new name) is attested again only at an owner's level, and that record keeps the
+level: whoever wrote that comment and whatever it said cannot be known, and a contributor can have edited the text. If such
+a comment is newer than the newest honoured record, the row reads attestation-stale: the honoured record is not the last
+word. Every reader gets all this from ``reading``, the one place that says what a row's attestation comments mean. So a lost
+journal never lets anyone below an owner lower a row or bring old text back, and never locks an owner out.
 
 A row whose text carries ``Adopts:`` or ``Authorises:`` pins the program decision's attestation id. It is attested only by
 someone who can read that decision now, and only with the id it has now: an area must not read ``adopted`` for text it
@@ -308,16 +310,45 @@ def journaled(project, record):
     return stored == record
 
 
-def history(row, project, journal):
-    """The honoured records on one row, oldest first, ordered by the record's own server time, then the native comment
-    id, so the order never depends on how a native read happens to list comments."""
+def _stated_time(comment):
+    """The ``at`` an attestation comment states, or None for one that does not read. Used only to place a comment no journal
+    honours against the honoured records: it is not trusted for anything else."""
+    try:
+        stated = record_json.loads(comment['text'][len(PREFIX):], object_pairs_hook=_unique)
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        return None
+    at = stated.get('at') if isinstance(stated, dict) else None
+    return at if isinstance(at, str) else None
+
+
+def reading(row, project, journal):
+    """What a row's attestation comments mean, the ONE place that says (review of r5): ``(records, unhonoured, newer)``.
+
+    ``records`` are the honoured ones, oldest first, ordered by the record's own server time, then the native comment id, so
+    the order never depends on how a native read happens to list comments. ``unhonoured`` is whether any comment with the
+    prefix is not honoured here: its entry is gone, it names another project (a restore under a new name), or it does not
+    read. ``newer`` is whether one of those comes after the newest honoured record, by the time it states and then its id;
+    one that states no time is placed by where the native read lists it, the only thing known of it."""
     decision = row.get('id') if isinstance(row, dict) else None
-    out = []
-    for comment in (row.get('comments') or []) if isinstance(row, dict) else []:
+    honoured, others = [], []
+    for position, comment in enumerate(_attestation_comments(row)):
         record = parse_comment(comment, project=project, decision=decision)
         if record is not None and journaled(journal, record):
-            out.append((record['at'], str(comment.get('id') or ''), record))
-    return [record for _, _, record in sorted(out, key=lambda item: (item[0], item[1]))]
+            honoured.append((record['at'], str(comment.get('id') or ''), position, record))
+        else:
+            others.append((_stated_time(comment), str(comment.get('id') or ''), position))
+    honoured.sort(key=lambda item: (item[0], item[1]))
+    records = [item[3] for item in honoured]
+    if not honoured:
+        return records, bool(others), False
+    last = honoured[-1]
+    newer = any((at, comment_id) > last[:2] if at is not None else position > last[2] for at, comment_id, position in others)
+    return records, bool(others), newer
+
+
+def history(row, project, journal):
+    """The honoured records on one row, oldest first (``reading``)."""
+    return reading(row, project, journal)[0]
 
 
 def _newest_run(records):
@@ -333,9 +364,9 @@ def _newest_run(records):
 def standing(row, project, state, operators, journal):
     """How a row counts now: ``{'state', 'role', 'author', 'id', 'owner_level', 'reason'}``. ``state`` is 'counts', or what
     it reads as; ``id`` is what an adoption pins: the sha256 of the first record of the newest run over this text;
-    ``owner_level`` is what its records ask of anyone changing it, however it reads now."""
-    records = history(row, project, journal)
-    level = needs_owner(records)
+    ``owner_level`` is what its comments ask of anyone changing it, however it reads now."""
+    records, unhonoured, newer = reading(row, project, journal)
+    level = unhonoured or needs_owner(records)
 
     def reads(name):
         return {'state': name, 'role': None, 'author': None, 'id': None, 'owner_level': level, 'reason': REASONS[name]}
@@ -343,7 +374,7 @@ def standing(row, project, state, operators, journal):
         return reads('closed')
     if not records:
         return reads('not-attested')
-    if records[-1]['digest'] != digest(row):
+    if newer or records[-1]['digest'] != digest(row):
         return reads('attestation-stale')
     run = _newest_run(records)
     found = [(role_now(record['via'], record['author'], project, state, operators), record) for record in run]
@@ -432,11 +463,10 @@ def apply(payload, *, project, journal, run, author, via, at, state, operators, 
     if role not in COORDINATORS:
         raise AttestRefusal(403, 'Only an owner or a coordinator of %s, or an operator, attests a decision. Nothing '
                                  'was written.' % project)
-    records = history(row, project, journal)
+    records, unhonoured, _ = reading(row, project, journal)
     if role not in OWNERS and any(record['owner_gated'] for record in _newest_run(records)):
         raise AttestRefusal(403, 'This decision was attested at an owner\'s level: only a person owner of %s, or an '
                                  'operator, attests it again. Nothing was written.' % project)
-    unhonoured = has_unhonoured_comment(row, project, journal)
     if role not in OWNERS and unhonoured:
         raise AttestRefusal(403, 'This decision carries an attestation that can no longer be read as one (its journal entry '
                                  'is gone, or the project was restored): only a person owner of %s, or an operator, attests '
@@ -446,6 +476,9 @@ def apply(payload, *, project, journal, run, author, via, at, state, operators, 
         raise AttestRefusal(409, 'The text changed since you read it. Read it again before you attest it. Nothing was '
                                  'written.')
     check_pins(row, pinned)
+    # This record has to be the newest, or an owner's recovery would not end a stale reading on a host whose clock went back.
+    stated = [time for time in map(_stated_time, _attestation_comments(row)) if time is not None]
+    at = max([at] + stated)
     # An owner recovering such a row keeps the level, so that nobody below it can replace this record while the words stand.
     record = make_record(payload, project=project, author=author, via=via, gated=unhonoured or owner_gated(row, role), at=at)
     open_journal(journal)
@@ -536,15 +569,8 @@ def carries_attestation_comment(row):
 
 
 def has_unhonoured_comment(row, project, journal):
-    """Whether a row has an attestation comment that no journal honours here: its entry is gone, it names another project
-    (a restore under a new name), or it does not read. What it said cannot be relied on, so nobody may act below an owner's
-    level on the row (review of r4)."""
-    decision = row.get('id') if isinstance(row, dict) else None
-    for comment in _attestation_comments(row):
-        record = parse_comment(comment, project=project, decision=decision)
-        if record is None or not journaled(journal, record):
-            return True
-    return False
+    """Whether a row has an attestation comment that no journal honours here (``reading``)."""
+    return reading(row, project, journal)[1]
 
 
 def gate(row, *, project, journal, actor, state, by_service, command, change):
@@ -552,7 +578,7 @@ def gate(row, *, project, journal, actor, state, by_service, command, change):
     section 6 or an attestation comment (reviews of r2 and r3: a row with no honoured record must not stand open, and a task
     these would turn into a decision is the same). On the web, the standing the row needs; every host route refuses everyone,
     an operator included: an operator goes through admin.py decision-change."""
-    records = history(row, project, journal)
+    records, unhonoured, _ = reading(row, project, journal)
     flips = changes_decision(row, change)
     marked = carries_attestation_comment(row)
     if not records and not ((marked or carries_lines(row)) and (is_decision(row) or flips)):
@@ -565,7 +591,7 @@ def gate(row, *, project, journal, actor, state, by_service, command, change):
                                   'with admin.py decision-change. Nothing was written.' % (what, row.get('id')))
     # With a record, the record says. A comment no journal honours says nothing to rely on and the text can be edited, so it
     # needs an owner, beside any record that is honoured too. With neither, the text is all there is, and nobody attested it.
-    needed = (OWNERS if needs_owner(records) or has_unhonoured_comment(row, project, journal)
+    needed = (OWNERS if needs_owner(records) or unhonoured
               or (not records and owner_gated(row, None)) else COORDINATORS)
     if authority(actor, project, state) in needed:
         return None
