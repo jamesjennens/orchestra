@@ -10,6 +10,11 @@ import { historyPanel } from '../agentHistory.js';
 
 export const ATTENTION = {
   feedback: ['Has feedback to act on', 'warn'],
+  // kittrial-5bb.237 (G2): the server distinguishes a FAILED work read (`error`)
+  // from an INCOMPLETE one (`unknown`); neither is idle, so an agent whose work
+  // could not be read is never headed "Could take more work".
+  error: ['Could not read its work', 'crit'],
+  unknown: ['Work read incomplete', 'warn'],
   idle: ['Could take more work', 'accent'],
   working: ['Working', ''],
   waiting: ['Waiting for review', 'ok'],
@@ -18,7 +23,7 @@ export const ATTENTION = {
 
 // The server reports attention as { state, summary, counts }; the prototype's mock
 // uses a flat word. One card shape serves both.
-const SERVER_ATTENTION = { 'changes-requested': 'feedback', blocked: 'blocked', 'waiting-review': 'waiting', 'waiting-integration': 'waiting', working: 'working', idle: 'idle' };
+const SERVER_ATTENTION = { 'changes-requested': 'feedback', error: 'error', unknown: 'unknown', blocked: 'blocked', 'waiting-review': 'waiting', 'waiting-integration': 'waiting', working: 'working', idle: 'idle' };
 export function attentionOf(agent) {
   if (typeof agent.attention === 'string') return agent.attention;
   return SERVER_ATTENTION[agent.attention && agent.attention.state] || 'idle';

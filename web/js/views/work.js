@@ -25,6 +25,8 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
         h('td', { class: 'task-state-column' }, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
         h('td', { class: 'task-next-column' }, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—'),
           t.blocked ? [' ', h('span', { class: 'chip crit', title: 'The latest checkpoint lists unresolved items' }, 'Blocked')] : null,
+          // kittrial-5bb.237 (G6): an unreadable blocking count is not "not blocked".
+          t.blocking_unknown ? [' ', h('span', { class: 'chip warn', title: 'The blocking count could not be read, so whether this is blocked is unknown' }, 'Blocked?')] : null,
           t.recommended ? [' ', h('span', { class: 'chip ok', title: 'A reviewer recommends approving this revision. An owner still decides.' }, 'Recommended')] : null,
           t.pending_request_ids && t.pending_request_ids.length ? h('div', { class: 'sub' }, 'Open requests: ', t.pending_request_ids.join(', ')) : null),
         // Canonical queue rows carry no update time; the review wait start is shown instead.

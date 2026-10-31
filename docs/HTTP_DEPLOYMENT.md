@@ -3657,10 +3657,14 @@ line separately and unconfined.
   single-agent route, an incomplete snapshot falls back to paged owner-filtered
   work so tasks beyond the project snapshot bound are recovered. When the first
   page's total exceeds the 1,000-row bound, stop once there are enough claimable
-  suggestions to fill the 30-action list. If the first page fills them, 250 own
-  tasks need three owner pages, four work commands in total. A first page filled
-  by other people's review states continues paging for claimable suggestions,
-  up to ten pages (1,000 rows). Owner-filtered recovery also stops at 1,000 rows;
+  suggestions to fill the 50-action list (`AGENT_ACTION_LIMIT`). If the first page
+  fills them, 250 own tasks need three owner pages, four work commands in total. A
+  first page filled by other people's review states continues paging for claimable
+  suggestions, up to ten pages (1,000 rows). When those ten pages still hold fewer
+  than 50 claimable suggestions the snapshot stays incomplete, and the single-agent
+  route adds up to ten owner-filtered pages to recover its own tasks: at most
+  twenty `work` commands in all (250 own tasks after ten unfiltered pages cost
+  thirteen). Owner-filtered recovery also stops at 1,000 rows;
   its counts are lower bounds when more remain. Owner lists reuse the bounded
   unfiltered snapshot and can under-count own tasks beyond it. In-process projects cost one
   snapshot read. `snapshot_truncated` marks incomplete project suggestions/counts;
@@ -3668,7 +3672,10 @@ line separately and unconfined.
   suggestion or action cap. `truncated` is their combined signal. Counts over an
   incomplete source are lower bounds, not project totals: summaries say "at least N".
   An incomplete read with no observed own work says `unknown`, never `idle`;
-  observed claimable actions are still offered. A failed work read of a still-authorized
+  observed claimable actions are still offered. A view that was never computed is
+  the separate state `not-computed`, so the two meanings (`unknown` = an incomplete
+  read with lower bounds; `not-computed` = no read at all) cannot be confused.
+  A failed work read of a still-authorized
   project says `error`, increments `read_errors`, and marks snapshot and own counts
   incomplete. Successful projects retain their actions. Projects the principal can
   no longer read are excluded. Nothing is cached across requests

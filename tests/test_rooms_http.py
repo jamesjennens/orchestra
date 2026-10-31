@@ -301,6 +301,18 @@ class Slice5PageTests(unittest.TestCase):
         self.assertEqual(['Then this \u2014 Then do the next thing'], seen['ownerRest'])
         self.assertEqual(['Next: nothing from you. It holds nightly report '], seen['agentNext'])
         self.assertEqual([], seen['agentWho'])
+        # kittrial-5bb.237 (G2): a failed read and an incomplete read each have their
+        # own chip, and neither is the idle heading "Could take more work".
+        self.assertEqual(['Could not read its work', 'Work read incomplete', 'Could take more work'],
+                         seen['attentionChips'])
+        for case, heading in (('errorCard', 'Could not read its work'),
+                              ('unknownCard', 'Work read incomplete')):
+            self.assertIn(heading, seen[case]['text'])
+            self.assertNotIn('Could take more work', seen[case]['text'])
+            self.assertIn(heading, seen[case]['chip'])
+        # kittrial-5bb.237 (G6): an unreadable blocking count is shown as unknown,
+        # never as a plain not-blocked row.
+        self.assertIn('Blocked?', seen['workFull']['text'])
         # My work renders the one row that needs its owner and no empty
         # section; the empty case renders the one-line empties.
         self.assertIn('1 need you', seen['workFull']['text'])

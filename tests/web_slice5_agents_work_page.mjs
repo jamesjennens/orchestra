@@ -34,6 +34,18 @@ const agentCaseAgent = { id: 'a-2', display_name: 'report-agent', tool: 'Claude 
 
 const ownerCard = agentViews.agentCard(ctx(), ownerAgent);
 const bareCard = agentViews.agentCard(ctx(), agentCaseAgent);
+// kittrial-5bb.237 (G2): a failed read and an incomplete read each get their own
+// heading and chip instead of the idle "Could take more work".
+const errorAgent = { id: 'a-3', display_name: 'failed-agent', tool: 'Claude Code',
+  working_directory: '/tmp/failed', last_seen_at: null, enabled: true,
+  attention: { state: 'error', summary: '1 work read(s) failed', counts: { claimable: 0 } },
+  items: [], projects: [], credentials: [] };
+const unknownAgent = { id: 'a-4', display_name: 'partial-agent', tool: 'Claude Code',
+  working_directory: '/tmp/partial', last_seen_at: null, enabled: true,
+  attention: { state: 'unknown', summary: 'at least 0 claimable task(s)', counts: { claimable: 0 } },
+  items: [], projects: [], credentials: [] };
+const errorCard = agentViews.agentCard(ctx(), errorAgent);
+const unknownCard = agentViews.agentCard(ctx(), unknownAgent);
 
 function workCtx(myWork) {
   return { href: (path) => '#' + path, go() {}, render() {}, me: { id: 'usr_1' },
@@ -42,7 +54,8 @@ function workCtx(myWork) {
       myContributions: async () => ({ items: [], total: 0, next_cursor: null }) } };
 }
 const fullWork = { truncated: false, unavailable: [],
-  assigned: [{ id: 't-1', project_id: 'alpha', title: 'Do it', status: 'open', review_state: 'none' }],
+  assigned: [{ id: 't-1', project_id: 'alpha', title: 'Do it', status: 'open', review_state: 'none',
+    blocking_unknown: true }],
   to_review: [{ id: 't-9', project_id: 'alpha', title: 'Review me', status: 'open', review_state: 'awaiting-review' }],
   agents: [ownerAgent] };
 const emptyWork = { truncated: false, unavailable: [], assigned: [], to_review: [], agents: [] };
@@ -55,6 +68,13 @@ console.log(JSON.stringify({
     && String(e.className || e.attributes['class'] || '').includes('agent-items')).map((e) => e.textContent),
   agentNext: nextLines(bareCard),
   agentWho: whoActs(bareCard),
+  // The flat prototype word and the server's state both map to the same chip.
+  attentionChips: ['error', 'unknown', 'idle'].map((state) => agentViews.attentionChip(
+    agentViews.attentionOf({ attention: { state } })).textContent),
+  errorCard: { text: errorCard.textContent, chip: errorCard.all((e) => e.tagName === 'SPAN'
+    && String(e.className || e.attributes['class'] || '').includes('chip')).map((e) => e.textContent) },
+  unknownCard: { text: unknownCard.textContent, chip: unknownCard.all((e) => e.tagName === 'SPAN'
+    && String(e.className || e.attributes['class'] || '').includes('chip')).map((e) => e.textContent) },
   workFull: { text: full.textContent, empty: emptyLines(full),
     agentSections: full.all((e) => e.attributes['data-agent']).length },
   workEmpty: { text: bare.textContent, empty: emptyLines(bare) },

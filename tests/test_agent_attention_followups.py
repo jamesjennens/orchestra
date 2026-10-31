@@ -157,6 +157,134 @@ class EndpointFollowups(a.EndpointAttentionTests):
         self.assertEqual(view['counts']['checkpoint_errors'],1)
         self.assertEqual(view['counts']['blocked'],0)
 
+    # -- kittrial-5bb.237 follow-ups: the two survivors, the real bound, the two
+    # -- meanings of unknown, and the My work flag for an unreadable blocking count.
+
+    def test_review_summary_marks_review_counts_as_lower_bounds(self):
+        """G1a: http_service.py:10710's "at least " is the only sign a review count is
+        a lower bound. Dropping it must fail this test.
+        """
+        summary = h.ApiHandler._agent_review_summary(
+            {'review_recommended': 2, 'to_review': 3}, snapshot_truncated=True)
+        self.assertIn('at least 2 contribution(s) recommended for approval', summary)
+        self.assertIn('at least 3 contribution(s) to review', summary)
+        complete = h.ApiHandler._agent_review_summary({'to_review': 3})
+        self.assertIn('3 contribution(s) to review', complete)
+        self.assertNotIn('at least', complete)
+
+    def test_authority_lost_during_a_failed_read_is_not_counted(self):
+        """G1b: the second authority check in the failed-read path decides whether a
+        failure is unknown work or a project the principal may no longer read. With
+        the check removed this test sees read_errors 1 and state error.
+        """
+        self.claim(self.tasks[0])
+        original=self.service.check_authority
+        checks=[]
+        def authority(principal,project_id,capability,**kw):
+            if project_id==self.project and capability==h.CAP_READ:
+                checks.append(project_id)
+                if len(checks)>1:
+                    raise h.forbidden('authority changed during the read')
+            return original(principal,project_id,capability,**kw)
+        def failed(action,*args,**kwargs):
+            if action=='work':
+                raise h.uncertain('synthetic canonical work failure')
+            return original_run(action,*args,**kwargs)
+        original_run=self.backend._run
+        with patch.object(self.backend,'_run',side_effect=failed), \
+                patch.object(self.service,'check_authority',side_effect=authority):
+            data=self.next();view=data['attention']
+        self.assertGreaterEqual(len(checks),2)
+        self.assertEqual(view['counts']['read_errors'],0)
+        self.assertEqual(view['state'],'idle')
+        self.assertEqual(data['next_actions'],[])
+
+    def test_worst_case_at_the_real_bound_costs_ten_unfiltered_plus_owner_pages(self):
+        """G4: >1,000 rows whose first 1,000 hold fewer than 50 claimable suggestions
+        cost all ten unfiltered pages, then three owner pages for 250 own tasks:
+        thirteen work commands, not the four the early-stop case costs.
+        """
+        actor=self.next()['agent']['actor']
+        review=[dict(task='review-%04d'%i,title='other delivery',owner='other-actor',
+                     status='in_progress',review_state='awaiting-review',contribution_id='delivery',
+                     open_items=0,blocking_items=0) for i in range(1000)]
+        own=[dict(task='own-%04d'%i,title='own',owner=actor,status='in_progress',
+                  review_state='none',open_items=0,blocking_items=0) for i in range(250)]
+        rows=review+own
+        calls=[]
+        def run(action,project,reader,args,*rest,**kwargs):
+            self.assertEqual(action,'work')
+            offset=int(args[args.index('--offset')+1]);owned='--owner' in args
+            calls.append((owned,offset))
+            selected=own if owned else rows
+            return dict(total=len(selected),items=selected[offset:offset+100],
+                        next_offset=offset+100 if offset+100<len(selected) else None)
+        with patch.object(self.backend,'_run',side_effect=run):
+            data=self.next();view=data['attention']
+        self.assertEqual(calls,[(False,o) for o in range(0,1000,100)]
+                         +[(True,0),(True,100),(True,200)])
+        self.assertEqual(view['counts']['claimed'],250)
+        self.assertEqual(view['counts']['in_progress'],250)
+        self.assertEqual(view['counts']['claimable'],0)
+        self.assertTrue(view['snapshot_truncated'])
+        self.assertFalse(view['own_tasks_truncated'])
+
+    def test_paging_document_names_the_action_cap_and_the_worst_case(self):
+        """G3/G4: the document and AGENT_ACTION_LIMIT agree, and the exact worst case
+        the test above measures is stated. Changing either number fails here.
+        """
+        text=(Path(__file__).resolve().parents[1]/'docs'/'HTTP_DEPLOYMENT.md').read_text(encoding='utf-8')
+        flat=' '.join(text.split())
+        self.assertTrue('to fill the %d-action list'%h.AGENT_ACTION_LIMIT in flat,
+                        'docs/HTTP_DEPLOYMENT.md must name AGENT_ACTION_LIMIT as the action cap')
+        self.assertNotIn('30-action list',flat)
+        self.assertTrue('at most twenty `work` commands in all' in flat,
+                        'docs/HTTP_DEPLOYMENT.md must state the exact worst-case read count')
+        self.assertTrue('250 own tasks after ten unfiltered pages cost thirteen' in flat,
+                        'docs/HTTP_DEPLOYMENT.md must state the measured 250-task cost')
+
+    def test_never_computed_attention_is_not_the_incomplete_unknown(self):
+        """G5: the route's defensive "never computed" view is not the computed state
+        "unknown", which means the read was incomplete and its counts are lower bounds.
+        """
+        absent=h.ApiHandler._agent_attention_view({})
+        self.assertEqual((absent['state'],absent['summary'],absent['counts']),
+                         ('not-computed','Not computed.',{}))
+        incomplete=h.ApiHandler._agent_attention_view({},{
+            'state':'unknown','summary':'at least 3 claimable task(s)','counts':{'claimable':3},
+            'truncated':True,'snapshot_truncated':True,'own_tasks_truncated':False,
+            'actions_truncated':False,'computed_at':None})
+        self.assertEqual(incomplete['state'],'unknown')
+        self.assertNotEqual(absent['state'],incomplete['state'])
+
+    def test_me_work_marks_an_explicit_null_blocking_count_unknown(self):
+        """G6(i): /v1/me/work must not show an explicit null blocking count as
+        not blocked; it says the count is unknown, and a known count carries no such
+        signal.
+        """
+        task=self.tasks[0];token=self.people['alex']
+        self.assertEqual(200,self.request('POST',self.base(task)+'/claim',{},token=token).status)
+        original=self.backend.review_queue
+        def null_blocking(project):
+            value=original(project);items=[]
+            for row in value.get('items') or []:
+                if row.get('id')==task:
+                    row=dict(row);row['attention']=dict(row.get('attention') or {},blocking_items=None)
+                items.append(row)
+            return dict(value,items=items)
+        with patch.object(self.backend,'READ_CACHE_SECONDS',0), \
+                patch.object(self.backend,'review_queue',side_effect=null_blocking):
+            work=self.request('GET','/v1/me/work',token=token)
+        self.assertEqual(200,work.status,work.data)
+        row=next(x for x in work.data['assigned'] if x['id']==task)
+        self.assertIs(row['blocked'],False)
+        self.assertIs(row['blocking_unknown'],True)
+        with patch.object(self.backend,'READ_CACHE_SECONDS',0):
+            work=self.request('GET','/v1/me/work',token=token)
+        row=next(x for x in work.data['assigned'] if x['id']==task)
+        self.assertIs(row['blocked'],False)
+        self.assertNotIn('blocking_unknown',row)
+
     def test_failed_authorized_work_read_is_error_with_incomplete_counts(self):
         task=self.tasks[0];self.claim(task)
         original=self.backend._run
