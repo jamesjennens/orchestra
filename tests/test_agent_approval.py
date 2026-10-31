@@ -152,34 +152,70 @@ class DefaultTests(SamePerson):
         self.assertEqual(len(self.approval_summary(task)), API.SUMMARY_MAX)
 
     def test_a_caller_cannot_write_the_basis_sentence_itself_and_similar_words_are_allowed(self):
-        forged_summaries = (
-            API.SAME_PERSON_APPROVAL,
-            API.SAME_PERSON_APPROVAL + ' Looks good.',
-            'Prefix. ' + API.SAME_PERSON_APPROVAL + ' Suffix.',
-            'Looks good. ' + API.SAME_PERSON_APPROVAL,
-        )
-        # 1. Forged by an ordinary person or independent coordinator agent on independent work:
+        base_sentence = API.SAME_PERSON_APPROVAL
+        forged_variants = {
+            'exact': base_sentence,
+            'prefix': base_sentence + ' Looks good.',
+            'middle': 'Prefix. ' + base_sentence + ' Suffix.',
+            'suffix': 'Looks good. ' + base_sentence,
+            'no-period': 'ok. ' + base_sentence[:-1],
+            'lowercase': 'ok. ' + base_sentence.lower(),
+            'upper-first-word': 'ok. APPROVED' + base_sentence[8:],
+            'whitespace': 'ok. ' + base_sentence.replace('same person', 'same   person'),
+            'newline': 'ok. ' + base_sentence.replace(' as ', '\nas '),
+            'nbsp': 'ok. ' + base_sentence.replace(' ', '\u00a0'),
+            'zero-width': 'ok. ' + base_sentence.replace('Approved', 'App\u200broved'),
+            'fullwidth-paren': 'ok. ' + base_sentence.replace('(', '\uff08').replace(')', '\uff09'),
+            'bang': 'ok. ' + base_sentence[:-1] + '!',
+            'split-before-period': 'ok. ' + base_sentence[:-1] + ' .',
+        }
+        # 0. Order against the 403 party refusal (f4-order-test): a forged summary on own work gives 403, not 422.
+        own_task, own_cid = self.deliver(self.agent)
+        for op_body in (
+            {'operation': 'approve', 'contribution': own_cid, 'summary': base_sentence},
+            {'operation': 'approve', 'contribution': own_cid, 'summary': forged_variants['no-period']},
+            {'operation': 'recommend', 'schema_version': 1, 'operation_id': 'rec-own-forged',
+             'contribution': own_cid, 'commit': test_coordinator_grant.test_own_party.test_http_agents.COMMIT,
+             'verdict': 'approve', 'summary': base_sentence, 'items': []},
+        ):
+            with self.subTest(own_work_op=op_body['operation'], summary=op_body['summary']):
+                own_refused = self.request('POST', self.base(own_task) + '/reviews', op_body, token=self.agent)
+                self.assertEqual(403, own_refused.status, own_refused.data)
+        # 1. Forged by an ordinary person or independent coordinator agent on independent work (approve & recommend):
         ind_task, ind_cid = self.deliver(self.tokens['carl'])
         for who in (self.tokens['olive'], self.agent):
-            for text in forged_summaries:
-                with self.subTest(who=who, summary=text):
+            for name, text in forged_variants.items():
+                with self.subTest(who=who, op='approve', variant=name):
                     refused = self.request('POST', self.base(ind_task) + '/reviews', {
                         'operation': 'approve', 'contribution': ind_cid, 'summary': text}, token=who)
                     self.assertEqual(422, refused.status, refused.data)
                     self.assertIn(API.SAME_PERSON_APPROVAL, refused.data['error']['message'])
                     self.assertEqual(self.state_of(ind_task), 'awaiting-review')
+        for name, text in forged_variants.items():
+            with self.subTest(op='recommend', variant=name):
+                rec_refused = self.request('POST', self.base(ind_task) + '/reviews', {
+                    'operation': 'recommend', 'schema_version': 1, 'operation_id': 'rec-forged-' + name,
+                    'contribution': ind_cid, 'commit': test_coordinator_grant.test_own_party.test_http_agents.COMMIT,
+                    'verdict': 'approve', 'summary': text, 'items': []}, token=self.agent)
+                self.assertEqual(422, rec_refused.status, rec_refused.data)
+                self.assertIn(API.SAME_PERSON_APPROVAL, rec_refused.data['error']['message'])
         # 2. Forged by a same-person coordinator agent on a sibling agent's delivery:
         sib_task, sib_cid = self.deliver(self.other)
-        for text in forged_summaries:
-            with self.subTest(same_person=True, summary=text):
+        for name, text in forged_variants.items():
+            with self.subTest(same_person=True, variant=name):
                 refused = self.request('POST', self.base(sib_task) + '/reviews', {
                     'operation': 'approve', 'contribution': sib_cid, 'summary': text}, token=self.agent)
                 self.assertEqual(422, refused.status, refused.data)
                 self.assertIn(API.SAME_PERSON_APPROVAL, refused.data['error']['message'])
                 self.assertEqual(self.state_of(sib_task), 'awaiting-review')
         self.assertFalse(any(e.get('same_person_coordinator') for e in self.events('reviews.add')))
-        # 3. Legitimate summaries with similar words are accepted, and the server-written sentence still works:
+        # 3. Legitimate summaries with similar words are accepted on both recommend and approve:
         similar = 'Approved by a coordinator agent of the same person after checking agent_approval: by-agent.'
+        ok_rec = self.request('POST', self.base(ind_task) + '/reviews', {
+            'operation': 'recommend', 'schema_version': 1, 'operation_id': 'rec-similar',
+            'contribution': ind_cid, 'commit': test_coordinator_grant.test_own_party.test_http_agents.COMMIT,
+            'verdict': 'approve', 'summary': similar, 'items': []}, token=self.agent)
+        self.assertEqual(201, ok_rec.status, ok_rec.data)
         ok_ind = self.request('POST', self.base(ind_task) + '/reviews', {
             'operation': 'approve', 'contribution': ind_cid, 'summary': similar}, token=self.tokens['olive'])
         self.assertEqual(201, ok_ind.status, ok_ind.data)

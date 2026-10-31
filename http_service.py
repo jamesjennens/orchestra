@@ -42,6 +42,7 @@ import ssl
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -6802,6 +6803,23 @@ class ApiHandler(BaseHTTPRequestHandler):
     SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
                             '(project setting agent_approval: by-agent).')
     SUMMARY_MAX = TEXT_LIMITS['summary']
+
+    @staticmethod
+    def _normalize_basis_text(text):
+        folded = unicodedata.normalize('NFKC', text).casefold()
+        stripped = ''.join(
+            ch for ch in folded
+            if unicodedata.category(ch) != 'Cf'
+            and not unicodedata.category(ch).startswith('P')
+            and ch not in '[](){}<>'
+        )
+        return ' '.join(stripped.split())
+
+    def _contains_same_person_approval(self, summary):
+        if not isinstance(summary, str):
+            return False
+        target = self._normalize_basis_text(self.SAME_PERSON_APPROVAL)
+        return bool(target) and target in self._normalize_basis_text(summary)
 
     def _another_agent_only(self, agent_id, names, parties, project):
         """Whether every one of ``parties`` of the approver's party is ANOTHER agent of its person (kittrial-5bb.438).
@@ -14125,7 +14143,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise forbidden(refusal)
             if payload.get('operation') == 'approve':
                 summary = payload.get('summary')
-                if isinstance(summary, str) and self.SAME_PERSON_APPROVAL in summary:
+                if self._contains_same_person_approval(summary):
                     raise invalid('The approval summary may not contain %r; the server adds that sentence itself'
                                   % self.SAME_PERSON_APPROVAL)
                 if setting is not None:
@@ -14151,6 +14169,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self._independent_all([actor, ctx.principal.user_id], parties, pid):
                     raise forbidden(self.NOT_INDEPENDENT_PARTY if self.service.approval_by_another_party
                                     else self.NOT_INDEPENDENT)
+                if self._contains_same_person_approval(payload.get('summary')):
+                    raise invalid('The recommendation summary may not contain %r; the server adds that sentence itself'
+                                  % self.SAME_PERSON_APPROVAL)
                 # One standing recommendation for a contribution from each PERSON
                 # (kittrial-5bb.154): a second one, by the same actor or by another agent of
                 # the same person, is refused and nothing is stored. Read from EVERY standing

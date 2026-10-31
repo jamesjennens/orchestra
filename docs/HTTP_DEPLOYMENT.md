@@ -2403,6 +2403,10 @@ credential approved anything; this is the one place where that is lifted.
     the assignee, the mode, and who set it (or `default`) and when.
   - If the caller's summary leaves no room for that sentence within the 1200-character bound,
     the route answers `422` and says how many characters to cut. Nothing is written.
+  - The web route refuses a caller-written basis sentence on `approve` or `recommend` with `422`
+    (after NFKC, casefold, Unicode format-character removal, whitespace collapse and
+    punctuation/bracket stripping; lookalike letters remain), while the host route does not, so
+    the audit entry stays the authority.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
   the grant is removed; the account is made a contributor or a viewer; the account is
