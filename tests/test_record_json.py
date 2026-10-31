@@ -344,8 +344,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             'fault_clear.py': 3,
             'delegations.py': 4,
             # kittrial-5bb.454 r2: a comment's record, a journal entry and the comment-write receipt.
-            # endpoint.py's seventeenth is the same action's request body.
-            'decision_attest.py': 3,
+            # endpoint.py's seventeenth is the same action's request body. r6: the time a comment no journal
+            # honours states, which is text nobody has validated.
+            'decision_attest.py': 4,
             'review_recommendations.py': 2, 'review_workflow.py': 5, 'work.py': 1, 'worker_gate.py': 1})
 
     def test_the_parsers_that_do_not_call_it_directly_reach_it(self):
