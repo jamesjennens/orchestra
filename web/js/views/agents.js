@@ -181,9 +181,11 @@ export function agentCard(ctx, raw, { compact = false, lean = false } = {}) {
 }
 
 // Open by itself when the agent has something the owner must see: more than one working credential
-// (each with its Revoke), one about to expire, or scopes that differ.
+// (each with its Revoke), one about to expire, scopes that differ, unknown or inferred scopes, or a creator other than the owner
+// (their notes live inside Details and must not be hidden).
 const needsDetails = (raw) => credentialsOf(raw).filter(works).length > 1
-  || credentialsOf(raw).some((c) => c.expires_soon && works(c)) || otherCredentials(raw).length > 0;
+  || credentialsOf(raw).some((c) => c.expires_soon && works(c)) || otherCredentials(raw).length > 0
+  || raw.scopes === null || raw.scopes_source === 'inferred' || Boolean(raw.created_by && raw.created_by !== raw.owner);
 
 export async function list(ctx) {
   // The page's structure is there at once, in its final order; the agents and the accounts fill in
@@ -553,38 +555,58 @@ function olderCredentials(ctx, agent, newId) {
   const live = credentialsOf(agent).filter((c) => c.id !== newId && works(c));
   if (!live.length) return h('p', { class: 'small muted' }, 'Any earlier credential for this agent keeps working until it is revoked.');
   const pending = new Map();   // credential id -> its Revoke button; only this agent's own credentials
-  const revoked = (button) => button.replaceWith(h('span', { class: 'chip plain' }, 'Revoked'));
+  const left = () => live.filter((c) => pending.has(c.id));
+  const sentence = (n) => (n ? `This agent now has ${n + 1} working credentials: the new one and ${n} earlier ${n === 1 ? 'one' : 'ones'}. The earlier ${n === 1 ? 'one keeps' : 'ones keep'} working until revoked. Revoke ${n === 1 ? 'it' : 'them'} once the agent uses the new secret.`
+    : 'Only the new credential works now.');
+  const note = h('p', { class: 'small', 'data-credential-total': String(live.length + 1) }, sentence(live.length));
+  const wrap = h('div', { class: 'setup-block', 'data-older-credentials': String(live.length) });
+  let all = null;
+  // Keeps the sentence, the counts and the revoke-all button true after every revocation.
+  const refresh = () => {
+    const n = left().length;
+    note.setAttribute('data-credential-total', String(n + 1));
+    wrap.setAttribute('data-older-credentials', String(n));
+    note.textContent = sentence(n);
+    if (all && n > 1) {
+      all.setAttribute('aria-label', `Revoke the ${n} older credentials`);
+      all.textContent = `Revoke the ${n} older credentials`;
+    } else if (all) {
+      all.remove();
+      all = null;
+    }
+  };
   const revokeOne = async (c, button) => {
     await act(button, () => ctx.api.revokeAgentCredential(agent.id, c.id), { success: 'Credential revoked' });
     pending.delete(c.id);
-    revoked(button);
+    button.replaceWith(h('span', { class: 'chip plain' }, 'Revoked'));
+    refresh();
   };
-  const all = live.length > 1 ? h('button', { type: 'button', class: 'danger', 'data-action': 'revoke-older',
-    'aria-label': `Revoke the ${live.length} older credentials`, onclick: async () => {
-      if (!(await confirmDialog({ title: `Revoke the ${live.length} older credentials?`,
-        body: `${agent.name || agent.display_name} keeps only the new credential. Anything still using the secret of an older one stops working immediately.`,
-        confirmLabel: `Revoke ${live.length}`, danger: true }))) return;
-      for (const c of live) {
-        const button = pending.get(c.id);
-        if (!button) continue;
-        try { await revokeOne(c, button); } catch { return; }
-      }
-      all.remove();
-    } }, `Revoke the ${live.length} older credentials`) : null;
-  return h('div', { class: 'setup-block', 'data-older-credentials': String(live.length) },
-    h('p', { class: 'small', 'data-credential-total': String(live.length + 1) },
-      `This agent now has ${live.length + 1} working credentials: the new one and ${live.length} earlier ${live.length === 1 ? 'one' : 'ones'}. The earlier ${live.length === 1 ? 'one keeps' : 'ones keep'} working until revoked. Revoke ${live.length === 1 ? 'it' : 'them'} once the agent uses the new secret.`),
-    all,
+  if (live.length > 1) {
+    all = h('button', { type: 'button', class: 'danger', 'data-action': 'revoke-older',
+      'aria-label': `Revoke the ${live.length} older credentials`, onclick: async () => {
+        const n = left().length;
+        if (!(await confirmDialog({ title: `Revoke the ${n} older credentials?`,
+          body: `${agent.name || agent.display_name} keeps only the new credential. Anything still using the secret of an older one stops working immediately.`,
+          confirmLabel: `Revoke ${n}`, danger: true }))) return;
+        for (const c of left()) {
+          try { await revokeOne(c, pending.get(c.id)); } catch { return; }
+        }
+      } }, `Revoke the ${live.length} older credentials`);
+  }
+  wrap.append(note);
+  if (all) wrap.append(all);
+  wrap.append(
     h('ul', { class: 'open-items' }, live.map((c) => {
       const row = h('li', { class: 'copy-row' }, h('span', null, c.label || c.id, ' ', h('span', { class: 'small muted' }, 'issued ', time(c.created_at), ' · allows ', scopeNames(c.scopes))));
       const button = h('button', { type: 'button', class: 'danger', 'aria-label': 'Revoke credential ' + (c.label || c.id), onclick: async (event) => {
         if (!(await confirmDialog({ title: 'Revoke this credential?', body: 'Anything still using its secret stops working immediately.', confirmLabel: 'Revoke', danger: true }))) return;
-        try { await revokeOne(c, event.currentTarget); } catch { /* act() showed the error */ }
+        try { await revokeOne(c, button); } catch { /* act() showed the error */ }
       } }, 'Revoke');
       pending.set(c.id, button);
       row.append(button);
       return row;
     })));
+  return wrap;
 }
 
 // Reopens the setup dialog from the card, from the agent's CURRENT secretless record.

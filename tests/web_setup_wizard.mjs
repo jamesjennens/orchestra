@@ -74,6 +74,7 @@ const server = {
   credentials: [],
   revoked: [],
   posts: [],
+  listNew: false,
 };
 let sessionReads = 0;
 let agentReads = 0;
@@ -93,6 +94,7 @@ const api = createApi(async (method, path, _headers, text) => {
     if (server.failIssue) return { status: 0, data: { error: { code: 'network', message: 'The server could not be reached.' } } };
     server.issued += 1;
     server.posts.push(path);
+    if (server.listNew) server.credentials.push({ id: 'cred_' + server.issued, label: 'the new one', scopes: ['read', 'tasks'], working: true, created_at: '2026-10-31T00:00:00Z' });
     return { status: 201, data: { credential: { id: 'cred_' + server.issued, secret: SECRET, scopes: ['read', 'tasks'] } } };
   }
   const revoke = /^\/v1\/agents\/(agent_[0-9]+)\/credentials\/(cred_[a-z0-9]+)\/revoke$/.exec(path);
@@ -499,9 +501,53 @@ await confirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Revoke 2')
 await pendingRevoke; await tick(); await tick();
 out.revokeAllRevokesOnlyThisAgentsOlderCredentials = JSON.stringify(server.revoked) === JSON.stringify(['agent_1/cred_old1', 'agent_1/cred_old2']);
 out.revokedRowsShowRevoked = d.all((e) => e.tagName === 'SPAN' && e.textContent === 'Revoked').length === 2;
+// After a single revocation the sentence, the count and the revoke-all label follow; the credential
+// just issued is never offered or revoked, even when the snapshot already lists it.
+server.revoked.length = 0;
+server.listNew = true;
+server.credentials.push({ id: 'cred_a', label: 'A', scopes: ['read'], working: true, created_at: '2026-10-03T00:00:00Z' },
+  { id: 'cred_b', label: 'B', scopes: ['read'], working: true, created_at: '2026-10-04T00:00:00Z' },
+  { id: 'cred_c', label: 'C', scopes: ['read'], working: true, created_at: '2026-10-05T00:00:00Z' });
+store.clear();
+d = await openWizard();
+await d.wizard.show('secret');
+issueNew = button(d, 'issue-secret').dispatch('click');
+await tick();
+confirm = openDialogs().find((x) => x !== d);
+await confirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Issue new secret')[0].dispatch('click');
+await issueNew; await tick(); await tick();
+const newId = 'cred_' + server.issued;
+const rows = () => d.all((e) => e.tagName === 'BUTTON' && /^Revoke credential /.test(e.getAttribute('aria-label') || ''));
+out.justIssuedCredentialIsNotOffered = rows().length === 3 && !rows().some((b) => b.getAttribute('aria-label').includes('the new one'));
+let block = attr(d, 'data-older-credentials', '3')[0];
+out.threeOlderCredentialsListed = Boolean(block) && /This agent now has 4 working credentials/.test(block.textContent);
+let one = rows().find((b) => b.getAttribute('aria-label') === 'Revoke credential A').dispatch('click');
+await tick();
+confirm = openDialogs().find((x) => x !== d);
+await confirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Revoke')[0].dispatch('click');
+await one; await tick(); await tick();
+block = attr(d, 'data-older-credentials', '2')[0];
+out.afterOneRevokeSentenceAndCountFollow = Boolean(block) && /This agent now has 3 working credentials/.test(block.textContent)
+  && attr(d, 'data-credential-total', '3').length === 1 && attr(d, 'data-older-credentials', '3').length === 0;
+const allNow = attr(d, 'data-action', 'revoke-older')[0];
+out.afterOneRevokeTheAllButtonCountsTwo = Boolean(allNow) && allNow.textContent === 'Revoke the 2 older credentials'
+  && allNow.getAttribute('aria-label') === 'Revoke the 2 older credentials';
+pendingRevoke = allNow.dispatch('click');
+await tick();
+confirm = openDialogs().find((x) => x !== d);
+out.afterOneRevokeTheConfirmationCountsTwo = /Revoke the 2 older credentials\?/.test(confirm.textContent)
+  && confirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Revoke 2').length === 1;
+await confirm.all((e) => e.tagName === 'BUTTON' && e.textContent === 'Revoke 2')[0].dispatch('click');
+await pendingRevoke; await tick(); await tick();
+out.revokeAllAfterOneRevokesTheRestButNeverTheNewOne = JSON.stringify(server.revoked) === JSON.stringify(['agent_1/cred_a', 'agent_1/cred_b', 'agent_1/cred_c'])
+  && !server.revoked.some((r) => r.endsWith('/' + newId));
+out.afterRevokeAllOnlyTheNewOneIsSaid = /Only the new credential works now\./.test(shownText(d)) && attr(d, 'data-action', 'revoke-older').length === 0
+  && attr(d, 'data-credential-total', '1').length === 1;
 const rulePayload = setupText.secretlessPayload({ agent: { id: 'agent_1', name: 'Kestrel', owner: 'u1', owner_display_name: 'Olive', role: 'worker', projects: [] } }, 'https://127.0.0.1:8765');
+const promptText = setupText.setupPrompt(rulePayload, { role: 'worker' });
 out.pastedSecretRuleInTheGuideAndPrompt = setupText.agentGuide(rulePayload, {}).includes(setupText.PASTED_SECRET_RULE)
-  && setupText.setupPrompt(rulePayload, { role: 'worker' }).includes(setupText.PASTED_SECRET_RULE)
+  && promptText.includes(setupText.PASTED_SECRET_RULE)
+  && promptText.split('\n').filter((line) => line.startsWith('5. ') && line.includes(setupText.PASTED_SECRET_RULE)).length === 1
   && /do not use it and do not save it: say that it is now exposed and ask your owner to issue a new one/.test(setupText.PASTED_SECRET_RULE);
 for (const open of openDialogs()) await open.close();
 

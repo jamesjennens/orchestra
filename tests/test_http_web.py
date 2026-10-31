@@ -2276,6 +2276,13 @@ console.log(JSON.stringify({
             'refusedAddressSaidAndNotUsed',
             'reloadResumesTheScreen',
             'reloadShowsNoSecret',
+            'justIssuedCredentialIsNotOffered',
+            'threeOlderCredentialsListed',
+            'afterOneRevokeSentenceAndCountFollow',
+            'afterOneRevokeTheAllButtonCountsTwo',
+            'afterOneRevokeTheConfirmationCountsTwo',
+            'revokeAllAfterOneRevokesTheRestButNeverTheNewOne',
+            'afterRevokeAllOnlyTheNewOneIsSaid',
             # kittrial-5bb.456: what the agent runs in, the secret screens, the older credentials.
             'bridgeRoutePreselected',
             'cancelledRevokeAllRevokesNothing',

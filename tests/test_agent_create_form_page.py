@@ -55,7 +55,8 @@ class CreateFormTests(unittest.TestCase):
             'oneWorkingCredentialKeepsDetailsClosed', 'severalWorkingCredentialsOpenDetails',
             'rowSaysHowManyWork', 'everyWorkingCredentialHasItsRevoke', 'rowKeepsOnlyTheKeyAction',
             'detailsHoldTheRest', 'createDialogSaysYouNeedNotSaveItNow',
-            'createDialogSaysSaveAndNeverPasteInAChat',
+            'createDialogSaysSaveAndNeverPasteInAChat', 'unknownScopesOpenDetailsWithTheInstruction',
+            'inferredScopesOpenDetailsWithTheNotice', 'aDifferentCreatorOpensDetailsWithTheNote',
         }, set(facts))
 
 

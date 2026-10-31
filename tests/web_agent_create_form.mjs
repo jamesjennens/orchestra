@@ -21,9 +21,12 @@ const cred = (id, working = true) => ({ id, label: 'web: ' + id, scopes: ['read'
 const sample = [
   { id: 'agent_one', name: 'Kestrel', display_name: 'Kestrel', owner: 'u1', enabled: true, scopes: ['read'], scopes_source: 'stored', projects: [], working_directory: 'C:\\k', credentials: [cred('c1')] },
   { id: 'agent_three', name: 'Wren', display_name: 'Wren', owner: 'u1', enabled: true, scopes: ['read'], scopes_source: 'stored', projects: [], working_directory: 'C:\\w', credentials: [cred('c2'), cred('c3'), cred('c4'), cred('c5', false)] },
+  { id: 'agent_unknown', name: 'Lark', display_name: 'Lark', owner: 'u1', enabled: true, scopes: null, scopes_source: 'none', projects: [], working_directory: 'C:\\l', credentials: [cred('c6')] },
+  { id: 'agent_inferred', name: 'Pipit', display_name: 'Pipit', owner: 'u1', enabled: true, scopes: ['read'], scopes_source: 'inferred', projects: [], working_directory: 'C:\\p', credentials: [cred('c7')] },
+  { id: 'agent_made', name: 'Swift', display_name: 'Swift', owner: 'u1', created_by: 'u2', created_by_display_name: 'Sam', enabled: true, scopes: ['read'], scopes_source: 'stored', projects: [], working_directory: 'C:\\s', credentials: [cred('c8')] },
 ];
 const api = {
-  agents: async () => { await agentsGate; return { items: sample, total: 2, next_cursor: null }; },
+  agents: async () => { await agentsGate; return { items: sample, total: sample.length, next_cursor: null }; },
   accounts: async () => { await accountsGate; return { items: [{ id: 'u1', username: 'olive' }, { id: 'u2', username: 'sam' }] }; },
   agentHistory: async () => ({ items: [] }),
   createAgent: async (body) => { created.push(body); return { agent: { id: 'agent_1', name: body.name, tool: body.tool || null, projects: [] }, credential: { id: 'cred_n', secret: 'orc_NEW_SECRET' } }; },
@@ -42,7 +45,7 @@ const orderBefore = shape(early).join('|');
 releaseAgents(); releaseAccounts(); await tick(); await tick();
 out.sameOrderAfterTheAgentsArrive = shape(early).join('|') === orderBefore;
 out.placeholderReplacedInPlace = early.all((e) => e.getAttribute('data-agents-loading') !== null).length === 0
-  && early.all((e) => e.getAttribute('data-agent') !== null).length === 2;
+  && early.all((e) => e.getAttribute('data-agent') !== null).length === sample.length;
 out.accountsFillTheOwnerChoiceInPlace = early.querySelector('#a-owner').all((e) => e.tagName === 'OPTION').length === 2;
 const row = (id) => early.all((e) => e.getAttribute('data-agent') === id)[0];
 const details = (id) => row(id).all((e) => e.getAttribute('data-agent-details') === id)[0];
@@ -55,6 +58,11 @@ out.everyWorkingCredentialHasItsRevoke = ['c2', 'c3', 'c4'].every((c) => row('ag
   && row('agent_three').all((e) => e.getAttribute('data-credential') === 'c5')[0].all((e) => e.tagName === 'BUTTON' && e.textContent === 'Revoke').length === 0;
 out.rowKeepsOnlyTheKeyAction = outside('agent_one').includes('Set up folder') && !outside('agent_one').includes('Resume prompt') && !outside('agent_one').includes('Projects:');
 out.detailsHoldTheRest = details('agent_one').textContent.includes('Resume prompt') && details('agent_one').textContent.includes('Projects:');
+// What the closed Details would hide must open them (the instruction is not cosmetic).
+const opens = (id, needle) => details(id).getAttribute('open') !== null && details(id).textContent.includes(needle);
+out.unknownScopesOpenDetailsWithTheInstruction = opens('agent_unknown', 'Nothing says what this agent may do');
+out.inferredScopesOpenDetailsWithTheNotice = opens('agent_inferred', 'inferred from working credentials');
+out.aDifferentCreatorOpensDetailsWithTheNote = opens('agent_made', 'That superuser saw the first secret');
 const page = early;
 const tool = page.querySelector('#a-tool');
 const dir = page.querySelector('#a-dir');
