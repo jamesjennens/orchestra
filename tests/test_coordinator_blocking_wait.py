@@ -1,8 +1,12 @@
 """The blocking coordinator wait over HTTP (kittrial-5bb.457): timeout, comment wakes, caps, authority."""
 import http.client
 import json
+import shutil
 import socket
+import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -83,6 +87,35 @@ class BlockingWaitTests(grants.Grants):
         self.assertEqual([], waiting.comment_pointers(
             [{'id': 't', 'comments': [{'id': '1', 'author': 'x', 'text': lane_state.PREFIX + '{}'}]}], 'me'))
         self.assertEqual(quiet['fingerprint'], self.baseline()['fingerprint'])
+
+    def test_the_newest_comment_wakes_even_when_it_ties_and_falls_out_of_the_bound(self):
+        import random
+        def rows(tasks):
+            return [{'id': t, 'comments': [{'id': c, 'author': 'other', 'text': 'x', 'created_at': '2026-10-31T09:00:00Z'}
+                                           for c in ids]} for t, ids in tasks.items()]
+        def print_of(tasks):
+            return waiting.coordinator_view([], {}, waiting.comment_pointers(rows(tasks), 'me'))['fingerprint']
+        before = {'t1': [str(n) for n in range(1, 100)]}
+        after = {'t1': [str(n) for n in range(1, 101)]}
+        # Numeric ids: "100" sorts below "9" as a string and used to fall out of the 20.
+        self.assertNotEqual(print_of(before), print_of(after))
+        # Random ids, tied time, across tasks: any addition changes the fingerprint, in any order.
+        generator = random.Random(457)
+        base = {'a': ['%08x' % generator.getrandbits(32) for _ in range(40)], 'b': ['%08x' % generator.getrandbits(32) for _ in range(40)]}
+        seen = {print_of(base)}
+        for task in ('a', 'b', 'z'):
+            grown = {name: list(ids) for name, ids in base.items()}
+            grown.setdefault(task, []).append('%08x' % generator.getrandbits(32))
+            seen.add(print_of(grown))
+        self.assertEqual(4, len(seen))
+        self.assertEqual(print_of(base), print_of({'b': base['b'], 'a': list(reversed(base['a']))}))
+        # The same count with a different comment outside the bounded list is still a change.
+        swapped = {name: list(ids) for name, ids in base.items()}
+        swapped['a'][0] = 'ffffffff'
+        self.assertNotEqual(print_of(base), print_of(swapped))
+        shown = waiting.comment_pointers(rows(after), 'me')
+        self.assertEqual(waiting.COMMENT_POINTER_LIMIT, len(shown))
+        self.assertEqual(100, shown.total)
 
     def test_without_the_parameter_the_fingerprint_is_the_cli_fingerprint(self):
         task = self.new_task()
@@ -210,6 +243,26 @@ class BlockingWaitTests(grants.Grants):
         # Its slot was released: the same credential can wait again.
         self.assertIs(True, self.wait(query='&comments=others&timeout=1&since=' + since).data['wait']['blocked'])
 
+    def test_the_timeout_bounds_the_whole_request_even_when_each_read_is_slow(self):
+        since = self.baseline()['fingerprint']
+        real = self.backend.coordinator_wait
+        calls = []
+
+        def slow(*args, **kwargs):
+            calls.append(time.monotonic())
+            time.sleep(0.3)
+            return real(*args, **kwargs)
+        with mock.patch.object(self.backend, 'coordinator_wait', side_effect=slow):
+            started = time.monotonic()
+            answer = self.wait(query='&comments=others&timeout=2&since=' + since)
+            elapsed = time.monotonic() - started
+        self.assertEqual(200, answer.status, answer.data)
+        self.assertIs(True, answer.data['wait']['timed_out'])
+        # The first read counts: from the route's start the request ends inside its two seconds, not after them.
+        self.assertLessEqual(answer.data['wait']['seconds'], 2.4)   # the timeout plus the jitter of one read (it was about 2.6 and up)
+        # The interval grows with the cost of a read (four times it), so a slow backend is read less often.
+        self.assertLessEqual(len(calls), 3)
+
     def test_comments_of_a_project_the_caller_does_not_coordinate_never_appear(self):
         beta = self.create_project(self.admin, 'Beta')
         self.assertEqual(200, self.member('cora', 'coordinator', project=beta, token=self.admin).status)
@@ -225,6 +278,69 @@ class BlockingWaitTests(grants.Grants):
         self.assertEqual(before['fingerprint'], after['fingerprint'])
         self.assertNotIn(beta, json.dumps(after))
         self.assertNotIn(task, json.dumps(after))
+
+
+@unittest.skipUnless(shutil.which('openssl'), 'openssl is not installed; the test certificate is made with it')
+class TlsHangupTests(unittest.TestCase):
+    """The sleep must notice a TLS client that has gone: its close_notify is encrypted and sits in
+    front of the EOF, so peeking the raw socket never sees the end."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cert, key = str(Path(tmp.name) / 'c.crt'), str(Path(tmp.name) / 'c.key')
+        subprocess.check_call([shutil.which('openssl'), 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2',
+                               '-keyout', key, '-out', cert, '-subj', '/CN=localhost',
+                               '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1'],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server.load_cert_chain(cert, key)
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        client = ssl.create_default_context(cafile=cert).wrap_socket(
+            socket.create_connection(listener.getsockname()), server_hostname='localhost', do_handshake_on_connect=False)
+        accepted = server.wrap_socket(listener.accept()[0], server_side=True, do_handshake_on_connect=False)
+        shaker = threading.Thread(target=accepted.do_handshake)
+        shaker.start()
+        client.do_handshake()
+        shaker.join(10)
+        self.addCleanup(accepted.close)
+        self.addCleanup(client.close)
+        self.client = client
+        self.handler = http_service.ApiHandler.__new__(http_service.ApiHandler)
+        self.handler.connection = accepted
+        self.handler.close_connection = False
+
+    def test_a_silent_client_is_not_gone(self):
+        started = time.monotonic()
+        self.assertIs(True, self.handler._sleep_unless_gone(0.4))
+        self.assertGreaterEqual(time.monotonic() - started, 0.35)
+
+    def test_a_client_that_closes_cleanly_and_disconnects_ends_the_sleep_at_once(self):
+        self.client.setblocking(False)
+        try:
+            self.client.unwrap()                        # sends close_notify
+        except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            pass
+        self.client.close()
+        started = time.monotonic()
+        self.assertIs(False, self.handler._sleep_unless_gone(5.0))
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_a_client_that_just_drops_the_connection_ends_the_sleep_at_once(self):
+        self.client.close()
+        started = time.monotonic()
+        self.assertIs(False, self.handler._sleep_unless_gone(5.0))
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_bytes_sent_during_the_wait_do_not_end_it_but_close_the_connection_after_the_answer(self):
+        self.client.sendall(b'G')
+        started = time.monotonic()
+        self.assertIs(True, self.handler._sleep_unless_gone(0.4))
+        self.assertGreaterEqual(time.monotonic() - started, 0.35)
+        self.assertIs(True, self.handler.close_connection)
 
 
 class EndpointReadTests(unittest.TestCase):

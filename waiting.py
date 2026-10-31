@@ -645,6 +645,14 @@ def _fault_fingerprinted(row):
 COMMENT_POINTER_LIMIT = 20
 
 
+class CommentPointers(list):
+    """The bounded pointer list, carrying what the bound drops: how many comments count and a digest
+    of ALL of them. A tie in time, task or id can push the newest write out of the bounded list,
+    so wake detection reads the digest, never the list's order (kittrial-5bb.457)."""
+    total = 0
+    digest = None
+
+
 def comment_pointers(rows, caller):
     """The newest comments by anybody but ``caller``, as pointers (kittrial-5bb.457).
 
@@ -673,7 +681,10 @@ def comment_pointers(rows, caller):
             found.append({'task': str(row.get('id')), 'comment': str(comment['id']),
                           'author': author, 'at': comment.get('created_at') or ''})
     found.sort(key=lambda item: (item['at'], item['task'], item['comment']))
-    return found[-COMMENT_POINTER_LIMIT:]
+    pointers = CommentPointers(found[-COMMENT_POINTER_LIMIT:])
+    pointers.total = len(found)
+    pointers.digest = digest(sorted([item['task'], item['comment']] for item in found))
+    return pointers
 
 
 def coordinator_view(queue_items, lanes_payload, comment_pointers=None):
@@ -738,6 +749,10 @@ def coordinator_view(queue_items, lanes_payload, comment_pointers=None):
         # never comment text.
         fingerprinted['comments'] = [{'task': row['task'], 'comment': row['comment']}
                                      for row in comment_pointers]
+        # Every counted comment, not just the bounded list: a newest comment that ties the others
+        # and falls outside the list still changes this.
+        fingerprinted['comments_all'] = {'total': getattr(comment_pointers, 'total', len(comment_pointers)),
+                                         'digest': getattr(comment_pointers, 'digest', None)}
         answer['comments'] = list(comment_pointers)
     answer['fingerprint'] = digest(fingerprinted)
     return answer

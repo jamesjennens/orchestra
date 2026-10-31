@@ -9796,7 +9796,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         comments = ctx.query.get('comments')
         if comments is not None and comments != 'others':
             raise HttpError(400, 'invalid_request', 'comments must be others')
+        began = time.monotonic()
         view = self._coordinator_pass(ctx, agent, idle_minutes, comments is not None, since)
+        cost = time.monotonic() - began
         # A baseline read (no since) has nothing to wait for, so it never blocks.
         if timeout == 0 or since is None or view['changed']:
             return 200, view
@@ -9804,24 +9806,29 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not self._wait_slots.take(key, self.WAIT_GLOBAL_CAP, self.WAIT_PER_CREDENTIAL):
             view['wait'] = {'blocked': False, 'reason': 'busy'}
             return 200, view
-        started = time.monotonic()
         try:
-            deadline = started + timeout
-            while time.monotonic() < deadline:
-                remaining = max(deadline - time.monotonic(), 0.0)
+            # The timeout bounds the whole request: it counts from before the first read, and a
+            # pass is only started when the slowest pass so far still fits in what is left. A pass
+            # that runs slower than every earlier one can still overrun; nothing interrupts a read.
+            deadline = began + timeout
+            pause = self._wait_pause(deadline, cost)
+            while pause > 0:
                 # Nothing is held here: no lock, no transaction and no backend read while asleep.
-                if not self._sleep_unless_gone(min(self.WAIT_INTERVAL, remaining)):
+                if not self._sleep_unless_gone(pause):
                     break
                 # Each pass re-decides the caller's authority; a revoked credential or a lost
                 # grant raises here and the wait ends with that refusal.
                 agent = self.service.agent_for_credential(ctx.principal)
+                pass_began = time.monotonic()
                 view = self._coordinator_pass(ctx, agent, idle_minutes, comments is not None, since)
+                cost = max(cost, time.monotonic() - pass_began)
                 if view['changed']:
                     break
+                pause = self._wait_pause(deadline, cost)
         finally:
             self._wait_slots.release(key)
         view['wait'] = {'blocked': True, 'timed_out': not view['changed'],
-                        'seconds': round(time.monotonic() - started, 1)}
+                        'seconds': round(time.monotonic() - began, 1)}
         return 200, view
 
     WAIT_TIMEOUT_MAX = 50
@@ -9829,6 +9836,13 @@ class ApiHandler(BaseHTTPRequestHandler):
     WAIT_GLOBAL_CAP = 20
     WAIT_PER_CREDENTIAL = 1
     _wait_slots = WaitSlots()
+
+    def _wait_pause(self, deadline, cost):
+        """How long to sleep before the next pass; zero or less when that pass would not fit.
+
+        Each waiter's reads take at most about a fifth of its own time: a slow backend (many waiters,
+        a big project) makes the interval longer, never the load higher."""
+        return min(max(self.WAIT_INTERVAL, 4 * cost), deadline - time.monotonic() - cost)
 
     def _sleep_unless_gone(self, seconds):
         """Sleep up to ``seconds``; False as soon as the client has hung up."""
@@ -9842,14 +9856,44 @@ class ApiHandler(BaseHTTPRequestHandler):
                 time.sleep(left)
                 continue
             try:
-                readable = select.select([connection], [], [], left)[0]
-                if readable and socket.socket.recv(connection, 1, socket.MSG_PEEK) == b'':
+                # Bytes the TLS layer has decrypted already are never in front of the socket.
+                readable = [connection] if isinstance(connection, ssl.SSLSocket) and connection.pending() \
+                    else select.select([connection], [], [], left)[0]
+                if readable and isinstance(connection, ssl.SSLSocket):
+                    if self._tls_peer_gone(connection):
+                        return False
+                elif readable and socket.socket.recv(connection, 1, socket.MSG_PEEK) == b'':
                     return False
             except (OSError, ValueError):
                 return False
             if readable:
                 time.sleep(min(left, 0.05))   # bytes the client sent early: not a hang-up
         return True
+
+    def _tls_peer_gone(self, connection):
+        """Whether a readable TLS socket says the client is gone.
+
+        Peeking the raw socket sees only an encrypted record, never the close_notify in front of the
+        EOF, so the decrypting read is used, without waiting. A real byte here is a request sent
+        during the wait; it cannot be handed back, so the connection is closed after the answer."""
+        timeout = connection.gettimeout()
+        try:
+            connection.settimeout(0.0)
+            try:
+                data = connection.recv(1)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                return False       # part of a record: nothing to tell yet
+            except (OSError, ValueError):
+                return True        # reset, or an unclean end
+            if data == b'':
+                return True
+            self.close_connection = True
+            return False
+        finally:
+            try:
+                connection.settimeout(timeout)
+            except (OSError, ValueError):
+                pass
 
     def _coordinator_pass(self, ctx, agent, idle_minutes, comments, since):
         """One read of the coordinator wait: the grant is judged afresh for every project."""
