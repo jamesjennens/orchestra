@@ -114,6 +114,74 @@ class InterfaceCase(unittest.TestCase):
         self.area.rows[:]=[r for r in self.area.rows if 'capability' not in r.get('labels',[])]
         self.accept(operation='retire-ok');self.assertEqual('retired',self.entry()['lifecycle'])
 
+    def test_interface_free_capability_staff_turnover_and_retirement_never_block_interface_retirement(self):
+        self.apply(payload());self.accept();record=self.entry()['record']
+        uid='usr_'+'d'*16
+        state={'users':{uid:{'id':uid,'disabled':False}},'memberships':{'area':{uid:'coordinator'}}}
+        ctx=self.context();ctx.set_authority(state);self.area.actor=uid
+        plain=cap_entry(operation='draft',operation_id='plain-coordinator',acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(plain,uid,self.area,self.path.parent/'area',operator=True,web_coordinator=True,operators=[OPERATOR])
+        self.assertTrue(ctx.usage()[1]['complete'])
+        # A second plain capability was retired while this person still coordinated.
+        # Both its old acceptance and retirement become role-inert on departure.
+        retired_plain=cap_entry(operation='draft',operation_id='plain-old',key='plain.old',
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(retired_plain,uid,self.area,self.path.parent/'area',operator=True,web_coordinator=True,operators=[OPERATOR])
+        old_plain=cr.KIND.find_entry(self.area.rows,'plain.old',[OPERATOR])['record']
+        cr.apply_native({'schema_version':1,'operation':'retire','operation_id':'plain-old-retire','key':'plain.old',
+            'revision':old_plain['revision'],'record_sha256':old_plain['sha256'],'successor':plain['key'],
+            'acceptance_state':'superseded','acceptance':acceptance()},uid,self.area,self.path.parent/'area',
+            operator=True,web_coordinator=True,operators=[OPERATOR])
+        state['memberships']['area'][uid]='contributor'
+        self.assertTrue(ctx.usage()[1]['complete'])
+        self.assertEqual([],ctx.usage()[0])
+        self.assertIn('orphan',ir.flags(record,[],ctx.usage()[1]['complete']))
+        self.area.actor=OPERATOR
+        cr.apply_native(cap_entry(operation_id='plain-successor',key='plain.successor'),OPERATOR,self.area,self.path.parent/'area',operators=[OPERATOR])
+        old=cr.KIND.find_entry(self.area.rows,plain['key'],[OPERATOR])['record']
+        cr.apply_native({'schema_version':1,'operation':'retire','operation_id':'plain-retire','key':plain['key'],
+            'revision':old['revision'],'record_sha256':old['sha256'],'successor':'plain.successor',
+            'acceptance_state':'superseded','acceptance':acceptance()},OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        retired=cr.KIND.find_entry(self.area.rows,plain['key'],[OPERATOR])['record']
+        with self.assertRaisesRegex(ValueError,'retired'):
+            cr.apply_native(cap_entry(operation='revise',operation_id='plain-cannot-revise',revision=retired['revision']+1,
+                expected_sha256=retired['sha256']),OPERATOR,self.area,self.path.parent/'area',operators=[OPERATOR])
+        self.assertTrue(ctx.usage()[1]['complete'])
+        self.apply(payload(operation='revise',operation_id='retire-beside-plain',revision=3,
+            expected_sha256=record['sha256'],state='retired'),ctx=ctx)
+        self.accept(operation='retire-beside-plain-ok',ctx=ctx)
+        self.assertEqual('retired',self.entry()['lifecycle'])
+
+    def test_consumer_capability_acceptor_role_loss_is_incomplete_and_refuses_retirement(self):
+        self.apply(payload());self.accept();record=self.entry()['record']
+        uid='usr_'+'d'*16
+        state={'users':{uid:{'id':uid,'disabled':False}},'memberships':{'area':{uid:'coordinator'}}}
+        ctx=self.context();ctx.set_authority(state);self.area.actor=uid
+        cap=cap_entry(operation='draft',operation_id='person-consumer',interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(cap,uid,self.area,self.path.parent/'area',operator=True,web_coordinator=True,operators=[OPERATOR])
+        self.assertTrue(ctx.usage()[1]['complete']);self.assertEqual(1,len(ctx.usage()[0]))
+        state['memberships']['area'][uid]='contributor'
+        self.assertFalse(ctx.usage()[1]['complete'])
+        self.apply(payload(operation='revise',operation_id='retire-role-lost',revision=3,
+            expected_sha256=record['sha256'],state='retired'),ctx=ctx)
+        before=copy.deepcopy(self.native.rows)
+        with self.assertRaisesRegex(ValueError,'incomplete'):self.accept(operation='refuse-role-lost',ctx=ctx)
+        self.assertEqual(before,self.native.rows)
+
+    def test_accepted_major_cannot_change_replaces_with_same_defining_owner(self):
+        self.apply(payload());self.accept()
+        self.apply(payload(key='iface.quotes.v2',replaces='iface.quotes.v1',operation_id='replacement-major'))
+        second=ir.get(self.native.rows,'iface.quotes.v2',[OPERATOR])['proposed']
+        self.accept(second,operation='replacement-accept')
+        current=ir.get(self.native.rows,'iface.quotes.v2',[OPERATOR])['record']
+        self.apply(payload(operation='revise',key=current['key'],operation_id='replacement-change',
+            revision=current['revision']+1,expected_sha256=current['sha256'],replaces=None,
+            compatibility={'rule':'additive-within-major','change':'additive'}))
+        draft=ir.get(self.native.rows,current['key'],[OPERATOR])['proposed'];before=copy.deepcopy(self.native.rows)
+        with self.assertRaisesRegex(ValueError,'replacement'):self.accept(draft,operation='replacement-refused')
+        self.assertEqual(before,self.native.rows)
+
     def test_proposer_loses_source_coordination_and_link_refused(self):
         with self.assertRaisesRegex(ValueError,'coordination'):self.apply(payload(),ctx=self.context(lambda p:False))
         self.assertEqual([],self.native.writes())
@@ -640,6 +708,11 @@ class InterfaceCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'proposer no longer coordinates'):
             self.accept(proposed,operation='demoted-recovery-accept',ctx=ctx)
         before=self.entry()['record'];self.native.actor=OPERATOR
+        denied=self.context();denied.operators=[]
+        rows=copy.deepcopy(self.native.rows)
+        with ir.context(denied),self.assertRaisesRegex(ValueError,'currently configured operator'):
+            ir.reconcile(self.path,'demoted-recovery-accept',OPERATOR,'refused stale operator','complete',self.native,operators=[OPERATOR])
+        self.assertEqual(rows,self.native.rows)
         with ir.context(ctx):
             result=ir.reconcile(self.path,'demoted-recovery-accept',OPERATOR,'explicit program recovery','complete',self.native,operators=[OPERATOR])
         self.assertTrue(result['transition_complete']);after=self.entry()['record']
@@ -699,6 +772,13 @@ class InterfaceCase(unittest.TestCase):
 
     @unittest.skipIf(__import__('os').name=='nt','endpoint is POSIX-only')
     def test_endpoint_prepares_foreign_snapshots_before_authority_and_does_no_project_io_in_effect(self):
+        self._endpoint_snapshot_probe()
+
+    @unittest.skipIf(__import__('os').name=='nt','endpoint is POSIX-only')
+    def test_endpoint_refreshes_authority_after_snapshots_before_effect(self):
+        self._endpoint_snapshot_probe(revoke=True)
+
+    def _endpoint_snapshot_probe(self,revoke=False):
         import endpoint,http_authority,contextlib
         from unittest.mock import patch
         from types import SimpleNamespace
@@ -706,6 +786,8 @@ class InterfaceCase(unittest.TestCase):
         for project in ('prog','area'):
             (root/project/'.beads').mkdir(exist_ok=True);(root/project/'.beads/metadata.json').write_text('{}')
         state={'users':{uid:{'id':uid,'disabled':False}},'memberships':{'prog':{uid:'coordinator'},'area':{uid:'coordinator'}}}
+        current=[state]
+        before=copy.deepcopy(self.native.rows)
         config=SimpleNamespace(store=str(root/'state.json'),lock=str(root/'state.json.lock'))
         body=payload()
         for field in ('operation',):body.pop(field)
@@ -725,7 +807,11 @@ class InterfaceCase(unittest.TestCase):
         def guarded(root,req,journal,fn,**kwargs):
             inside[0]=True
             try:
-                kwargs['identity_check']();return fn()
+                kwargs['identity_check']()
+                if revoke:
+                    current[0]=copy.deepcopy(state)
+                    current[0]['memberships']['area'][uid]='contributor'
+                return fn()
             finally:inside[0]=False
         with contextlib.ExitStack() as stack:
             for name in ('http_actor_denial','descriptor_actor_denial','block_mismatch_denial'):
@@ -737,9 +823,14 @@ class InterfaceCase(unittest.TestCase):
             stack.enter_context(patch.object(endpoint,'environment',return_value={}))
             stack.enter_context(patch.object(endpoint,'held_coordination_lock',side_effect=project_lock))
             stack.enter_context(patch.object(endpoint,'guarded_write',side_effect=guarded))
-            stack.enter_context(patch.object(http_authority,'read_state',return_value=state))
+            stack.enter_context(patch.object(http_authority,'read_state',side_effect=lambda *a:current[0]))
             stack.enter_context(patch.object(http_authority,'decide',return_value={}))
             stack.enter_context(patch.object(endpoint.native,'argv',side_effect=argv))
             stack.enter_context(patch.object(endpoint.native,'run',side_effect=run))
             result=endpoint.execute(root,request,authority_config=config,require_authority=True)
-        self.assertEqual(0,result['returncode'],result);self.assertEqual(['prog','area'],exports)
+        if revoke:
+            self.assertNotEqual(0,result['returncode'],result)
+            self.assertIn('coordination',result['stderr'])
+            self.assertEqual(before,self.native.rows)
+        else:self.assertEqual(0,result['returncode'],result)
+        self.assertEqual(['prog','area'],exports)

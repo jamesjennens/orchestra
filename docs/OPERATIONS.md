@@ -3522,7 +3522,7 @@ Retirement is a state-only draft followed by acceptance, not a successor-key
 retirement. The complete-view check runs **as the acceptor**, with no privileged
 fallback and no decision override in slice 3a. An unreadable, absent, unsupported,
 malformed or truncated area/catalog is not evidence of zero consumers. A single
-coverage classifier applies to sides and capabilities: an acceptance that exists
+coverage classifier applies to sides and capabilities. A well-formed capability with no retained approved interface declaration is outside the interface inventory, including v1 records and retired interface-free records; staff turnover on those records does not affect coverage. A former interface declaration still needs live withdrawal evidence. For records in scope, an acceptance that exists
 but is now inert for any reason (operator removed, role lost, account disabled or
 grant no longer effective) makes coverage incomplete, even when the ordinary
 catalog calls it draft-only. Only never-accepted records or an actual withdrawal whose approval is still live

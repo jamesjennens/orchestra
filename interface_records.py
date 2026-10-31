@@ -345,6 +345,17 @@ class ProgramContext:
             approved=[r for n,r in revisions.items() if r.get('acceptance_state')!='draft'
                       and n in evidence and evidence[n]['record_sha256']==r['sha256']
                       and evidence[n]['acceptance_state']==r['acceptance_state']]
+            if not link:
+                # Ordinary capabilities never admitted to the interface graph do
+                # not become unknown consumers when their staff leave. Inspect
+                # retained approvals too: an inert/voided former declaration must
+                # still fail closed, including a later empty withdrawal.
+                raw_evidence=kind.existing_acceptances(row)
+                declared=any(r.get('interfaces') and n in raw_evidence
+                             and raw_evidence[n]['record_sha256']==r['sha256']
+                             and raw_evidence[n]['acceptance_state']==r['acceptance_state']
+                             for n,r in kind.existing_revisions(row).items())
+                if not declared:return 'never-accepted'
             if entry.get('acceptance_inert'):return 'incomplete'
             record=entry.get('record')
             if entry.get('state') in ('accepted','superseded') and record is not None:

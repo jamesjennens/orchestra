@@ -13,6 +13,35 @@ from http_authority import file_lock
 
 
 class InterfaceLockTests(unittest.TestCase):
+    @unittest.skipIf(os.name=='nt','endpoint is POSIX-only')
+    def test_actual_interface_write_waits_for_semantic_mutex_before_effect(self):
+        import endpoint,interface_records,http_authority,json
+        from test_interfaces import payload
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as stack:
+            root=Path(temp);project=root/'projects/prog';(project/'.beads').mkdir(parents=True)
+            (project/'.beads/metadata.json').write_text('{}');entered=threading.Event()
+            body=payload();body.pop('operation')
+            request={'project':'prog','actor':'fixture','action':'interface','args':['propose','@attachment:p'],
+                'attachments':{'p':{'flag':'--file','text':json.dumps(body)}}}
+            stack.enter_context(patch.object(endpoint,'guarded_write',lambda root,req,journal,fn,**kw:fn()))
+            for name in ('http_actor_denial','descriptor_actor_denial','block_mismatch_denial'):
+                stack.enter_context(patch.object(endpoint,name,return_value=None))
+            stack.enter_context(patch.object(endpoint,'configured_coordinator_rules',return_value={}))
+            stack.enter_context(patch.object(endpoint,'configured_operators',return_value=[]))
+            stack.enter_context(patch.object(http_authority,'read_state',return_value={}))
+            stack.enter_context(patch.object(interface_records,'ProgramContext',return_value=Mock()))
+            stack.enter_context(patch.object(interface_records,'apply_native',side_effect=lambda *a,**kw:(entered.set() or {})))
+            with ThreadPoolExecutor(1) as pool:
+                with interface_lock.held(root):
+                    job=pool.submit(endpoint.execute,root,request,
+                        authority_config=SimpleNamespace(store=str(root/'state.json')),require_authority=True)
+                    self.assertFalse(entered.wait(.15),'interface effect bypassed semantic mutex')
+                self.assertEqual(0,job.result(5)['returncode'])
+            self.assertTrue(entered.is_set())
+
     def setup_routes(self,root,touches=True):
         from test_capability_records import entry
         from test_reference_records import entry as ref_entry
