@@ -247,6 +247,12 @@ ITEMS_MAX = 20
 PAYLOAD_MAX_BYTES = 24000
 
 
+def unresolved_changes_approval_refusal(assignee=None):
+    who = 'the task assignee' + (' (%s)' % assignee if assignee else '')
+    return ('Cannot approve while requested changes remain unresolved: %s must use operation respond '
+            'for every open item, then the reviewer must reread the current review before approving.' % who)
+
+
 def text(value, name, limit=500):
     check_text(value, name, limit)
 
@@ -2226,7 +2232,7 @@ def receipt(state, rows, task):
 
 
 def projection(ordered, voids=None, invalid=None, refused=None, positions=None, reverts=None,
-               invalid_reverts=None, closed=False):
+               invalid_reverts=None, closed=False, assignee=None):
     """Project the chain. ``prior_contributions`` keeps every revision the current
     one replaced visible, tagged with its ``relation`` (``follows`` additive or
     ``supersedes``), so a follow-on never removes the prior revision's record from
@@ -2426,7 +2432,7 @@ def projection(ordered, voids=None, invalid=None, refused=None, positions=None, 
                     approved = False; approved_id = None
             elif op == 'approve':
                 if pending:
-                    raise ValueError('Cannot approve while review requests remain unresolved')
+                    raise ValueError(unresolved_changes_approval_refusal(assignee))
                 approved = True; approved_id = cid
             if op == 'approve':
                 # An approval settles the contribution: no review request for it
@@ -3206,7 +3212,8 @@ def execute(rows, task, actor, payload, run, operators=None, journal=None, revie
     preview_positions = dict(positions)
     preview_positions['pending-write'] = len(issue.get('comments') or [])
     preview = projection(ordered + [(payload, {'id': 'pending-write', 'author': actor, 'created_at': 'pending'})],
-                         voids, invalid, refused, preview_positions, reverts, invalid_reverts, closed=closed)
+                         voids, invalid, refused, preview_positions, reverts, invalid_reverts, closed=closed,
+                         assignee=issue.get('assignee'))
     # A follow-on may only base itself on a prior revision approved by a distinct
     # native author and genuinely integrated. Resolve the approving record from the
     # chain and the integration evidence from the shared review-state projection

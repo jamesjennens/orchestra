@@ -186,6 +186,12 @@ class CoordinatorGuideTests(unittest.TestCase):
                      'approves or requests changes; it does not recommend'):
             self.assertIn(text, step)
 
+    def test_coordinator_guide_explains_approval_after_requested_changes(self):
+        step = self.guides("[{ project: 'alpha', effective: true }]")['steps'][8]
+        self.assertIn('Before approving, read the current review with GET .../tasks/TASK/brief.', step)
+        self.assertIn('After request-changes, the assignee redelivers if needed, uses operation respond '
+                      'for every open item, and you reread the current review before approving.', step)
+
     def test_coordinator_guide_says_requirement_records_are_not_work(self):
         step = self.guides("[{ project: 'alpha', effective: true }]")['steps'][9]
         self.assertTrue(step.startswith('10. '))

@@ -1255,7 +1255,8 @@ class InProcessBackend:
             resolutions = self._resolutions(payload.get('resolutions'),
                                             self._requests(contributions, True))
         elif operation == 'approve' and self._requests(contributions, True):
-            raise conflict('Cannot approve while requested changes remain unresolved')
+            from review_workflow import unresolved_changes_approval_refusal
+            raise conflict(unresolved_changes_approval_refusal(task.get('assignee')))
         record = {'id': 'rev_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': operation,
                   'contribution_id': current[-1]['id'],
                   'summary': (payload.get('summary') or '')[:1200],
