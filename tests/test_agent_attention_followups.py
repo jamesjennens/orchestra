@@ -172,6 +172,27 @@ class EndpointFollowups(a.EndpointAttentionTests):
         self.assertIn('3 contribution(s) to review', complete)
         self.assertNotIn('at least', complete)
 
+    def test_review_summary_at_the_call_site_marks_a_truncated_snapshot(self):
+        """F2: the endpoint's call site must pass snapshot_truncated, not only the helper.
+
+        Dropping the flag at http_service.py:11194 leaves the helper's own test green
+        while the answer stops saying that the review counts are a lower bound.
+        """
+        run, calls = self.large_work(1000, 720)
+        with patch.object(self.backend, '_run', side_effect=run):
+            data = self.next()
+            view = data['attention']
+        self.assertTrue(view['snapshot_truncated'])
+        self.assertGreater(view['counts']['to_review'], 0)
+        self.assertIn('at least %d contribution(s) to review' % view['counts']['to_review'],
+                      view['summary'])
+
+    def test_docs_name_the_unknown_blocking_count_and_its_chip(self):
+        """F3: the deployment doc names blocking_unknown and the 'Blocked?' chip."""
+        text = (Path(__file__).resolve().parents[1] / 'docs' / 'HTTP_DEPLOYMENT.md').read_text(encoding='utf-8')
+        self.assertIn('`blocking_unknown`', text)
+        self.assertIn('"Blocked?"', text)
+
     def test_authority_lost_during_a_failed_read_is_not_counted(self):
         """G1b: the second authority check in the failed-read path decides whether a
         failure is unknown work or a project the principal may no longer read. With

@@ -44,8 +44,13 @@ const unknownAgent = { id: 'a-4', display_name: 'partial-agent', tool: 'Claude C
   working_directory: '/tmp/partial', last_seen_at: null, enabled: true,
   attention: { state: 'unknown', summary: 'at least 0 claimable task(s)', counts: { claimable: 0 } },
   items: [], projects: [], credentials: [] };
+const notComputedAgent = { id: 'a-5', display_name: 'not-computed-agent', tool: 'Claude Code',
+  working_directory: '/tmp/not-computed', last_seen_at: null, enabled: true,
+  attention: { state: 'not-computed', summary: 'attention was never computed', counts: { claimable: 0 } },
+  items: [], projects: [], credentials: [] };
 const errorCard = agentViews.agentCard(ctx(), errorAgent);
 const unknownCard = agentViews.agentCard(ctx(), unknownAgent);
+const notComputedCard = agentViews.agentCard(ctx(), notComputedAgent);
 
 function workCtx(myWork) {
   return { href: (path) => '#' + path, go() {}, render() {}, me: { id: 'usr_1' },
@@ -57,7 +62,7 @@ const fullWork = { truncated: false, unavailable: [],
   assigned: [{ id: 't-1', project_id: 'alpha', title: 'Do it', status: 'open', review_state: 'none',
     blocking_unknown: true }],
   to_review: [{ id: 't-9', project_id: 'alpha', title: 'Review me', status: 'open', review_state: 'awaiting-review' }],
-  agents: [ownerAgent] };
+  agents: [ownerAgent, errorAgent, unknownAgent, notComputedAgent] };
 const emptyWork = { truncated: false, unavailable: [], assigned: [], to_review: [], agents: [] };
 const full = await workViews.home(workCtx(fullWork));
 const bare = await workViews.home(workCtx(emptyWork));
@@ -69,11 +74,13 @@ console.log(JSON.stringify({
   agentNext: nextLines(bareCard),
   agentWho: whoActs(bareCard),
   // The flat prototype word and the server's state both map to the same chip.
-  attentionChips: ['error', 'unknown', 'idle'].map((state) => agentViews.attentionChip(
+  attentionChips: ['error', 'unknown', 'not-computed', 'idle'].map((state) => agentViews.attentionChip(
     agentViews.attentionOf({ attention: { state } })).textContent),
   errorCard: { text: errorCard.textContent, chip: errorCard.all((e) => e.tagName === 'SPAN'
     && String(e.className || e.attributes['class'] || '').includes('chip')).map((e) => e.textContent) },
   unknownCard: { text: unknownCard.textContent, chip: unknownCard.all((e) => e.tagName === 'SPAN'
+    && String(e.className || e.attributes['class'] || '').includes('chip')).map((e) => e.textContent) },
+  notComputedCard: { text: notComputedCard.textContent, chip: notComputedCard.all((e) => e.tagName === 'SPAN'
     && String(e.className || e.attributes['class'] || '').includes('chip')).map((e) => e.textContent) },
   workFull: { text: full.textContent, empty: emptyLines(full),
     agentSections: full.all((e) => e.attributes['data-agent']).length },

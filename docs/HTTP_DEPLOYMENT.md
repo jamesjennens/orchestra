@@ -3550,7 +3550,13 @@ line separately and unconfined.
   was delivered), the caller's own claimed tasks and then other claimed tasks where the
   caller approves (blocked when the latest checkpoint lists unresolved items). Rows past
   the bound still say "read the task brief" and "wait time unknown" and are not marked
-  blocked. My work rows show "Blocked" and the open request ids where known.
+  blocked. My work rows show "Blocked" when the latest checkpoint lists unresolved
+  items, "Blocked?" when an explicit blocking count could not be read
+  (`blocking_unknown`; a null count is not "not blocked"), and the open request ids
+  where known. An agent whose work read failed or was incomplete stays in the
+  "Your agents need you" panel: the `error` and `unknown` states are never shown as
+  idle, and the defensive `not-computed` state reads as unknown, not as
+  "Could take more work".
 - **A per-agent limit on claimed, undelivered tasks.** Each personal agent carries
   `claim_limit` on its record: a whole number from 1 to 50, default 1, editable by the
   agent's owner on My agents and with `PATCH /v1/agents/{id}` (`422` outside the bounds,
