@@ -9806,10 +9806,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             return 200, view
         started = time.monotonic()
         try:
-            while True:
-                remaining = timeout - (time.monotonic() - started)
-                if remaining <= 0:
-                    break
+            deadline = started + timeout
+            while time.monotonic() < deadline:
+                remaining = max(deadline - time.monotonic(), 0.0)
                 # Nothing is held here: no lock, no transaction and no backend read while asleep.
                 if not self._sleep_unless_gone(min(self.WAIT_INTERVAL, remaining)):
                     break
@@ -9837,10 +9836,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         import socket
         connection = getattr(self, 'connection', None)
         end = time.monotonic() + seconds
-        while True:
-            left = end - time.monotonic()
-            if left <= 0:
-                return True
+        while time.monotonic() < end:
+            left = max(end - time.monotonic(), 0.0)
             if connection is None:
                 time.sleep(left)
                 continue
@@ -9852,6 +9849,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return False
             if readable:
                 time.sleep(min(left, 0.05))   # bytes the client sent early: not a hang-up
+        return True
 
     def _coordinator_pass(self, ctx, agent, idle_minutes, comments, since):
         """One read of the coordinator wait: the grant is judged afresh for every project."""
