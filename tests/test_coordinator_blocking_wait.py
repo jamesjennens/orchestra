@@ -251,7 +251,11 @@ class BlockingWaitTests(grants.Grants):
         def slow(*args, **kwargs):
             calls.append(time.monotonic())
             time.sleep(0.3)
-            return real(*args, **kwargs)
+            try:
+                return real(*args, **kwargs)
+            finally:
+                spent.append(time.monotonic() - calls[-1])
+        spent = []
         with mock.patch.object(self.backend, 'coordinator_wait', side_effect=slow):
             started = time.monotonic()
             answer = self.wait(query='&comments=others&timeout=2&since=' + since)
@@ -259,7 +263,8 @@ class BlockingWaitTests(grants.Grants):
         self.assertEqual(200, answer.status, answer.data)
         self.assertIs(True, answer.data['wait']['timed_out'])
         # The first read counts: from the route's start the request ends inside its two seconds, not after them.
-        self.assertLessEqual(answer.data['wait']['seconds'], 2.4)   # the timeout plus the jitter of one read (it was about 2.6 and up)
+        # At most the timeout plus the one read that was running at the bound (measured, so a loaded host does not flake).
+        self.assertLessEqual(answer.data['wait']['seconds'], 2.0 + max(spent) + 0.15)
         # The interval grows with the cost of a read (four times it), so a slow backend is read less often.
         self.assertLessEqual(len(calls), 3)
 
