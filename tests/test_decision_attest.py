@@ -1024,27 +1024,31 @@ class WebRouteTests(unittest.TestCase):
         issue = self.make(text)
         self.attest(issue, 'pat')
         self.patch_task(issue, 'pat', {'status': 'closed'})
-        journal = self.project / da.JOURNAL_DIR
-        aside = self.project / (da.JOURNAL_DIR + '-aside')
-        journal.rename(aside)
-        self.addCleanup(lambda: aside.rename(journal) if aside.exists() else None)
+        back = self.journal_away()
         self.assertEqual(0, self.host('plain', 'update', issue, '--description', 'Prose only.', '--json')['returncode'])
         for args in (('reopen', issue), ('update', issue, '--status', 'open'), ('update', issue, '--type', 'task')):
             answer = self.host('plain', *args, '--json')
             self.assertEqual((2, 403), (answer['returncode'], answer['delegation_status']), (args, answer))
         self.assertEqual(0, self.host('plain', 'update', issue, '--description', text, '--json')['returncode'])
-        aside.rename(journal)
+        back()
         found = self.read(issue)
         self.assertEqual(('closed', 'closed'), (found['status'], found['attestation']))
         self.patch_task(issue, 'pat', {'status': 'open'})
         self.assertEqual('counts', self.read(issue)['attestation'])
 
     def journal_away(self):
+        """The journal gone, and what brings it back: beside whatever was written while it was gone."""
         journal = self.project / da.JOURNAL_DIR
         aside = self.project / (da.JOURNAL_DIR + '-aside')
         journal.rename(aside)
-        self.addCleanup(lambda: aside.rename(journal) if aside.exists() else None)
-        return lambda: aside.rename(journal)
+
+        def back():
+            journal.mkdir(exist_ok=True)
+            for entry in aside.iterdir():
+                entry.rename(journal / entry.name)
+            aside.rmdir()
+        self.addCleanup(lambda: back() if aside.exists() else None)
+        return back
 
     def test_after_journal_loss_a_contributor_and_a_coordinator_cannot_lower_an_owners_row(self):
         # Review of r4, b1, the reviewer's sequence over HTTP: closed and open, for a person and a granted agent, and the
