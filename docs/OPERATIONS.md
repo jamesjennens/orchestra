@@ -2009,13 +2009,20 @@ that does not change the value appends nothing instead of overwriting the record
 `audit_agrees`, and **warns when the switch and the last recorded entry disagree**
 - what an older kit, which does not know the audit file, or a hand edit leaves
 behind. A **damaged** audit file - not JSON, not an object, an unknown schema, or
-malformed entries - is reported the same way and reads `audit_agrees: false`; the
-next flip does not silently overwrite it. Before writing the fresh history the flip
-renames the damaged bytes aside, in the same directory, as
+malformed entries - gets a damage warning and reads `audit_agrees: false`; the stale
+warning is separate and appears only when a readable last entry's value differs from
+the switch. The next flip does not silently overwrite damage. Before writing the fresh
+history the flip renames the damaged bytes aside, in the same directory, as
 `review-writes.audit.json.damaged-<UTC date-time>` (`.N` on a collision) and says so
 in its warning. The audit file is read through the same bounded-nesting JSON guard as
 every other caller-written file, so a deeply nested one is refused cleanly instead of
 crashing `status` with a `RecursionError`.
+
+The kit does not prune set-aside files automatically. An operator should review the
+`review-writes.audit.json.damaged-*` files periodically and remove old copies that are
+no longer needed, keeping the newest few if that helps local retention. This cleanup
+applies only to set-aside copies: do not remove or replace the active
+`review-writes.audit.json` as part of it.
 
 **Deployment order and rollback.** Deploy this kit with the switch off, verify the
 reads (`review`, `brief`, `work`, `history`), and leave it off for as long as a

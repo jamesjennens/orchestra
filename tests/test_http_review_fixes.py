@@ -1072,11 +1072,13 @@ class HttpClientEveryReviewOperationCase(EndpointCase):
 
         # 7. recommend (legacy, kittrial-5bb.115) by a reviewer who is neither author nor
         #    assignee. It is a record BESIDE the chain, so it takes no `previous`.
-        recommended = reviewer.add_review(project, task, 'recommend',
-                                          contribution=contribution, commit=COMMIT,
-                                          verdict='approve', summary='Checked the render path',
-                                          items=[], key=new_idempotency_key())
+        recommended = reviewer.recommend(project, task, contribution, COMMIT,
+                                         'approve', 'Checked the render path',
+                                         items=[], key=new_idempotency_key())
         self.assertTrue(recommended)
+        brief = self.brief(project, task, alex)['review']
+        self.assertEqual('approve', brief['recommendation']['verdict'])
+        self.assertEqual(responded['comment_id'], brief['latest_id'])
 
         # 8. approve (legacy).
         approved = owner.add_review(project, task, 'approve',
@@ -1427,6 +1429,25 @@ class HttpSmallRefusalsCase(EndpointCase):
         response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews' % (project, task),
                                 allowed, token=alex)
         self.assertEqual(201, response.status, response.data)
+
+    def test_unknown_fields_with_falsy_values_are_still_refused(self):
+        alex, project = self.setup_project()
+        task = self.create_task(alex, project, 'falsy unknown fields').data['id']
+        self.assertEqual(200, self.request('POST', '/v1/projects/%s/tasks/%s/claim'
+                                           % (project, task), {}, token=alex).status)
+        made = self.contribute(alex, project, task)
+        self.assertEqual(201, made.status, made.data)
+        contribution = made.data.get('comment_id') or \
+            (made.data.get('contribution') or {}).get('comment_id')
+        base = {'operation': 'request-changes', 'schema_version': 1,
+                'operation_id': 'op-falsy-fields', 'previous': contribution,
+                'contribution': contribution, 'items': [{'id': 'fix-1', 'text': 'Fix'}]}
+        for value in ([], '', 0):
+            with self.subTest(value=value):
+                response = self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
+                                        % (project, task), dict(base, bogus=value), token=alex)
+                self.assertEqual(422, response.status, response.data)
+                self.assertIn('Unsupported review payload field', response.data['error']['message'])
 
     def test_the_field_refusal_is_bounded_and_does_not_echo_non_identifiers(self):
         """A 300-character name and 400 unknown names must not be echoed (item 4 P3)."""

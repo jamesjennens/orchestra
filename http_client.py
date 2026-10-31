@@ -664,6 +664,11 @@ class Client:
         return self.request('POST', '/v1/projects/%s/tasks/%s/reviews'
                             % (quote(project, safe=''), quote(task, safe='')), body, key=key)
 
+    def recommend(self, project, task, contribution, commit, verdict, summary, items=None, key=None):
+        """Record a recommendation beside the review chain, with no previous record."""
+        return self.add_review(project, task, 'recommend', contribution=contribution,
+                               commit=commit, verdict=verdict, summary=summary, items=items, key=key)
+
     def delivery(self, project, task, *, contribution=None):
         qs = ('?' + urlencode({'contribution': contribution})) if contribution is not None else ''
         return self.request('GET', '/v1/projects/%s/tasks/%s/delivery%s'

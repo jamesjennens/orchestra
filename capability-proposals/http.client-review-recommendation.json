@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "operation_id": "capnew-5bb134-http-client-review-recommendation-0001",
+  "key": "http.client-review-recommendation",
+  "name": "How the standard-library HTTP client records a review recommendation",
+  "aliases": [
+    "Client.recommend",
+    "http client recommendation",
+    "recommend review over HTTP",
+    "recommend wrapper"
+  ],
+  "summary": "http_client.Client.recommend delegates to add_review with operation recommend, the contribution, commit, verdict, summary, optional items and idempotency key. Recommendations sit beside the review chain and carry no previous record. add_review omits unset optional nulls, retaining only operation_id and the operation's required nullable fields.",
+  "requirements": [],
+  "anchors": [],
+  "code": [
+    "http_client.py::Client.recommend",
+    "http_client.py::Client.add_review"
+  ],
+  "tests": [
+    "tests/test_http_client.py",
+    "tests/test_http_review_fixes.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "http",
+    "client",
+    "review",
+    "recommendation"
+  ]
+}
