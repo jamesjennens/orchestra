@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "operation_id": "kittrial-5bb.458-notes-coordinator-service-r1",
+  "key": "notes.coordinator-service",
+  "revision": 1,
+  "expected_sha256": null,
+  "name": "Coordinator notes on the web service",
+  "aliases": [
+    "coordinator notes wait",
+    "notes between coordinators",
+    "coordinator inbox and sent notes"
+  ],
+  "summary": "Existing .447 HTTP notes on one installation: live coordinators of program-linked projects send bounded plain-text notes, read their inbox/outbox, reply in a thread or mark noted. Only coordinators of the two projects may read note text. Notes are stored by the web service; unsettled notes fold into granted agents' wait fingerprints. This describes the existing HTTP feature, not the proposed SSH host adapter in the .458 design.",
+  "requirements": [],
+  "anchors": [
+    "docs/WORKER_GUIDE.md#notes-between-coordinators"
+  ],
+  "code": [
+    "http_auth.py::Service.write_note",
+    "http_auth.py::Service.notes_for",
+    "http_auth.py::Service.settle_note",
+    "http_service.py::ApiHandler.notes_write",
+    "http_service.py::ApiHandler._fold_notes"
+  ],
+  "tests": [
+    "tests/test_coordinator_notes.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "coordinator",
+    "notes",
+    "web",
+    "wait"
+  ]
+}
