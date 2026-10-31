@@ -508,3 +508,55 @@ class ParserTests(unittest.TestCase):
             self.assertEqual('north', hn.parse(args + ['@attachment:0'], {'0': {'flag': '-f', 'text': TEXT}})['to'])
         for args in (['enroll'], ['inbox', '--principal=lane:other'], ['send', '--to=north', '--request-id=x', '--file=/srv/private']):
             with self.assertRaises(hn.Refusal): hn.parse(args, {})
+
+
+class StorageValidationTests(unittest.TestCase):
+    def setUp(self):
+        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
+        self.root=Path(directory.name)
+
+    def test_preflight_refuses_damaged_note_shapes_without_changing_cache_or_disk(self):
+        from http_auth import Store,Service
+        service=Service(Store(self.root/'state.json'))
+        manager=hn.Manager(self.root,service,None)
+        for record in ({'notes':[]},{'notes':[],'dropped':None},{'notes':[],'dropped':[]}):
+            with self.subTest(record=record):
+                service.state['coordinator_notes']=copy.deepcopy(record);service.store.save()
+                before=copy.deepcopy(service.state);disk=service.store.path.read_bytes()
+                with self.assertRaises(hn.Refusal) as error:manager.preflight()
+                self.assertEqual(503,error.exception.status)
+                self.assertEqual(before,service.state)
+                self.assertEqual(disk,service.store.path.read_bytes())
+
+    def test_enrollment_counts_the_bytes_it_writes_and_keeps_the_old_file_on_refusal(self):
+        (self.root/'deployment.private.json').write_text(json.dumps({'operators':['operator']}))
+        project=self.root/'projects/pp/.beads';project.mkdir(parents=True)
+        (project/'metadata.json').write_text('{}')
+        hn.enroll(self.root,'pp','lane:pp','operator',approved_by='person:owner',approval='decision:initial')
+        path=hn.location(self.root)/'enrollment.json';before=path.read_bytes()
+        with mock.patch.object(hn,'ENROLLMENT_MAX',2000):
+            with self.assertRaises(hn.Refusal) as error:
+                hn.enroll(self.root,'pp','lane:pp','operator',approved_by='person:owner',approval='é'*240)
+            self.assertEqual(503,error.exception.status)
+        self.assertEqual(before,path.read_bytes())
+        self.assertEqual('decision:initial',hn.read_enrollment(self.root)['grants']['pp']['lane:pp']['approval'])
+
+    def test_revoke_validates_optional_metadata_before_changing_the_file(self):
+        (self.root/'deployment.private.json').write_text(json.dumps({'operators':['operator']}))
+        project=self.root/'projects/pp/.beads';project.mkdir(parents=True)
+        (project/'metadata.json').write_text('{}')
+        hn.enroll(self.root,'pp','lane:pp','operator',approved_by='person:owner',approval='decision:initial')
+        path=hn.location(self.root)/'enrollment.json';before=path.read_bytes()
+        for fields in ({'approval':''},{'approval':'x'*241},{'approved_by':''}):
+            with self.subTest(fields=fields):
+                path.write_bytes(before)
+                with self.assertRaises(ValueError):
+                    hn.enroll(self.root,'pp','lane:pp','operator',revoke=True,**fields)
+                self.assertEqual(before,path.read_bytes())
+                self.assertIn('lane:pp',hn.read_enrollment(self.root)['grants']['pp'])
+        path.write_bytes(before)
+        hn.enroll(self.root,'pp','lane:pp','operator',revoke=True,
+                  approved_by='person:owner',approval='decision:revoke')
+        document=hn.read_enrollment(self.root)
+        self.assertNotIn('lane:pp',document['grants']['pp'])
+        self.assertEqual('decision:revoke',document['audit'][-1]['approval'])

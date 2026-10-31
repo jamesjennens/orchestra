@@ -130,13 +130,15 @@ def enroll(root, project, principal, actor, *, approved_by=None, approval=None, 
     if not PROJECT.fullmatch(project):
         raise ValueError('Supply a project id')
     valid_principal(principal, 'principal')
-    if not revoke:
+    if not revoke or approved_by is not None:
         valid_principal(approved_by, 'owner approver')
         if not approved_by.startswith('person:'):
             raise ValueError('Enrollment approval names the person owner')
-        for value in (approved_by, approval):
-            if not isinstance(value, str) or not value or len(value) > 240 or any(ord(c) < 32 for c in value):
-                raise ValueError('Enrollment records the owner approver and approval reference (1..240 plain characters)')
+    for value in (approved_by, approval):
+        if revoke and value is None:
+            continue
+        if not isinstance(value, str) or not value or len(value) > 240 or any(ord(c) < 32 for c in value):
+            raise ValueError('Enrollment records the owner approver and approval reference (1..240 plain characters)')
     directory = location(root)
     if directory.is_symlink():
         raise Refusal(503, UNAVAILABLE)
@@ -160,9 +162,10 @@ def enroll(root, project, principal, actor, *, approved_by=None, approval=None, 
         document['audit'] = (document['audit'] + [{'project': project, 'principal': principal,
                             'actor': actor, 'operation': 'revoke' if revoke else 'enroll',
                             'approved_by': approved_by, 'approval': approval, 'at': server_time()}])[-200:]
-        if len(encoded(document)) > ENROLLMENT_MAX:
+        serialized = json.dumps(document)
+        if len(encoded(document)) > ENROLLMENT_MAX or len(serialized.encode('utf-8')) > ENROLLMENT_MAX:
             raise Refusal(503, UNAVAILABLE)
-        atomic_private_write(directory / 'enrollment.json', json.dumps(document))
+        atomic_private_write(directory / 'enrollment.json', serialized)
     return {'project': project, 'principal': principal, 'enrolled': not revoke}
 
 
@@ -371,8 +374,10 @@ class Manager:
                 raise ValueError()
             if any(value.get(k) != self.service.state.get(k) for k in ('coordinator_notes', 'host_note_requests')):
                 raise ValueError()
-            if self.service.state.get('coordinator_notes') is not None:
-                self.service._note_store(write=True)
+            notes = self.service.state.get('coordinator_notes')
+            if notes is not None and (not isinstance(notes, dict)
+                    or not isinstance(notes.get('notes'), list) or not isinstance(notes.get('dropped'), dict)):
+                raise ValueError()
             requests = self.service.state.get('host_note_requests', {})
             if not isinstance(requests, dict) or len(requests) > REQUESTS_MAX:
                 raise ValueError()
