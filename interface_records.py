@@ -340,21 +340,30 @@ class ProgramContext:
         if row is None:return 'incomplete'
         try:
             live=kind.live_row(row,self.operators)[0]
-            revisions=kind.existing_revisions(live)
-            evidence=kind.existing_acceptances(live)
-            approved=[r for n,r in revisions.items() if r.get('acceptance_state')!='draft'
-                      and n in evidence and evidence[n]['record_sha256']==r['sha256']
-                      and evidence[n]['acceptance_state']==r['acceptance_state']]
+            kind.existing_revisions(live)  # Current unvoided revision conflicts still refuse.
+            # Historical presence is not a single-writer ledger: a removed
+            # operator's evidence can coexist with a current re-acceptance.
+            # Parse individual retained comments, leaving malformed void targets
+            # out without losing a well-formed former declaration.
+            records=[];decisions=set()
+            for comment in row.get('comments') or []:
+                if not isinstance(comment,dict):continue
+                text=comment.get('text')
+                revision=kind.parse_entry(text)
+                if revision is not None and kind.entry_belongs(revision,row):records.append(revision)
+                decision=kind.parse_acceptance(text)
+                if (decision is not None and decision['id']==row.get('id')
+                        and kind.key_label(decision['key']) in kind.key_labels(row)
+                        and decision['operator']==comment.get('author')):
+                    decisions.add((decision['key'],decision['revision'],decision['record_sha256'],decision['acceptance_state']))
+            approved=[r for r in records if r.get('acceptance_state')!='draft'
+                      and (r['key'],r['revision'],r['sha256'],r['acceptance_state']) in decisions]
             if not link:
                 # Ordinary capabilities never admitted to the interface graph do
                 # not become unknown consumers when their staff leave. Inspect
                 # retained approvals too: an inert/voided former declaration must
                 # still fail closed, including a later empty withdrawal.
-                raw_evidence=kind.existing_acceptances(row)
-                declared=any(r.get('interfaces') and n in raw_evidence
-                             and raw_evidence[n]['record_sha256']==r['sha256']
-                             and raw_evidence[n]['acceptance_state']==r['acceptance_state']
-                             for n,r in kind.existing_revisions(row).items())
+                declared=any(r.get('interfaces') for r in approved)
                 if not declared:return 'never-accepted'
             if entry.get('acceptance_inert'):return 'incomplete'
             record=entry.get('record')
@@ -370,13 +379,17 @@ class ProgramContext:
                     status,_=program_links.side_status(entry,project,other,self.memberships,self.users)
                     if status=='left':return 'withdrawn'
                     return 'live' if status=='in' else 'incomplete'
+                # A retirement the canonical reader honours is irreversible;
+                # later staff turnover cannot make its old consumers live again.
+                # An inert/unhonoured retirement was refused above instead.
+                if record['acceptance_state']=='superseded':return 'withdrawn'
                 if not self.proposer_holds(entry.get('accepted_by'),project):return 'incomplete'
-                if record['acceptance_state']=='superseded' or not record.get('interfaces'):
+                if not record.get('interfaces'):
                     return 'withdrawn'
                 return 'live'
             # An approval hidden by a void is still not "never accepted". It takes
             # an explicit withdrawal to prove that its former consumers vanished.
-            return 'incomplete' if approved or kind.existing_acceptances(row) else 'never-accepted'
+            return 'incomplete' if approved else 'never-accepted'
         except (ValueError,TypeError,KeyError):
             return 'incomplete'
 

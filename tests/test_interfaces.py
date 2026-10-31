@@ -152,6 +152,123 @@ class InterfaceCase(unittest.TestCase):
         self.accept(operation='retire-beside-plain-ok',ctx=ctx)
         self.assertEqual('retired',self.entry()['lifecycle'])
 
+    def test_void_repairs_malformed_plain_capability_without_losing_interface_coverage(self):
+        from test_record_voids import void_payload
+        self.apply(payload());self.accept();record=self.entry()['record'];self.area.actor=OPERATOR
+        cap=cap_entry(operation='draft',operation_id='plain-before-void',acceptance_state='accepted',acceptance=acceptance())
+        result=cr.apply_native(cap,OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        self.assertTrue(self.context().usage()[1]['complete'])
+        bad=self.area.add_comment(result['native_id'],cr.ENTRY_PREFIX+'{"not":"valid"}',author='outsider')
+        self.assertFalse(self.context().usage()[1]['complete'])
+        cr.KIND.apply_void(void_payload(result['native_id'],bad['id'],bad['text'],kind='capability-entry'),
+            OPERATOR,self.area,[OPERATOR])
+        self.assertTrue(self.context().usage()[1]['complete']);self.assertEqual([],self.context().usage()[0])
+        self.apply(payload(operation='revise',operation_id='retire-after-void-repair',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        self.accept(operation='retire-void-repaired');self.assertEqual('retired',self.entry()['lifecycle'])
+
+    def test_void_cannot_hide_an_accepted_real_consumer_declaration(self):
+        from test_record_voids import void_payload
+        import recovery
+        from requirements import canonical_bytes
+        self.apply(payload());self.accept();record=self.entry()['record'];self.area.actor=OPERATOR
+        cap=cap_entry(operation='draft',operation_id='consumer-not-voidable',
+            interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        result=cr.apply_native(cap,OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        row=self.area.row(result['native_id']);comment=next(c for c in row['comments'] if cr.parse_entry(c['text']))
+        request=void_payload(row['id'],comment['id'],comment['text'],kind='capability-entry')
+        before=copy.deepcopy(self.area.rows)
+        with self.assertRaisesRegex(ValueError,'well-formed'):cr.KIND.apply_void(request,OPERATOR,self.area,[OPERATOR])
+        self.assertEqual(before,self.area.rows)
+        # Even a raw planted void is refused by the kind's reader.
+        self.area.add_comment(row['id'],recovery.PREFIX+canonical_bytes(request).decode(),author=OPERATOR)
+        usage,coverage=self.context().usage();self.assertTrue(coverage['complete']);self.assertEqual(1,len(usage))
+        self.apply(payload(operation='revise',operation_id='retire-past-void',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        with self.assertRaisesRegex(ValueError,'current consumers'):self.accept(operation='void-cannot-retire')
+
+    def test_honoured_retirement_with_interface_history_survives_acceptor_demotion(self):
+        self.apply(payload());self.accept();record=self.entry()['record'];uid='usr_'+'d'*16
+        state={'users':{uid:{'id':uid,'disabled':False}},'memberships':{'area':{uid:'coordinator'}}}
+        ctx=self.context();ctx.set_authority(state);self.area.actor=uid
+        cap=cap_entry(operation='draft',operation_id='retired-history-consumer',
+            interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(cap,uid,self.area,self.path.parent/'area',operator=True,web_coordinator=True,operators=[OPERATOR])
+        self.assertEqual(1,len(ctx.usage()[0]))
+        cr.apply_native(cap_entry(operation_id='retired-history-successor',key='history.successor'),uid,self.area,self.path.parent/'area',operators=[OPERATOR])
+        old=cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR])['record']
+        cr.apply_native({'schema_version':1,'operation':'retire','operation_id':'honoured-history-retirement','key':cap['key'],
+            'revision':old['revision'],'record_sha256':old['sha256'],'successor':'history.successor',
+            'acceptance_state':'superseded','acceptance':acceptance()},uid,self.area,self.path.parent/'area',
+            operator=True,web_coordinator=True,operators=[OPERATOR])
+        state['memberships']['area'][uid]='contributor'
+        self.assertEqual('superseded',cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR])['state'])
+        self.assertTrue(ctx.usage()[1]['complete']);self.assertEqual([],ctx.usage()[0])
+        self.apply(payload(operation='revise',operation_id='retire-beside-history',revision=3,
+            expected_sha256=record['sha256'],state='retired'),ctx=ctx)
+        self.accept(operation='retire-beside-history-ok',ctx=ctx);self.assertEqual('retired',self.entry()['lifecycle'])
+
+    def test_void_of_inert_acceptance_cannot_hide_former_consumer_history(self):
+        from test_record_voids import void_payload
+        self.apply(payload());self.accept();self.area.actor='ops2'
+        cap=cap_entry(operation='draft',operation_id='voidable-inert-consumer',
+            interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        result=cr.apply_native(cap,'ops2',self.area,self.path.parent/'area',operator=True,operators=[OPERATOR,'ops2'])
+        row=self.area.row(result['native_id']);comment=next(c for c in row['comments'] if cr.KIND.parse_acceptance(c['text']))
+        self.area.actor=OPERATOR
+        cr.KIND.apply_void(void_payload(row['id'],comment['id'],comment['text'],kind='capability-acceptance'),
+            OPERATOR,self.area,[OPERATOR])
+        self.assertFalse(self.context().usage()[1]['complete'],'voiding inert evidence is not withdrawal of its consumer')
+
+    def test_unhonoured_or_unauthorized_retirement_cannot_hide_real_consumption(self):
+        self.apply(payload());self.accept();record=self.entry()['record'];self.area.actor=OPERATOR
+        cap=cap_entry(operation='draft',operation_id='unhonoured-consumer',
+            interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(cap,OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        cr.apply_native(cap_entry(operation_id='unhonoured-successor',key='unhonoured.successor'),OPERATOR,self.area,self.path.parent/'area',operators=[OPERATOR])
+        old=cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR])['record']
+        retirement={'schema_version':1,'operation':'retire','operation_id':'unhonoured-retirement','key':cap['key'],
+            'revision':old['revision'],'record_sha256':old['sha256'],'successor':'unhonoured.successor',
+            'acceptance_state':'superseded','acceptance':acceptance()}
+        self.area.actor='intruder';before=copy.deepcopy(self.area.rows)
+        with self.assertRaises(ValueError):
+            cr.apply_native(retirement,'intruder',self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        self.assertEqual(before,self.area.rows);self.assertEqual(1,len(self.context().usage()[0]))
+        self.area.actor='ops2'
+        cr.apply_native(retirement,'ops2',self.area,self.path.parent/'area',operator=True,operators=[OPERATOR,'ops2'])
+        honoured=self.context();honoured.operators=[OPERATOR,'ops2']
+        row=next(r for r in self.area.rows if r['id']==cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR,'ops2'])['native_id'])
+        evidence=next(c for c in row['comments'] if (cr.KIND.parse_acceptance(c['text']) or {}).get('acceptance_state')=='superseded')
+        evidence['author']='intruder'  # Raw retirement evidence not authored by its named operator.
+        self.assertFalse(honoured.usage()[1]['complete'])
+        evidence['author']='ops2'
+        self.assertTrue(honoured.usage()[1]['complete']);self.assertEqual([],honoured.usage()[0])
+        # The retirement is no longer honoured after its operator is removed.
+        self.assertFalse(self.context().usage()[1]['complete'])
+        self.apply(payload(operation='revise',operation_id='retire-beside-inert-history',revision=3,
+            expected_sha256=record['sha256'],state='retired'))
+        with self.assertRaisesRegex(ValueError,'incomplete'):self.accept(operation='unhonoured-refused')
+
+    def test_current_operator_reacceptance_restores_coverage_with_retained_inert_evidence(self):
+        self.apply(payload());self.accept();self.area.actor='ops2'
+        cap=cap_entry(operation='draft',operation_id='reaccepted-consumer',
+            interfaces=[{'iface':'iface:prog/iface.quotes.v1@2','role':'consumes'}],
+            acceptance_state='accepted',acceptance=acceptance())
+        cr.apply_native(cap,'ops2',self.area,self.path.parent/'area',operator=True,operators=[OPERATOR,'ops2'])
+        old=cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR,'ops2'])['record']
+        self.assertFalse(self.context().usage()[1]['complete'])
+        self.area.actor=OPERATOR
+        cr.apply_native({'schema_version':1,'operation':'accept','operation_id':'current-operator-reaccept',
+            'key':cap['key'],'revision':old['revision'],'record_sha256':old['sha256'],
+            'acceptance_state':'accepted','acceptance':acceptance(evidence='current operator rechecked the declaration')},
+            OPERATOR,self.area,self.path.parent/'area',operator=True,operators=[OPERATOR])
+        self.assertEqual(OPERATOR,cr.KIND.find_entry(self.area.rows,cap['key'],[OPERATOR])['accepted_by'])
+        usage,coverage=self.context().usage();self.assertTrue(coverage['complete']);self.assertEqual(1,len(usage))
+
     def test_consumer_capability_acceptor_role_loss_is_incomplete_and_refuses_retirement(self):
         self.apply(payload());self.accept();record=self.entry()['record']
         uid='usr_'+'d'*16
@@ -713,6 +830,14 @@ class InterfaceCase(unittest.TestCase):
         with ir.context(denied),self.assertRaisesRegex(ValueError,'currently configured operator'):
             ir.reconcile(self.path,'demoted-recovery-accept',OPERATOR,'refused stale operator','complete',self.native,operators=[OPERATOR])
         self.assertEqual(rows,self.native.rows)
+        for boundary,message in [('owner','Stored defining area'),('link','currently linked defining area')]:
+            denied=self.context()
+            target='stored_owner' if boundary=='owner' else 'areas'
+            replacement=(lambda key:'changed-area') if boundary=='owner' else (lambda:([],True,0))
+            with self.subTest(boundary=boundary),patch.object(denied,target,side_effect=replacement),ir.context(denied):
+                with self.assertRaisesRegex(ValueError,message):
+                    ir.reconcile(self.path,'demoted-recovery-accept',OPERATOR,'refuse changed graph','complete',self.native,operators=[OPERATOR])
+            self.assertEqual(rows,self.native.rows)
         with ir.context(ctx):
             result=ir.reconcile(self.path,'demoted-recovery-accept',OPERATOR,'explicit program recovery','complete',self.native,operators=[OPERATOR])
         self.assertTrue(result['transition_complete']);after=self.entry()['record']
