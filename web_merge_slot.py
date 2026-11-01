@@ -112,12 +112,17 @@ def snapshot(run, project, *, repair=False):
         # restored under a new name (`admin.py restore-new SOURCE NEW`) keeps the SOURCE's
         # prefix and its slot `SOURCE-merge-slot`. Naming `NEW-merge-slot` here made every
         # read of a healthy slot on such a project 503: the merge-slot page, and every
-        # coordinator assign, which reads the slot before it judges the row. An answer
-        # without an id keeps the folder name; an id that is not a slot id is refused.
+        # coordinator assign, which reads the slot before it judges the row. An id bd answered
+        # that is not a slot id is refused. An answer without an id keeps the folder name,
+        # exactly as before this change and unvalidated, as it always was: the kit built it, bd
+        # did not say it (r2: validating it refused the one-letter projects of the test stand-ins).
         from reserved_comments import is_merge_slot_id
-        slot_id = state.get('id', Path(project).name + coordination.MERGE_SLOT_SUFFIX)
-        if not is_merge_slot_id(slot_id):
-            raise SlotError(503, 'The native merge-slot state is invalid; ask an installation operator to inspect it.')
+        if 'id' in state:
+            slot_id = state['id']
+            if not is_merge_slot_id(slot_id):
+                raise SlotError(503, 'The native merge-slot state is invalid; ask an installation operator to inspect it.')
+        else:
+            slot_id = Path(project).name + coordination.MERGE_SLOT_SUFFIX
         try:
             rows = record_json.loads(run(['show', slot_id, '--json']))
             row = rows[0] if isinstance(rows, list) and len(rows) == 1 else rows

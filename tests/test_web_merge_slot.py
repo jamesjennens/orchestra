@@ -97,6 +97,11 @@ class BoundaryTests(unittest.TestCase):
         # An answer with no id keeps the folder name, as before this change.
         run, shown = native('dst-merge-slot', check_id=None)
         self.assertTrue(web_merge_slot.snapshot(run, project)['available']);self.assertEqual(shown, ['dst-merge-slot'])
+        # ...unvalidated, as before (r2): the stand-ins of tests/test_web_lifecycle*.py answer without an id for
+        # a project folder `p`, whose `p-merge-slot` is no shape bd gives, and that read must not change.
+        run, shown = native('p-merge-slot', check_id=None)
+        self.assertTrue(web_merge_slot.snapshot(run, str(Path('absent-root') / 'projects' / 'p'))['available'])
+        self.assertEqual(shown, ['p-merge-slot'])
         # An id that is not a slot id is refused before any row is read.
         for bad in ('pp-1', '../x-merge-slot', 'dst-merge-slot\n', 7, None):
             run, shown = native('dst-merge-slot', check_id=bad)
