@@ -1043,6 +1043,74 @@ def session_limit_seconds(idle_minutes=None, absolute_hours=None):
     return session_idle, session_absolute
 
 
+#: Marks an entry that did not exist before a mutation wrote it (kittrial-5bb.487).
+_ABSENT = object()
+
+
+class _Widening:
+    """What one authority-WIDENING mutation wrote, so a failed save can take it back (kittrial-5bb.487).
+
+    ``Store.save`` fails only before its atomic replace (the state lock timed out, or the
+    temporary could not be written or renamed), so when it raises nothing of this change is
+    on disk. Leaving the change in memory made it durable with the next unrelated save, with
+    no audit entry, and in force at once: a coordinator grant whose save failed authorised
+    approvals (Fable audit .482 F1). The rule is the one ``create_project`` already follows
+    (kittrial-5bb.255) and docs/HTTP_MUTATION_PERSISTENCE.md states: a failed save takes a
+    widening back out of memory. A NARROWING keeps its effect instead (see
+    :meth:`Service._save_narrowing`): undoing a failed revocation would hand back what the
+    owner was taking away.
+
+    Entries are restored exactly, each to the value it had when :meth:`remember` first saw it.
+    The caller holds ``store.lock`` from before the first write to the end, so the prior values
+    include any narrowing another request kept in memory unsaved, and that narrowing survives
+    the undo. Audit events this mutation appended are removed too, except refusals.
+    """
+
+    def __init__(self, service):
+        self.service = service
+        self.entries = []
+        self.audit_start = len(service.state['audit'])
+        self.saved = False
+
+    def remember(self, container, key):
+        """Record ``container[key]`` (or its absence) before the mutation writes it; returns ``container``."""
+        if not self.saved and not any(c is container and k == key for c, k, _ in self.entries):
+            self.entries.append((container, key, copy.deepcopy(container[key]) if key in container else _ABSENT))
+        return container
+
+    def created(self, container, key):
+        """Record that ``container[key]`` was absent before this mutation added it."""
+        if not self.saved:
+            self.entries.append((container, key, _ABSENT))
+        return container
+
+    def save(self, keeps_narrowing=False):
+        """Save; with ``keeps_narrowing`` a failure marks what this mutation also narrowed as kept."""
+        try:
+            self.service.store.save()
+        except Exception as error:
+            if keeps_narrowing:
+                try:
+                    error.kept_narrowing = True
+                except AttributeError:
+                    pass
+                if self.service.store.unsaved_since is None:
+                    self.service.store.unsaved_since = self.service.store.clock()
+            raise
+        self.saved = True
+
+    def undo(self):
+        for container, key, prior in reversed(self.entries):
+            if prior is _ABSENT:
+                container.pop(key, None)
+            else:
+                container[key] = prior
+        audit = self.service.state['audit']
+        refusals = [event for event in audit[self.audit_start:] if event.get('outcome') in ('denied', 'rejected')]
+        del audit[self.audit_start:]
+        audit.extend(refusals)
+
+
 class Service:
     """The authenticated authorization boundary.
 
@@ -1293,6 +1361,51 @@ class Service:
                 del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
         return event
 
+    @contextmanager
+    def _widening(self):
+        """Hold one authority-widening mutation; a failed save takes it back out of memory (kittrial-5bb.487).
+
+        Use inside ``with self.store.lock``. Call ``change.remember(container, key)`` before each
+        write and ``change.save()`` instead of ``self.store.save()``. Any exception before that
+        save succeeded undoes what was remembered and re-raises, so the route's answer is the
+        one it was before (500, or "cannot say" for a lock wait) and is true: nothing was done.
+        An exception after a successful save undoes nothing.
+        """
+        change = _Widening(self)
+        self._audit_defer_trim += 1
+        try:
+            yield change
+        except BaseException:
+            if not change.saved:
+                change.undo()
+            raise
+        finally:
+            self._audit_defer_trim -= 1
+            if not self._audit_defer_trim and len(self.state['audit']) > AUDIT_LIMIT:
+                del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
+
+    def _save_narrowing(self):
+        """Save a NARROWING; if the save fails it keeps its effect in memory (kittrial-5bb.487).
+
+        A revocation, demotion, removal or disable that could not be saved still holds for every
+        request this service answers (the fail-safe side, as credential revocation already does).
+        The state is marked unsaved, so the next save writes it, and the exception is marked
+        ``kept_narrowing`` so the route records a ``committed-unsaved`` audit event that the next
+        save writes with it. Until then the change is in memory only: if the service stops before
+        a save succeeds, it is lost with the rest of the unsaved state, and the owner, who was told
+        the outcome could not be confirmed, must do it again.
+        """
+        try:
+            self.store.save()
+        except Exception as error:
+            try:
+                error.kept_narrowing = True
+            except AttributeError:
+                pass
+            if self.store.unsaved_since is None:
+                self.store.unsaved_since = self.store.clock()
+            raise
+
     def _username(self, username):
         if not isinstance(username, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]{1,63}',
                                                             username):
@@ -1325,9 +1438,12 @@ class Service:
                 'disabled': False,
                 'created_at': now_iso(store.now()),
             }
-            store.state['users'][user['id']] = user
-            store.state['usernames'][username.lower()] = user['id']
-            store.save()
+            with service._widening() as change:
+                change.created(store.state['users'], user['id'])
+                change.remember(store.state['usernames'], username.lower())
+                store.state['users'][user['id']] = user
+                store.state['usernames'][username.lower()] = user['id']
+                change.save()
             service.audit(None, None, 'bootstrap', 'committed', reason='superuser created')
             return user
 
@@ -1347,9 +1463,12 @@ class Service:
                 'disabled': False,
                 'created_at': now_iso(self._now()),
             }
-            self.state['users'][user['id']] = user
-            self.state['usernames'][username.lower()] = user['id']
-            self.store.save()
+            with self._widening() as change:
+                change.created(self.state['users'], user['id'])
+                change.remember(self.state['usernames'], username.lower())
+                self.state['users'][user['id']] = user
+                self.state['usernames'][username.lower()] = user['id']
+                change.save()
         return self._public_user(user)
 
     def list_users(self, principal):
@@ -1391,13 +1510,15 @@ class Service:
             if user.get('disabled'):
                 raise conflict('That account is disabled')
             before = project_grant(user)
-            user['project_grant'] = {'limit': limit, 'granted_by': principal.user_id,
-                                     'granted_at': now_iso(self._now())}
-            self.audit(request_id, principal, 'accounts.project-grant', 'committed',
-                       reason='account=%s %s limit=%d%s' % (
-                           user_id, 'changed' if before else 'granted', limit,
-                           ' (was %d)' % before['limit'] if before else ''))
-            self.store.save()
+            with self._widening() as change:
+                change.remember(user, 'project_grant')
+                user['project_grant'] = {'limit': limit, 'granted_by': principal.user_id,
+                                         'granted_at': now_iso(self._now())}
+                self.audit(request_id, principal, 'accounts.project-grant', 'committed',
+                           reason='account=%s %s limit=%d%s' % (
+                               user_id, 'changed' if before else 'granted', limit,
+                               ' (was %d)' % before['limit'] if before else ''))
+                change.save()
             return self._public_user(user)
 
     def clear_project_grant(self, principal, user_id, request_id=None):
@@ -1414,7 +1535,7 @@ class Service:
             self.audit(request_id, principal, 'accounts.project-grant', 'committed',
                        reason='account=%s %s' % (user_id, 'revoked (limit was %d)' % had['limit'] if had
                                                  else 'revoked (none held)'))
-            self.store.save()
+            self._save_narrowing()
             return self._public_user(user)
 
     def host_creation(self, principal):
@@ -1456,6 +1577,9 @@ class Service:
             self._validate_project_name(name)
             user = self.state['users'].get(principal.user_id) or {}
             grant = project_grant(user)
+            # Not taken back on a failed save (kittrial-5bb.487): the host has already created the project, so
+            # this records a fact rather than granting anything new; kept in memory, the creator's same request
+            # registers it again (kittrial-5bb.156, tests/test_http_project_create.py HeldLockTests).
             self.state['projects'][project_id] = {
                 'id': project_id, 'name': name, 'created_by': principal.user_id,
                 'created_at': now_iso(self._now()), 'archived': False,
@@ -1482,12 +1606,17 @@ class Service:
                     raise forbidden('Current password is incorrect')
             if verify_password(user.get('password'), new_password):
                 raise invalid('New password must differ from the current password')
-            user['password'] = hash_password(new_password, minimum=self.password_min_length)
-            if user.get('reset_token'):
-                user.pop('reset_token')
-            self._revoke_sessions_for(user_id)
-            self._revoke_credentials_for(user_id)
-            self.store.save()
+            with self._widening() as change:
+                # The new secret is undone if it cannot be saved; the sessions and credentials it
+                # ended stay ended (a narrowing keeps its effect, kittrial-5bb.487).
+                change.remember(user, 'password')
+                change.remember(user, 'reset_token')
+                user['password'] = hash_password(new_password, minimum=self.password_min_length)
+                if user.get('reset_token'):
+                    user.pop('reset_token')
+                self._revoke_sessions_for(user_id)
+                self._revoke_credentials_for(user_id)
+                change.save(keeps_narrowing=True)
         return {'id': user_id, 'changed': True}
 
     def issue_reset(self, principal, user_id, request_id=None):
@@ -1502,18 +1631,24 @@ class Service:
             moment = self._expiry_now()
             raw = self._raw_now()
             # Reissuing invalidates any previous pending reset for the account.
+            superseded = False
             for existing, record in list(self.state['reset_tokens'].items()):
                 if record['user_id'] == user_id and not record['used']:
                     del self.state['reset_tokens'][existing]
-            self.state['reset_tokens'][token_hash(token)] = {
-                'user_id': user_id,
-                'issued_at': moment,
-                'issued_raw': raw,
-                'expires_at': moment + self.reset_ttl,
-                'used': False,
-                'issued_by': principal.user_id,
-            }
-            self.store.save()
+                    superseded = True
+            with self._widening() as change:
+                change.created(self.state['reset_tokens'], token_hash(token))
+                self.state['reset_tokens'][token_hash(token)] = {
+                    'user_id': user_id,
+                    'issued_at': moment,
+                    'issued_raw': raw,
+                    'expires_at': moment + self.reset_ttl,
+                    'used': False,
+                    'issued_by': principal.user_id,
+                }
+                # The new value is undone if it cannot be saved; a previous one it replaced stays
+                # withdrawn (a narrowing keeps its effect, kittrial-5bb.487).
+                change.save(keeps_narrowing=superseded)
         # The value is returned once, to the authenticated superuser, and never stored.
         return {'id': user_id, 'reset_value': token,
                 'expires_at': now_iso(moment + self.reset_ttl), 'single_use': True}
@@ -1529,11 +1664,16 @@ class Service:
                                   lifetime=self.reset_ttl):
                 raise unauthenticated('Invalid or expired reset value')
             user = self._user(user_id)
-            record['used'] = True
-            user['password'] = hash_password(new_password, minimum=self.password_min_length)
-            self._revoke_sessions_for(user_id)
-            self._revoke_credentials_for(user_id)
-            self.store.save()
+            with self._widening() as change:
+                # The new password is undone and the reset value stays usable if this cannot be
+                # saved; the sessions and credentials it ended stay ended (kittrial-5bb.487).
+                change.remember(record, 'used')
+                change.remember(user, 'password')
+                record['used'] = True
+                user['password'] = hash_password(new_password, minimum=self.password_min_length)
+                self._revoke_sessions_for(user_id)
+                self._revoke_credentials_for(user_id)
+                change.save(keeps_narrowing=True)
         return {'id': user_id, 'password_set': True}
 
     def _assert_not_final_owner(self, user_id):
@@ -1566,7 +1706,7 @@ class Service:
             user['disabled'] = True
             self._revoke_sessions_for(user_id)
             self._revoke_credentials_for(user_id)
-            self.store.save()
+            self._save_narrowing()
         return {'id': user_id, 'disabled': True}
 
     def _require_superuser(self, principal):
@@ -1718,22 +1858,25 @@ class Service:
             # lifetimes while that monotone floor is still pinned ahead.
             moment = self._expiry_now()
             raw = self._raw_now()
-            self.state['sessions'][token_hash(token)] = {
-                'user_id': user['id'],
-                'issued_at': moment,
-                'issued_raw': raw,
-                'last_used': moment,
-                'last_used_raw': raw,
-                'idle_expires': moment + self.session_idle,
-                'absolute_expires': moment + self.session_absolute,
-                'revoked': False,
-                'csrf': csrf,
-            }
-            self._failures.pop(self._throttle_key(username, source), None)
-            self.audit(request_id, Principal(user['id'], user['display_name'],
-                                             user['superuser'], 'session', user['id']),
-                       'login', 'committed')
-            self.store.save()
+            with self._widening() as change:
+                # A session whose save failed is taken back: its token was never handed out (kittrial-5bb.487).
+                change.created(self.state['sessions'], token_hash(token))
+                self.state['sessions'][token_hash(token)] = {
+                    'user_id': user['id'],
+                    'issued_at': moment,
+                    'issued_raw': raw,
+                    'last_used': moment,
+                    'last_used_raw': raw,
+                    'idle_expires': moment + self.session_idle,
+                    'absolute_expires': moment + self.session_absolute,
+                    'revoked': False,
+                    'csrf': csrf,
+                }
+                self._failures.pop(self._throttle_key(username, source), None)
+                self.audit(request_id, Principal(user['id'], user['display_name'],
+                                                 user['superuser'], 'session', user['id']),
+                           'login', 'committed')
+                change.save()
         return {'session_token': token, 'csrf_token': csrf,
                 'expires_at': now_iso(moment + self.session_absolute),
                 'idle_expires_at': now_iso(moment + self.session_idle),
@@ -1966,7 +2109,7 @@ class Service:
             if session is not None:
                 session['revoked'] = True
                 self.audit(request_id, principal, 'logout', 'committed')
-                self.store.save()
+                self._save_narrowing()
         return {'logged_out': True}
 
     def revoke_session(self, session_hash):
@@ -1974,7 +2117,7 @@ class Service:
             session = self.state['sessions'].get(session_hash)
             if session:
                 session['revoked'] = True
-                self.store.save()
+                self._save_narrowing()
 
     # -- actor binding ---------------------------------------------------------
     def bind_actor(self, principal, submitted_actor):
@@ -2289,8 +2432,16 @@ class Service:
                 if sum(1 for r in members.values() if r == 'owner') <= 1:
                     raise conflict('The final active project owner cannot be demoted; '
                                    'assign another owner first', {'project': project_id})
-            members[user_id] = role
-            self.store.save()
+            if current is not None and ROLES.index(role) <= ROLES.index(current):
+                # A demotion (or the same role) narrows: kept if the save fails (kittrial-5bb.487).
+                members[user_id] = role
+                self._save_narrowing()
+            else:
+                # A new member or a promotion widens: taken back if the save fails (kittrial-5bb.487).
+                with self._widening() as change:
+                    change.remember(members, user_id)
+                    members[user_id] = role
+                    change.save()
         return {'project': project_id, 'user': user_id, 'role': role}
 
     def remove_member(self, principal, project_id, user_id, request_id=None):
@@ -2315,7 +2466,7 @@ class Service:
                 if isinstance(agent, dict) and agent.get('owner') == user_id and isinstance(agent.get('id'), str):
                     self._end_coordinator_grants(agent, [project_id], principal, request_id,
                                                  'the account was removed from the project')
-            self.store.save()
+            self._save_narrowing()
         return {'project': project_id, 'user': user_id, 'removed': True}
 
     def archive_project(self, principal, project_id):
@@ -2327,7 +2478,7 @@ class Service:
             if project['archived']:
                 raise conflict('Project is already archived')
             project['archived'] = True
-            self.store.save()
+            self._save_narrowing()
         return {'id': project_id, 'archived': True}
 
     # -- worker credentials ----------------------------------------------------
@@ -2407,9 +2558,12 @@ class Service:
                     'reason': actor_waived.get('reason'),
                     'at': now_iso(self._now()),
                 }
-            self.state['credentials'][credential['id']] = credential
-            self.state['credential_tokens'][token_hash(secret)] = credential['id']
-            self.store.save()
+            with self._widening() as change:
+                change.created(self.state['credentials'], credential['id'])
+                change.created(self.state['credential_tokens'], token_hash(secret))
+                self.state['credentials'][credential['id']] = credential
+                self.state['credential_tokens'][token_hash(secret)] = credential['id']
+                change.save()
         answer = {'id': credential['id'], 'project': project_id, 'label': credential['label'],
                   'scopes': list(requested), 'actor': actor, 'secret': secret,
                   'expires_at': now_iso(credential['expires_at']), 'secret_available': True}
@@ -2496,7 +2650,7 @@ class Service:
             # (kittrial-5bb.188 item 3). A record revoked before this field existed carries no
             # time and lends nothing, which is the fail-closed reading.
             credential['revoked_at'] = now_iso(self._now())
-            self.store.save()
+            self._save_narrowing()
         return {'id': credential_id, 'revoked': True}
 
     # -- web interface reads (kittrial-5bb.20) ----------------------------------
@@ -3982,12 +4136,16 @@ class Service:
                 raise HttpError(503, 'unavailable',
                                 'The record of coordinator grants in the service state is damaged (it is not an object), '
                                 'so no grant was written. An operator must repair the state file')
-            grants = self.state.setdefault('coordinator_grants', {}).setdefault(project_id, {})
             held = coordinator_grant(self.state, project_id, agent_id)
             # A record whose issuer no longer qualifies is dormant: a current issuer gives it afresh.
             if held is None or not grant_issuer_holds(self.state, project_id, held):
-                grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
-                self.store.save()
+                with self._widening() as change:
+                    # Taken back if the save fails: before kittrial-5bb.487 it stayed in memory, unaudited,
+                    # authorised approvals at once and became durable with the next unrelated save.
+                    change.remember(self.state, 'coordinator_grants')
+                    grants = self.state.setdefault('coordinator_grants', {}).setdefault(project_id, {})
+                    grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
+                    change.save()
             return self.project_agent_view(agent, project_id)
 
     #: How an agent holding the coordinator grant is judged when it approves (kittrial-5bb.438).
@@ -4033,9 +4191,17 @@ class Service:
                 raise HttpError(503, 'unavailable',
                                 'The record of agent-approval settings in the service state is damaged (it is not '
                                 'an object), so nothing was written. An operator must repair the state file')
-            self.state.setdefault('agent_approval', {})[project_id] = {
-                'mode': mode, 'set_by': principal.user_id, 'set_at': now_iso(self._now())}
-            self.store.save()
+            if mode == 'by-person':
+                # The strict rule narrows: kept if the save fails (kittrial-5bb.487).
+                self.state.setdefault('agent_approval', {})[project_id] = {
+                    'mode': mode, 'set_by': principal.user_id, 'set_at': now_iso(self._now())}
+                self._save_narrowing()
+            else:
+                with self._widening() as change:
+                    change.remember(self.state, 'agent_approval')
+                    self.state.setdefault('agent_approval', {})[project_id] = {
+                        'mode': mode, 'set_by': principal.user_id, 'set_at': now_iso(self._now())}
+                    change.save()
         return self.agent_approval(project_id)
 
     def other_agent_of_same_person(self, agent_id, name):
@@ -4100,7 +4266,7 @@ class Service:
             del held[agent_id]
             if not held:
                 del grants[project_id]
-            self.store.save()
+            self._save_narrowing()
             return self.project_agent_view(agent, project_id)
 
     # -- lane nudges (kittrial-5bb.413; docs/design/LANE_NUDGE_DESIGN.md, kittrial-5bb.409) -------
@@ -4406,11 +4572,13 @@ class Service:
                 raise HttpError(503, 'unavailable',
                                 'The record of release grants in the service state is damaged (it is not an object), '
                                 'so no grant was written. An operator must repair the state file')
-            grants = self.state.setdefault('release_grants', {}).setdefault(project_id, {})
             held = release_grant(self.state, project_id, agent_id)
             if held is None or not grant_issuer_holds(self.state, project_id, held):
-                grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
-                self.store.save()
+                with self._widening() as change:
+                    change.remember(self.state, 'release_grants')
+                    grants = self.state.setdefault('release_grants', {}).setdefault(project_id, {})
+                    grants[agent_id] = {'granted_by': principal.user_id, 'granted_at': now_iso(self._now())}
+                    change.save()
             return self.project_agent_view(agent, project_id)
 
     def revoke_release(self, principal, project_id, agent_id, request_id=None):
@@ -4428,7 +4596,7 @@ class Service:
             del held[agent_id]
             if not held:
                 del grants[project_id]
-            self.store.save()
+            self._save_narrowing()
             return self.project_agent_view(agent, project_id)
 
     def list_project_agents(self, principal, project_id):
@@ -4497,7 +4665,7 @@ class Service:
             agent['projects'] = [pid for pid in projects if pid != project_id]
             self._end_coordinator_grants(agent, [project_id], principal, request_id,
                                          'a project owner took the agent out of the project')
-            self.store.save()
+            self._save_narrowing()
             view = self.project_agent_view(agent, project_id)
         return {'operation': 'agents.project.revoke', 'project': project_id, 'agent': view}
 
@@ -4781,16 +4949,22 @@ class Service:
             }
             if clean_role is not None:
                 agent['role'] = clean_role
-            self.state['agents'][agent_id] = agent
-            # The grants first, so a project's view of the history includes the first credential.
-            self._audit_project_grants(principal, agent, list(granted or []), request_id)
-            credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry)
-            self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
-                                         self.agent_scopes(agent), request_id)
-            event = self.audit(request_id, principal, 'agents.created', 'committed',
-                               actor=self.agent_actor(agent))
-            event.update(agent_id=agent_id, owner_id=owner_id, created_by=principal.user_id)
-            self.store.save()
+            with self._widening() as change:
+                # The new agent and its first credential are taken back if this cannot be saved
+                # (kittrial-5bb.487); its one-time secret was never handed out.
+                change.created(self.state['agents'], agent_id)
+                self.state['agents'][agent_id] = agent
+                # The grants first, so a project's view of the history includes the first credential.
+                self._audit_project_grants(principal, agent, list(granted or []), request_id)
+                credential, secret = self._issue_agent_credential_locked(principal, agent, expiry=expiry)
+                change.created(self.state['credentials'], credential['id'])
+                change.created(self.state['credential_tokens'], credential['token_hash'])
+                self._audit_agent_credential(principal, agent, credential, 'agents.credentials.issued',
+                                             self.agent_scopes(agent), request_id)
+                event = self.audit(request_id, principal, 'agents.created', 'committed',
+                                   actor=self.agent_actor(agent))
+                event.update(agent_id=agent_id, owner_id=owner_id, created_by=principal.user_id)
+                change.save()
             # The one-time secret travels only in this response.
             public = {
                 'operation': 'agents.create',
@@ -4875,6 +5049,15 @@ class Service:
                 changes['claim_limit'] = validate_claim_limit(payload.get('claim_limit'))
             left = [pid for pid in (agent.get('projects') or []) if pid not in changes.get('projects', agent.get('projects') or [])]
             added = [pid for pid in changes.get('projects', []) if pid not in (agent.get('projects') or [])]
+            # What this change WIDENS is taken back if it cannot be saved; what it narrows keeps its
+            # effect (kittrial-5bb.487): projects added, a re-enable, a higher claim limit.
+            was_enabled = bool(agent.get('enabled'))
+            enabling = changes.get('enabled') is True and not was_enabled
+            limit_before = agent.get('claim_limit')
+            raising = ('claim_limit' in changes and
+                       claim_limit.default_limit(dict(agent, claim_limit=changes['claim_limit']))
+                       > claim_limit.default_limit(agent))
+            audit_start = len(self.state['audit'])
             agent.update(changes)
             self._audit_project_grants(principal, agent, added, request_id)
             if 'role' in payload:
@@ -4890,7 +5073,35 @@ class Service:
                                          'the agent\'s projects were changed (PATCH /v1/agents)')
             if changes.get('enabled') is False:
                 self._revoke_agent_credentials(agent)
-            self.store.save()
+            if not (added or enabling or raising):
+                self._save_narrowing()
+                return self.agent_view(agent, principal)
+            self._audit_defer_trim += 1
+            try:
+                self.store.save()
+            except Exception as error:
+                agent['projects'] = [pid for pid in (agent.get('projects') or []) if pid not in added]
+                if enabling:
+                    agent['enabled'] = was_enabled
+                if raising:
+                    agent['claim_limit'] = limit_before
+                audit = self.state['audit']
+                grants = [event for event in audit[audit_start:] if event.get('action') == 'agents.project.granted'
+                          and event.get('agent_id') == agent['id'] and event.get('project_id') in added]
+                for event in grants:
+                    audit.remove(event)
+                if left or changes.get('enabled') is False or ('claim_limit' in changes and not raising):
+                    try:
+                        error.kept_narrowing = True
+                    except AttributeError:
+                        pass
+                    if self.store.unsaved_since is None:
+                        self.store.unsaved_since = self.store.clock()
+                raise
+            finally:
+                self._audit_defer_trim -= 1
+                if not self._audit_defer_trim and len(self.state['audit']) > AUDIT_LIMIT:
+                    del self.state['audit'][:len(self.state['audit']) - AUDIT_LIMIT]
             return self.agent_view(agent, principal)
 
     def lower_own_claim_limit(self, principal, value):
@@ -4984,7 +5195,7 @@ class Service:
             agent = self._agent_owned(principal, agent_id)
             agent['enabled'] = False
             self._revoke_agent_credentials(agent)
-            self.store.save()
+            self._save_narrowing()
             return self.agent_view(agent, principal)
 
     def enable_agent(self, principal, agent_id):
@@ -4994,8 +5205,10 @@ class Service:
         with self.store.lock:
             self._refresh_authority(principal)
             agent = self._agent_owned(principal, agent_id)
-            agent['enabled'] = True
-            self.store.save()
+            with self._widening() as change:
+                change.remember(agent, 'enabled')
+                agent['enabled'] = True
+                change.save()
             return self.agent_view(agent, principal)
 
     def issue_agent_credential(self, principal, agent_id, *, scopes=None, label=None,

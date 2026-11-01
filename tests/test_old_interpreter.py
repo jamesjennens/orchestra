@@ -29,7 +29,8 @@ ADVICE = {'endpoint.py': 'Set "python" in the client configuration to an interpr
           'requirement_records.py': OWN, 'setup_assistant.py': OWN, 'worker.py': OWN, 'worker_gate.py': OWN,
           'tools/http_rev3_probe.py': OWN, 'tools/http_rev4_probe.py': OWN, 'tools/http_rev5_probe.py': OWN,
           'tools/http_security_probe.py': OWN, 'tools/strict_canonical_endpoint.py': OWN,
-          'tools/demonstrate_review_targeting.py': OWN, 'tools/read_timing.py': OWN}
+          'tools/demonstrate_review_targeting.py': OWN, 'tools/read_timing.py': OWN,
+          'tools/authority_audit_check.py': OWN}
 ENTRY_POINTS = tuple(ADVICE)
 #: Programs with a ``__main__`` block and NO check, and why. The first two run under the host's
 #: Python 3.6 on purpose. The others were started with ``--help`` under a real Python 3.6.8
