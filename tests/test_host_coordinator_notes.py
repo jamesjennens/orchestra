@@ -440,11 +440,12 @@ greeting=json.loads(f.readline());f.write((json.dumps({'request':json.loads(sys.
                         (['reply', first['id'], '--to', 'prog', '--request-id', 'full-reply'], 'north', TEXT),
                         (['noted', first['id'], '--request-id', 'full-noted'], 'north', None))
             for args, project, text in attempts:
-                with self.subTest(operation=args[0]), self.assertRaises(hn.Refusal) as full:
-                    self.host(args, project=project, text=text)
-                self.assertEqual(503, full.exception.status)
-                self.assertIn('request history', str(full.exception))
-                self.assertIn('24-hour retry window', str(full.exception))
+                with self.subTest(operation=args[0]):
+                    with self.assertRaises(hn.Refusal) as full:
+                        self.host(args, project=project, text=text)
+                    self.assertEqual(503, full.exception.status)
+                    self.assertIn('request history', str(full.exception))
+                    self.assertIn('24-hour retry window', str(full.exception))
             self.assertIsNone(self.service._notes()[0]['settled'])
             self.assertEqual(first['id'], self.send_host()['note']['id'])
 
@@ -525,10 +526,11 @@ greeting=json.loads(f.readline());f.write((json.dumps({'request':json.loads(sys.
             request = self.envelope(args, project='north', principal='lane:prog',
                                     text=TEXT if args[0] in ('send', 'reply') else None)
             request.update(actor='host-prog-in-north', projects=['prog', 'north'])
-            with self.subTest(operation=args[0]), self.assertRaises(hn.Refusal) as denied:
-                hn.call(self.root, request)
-            self.assertEqual(403, denied.exception.status)
-            self.assertNotIn('NORTH-PRIVATE', str(denied.exception))
+            with self.subTest(operation=args[0]):
+                with self.assertRaises(hn.Refusal) as denied:
+                    hn.call(self.root, request)
+                self.assertEqual(403, denied.exception.status)
+                self.assertNotIn('NORTH-PRIVATE', str(denied.exception))
 
     def test_a_web_service_caller_cannot_enter_the_host_namespace(self):
         import endpoint
@@ -538,7 +540,7 @@ greeting=json.loads(f.readline());f.write((json.dumps({'request':json.loads(sys.
         config = AuthorityConfig(str(self.service.store.path))
         answer = endpoint.execute(self.root, request, authority_config=config,
                                   key_principal='lane:prog', key_projects=['prog'])
-        self.assertEqual((2, 403), (answer['returncode'], answer['host_notes_status']))
+        self.assertEqual((2, 403), (answer['returncode'], answer.get('host_notes_status')))
 
     def test_reply_after_the_program_link_is_removed_is_refused_without_settling(self):
         parent = self.send_host()['note']
