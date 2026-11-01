@@ -1,11 +1,12 @@
 """A failed state save never leaves a WIDER authority in force (kittrial-5bb.487, Fable audit .482 F1).
 
-``Store.save`` fails only before its atomic replace, so nothing of the failed save is on disk. A
+``Store.save`` raises only before its atomic replace, so nothing of the failed save is on disk. A
 widening (grant, promotion, credential, re-enable, ...) is taken back out of memory; a narrowing
 (revoke, demotion, removal, disable) keeps its effect and is audited ``committed-unsaved``, written
 with the next save. Through the real routes of the web service on the in-process backend.
 """
 import contextlib
+import io
 import json
 import sys
 import unittest
@@ -109,8 +110,20 @@ class Base(test_coordinator_grant.Grants):
 class CoordinatorGrantTests(Base):
     def test_a_grant_whose_save_fails_is_not_in_force_nor_written_later(self):
         task, contribution = self.deliver(self.tokens['carl'])
-        with self.failing():
+        # Only the grant's own save fails: an unconditional fault was spent by the authentication's
+        # last-use stamp, and the grant was never attempted (review of .487 F6).
+        granted = lambda state: self.agent_id in (state.get('coordinator_grants') or {}).get(self.project, {})
+        reached = []
+        real = self.service.grant_coordinator
+
+        def grant_coordinator(*args, **kwargs):
+            reached.append(True)
+            return real(*args, **kwargs)
+        with mock.patch.object(self.service, 'grant_coordinator', side_effect=grant_coordinator), \
+                self.failing(when=granted) as fault:
             failed = self.grant()
+        self.assertEqual([True], reached)
+        self.failed(failed, fault)
         self.assertEqual(500, failed.status, failed.data)
         self.assertNotIn(self.agent_id, (self.service.state.get('coordinator_grants') or {}).get(self.project, {}))
         self.unrelated_save()
@@ -125,11 +138,14 @@ class CoordinatorGrantTests(Base):
     def test_a_grant_whose_save_waited_too_long_for_the_lock_is_not_in_force(self):
         task, contribution = self.deliver(self.tokens['carl'])
         granted = lambda state: self.agent_id in (state.get('coordinator_grants') or {}).get(self.project, {})
+        self.assertIsNone(self.service.store.unsaved_since)
         with self.failing(TimeoutError('the state lock is held'), when=granted) as fault:
             failed = self.grant()
         self.assertEqual(0, fault.count, 'the grant\'s own save did not fail')
         self.assertNotIn(failed.status, (200, 201), failed.data)
         self.assertNotIn(self.agent_id, (self.service.state.get('coordinator_grants') or {}).get(self.project, {}))
+        # Memory equals the file again, so the lock wait's unsaved mark went with the grant (review of .487 F5).
+        self.assertIsNone(self.service.store.unsaved_since)
         self.unrelated_save()
         self.assertNotIn(self.agent_id, (self.on_disk().get('coordinator_grants') or {}).get(self.project, {}))
         self.assertEqual(403, self.approve(self.agent, task, contribution).status)
@@ -476,9 +492,13 @@ class WideningTests(Base):
         tests/test_http_project_create.py HeldLockTests). Undoing it would leave a host project nobody owns."""
         principal = self.service.authenticate(self.admin)
         known = lambda state: 'newproj' in state['projects']
-        with self.assertRaises(OSError), self.failing(when=known) as fault:
+        with self.assertRaises(OSError) as raised, self.failing(when=known) as fault:
             self.service.register_host_created(principal, 'newproj', 'Newproj', {'adopted': True})
         self.assertEqual(0, fault.count)
+        # Kept, and said to be kept: marked unsaved, and the route's _mutate audits it committed-unsaved
+        # (review of .487 F4b).
+        self.assertTrue(getattr(raised.exception, 'kept_narrowing', False))
+        self.assertIsNotNone(self.service.store.unsaved_since)
         self.assertIn('newproj', self.service.state['projects'])
         self.assertEqual({self.ids_admin(): 'owner'}, self.service.state['memberships']['newproj'])
         self.unrelated_save()
@@ -635,6 +655,164 @@ class InterleavingAndReloadTests(Base):
         self.assertFalse(gone(self.reloaded()), 'a reload would have held the narrowing: the documented limit changed')
         self.assertNotIn(('agents.coordinator.revoke', 'committed-unsaved'), self.audit_actions(self.reloaded()))
         self.assertGreaterEqual(failed.status, 500, failed.data)
+
+
+class UpdateAgentTests(Base):
+    """The two update_agent widenings the r1 tests did not reach (review of .487 F6, mutants M17 and M18)."""
+
+    def test_a_re_enable_whose_save_fails_is_undone(self):
+        path = '/v1/agents/%s' % self.agent_id
+        enabled = lambda state: state['agents'][self.agent_id].get('enabled')
+        self.assertEqual(200, self.request('PATCH', path, {'enabled': False}, token=self.tokens['cora']).status)
+        self.assertEqual(401, self.agent_me(self.agent))
+        before = self.committed()
+        with self.failing(when=enabled) as fault:
+            failed = self.request('PATCH', path, {'enabled': True}, token=self.tokens['cora'])
+        self.failed(failed, fault)
+        self.assertFalse(enabled(self.service.state))
+        self.assertIsNone(self.service.store.unsaved_since)
+        self.unrelated_save()
+        self.assertFalse(enabled(self.on_disk()))
+        self.assertEqual(before, self.committed())
+        self.assertNotEqual(201, self.request('POST', path + '/credentials', {}, token=self.tokens['cora']).status)
+        self.assertEqual(200, self.request('PATCH', path, {'enabled': True}, token=self.tokens['cora']).status)
+        self.assertTrue(enabled(self.on_disk()))
+
+    def test_a_claim_limit_raised_from_none_whose_save_fails_is_undone_exactly(self):
+        path = '/v1/agents/%s' % self.agent_id
+        record = lambda state: state['agents'][self.agent_id]
+        prior = dict(record(self.service.state))
+        default = http_auth.claim_limit.default_limit(prior)
+        with self.failing(when=lambda state: record(state).get('claim_limit') == default + 3) as fault:
+            failed = self.request('PATCH', path, {'claim_limit': default + 3}, token=self.tokens['cora'])
+        self.failed(failed, fault)
+        self.assertEqual(prior, record(self.service.state))
+        self.assertIsNone(self.service.store.unsaved_since)
+        self.unrelated_save()
+        self.assertEqual(prior.get('claim_limit'), record(self.on_disk()).get('claim_limit'))
+        self.assertEqual(200, self.request('PATCH', path, {'claim_limit': default + 3}, token=self.tokens['cora']).status)
+        self.assertEqual(default + 3, record(self.on_disk())['claim_limit'])
+
+    def test_a_project_added_whose_save_waited_too_long_leaves_no_unsaved_mark(self):
+        beta = WideningTests.other_project(self, 'Beta')
+        path = '/v1/agents/%s' % self.agent_id
+        projects = lambda state: state['agents'][self.agent_id]['projects']
+        self.assertIsNone(self.service.store.unsaved_since)
+        with self.failing(TimeoutError('the state lock is held'), when=lambda state: beta in projects(state)) as fault:
+            failed = self.request('PATCH', path, {'projects': [self.project, beta]}, token=self.tokens['cora'])
+        self.failed(failed, fault)
+        self.assertEqual([self.project], projects(self.service.state))
+        # Memory equals the file, so the lock wait's unsaved mark went with the change (review of .487 F5).
+        self.assertIsNone(self.service.store.unsaved_since)
+
+
+class AuditCapTests(Base):
+    """At the audit cap, an undone widening leaves no event of itself behind (review of .487 F1)."""
+
+    LIMIT = 60
+
+    def fill(self):
+        audit = self.service.state['audit']
+        while len(audit) < self.LIMIT:
+            audit.append({'time': '2026-01-01T00:00:00Z', 'request_id': None, 'user_id': None, 'actor': None,
+                          'credential_id': None, 'project_id': None, 'action': 'filler', 'outcome': 'committed',
+                          'reason': None})
+
+    def test_update_agent_adding_a_project_at_the_cap(self):
+        beta = WideningTests.other_project(self, 'Beta')
+        path = '/v1/agents/%s' % self.agent_id
+        projects = lambda state: state['agents'][self.agent_id]['projects']
+        granted = lambda state: [e for e in state['audit'] if e['action'] == 'agents.project.granted'
+                                 and e.get('project_id') == beta]
+        with mock.patch.object(http_auth, 'AUDIT_LIMIT', self.LIMIT):
+            self.fill()
+            with self.failing(when=lambda state: beta in projects(state)) as fault:
+                failed = self.request('PATCH', path, {'projects': [self.project, beta]}, token=self.tokens['cora'])
+            self.failed(failed, fault)
+            self.assertEqual([self.project], projects(self.service.state))
+            self.assertEqual([], granted(self.service.state))
+            self.assertLessEqual(len(self.service.state['audit']), self.LIMIT)
+            self.unrelated_save()
+            self.assertEqual([], granted(self.on_disk()))
+            self.assertEqual(200, self.request('PATCH', path, {'projects': [self.project, beta]},
+                                               token=self.tokens['cora']).status)
+            self.assertEqual(1, len(granted(self.on_disk())))
+
+    def test_a_coordinator_grant_at_the_cap(self):
+        granted = lambda state: self.agent_id in (state.get('coordinator_grants') or {}).get(self.project, {})
+        with mock.patch.object(http_auth, 'AUDIT_LIMIT', self.LIMIT):
+            self.fill()
+            with self.failing(when=granted) as fault:
+                failed = self.grant()
+            self.failed(failed, fault)
+            self.assertFalse(granted(self.service.state))
+            self.unrelated_save()
+            self.assertNotIn(('agents.coordinator.grant', 'committed'), self.audit_actions(self.on_disk()))
+            self.assertLessEqual(len(self.on_disk()['audit']), self.LIMIT)
+
+
+class AfterTheReplaceTests(Base):
+    """Nothing after the atomic replace makes a save raise (review of .487 F2)."""
+
+    class Stderr(io.StringIO):
+        def write(self, text):
+            if 'saved again' in text:
+                raise BrokenPipeError(32, 'Broken pipe')
+            return super().write(text)
+
+    def test_a_broken_log_stream_after_the_replace_leaves_a_saved_grant_saved(self):
+        task, contribution = self.deliver(self.tokens['carl'])
+        granted = lambda state: self.agent_id in (state.get('coordinator_grants') or {}).get(self.project, {})
+        self.service.store.unsaved_since = self.service.store.clock()     # as an earlier lock wait leaves it
+        with mock.patch.object(sys, 'stderr', self.Stderr()):
+            answer = self.grant()
+        self.assertEqual(200, answer.status, answer.data)
+        self.assertIsNone(self.service.store.unsaved_since)
+        self.assertTrue(granted(self.service.state))
+        self.assertTrue(granted(self.on_disk()))
+        self.assertIn(('agents.coordinator.grant', 'committed'), self.audit_actions())
+        self.assertEqual(201, self.approve(self.agent, task, contribution).status)
+
+    def test_a_lock_release_that_raises_after_the_write_is_a_saved_state(self):
+        real = http_auth.file_lock
+
+        @contextlib.contextmanager
+        def releasing_badly(*args, **kwargs):
+            with real(*args, **kwargs):
+                yield
+            raise OSError(5, 'Input/output error')
+        self.service.state['cursor_key'] = 'after-the-replace'
+        with mock.patch.object(http_auth, 'file_lock', side_effect=releasing_badly):
+            self.service.store.save()
+        self.assertEqual('after-the-replace', self.on_disk()['cursor_key'])
+
+    def test_a_failure_before_the_replace_still_raises(self):
+        self.service.state['cursor_key'] = 'before-the-replace'
+        with mock.patch.object(http_auth.os, 'replace', side_effect=OSError(28, 'No space left on device')):
+            with self.assertRaises(OSError):
+                self.service.store.save()
+        self.assertNotEqual('before-the-replace', self.on_disk()['cursor_key'])
+
+
+class AgentCredentialRevokeTests(Base):
+    def test_a_revoke_whose_save_fails_holds_and_is_audited_as_unsaved(self):
+        """Kept like every narrowing, and its event says so (review of .487 F4a)."""
+        credential_id = next(key for key, value in self.service.state['credentials'].items()
+                             if value.get('agent_id') == self.agent_id and not value.get('revoked'))
+        revoked = lambda state: state['credentials'].get(credential_id, {}).get('revoked') is True
+        events = lambda state: [e['outcome'] for e in state['audit'] if e['action'] == 'agents.credentials.revoked'
+                                and e.get('target_credential_id') == credential_id]
+        with self.failing(when=revoked) as fault:
+            failed = self.request('POST', '/v1/agents/%s/credentials/%s/revoke' % (self.agent_id, credential_id),
+                                  {}, token=self.tokens['cora'])
+        self.failed(failed, fault)
+        self.assertTrue(revoked(self.service.state))
+        self.assertEqual(['committed-unsaved'], events(self.service.state))
+        self.assertIsNotNone(self.service.store.unsaved_since)
+        self.assertEqual(401, self.agent_me(self.agent))
+        self.unrelated_save()
+        self.assertTrue(revoked(self.on_disk()))
+        self.assertEqual(['committed-unsaved'], events(self.on_disk()))
 
 
 if __name__ == '__main__':

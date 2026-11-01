@@ -936,13 +936,26 @@ class Store:
         # authority change persisted here (revocation, membership, disable) is either
         # committed before the endpoint's check or serialized after the effect.
         with self.lock:
+            written = False
             try:
                 with file_lock(str(self.path) + '.lock', timeout=wait):
                     self._write()
+                    written = True
             except TimeoutError:
+                if written:
+                    return
                 # Whatever this save was to write is in memory only, until a save succeeds.
                 if self.unsaved_since is None:
                     self.unsaved_since = self.clock()
+                raise
+            except Exception:
+                # Once the atomic replace is done the file holds this state, so the save has
+                # succeeded, whatever releasing the lock afterwards raises. A caller that took a
+                # widening back on this exception would leave memory narrower than the file, and
+                # the grant the owner saw fail would return at the next restart (review of
+                # kittrial-5bb.487 F2). So a save raises only BEFORE the replace.
+                if written:
+                    return
                 raise
 
     def _write(self):
@@ -962,15 +975,20 @@ class Store:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self.path)
-            if self.unsaved_since is not None:
-                self.unsaved_since = None
-                print('The state is saved again; what was kept in memory is written.', file=sys.stderr, flush=True)
         except BaseException:
             try:
                 os.unlink(temporary)
             except OSError:
                 pass
             raise
+        # Saved. Nothing after the replace may raise (review of kittrial-5bb.487 F2): a log stream
+        # that is closed or broken must not turn a written state into a failed save.
+        if self.unsaved_since is not None:
+            self.unsaved_since = None
+            try:
+                print('The state is saved again; what was kept in memory is written.', file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass
 
 
 # --------------------------------------------------------------------------- service
@@ -1050,9 +1068,9 @@ _ABSENT = object()
 class _Widening:
     """What one authority-WIDENING mutation wrote, so a failed save can take it back (kittrial-5bb.487).
 
-    ``Store.save`` fails only before its atomic replace (the state lock timed out, or the
-    temporary could not be written or renamed), so when it raises nothing of this change is
-    on disk. Leaving the change in memory made it durable with the next unrelated save, with
+    ``Store.save`` raises only before its atomic replace (the state lock timed out, or the
+    temporary could not be written or renamed; what follows the replace cannot fail it), so
+    when it raises nothing of this change is on disk. Leaving the change in memory made it durable with the next unrelated save, with
     no audit entry, and in force at once: a coordinator grant whose save failed authorised
     approvals (Fable audit .482 F1). The rule is the one ``create_project`` already follows
     (kittrial-5bb.255) and docs/HTTP_MUTATION_PERSISTENCE.md states: a failed save takes a
@@ -1070,6 +1088,11 @@ class _Widening:
         self.service = service
         self.entries = []
         self.audit_start = len(service.state['audit'])
+        # A lock wait that ran out marks the state unsaved; once this change is undone memory is
+        # what it was, so the mark it set is taken back too (review of .487 F5), unless the
+        # change also kept a narrowing.
+        self.unsaved_before = service.store.unsaved_since
+        self.kept = False
         self.saved = False
 
     def remember(self, container, key):
@@ -1090,6 +1113,7 @@ class _Widening:
             self.service.store.save()
         except Exception as error:
             if keeps_narrowing:
+                self.kept = True
                 try:
                     error.kept_narrowing = True
                 except AttributeError:
@@ -1109,6 +1133,8 @@ class _Widening:
         refusals = [event for event in audit[self.audit_start:] if event.get('outcome') in ('denied', 'rejected')]
         del audit[self.audit_start:]
         audit.extend(refusals)
+        if not self.kept and not refusals:
+            self.service.store.unsaved_since = self.unsaved_before
 
 
 class Service:
@@ -1371,9 +1397,9 @@ class Service:
         one it was before (500, or "cannot say" for a lock wait) and is true: nothing was done.
         An exception after a successful save undoes nothing.
         """
-        change = _Widening(self)
-        self._audit_defer_trim += 1
+        self._audit_defer_trim += 1     # before _Widening reads the audit's length (review of .487 F1)
         try:
+            change = _Widening(self)
             yield change
         except BaseException:
             if not change.saved:
@@ -1579,7 +1605,8 @@ class Service:
             grant = project_grant(user)
             # Not taken back on a failed save (kittrial-5bb.487): the host has already created the project, so
             # this records a fact rather than granting anything new; kept in memory, the creator's same request
-            # registers it again (kittrial-5bb.156, tests/test_http_project_create.py HeldLockTests).
+            # registers it again (kittrial-5bb.156, tests/test_http_project_create.py HeldLockTests). Kept the
+            # way a narrowing is: marked unsaved and audited ``committed-unsaved`` (review of .487 F4b).
             self.state['projects'][project_id] = {
                 'id': project_id, 'name': name, 'created_by': principal.user_id,
                 'created_at': now_iso(self._now()), 'archived': False,
@@ -1590,7 +1617,7 @@ class Service:
                                  'granted_by': None if user.get('superuser') else (grant or {}).get('granted_by')},
             }
             self.state['memberships'][project_id] = {principal.user_id: 'owner'}
-            self.store.save()
+            self._save_narrowing()
             return self.project_view(principal, project_id)
 
     def change_password(self, principal, user_id, current_password, new_password):
@@ -4815,8 +4842,15 @@ class Service:
                         self.store.unsaved_since = self.store.clock()
                 else:
                     self.store.unsaved_since = unsaved
-            elif not saved[0] and not isinstance(error, HttpError) and self.store.unsaved_since is None:
-                self.store.unsaved_since = self.store.clock()
+            elif not saved[0] and not isinstance(error, HttpError):
+                # A revocation that could not be saved keeps its effect; its event says so, as a kept
+                # narrowing's does everywhere else (review of kittrial-5bb.487 F4a). The next save
+                # writes both.
+                for event in self.state['audit'][audit_start:]:
+                    if event.get('outcome') == 'committed' and event.get('action') == 'agents.credentials.revoked':
+                        event['outcome'] = 'committed-unsaved'
+                if self.store.unsaved_since is None:
+                    self.store.unsaved_since = self.store.clock()
             raise
         finally:
             self._audit_defer_trim -= 1
@@ -5053,51 +5087,67 @@ class Service:
             # effect (kittrial-5bb.487): projects added, a re-enable, a higher claim limit.
             was_enabled = bool(agent.get('enabled'))
             enabling = changes.get('enabled') is True and not was_enabled
-            limit_before = agent.get('claim_limit')
             raising = ('claim_limit' in changes and
                        claim_limit.default_limit(dict(agent, claim_limit=changes['claim_limit']))
                        > claim_limit.default_limit(agent))
-            audit_start = len(self.state['audit'])
-            agent.update(changes)
-            self._audit_project_grants(principal, agent, added, request_id)
-            if 'role' in payload:
-                clean_role = validate_agent_role(payload.get('role'))
-                if clean_role is None:
-                    agent.pop('role', None)
-                else:
-                    agent['role'] = clean_role
-            # An agent that leaves a project by THIS route leaves its coordinators too (review of
-            # kittrial-5bb.209): the grant stayed in the state, unseen by the project's owner, and
-            # took effect again when the project was put back, with no owner's decision.
-            self._end_coordinator_grants(agent, left, principal, request_id,
-                                         'the agent\'s projects were changed (PATCH /v1/agents)')
-            if changes.get('enabled') is False:
-                self._revoke_agent_credentials(agent)
-            if not (added or enabling or raising):
-                self._save_narrowing()
-                return self.agent_view(agent, principal)
+            # The trim waits from BEFORE the audit's length is taken: at the cap the grant events
+            # appended below would otherwise push older events out, sit below ``audit_start`` and
+            # survive the undo of the grants they describe (review of kittrial-5bb.487 F1).
             self._audit_defer_trim += 1
             try:
-                self.store.save()
-            except Exception as error:
-                agent['projects'] = [pid for pid in (agent.get('projects') or []) if pid not in added]
-                if enabling:
-                    agent['enabled'] = was_enabled
-                if raising:
-                    agent['claim_limit'] = limit_before
-                audit = self.state['audit']
-                grants = [event for event in audit[audit_start:] if event.get('action') == 'agents.project.granted'
-                          and event.get('agent_id') == agent['id'] and event.get('project_id') in added]
-                for event in grants:
-                    audit.remove(event)
-                if left or changes.get('enabled') is False or ('claim_limit' in changes and not raising):
-                    try:
-                        error.kept_narrowing = True
-                    except AttributeError:
-                        pass
-                    if self.store.unsaved_since is None:
-                        self.store.unsaved_since = self.store.clock()
-                raise
+                unsaved_before = self.store.unsaved_since
+                agent_before = copy.deepcopy(agent)
+                audit_start = len(self.state['audit'])
+                agent.update(changes)
+                self._audit_project_grants(principal, agent, added, request_id)
+                if 'role' in payload:
+                    clean_role = validate_agent_role(payload.get('role'))
+                    if clean_role is None:
+                        agent.pop('role', None)
+                    else:
+                        agent['role'] = clean_role
+                # An agent that leaves a project by THIS route leaves its coordinators too (review of
+                # kittrial-5bb.209): the grant stayed in the state, unseen by the project's owner, and
+                # took effect again when the project was put back, with no owner's decision.
+                self._end_coordinator_grants(agent, left, principal, request_id,
+                                             'the agent\'s projects were changed (PATCH /v1/agents)')
+                if changes.get('enabled') is False:
+                    self._revoke_agent_credentials(agent)
+                if not (added or enabling or raising):
+                    self._save_narrowing()
+                    return self.agent_view(agent, principal)
+                try:
+                    self.store.save()
+                except Exception as error:
+                    agent['projects'] = [pid for pid in (agent.get('projects') or []) if pid not in added]
+                    if enabling:
+                        if 'enabled' in agent_before:
+                            agent['enabled'] = agent_before['enabled']
+                        else:
+                            agent.pop('enabled', None)
+                    if raising:
+                        if 'claim_limit' in agent_before:
+                            agent['claim_limit'] = agent_before['claim_limit']
+                        else:
+                            agent.pop('claim_limit', None)
+                    audit = self.state['audit']
+                    grants = [event for event in audit[audit_start:] if event.get('action') == 'agents.project.granted'
+                              and event.get('agent_id') == agent['id'] and event.get('project_id') in added]
+                    for event in grants:
+                        audit.remove(event)
+                    if agent != agent_before or len(audit) != audit_start:
+                        # Something else of this change holds (a removal, a disable, a lower limit, a
+                        # role or folder): kept in memory, marked unsaved and audited as such.
+                        try:
+                            error.kept_narrowing = True
+                        except AttributeError:
+                            pass
+                        if self.store.unsaved_since is None:
+                            self.store.unsaved_since = self.store.clock()
+                    elif len(audit) == audit_start:
+                        # Nothing of this change is left in memory: a lock wait's unsaved mark goes too (F5).
+                        self.store.unsaved_since = unsaved_before
+                    raise
             finally:
                 self._audit_defer_trim -= 1
                 if not self._audit_defer_trim and len(self.state['audit']) > AUDIT_LIMIT:
