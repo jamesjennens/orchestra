@@ -24,11 +24,45 @@ names exactly the authorized projects covered.
 
 Send `since=FINGERPRINT` from the previous reply to receive `changed: false` when
 the fact is unchanged, or `true` when it differs. Invalid fingerprints or forms
-are refused. This does not block, sleep, acknowledge any work or schedule a poll:
-the Bridge or caller decides when to read again. The coordinator projection and
+are refused. Without `timeout` this does not block, sleep, acknowledge any work or
+schedule a poll: the Bridge or caller decides when to read again. The coordinator projection and
 its trigger rules are shared with the CLI unchanged. The default worker form
 remains the agent's own work read. The generated `.orchestra/AGENT.md` describes
 both roles and uses the existing secret-safe curl credential file.
+
+### Blocking form and comment wakes (kittrial-5bb.457)
+
+`timeout=SECONDS` (whole seconds, 0..50, default 0 = today's read) holds the request on the
+server until the fingerprint differs from `since`, then answers at once with `changed: true`;
+at the bound it answers `changed: false`. The bound is soft: it counts from the first backend
+read (not from authentication or admission, which come before it), and the server only starts a
+pass when the slowest pass so far still fits in the time left, but it cannot interrupt a read
+that is running. A read that is slower than every earlier one, or a loaded backend, can
+therefore make the request last longer than `timeout` (no new pass starts after the bound, but
+the last read can run past it); `wait.seconds` reports how long the request really held. The reply carries `wait`: `blocked`, `timed_out` and `seconds`. A read
+without `since` (a baseline) never blocks. The server re-reads every 5 seconds, or every four
+times the cost of a read when that is longer, so a slow backend is read less often, never more.
+It holds no lock, transaction or backend connection between passes, so writers are never kept
+waiting. Each pass judges the credential and the grant afresh: a revoked credential or a lost
+grant ends the wait with that refusal and nothing further is read. A client that hangs up ends
+the loop at once (the socket is watched while it sleeps). At most 20 waits are held per service
+and one per credential; beyond either the route answers at once with today's read and
+`wait: {blocked: false, reason: busy}`, and the caller waits itself and calls again. Each held
+wait occupies one of the service's 200 connection slots and one request thread, so 20 waiters
+leave 180 slots for everything else.
+
+`comments=others` adds the newest 20 comments by anybody but the caller to the answer and
+folds them into the fingerprint: `comments` lists pointers (`task`, `comment`, `author`, `at`;
+never the text) for every task of the project, unassigned and closed ones included, and for the
+projects the caller coordinates only. "Own" is the caller's actor and its sub-labels; another
+actor of the same person wakes it. Reference, proposal and lane-state record comments are not
+comments anybody wrote to the coordinator. The pointers are read from the same export rows as
+the rest of the wait, never from the paged history. Without the parameter the fingerprint is
+byte-identical to the CLI's. Unsettled notes (kittrial-5bb.447) fold into the fingerprint as
+before, so a note wakes a blocked wait. To read a pointed-at comment use
+`GET /v1/projects/PROJECT/tasks/TASK/history?recent=10` (newest first): the default order of
+`/history` is oldest first, a long comment is several entries and a page holds at most 75
+entries, so reading only its first page misses new comments on a busy task.
 
 ## Guidance and onboarding disclosure
 
@@ -2234,11 +2268,16 @@ that account made, and every worker credential that account issued. From the nex
   agent of the account that issued a worker credential can no longer recommend work
   delivered under it (with the setting off that work is nobody's, and it can). My work's
   `to_review` holds only work the caller may actually approve: a contribution of the
-  caller's own party is left out of that list, since approving it would be refused
-  (the project's review queue still lists every row for everybody, with no per-caller
-  mark). The refusal of a recommendation names the worker credential as one of its reasons,
-  in both directions: work delivered under a credential the person issued, and a credential
-  the person issued recommending that person's own work.
+  caller's own party is left out of that list in every review state (`awaiting-review`,
+  `legacy-review-ready`, `awaiting-integration` and `approved`), since approving it would
+  be refused. The response's `to_review_note` and the page disclose that omission (the
+  field is null with the setting off). The project's review queue still lists every row
+  for everybody, with no per-caller mark, so the owner can open an own-party row there
+  and request changes on it. The refusal of a recommendation ends by refusing "anything
+  else of the same party as the author or the assignee": that covers a credential of the
+  agent owner's account, another credential of the account whose credential delivered the
+  work, and every account, agent or credential of the assignee's party, as well as the two
+  worker-credential directions named earlier in the sentence.
 
 **Whose party a name is.**
 
@@ -2711,8 +2750,10 @@ screen at a time: a short title, at most two short sentences, the screen's one a
 choice, or one command with its Copy button) and `Back` / `Next`; any explanation is behind a
 collapsed "More about this". Only the current screen is in the dialog, so another screen's command
 is absent, not hidden. The first screen chooses the **operating system** (`Windows (PowerShell)`,
-`macOS`, `Linux`, auto-detected from `navigator`) and whether that computer's VS Code has
-**Orchestra Bridge 0.14 or later**; the second chooses what the agent does (worker first; reviewer
+`macOS`, `Linux`, auto-detected from `navigator`) and what the agent runs in (`kittrial-5bb.456`:
+VS Code with **Orchestra Bridge 0.14 or later**, VS Code with an older Bridge or none yet, or **No Bridge**:
+Claude Code, Codex, a command-line agent, which takes the longer path without the *Set up in VS Code*
+screen; `screenPlan({vscode: false})`); the second chooses what the agent does (worker first; reviewer
 also gets other people's deliveries). The rest of the screens are `screenPlan()` in
 `web/js/agentSetup.js`:
 

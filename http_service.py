@@ -1222,9 +1222,9 @@ class InProcessBackend:
             task['version'] += 1
             self._event(project_id, task['id'], 'contribution', principal, record['actor'])
             # The canonical answer's additive `open_items` and `open_items_total` (kittrial-5bb.431,
-            # .435). This backend caps each request at 20 items but not their sum, so more than 20 can be
-            # open: it counts and words the warning from every one, with this task's route, and cuts only
-            # the list.
+            # .435, .436). Like the canonical projection, this backend refuses a request-changes that
+            # would leave more than 20 unresolved blocking items on the task; `open_items_total` is
+            # still counted before slicing to `OPEN_ITEMS_MAX`.
             from review_state import OPEN_ITEMS_MAX, open_items_warnings
             every = [{'request': r['request'], 'item': r['id'], 'contribution': r['contribution']}
                      for r in still_open]
@@ -1244,21 +1244,36 @@ class InProcessBackend:
             raise conflict('A newer contribution arrived; reread the task before reviewing',
                            {'current_contribution': current[-1]['id']})
         actor = payload.get('actor') or principal.actor
+        summary = (payload.get('summary') or '')[:1200]
+        operation_id = payload.get('operation_id')
         items, resolutions = [], []
         if operation == 'request-changes':
-            items = self._review_items(payload.get('items'))
+            items = self._review_items(payload.get('items'), allow_severity=True)
+            if isinstance(operation_id, str) and operation_id:
+                for stored in contributions:
+                    if stored.get('kind') != 'request-changes' or stored.get('operation_id') != operation_id:
+                        continue
+                    if stored.get('actor') == actor and stored.get('contribution_id') == current[-1]['id'] \
+                            and stored.get('summary') == summary and stored.get('items') == items:
+                        return {'review': stored, 'task_version': task['version']}
+                    raise invalid('Operation ID already used with different payload or actor')
+            blocking = [i for i in items if i.get('severity') != 'note'] if items else (
+                [{'id': 'item-1', 'text': summary}] if summary else [])
+            if len(self._requests(contributions, True)) + len(blocking) > 20:
+                raise invalid('At most 20 unresolved review items are allowed')
         elif operation == 'respond':
             # Canonical rule (review_workflow.execute): only the current assignee may
             # respond, and every resolution must name a still-open request item.
             if not task.get('assignee') or actor != task['assignee']:
                 raise forbidden('Only the task assignee may respond to requested changes')
             resolutions = self._resolutions(payload.get('resolutions'),
-                                            self._requests(contributions, True))
+                                            [r for r in self._requests(contributions) if r['status'] == 'open'])
         elif operation == 'approve' and self._requests(contributions, True):
-            raise conflict('Cannot approve while requested changes remain unresolved')
+            from review_workflow import unresolved_changes_approval_refusal
+            raise conflict(unresolved_changes_approval_refusal(task.get('assignee')))
         record = {'id': 'rev_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': operation,
                   'contribution_id': current[-1]['id'],
-                  'summary': (payload.get('summary') or '')[:1200],
+                  'summary': summary,
                   'items': items,
                   'actor': actor,
                   'created_at': now_iso(self.service._now())}
@@ -1268,6 +1283,8 @@ class InProcessBackend:
             # rule (a later revision resolves them), so older disposable state reads
             # the same as before.
             record['needs_respond'] = True
+            if isinstance(operation_id, str) and operation_id:
+                record['operation_id'] = operation_id
         if operation == 'respond':
             record['resolutions'] = resolutions
         contributions.append(record)
@@ -1412,6 +1429,8 @@ class InProcessBackend:
                 entry = {'id': item['id'], 'request': record['id'], 'text': item['text'],
                          'contribution': record['contribution_id'], 'author': record['actor'],
                          'at': record['created_at'], 'status': 'open', 'resolution': None}
+                if item.get('severity') == 'note':
+                    entry['severity'] = 'note'
                 answer = resolved.get((record['id'], item['id']))
                 if answer is not None:
                     entry.update(status='resolved', resolution=answer['reason'],
@@ -1421,7 +1440,7 @@ class InProcessBackend:
                     entry.update(status='resolved', resolution='Addressed in revision %d'
                                  % (contributions.index(later[0]) + 1))
                 found.append(entry)
-        return [r for r in found if r['status'] == 'open'] if open_only else found
+        return [r for r in found if r['status'] == 'open' and r.get('severity') != 'note'] if open_only else found
 
     @staticmethod
     def _resolutions(raw, open_requests):
@@ -1453,7 +1472,7 @@ class InProcessBackend:
         return clean
 
     @staticmethod
-    def _review_items(raw):
+    def _review_items(raw, allow_severity=False):
         """Normalize requested-change items: plain strings or canonical ``{id, text}``."""
         if raw is None:
             return []
@@ -1467,7 +1486,13 @@ class InProcessBackend:
                     not item['text'].strip() or len(item['text']) > 1000 or \
                     not isinstance(item.get('id'), str) or not SAFE_ID.fullmatch(item['id']):
                 raise invalid('Each review item needs an id and 1-1000 characters of text')
-            items.append({'id': item['id'], 'text': item['text'].strip()})
+            entry = {'id': item['id'], 'text': item['text'].strip()}
+            if allow_severity and item.get('severity') is not None:
+                if item.get('severity') not in ('blocking', 'note'):
+                    raise invalid('Review item severity must be blocking or note')
+                if item['severity'] == 'note':
+                    entry['severity'] = 'note'
+            items.append(entry)
         return items
 
     def _feedback_add(self, principal, project_id, payload):
@@ -1709,7 +1734,7 @@ class InProcessBackend:
                 'recommendation_keys': [{'author': record['actor'], 'operation_id': record.get('operation_id')}
                                         for record in records_standing],
                 'requests': requests,
-                'open_requests': sum(1 for r in requests if r['status'] == 'open'),
+                'open_requests': sum(1 for r in requests if r['status'] == 'open' and r.get('severity') != 'note'),
                 'latest_id': records[-1]['id'] if records else None,
                 'latest_at': records[-1]['created_at'] if records else None,
                 'revisions': len(contributions)}
@@ -2007,7 +2032,7 @@ class InProcessBackend:
         return lanes_read(rows, actor, {'schema_version': 1, 'records': {}}, list(args),
                           journal=None, scope=scope)
 
-    def coordinator_wait(self, project_id, principal, idle_minutes):
+    def coordinator_wait(self, project_id, principal, idle_minutes, comments=False):
         """The disposable model's queue and board at one locked state."""
         import waiting
         from lanes import LANES_LIMIT_MAX
@@ -2023,10 +2048,12 @@ class InProcessBackend:
                     assignee=row['owner'], closed=row['status'] == 'closed', claimable=item['claimable'],
                     comment_pending=attention_field(item, 'assignee_comment_pending') is True)
                 rows.append(row)
+            pointers = waiting.comment_pointers(self._project_rows(project_id), actor) if comments else None
             return waiting.coordinator_view(
                 rows,
                 self.lanes_read(project_id, principal, ['--idle-minutes', str(idle_minutes),
-                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'))
+                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'),
+                pointers)
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -3601,10 +3628,11 @@ class EndpointBackend:
             return None
         return path if path.is_dir() else None
 
-    def coordinator_wait(self, project_id, principal, idle_minutes):
+    def coordinator_wait(self, project_id, principal, idle_minutes, comments=False):
         """One canonical wait read: queue and lanes share the endpoint's export."""
         reply = self._endpoint('wait', project_id, self.service.bind_actor(principal, None),
-                               ['--coordinator', '--idle-minutes', str(idle_minutes)],
+                               ['--coordinator', '--idle-minutes', str(idle_minutes)]
+                               + (['--comments-others'] if comments else []),
                                authority=authority_request(principal, project_id, CAP_COORDINATE,
                                                            now=self.service._expiry_now()),
                                extra={'lanes_scope': 'all'})
@@ -5384,6 +5412,30 @@ def serves_web_guidance(routes=None):
     return read, ack
 
 
+class WaitSlots:
+    """Counts the blocking coordinator waits being held (kittrial-5bb.457)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._total = 0
+        self._by_key = {}
+
+    def take(self, key, total_cap, key_cap):
+        with self._lock:
+            if self._total >= total_cap or self._by_key.get(key, 0) >= key_cap:
+                return False
+            self._total += 1
+            self._by_key[key] = self._by_key.get(key, 0) + 1
+            return True
+
+    def release(self, key):
+        with self._lock:
+            self._total -= 1
+            self._by_key[key] -= 1
+            if not self._by_key[key]:
+                del self._by_key[key]
+
+
 class ApiHandler(BaseHTTPRequestHandler):
     """One request per call. Class attributes are supplied by :func:`build_handler`."""
 
@@ -6757,7 +6809,10 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: your own work (round 2, N6).
     NOT_INDEPENDENT_PARTY = (NOT_INDEPENDENT + '; and on this server neither can the account that issued the worker '
                              'credential it was delivered under, nor that account\'s agents, nor a worker credential '
-                             'issued by the contribution\'s author or by the task\'s assignee')
+                             'issued by the contribution\'s author or by the task\'s assignee, nor anything else of '
+                             'the same party as the author or the assignee')
+    ME_WORK_PARTY_NOTE = ('Only work you may approve is listed; own-party contributions are left out in every review '
+                          'state. Open the project review queue to request changes on one.')
 
     #: Said to an approver of the party the work belongs to (the setting of kittrial-5bb.199). Which of
     #: the three is said depends on what is true; each ends with OWN_PARTY_NEXT.
@@ -9739,7 +9794,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         from work import move_decision
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
-        refuse_ambiguous_query(urlsplit(self.path).query, ('form', 'since', 'idle_minutes'))
+        refuse_ambiguous_query(urlsplit(self.path).query, ('form', 'since', 'idle_minutes', 'timeout', 'comments'))
         # Both forms share this query, so a malformed threshold is refused even on the
         # worker form, where the value is otherwise unused (kittrial-5bb.389).
         self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
@@ -9862,11 +9917,123 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _agent_coordinator_wait(self, ctx, agent):
         """Live project grants bound this read, never the service's host identity."""
         import waiting
-        refuse_unknown_fields(ctx.query, ('form', 'since', 'idle_minutes'), 'Coordinator wait query')
+        refuse_unknown_fields(ctx.query, ('form', 'since', 'idle_minutes', 'timeout', 'comments'),
+                              'Coordinator wait query')
         since = ctx.query.get('since')
         if since is not None and not waiting.is_fingerprint(since):
             raise HttpError(400, 'invalid_request', 'since must be a wait fingerprint')
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        timeout = ctx.query.get('timeout', '0')
+        if not re.fullmatch(r'[0-9]{1,3}', timeout) or int(timeout) > self.WAIT_TIMEOUT_MAX:
+            raise HttpError(400, 'invalid_request',
+                            'timeout must be whole seconds from 0 to %d' % self.WAIT_TIMEOUT_MAX)
+        timeout = int(timeout)
+        comments = ctx.query.get('comments')
+        if comments is not None and comments != 'others':
+            raise HttpError(400, 'invalid_request', 'comments must be others')
+        began = time.monotonic()
+        view = self._coordinator_pass(ctx, agent, idle_minutes, comments is not None, since)
+        cost = time.monotonic() - began
+        # A baseline read (no since) has nothing to wait for, so it never blocks.
+        if timeout == 0 or since is None or view['changed']:
+            return 200, view
+        key = agent.get('id')
+        if not self._wait_slots.take(key, self.WAIT_GLOBAL_CAP, self.WAIT_PER_CREDENTIAL):
+            view['wait'] = {'blocked': False, 'reason': 'busy'}
+            return 200, view
+        try:
+            # A soft bound, not a hard one: the deadline counts from before the first read (not from
+            # authentication or admission), and a pass only starts when the slowest pass so far
+            # still fits in what is left. A pass slower than every earlier one, or a loaded
+            # backend, can overrun it because nothing interrupts a read. wait.seconds says so.
+            deadline = began + timeout
+            pause = self._wait_pause(deadline, cost)
+            while pause > 0:
+                # Nothing is held here: no lock, no transaction and no backend read while asleep.
+                if not self._sleep_unless_gone(pause):
+                    break
+                # Each pass re-decides the caller's authority; a revoked credential or a lost
+                # grant raises here and the wait ends with that refusal.
+                agent = self.service.agent_for_credential(ctx.principal)
+                pass_began = time.monotonic()
+                view = self._coordinator_pass(ctx, agent, idle_minutes, comments is not None, since)
+                cost = max(cost, time.monotonic() - pass_began)
+                if view['changed']:
+                    break
+                pause = self._wait_pause(deadline, cost)
+        finally:
+            self._wait_slots.release(key)
+        view['wait'] = {'blocked': True, 'timed_out': not view['changed'],
+                        'seconds': round(time.monotonic() - began, 1)}
+        return 200, view
+
+    WAIT_TIMEOUT_MAX = 50
+    WAIT_INTERVAL = 5.0
+    WAIT_GLOBAL_CAP = 20
+    WAIT_PER_CREDENTIAL = 1
+    _wait_slots = WaitSlots()
+
+    def _wait_pause(self, deadline, cost):
+        """How long to sleep before the next pass; zero or less when that pass would not fit.
+
+        Each waiter's reads take at most about a fifth of its own time: a slow backend (many waiters,
+        a big project) makes the interval longer, never the load higher."""
+        return min(max(self.WAIT_INTERVAL, 4 * cost), deadline - time.monotonic() - cost)
+
+    def _sleep_unless_gone(self, seconds):
+        """Sleep up to ``seconds``; False as soon as the client has hung up."""
+        import select
+        import socket
+        connection = getattr(self, 'connection', None)
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            left = max(end - time.monotonic(), 0.0)
+            if connection is None:
+                time.sleep(left)
+                continue
+            try:
+                # Bytes the TLS layer has decrypted already are never in front of the socket.
+                readable = [connection] if isinstance(connection, ssl.SSLSocket) and connection.pending() \
+                    else select.select([connection], [], [], left)[0]
+                if readable and isinstance(connection, ssl.SSLSocket):
+                    if self._tls_peer_gone(connection):
+                        return False
+                elif readable and socket.socket.recv(connection, 1, socket.MSG_PEEK) == b'':
+                    return False
+            except (OSError, ValueError):
+                return False
+            if readable:
+                time.sleep(min(left, 0.05))   # bytes the client sent early: not a hang-up
+        return True
+
+    def _tls_peer_gone(self, connection):
+        """Whether a readable TLS socket says the client is gone.
+
+        Peeking the raw socket sees only an encrypted record, never the close_notify in front of the
+        EOF, so the decrypting read is used, without waiting. A real byte here is a request sent
+        during the wait; it cannot be handed back, so the connection is closed after the answer."""
+        timeout = connection.gettimeout()
+        try:
+            connection.settimeout(0.0)
+            try:
+                data = connection.recv(1)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                return False       # part of a record: nothing to tell yet
+            except (OSError, ValueError):
+                return True        # reset, or an unclean end
+            if data == b'':
+                return True
+            self.close_connection = True
+            return False
+        finally:
+            try:
+                connection.settimeout(timeout)
+            except (OSError, ValueError):
+                pass
+
+    def _coordinator_pass(self, ctx, agent, idle_minutes, comments, since):
+        """One read of the coordinator wait: the grant is judged afresh for every project."""
+        import waiting
         projects = []
         for project_id in sorted(set(agent.get('projects') or [])):
             try:
@@ -9880,7 +10047,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise forbidden('A current project coordinator grant is required for coordinator wait')
         if not hasattr(self.backend, 'coordinator_wait'):
             raise not_implemented('Coordinator wait is unavailable on this server')
-        reads = [(project, self.backend.coordinator_wait(project, ctx.principal, idle_minutes))
+        extra = {'comments': True} if comments else {}
+        reads = [(project, self.backend.coordinator_wait(project, ctx.principal, idle_minutes, **extra))
                  for project in projects]
         # A one-project fingerprint is EXACTLY the CLI fact. Multiple projects have
         # an explicit project namespace, including empty projects and grant changes.
@@ -9896,15 +10064,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                     'items': [dict(row, trigger=name) for name in triggers for row in triggers[name]],
                     'fingerprint': waiting.digest([{'project': project, 'fingerprint': read['fingerprint']}
                                                    for project, read in reads])}
+            if comments:
+                view['comments'] = [dict(row, project=project) for project, read in reads
+                                    for row in read.get('comments') or []]
         view['projects'] = projects
         view['agent'] = agent.get('id')
         view['generated_at'] = now_iso(self.service._now())
+        self._fold_notes(view, self._notes_waking(ctx.principal), since)
         if since is not None:
             view['changed'] = since != view['fingerprint']
-        self._fold_notes(view, self._notes_waking(ctx.principal), since)
         view['manual_cadence'] = ('Read this route again with form=coordinator and since=FINGERPRINT; '
-                                  'it never blocks, sleeps or schedules work.')
-        return 200, view
+                                  'it never blocks unless timeout=SECONDS is given (at most %d).'
+                                  % self.WAIT_TIMEOUT_MAX)
+        return view
 
     # -- coordinator notes (kittrial-5bb.447) ---------------------------------------------------------------------
     def _notes_waking(self, principal):
@@ -14146,6 +14318,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
                         and refusal.detail.startswith('ValueError: '):
                     raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
+                if refusal.status == 422 and refusal.detail == 'ValueError: At most 20 unresolved review items are allowed':
+                    raise invalid('At most 20 unresolved review items are allowed', refusal.detail) from None
                 # So does a refused follow-on base (kittrial-5bb.158): the sentence says which
                 # base is acceptable, why this one is not and what an operator does about it.
                 sentence = EndpointBackend.base_refusal(refusal.detail) if refusal.status == 422 else None
@@ -14927,9 +15101,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         one queue read per project and at most :data:`ME_WORK_MAX_PROJECTS` projects.
         ``to_review`` lists contributions only in projects where the caller holds the
         approval capability. With the party rule on it holds only work the caller may
-        actually approve: a row of the caller's own party is left out, since approving it
-        would be refused (kittrial-5bb.199 review, N4). Computed at read time; nothing is
-        scheduled or marked.
+        actually approve: a row of the caller's own party is left out in every review state,
+        since approving it would be refused (kittrial-5bb.199 review, N4). ``to_review_note``
+        discloses that omission and points to the project queue for requesting changes;
+        it is null with the party rule off. Computed at read time; nothing is scheduled or marked.
         """
         principal = ctx.principal
         if principal.via == 'credential':
@@ -15016,6 +15191,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             for agent in agents if agent.get('owner') == principal.user_id]
         return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
                      'to_review': self._task_views(to_review[:MAX_PAGE]),
+                     'to_review_note': (self.ME_WORK_PARTY_NOTE
+                                        if self.service.approval_by_another_party else None),
                      'agents': agents, 'agent_prompts': prompts,
                      'truncated': truncated, 'unavailable': unavailable,
                      'generated_at': generated_at}

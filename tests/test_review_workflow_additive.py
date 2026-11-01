@@ -978,6 +978,33 @@ class ReviewWritesCommandTests(unittest.TestCase):
         self.assertTrue(result['audit_agrees'])
         self.assertEqual(warnings, [])
 
+    def test_mixed_damage_does_not_invent_a_stale_value_warning(self):
+        admin.review_writes_command(self.root, 'coord', 'on')
+        valid = admin.review_writes_audit(self.root)[-1]
+        (self.root / admin.REVIEW_WRITES_AUDIT).write_text(json.dumps(
+            {'schema_version': admin.REVIEW_WRITES_AUDIT_SCHEMA,
+             'entries': [valid, {'set_by': 'malformed'}]}), encoding='utf-8')
+        result, warnings = admin.review_writes_command(self.root, 'coord', 'status')
+        self.assertTrue(result['review_workflow_writes'])
+        self.assertEqual(result['audit'], valid)
+        self.assertFalse(result['audit_agrees'])
+        self.assertTrue(any('damaged' in line for line in warnings), warnings)
+        self.assertFalse(any('stale' in line for line in warnings), warnings)
+
+    def test_same_second_set_asides_keep_every_damaged_audit(self):
+        path = self.root / admin.REVIEW_WRITES_AUDIT
+        stamp = '20261031T185200Z'
+        first = path.with_name(path.name + '.damaged-' + stamp)
+        second = path.with_name(first.name + '.1')
+        for content, expected in (('first damaged bytes', first), ('second damaged bytes', second)):
+            path.write_text(content, encoding='utf-8')
+            kept = admin.keep_damaged_review_writes_audit(self.root, stamp=stamp)
+            self.assertEqual(kept, expected)
+            self.assertEqual(kept.read_text(encoding='utf-8'), content)
+            self.assertFalse(path.exists())
+        self.assertEqual(first.read_text(encoding='utf-8'), 'first damaged bytes')
+        self.assertEqual(second.read_text(encoding='utf-8'), 'second damaged bytes')
+
     def test_a_deeply_nested_audit_file_does_not_crash_status(self):
         """Removing the record_json guard makes this a RecursionError traceback."""
         admin.review_writes_command(self.root, 'coord', 'on')

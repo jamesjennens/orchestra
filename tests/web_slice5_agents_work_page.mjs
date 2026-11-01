@@ -41,11 +41,13 @@ function workCtx(myWork) {
     api: { myWork: async () => myWork,
       myContributions: async () => ({ items: [], total: 0, next_cursor: null }) } };
 }
-const fullWork = { truncated: false, unavailable: [],
+const reviewNote = 'Only work you may approve is listed; own-party contributions are left out in every review state.';
+const fullWork = { truncated: false, unavailable: [], to_review_note: reviewNote,
   assigned: [{ id: 't-1', project_id: 'alpha', title: 'Do it', status: 'open', review_state: 'none' }],
   to_review: [{ id: 't-9', project_id: 'alpha', title: 'Review me', status: 'open', review_state: 'awaiting-review' }],
   agents: [ownerAgent] };
-const emptyWork = { truncated: false, unavailable: [], assigned: [], to_review: [], agents: [] };
+const emptyWork = { truncated: false, unavailable: [], to_review_note: reviewNote,
+  assigned: [], to_review: [], agents: [] };
 const full = await workViews.home(workCtx(fullWork));
 const bare = await workViews.home(workCtx(emptyWork));
 console.log(JSON.stringify({

@@ -62,6 +62,7 @@ export async function home(ctx) {
     // block; groups with items keep their panel. Omitting the sections entirely
     // would hide where Revisions/Waiting/Assigned live.
     revisions.length ? panel('Revisions requested', revisions.length, workTable(ctx, revisions, { emptyTitle: 'No revisions requested', emptyBody: 'When a reviewer asks for changes to your work, it appears here first.' })) : h('p', { class: 'empty-line' }, 'No revisions requested.'),
+    data.to_review_note ? h('p', { class: 'small muted', 'data-to-review-note': 'true' }, data.to_review_note) : null,
     data.to_review.length ? panel('Waiting for your review', data.to_review.length, workTable(ctx, data.to_review, { emptyTitle: 'Nothing to review', emptyBody: 'Contributions to projects you own appear here until you approve them or request changes.' }), 'Stays here until you act — no reminder needed') : h('p', { class: 'empty-line' }, 'Nothing to review.'),
     assigned.length ? panel('Assigned to you', assigned.length, workTable(ctx, assigned, { emptyTitle: 'Nothing assigned', emptyBody: 'Claim a task from a project to start work on it.' })) : h('p', { class: 'empty-line' }, 'Nothing assigned.'));
 }

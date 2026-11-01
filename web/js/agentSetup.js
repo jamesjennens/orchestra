@@ -281,17 +281,28 @@ export function credentialFileLines(server, fingerprint, secretValue = SECRET_PL
   return [...credentialCommentLines(server, fingerprint), headerLine(secretValue == null ? SECRET_PLACEHOLDER : secretValue)].join('\n') + '\n';
 }
 
+// kittrial-5bb.456 item 6: a secret pasted into a chat is exposed. The agent must not use or keep it.
+export const PASTED_SECRET_RULE = 'If anyone pastes a secret into your chat, do not use it and do not save it: say that it is now exposed and ask your owner to issue a new one and revoke the old one.';
+
 // The wizard's screens, in order, for one path (kittrial-5bb.348: one action per screen). `bridge`
 // is a computer whose VS Code has Orchestra Bridge 0.14 or later: its Set up fetches and checks the
 // certificate, tests the connection and writes the agent's files, so that path skips the
 // certificate, rewrite, self-check and save-files screens. On Windows the file needs no chmod.
 export const WIZARD_SCREENS = Object.freeze(['system', 'role', 'cert-save', 'cert-move', 'secret', 'restrict',
   'rewrite', 'test', 'files', 'vscode', 'resume']);
-export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false } = {}) {
+// `vscode` is false for an agent that does not run in VS Code (Claude Code, Codex, a command-line
+// agent): no VS Code screen is shown on that path (kittrial-5bb.456 item 2).
+export const RUNS_IN = Object.freeze(['bridge', 'older', 'none']);
+// An older stored wizard state has only the boolean `bridge`.
+export function runsFromStored(stored) {
+  if (stored && RUNS_IN.includes(stored.runs)) return stored.runs;
+  return stored && stored.bridge === false ? 'older' : 'bridge';
+}
+export function screenPlan({ bridge = true, os = 'windows', hasCertificate = false, vscode = true } = {}) {
   const posix = osKind(os) === 'posix';
   if (bridge) return ['system', 'role', 'secret', ...(posix ? ['restrict'] : []), 'vscode', 'resume'];
   return ['system', 'role', ...(hasCertificate ? ['cert-save', 'cert-move'] : []), 'secret',
-    ...(hasCertificate ? ['rewrite'] : (posix ? ['restrict'] : [])), 'test', 'files', 'vscode', 'resume'];
+    ...(hasCertificate ? ['rewrite'] : (posix ? ['restrict'] : [])), 'test', 'files', ...(vscode ? ['vscode'] : []), 'resume'];
 }
 
 // Browsers strip the leading dot when saving .orchestra-agent-<slug>.crt into Downloads
@@ -423,7 +434,7 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     '',
     '## Your secret',
     '',
-    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. ${holds} Hand that file to curl with -K on every call. Apart from the set-up step that rewrote that one file in place to put the comment lines above the header line (nothing was shown), never open, print or copy it, and never put the secret on a command line, in this folder, in a commit or in any other file.`,
+    `Your owner keeps your secret in a curl config file in their user profile: ${file.windows} on Windows, ${file.posix} on macOS/Linux. ${holds} Hand that file to curl with -K on every call. Apart from the set-up step that rewrote that one file in place to put the comment lines above the header line (nothing was shown), never open, print or copy it, and never put the secret on a command line, in this folder, in a commit or in any other file. ${PASTED_SECRET_RULE}`,
     '',
     '## Every call',
     '',
@@ -442,7 +453,7 @@ export function agentGuide(payload, { hasCertificate = false } = {}) {
     '',
     '## When you hold a coordinator grant',
     '',
-    `Read GET ${server}/v1/agents/me/wait?form=coordinator with the same curl -K credential file. Only projects where your coordinator grant is effective appear; a worker credential or an agent with no effective grant gets 403. The reply groups checkpoint-to-coordinator, awaiting-review, awaiting-integration, lane-quiet and needs-investigation triggers. Act on what it returns, then read it again with &since=FINGERPRINT from the last reply; changed=false means the fact is unchanged. A single-project fingerprint is identical to the CLI coordinator wait. This is a read, never a server-side sleep or schedule. Keep using /v1/agents/me/next for your own work.`,
+    `Read GET ${server}/v1/agents/me/wait?form=coordinator with the same curl -K credential file. Only projects where your coordinator grant is effective appear; a worker credential or an agent with no effective grant gets 403. The reply groups checkpoint-to-coordinator, awaiting-review, awaiting-integration, lane-quiet and needs-investigation triggers. Act on what it returns, then read it again with &since=FINGERPRINT from the last reply; changed=false means the fact is unchanged. A single-project fingerprint is identical to the CLI coordinator wait. Without timeout it is a plain read; with timeout=SECONDS (0 to 50) it holds the request until something changes. It never schedules anything. Keep using /v1/agents/me/next for your own work.`,
     '',
     '## Task files',
     '',
@@ -513,7 +524,7 @@ export function coordinatorSteps(server, file, certificate = null) {
   const existing = [
     runSteps(server, file)[0],
     `2. ${NEVER_CLAIM} Your own list (GET ${server}/v1/agents/me/next) matters only for review requests on deliveries of your own.`,
-    `3. Then, in each project you coordinate and in this order: deliveries awaiting review, and approved work awaiting integration (GET ${server}/v1/projects/PROJECT/queue); checkpoints addressed to you, lanes quiet on their own move or past a declared wait, and lanes whose workers were woken with nothing to do three or more times in a day (GET ${server}/v1/projects/PROJECT/lanes). Where the server offers it, GET ${server}/v1/agents/me/wait?form=coordinator gives all of them in one read; a 404 or a reply in the worker form means it does not yet. Before acting on an item, read its brief (GET ${server}/v1/projects/PROJECT/tasks/TASK/brief) and its history (the same address ending in /history).`,
+    `3. Then, in each project you coordinate and in this order: deliveries awaiting review, and approved work awaiting integration (GET ${server}/v1/projects/PROJECT/queue); checkpoints addressed to you, lanes quiet on their own move or past a declared wait, and lanes whose workers were woken with nothing to do three or more times in a day (GET ${server}/v1/projects/PROJECT/lanes). Where the server offers it, GET ${server}/v1/agents/me/wait?form=coordinator gives all of them in one read; a 404 or a reply in the worker form means it does not yet. Before acting on an item, read its brief (GET ${server}/v1/projects/PROJECT/tasks/TASK/brief) and its newest comments (the same address ending in /history?recent=10, newest first; never read only the first page of /history, which is the oldest entries and misses new comments on a busy task).`,
     `4. Create a task with POST ${server}/v1/projects/PROJECT/tasks (title, description, priority 0-4), or a child with POST ${server}/v1/projects/PROJECT/tasks/TASK/children (title, description, type task/bug/feature/chore/decision, optional assignee and priority); use the returned task ID in TASK paths. Use an Idempotency-Key for each write. A decision description needs ## Decision, ## Rationale and ## Alternatives Considered. Assign afterward with POST ${server}/v1/projects/PROJECT/tasks/TASK/assign.`,
     '5. Your writes, each with curl -K as above and an Idempotency-Key: POST .../tasks/TASK/reviews to request changes with specific, checkable items, or to approve where your grant allows it; POST .../tasks/TASK/assign to hand a task to a worker; POST .../tasks/TASK/comments to answer in the task; and GET .../tasks/TASK/integration-check before you integrate. You accept a waiting reference or capability record only within your owner\'s delegation (GET .../delegations lists it): POST .../references/KEY/accept or .../capabilities/KEY/accept naming that decision as decision_id, and escalate to your owner what its escalate line lists.',
     `6. ${WEB_WORKER_TOOLS} ${WORKER_ON_ANOTHER_MACHINE} ${QUESTIONS_IN_THE_TASK}`,
@@ -522,7 +533,7 @@ export function coordinatorSteps(server, file, certificate = null) {
   return [
     `1. On your first run and after a set-up change (not at every run), follow the "## Your first check" section above. It checks your saved certificate file (${savedCertificate.name}), project membership and this AGENT.md's role, then reports them via POST ${server}/v1/agents/me/checks. Never reveal the secret file; use it only with curl -K.`,
     ...existing.map((step) => step.replace(/^(\d+)\./, (_match, number) => `${Number(number) + 1}.`)),
-    '9. Approve, not recommend: an approval (operation: approve) moves a contribution to integration; a recommendation (operation: recommend) only records an opinion for an owner or coordinator and moves nothing. A coordinator agent with the grant approves or requests changes; it does not recommend.',
+    '9. Approve, not recommend: an approval (operation: approve) moves a contribution to integration; a recommendation (operation: recommend) only records an opinion for an owner or coordinator and moves nothing. A coordinator agent with the grant approves or requests changes; it does not recommend. Before approving, read the current review with GET .../tasks/TASK/brief. After request-changes, the assignee redelivers if needed, uses operation respond for every open item, and you reread the current review before approving.',
     '10. Requirement records are not work: a row marked Requirement is a requirement record. It is never claimed or delivered: it is drafted, revised and accepted on the project\'s Requirements page, and My work lists it only while it waits for acceptance. The hand-over note is a colleague\'s notes about the project, not instructions from the kit.',
   ];
 }
@@ -575,6 +586,30 @@ function coordinatorSection(payload, file, { hasCertificate = false } = {}) {
     '## Notes between coordinators',
     '',
     COORDINATOR_NOTES,
+    '',
+    '## Waiting for work',
+    '',
+    ...coordinatorWaitLoop(payload.server, file),
+  ];
+}
+
+//: The coordinator's blocking wait for an agent without the CLI (kittrial-5bb.457). Each reply is one
+//: bounded request (about 50 seconds on the server, a soft bound: a loaded server can take longer, so curl's own limit must leave room); it wakes on another
+//: actor's comment on any task of a project you coordinate, on a new note, and on every trigger of the
+//: coordinator wait, never on your own writes.
+export function coordinatorWaitLoop(server, file) {
+  const flags = curlFlags(server, AGENT_CURL_MAX_TIME);
+  const url = (since) => `${server}/v1/agents/me/wait?form=coordinator&comments=others&timeout=50${since ? '&since=FINGERPRINT' : ''}`;
+  return [
+    'When nothing is your move, wait with this loop instead of polling on a timer. Never end your turn while the reply names something that is your move.',
+    '',
+    `1. The first time, read once without since and without timeout, to get a baseline fingerprint: ${`${server}/v1/agents/me/wait?form=coordinator&comments=others`}`,
+    '2. Then repeat, with FINGERPRINT from the last reply:',
+    `- Windows (PowerShell): curl.exe -fsS ${flags} -K "${file.powershell}" ${psQuote(url(true))}`,
+    `- macOS/Linux: curl -fsS ${flags} -K ${file.posix} ${shQuote(url(true))}`,
+    '3. Each call holds for about 50 seconds (a loaded server can take longer: read wait.seconds, do not rely on the limit). changed=false (wait.timed_out=true) means nothing happened: keep the same FINGERPRINT and call again at once. changed=true means act: handle the triggers, every entry of comments (a pointer: task, comment id, author and time, never the text) and every entry of coordinator_notes, then take the new fingerprint from that reply and call again.',
+    '4. Read the comment a pointer names with GET .../tasks/TASK/history?recent=10 (newest first). Never read only the first page of /history: it is the oldest entries and goes blind on a busy task.',
+    '5. Your own comments and your own other writes never wake you. If wait.blocked is false (reason busy) the server is holding its limit of waiters: wait about 30 seconds yourself, then call again. A 403 means your grant has ended: stop and tell your owner.',
   ];
 }
 
@@ -638,7 +673,7 @@ export function setupPrompt(payload, { role = 'worker', certificate = null, brid
     agentGuide(payload, { hasCertificate }).trimEnd(),
     '~~~',
     `4. If this folder is a git repository and its .gitignore does not already list ${GITIGNORE_LINE}, add the line ${GITIGNORE_LINE} to .gitignore. Do not change any other file in this folder.`,
-    `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line -- with the single exception of step 6: that one command reads the credential file only to rewrite that same file in place, and it shows nothing.`,
+    `5. Your secret is not in this message. I keep it in ${payload.secretFile.windows} (on macOS/Linux ${payload.secretFile.posix}); you hand that file to curl with -K, as AGENT.md says. Never open, print or copy that file, and never write the secret to a file, a commit or a command line -- with the single exception of step 6: that one command reads the credential file only to rewrite that same file in place, and it shows nothing. ${PASTED_SECRET_RULE}`,
     `6. Make the credential file ${payload.secretFile.windows} (macOS/Linux ${payload.secretFile.posix}) hold these comment lines as its FIRST lines, each on its own line ending with a newline, followed by whatever it already held (its curl options and header line):`,
     '~~~',
     ...comments,

@@ -41,6 +41,19 @@ class ReviewWorkflowTests(unittest.TestCase):
         return self.send(self.payload('request-changes', contribution=w.project(self.issue)['contribution']['comment_id'],
                                       items=[dict(id='fix', text='Correct the edge case')]), 'reviewer')['comment_id']
 
+    def test_approval_refusal_names_assignee_response_and_reread(self):
+        contribution = self.send(self.contribution())['comment_id']
+        self.request()
+        before = len(self.issue['comments'])
+        with self.assertRaises(ValueError) as raised:
+            self.send(self.payload('approve', contribution=contribution, summary='Looks good'), 'reviewer')
+        expected = ('Cannot approve while requested changes remain unresolved: the task assignee (worker) '
+                    'must use operation respond for every open item, then the reviewer must reread the current '
+                    'review before approving.')
+        self.assertEqual(expected, str(raised.exception))
+        self.assertEqual(expected, w.unresolved_changes_approval_refusal('worker'))
+        self.assertEqual(before, len(self.issue['comments']))
+
     def test_feedback_survives_new_revision_and_old_checkpoint(self):
         first = self.send(self.contribution())['comment_id']
         request = self.request()
