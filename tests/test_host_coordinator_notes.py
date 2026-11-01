@@ -75,6 +75,7 @@ class HostTests(NoteCase):
     def test_send_fetch_reply_and_noted_share_the_existing_store(self):
         sent = self.send_host(); nid = sent['note']['id']
         self.assertEqual('host', sent['note']['from']['kind'])
+        self.assertTrue(sent['note']['delivery']['receiver_enrolled'])
         self.assertEqual(TEXT, self.box(self.tokens['nora'])['items'][0]['text'])
         fetched = self.host(['sent'])['items'][0]
         self.assertIn('fetched_at', fetched['delivery'])
@@ -83,7 +84,8 @@ class HostTests(NoteCase):
         self.host(['noted', reply['note']['id'], '--request-id', 'noted-one'])
         self.assertEqual('noted', self.host(['inbox'])['items'][0]['settled']['how'])
         self.assertEqual(3, len(self.service.state['host_note_requests']))
-        self.assertEqual(0, len(self.events()))  # no new audit copy of the text or receipt
+        self.assertEqual(0, len(self.events()))  # Host audit uses host.notes.*, with no text or receipt.
+        self.assertEqual(3, len([e for e in self.service.state['audit'] if e['action'].startswith('host.notes.')]))
 
     def test_retries_keep_the_identity_and_changed_payload_conflicts(self):
         first = self.send_host(); again = self.send_host()
@@ -108,6 +110,15 @@ class HostTests(NoteCase):
         for target in ('missing', 'unlinked'):
             with self.assertRaises(hn.Refusal) as e: self.send_host(to=target, key=target)
             self.assertEqual((404, 'No permitted coordinator note address'), (e.exception.status, str(e.exception)))
+
+    def test_an_enrolled_host_is_a_receiver_even_without_any_enabled_web_agent(self):
+        with self.service.store.lock:
+            for agent in self.service.state['agents'].values():
+                agent['enabled'] = False
+            self.service.store.save()
+        delivery = self.send_host()['note']['delivery']
+        self.assertTrue(delivery['receiver_enrolled'])
+        self.assertNotIn('warning', delivery)
 
     def test_operator_names_project_lists_and_other_actors_are_not_enrollment(self):
         for patch in ({'principal': 'person:operator', 'actor':'operator'}, {'principal': 'lane:south'}, {'actor': 'host-north'},
@@ -391,6 +402,228 @@ greeting=json.loads(f.readline());f.write((json.dumps({'request':json.loads(sys.
             with self.assertRaises(hn.Refusal): self.host(['inbox'])
         finally: key.unlink(); key.write_bytes(saved); key.chmod(0o600)
 
+    def test_link_reads_never_hold_the_web_state_lock(self):
+        original = self.backend.reference_links
+        held = []
+        def links(project):
+            held.append(self.service.store.lock._is_owned())
+            return original(project)
+        with mock.patch.object(self.backend, 'reference_links', side_effect=links):
+            first = self.send_host()['note']
+            self.host(['reply', first['id'], '--to', 'prog', '--request-id', 'outside-lock-reply'],
+                      project='north', text='Received without blocking web readers')
+        self.assertGreaterEqual(len(held), 2)
+        self.assertEqual([False] * len(held), held)
+
+    def test_request_history_expires_after_a_day_without_extending_retries(self):
+        moment = [self.service._now()]
+        with mock.patch.object(self.manager, 'request_time', side_effect=lambda: moment[0], create=True), \
+             mock.patch.object(hn, 'REQUESTS_MAX', 2):
+            first = self.send_host()['note']
+            self.send_host(key='second')
+            moment[0] += 24 * 60 * 60 - 1
+            replay = self.send_host()
+            self.assertEqual(first['id'], replay['note']['id'])
+            self.assertTrue(replay['reconciled'])
+            with self.assertRaises(hn.Refusal) as full:
+                self.send_host(key='third')
+            self.assertEqual(503, full.exception.status)
+            moment[0] += 2
+            accepted = self.send_host(key='third')
+            self.assertFalse(accepted['reconciled'])
+            self.assertEqual(1, len(self.service.state['host_note_requests']))
+
+    def test_full_request_history_names_the_retry_window(self):
+        with mock.patch.object(hn, 'REQUESTS_MAX', 1):
+            first = self.send_host()['note']
+            attempts = ((['send', '--to', 'north', '--request-id', 'full-history'], 'prog', TEXT),
+                        (['reply', first['id'], '--to', 'prog', '--request-id', 'full-reply'], 'north', TEXT),
+                        (['noted', first['id'], '--request-id', 'full-noted'], 'north', None))
+            for args, project, text in attempts:
+                with self.subTest(operation=args[0]), self.assertRaises(hn.Refusal) as full:
+                    self.host(args, project=project, text=text)
+                self.assertEqual(503, full.exception.status)
+                self.assertIn('request history', str(full.exception))
+                self.assertIn('24-hour retry window', str(full.exception))
+            self.assertIsNone(self.service._notes()[0]['settled'])
+            self.assertEqual(first['id'], self.send_host()['note']['id'])
+
+    def test_legacy_request_history_gets_a_persisted_upgrade_retry_window(self):
+        first = self.send_host()['note']
+        key = hashlib.sha256(hn.encoded(['lane:prog', 'prog', 'request-one'])).hexdigest()
+        self.service.state['host_note_requests'][key].pop('at', None)
+        self.service.store.save()
+        moment = [self.service._now()]
+        with mock.patch.object(self.manager, 'request_time', side_effect=lambda: moment[0], create=True):
+            self.assertEqual(first['id'], self.send_host()['note']['id'])
+            entry = self.service.state['host_note_requests'][key]
+            self.assertIn('at', entry)
+            self.assertEqual(entry, json.loads(self.service.store.path.read_text())['host_note_requests'][key])
+            moment[0] += 24 * 60 * 60 - 1
+            self.assertEqual(first['id'], self.send_host()['note']['id'])
+
+    def test_sent_never_returns_another_projects_text_or_fetch_receipt(self):
+        own = self.send_host()['note']
+        secret = 'PRIVATE-NORTH-SOUTH-SENT-CANARY'
+        foreign = self.send_host(project='north', to='south', key='foreign-sent', text=secret)['note']
+        self.box(self.tokens['sam'], project='south')
+        answer = self.host(['sent'])
+        self.assertEqual((1, [own['id']]), (answer['total'], [n['id'] for n in answer['items']]))
+        self.assertNotIn(secret, json.dumps(answer))
+        self.assertNotIn(foreign['id'], json.dumps(answer))
+        self.assertNotIn('fetched_at', answer['items'][0]['delivery'])
+
+    def test_a_full_legacy_history_persists_its_grace_window_before_refusing(self):
+        moment = [self.service._now()]
+        with mock.patch.object(self.manager, 'request_time', side_effect=lambda: moment[0], create=True), \
+             mock.patch.object(hn, 'REQUESTS_MAX', 1):
+            self.send_host()
+            key = next(iter(self.service.state['host_note_requests']))
+            self.service.state['host_note_requests'][key].pop('at')
+            self.service.store.save()
+            with self.assertRaises(hn.Refusal) as full:
+                self.send_host(key='after-legacy')
+            self.assertEqual(503, full.exception.status)
+            entry = self.service.state['host_note_requests'][key]
+            self.assertEqual(moment[0], entry.get('at'))
+            self.assertEqual(entry, json.loads(self.service.store.path.read_text())['host_note_requests'][key])
+            moment[0] += 24 * 60 * 60 + 1
+            self.assertFalse(self.send_host(key='after-legacy')['reconciled'])
+
+    def test_an_evicted_note_keeps_its_retry_identity_until_the_window_ends(self):
+        moment = [self.service._now()]
+        with mock.patch.object(self.manager, 'request_time', side_effect=lambda: moment[0], create=True):
+            first = self.send_host()['note']
+            self.host(['noted', first['id'], '--request-id', 'settle-before-eviction'], project='north')
+            with mock.patch.object(self.service, 'NOTES_KEPT', 1):
+                replacement = self.send_host(key='replacement')['note']
+            self.assertEqual([replacement['id']], [n['id'] for n in self.service._notes()])
+            with self.assertRaises(hn.Refusal) as gone:
+                self.send_host()
+            self.assertEqual(410, gone.exception.status)
+            self.assertEqual(1, len(self.service._notes()))
+            moment[0] += 24 * 60 * 60 + 1
+            accepted = self.send_host()
+            self.assertFalse(accepted['reconciled'])
+            self.assertNotEqual(first['id'], accepted['note']['id'])
+
+    def test_enrollment_elsewhere_is_not_enrollment_here_even_with_an_owned_actor(self):
+        incoming = self.send_host()['note']
+        north = self.send_host(project='north', to='south', key='private-north', text='NORTH-PRIVATE')['note']
+        path = self.root / 'projects/north/.sessions.json'
+        saved = path.read_bytes()
+        registry = json.loads(saved)
+        registry['owners']['host-prog-in-north'] = 'lane:prog'
+        path.write_text(json.dumps(registry))
+        self.addCleanup(path.write_bytes, saved)
+        from sessions import owners
+        self.assertEqual('lane:prog', owners(path.parent)['host-prog-in-north'])
+        for args in (['inbox'], ['sent'], ['wait', '--timeout', '0'],
+                     ['noted', incoming['id'], '--request-id', 'foreign-noted'],
+                     ['send', '--to', 'prog', '--request-id', 'foreign-send'],
+                     ['reply', incoming['id'], '--to', 'prog', '--request-id', 'foreign-reply']):
+            request = self.envelope(args, project='north', principal='lane:prog',
+                                    text=TEXT if args[0] in ('send', 'reply') else None)
+            request.update(actor='host-prog-in-north', projects=['prog', 'north'])
+            with self.subTest(operation=args[0]), self.assertRaises(hn.Refusal) as denied:
+                hn.call(self.root, request)
+            self.assertEqual(403, denied.exception.status)
+            self.assertNotIn('NORTH-PRIVATE', str(denied.exception))
+
+    def test_a_web_service_caller_cannot_enter_the_host_namespace(self):
+        import endpoint
+        from http_authority import AuthorityConfig
+        request = {'project': 'prog', 'actor': 'host-prog', 'action': 'coordinator',
+                   'args': ['notes', 'inbox']}
+        config = AuthorityConfig(str(self.service.store.path))
+        answer = endpoint.execute(self.root, request, authority_config=config,
+                                  key_principal='lane:prog', key_projects=['prog'])
+        self.assertEqual((2, 403), (answer['returncode'], answer['host_notes_status']))
+
+    def test_reply_after_the_program_link_is_removed_is_refused_without_settling(self):
+        parent = self.send_host()['note']
+        saved = copy.deepcopy(self.links)
+        self.links['prog'] = []
+        try:
+            before = copy.deepcopy(self.service.state['coordinator_notes'])
+            with self.assertRaises(hn.Refusal) as denied:
+                self.host(['reply', parent['id'], '--to', 'prog', '--request-id', 'removed-link-reply'],
+                          project='north', text='This address is no longer linked')
+            self.assertEqual(404, denied.exception.status)
+            self.assertEqual(before, self.service.state['coordinator_notes'])
+        finally:
+            self.links.clear(); self.links.update(saved)
+
+    def test_losing_actor_ownership_ends_a_live_wait_without_pointers(self):
+        baseline = self.host(['wait', '--timeout', '0'])
+        first_pass = threading.Event()
+        original = self.manager.pass_once
+        def read(request):
+            view = original(request)
+            first_pass.set()
+            return view
+        path = self.root / 'projects/prog/.sessions.json'
+        saved = path.read_bytes()
+        try:
+            with mock.patch.object(self.manager, 'pass_once', side_effect=read), \
+                 mock.patch.object(hn, 'WAIT_INTERVAL', 0.02), concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(self.host, ['wait', '--since', baseline['fingerprint'], '--timeout', '2'])
+                self.assertTrue(first_pass.wait(timeout=2))
+                registry = json.loads(saved)
+                registry['owners']['host-prog'] = 'lane:replacement'
+                path.write_text(json.dumps(registry))
+                with self.assertRaises(hn.Refusal) as denied:
+                    future.result(timeout=3)
+                self.assertEqual(403, denied.exception.status)
+        finally:
+            path.write_bytes(saved)
+
+    def test_host_inbox_adds_fetch_receipts_only_for_the_requested_page(self):
+        first = self.send_host()['note']
+        second = self.send_host(key='second-page-note')['note']
+        page = self.host(['inbox', '--offset=1', '--limit=1'], project='north')
+        self.assertEqual((2, 1), (page['total'], len(page['items'])))
+        selected = page['items'][0]['id']
+        notes = {n['id']: n for n in self.host(['sent'])['items']}
+        for nid in (first['id'], second['id']):
+            self.assertEqual(nid == selected, 'fetched_at' in notes[nid]['delivery'])
+
+    def test_damaged_enrollment_gives_web_senders_an_actionable_503_and_a_retry(self):
+        path = hn.location(self.root) / 'enrollment.json'
+        saved = path.read_bytes()
+        before = len(self.service._notes())
+        path.write_text('{BROKEN')
+        try:
+            refused = self.send(self.tokens['pat'], key='repair-enrollment-retry')
+            self.assertEqual(503, refused.status, refused.data)
+            self.assertIn('enrollment', refused.data['error']['message'].lower())
+            self.assertIn('repair', refused.data['error']['message'].lower())
+            self.assertEqual(before, len(self.service._notes()))
+        finally:
+            path.write_bytes(saved)
+        repaired = self.send(self.tokens['pat'], key='repair-enrollment-retry')
+        self.assertEqual(201, repaired.status, repaired.data)
+        self.assertEqual(before + 1, len(self.service._notes()))
+
+    def test_host_audit_contains_only_operation_metadata_and_rolls_back_failed_saves(self):
+        raw_request = 'REQUEST-ID-PRIVATE-CANARY'
+        note = self.send_host(key=raw_request)['note']
+        events = self.events('host.notes.send')
+        self.assertEqual(1, len(events))
+        event = events[0]
+        self.assertEqual(('prog', 'host-prog', 'accepted'),
+                         (event['project_id'], event['actor'], event['outcome']))
+        self.assertIsNone(event['reason'])
+        serialized = json.dumps(event)
+        for private in (TEXT, raw_request, json.dumps(note['delivery'], sort_keys=True)):
+            self.assertNotIn(private, serialized)
+        self.assertNotIn('fetched_at', serialized)
+        before = copy.deepcopy(self.service.state['audit'])
+        with mock.patch.object(self.service.store, 'save', side_effect=OSError('audit-save-failure')):
+            with self.assertRaises(hn.Refusal):
+                self.send_host(key='audit-failed')
+        self.assertEqual(before, self.service.state['audit'])
+
 
 @unittest.skipUnless(os.name == 'posix' and hasattr(socket, 'AF_UNIX'), 'private Linux host adapter')
 class ProcessTests(unittest.TestCase):
@@ -510,6 +743,29 @@ class ParserTests(unittest.TestCase):
             with self.assertRaises(hn.Refusal): hn.parse(args, {})
 
 
+    def test_wait_does_not_start_a_pass_that_will_not_fit_the_read_cost_budget(self):
+        clock, passes = [0.0], []
+        class Stop:
+            def is_set(self): return False
+            def wait(self, seconds): clock[0] += seconds
+        manager = hn.Manager(Path('.'), None, None)
+        manager.stopped = Stop()
+        def read(request):
+            passes.append(clock[0])
+            clock[0] += 0.04
+            return {'fingerprint': 'same', 'items': [], 'total': 0}
+        request = {'principal': 'lane:prog', 'project': 'prog',
+                   'payload': {'timeout': 0.11, 'since': 'same'}}
+        with mock.patch.object(hn, 'locked', return_value=contextlib.nullcontext()), \
+             mock.patch.object(hn, 'authorize'), mock.patch.object(hn, 'WAIT_INTERVAL', 0.01), \
+             mock.patch.object(hn.time, 'monotonic', side_effect=lambda: clock[0]), \
+             mock.patch.object(manager, 'pass_once', side_effect=read):
+            answer = manager.wait(request)
+        self.assertTrue(answer['timed_out'])
+        self.assertLessEqual(len(passes), 2)
+        self.assertLessEqual(clock[0], 0.11 + 1e-9)
+
+
 class StorageValidationTests(unittest.TestCase):
     def setUp(self):
         directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
@@ -527,6 +783,18 @@ class StorageValidationTests(unittest.TestCase):
                 self.assertEqual(503,error.exception.status)
                 self.assertEqual(before,service.state)
                 self.assertEqual(disk,service.store.path.read_bytes())
+
+    def test_request_timestamps_refuse_booleans_nonfinite_and_unrepresentable_numbers(self):
+        from http_auth import Store, Service
+        service = Service(Store(self.root / 'timestamps.json'))
+        manager = hn.Manager(self.root, service, None)
+        for value in (True, float('inf'), float('nan'), 10 ** 400):
+            with self.subTest(value=repr(value)):
+                service.state['host_note_requests'] = {'a' * 64: {
+                    'digest': 'b' * 64, 'note': 'cnote-' + 'c' * 24, 'at': value}}
+                with self.assertRaises(hn.Refusal) as refused:
+                    manager.request_history()
+                self.assertEqual(503, refused.exception.status)
 
     def test_enrollment_counts_the_bytes_it_writes_and_keeps_the_old_file_on_refusal(self):
         (self.root/'deployment.private.json').write_text(json.dumps({'operators':['operator']}))

@@ -3631,8 +3631,8 @@ class Service:
         """A fetch receipt, only after the route has proved the receiving coordinator."""
         if getattr(self, 'host_notes_manager', None) is None:
             return
-        from host_notes import state_change
-        with self.store.lock, state_change(self):
+        from host_notes import state_change, HostIdentity
+        with self.store.lock, state_change(self, web=principal is not None and not isinstance(principal, HostIdentity)):
             if principal is not None: self._note_identity(principal,project)
             changed = False
             for view in notes:
@@ -3670,8 +3670,8 @@ class Service:
             raise invalid(str(error)) from None
         if reserved_match(text) is not None:
             raise invalid('A note cannot start with a reserved machine-record prefix')
-        from host_notes import state_change
-        with self.store.lock, state_change(self):
+        from host_notes import state_change, HostIdentity
+        with self.store.lock, state_change(self, web=not isinstance(principal, HostIdentity)):
             attribution = self._note_identity(principal, from_project)
             store = self._note_store(write=True)
             notes = [note for note in store['notes'] if self._note_ok(note)]
@@ -3728,8 +3728,8 @@ class Service:
 
     def settle_note(self, principal, project_id, note_id, *, persist=True):
         """Mark a note to ``project_id`` noted: nothing is owed. A settled one is 409 with how it was settled."""
-        from host_notes import state_change
-        with self.store.lock, state_change(self):
+        from host_notes import state_change, HostIdentity
+        with self.store.lock, state_change(self, web=not isinstance(principal, HostIdentity)):
             self._note_identity(principal, project_id)
             self._note_store(write=True)
             note = next((n for n in self._notes() if n['id'] == note_id and n['to']['project'] == project_id), None)

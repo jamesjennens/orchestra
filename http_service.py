@@ -9978,7 +9978,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         Each waiter's reads take at most about a fifth of its own time: a slow backend (many waiters,
         a big project) makes the interval longer, never the load higher."""
-        return min(max(self.WAIT_INTERVAL, 4 * cost), deadline - time.monotonic() - cost)
+        from waiting import bounded_pause
+        return bounded_pause(deadline, cost, self.WAIT_INTERVAL)
 
     def _sleep_unless_gone(self, seconds):
         """Sleep up to ``seconds``; False as soon as the client has hung up."""

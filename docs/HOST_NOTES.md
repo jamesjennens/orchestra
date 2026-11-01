@@ -92,9 +92,16 @@ authenticate and remains within the trusted-host boundary below.
 An unrestricted shell with the service account's private files remains inside the
 kit's existing trusted-host boundary; confinement is what denies that access to a
 worker key. Never distribute the adapter key to workers or put it in client config.
+The greeting uses a server-selected challenge and response frames are not signed;
+protection from a process controlling the service account is outside this boundary.
 
-There is no public adapter route, new note database or new note audit copy.
-Enrollment/audit files carry approval metadata only. Note text, fetch receipts and
+The adapter uses the existing note store and service audit.
+Private enrollment files and their audit carry approval metadata only. Accepted
+host send/reply/noted operations also append to the existing service audit: the
+hashed request identity, project, launcher actor, operation, outcome and audit time.
+They copy no note text, raw request id, delivery receipt or settlement object.
+A reconciled retry adds no second audit event. The event shares the note/request
+save, and a failed uncommitted save rolls all three back. Note text, fetch receipts and
 request identity metadata stay in the existing service state and its existing
 backup boundary. Errors are fixed sentences without note contents, receipts or
 host paths. A missing service, unreadable state or damaged enrollment refuses
@@ -109,18 +116,52 @@ latency figures are rollout targets, not measurements supplied by this change.
 
 ## Relationship to .457
 
-At the checked main base `8f84798`, .457's HTTP blocking wait is not integrated.
-This version uses the same bounded-pass approach in `host_notes.Manager.wait`: a
-monotonic deadline, five-second unlocked waits, cancellation and live authorization
-on every pass. The reusable boundary is that pass/deadline/cancellation loop and
-the global waiter budget; note view/marker generation remains transport-specific.
-Recheck the .457 merge before delivery and share its helper when available. The
+Main `493c1a2` includes .457's HTTP blocking wait. Both transports now use
+`waiting.bounded_pause`: a monotonic deadline starts before the first pass, and
+another pass starts only when its worst observed read cost still fits. Sleeps are
+unlocked, normally five seconds and longer when needed to keep reads near a fifth
+of the waiter's time. This is a soft bound: a pass slower than earlier ones can
+overrun it; reads are not interrupted. Each host pass checks enrollment and actor
+ownership again, and service shutdown ends the wait. Note view/marker generation
+and waiter budgets remain specific to each transport. The default worker wait's
+projection, polling and CLI behavior are unchanged. The
 host marker tracks the last incoming accepted note, including settled notes, so
 its coordinator's own reply/noted cannot trigger an empty wake.
+A dropped host connection does not immediately free its waiter slot: capacity is
+released when that wait returns or the service stops. A reconnect can temporarily
+receive 429 while the previous soft-deadline wait is still running.
 
 Resource bounds: private request frames are 64 KiB, reply pages 1 MiB, enrollment
 metadata 1 MiB with 200 audit entries, and durable-store preflight 32 MiB. A larger
-store or page fails closed rather than being silently truncated. The host request
-identity journal keeps at most 10,000 entries and refuses new writes when full; it
-never evicts an identity to accept another request. An operator must plan retention
-maintenance before reaching these limits.
+store or page fails closed rather than being silently truncated. While the adapter
+is enabled, that state limit applies to web notes as well as host notes. Web callers
+now receive a 503 instead of a generic 500 for failed host-note state/enrollment
+validation; damaged enrollment explicitly asks an operator to repair its metadata.
+
+The fresh durable-state comparison still reads/parses the whole file on every
+pass. This version retains the bounded check rather than trusting a cached copy
+after the durable file becomes unreadable or changes. No large-state performance
+optimization is claimed. For an installation already above this bound, leave the
+adapter disabled until its storage validation is revised; that rollout/restart is
+an operator action. Link reads through the tracker run outside the enrollment and
+web state locks; only live authorization, in-memory checks and the atomic effect
+run under those locks.
+
+## Request retry window
+
+Request identities are scoped by principal and project and retained for 24 hours.
+The same id and payload reconcile to the accepted result during that window;
+retries do not extend its age. If its note has already been evicted, the retry is
+410 and cannot silently send another note. After the window expires, the identity
+may be treated as a new operation: inspect the inbox/sent state before retrying an
+old uncertain write, and use a fresh id for a new intention.
+
+The journal keeps at most 10,000 retained identities across the installation.
+Expired entries are pruned on host write attempts. If all slots are still within
+their window, a new write receives a distinct 503 naming the 24-hour retry window;
+no change is accepted, but retained matching retries and reads still work. Once an
+entry ages out, a subsequent write can proceed without an operator editing state.
+Legacy entries with no timestamp receive a persisted 24-hour grace window when
+R2 first saves their journal, including housekeeping when a full write is refused.
+The grace timestamp survives restart. Request timestamps use the service's expiry
+clock; moving the wall clock backwards does not shorten a retained window.

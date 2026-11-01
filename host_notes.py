@@ -10,6 +10,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -29,7 +30,12 @@ WAIT_MAX = 50
 WAIT_INTERVAL = 5
 WAITERS_MAX = 16
 REQUESTS_MAX = 10000
+REQUEST_RETENTION_SECONDS = 24 * 60 * 60
+REQUESTS_FULL = ('Host note request history is full within the 24-hour retry window; '
+                 'no change was accepted. Retry later with the same request id.')
 UNAVAILABLE = 'Host notes unavailable; retry with the same request id. An operator must check the service.'
+ENROLLMENT_UNAVAILABLE = ('Host-note enrollment is unreadable or invalid; '
+                          'an operator must repair the enrollment metadata.')
 FORBIDDEN = 'Host coordinator notes are not available to this principal in this project'
 OPERATIONS = ('send', 'inbox', 'sent', 'reply', 'noted', 'wait')
 PROJECT = re.compile(r'[a-z][a-z0-9]{1,23}\Z')
@@ -62,7 +68,7 @@ def private_text(path, limit=FRAME_MAX):
         raise Refusal(503, UNAVAILABLE) from None
 
 
-def read_enrollment(root):
+def _read_enrollment(root):
     """Strict, fail-closed metadata; never holds a note or a receipt."""
     from sessions import valid_principal
     directory = location(root)
@@ -105,6 +111,13 @@ def read_enrollment(root):
         return document
     except (ValueError, TypeError, KeyError):
         raise Refusal(503, UNAVAILABLE) from None
+
+
+def read_enrollment(root):
+    try:
+        return _read_enrollment(root)
+    except (OSError, ValueError, TypeError):
+        raise Refusal(503, ENROLLMENT_UNAVAILABLE) from None
 
 
 def locked(root):
@@ -317,32 +330,47 @@ def call(root, request):
 
 
 @contextmanager
-def state_change(service):
+def state_change(service, *, audit=False, web=False):
     """The existing state file is the atomic boundary, including receipt/request metadata."""
     manager = getattr(service, 'host_notes_manager', None)
     if manager is None:
         yield
         return
     depth = getattr(manager.local, 'depth', 0)
-    if depth == 0: manager.preflight()
-    before = {k: copy.deepcopy(service.state.get(k)) for k in ('coordinator_notes', 'host_note_requests')}
+    if depth == 0:
+        try:
+            manager.preflight()
+        except Refusal as error:
+            if web:
+                raise http_unavailable(error) from None
+            raise
+    durable_keys = ('coordinator_notes', 'host_note_requests')
+    before = {k: copy.deepcopy(service.state.get(k)) for k in durable_keys + (('audit',) if audit else ())}
     manager.local.depth = depth + 1
     try:
         yield
-    except BaseException:
+    except BaseException as error:
         from admin import read_regular_text
         try:
             disk = record_json.loads(read_regular_text(service.store.path, limit=32 * 1024 * 1024))
-            unchanged = all(disk.get(k) == value for k, value in before.items())
+            unchanged = all(disk.get(k) == before[k] for k in durable_keys)
         except Exception:
             unchanged = False
         if unchanged:
             for k, value in before.items():
                 if value is None: service.state.pop(k, None)
                 else: service.state[k] = value
+        if web and isinstance(error, Refusal) and error.status == 503:
+            raise http_unavailable(error) from None
         raise
     finally:
         manager.local.depth = depth
+
+
+def http_unavailable(error):
+    """Web callers get the same fixed repair/refusal sentence, never a generic 500."""
+    from http_auth import HttpError
+    return HttpError(503, 'unavailable', str(error))
 
 
 class HostIdentity:
@@ -378,17 +406,49 @@ class Manager:
             if notes is not None and (not isinstance(notes, dict)
                     or not isinstance(notes.get('notes'), list) or not isinstance(notes.get('dropped'), dict)):
                 raise ValueError()
-            requests = self.service.state.get('host_note_requests', {})
-            if not isinstance(requests, dict) or len(requests) > REQUESTS_MAX:
-                raise ValueError()
-            for key, entry in requests.items():
-                if not isinstance(key,str) or not re.fullmatch(r'[0-9a-f]{64}',key) or not isinstance(entry,dict) \
-                        or set(entry) != {'digest','note'} or not isinstance(entry['digest'],str) \
-                        or not re.fullmatch(r'[0-9a-f]{64}',entry['digest']) or not isinstance(entry['note'],str) \
-                        or not NOTE.fullmatch(entry['note']):
-                    raise ValueError()
+            self.request_history()
         except (OSError, ValueError, TypeError):
             raise Refusal(503, UNAVAILABLE) from None
+
+    def request_time(self):
+        # The service's expiry clock never goes backwards within its lifetime.
+        return self.service._expiry_now()
+
+    @staticmethod
+    def request_key(request):
+        return hashlib.sha256(encoded([request['principal'], request['project'],
+                                       request['payload']['request_id']])).hexdigest()
+
+    def request_history(self, now=None):
+        """A pure retained view. Legacy entries get a grace timestamp when this view is saved."""
+        requests = self.service.state.get('host_note_requests', {})
+        if not isinstance(requests, dict) or len(requests) > REQUESTS_MAX:
+            raise Refusal(503, UNAVAILABLE)
+        observed = self.request_time()
+        now = observed if now is None else now
+        retained = {}
+        for key, entry in requests.items():
+            if not isinstance(key, str) or not re.fullmatch(r'[0-9a-f]{64}', key) or not isinstance(entry, dict) \
+                    or set(entry) not in ({'digest', 'note'}, {'digest', 'note', 'at'}) \
+                    or not isinstance(entry['digest'], str) or not re.fullmatch(r'[0-9a-f]{64}', entry['digest']) \
+                    or not isinstance(entry['note'], str) or not NOTE.fullmatch(entry['note']):
+                raise Refusal(503, UNAVAILABLE)
+            at = entry.get('at', observed)
+            try:
+                valid_time = not isinstance(at, bool) and isinstance(at, (int, float)) and math.isfinite(at)
+            except OverflowError:
+                valid_time = False
+            if not valid_time:
+                raise Refusal(503, UNAVAILABLE)
+            if now - at < REQUEST_RETENTION_SECONDS:
+                retained[key] = dict(entry, at=at)
+        return retained
+
+    def save_history(self, history):
+        # Retention/grace migration can progress even when the bounded window is full.
+        if history != self.service.state.get('host_note_requests', {}):
+            self.service.state['host_note_requests'] = history
+            self.service.store.save()
 
     def active(self, project):
         grants = read_enrollment(self.root)['grants'].get(project, {})
@@ -425,13 +485,22 @@ class Manager:
         return self.pass_once(request)
 
     def pass_once(self, request):
-        # Both enrollment and the existing service state are serialized for the whole effect.
+        paired, retention_now = None, None
+        if request['payload']['operation'] in ('send', 'reply'):
+            with locked(self.root), self.service.store.lock:
+                authorize(self.root, request)
+                retention_now = self.request_time()
+                replay = self.request_key(request) in self.request_history(retention_now)
+            # Like the web route, tracker I/O holds neither enrollment nor web-state locks.
+            # A retained retry needs no new link read, including when the tracker is down.
+            if not replay:
+                paired = self.pairing(request['project'], request['payload']['to'])
         with locked(self.root), self.service.store.lock:
             authorize(self.root, request)
-            with state_change(self.service):
-                return self.effect(request)
+            with state_change(self.service, audit=request['payload']['operation'] in ('send', 'reply', 'noted')):
+                return self.effect(request, paired=paired, retention_now=retention_now)
 
-    def effect(self, request):
+    def effect(self, request, *, paired=None, retention_now=None):
         op, p, project = request['payload']['operation'], request['payload'], request['project']
         if op == 'wait':
             notes = self.service.unsettled_notes_to([project])
@@ -445,16 +514,17 @@ class Manager:
                 self.service.mark_notes_fetched(project, notes[p['offset']:p['offset'] + p['limit']])
             return {'project': project, 'box': op, 'items': copy.deepcopy(notes[p['offset']:p['offset'] + p['limit']]),
                     'total': len(notes)}
-        key = hashlib.sha256(encoded([request['principal'], project, p['request_id']])).hexdigest()
+        key = self.request_key(request)
         digest = hashlib.sha256(encoded(p)).hexdigest()
-        journal = self.service.state.get('host_note_requests', {})
-        if not isinstance(journal, dict): raise Refusal(503, UNAVAILABLE)
+        journal = self.request_history(retention_now)
         old = journal.get(key)
         if old is not None:
             if old.get('digest') != digest:
                 raise Refusal(409, 'Request id already used with another request')
             note = next((n for n in self.service._notes() if n['id'] == old['note']), None)
-            if note is None: raise Refusal(410, 'Request was already handled; its note is no longer retained')
+            if note is None:
+                self.save_history(journal)
+                raise Refusal(410, 'Request was already handled; its note is no longer retained')
             if op == 'noted':
                 matches = (note['id'] == p['note'] and note['to']['project'] == project
                            and note.get('settled') is not None)
@@ -462,13 +532,16 @@ class Manager:
                 matches = (note['from']['project'] == project and note['to']['project'] == p['to']
                            and note['text'] == p['text'] and note.get('reply_to') == p['note'])
             if not matches: raise Refusal(503, UNAVAILABLE)
+            self.save_history(journal)
             return {'note': copy.deepcopy(note), 'reconciled': True}
-        if len(journal) >= REQUESTS_MAX: raise Refusal(503, UNAVAILABLE)
+        if len(journal) >= REQUESTS_MAX:
+            self.save_history(journal)
+            raise Refusal(503, REQUESTS_FULL)
         identity = HostIdentity(self, request)
         if op == 'noted':
             note = self.service.settle_note(identity, project, p['note'], persist=False)
         else:
-            if not self.pairing(project, p['to']):
+            if not paired:
                 raise Refusal(404, 'No permitted coordinator note address')
             unread = self.service.unsettled_notes_to([p['to']])
             if len(unread) >= self.service.NOTES_KEPT:
@@ -481,8 +554,9 @@ class Manager:
             if not receiver: note['delivery']['warning'] = 'No receiver enrolled; accepted does not mean read'
             original = next(n for n in self.service._notes() if n['id'] == note['id'])
             original['delivery'] = dict(note['delivery'])
-        journal[key] = {'digest': digest, 'note': note['id']}
+        journal[key] = {'digest': digest, 'note': note['id'], 'at': self.request_time()}
         self.service.state['host_note_requests'] = journal
+        self.service.audit(key, None, 'host.notes.' + op, 'accepted', project_id=project, actor=request['actor'])
         self.service.store.save()
         return {'note': copy.deepcopy(note), 'reconciled': False}
 
@@ -491,6 +565,7 @@ class Manager:
         return now_iso(self.service._now())
 
     def wait(self, request):
+        from waiting import bounded_pause
         p = request['payload']; identity = (request['principal'], request['project'])
         with locked(self.root): authorize(self.root, request)
         with self.guard:
@@ -499,13 +574,17 @@ class Manager:
             self.waiters.add(identity)
         try:
             deadline = time.monotonic() + p['timeout']
+            cost = 0
             while True:
                 if self.stopped.is_set(): raise Refusal(503, UNAVAILABLE)
+                began = time.monotonic()
                 view = self.pass_once(request)
+                cost = max(cost, time.monotonic() - began)
                 changed = p['since'] != view['fingerprint']
-                if changed or time.monotonic() >= deadline:
+                pause = bounded_pause(deadline, cost, WAIT_INTERVAL)
+                if changed or pause <= 0:
                     return dict(view, changed=changed, timed_out=not changed)
-                self.stopped.wait(min(WAIT_INTERVAL, max(0, deadline - time.monotonic())))
+                self.stopped.wait(pause)
         finally:
             with self.guard: self.waiters.discard(identity)
 
