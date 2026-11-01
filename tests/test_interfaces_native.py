@@ -310,9 +310,9 @@ class NativeProgramViewInterfacesBase(NativeInterfaceTests):
                  'unverified_pointer_reason':'Synthetic test pointers; no checkout verification claimed'},
                 token=self.owner,key='gate-cap-accept-'+name)
             self.assertEqual(200,accepted.status,accepted.data)
-        tokens={}
+        tokens={};self.uids={}
         for who,projects in (('rita',('pp','north')),('rhea',('pp','north','south'))):
-            uid=h.create_account(self.owner,who,who+'-password-1')
+            uid=h.create_account(self.owner,who,who+'-password-1');self.uids[who]=uid
             for project in projects:
                 self.assertEqual(200,h.request('PUT','/v1/projects/%s/members/%s'%(project,uid),{'role':'viewer'},
                                                token=self.owner).status)
@@ -394,3 +394,52 @@ class NativeProgramViewInterfacesUnsettledTests(NativeProgramViewInterfacesBase)
         self.assertEqual(200,answer.status,answer.data)
         self.assertEqual('unsettled',answer.data['interfaces']['state'])
         self.assertNotIn('south',json.dumps(answer.data['interfaces']))
+
+
+class NativeProgramViewInterfacesFlagsTests(NativeProgramViewInterfacesBase):
+    def test_an_unused_offpage_area_losing_its_right_mid_read_decides_no_flag(self):
+        """kittrial-5bb.467 r3 (review of r2, Sol, 02:37Z): an area need not be named to shape the section. south
+        consumes nothing, sits off the areas page, and still decides `complete` and the absence flags. Its reader's
+        membership is removed through the real route while the read is in flight; the answer must not keep a
+        complete view or a flag built with south's snapshot."""
+        tokens=self.build_program(ghost=False)
+        h=self.harness
+        capread=h.request('GET','/v1/projects/south/capabilities/synthetic.south',token=self.owner)
+        current=capread.data['record']
+        cap=_valid_cap_propose('synthetic.south')
+        empty=dict(cap,revision=current['revision']+1,expected_sha256=current['sha256'],interfaces=[])
+        change=h.request('POST','/v1/projects/south/capabilities/synthetic.south/revisions',empty,
+                         token=self.owner,key='flags-south-empty')
+        self.assertEqual(200,change.status,change.data)
+        accepted=h.request('POST','/v1/projects/south/capabilities/synthetic.south/accept',
+             {'expected_revision':change.data['revision'],'record_sha256':change.data['sha256'],
+              'evidence':'south consumes nothing','unverified_pointer_reason':'Synthetic pointers'},
+             token=self.owner,key='flags-south-empty-accept')
+        self.assertEqual(200,accepted.status,accepted.data)
+        page=h.request('GET','/v1/projects/pp/program?limit=1',token=tokens['rhea'])
+        self.assertEqual(200,page.status,page.data)
+        self.assertEqual(['north'],[row['area'] for row in page.data['areas']['items']])
+        before=page.data['interfaces']
+        self.assertEqual(['north'],sorted(self.consumers(before)))
+        self.assertTrue(before['complete'],before)          # rhea reads both areas: the baseline is complete
+        backend=h.backend
+        real=backend.program
+        removed=[]
+        def remove_south_during_the_read(*args,**more):
+            answer=real(*args,**more)
+            if not removed:
+                gone=h.request('DELETE','/v1/projects/south/members/'+self.uids['rhea'],None,token=self.owner)
+                removed.append(gone.status)
+            return answer
+        with unittest.mock.patch.object(backend,'program',remove_south_during_the_read):
+            answer=h.request('GET','/v1/projects/pp/program?limit=1',token=tokens['rhea'])
+        self.assertEqual([200],removed)
+        self.assertEqual(200,answer.status,answer.data)
+        section=answer.data['interfaces']
+        self.assertFalse(section.get('complete'),section)
+        self.assertNotIn('no-provider',json.dumps(section))
+        self.assertNotIn('south',json.dumps(section))
+        after=h.request('GET','/v1/projects/pp/program?limit=1',token=tokens['rhea']).data['interfaces']
+        self.assertEqual((after.get('complete'),[r['flags'] for r in after['items']]),
+                         (section.get('complete'),[r['flags'] for r in section['items']]))
+

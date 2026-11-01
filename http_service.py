@@ -12838,10 +12838,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                     hidden = program_view.area_row(row['area'], row['state'])
                     row.clear()
                     row.update(hidden)
-            # kittrial-5bb.467 r2: the interfaces section names areas read from EVERY linked readable area, not
-            # only those on this areas page (interface_records.areas/usage, endpoint.interface_section). Each area
-            # it names is rechecked with the same gate as a page row; one whose right was lost during the read
-            # makes the answer read again without it, so its role and minimum revision are never shown.
+            # kittrial-5bb.467 r3: the interfaces section is built from EVERY linked readable area this read was
+            # given, not only those on this areas page (interface_records.areas/usage, endpoint.interface_section).
+            # An area need not be named in the answer to have shaped it: one with no usage still decides
+            # `complete` and the absence flags (no-provider, orphan). So every project of the readable set this
+            # read used is rechecked with the same gate as a page row, named or not (r2 rechecked only the names,
+            # review of r2, Sol, 02:37Z). One whose right was lost makes the answer read again without it.
+            # Named areas are rechecked too, whether or not this read was given them: the answer must not name an
+            # area the caller cannot read, whatever produced it.
             rechecked = {row.get('area') for row in (result.get('areas') or {}).get('items') or []
                          if isinstance(row, dict) and row.get('visible')}
             interfaces = result.get('interfaces') if isinstance(result.get('interfaces'), dict) else {}
@@ -12851,7 +12855,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     for use in (item.get(side) or []) if isinstance(item, dict) else []:
                         if isinstance(use, dict) and isinstance(use.get('area'), str):
                             named.add(use['area'])
-            for area in sorted(named - rechecked):
+            for area in sorted((set(readable) | named) - rechecked - {pid}):
                 try:
                     self.service.coordinators_of(ctx.principal, area)
                 except HttpError:

@@ -138,7 +138,9 @@ export async function page(ctx, { pid }) {
     host.replaceChildren(head(), ...view(read),
       next || moreInterfaces ? h('div', { class: 'toolbar' },
         next ? h('button', { type: 'button', onclick: () => draw(next, interfacesOffset) }, 'Next areas') : null,
-        moreInterfaces ? h('button', { type: 'button', onclick: () => draw(cursor, moreInterfaces) }, 'Next interfaces') : null) : null);
+        // An areas cursor is bound to the whole query, interfaces_offset included (kittrial-5bb.467 r3): the next
+        // interfaces page starts the areas from their first page instead of sending a cursor the server refuses.
+        moreInterfaces ? h('button', { type: 'button', onclick: () => draw(null, moreInterfaces) }, 'Next interfaces') : null) : null);
   }
   await draw(null);
   return host;
