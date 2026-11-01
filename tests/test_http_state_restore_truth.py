@@ -178,6 +178,8 @@ class StateRestoreRealBdTests(RealRuntimeCase):
                     (folder / name).unlink()
         with contextlib.suppress(FileNotFoundError):
             (self.root / 'backups' / admin.BACKUP_STATUS_NAME).unlink()
+        for kept in self.root.glob('http-state.json.before-restore-*'):    # r2: the live pair a restore kept
+            kept.unlink()
         config = self.root / 'deployment.private.json'
         document = json.loads(config.read_text(encoding='utf-8'))
         if document.pop('http_state', None) is not None:
@@ -485,6 +487,128 @@ class StateRestoreRealBdTests(RealRuntimeCase):
             with contextlib.suppress(FileNotFoundError):
                 other.unlink()
 
+    # -- r2 (review of r1, request 01a1993f) ----------------------------------------------------------
+    def bot(self, administrator):
+        status, data = self.web.request('POST', '/v1/agents', {'name': 'bot'}, administrator)
+        self.assertEqual(201, status, data)
+        agent = data.get('agent')
+        agent_id = agent if isinstance(agent, str) else (agent or {}).get('id') or data.get('id')
+        return agent_id, data['credential']['secret']
+
+    def plain_service(self, command, cwd, label):
+        port = free_port()
+        log = open(str(self.root / ('%s.log' % label)), 'ab')
+        self.addCleanup(log.close)
+        service = subprocess.Popen([part.replace('PORT', str(port)) for part in command], cwd=cwd, stdout=log, stderr=log)
+        self.addCleanup(self.stop_process, service)
+        for _ in range(150):
+            try:
+                if http_request(port, 'GET', '/healthz')[0] == 200:
+                    return service, port
+            except OSError:
+                pass
+            time.sleep(0.2)
+        self.fail('%s did not start; see %s' % (label, self.root / ('%s.log' % label)))
+
+    @staticmethod
+    def stop_process(process):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=20)
+
+    def test_r3_accounts_and_agents_disabled_since_the_backup_are_named_and_the_backups_values_stand(self):
+        """Review R3 (test_p1): nothing is merged, and the restore names what comes back enabled."""
+        self.new_project('hr3')
+        administrator, alex_id = self.office()
+        agent_id, _ = self.bot(administrator)
+        self.backup('hr3')
+        self.assertEqual(200, self.web.request('POST', '/v1/accounts/%s/disable' % alex_id, {}, administrator)[0])
+        self.assertEqual(200, self.web.request('POST', '/v1/agents/%s/disable' % agent_id, {}, administrator)[0])
+        self.stop_web()
+        code, out, err = self.main('restore-new', 'hr3', 'hr3d', '--restore-http-state', '--credentials', 'keep')
+        self.assertEqual(0, code, err or out)
+        self.assertIn('Accounts disabled since the backup are ENABLED again by this restore (1): alex.', out)
+        self.assertIn('Agents disabled since the backup are ENABLED again by this restore (1): bot.', out)
+        self.web = Web(self.live)
+        self.login('alex', ALEX_PASSWORD)                                   # the backup's value stands, as said
+
+    def test_r4_the_live_pair_is_kept_aside_and_what_was_created_since_is_named(self):
+        """Review R4 (test_p2): the live pair is copied aside 0600 before the replace, and the restore says so."""
+        self.new_project('hr4')
+        administrator, _ = self.office()
+        self.backup('hr4')
+        status, data = self.web.request('POST', '/v1/accounts', {'username': 'newbie'}, administrator)
+        self.assertEqual(201, status, data)
+        newbie_id = data['id']
+        self.bot(administrator)
+        self.stop_web()
+        before = self.live.read_bytes()
+        code, out, err = self.main('restore-new', 'hr4', 'hr4d', '--restore-http-state', '--credentials', 'keep')
+        self.assertEqual(0, code, err or out)
+        self.assertIn('Accounts created since the backup are not in the restored state and are gone from it (1): newbie.', out)
+        self.assertIn('Agents created since the backup are not in the restored state and are gone from it (1): bot.', out)
+        kept = sorted(self.root.glob('http-state.json.before-restore-*'))
+        self.assertEqual(2, len(kept), kept)                                # the JSON and its records file
+        json_copy = [path for path in kept if not path.name.endswith('.records.sqlite3')][0]
+        self.assertEqual(before, json_copy.read_bytes())
+        self.assertIn(newbie_id, json_copy.read_text(encoding='utf-8'))
+        for path in kept:
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            self.assertIn(str(path), out)
+        self.assertNotIn(newbie_id, self.live.read_text(encoding='utf-8'))
+
+    def test_r1_a_service_started_during_the_restore_is_found_before_the_write(self):
+        """Review R1 (test_p3): the process check runs again immediately before the state is written."""
+        self.new_project('hr1')
+        self.office()
+        self.backup('hr1')
+        self.stop_web()
+        started = {}
+        original = admin.native_restore
+
+        def a_service_starts_meanwhile(root, source, destination):
+            started['service'] = self.plain_service(
+                [sys.executable, str(KIT / 'http_service.py'), '--state', str(self.live), '--port', 'PORT',
+                 '--backend', 'inprocess'], str(self.root), 'r1-service')
+            started['sha'] = sha(self.live)                                 # a starting service may write it
+            return original(root, source, destination)
+        with mock.patch.object(admin, 'native_restore', side_effect=a_service_starts_meanwhile):
+            code, out, err = self.main('restore-new', 'hr1', 'hr1d', '--restore-http-state', '--credentials', 'revoke')
+        service, _ = started['service']
+        self.assertNotEqual(0, code)
+        self.assertIn('an http_service.py process (pid %d)' % service.pid, err)
+        self.assertIn('The live HTTP state was not changed.', err)
+        self.assertIn('To restore it, either retire the clone (admin.py retire-project hr1d --actor OPERATOR '
+                      '--reason REASON) and run this restore-new again', err)       # review R7: the way out
+        self.assertIn('restore-new hr1 NEWNAME --restore-http-state --credentials revoke', err)
+        self.assertEqual(started['sha'], sha(self.live))
+        self.assertEqual([], sorted(p.name for p in self.root.glob('.http-state-restore-*')))
+
+    def test_r2_a_service_run_as_a_module_or_behind_interpreter_options_is_seen(self):
+        """Review R2 (test_p4)."""
+        self.a_backed_up_office('hr2')
+        shapes = {
+            'module': ([sys.executable, '-m', 'http_service', '--state', str(self.live), '--port', 'PORT',
+                        '--backend', 'inprocess'], str(KIT)),
+            'options': ([sys.executable, '-X', 'utf8', '-X', 'faulthandler', '-W', 'ignore', str(KIT / 'http_service.py'),
+                         '--state', str(self.live), '--port', 'PORT', '--backend', 'inprocess'], str(self.root)),
+        }
+        for label, (command, cwd) in shapes.items():
+            with self.subTest(shape=label):
+                service, _ = self.plain_service(command, cwd, 'r2-' + label)
+                self.assertIn(service.pid, admin.http_service_processes(self.root, self.live))
+                if label == 'module':
+                    before = sha(self.live)
+                    code, out, err = self.main('restore-new', 'hr2', 'hr2d', '--restore-http-state', '--credentials', 'keep')
+                    self.assertNotEqual(0, code)
+                    self.assertIn('an http_service.py process (pid %d)' % service.pid, err)
+                    self.assertFalse(self.exists('hr2d'))
+                    self.assertEqual(before, sha(self.live))
+                self.stop_process(service)
 
 # --------------------------------------------------------------------- F5 and the time, no tracker needed
 class StateFilesTests(unittest.TestCase):
@@ -620,6 +744,46 @@ class StateFilesTests(unittest.TestCase):
         self.assertTrue(restored['sessions']['s']['revoked'])
         self.assertIn('Unused password-reset values in it were revoked (1)', text)
 
+
+    def test_r5_a_named_state_with_no_records_file_beside_it_is_degraded(self):
+        """Review R5 (test_p10): the pair is what is promised; the stale records copy is named."""
+        self.state_pair()                                                   # a full pair in backups/ first
+        lone = self.root / 'lone.json'
+        shutil.copy(str(self.root / 'http-state.json'), str(lone))
+        entry = admin.backup_http_state(self.root, named=str(lone))
+        self.assertEqual('degraded', entry['status'])
+        self.assertIn('has no records file beside it', entry['reason'])
+        self.assertIn('is from an earlier run', entry['reason'])
+        self.assertEqual('complete', admin.backup_http_state(self.root)['status'])     # the default: as before
+
+    SCRIPT_R6 = '''
+import os, signal, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import admin
+real = os.fsync
+state = {'sent': False}
+def fsync(fd):
+    if not state['sent']:
+        state['sent'] = True
+        os.kill(os.getpid(), signal.SIGTERM)
+    return real(fd)
+admin.os.fsync = fsync
+print(admin.restore_http_state(Path(sys.argv[2]), credentials='keep'))
+'''
+
+    def test_r6_a_stop_during_the_state_write_leaves_no_temporary_and_the_live_state_as_it_was(self):
+        """Review R6 (test_p6)."""
+        live = self.state_pair()
+        before = sha(live)
+        script = self.root / 'stop_during_state_write.py'
+        script.write_text(self.SCRIPT_R6, encoding='utf-8')
+        done = subprocess.run([sys.executable, str(script), str(KIT), str(self.root)], capture_output=True, text=True,
+                              timeout=120, cwd=str(self.root))
+        self.assertNotEqual(-signal.SIGTERM, done.returncode, 'the stop took the default action')
+        self.assertNotEqual(0, done.returncode)
+        self.assertEqual([], sorted(p.name for p in self.root.glob('.http-state-*')))
+        self.assertEqual(before, sha(live))
 
 # ------------------------------------------------------------------------------------------------ F6
 @unittest.skipUnless(os.name == 'posix', 'SIGTERM semantics are POSIX')

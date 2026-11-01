@@ -6557,6 +6557,16 @@ def backup_http_state(root, named=None):
         if os.path.exists(temp):os.unlink(temp)
     files=[{'name':HTTP_STATE_JSON,'bytes':json_target.stat().st_size}]
     records=Path(str(source)+'.records.sqlite3')
+    if origin in ('flag','deployment') and not records.is_file():
+        # kittrial-5bb.500 r2 (review R5): the pair is what the docs promise. A named state with no records
+        # file beside it is degraded, and the records copy already in backups/ is from an earlier run.
+        stale=backups/HTTP_STATE_RECORDS
+        entry.update(status='degraded',files=files,origin=origin,
+                     reason=('the HTTP state %s has no records file beside it (%s is missing), so only the JSON half '
+                             'was copied%s'%(source,records,
+                              ('; backups/%s is from an earlier run (%s) and was NOT refreshed'
+                               %(HTTP_STATE_RECORDS,_utc_text(stale.stat().st_mtime))) if stale.is_file() else '')))
+        return entry
     if records.is_file():
         if records.is_symlink():
             raise ValueError('The HTTP state records file %s must not be a symlink'%records)
@@ -6647,6 +6657,14 @@ def prepare_http_state_restore(root,credentials):
 def restore_http_state(root, named=None, credentials='keep', now=None):
     """Restore the backed-up HTTP state pair to the live path; the text to print.
 
+    kittrial-5bb.500 r2 (review R6): the whole of it runs under the termination guard, so a SIGTERM
+    during the write is an exception: the temporaries are removed and the caller reports it."""
+    with signal_termination_guard():
+        return _restore_http_state(root,named,credentials,now)
+
+def _restore_http_state(root, named=None, credentials='keep', now=None):
+    """The work of ``restore_http_state``, which see.
+
     The ONLY caller is ``restore-new --restore-http-state`` (kittrial-5bb.331). The accounts, agents
     and memberships come back with their password and credential hashes. kittrial-5bb.500 F1: the
     sessions in the restored document are really revoked (it used to claim so and revoke nothing, so
@@ -6684,6 +6702,13 @@ def restore_http_state(root, named=None, credentials='keep', now=None):
     live.parent.mkdir(parents=True,exist_ok=True)
     import shutil
     import tempfile
+    records=backups/HTTP_STATE_RECORDS
+    records_live=Path(str(live)+'.records.sqlite3')
+    # kittrial-5bb.500 r2 (review R3, R4): what the live state holds that the restore changes, by name,
+    # read BEFORE anything is written; the backup's values stand and the operator is told.
+    changes=http_state_changes(live,document)
+    # The live pair is kept: copied aside, mode 0600, before it is replaced.
+    aside=keep_live_http_state(live,records_live)
     handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-restore-')
     try:
         with os.fdopen(handle,'w',encoding='utf-8') as stream:
@@ -6691,12 +6716,13 @@ def restore_http_state(root, named=None, credentials='keep', now=None):
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temp,0o600)
+        # Review R1: a plain http_service started while the project restored (it takes no lock) is
+        # looked for again here, immediately before the replace, while the office lock is still held.
+        refuse_running_http_service(root,live,tail='The live HTTP state was not changed.')
         os.replace(temp,str(live))
     finally:
         if os.path.exists(temp):os.unlink(temp)
     restored=[HTTP_STATE_JSON]
-    records=backups/HTTP_STATE_RECORDS
-    records_live=Path(str(live)+'.records.sqlite3')
     if records.is_file():
         handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-records-restore-')
         os.close(handle);os.unlink(temp)
@@ -6726,7 +6752,93 @@ def restore_http_state(root, named=None, credentials='keep', now=None):
                      %(stamp,revoked_before,len(stored)))
     if unused:lines.append('Unused password-reset values in it were revoked (%d).'%len(unused))
     lines.append('Passwords changed since %s UTC are back to their values at that time.'%stamp)
+    lines.extend(changes)
+    if aside:
+        lines.append('The live HTTP state it replaced was kept as %s (mode 0600).'%', '.join(map(str,aside)))
     return '\n'.join(lines)
+
+def http_state_changes(live,document):
+    """Sentences naming what the restore changes in the live state (kittrial-5bb.500 r2, review R3, R4).
+
+    Accounts and agents disabled in the live state but enabled in the backup come back ENABLED;
+    those created since the backup are not in it. Nothing is merged: the backup's values stand."""
+    if not live.is_file():
+        return ['There was no live HTTP state at %s, so nothing in it was replaced.'%live]
+    try:
+        current=record_json.loads(read_regular_text(live))
+        if not isinstance(current,dict):raise ValueError('not a state document')
+    except (OSError,ValueError) as error:
+        return ['The live HTTP state at %s could not be read to compare with the backup (%s): what it held that '
+                'the backup does not is not listed here; the copy kept beside it holds it.'%(live,str(error)[:120])]
+    def table(doc,key):
+        value=doc.get(key)
+        return value if isinstance(value,dict) else {}
+    def label(record,key):
+        return str(record.get(key) or record.get('id') or '?') if isinstance(record,dict) else '?'
+    out=[]
+    users_now,users_then=table(current,'users'),table(document,'users')
+    agents_now,agents_then=table(current,'agents'),table(document,'agents')
+    def is_on(record,flag,on_when):
+        return isinstance(record,dict) and bool(record.get(flag))==on_when
+    disabled=sorted(label(users_now[k],'username') for k in users_now
+                    if k in users_then and is_on(users_now[k],'disabled',True) and is_on(users_then[k],'disabled',False))
+    agents_off=sorted(label(agents_now[k],'name') for k in agents_now
+                      if k in agents_then and is_on(agents_now[k],'enabled',False) and is_on(agents_then[k],'enabled',True))
+    new_users=sorted(label(users_now[k],'username') for k in users_now if k not in users_then)
+    new_agents=sorted(label(agents_now[k],'name') for k in agents_now if k not in agents_then)
+    if disabled:
+        out.append('Accounts disabled since the backup are ENABLED again by this restore (%d): %s. Disable them again '
+                   'if they should stay disabled.'%(len(disabled),', '.join(disabled)))
+    if agents_off:
+        out.append('Agents disabled since the backup are ENABLED again by this restore (%d): %s. Disable them again '
+                   'if they should stay disabled.'%(len(agents_off),', '.join(agents_off)))
+    if new_users:
+        out.append('Accounts created since the backup are not in the restored state and are gone from it (%d): %s.'
+                   %(len(new_users),', '.join(new_users)))
+    if new_agents:
+        out.append('Agents created since the backup are not in the restored state and are gone from it (%d): %s.'
+                   %(len(new_agents),', '.join(new_agents)))
+    if not out:
+        out.append('No account or agent was disabled or created in the live state since the backup.')
+    return out
+
+def keep_live_http_state(live,records_live):
+    """Copy the live pair aside as ``<state>.before-restore-<UTC stamp>`` (and its records file), mode 0600.
+
+    kittrial-5bb.500 r2 (review R4): the restore never overwrites the live state without a copy. Each
+    file goes to a temporary name and is renamed, so a stop leaves no half copy. The paths kept."""
+    import shutil
+    import tempfile
+    if not live.is_file():
+        return []
+    stamp=time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())
+    target=Path('%s.before-restore-%s'%(live,stamp))
+    number=1
+    while os.path.lexists(str(target)) or os.path.lexists(str(target)+'.records.sqlite3'):
+        number+=1                                   # two restores in one second: never over an earlier copy
+        target=Path('%s.before-restore-%s-%d'%(live,stamp,number))
+    kept=[]
+    pairs=[(live,target)]
+    if records_live.is_file():
+        pairs.append((records_live,Path(str(target)+'.records.sqlite3')))
+    for source,destination in pairs:
+        handle,temp=tempfile.mkstemp(dir=str(destination.parent),prefix='.http-state-aside-')
+        os.close(handle)
+        try:
+            if source==records_live:
+                # The service is stopped here (the office lock is held and no http_service process was
+                # found), so where no consistent SQLite copy is available (Python 3.6 with no sqlite3 CLI)
+                # a plain copy of the closed file is one: nothing is writing it.
+                if copy_sqlite_consistently(source,Path(temp)) is not None:
+                    shutil.copyfile(str(source),temp)
+            else:
+                shutil.copyfile(str(source),temp)
+            os.chmod(temp,0o600)
+            os.replace(temp,str(destination))
+            kept.append(destination)
+        finally:
+            if os.path.exists(temp):os.unlink(temp)
+    return kept
 
 def office_service_lock(root):
     """The office lock ``<root>/office-service.lock``, held exclusively and without waiting; the fd.
@@ -6752,6 +6864,18 @@ def office_service_lock(root):
                          'Nothing was changed.'%(root/'office-service.lock')) from None
     return fd
 
+#: What ``http_service_processes`` looks for in a process's arguments: the script, or the module of ``-m``.
+HTTP_SERVICE_NAMES=('http_service.py','http_service')
+
+def refuse_running_http_service(root,live,tail='Nothing was changed.'):
+    """Raise the refusal of ``--restore-http-state`` when an http_service process serves ``live``."""
+    pids=http_service_processes(root,live)
+    if pids:
+        raise ValueError('Refusing --restore-http-state: an http_service.py process (pid %s) is serving this '
+                         'runtime\'s HTTP state. Stop the service first, then run restore-new again: a running '
+                         'service keeps the state in memory and writes it back over the restored file, so the '
+                         'restore would be silently undone. %s'%(', '.join(map(str,pids)),tail))
+
 def http_service_processes(root,live):
     """Pids of other ``http_service.py`` processes serving this runtime's HTTP state (Linux ``/proc``).
 
@@ -6775,7 +6899,10 @@ def http_service_processes(root,live):
             with open('/proc/%s/cmdline'%entry,'rb') as stream:arguments=stream.read().decode('utf-8','replace').split('\0')
         except OSError:
             continue
-        if not any(os.path.basename(item)=='http_service.py' for item in arguments[:4]):continue
+        # kittrial-5bb.500 r2 (review R2): anywhere in the argument list, and the module form too, so
+        # ``python3 -m http_service`` and a script behind interpreter options are seen. A renamed or
+        # symlinked copy of the script is not (docs/OPERATIONS.md says so).
+        if not any(os.path.basename(item) in HTTP_SERVICE_NAMES for item in arguments):continue
         try:cwd=os.readlink('/proc/%s/cwd'%entry)
         except OSError:cwd='/'
         values={}
@@ -6799,12 +6926,7 @@ def http_restore_hold(root,args):
     fd=office_service_lock(root)
     try:
         live,_=resolve_http_state_path(root)
-        pids=http_service_processes(root,live if live is not None else root/HTTP_STATE_JSON)
-        if pids:
-            raise ValueError('Refusing --restore-http-state: an http_service.py process (pid %s) is serving this '
-                             'runtime\'s HTTP state. Stop the service first, then run restore-new again: a running '
-                             'service keeps the state in memory and writes it back over the restored file, so the '
-                             'restore would be silently undone. Nothing was changed.'%', '.join(map(str,pids)))
+        refuse_running_http_service(root,live if live is not None else root/HTTP_STATE_JSON)
         yield
     finally:
         import fcntl
@@ -12463,9 +12585,16 @@ def _main():
             http_text=None
             if args.restore_http_state:
                 try:
-                    http_text=restore_http_state(root,credentials=args.credentials)
+                    # Review R6: under the termination guard, so a stop removes the temporary and is reported.
+                    with signal_termination_guard():
+                        http_text=restore_http_state(root,credentials=args.credentials)
                 except BaseException as error:
-                    print('The project %s was restored, but the HTTP state was NOT: %s'%(args.destination,error),
+                    # Review R7: no new command during the freeze; the exact way out instead.
+                    print('The project %s was restored, but the HTTP state was NOT: %s. Any live HTTP state it replaced '
+                          'is kept beside it as <state>.before-restore-<UTC time>. To restore it, either retire the clone (admin.py retire-project %s --actor OPERATOR '
+                          '--reason REASON) and run this restore-new again, or run restore-new %s NEWNAME '
+                          '--restore-http-state --credentials %s into a new name.'
+                          %(args.destination,error,args.destination,args.project,args.credentials),
                           file=sys.stderr)
                     raise
         print('Restored only into the newly created project; retained original issue IDs. Never use this clone as a second live tracker.')
