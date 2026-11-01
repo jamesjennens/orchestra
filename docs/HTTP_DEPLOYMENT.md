@@ -436,6 +436,12 @@ forwarded headers the service will believe. A reverse proxy on the same host is
 `--trusted-proxy 127.0.0.1`. Enable it **only** for the configured proxy address:
 forwarded headers from any other peer are ignored, so a client cannot spoof the
 throttle key or claim `https`.
+The service takes a forwarded client's address from the RIGHTMOST entry of
+`X-Forwarded-For`, so the trusted proxy must APPEND the client's address (nginx
+`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, as below), never
+pass a client's own header through unchanged; behind a chain of proxies only the
+last hop would be seen. Sign-in limits are kept in the service's memory and a
+restart resets them (docs/HTTP_TRANSPORT_DESIGN.md section 4).
 
 `--connections-per-address N` (default 100; 1 to 200) is how many of the
 service's 200 connections one client address may have open at once; one more

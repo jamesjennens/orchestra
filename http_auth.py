@@ -122,6 +122,9 @@ SOURCE_FAIL_LIMIT = 100
 SHARED_SOURCE_FAIL_LIMIT = 300        # the address everybody arrives from (the SSH tunnel)
 SOURCE_FAIL_WINDOW = 15 * 60
 SOURCE_SLOT_SECONDS = 5
+#: On the SHARED source (the SSH tunnel) an over-limit pair slows instead of refusing (kittrial-5bb.501 r2):
+#: one checked attempt per this many seconds, about 180 an hour per account.
+PAIR_SLOT_SECONDS = 20
 #: A source group that signed in to an account this recently is "known" to it, and skips both aggregate counts.
 KNOWN_SOURCE_SECONDS = 30 * 24 * 60 * 60
 KNOWN_SOURCES_PER_ACCOUNT = 4
@@ -1161,6 +1164,7 @@ class Service:
         self._failures = {}              # 'account|source group' -> failure times (the pair count)
         self._failures_account = {}      # account -> failure times, any source
         self._failures_source = {}       # source group (SHARED_SOURCE_KEY for the tunnel) -> failure times, any account
+        self._slot_pair = {}             # 'account|(shared)' -> time of the last attempt let through in slow mode
         self._slot_account = {}          # account -> time of the last attempt let through in slow mode
         self._slot_source = {}           # source group -> the same
         self._known_sources = {}         # account -> [[source group, time of its last sign-in], ...], at most 4
@@ -1608,6 +1612,10 @@ class Service:
                                   lifetime=self.reset_ttl):
                 raise unauthenticated('Invalid or expired reset value')
             user = self._user(user_id)
+            if user.get('disabled'):
+                # A disabled account takes no password from a reset, with the usual answer
+                # (kittrial-5bb.501 r2, review item b).
+                raise unauthenticated('Invalid or expired reset value')
             record['used'] = True
             user['password'] = hash_password(new_password, minimum=self.password_min_length)
             self._revoke_sessions_for(user_id)
@@ -1643,6 +1651,11 @@ class Service:
             # superuser disabling a project's sole owner.
             self._assert_not_final_owner(user_id)
             user['disabled'] = True
+            # A pending reset value must not outlive the account's use either (kittrial-5bb.501 r2,
+            # review item b): the same loop as change_password and issue_reset.
+            for existing, record in list(self.state['reset_tokens'].items()):
+                if record['user_id'] == user_id and not record['used']:
+                    del self.state['reset_tokens'][existing]
             self._revoke_sessions_for(user_id)
             self._revoke_credentials_for(user_id)
             self.store.save()
@@ -1708,35 +1721,50 @@ class Service:
     def _check_throttle(self, username, source, shared_source=False):
         """Refuse with 429 when this attempt is over a limit; raises nothing when it may be checked.
 
-        The pair count (account, source group) refuses outright, as it always did. The two
-        aggregate counts, per account and per source group, only slow: over its limit a count
-        lets one checked attempt through per slot (the slot is taken here, under the store's
-        lock, so two at once cannot both take it) and answers 429 with Retry-After for the
-        rest. A source that signed in to this account in the last 30 days skips both
-        aggregates: someone failing against the name elsewhere cannot lock its user out.
+        The pair count (account, source group) refuses outright, as it always did, with a
+        Retry-After saying when its oldest counted failure leaves the window, except on the
+        SHARED source (kittrial-5bb.501 r2, review item a): there everybody is one group, so
+        a hard pair limit would let anyone on the tunnel lock any account out by name. On the
+        shared source an over-limit pair only slows, one checked attempt per
+        PAIR_SLOT_SECONDS. The two aggregate counts, per account and per source group, only
+        slow too: over its limit a count lets one checked attempt through per slot and
+        answers 429 with Retry-After for the rest. Every wait is worked out first and the
+        slots are taken only when the attempt goes through, all under the store's lock, so
+        two at once cannot both take a slot and a refused attempt takes none. A source that
+        signed in to this account in the last 30 days skips both aggregates: someone failing
+        against the name elsewhere cannot lock its user out.
         """
         with self.store.lock:
             now = self._now()
             account = (username or '').lower()
             group = self._source_key(source, shared_source)
             pair = '%s|%s' % (account, group)
-            if _count_recent(self._failures, pair, now, LOGIN_WINDOW_SECONDS) >= self.login_max_attempts:
-                raise throttled()
-            if self._is_known_source(account, group, now):
-                return
-            account_over = _count_recent(self._failures_account, account, now,
-                                         ACCOUNT_FAIL_WINDOW) >= ACCOUNT_FAIL_LIMIT
+            pair_over = _count_recent(self._failures, pair, now, LOGIN_WINDOW_SECONDS) >= self.login_max_attempts
+            if pair_over and not shared_source:
+                times = self._failures[pair]
+                oldest = times[len(times) - self.login_max_attempts]
+                error = throttled()
+                # A failure counts while it is no older than the window, so it drops out one moment AFTER
+                # oldest + window: a client that waits exactly this long is checked again.
+                error.retry_after = max(1, int(math.floor(oldest + LOGIN_WINDOW_SECONDS - now)) + 1)
+                raise error
+            known = self._is_known_source(account, group, now)
+            account_over = not known and _count_recent(self._failures_account, account, now,
+                                                       ACCOUNT_FAIL_WINDOW) >= ACCOUNT_FAIL_LIMIT
             source_limit = SHARED_SOURCE_FAIL_LIMIT if shared_source else SOURCE_FAIL_LIMIT
-            source_over = _count_recent(self._failures_source, group, now,
-                                        SOURCE_FAIL_WINDOW) >= source_limit
-            if not (account_over or source_over):
+            source_over = not known and _count_recent(self._failures_source, group, now,
+                                                      SOURCE_FAIL_WINDOW) >= source_limit
+            if not (pair_over or account_over or source_over):
                 return
-            wait = max(self._slot_wait(self._slot_account, account, now, ACCOUNT_SLOT_SECONDS) if account_over else 0,
+            wait = max(self._slot_wait(self._slot_pair, pair, now, PAIR_SLOT_SECONDS) if pair_over else 0,
+                       self._slot_wait(self._slot_account, account, now, ACCOUNT_SLOT_SECONDS) if account_over else 0,
                        self._slot_wait(self._slot_source, group, now, SOURCE_SLOT_SECONDS) if source_over else 0)
             if wait:
                 error = throttled('Too many sign-in attempts. Try again in %d seconds.' % wait)
                 error.retry_after = wait
                 raise error
+            if pair_over:
+                self._take_slot(self._slot_pair, pair, now, PAIR_SLOT_SECONDS)
             if account_over:
                 self._take_slot(self._slot_account, account, now, ACCOUNT_SLOT_SECONDS)
             if source_over:

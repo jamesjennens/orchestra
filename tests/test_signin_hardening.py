@@ -494,5 +494,104 @@ class MinimumLengthTests(unittest.TestCase):
         self.assertIn('Run the command again with a password of 12 to 1024 characters.', stderr.getvalue())
 
 
+class SharedPairSlowModeTests(ServerCase):
+    """r2, review item a: on the shared source (the SSH tunnel) nobody can lock an account out by name."""
+
+    def test_on_the_tunnel_ten_failures_by_name_no_longer_lock_the_real_user_out(self):
+        self.make_account('bob', 'bob-pass-1234')
+        self.session('bob', 'bob-pass-1234')                                   # bob signed in through the tunnel before
+        codes = [self.attempt('bob', 'guess %d' % i)[0] for i in range(10)]   # an insider on the tunnel, by bob's name
+        self.assertEqual(codes, [401] * 10)
+        self.assertEqual(self.attempt('bob', 'bob-pass-1234')[0], 201)         # the review's lockout probe: now gets in
+
+    def test_on_the_tunnel_guessing_one_name_stays_bounded_at_one_per_slot(self):
+        self.make_account('bob', 'bob-pass-1234')
+        for i in range(10):
+            self.attempt('bob', 'guess %d' % i)
+        checked, refused = 0, []
+        for second in range(60):                                               # one guess a second for a minute
+            status, _, headers = self.attempt('bob', 'more %d' % second)
+            if status == 401:
+                checked += 1
+            else:
+                refused.append((status, headers.get('Retry-After')))
+            self.clock.advance(1)
+        self.assertEqual(checked, 3)                                           # one per 20 s: about 180 an hour
+        self.assertEqual(refused[0], (429, '19'))
+        self.assertTrue(all(code == 429 and int(after) >= 1 for code, after in refused))
+
+    def test_the_real_user_gets_the_next_slot_after_the_insiders_guess(self):
+        self.make_account('bob', 'bob-pass-1234')
+        self.session('bob', 'bob-pass-1234')
+        for i in range(11):
+            self.attempt('bob', 'guess %d' % i)                                # the eleventh takes the slot
+        status, _, headers = self.attempt('bob', 'bob-pass-1234')
+        self.assertEqual((status, headers.get('Retry-After')), (429, '20'))
+        self.clock.advance(20)
+        self.assertEqual(self.attempt('bob', 'bob-pass-1234')[0], 201)
+
+    def test_off_the_tunnel_the_pair_limit_still_refuses_and_now_says_when(self):
+        self.make_account('bob', 'bob-pass-1234')
+        source = '198.51.100.7'
+        for i in range(10):
+            self.attempt('bob', 'guess %d' % i, source)
+        self.clock.advance(100)
+        status, _, headers = self.attempt('bob', 'bob-pass-1234', source)
+        self.assertEqual((status, headers.get('Retry-After')), (429, '201'))   # the window is 300 s, inclusive
+        self.clock.advance(200)
+        self.assertEqual(self.attempt('bob', 'bob-pass-1234', source)[0], 429)  # one second early: still refused
+        self.clock.advance(1)
+        self.assertEqual(self.attempt('bob', 'bob-pass-1234', source)[0], 201)
+
+    def test_an_ipv4_address_and_its_ipv6_mapped_form_are_one_pair(self):
+        self.make_account('bob', 'bob-pass-1234')
+        codes = [self.attempt('bob', 'guess %d' % i, '198.51.100.9' if i % 2 else '::ffff:198.51.100.9')[0]
+                 for i in range(12)]
+        self.assertEqual(codes, [401] * 10 + [429] * 2)
+
+
+class DisableResetTests(ServerCase):
+    """r2, review item b: a disable deletes pending reset values, and redeem refuses a disabled account."""
+
+    def issue(self, user_id):
+        status, issued, _ = self.request('POST', '/v1/accounts/%s/reset' % user_id, {}, self.admin['bearer'], key=True)
+        self.assertEqual(status, 201, issued)
+        return issued['reset_value']
+
+    def disable(self, user_id):
+        status, body, _ = self.request('POST', '/v1/accounts/%s/disable' % user_id, {}, self.admin['bearer'], key=True)
+        self.assertEqual(status, 200, body)
+
+    def redeem(self, user_id, value):
+        return self.request('POST', '/v1/accounts/%s/reset/redeem' % user_id,
+                            {'reset_value': value, 'new_password': 'attacker-pass-9999'})[:2]
+
+    def pending(self, user_id):
+        return [r for r in self.service.state['reset_tokens'].values() if r['user_id'] == user_id and not r['used']]
+
+    def test_a_reset_issued_before_a_disable_is_deleted_by_it(self):
+        dan = self.make_account('dan', 'dan-pass-1234')
+        old = self.issue(dan)
+        self.disable(dan)
+        self.assertEqual(self.pending(dan), [])
+        status, body = self.redeem(dan, old)
+        self.assertEqual((status, body['error']['message']), (401, 'Invalid or expired reset value'))
+        self.assertTrue(http_auth.verify_password(self.service.state['users'][dan]['password'], 'dan-pass-1234'))
+
+    def test_a_reset_issued_after_a_disable_sets_no_password(self):
+        dan = self.make_account('dan', 'dan-pass-1234')
+        self.disable(dan)
+        value = self.issue(dan)
+        status, body = self.redeem(dan, value)
+        self.assertEqual((status, body['error']['message']), (401, 'Invalid or expired reset value'))
+        self.assertTrue(http_auth.verify_password(self.service.state['users'][dan]['password'], 'dan-pass-1234'))
+
+    def test_a_disable_leaves_another_accounts_pending_value_alone(self):
+        dan, eve = self.make_account('dan', 'dan-pass-1234'), self.make_account('eve', 'eve-pass-1234')
+        eves = self.issue(eve)
+        self.disable(dan)
+        self.assertEqual(self.redeem(eve, eves)[0], 200)
+
+
 if __name__ == '__main__':
     unittest.main()
