@@ -303,7 +303,7 @@ export async function detail(ctx, { pid, rid }) {
     room = data.room;
     since = data.next_since;
     const rows = data.messages.map(messageRow);
-    const log = h('ul', { class: 'timeline', 'aria-label': 'Room messages' }, rows.length ? rows : h('li', null, h('div', { class: 'empty' }, 'No messages yet.')));
+    const log = h('ul', { class: 'timeline timeline-plain', 'aria-label': 'Room messages' }, rows.length ? rows : h('li', null, h('div', { class: 'empty' }, 'No messages yet.')));
     const more = data.has_more ? h('button', { type: 'button', class: 'ghost', onclick: async (event) => {
       event.currentTarget.disabled = true;
       const next = await ctx.api.room(pid, rid, { since, limit: 100 });
@@ -316,7 +316,7 @@ export async function detail(ctx, { pid, rid }) {
     const itemSection = h('section', { class: 'panel' },
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Items awaiting a person')),
       h('div', { class: 'panel-body' }, items.length
-        ? h('ul', { class: 'timeline', 'aria-label': 'Room items' }, items.map(itemRow))
+        ? h('ul', { class: 'timeline timeline-plain', 'aria-label': 'Room items' }, items.map(itemRow))
         : h('div', { class: 'empty' }, 'No items yet. A candidate requirement, decision or open question goes here until a person decides it.')));
 
     const adding = [];

@@ -74,8 +74,20 @@ class LayoutSourceCase(unittest.TestCase):
 
     def test_room_lists_use_the_plain_timeline(self):
         rooms = self.read('js/views/rooms.js')
-        for label in ('Damaged rooms', 'Open rooms', 'Archived rooms'):
+        for label in ('Damaged rooms', 'Open rooms', 'Archived rooms', 'Room messages', 'Room items'):
             self.assertIn("class: 'timeline timeline-plain', 'aria-label': '%s'" % label, rooms)
+        self.assertNotIn("class: 'timeline', 'aria-label'", rooms)
+
+    def test_lanes_hide_account_ids_as_text(self):
+        project = self.read('js/views/project.js')
+        self.assertIn("title: isAccountId(lane.lane) ? lane.lane : null", project)
+        self.assertIn("isAccountId(lane.lane) ? null : h('span', { class: 'mono small muted' }, lane.lane)", project)
+
+    def test_switch_notice_is_a_toast_not_a_banner(self):
+        app = self.read('js/app.js')
+        self.assertIn("toast(label ? `${name} has no ${label} page", app)
+        self.assertNotIn("class: 'banner', role: 'status'", app)
+        self.assertNotIn('ctx.notice', app)
 
     def test_plain_timeline_is_one_column_without_the_rule(self):
         css = self.read('css/app.css')

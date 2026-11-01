@@ -101,20 +101,20 @@ export async function start(root, options = {}) {
   }
 
   // Switching project keeps the page when the target has it; otherwise the target's Tasks
-  // list opens and a one-line notice says why (read once by the next buildShell).
+  // list opens and a toast says why (the toast layer leaves the page layout alone).
   function switchProject(targetPid) {
     const target = ctx.projects.find((p) => p.id === targetPid);
-    const t = switchTarget(currentRoute(), targetPid, target ? projectSections(target).map(([seg]) => seg) : []);
+    const sections = target ? projectSections(target) : [];
+    const t = switchTarget(currentRoute(), targetPid, sections.map(([seg]) => seg));
+    ctx.go(t.path);
     if (t.fellBack) {
       const name = target ? target.name : 'that project';
-      ctx.notice = t.section ? `${name} has no ${t.section} page, so it opened on Tasks.` : `Task pages belong to one project, so ${name} opened on Tasks.`;
+      const label = t.section && (sections.find(([seg]) => seg === t.section) || [])[1];
+      toast(label ? `${name} has no ${label} page, so it opened on Tasks.` : `Task pages belong to one project, so ${name} opened on Tasks.`);
     }
-    ctx.go(t.path);
   }
 
   function buildShell(route) {
-    const notice = ctx.notice ? h('div', { class: 'banner', role: 'status' }, ctx.notice) : null;
-    ctx.notice = null;
     route = route.split('?')[0];
     const pid = projectOf(route);
     const active = ctx.projects.filter((p) => !p.archived);
@@ -152,7 +152,6 @@ export async function start(root, options = {}) {
         h('div', { class: 'main-top' },
           h('button', { type: 'button', class: 'menu-toggle ghost', 'aria-expanded': 'false', 'aria-controls': 'rail', onclick: (e) => { const open = shell.classList.toggle('nav-open'); e.currentTarget.setAttribute('aria-expanded', String(open)); } }, 'Menu'),
           h('a', { class: 'brand', href: ctx.href('/') }, brandMark(), h('span', null, 'Orchestra'))),
-        notice,
         main));
     return main;
   }

@@ -201,7 +201,8 @@ function laneBlock(ctx, project, lane) {
       'data-inferred': lane.inferred ? 'true' : null },
       h('div', { class: 'event-head' },
         // Display only (kittrial-5bb.416): the server's display_name text, never decided here.
-        h('strong', null, lane.display_name || lane.lane), ' ', h('span', { class: 'mono small muted' }, lane.lane),
+        h('strong', { title: isAccountId(lane.lane) ? lane.lane : null }, lane.display_name || (isAccountId(lane.lane) ? 'Someone' : lane.lane)), ' ',
+        isAccountId(lane.lane) ? null : h('span', { class: 'mono small muted' }, lane.lane),
         ' ',
         lane.idle ? h('span', { class: 'chip', 'data-idle': 'true', title: 'This lane holds nothing' }, 'Free')
           : h('span', { class: 'chip plain' }, held.length === 1 ? '1 task held' : held.length + ' tasks held'),

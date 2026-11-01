@@ -4203,6 +4203,8 @@ class EndpointBackend:
                           'open_items_shown': shown,
                           'open_items_total': total,
                           **({'open_items_note': note} if note else {})}
+            if isinstance(point.get('author'), str):
+                checkpoint['author_name'] = self._actor_names([point['author']], project_id).get(point['author'])
             from briefing import bound_context_pointer_display
             checkpoint['pointer_items'],checkpoint['resolved_pointer_items']=bound_context_pointer_display(
                 [checkpoint['pointer_items'],checkpoint['resolved_pointer_items']])
