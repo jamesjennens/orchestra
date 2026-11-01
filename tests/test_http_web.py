@@ -2421,6 +2421,10 @@ def work_row(warnings=(WARNING,)):
             'integration_warnings': list(warnings)}
 
 
+_PASSWORD_FORMS_RUN = {}
+FOCUS_KEYS = ('signInFocus', 'signInFocusKeptWhenTyping', 'redeemFocus', 'accountFocus')
+
+
 class PasswordPageCase(unittest.TestCase):
     """The two web password forms state the server's rule and refuse a mismatch (5bb.363)."""
 
@@ -2430,18 +2434,23 @@ class PasswordPageCase(unittest.TestCase):
             self.assertNotIn('At least 12', text, name)
             self.assertNotIn('length < 12', text, name)
 
+    def _observed(self):
+        if 'observed' not in _PASSWORD_FORMS_RUN:
+            node = shutil.which('node')
+            if not node:
+                self.skipTest('node is not installed; the static check above still applies')
+            tests = Path(__file__).resolve().parent
+            done = run_node_module(self, node, 'await import(process.argv[1])',
+                                   (tests / 'web_password_forms.mjs').as_uri(),
+                                   (tests / 'web_dom_shim.mjs').as_uri(),
+                                   (WEB / 'js' / 'views' / 'admin.js').as_uri(),
+                                   (WEB / 'js' / 'views' / 'auth.js').as_uri())
+            self.assertEqual(0, done.returncode, done.stderr[-3000:])
+            _PASSWORD_FORMS_RUN['observed'] = json.loads(done.stdout.strip().splitlines()[-1])
+        return _PASSWORD_FORMS_RUN['observed']
+
     def test_the_real_forms_under_node(self):
-        node = shutil.which('node')
-        if not node:
-            self.skipTest('node is not installed; the static check above still applies')
-        tests = Path(__file__).resolve().parent
-        done = run_node_module(self, node, 'await import(process.argv[1])',
-                               (tests / 'web_password_forms.mjs').as_uri(),
-                               (tests / 'web_dom_shim.mjs').as_uri(),
-                               (WEB / 'js' / 'views' / 'admin.js').as_uri(),
-                               (WEB / 'js' / 'views' / 'auth.js').as_uri())
-        self.assertEqual(0, done.returncode, done.stderr[-3000:])
-        observed = json.loads(done.stdout.strip().splitlines()[-1])
+        observed = self._observed()
         self.assertEqual({
             'accountHintDefault': 'At least 1 character.',
             'accountEmpty': 'Use at least 1 character.',
@@ -2477,7 +2486,19 @@ class PasswordPageCase(unittest.TestCase):
             'redeemSignedOutMismatch': 'The two new passwords do not match.',
             'redeemSignedOutMismatchCalls': 0,
             'redeemSignedOutOneCharCalls': 1,
-        }, observed)
+        }, {k: v for k, v in observed.items() if k not in FOCUS_KEYS})
+
+    def test_sign_in_cursor_opens_in_the_username_box(self):
+        self.assertEqual('username', self._observed()['signInFocus'])
+
+    def test_sign_in_cursor_is_not_taken_from_someone_already_typing(self):
+        self.assertEqual('typed-elsewhere', self._observed()['signInFocusKeptWhenTyping'])
+
+    def test_reset_page_cursor_opens_in_the_account_id(self):
+        self.assertEqual('account', self._observed()['redeemFocus'])
+
+    def test_change_password_cursor_opens_in_the_current_password(self):
+        self.assertEqual('current', self._observed()['accountFocus'])
 
 
 class ReviewQueueWarningsTests(unittest.TestCase):

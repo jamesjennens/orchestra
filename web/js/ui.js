@@ -156,6 +156,17 @@ export function formValues(form) {
   return Object.fromEntries(new FormData(form).entries());
 }
 
+// Put the cursor in the first empty field of a form just shown, but only while nothing else
+// has the focus: the page title (app.js focuses it on every render) or the body. Once the
+// person has moved into a field, or into anything else, the focus is theirs (kittrial-5bb.503).
+export function focusFirstEmpty(form) {
+  const active = document.activeElement;
+  const untouched = !active || active === document.body || (active.getAttribute && active.getAttribute('id') === 'page-title');
+  if (!untouched) return;
+  const first = Array.from(form.querySelectorAll('input')).find((input) => !input.value);
+  if (first) first.focus();
+}
+
 // The server's password rule, stated by the page (kittrial-5bb.363). The session read
 // carries the installation's minimum. The reset page is used signed out, where there is
 // no session answer to read: it states no number and lets the server's own 422 sentence

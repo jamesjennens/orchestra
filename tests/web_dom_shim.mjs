@@ -108,7 +108,7 @@ class Element extends Node {
   // "null" and append(undefined) inserts "undefined"; it does not skip them.
   append(...children) { for (const child of children) this.appendChild(child instanceof Node ? child : new Text(String(child))); }
   replaceChildren(...children) { this._childNodes.length = 0; this.append(...children); }
-  focus() {}
+  focus() { document.activeElement = this; }
   all(test, out = []) {
     for (const c of this._childNodes) if (c instanceof Element) { if (test(c)) out.push(c); c.all(test, out); }
     return out;
@@ -145,6 +145,7 @@ class FormData {
 globalThis.Node = Node;
 globalThis.FormData = FormData;
 globalThis.document = { createElement: (tag) => new Element(tag), createTextNode: (text) => new Text(text),
-  createElementNS: (_, tag) => new Element(tag), body: new Element('body') };
+  createElementNS: (_, tag) => new Element(tag), body: new Element('body'), activeElement: null };
+document.activeElement = document.body;
 
 export { Node, Text, Element, FormData, liveCollection, nodeList };
