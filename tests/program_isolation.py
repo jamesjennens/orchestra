@@ -44,6 +44,7 @@ PERSONAL_READS = (
 #: Every route handler whose pattern mentions "program", with the read above that covers it.
 PROGRAM_ROUTES = {'interfaces_list':'interfaces','interfaces_get':'interface-detail',
                   'interfaces_propose':'interfaces','interfaces_revise':'interfaces','interfaces_accept':'interfaces',
+                  'interfaces_verify':'interface-detail','interfaces_report':'interface-detail',
                   'program_links_read': 'program-links', 'notes_read': 'notes', 'notes_write': 'notes',
                   'notes_noted': 'notes', 'me_notes': 'me-notes', 'program_view_read': 'program'}
 

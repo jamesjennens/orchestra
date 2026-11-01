@@ -174,6 +174,57 @@ class NativeVerificationTests(fixture.NativeInterfaceTests):
         self.assertEqual('breaking-without-version',detail()['compatibility'])
         ok(dict(bp,operation_id='reported-break-pass'),actor='contributor',report=True)
         self.assertEqual('breaking-without-version',detail()['compatibility'])
+        self.assert_contributor_http_report()
+
+    def assert_contributor_http_report(self):
+        h=self.harness;path='/v1/projects/pp/interfaces/iface.quotes.v1'
+        def exported():return fixture.native_fixture.admin.run_bd(self.root,'pp',['--actor','ops','export','--all'])
+        current=h.request('GET',path,token=self.owner);self.assertEqual(200,current.status,current.data)
+        self.assertEqual('breaking-without-version',current.data['compatibility'])
+        target=current.data['record']
+        checks=[item['record'] for item in current.data['interface_verifications']
+            if item['record']['trusted'] and item['record']['new_record_sha256']==target['sha256']]
+        self.assertTrue(checks);check=checks[-1]
+        body={key:check[key] for key in ('old_revision','old_record_sha256','new_revision','new_record_sha256','direction')}
+        body.update(decision_id=None,claimed='additive')
+        uid=h.create_account(self.owner,'supplemental-reporter','synthetic-report-password')
+        membership=h.request('PUT','/v1/projects/pp/members/'+uid,{'role':'contributor'},token=self.owner)
+        self.assertEqual(200,membership.status,membership.data)
+        token=h.login('supplemental-reporter','synthetic-report-password')[0]
+        answer=h.request('POST',path+'/report',body,token=token,key='supplemental-http-report')
+        self.assertEqual(200,answer.status,answer.data)
+        value=answer.data['record'];self.assertFalse(value['trusted'])
+        self.assertEqual('additive',value['claimed']);self.assertEqual('unknown',value['result']['classification'])
+        self.assertIsNone(value['old_source']);self.assertIsNone(value['new_source'])
+        after=h.request('GET',path,token=self.owner);self.assertEqual(200,after.status,after.data)
+        self.assertEqual('breaking-without-version',after.data['compatibility'])
+        before=exported();replay=h.request('POST',path+'/report',body,token=token,key='supplemental-http-report')
+        self.assertEqual(200,replay.status,replay.data);self.assertEqual(value,replay.data['record'])
+        self.assertEqual(before,exported())
+        changed=h.request('POST',path+'/report',dict(body,claimed='breaking'),token=token,key='supplemental-http-report')
+        self.assertEqual(409,changed.status,changed.data);self.assertEqual(before,exported())
+        forged=h.request('POST',path+'/report',dict(body,trusted=True),token=token,key='supplemental-forged-report')
+        self.assertEqual(422,forged.status,forged.data);self.assertEqual(before,exported())
+        # Membership of the program grants no mutation right in its area.
+        import program_isolation
+        for suffix in ('verify','report'):
+            request=body if suffix=='report' else {k:v for k,v in body.items() if k!='claimed'}
+            answers=[]
+            before_area=fixture.native_fixture.admin.run_bd(self.root,'area',['--actor','ops','export','--all'])
+            before_program=exported()
+            for project in ('area','absentarea'):
+                response=h.request('POST','/v1/projects/'+project+'/interfaces/iface.quotes.v1/'+suffix,
+                    request,token=token,key='outsider-'+project+'-'+suffix)
+                self.assertEqual(404,response.status,response.data)
+                answers.append(program_isolation.without_request_id(response.data))
+            self.assertEqual(answers[0],answers[1])
+            self.assertEqual(before_area,fixture.native_fixture.admin.run_bd(self.root,'area',['--actor','ops','export','--all']))
+            self.assertEqual(before_program,exported())
+        demote=h.request('PUT','/v1/projects/pp/members/'+uid,{'role':'viewer'},token=self.owner)
+        self.assertEqual(200,demote.status,demote.data)
+        before=exported();revoked=h.request('POST',path+'/report',body,token=token,key='supplemental-http-report')
+        self.assertEqual(403,revoked.status,revoked.data);self.assertNotIn('record',revoked.data)
+        self.assertEqual(before,exported())
 
     def git(self,*args):
         return subprocess.check_output(['git','-c','user.name=Fixture','-c','user.email=fixture@example.invalid',*args],cwd=self.repo,stderr=subprocess.DEVNULL)

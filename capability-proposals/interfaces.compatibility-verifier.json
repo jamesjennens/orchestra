@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "operation_id": "goomba-451-capability-0001",
+  "key": "interfaces.compatibility-verifier",
+  "name": "Conservative offline interface compatibility verification",
+  "aliases": [
+    "interface compatibility verifier",
+    "JSON Schema interface verification",
+    "OpenAPI interface verification"
+  ],
+  "summary": "Native configured verifiers and bound HTTP coordinators or delegated agents record pinned interface compatibility attestations from locally configured Git object sources. Bounded JSON Schema2020-12 and OpenAPI3.1 JSON subset proofs use request and response variance; unsupported or unproved input remains unknown. Contributor reports are untrusted and cannot clear trusted breaking evidence. Current issuer, delegation, independent-party policy, source configuration and exact record pins determine trusted evidence; both HTTP cached replay paths recheck current authority. Per-interface API flags expose derived compatibility; no automatic lifecycle change. Host interface-verify and interface-report use native actors.",
+  "requirements": [],
+  "anchors": [
+    "docs/OPERATIONS.md#offline-interface-compatibility-checks"
+  ],
+  "code": [
+    "interface_compatibility.py::classify",
+    "interface_schema_source.py::prove",
+    "interface_verification.py::record",
+    "interface_verification.py::derive",
+    "interface_verification.py::pair",
+    "endpoint.py::execute"
+  ],
+  "tests": [
+    "tests/test_interface_compatibility.py",
+    "tests/test_interface_schema_source.py",
+    "tests/test_interface_verification.py",
+    "tests/test_interface_verification_native.py"
+  ],
+  "owner": "person:orchestra-coordinator",
+  "tags": [
+    "interfaces",
+    "programs",
+    "verification"
+  ]
+}
