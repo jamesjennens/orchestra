@@ -11550,7 +11550,10 @@ class ApiHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _agent_attention_view(agent, attention=None):
         if attention is None:
-            attention = {'state': 'unknown', 'summary': 'Not computed.',
+            # kittrial-5bb.237 (G5): a view that was never computed is its own state.
+            # The routes always compute attention; 'unknown' on a computed read means
+            # the read was INCOMPLETE (lower bounds), never "not computed".
+            attention = {'state': 'not-computed', 'summary': 'Not computed.',
                          'counts': {}, 'actions': [], 'truncated': False,
                          'snapshot_truncated': False, 'own_tasks_truncated': False,
                          'actions_truncated': False,
@@ -15434,8 +15437,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             if isinstance(detail, dict):
                 row=attention_rows[(project_id,task_id)]
                 blocking=attention_blocking_items(row.get('attention') or {})
-                detail=dict(detail,blocked=row.get('review_state') in (None,'none')
-                            and not row.get('contribution') and type(blocking) is int and blocking>0)
+                undelivered=row.get('review_state') in (None,'none') and not row.get('contribution')
+                # kittrial-5bb.237 (G6): an explicit null blocking count is not
+                # "not blocked". Keep `blocked` false (nothing observed is blocked)
+                # and carry the unreadable count as its own signal, dropped by the
+                # None filter below when the count is known.
+                detail=dict(detail,blocked=undelivered and type(blocking) is int and blocking>0,
+                            blocking_unknown=True if undelivered and blocking is None else None)
                 details[(project_id, task_id)] = {k: v for k, v in detail.items()
                                                   if v is not None}
         return details
