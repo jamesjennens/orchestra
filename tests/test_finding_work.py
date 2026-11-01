@@ -632,9 +632,9 @@ class PageTests(Members):
         routes = (KIT / 'web' / 'js' / 'routes.js').read_text(encoding='utf-8')
         self.assertIn("  ['how', '/p/{pid}/how'],\n", routes)
         self.assertIn('how: how.page,', app)
-        line = "            link('/p/' + pid + '/how', 'How work is found'),\n"
+        line = "      ['how', 'How work is found'],\n"
         self.assertIn(line, app)
-        # Not behind a role: the line before it is the owners' one, and this one has no condition.
+        # Not behind a role: the entry has no condition, so every member sees the page.
         self.assertNotIn('?', line)
 
 

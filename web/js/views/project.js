@@ -1,5 +1,5 @@
 import { h, time, confirmDialog, secretDialog, toast, shortSha } from '../dom.js';
-import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe } from '../ui.js';
+import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, errorState, describe, actorWords, isAccountId } from '../ui.js';
 import { queuePanel, detailPanel, proposeForm, myStrip } from './proposals.js';
 import { proposeSection } from './proposals.js';
 export { proposeSection } from './proposals.js';
@@ -154,9 +154,9 @@ export function lanesPanel(ctx, project) {
     if (!entry.waiting_on) return null;
     if (entry.waiting_on === 'you') return 'you';
     if (entry.waiting_on_name && entry.waiting_on_name !== entry.waiting_on) {
-      return `${entry.waiting_on_name} (${entry.waiting_on})`;
+      return isAccountId(entry.waiting_on) ? entry.waiting_on_name : `${entry.waiting_on_name} (${entry.waiting_on})`;
     }
-    return entry.waiting_on_name || entry.waiting_on;
+    return entry.waiting_on_name || (isAccountId(entry.waiting_on) ? 'someone' : entry.waiting_on);
   }
 
   function taskLine(entry) {
@@ -355,7 +355,7 @@ export async function overview(ctx, { pid }) {
       : null;
     tableHost.replaceChildren(
       ...(unreadable ? [unreadable] : []),
-      leftOut,
+      ...(leftOut ? [leftOut] : []),
       rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'stack-narrow task-list-project' },
         h('caption', { class: 'visually-hidden' }, 'Tasks in ' + project.name),
         // Slice 3 (kittrial-5bb.416): the task list leads with STATE and WHO ACTS NEXT,
@@ -388,7 +388,7 @@ export async function overview(ctx, { pid }) {
               (t.next_action ? t.next_action.text : '—'))),
           h('td', { class: 'hide-narrow muted task-updated-column' }, t.updated_at ? time(t.updated_at) : '')))))) :
         empty(state.q || state.review ? 'No matching tasks' : 'No tasks yet', state.q || state.review ? 'Try a different search or filter.' : canWrite(project) && !project.archived ? 'Define the first task for this project.' : null),
-      partial,
+      ...(partial ? [partial] : []),
       h('div', { class: 'pager' },
         h('span', { class: 'num' }, page.total ? `${start + 1}–${start + rows.length} of ${page.total}` : ''),
         h('div', { class: 'actions' },
@@ -763,7 +763,7 @@ export async function settings(ctx, { pid }) {
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Label'), h('th', { scope: 'col' }, 'Issued by'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Scopes'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Expires'), h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Actions')))),
         h('tbody', null, data.items.map((c) => h('tr', null,
           h('td', null, c.label, c.revoked ? h('div', { class: 'sub' }, 'Revoked') : null),
-          h('td', null, c.user_name || c.user_id || ''),
+          h('td', { title: c.user_id || null }, actorWords(c.user_name, c.user_id, 'someone')),
           h('td', { class: 'hide-narrow mono small' }, c.scopes.join(', ')),
           h('td', { class: 'hide-narrow muted' }, time(c.expires_at)),
           h('td', null, c.revoked ? null : h('button', { type: 'button', class: 'danger', onclick: async (e) => {
@@ -782,7 +782,7 @@ export async function settings(ctx, { pid }) {
       h('div', { class: 'panel-head' }, h('h2', { class: 'small' }, 'Recent activity (audit)')),
       data.items.length ? h('div', { class: 'table-wrap' }, h('table', null,
         h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'When'), h('th', { scope: 'col' }, 'Who'), h('th', { scope: 'col' }, 'Action'), h('th', { scope: 'col', class: 'hide-narrow' }, 'Detail'))),
-        h('tbody', null, data.items.map((a) => h('tr', null, h('td', { class: 'muted' }, time(a.time)), h('td', null, a.user_name || a.user_id || ''), h('td', { class: 'mono small' }, a.action, a.outcome && a.outcome !== 'committed' ? ' · ' + a.outcome : ''), h('td', { class: 'hide-narrow' }, a.detail || '')))))) :
+        h('tbody', null, data.items.map((a) => h('tr', null, h('td', { class: 'muted' }, time(a.time)), h('td', { title: a.user_id || null }, actorWords(a.user_name, a.user_id, 'someone')), h('td', { class: 'mono small' }, a.action, a.outcome && a.outcome !== 'committed' ? ' · ' + a.outcome : ''), h('td', { class: 'hide-narrow' }, a.detail || '')))))) :
         empty('No administrative activity yet', null)));
   }
 

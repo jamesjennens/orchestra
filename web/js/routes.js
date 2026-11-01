@@ -74,3 +74,19 @@ export function projectOf(route) {
 
 // Views whose server routes are not part of every deployment yet.
 export const RECORD_ROUTES = new Set(['requirements', 'requirement', 'decisions', 'decision', 'record']);
+
+// Where the project switcher sends the current page. A project page keeps its section
+// when the target project has it (`sections` lists the segments, '' for Tasks); anything
+// else, a task page included, opens the target's Tasks list and says so via fellBack.
+export function switchTarget(route, targetPid, sections) {
+  const path = route.split('?')[0];
+  const pid = projectOf(path);
+  if (!pid) return { path: `/p/${targetPid}`, fellBack: false, section: '' };
+  const match = new RegExp(`^/p/${ID}(?:/([a-z]+))?$`).exec(path);
+  if (!match) return { path: `/p/${targetPid}`, fellBack: true, section: '' };
+  const section = match[1] || '';
+  if (section === '' || sections.includes(section)) {
+    return { path: section ? `/p/${targetPid}/${section}` : `/p/${targetPid}`, fellBack: false, section };
+  }
+  return { path: `/p/${targetPid}`, fellBack: true, section };
+}

@@ -1,6 +1,6 @@
 import { h, time, confirmDialog, shortSha, toast } from '../dom.js';
 import { markdown } from '../md.js';
-import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, describe, errorState } from '../ui.js';
+import { pageHead, reviewChip, statusChip, priority, empty, field, setFieldError, formValues, act, describe, errorState, actorWords } from '../ui.js';
 import { canWrite, canApprove, isOwner } from './project.js';
 import { lifecyclePanel } from './lifecycle.js';
 import { taskFilesPanel } from './taskFiles.js';
@@ -115,7 +115,7 @@ export async function detail(ctx, { pid, tid }) {
   const openTotal = cp && Number.isInteger(cp.open_items_total) ? cp.open_items_total : openItems.length;
   const incomplete = brief.carry_open_items === null;
   const briefPanel = h('section', { class: 'panel', 'aria-labelledby': 'brief-h' },
-    h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'brief-h' }, 'Brief'), cp ? h('span', { class: 'small muted' }, 'Checkpoint ', time(cp.at), ' by ', cp.author_name || cp.author) : null),
+    h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'brief-h' }, 'Brief'), cp ? h('span', { class: 'small muted' }, 'Checkpoint ', time(cp.at), ' by ', actorWords(cp.author_name, cp.author, 'someone')) : null),
     h('div', { class: 'panel-body' },
       // Slice 2: the description moves to the "What is wanted" panel above; the
       // checkpoint keeps its own panel (summary, next step, carried items).
@@ -141,7 +141,7 @@ export async function detail(ctx, { pid, tid }) {
         h('dt', null, 'Revision'), h('dd', null, String(c.revision)),
         h('dt', null, 'Commit'), h('dd', null, h('code', { title: c.commit }, shortSha(c.commit)), c.branch ? h('span', { class: 'muted' }, ' on ', h('code', null, c.branch)) : null),
         c.base_commit ? [h('dt', null, 'Based on'), h('dd', null, h('code', { title: c.base_commit }, shortSha(c.base_commit)))] : null,
-        h('dt', null, 'Delivered'), h('dd', null, time(c.at), ' by ', c.author_name || c.author)),
+        h('dt', null, 'Delivered'), h('dd', null, time(c.at), ' by ', actorWords(c.author_name, c.author, 'someone'))),
       h('p', { class: 'prose' }, c.summary));
   } else {
     reviewBody.append(empty('No contribution yet', t.assignee ? `${t.assignee_name} will deliver work here for review.` : 'Once someone claims this task, their delivered work appears here.'));
@@ -199,14 +199,9 @@ export async function detail(ctx, { pid, tid }) {
   // A history entry's [object Object] author is an author id or object rendered as
   // text (WEB_UX_REVIEW s2.2): prefer the name the server resolved for it.
   function entryName(e) {
-    const direct = [e.user_name, e.author_name, e.assignee_name, e.actor_name].find((v) => typeof v === 'string' && v);
-    if (direct) return direct;
-    for (const key of ['author', 'actor', 'user', 'user_id']) {
-      const v = e[key];
-      if (typeof v === 'string' && v) return v;
-      if (v && typeof v === 'object' && typeof v.text === 'string' && v.text) return v.text;
-    }
-    return 'Someone';
+    const named = [e.user_name, e.author_name, e.assignee_name, e.actor_name].find((v) => typeof v === 'string' && v);
+    const id = [e.author, e.actor, e.user, e.user_id].find((v) => v);
+    return actorWords(named, id, 'Someone');
   }
   const byKindEntry = new Map();
   function addEntry(e) {
@@ -387,7 +382,7 @@ export function changesSinceCheckpoint(section) {
     h('h3', { class: 'small' }, 'Changes since this checkpoint ', h('span', { class: 'nav-count' }, String(section.total || 0))),
     entries.length ? h('ul', { class: 'changes-entries' }, entries.map((e) => h('li', null,
       h('span', { class: 'chip plain' }, e.state), ' ', e.own ? h('span', { class: 'chip plain' }, 'yours') : null, ' ',
-      (e.author && e.author.text) || 'unknown', ' · ', time(e.timestamp), ': ',
+      actorWords(null, e.author, 'someone'), ' · ', time(e.timestamp), ': ',
       (e.body && e.body.text) || '', clipped(e.body)))) : null,
     section.omitted ? h('p', { class: 'small muted' }, `${section.omitted} more are not shown; the history below has them all.`) : null,
     fields.length ? h('ul', { class: 'changes-fields' }, fields.map((f) => h('li', null,
@@ -558,10 +553,10 @@ export function reviewActions(ctx, pid, tid, contribution, review) {
 // What a reviewer recommended for the current revision. Shown as advice: the owner's
 // decision is still to make, and the page says so.
 function recommendationNote(review, advice) {
-  const others = (review.recommendations || []).filter((r) => r.id !== advice.id).map((r) => r.author_name || r.author);
+  const others = (review.recommendations || []).filter((r) => r.id !== advice.id).map((r) => actorWords(r.author_name, r.author, 'someone'));
   // One child, so the banner's row layout does not split the sentence into columns.
   return h('div', { class: 'banner', role: 'note', id: 'recommendation' }, h('div', null,
-    h('p', null, h('strong', null, 'Recommended for approval'), ' by ', advice.author_name || advice.author, ' ', time(advice.at),
+    h('p', null, h('strong', null, 'Recommended for approval'), ' by ', actorWords(advice.author_name, advice.author, 'someone'), ' ', time(advice.at),
       ' for commit ', h('code', { title: advice.commit }, shortSha(advice.commit)), '. An owner still decides.'),
     h('p', { class: 'prose' }, advice.summary),
     advice.items && advice.items.length ? h('ul', null, advice.items.map((item) => h('li', null, item.text))) : null,

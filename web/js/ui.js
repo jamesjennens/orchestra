@@ -1,6 +1,16 @@
 // Shared UI pieces: state chips, lifecycle strip, page scaffolding and error states.
 import { h, toast } from './dom.js';
 
+// An account id (usr_...) is never shown as text; agent and session ids stay visible so
+// an actor can still be told apart. The caller passes the fallback word: 'Someone' where
+// it starts a sentence, 'someone' mid-sentence.
+export const isAccountId = (value) => typeof value === 'string' && value.startsWith('usr_');
+export function actorWords(name, id, fallback) {
+  if (typeof name === 'string' && name) return name;
+  const raw = typeof id === 'string' ? id : (id && typeof id.text === 'string' ? id.text : '');
+  return raw && !isAccountId(raw) ? raw : fallback;
+}
+
 export const FACTS = [
   ['implemented', 'Implemented'], ['tested', 'Tested'], ['reviewed', 'Reviewed'],
   ['integrated', 'Integrated'], ['deployed', 'Deployed'], ['live-verified', 'Live-verified'],
