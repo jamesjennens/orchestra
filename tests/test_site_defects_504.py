@@ -105,7 +105,8 @@ class LayoutSourceCase(unittest.TestCase):
     def test_switch_notice_is_a_toast_not_a_banner(self):
         app = self.read('js/app.js')
         self.assertIn('toast(fallbackMessage(name, label));', app)
-        self.assertIn("const here = ctx.projects.find((p) => p.id === projectOf(currentRoute()));", app)
+        body = app[app.index('function switchProject('):app.index('function buildShell(')]
+        self.assertLess(body.index('const hereSections'), body.index('ctx.go(t.path)'))
         self.assertNotIn("class: 'banner', role: 'status'", app)
         self.assertNotIn('ctx.notice', app)
 

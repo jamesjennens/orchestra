@@ -646,7 +646,8 @@ console.log(JSON.stringify({text:host.textContent,made}));"""
 
     def test_the_rail_shows_program_only_by_the_flag(self):
         source = (KIT / 'web/js/app.js').read_text(encoding='utf-8')
-        self.assertIn("program.showsProgram(current) ? link('/p/' + pid + '/program', 'Program') : null", source)
+        self.assertIn("program.showsProgram(proj) && ['program', 'Program']", source)
+        self.assertIn("projectSections(current).map(", source)
         self.assertIn("['program', '/p/{pid}/program']", (KIT / 'web/js/routes.js').read_text(encoding='utf-8'))
 
 

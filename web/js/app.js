@@ -103,14 +103,16 @@ export async function start(root, options = {}) {
   // Switching project keeps the page when the target has it; otherwise the target's Tasks
   // list opens and a toast says why (the toast layer leaves the page layout alone).
   function switchProject(targetPid) {
+    // Read the current route and its project's sections before ctx.go changes location.hash.
+    const route = currentRoute();
+    const here = ctx.projects.find((p) => p.id === projectOf(route));
+    const hereSections = here ? projectSections(here) : [];
     const target = ctx.projects.find((p) => p.id === targetPid);
     const sections = target ? projectSections(target) : [];
-    const t = switchTarget(currentRoute(), targetPid, sections.map(([seg]) => seg));
+    const t = switchTarget(route, targetPid, sections.map(([seg]) => seg));
     ctx.go(t.path);
     if (t.fellBack) {
       const name = target ? target.name : 'that project';
-      const here = ctx.projects.find((p) => p.id === projectOf(currentRoute()));
-      const hereSections = here ? projectSections(here) : [];
       const label = t.section && (hereSections.find(([seg]) => seg === t.section) || [])[1];
       toast(fallbackMessage(name, label));
     }

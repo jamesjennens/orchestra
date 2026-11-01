@@ -399,7 +399,7 @@ class ProjectSidebarAndRequirementsWordingTests(unittest.TestCase):
     """The project rail names the Orchestra feedback page, and the Requirements page says in
     one sentence that its requirements are this project's, not Orchestra's (kittrial-5bb.279)."""
 
-    FEEDBACK_RAIL = "            link('/p/' + pid + '/feedback', 'Orchestra feedback'),\n"
+    FEEDBACK_RAIL = "      ['feedback', 'Orchestra feedback'],\n"
     REQUIREMENTS = "These are this project's own requirements - its BRD - not Orchestra's."
 
     def read(self, relative):
@@ -409,6 +409,7 @@ class ProjectSidebarAndRequirementsWordingTests(unittest.TestCase):
         app = self.read('web/js/app.js')
         self.assertIn(self.FEEDBACK_RAIL, app)
         self.assertNotIn("            link('/p/' + pid + '/feedback', 'Feedback'),\n", app)
+        self.assertIn("projectSections(current).map(", app)
 
     def test_the_requirements_page_says_whose_requirements_they_are(self):
         for name in ('web/js/views/requirements.js', 'web/js/views/owner_requirements.js'):
