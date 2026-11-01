@@ -1202,6 +1202,7 @@ class RecentHistoryTests(unittest.TestCase):
         self.assertNotIn(TASK + '-cc0000', delivered)       # beyond both recorded bounds
         self.assertEqual(page['checkpoint_coverage'], 'windowed')
         self.assertGreater(page['unverified_entries'], 0)
+        self.assertIn('backdated', page['checkpoint_note'])
         self.assertIn('no per-entry evidence', page['checkpoint_note'])
         self.assertIn('--verify', page['checkpoint_note'])
         # The window that produced the coverage is the documented one.
@@ -1209,6 +1210,14 @@ class RecentHistoryTests(unittest.TestCase):
         view = b.checkpoint_view(snap, state, len(state['history']) - 1)
         self.assertEqual(view['provenance']['covered'], 501)
         self.assertEqual(view['provenance']['verifiable'], b.DIGEST_WINDOW + b.OLDER_MAX)
+        # G2: only entries that sort BEFORE the baseline can be hidden by this read. The
+        # unverified same-second arrival after the checkpoint is returned, so it must not
+        # be counted as hidden.
+        boundary = next(i for i, entry in enumerate(snap['entries'])
+                        if entry['entry_id'] == TASK + '-ccpB')
+        expected = sum(1 for i, entry in enumerate(snap['entries'])
+                       if i < boundary and b.classify_entry(entry, view['provenance']) == 'unverified')
+        self.assertEqual(page['unverified_entries'], expected)
         # --recent on the same read must not refuse; it pages it newest-first.
         newest = b.history_page(snap, PROJECT, TASK, since_checkpoint=True, recent=5)
         self.assertEqual(newest['checkpoint_coverage'], 'windowed')
@@ -1231,25 +1240,42 @@ class RecentHistoryTests(unittest.TestCase):
         self.assertEqual(anyone['since_checkpoint'], 'cpEve')
         self.assertEqual(anyone['checkpoint_author']['text'], 'bob/session')
         self.assertEqual(anyone['checkpoint_timestamp'], STAMP)
+        self.assertTrue(anyone['checkpoint_note'].startswith('newest valid checkpoint, by anyone:'))
         self.assertNotIn(TASK + '-cmid', [e['entry_id'] for e in anyone['entries']])
         mine = b.history_page(snap, PROJECT, TASK, since_checkpoint=True, actor='alice/session',
                               since_my_checkpoint=True, limit=1)
         self.assertEqual(mine['since_checkpoint'], 'cpAlice')
         self.assertEqual(mine['checkpoint_author']['text'], 'alice/session')
+        self.assertTrue(mine['checkpoint_note'].startswith('your newest valid checkpoint:'))
         delivered = [e['entry_id'] for e in mine['entries']]
         cursor = mine['next_cursor']
         while cursor:
             page = b.history_page(snap, PROJECT, TASK, cursor=cursor)
             self.assertEqual(page['since_checkpoint'], 'cpAlice')
+            # The continuation carries which baseline the caller asked for (G1).
+            self.assertTrue(page['checkpoint_note'].startswith('your newest valid checkpoint:'))
             delivered.extend(e['entry_id'] for e in page['entries'])
             cursor = page['next_cursor']
         # Everything hal has not incorporated, including eve's own checkpoint record.
         self.assertEqual(delivered, [TASK + '-ccpEve', TASK + '-cmid']
                          + [TASK + '-cafter%d' % n for n in range(6)])
-        # An actor that never wrote a checkpoint gets no baseline, not another's.
+        # An actor that never wrote a checkpoint gets no baseline, not another's, and
+        # the read says so in a note instead of staying silent (G4).
         self.assertIsNone(b.latest_checkpoint(snap, actor='carol/session'))
         alone = b.history_page(snap, PROJECT, TASK, actor='carol/session', since_my_checkpoint=True)
         self.assertIsNone(alone['since_checkpoint'])
+        self.assertIn('no checkpoint of your own', alone['checkpoint_note'])
+        self.assertIn('--since-my-checkpoint', alone['checkpoint_note'])
+        self.assertEqual(alone['total_entries'], len(snap['entries']))
+        # The continuation keeps the baseline-free selection even without the repeated
+        # selector: it must never fall back to another actor's checkpoint (G4).
+        cursor = alone['next_cursor']
+        self.assertTrue(cursor)
+        while cursor:
+            page = b.history_page(snap, PROJECT, TASK, cursor=cursor)
+            self.assertIsNone(page['since_checkpoint'])
+            self.assertIn('no checkpoint of your own', page['checkpoint_note'])
+            cursor = page['next_cursor']
         with self.assertRaisesRegex(ValueError, 'requires a caller actor'):
             b.history_page(snap, PROJECT, TASK, since_my_checkpoint=True)
 
@@ -1390,6 +1416,22 @@ class FullContextAndLatestCheckpointTests(unittest.TestCase):
         self.assertTrue(modest['complete'])
         self.assertEqual(modest['truncated'], [])
         self.assertEqual(modest['full_omitted_chars']['title'], 0)
+
+    def test_full_omitted_chars_counts_source_characters_not_escapes(self):
+        """G5: one ESC is one source character and six wire characters. The cap is measured
+        on the escaped text, but what it removed is reported in source characters."""
+        data = rows()
+        data[0]['description'] = '\x1b' * 100000
+        block = b.brief(data, PROJECT, TASK, full=True)['full_context']
+        escaped = block['intent']
+        # Every source character kept here is one ESC, which is six wire characters.
+        kept_source = len(escaped) // 6
+        self.assertGreater(kept_source, 0)
+        self.assertEqual(len(escaped) % 6, 0)
+        self.assertEqual(block['full_omitted_chars']['intent'], 100000 - kept_source)
+        self.assertEqual(block['full_omitted_chars']['intent'] + kept_source, 100000)
+        # The old escaped-character unit reported several hundred thousand.
+        self.assertLess(block['full_omitted_chars']['intent'], 100000)
 
     def test_checkpoint_latest_reads_one_record_and_names_its_coverage(self):
         data = rows()
@@ -1546,3 +1588,18 @@ class IntegrationDisagreementBriefTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class HistoryContractDocsTests(unittest.TestCase):
+    def test_cli_contract_says_the_ten_keys_are_on_every_history_answer(self):
+        """G3: the additive keys are on every answer, not only a checkpoint-relative one."""
+        text = (Path(__file__).resolve().parents[1] / 'docs' / 'CLI_CONTRACT.md').read_text(encoding='utf-8')
+        section = text.split('### `history`: additive keys', 1)[1].split('\n### ', 1)[0]
+        self.assertIn('ten keys to **every** history answer', section)
+        self.assertNotIn('A checkpoint-relative read also carries', section)
+        for key in ('order', 'kind', 'since_checkpoint', 'snapshot_entries', 'omitted_entries',
+                    'checkpoint_author', 'checkpoint_timestamp', 'checkpoint_coverage',
+                    'unverified_entries', 'checkpoint_note'):
+            self.assertIn('`%s`' % key, section)
+        self.assertIn('`total_entries`', section)
+        self.assertIn('plain read the checkpoint keys are `null`', section)

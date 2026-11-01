@@ -445,25 +445,34 @@ complete tokens.
 
 ### `history`: additive keys (kittrial-5bb.8)
 
-The bounded history reads add keys to **every** history answer. They are additive: no
+The bounded history reads add ten keys to **every** history answer. They are additive: no
 released key changed shape or meaning, a released cursor still reads as oldest-first,
-and a released consumer that names the keys it knows is unaffected. `order`
+and a released consumer that names the keys it knows is unaffected. The ten are `order`
 (`oldest-first`/`newest-first`), `kind` (`comment`/`event`/`null`), `since_checkpoint`
 (the baseline checkpoint's comment ID or `null`), `snapshot_entries` (entries in the
-snapshot), `total_entries` (entries the current selectors chose) and `omitted_entries`
-(`snapshot_entries - total_entries`) state what a bounded read hid. A
-checkpoint-relative read also carries `checkpoint_author` (excerpt object),
-`checkpoint_timestamp`, `checkpoint_coverage` (`snapshot`/`windowed`/`unknown`),
-`unverified_entries` and `checkpoint_note`, so a reader can tell from the answer alone
-whose checkpoint was the baseline and what it could not be shown. `brief --full` adds
-`full_context` with the same additive rule; its `omission_counts` are the compact
-read's clips and its `full_omitted_chars`/`truncated`/`complete` are the bound's own.
+snapshot), `omitted_entries` (`snapshot_entries - total_entries`), `checkpoint_author`
+(excerpt object), `checkpoint_timestamp`, `checkpoint_coverage`
+(`snapshot`/`windowed`/`unknown`), `unverified_entries` and `checkpoint_note`.
+`total_entries` (entries the current selectors chose) was already released and is still
+on every answer. On a plain read the checkpoint keys are `null` (and `unverified_entries`
+is 0). `since_checkpoint` and `checkpoint_author` say which baseline was used;
+`checkpoint_note` names it in words too: "your newest valid checkpoint" for
+`--since-my-checkpoint`, "newest valid checkpoint, by anyone" otherwise, and it says so
+when `--since-my-checkpoint` found no checkpoint of the caller's instead of returning
+silence. `brief --full` adds `full_context` with the same additive rule; its
+`omission_counts` are the compact read's clips and its `full_omitted_chars`/`truncated`/
+`complete` are the bound's own, with `full_omitted_chars` counting source characters.
 
-The web service's `GET /v1/projects/{id}/tasks/{task}/history` gives the same two
-directions (kittrial-5bb.353):
+The web service's `GET /v1/projects/{id}/tasks/{task}/history` gives the same reads
+(kittrial-5bb.353 and kittrial-5bb.244):
 - its `recent=N` (1..100) is this `--recent`/`--last`, read newest first over the same
   snapshot, with the same fragment order and a cursor toward older entries;
-- its `since_checkpoint=true` is this `--since-checkpoint`.
+- its `since_checkpoint=true` is this `--since-checkpoint`;
+- its `kind=comment|event` is this `--kind`;
+- its `since_my_checkpoint=true` is this `--since-my-checkpoint` (the caller's own newest
+  checkpoint as the baseline, under the same `CAP_READ` gate and cursor binding); and
+- `latest_checkpoint=true` answers the newest checkpoint's keys with no entries and takes
+  no other selector.
 
 The route assembles each page from canonical pages of at most 20, so its page size may be
 larger than the canonical `--recent` range. Its answer carries `order` and the checkpoint

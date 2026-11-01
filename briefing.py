@@ -46,7 +46,7 @@ HISTORY_ORDERS=('oldest','newest')
 #: so a plain page still emits the token the released kit wrote, and every old cursor
 #: still reads as oldest-first.
 HISTORY_CURSOR_BASE={'v','kind','project','task','snapshot','since','index','offset'}
-HISTORY_CURSOR_EXTRA={'order','entry_kind','scp'}
+HISTORY_CURSOR_EXTRA={'order','entry_kind','scp','mcp'}
 HISTORY_CURSOR_KEYS=HISTORY_CURSOR_BASE|HISTORY_CURSOR_EXTRA
 FIELD_NAME_LIMIT=60
 FIELD_NAME_COUNT=8
@@ -963,6 +963,23 @@ def fitting_prefix(text,budget):
         if encoded_size(text[:middle])<=budget:lo=middle
         else:hi=middle-1
     return text[:lo]
+
+def escaped_fitting_prefix(value,budget):
+    """(escaped prefix, source characters omitted) for one ``--full`` field.
+
+    The cap is measured on the escaped text that is sent, but ``full_omitted_chars``
+    counts SOURCE characters: one ESC is one source character and six wire characters.
+    The prefix is therefore chosen on the source text with its escaped length measured,
+    never on the escaped text itself (kittrial-5bb.244 G5).
+    """
+    source=str(value or '')
+    if budget<=0:return '',len(source)
+    lo,hi=0,len(source)
+    while lo<hi:
+        middle=(lo+hi+1)//2
+        if encoded_size(plain_text(source[:middle]))<=budget:lo=middle
+        else:hi=middle-1
+    return plain_text(source[:lo]),len(source)-lo
 
 NEWER_MAX=5
 # A stable newer-activity marker is the newest other-party entry's ID plus this many
@@ -1891,10 +1908,9 @@ def brief(rows,project,task,offset=0,limit=5,operators=None,journal=None,verifie
                 'current_position':0,'next_action':0}
         bounded={};bounded_omitted={};truncated=[];remaining=FULL_CONTEXT_BUDGET
         for name,value in full_fields.items():
-            text=plain_text(value)
-            kept=fitting_prefix(text,max(0,min(remaining,FULL_FIELD_BUDGET)))
+            kept,removed=escaped_fitting_prefix(value,max(0,min(remaining,FULL_FIELD_BUDGET)))
             bounded[name]=kept
-            bounded_omitted[name]=len(text)-len(kept)
+            bounded_omitted[name]=removed
             if bounded_omitted[name]:truncated.append(name)
             remaining-=encoded_size(kept)
         result['full_context']={'note':'Task context, bounded to %d encoded bytes in total; omission_counts are the '
@@ -2384,7 +2400,7 @@ def since_checkpoint_entries(data,checkpoint):
         elif after and classify_entry(entry,prov)!='incorporated':result.append(entry)
     return result
 
-def checkpoint_gaps(data,checkpoint):
+def checkpoint_gaps(data,checkpoint,mine=False):
     """(coverage, unverified_count, note) for a checkpoint-relative read.
 
     ``coverage`` is `snapshot` (retained evidence re-verifies every entry the checkpoint
@@ -2396,10 +2412,19 @@ def checkpoint_gaps(data,checkpoint):
     that sort before the baseline. ``note`` says in plain words what this read cannot
     show, so a reader never has to infer a hidden instruction from a count
     (kittrial-5bb.8 review, F1/F3).
+
+    ``mine`` says the baseline was chosen by ``--since-my-checkpoint`` (the caller's own
+    newest valid checkpoint), so the note names that baseline instead of "by anyone";
+    with no such checkpoint it says so instead of staying silent (kittrial-5bb.244 G1/G4).
     """
     if checkpoint is None:
+        if mine:
+            return (None,0,'you have no checkpoint of your own on this task, so --since-my-checkpoint returned the whole '
+                    'history with a null baseline; write a checkpoint to make this a delta read. Read '
+                    'history '+data['task']+' to be sure you saw everything.')
         return None,0,None
-    who=('newest valid checkpoint, by anyone: '+str(checkpoint['comment_id'])+' by '
+    who=(('your newest valid checkpoint: ' if mine else 'newest valid checkpoint, by anyone: ')
+         +str(checkpoint['comment_id'])+' by '
          +str(checkpoint['comment'].get('author'))+' at '+str(checkpoint['comment'].get('created_at')))
     prov=checkpoint['provenance']
     if prov is None:
@@ -2410,11 +2435,19 @@ def checkpoint_gaps(data,checkpoint):
     if prov['covered']-prov['verifiable']<=0:
         return ('snapshot',0,who+'. Retained evidence from the checkpoint chain re-verifies every entry it incorporated, '
                 'so this read hides nothing it can prove.')
-    count=sum(1 for entry in data['entries']
-              if entry['entry_id']!=checkpoint['entry_id'] and classify_entry(entry,prov)=='unverified')
+    positions={entry['entry_id']:index for index,entry in enumerate(data['entries'])}
+    boundary=positions.get(checkpoint['entry_id'])
+    # Only an entry that sorts BEFORE the baseline can be hidden by this read: an
+    # unverified entry after it is returned here (kittrial-5bb.244 G2). When the
+    # checkpoint's own entry is not in this snapshot, nothing can be ordered behind it,
+    # so this read hides nothing it could count.
+    count=sum(1 for index,entry in enumerate(data['entries'])
+              if entry['entry_id']!=checkpoint['entry_id'] and boundary is not None and index<boundary
+              and classify_entry(entry,prov)=='unverified')
     return ('windowed',count,who+'. Retained evidence re-verifies '+str(prov['verifiable'])+' of the '+str(prov['covered'])
             +' entries this checkpoint recorded; '+str(count)+' current entries have no per-entry evidence and are only shown '
-            'when they order after the checkpoint, so an edit to one of those older entries CANNOT be seen here. Run '
+            'when they order after the checkpoint, so an edit to one of those older entries, or an arrival backdated to '
+            'before the checkpoint, CANNOT be seen here. Run '
             'checkpoint '+data['task']+' --verify or read the whole history before trusting this read alone.')
 
 def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=4000,
@@ -2452,6 +2485,7 @@ def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=40
         if since is not None and since!=c['since']:raise ValueError('Cursor --since mismatch')
         if c.get('order','oldest') not in HISTORY_ORDERS:raise ValueError('Invalid history cursor')
         if c.get('entry_kind') is not None and c['entry_kind'] not in HISTORY_KINDS:raise ValueError('Invalid history cursor')
+        if 'mcp' in c and not isinstance(c['mcp'],bool):raise ValueError('Invalid history cursor')
         if recent is not None and c.get('order','oldest')!='newest':raise ValueError('Cursor direction mismatch: this cursor continues an oldest-first page')
         if kind is not None and kind!=c.get('entry_kind'):raise ValueError('Cursor --kind mismatch')
         since=c['since'];index=c['index'];start=c['offset']
@@ -2460,14 +2494,19 @@ def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=40
     elif recent is not None:order='newest'
     entry_kind=kind if kind is not None else (c.get('entry_kind') if c is not None else None)
     # Resolve the checkpoint only when one is asked for, so an ordinary history read
-    # never starts refusing because a checkpoint chain is corrupt.
-    use_checkpoint=bool(since_checkpoint or since_my_checkpoint or (c is not None and c.get('scp') is not None))
+    # never starts refusing because a checkpoint chain is corrupt. ``mine`` records that
+    # the caller asked for its OWN newest checkpoint, so the note says which baseline was
+    # used and a continuation keeps saying it (kittrial-5bb.244 G1).
+    mine=bool(since_my_checkpoint or (c is not None and c.get('mcp')))
+    use_checkpoint=bool(since_checkpoint or since_my_checkpoint or mine or (c is not None and c.get('scp') is not None))
     checkpoint=None
     if use_checkpoint:
-        if c is not None and c.get('scp') is not None:
+        if c is not None and (c.get('scp') is not None or c.get('mcp')):
             # A cursor stores the boundary it was written with, so continuing a
-            # --since-my-checkpoint page needs no repeated selector.
-            checkpoint=checkpoint_by_id(data,c['scp'])
+            # --since-my-checkpoint page needs no repeated selector. A my-checkpoint
+            # cursor with no scp means that actor had NO checkpoint: the continuation
+            # must stay baseline-free, never fall back to another actor's checkpoint.
+            checkpoint=checkpoint_by_id(data,c['scp']) if c.get('scp') is not None else None
         else:
             checkpoint=latest_checkpoint(data,actor=actor if since_my_checkpoint else None)
     checkpoint_id=checkpoint['comment_id'] if checkpoint else None
@@ -2506,10 +2545,11 @@ def history_page(data,project,task,limit=5,since=None,cursor=None,body_budget=40
     if order=='newest':extra['order']='newest'
     if entry_kind is not None:extra['entry_kind']=entry_kind
     if checkpoint_id is not None:extra['scp']=checkpoint_id
+    if mine:extra['mcp']=True
     exhausted=index<0 if order=='newest' else index>=len(entries)
     next_value=None if exhausted else token({'v':1,'kind':'history','project':project,'task':task,'snapshot':digest,
                                              'since':since,'index':index,'offset':start,**extra})
-    coverage,unverified,note=checkpoint_gaps(data,checkpoint) if use_checkpoint else (None,0,None)
+    coverage,unverified,note=checkpoint_gaps(data,checkpoint,mine=mine) if use_checkpoint else (None,0,None)
     return {'task':task,'snapshot':digest,'since':since,'since_inclusive':True,
             'order':'newest-first' if order=='newest' else 'oldest-first',
             'kind':entry_kind,'since_checkpoint':checkpoint_id,
@@ -2775,11 +2815,13 @@ def help_notes(action):
                 'The baseline is the NEWEST VALID CHECKPOINT, BY ANYONE (the kit lets another project actor '
                 'write a real checkpoint on a task it does not hold), and the answer names that checkpoint\'s '
                 'comment id, author and timestamp as well as checkpoint_coverage and unverified_entries. '
-                'history TASK --since-my-checkpoint uses this actor\'s own newest valid checkpoint instead.',
+                'history TASK --since-my-checkpoint uses this actor\'s own newest valid checkpoint instead; '
+                'checkpoint_note names which baseline was used, and says so when the actor has no checkpoint yet.',
                 'Coverage is part of the answer: snapshot means retained evidence from the checkpoint chain '
                 're-verifies every entry the checkpoint incorporated; windowed means N entries recorded by '
                 'the checkpoint have no per-entry evidence and are only returned when they order after it, '
-                'so an edit to one of them cannot be seen (unverified_entries counts them); timestamp means the '
+                'so an edit to one of them, or an arrival backdated to before it, cannot be seen '
+                '(unverified_entries counts only the hidden ones); timestamp means the '
                 'baseline is a legacy record with no provenance, where the released timestamp rule applies — '
                 'every entry at or after the checkpoint is shown — so an entry edited since it, or an arrival '
                 'backdated to before it, CANNOT be seen; unknown means a legacy record with no timestamp at all. '
