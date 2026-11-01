@@ -42,6 +42,7 @@ import ssl
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -51,6 +52,7 @@ import actor_names
 import agent_prompts
 import bd_refusals
 from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
+from review_workflow import TEXT_LIMITS
 import claim_limit
 import handover_steps
 import project_setup
@@ -6855,7 +6857,24 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: Added to the summary of an approval that only this setting let through, so the record says so.
     SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
                             '(project setting agent_approval: by-agent).')
-    SUMMARY_MAX = 1200                 # review_workflow.TEXT_LIMITS['summary']
+    SUMMARY_MAX = TEXT_LIMITS['summary']
+
+    @staticmethod
+    def _normalize_basis_text(text):
+        folded = unicodedata.normalize('NFKC', text).casefold()
+        stripped = ''.join(
+            ch for ch in folded
+            if unicodedata.category(ch) != 'Cf'
+            and not unicodedata.category(ch).startswith('P')
+            and ch not in '[](){}<>'
+        )
+        return ' '.join(stripped.split())
+
+    def _contains_same_person_approval(self, summary):
+        if not isinstance(summary, str):
+            return False
+        target = self._normalize_basis_text(self.SAME_PERSON_APPROVAL)
+        return bool(target) and target in self._normalize_basis_text(summary)
 
     def _another_agent_only(self, agent_id, names, parties, project):
         """Whether every one of ``parties`` of the approver's party is ANOTHER agent of its person (kittrial-5bb.438).
@@ -14278,6 +14297,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         def add():
             delivered = (current.get('review') or {}).get('contribution') or {} if current else {}
             pid = ctx.params['pid']
+            setting = None
             if judged:
                 # Nobody approves work of their own party: the account that approves, against the
                 # account behind the contribution's author and behind the task's assignee. A
@@ -14291,23 +14311,28 @@ class ApiHandler(BaseHTTPRequestHandler):
                     # project's owner chose the strict rule. Read here, inside the mutation, every time.
                     refusal, setting = self._agent_approval_refusal(ctx.principal, names, assignee,
                                                                     delivered.get('author'), pid)
-                    if refusal is None:
-                        summary = payload.get('summary')
-                        if isinstance(summary, str):
-                            joined = (summary.rstrip() + ' ' if summary.strip() else '') + self.SAME_PERSON_APPROVAL
-                            over = len(joined) - self.SUMMARY_MAX
-                            if over > 0:
-                                raise invalid('This approval is allowed by the project\'s agent-approval setting, and '
-                                              'its summary must then say so in a sentence of %d characters; shorten '
-                                              'the summary by %d characters and send it again'
-                                              % (len(self.SAME_PERSON_APPROVAL), over))
-                            payload['summary'] = joined
-                        same_person.update(same_person_coordinator=True, author=delivered.get('author'),
-                                           assignee=assignee, agent_approval=setting['mode'],
-                                           agent_approval_set_by=setting.get('set_by') or 'default',
-                                           agent_approval_set_at=setting.get('set_at'))
                 if refusal:
                     raise forbidden(refusal)
+            if payload.get('operation') == 'approve':
+                summary = payload.get('summary')
+                if self._contains_same_person_approval(summary):
+                    raise invalid('The approval summary may not contain %r; the server adds that sentence itself'
+                                  % self.SAME_PERSON_APPROVAL)
+                if setting is not None:
+                    if isinstance(summary, str):
+                        joined = (summary.rstrip() + ' ' if summary.strip() else '') + self.SAME_PERSON_APPROVAL
+                        over = len(joined) - self.SUMMARY_MAX
+                        if over > 0:
+                            raise invalid('This approval is allowed by the project\'s agent-approval setting, and '
+                                          'its summary must then say so in a sentence of %d characters; shorten '
+                                          'the summary by %d characters and send it again'
+                                          % (len(self.SAME_PERSON_APPROVAL), over))
+                        payload['summary'] = joined
+                    same_person.update(same_person_coordinator=True, author=delivered.get('author'),
+                                       assignee=(current.get('task') or {}).get('assignee'),
+                                       agent_approval=setting['mode'],
+                                       agent_approval_set_by=setting.get('set_by') or 'default',
+                                       agent_approval_set_at=setting.get('set_at'))
             if recommending:
                 # Independence by PERSON, which only the web service can know; the
                 # canonical write then applies the name rule and every other rule.
@@ -14316,6 +14341,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self._independent_all([actor, ctx.principal.user_id], parties, pid):
                     raise forbidden(self.NOT_INDEPENDENT_PARTY if self.service.approval_by_another_party
                                     else self.NOT_INDEPENDENT)
+                if self._contains_same_person_approval(payload.get('summary')):
+                    raise invalid('The recommendation summary may not contain %r; the server adds that sentence itself'
+                                  % self.SAME_PERSON_APPROVAL)
                 # One standing recommendation for a contribution from each PERSON
                 # (kittrial-5bb.154): a second one, by the same actor or by another agent of
                 # the same person, is refused and nothing is stored. Read from EVERY standing
