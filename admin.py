@@ -1836,11 +1836,11 @@ def review_writes_command(root, actor, action):
         last=history[-1] if history else None
         # The switch and the audit are written together by a flip, so they disagree only
         # when something else changed one of them: an older kit (which does not know the
-        # audit file at all) or a hand edit. A DAMAGED audit file is a disagreement too:
-        # it must not read as "no history, everything agrees" (kittrial-5bb.110 item 3).
+        # audit file at all) or a hand edit. A DAMAGED audit file is not agreement either,
+        # but its readable last value triggers the stale warning only on an actual mismatch.
         damage=_review_writes_audit_damage(root)
         agrees=damage is None and (last is None or last['review_workflow_writes']==enabled)
-        if last is not None and not agrees:
+        if last is not None and last['review_workflow_writes']!=enabled:
             warnings.append('WARNING: deployment review_workflow_writes is %s but the recorded audit '
                             'history last says %s (set by %s at %s); the switch was changed without '
                             'recording it here (an older kit or a hand edit), so the audit is stale'

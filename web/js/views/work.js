@@ -25,6 +25,8 @@ function workTable(ctx, rows, { showProject = true, emptyTitle, emptyBody }) {
         h('td', { class: 'task-state-column' }, t.review_state && t.review_state !== 'none' ? reviewChip(t.review_state) : statusChip(t.status)),
         h('td', { class: 'task-next-column' }, t.next_action ? t.next_action.text : h('span', { class: 'muted' }, '—'),
           t.blocked ? [' ', h('span', { class: 'chip crit', title: 'The latest checkpoint lists unresolved items' }, 'Blocked')] : null,
+          // kittrial-5bb.237 (G6): an unreadable blocking count is not "not blocked".
+          t.blocking_unknown ? [' ', h('span', { class: 'chip warn', title: 'The blocking count could not be read, so whether this is blocked is unknown' }, 'Blocked?')] : null,
           t.recommended ? [' ', h('span', { class: 'chip ok', title: 'A reviewer recommends approving this revision. An owner still decides.' }, 'Recommended')] : null,
           t.pending_request_ids && t.pending_request_ids.length ? h('div', { class: 'sub' }, 'Open requests: ', t.pending_request_ids.join(', ')) : null),
         // Canonical queue rows carry no update time; the review wait start is shown instead.
@@ -46,7 +48,10 @@ export async function home(ctx) {
   // needs its owner; the full card grid stays on My agents. The row keeps
   // DIV[data-agent] with the name as its first H3 (pinned); only the lead
   // line is added.
-  const needed = myAgents.filter((a) => ['feedback', 'idle'].includes(attentionOf(a)));
+  // kittrial-5bb.237 r2 (F1): an agent whose work read FAILED (error) or was
+  // INCOMPLETE (unknown) is the one the owner most needs to see, so it must not be
+  // dropped by this panel. not-computed maps to unknown in agents.js.
+  const needed = myAgents.filter((a) => ['feedback', 'error', 'unknown', 'idle'].includes(attentionOf(a)));
   const agentsPanel = needed.length ? h('section', { class: 'panel', 'aria-labelledby': 'h-agents' },
     h('div', { class: 'panel-head' }, h('h2', { class: 'small', id: 'h-agents' }, 'Your agents ', h('span', { class: 'nav-count' }, `${needed.length} need you`)),
       h('span', { class: 'small muted' }, 'As of ', new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), ' · ', h('button', { type: 'button', class: 'link', onclick: () => ctx.render() }, 'Refresh'))),
@@ -62,6 +67,7 @@ export async function home(ctx) {
     // block; groups with items keep their panel. Omitting the sections entirely
     // would hide where Revisions/Waiting/Assigned live.
     revisions.length ? panel('Revisions requested', revisions.length, workTable(ctx, revisions, { emptyTitle: 'No revisions requested', emptyBody: 'When a reviewer asks for changes to your work, it appears here first.' })) : h('p', { class: 'empty-line' }, 'No revisions requested.'),
+    data.to_review_note ? h('p', { class: 'small muted', 'data-to-review-note': 'true' }, data.to_review_note) : null,
     data.to_review.length ? panel('Waiting for your review', data.to_review.length, workTable(ctx, data.to_review, { emptyTitle: 'Nothing to review', emptyBody: 'Contributions to projects you own appear here until you approve them or request changes.' }), 'Stays here until you act — no reminder needed') : h('p', { class: 'empty-line' }, 'Nothing to review.'),
     assigned.length ? panel('Assigned to you', assigned.length, workTable(ctx, assigned, { emptyTitle: 'Nothing assigned', emptyBody: 'Claim a task from a project to start work on it.' })) : h('p', { class: 'empty-line' }, 'Nothing assigned.'));
 }

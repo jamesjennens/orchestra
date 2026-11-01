@@ -8,7 +8,7 @@ agent without an effective grant cannot approve at all; people are judged as bef
 the setting let through says so in its summary and in the audit.
 
 Through the real routes of the web service (the in-process backend); the canonical binding is in
-EndpointAgentApprovalTests below.
+tests/test_coordinator_grant_real.py.
 """
 import sys
 import unittest
@@ -18,6 +18,7 @@ KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT))
 sys.path.insert(0, str(KIT / 'tests'))
 import http_service
+import review_workflow
 import test_coordinator_grant
 
 API = http_service.ApiHandler
@@ -149,6 +150,107 @@ class DefaultTests(SamePerson):
             'operation': 'approve', 'contribution': contribution, 'summary': 'x' * room}, token=self.agent)
         self.assertEqual(201, fits.status, fits.data)
         self.assertEqual(len(self.approval_summary(task)), API.SUMMARY_MAX)
+
+    def test_a_caller_cannot_write_the_basis_sentence_itself_and_similar_words_are_allowed(self):
+        base_sentence = API.SAME_PERSON_APPROVAL
+        forged_variants = {
+            'exact': base_sentence,
+            'prefix': base_sentence + ' Looks good.',
+            'middle': 'Prefix. ' + base_sentence + ' Suffix.',
+            'suffix': 'Looks good. ' + base_sentence,
+            'no-period': 'ok. ' + base_sentence[:-1],
+            'lowercase': 'ok. ' + base_sentence.lower(),
+            'upper-first-word': 'ok. APPROVED' + base_sentence[8:],
+            'whitespace': 'ok. ' + base_sentence.replace('same person', 'same   person'),
+            'newline': 'ok. ' + base_sentence.replace(' as ', '\nas '),
+            'nbsp': 'ok. ' + base_sentence.replace(' ', '\u00a0'),
+            'zero-width': 'ok. ' + base_sentence.replace('Approved', 'App\u200broved'),
+            'fullwidth-paren': 'ok. ' + base_sentence.replace('(', '\uff08').replace(')', '\uff09'),
+            'bang': 'ok. ' + base_sentence[:-1] + '!',
+            'split-before-period': 'ok. ' + base_sentence[:-1] + ' .',
+        }
+        # 0. Order against the 403 party refusal (f4-order-test): a forged summary on own work gives 403, not 422.
+        own_task, own_cid = self.deliver(self.agent)
+        for op_body in (
+            {'operation': 'approve', 'contribution': own_cid, 'summary': base_sentence},
+            {'operation': 'approve', 'contribution': own_cid, 'summary': forged_variants['no-period']},
+            {'operation': 'recommend', 'schema_version': 1, 'operation_id': 'rec-own-forged',
+             'contribution': own_cid, 'commit': test_coordinator_grant.test_own_party.test_http_agents.COMMIT,
+             'verdict': 'approve', 'summary': base_sentence, 'items': []},
+        ):
+            with self.subTest(own_work_op=op_body['operation'], summary=op_body['summary']):
+                own_refused = self.request('POST', self.base(own_task) + '/reviews', op_body, token=self.agent)
+                self.assertEqual(403, own_refused.status, own_refused.data)
+        # 1. Forged by an ordinary person or independent coordinator agent on independent work (approve & recommend):
+        ind_task, ind_cid = self.deliver(self.tokens['carl'])
+        for who in (self.tokens['olive'], self.agent):
+            for name, text in forged_variants.items():
+                with self.subTest(who=who, op='approve', variant=name):
+                    refused = self.request('POST', self.base(ind_task) + '/reviews', {
+                        'operation': 'approve', 'contribution': ind_cid, 'summary': text}, token=who)
+                    self.assertEqual(422, refused.status, refused.data)
+                    self.assertIn(API.SAME_PERSON_APPROVAL, refused.data['error']['message'])
+                    self.assertEqual(self.state_of(ind_task), 'awaiting-review')
+        for name, text in forged_variants.items():
+            with self.subTest(op='recommend', variant=name):
+                rec_refused = self.request('POST', self.base(ind_task) + '/reviews', {
+                    'operation': 'recommend', 'schema_version': 1, 'operation_id': 'rec-forged-' + name,
+                    'contribution': ind_cid, 'commit': test_coordinator_grant.test_own_party.test_http_agents.COMMIT,
+                    'verdict': 'approve', 'summary': text, 'items': []}, token=self.agent)
+                self.assertEqual(422, rec_refused.status, rec_refused.data)
+                self.assertIn(API.SAME_PERSON_APPROVAL, rec_refused.data['error']['message'])
+        # 2. Forged by a same-person coordinator agent on a sibling agent's delivery:
+        sib_task, sib_cid = self.deliver(self.other)
+        for name, text in forged_variants.items():
+            with self.subTest(same_person=True, variant=name):
+                refused = self.request('POST', self.base(sib_task) + '/reviews', {
+                    'operation': 'approve', 'contribution': sib_cid, 'summary': text}, token=self.agent)
+                self.assertEqual(422, refused.status, refused.data)
+                self.assertIn(API.SAME_PERSON_APPROVAL, refused.data['error']['message'])
+                self.assertEqual(self.state_of(sib_task), 'awaiting-review')
+        self.assertFalse(any(e.get('same_person_coordinator') for e in self.events('reviews.add')))
+        # 3. Legitimate summaries with similar words are accepted on both recommend and approve:
+        similar = 'Approved by a coordinator agent of the same person after checking agent_approval: by-agent.'
+        ok_rec = self.request('POST', self.base(ind_task) + '/reviews', {
+            'operation': 'recommend', 'schema_version': 1, 'operation_id': 'rec-similar',
+            'contribution': ind_cid, 'commit': test_coordinator_grant.test_own_party.test_http_agents.COMMIT,
+            'verdict': 'approve', 'summary': similar, 'items': []}, token=self.agent)
+        self.assertEqual(201, ok_rec.status, ok_rec.data)
+        ok_ind = self.request('POST', self.base(ind_task) + '/reviews', {
+            'operation': 'approve', 'contribution': ind_cid, 'summary': similar}, token=self.tokens['olive'])
+        self.assertEqual(201, ok_ind.status, ok_ind.data)
+        self.assertEqual(self.approval_summary(ind_task), similar)
+        ok_sib = self.request('POST', self.base(sib_task) + '/reviews', {
+            'operation': 'approve', 'contribution': sib_cid, 'summary': similar}, token=self.agent)
+        self.assertEqual(201, ok_sib.status, ok_sib.data)
+        self.assertEqual(self.approval_summary(sib_task), similar + ' ' + API.SAME_PERSON_APPROVAL)
+        event = [e for e in self.events('reviews.add') if e.get('same_person_coordinator')][-1]
+        self.assertEqual(event['author'], self.other_id)
+
+    def test_next_actions_keep_a_siblings_work_out_for_an_agent_without_a_grant(self):
+        by_heron, _ = self.deliver(self.agent)
+        by_egret, _ = self.deliver(self.other)
+        by_carl, _ = self.deliver(self.tokens['carl'])
+
+        def offered_to(token):
+            data = self.request('GET', '/v1/agents/me/next', token=token).data
+            return {a['task']: a for a in data['next_actions'] if a['kind'] == 'to-review'}
+
+        # Egret has no coordinator grant: Heron's sibling delivery is kept out, while Carl's is offered.
+        egret_actions = offered_to(self.other)
+        self.assertNotIn(by_heron, egret_actions)
+        self.assertNotIn(by_egret, egret_actions)
+        self.assertIn(by_carl, egret_actions)
+        # Once Heron's coordinator grant is removed, Egret's sibling delivery is kept out for Heron too.
+        self.assertEqual(200, self.grant(method='DELETE').status)
+        heron_actions = offered_to(self.agent)
+        self.assertNotIn(by_egret, heron_actions)
+        self.assertNotIn(by_heron, heron_actions)
+        self.assertIn(by_carl, heron_actions)
+
+    def test_summary_max_comes_from_review_workflow_text_limits(self):
+        self.assertIs(http_service.TEXT_LIMITS, review_workflow.TEXT_LIMITS)
+        self.assertEqual(API.SUMMARY_MAX, review_workflow.TEXT_LIMITS['summary'])
 
 
 class StrictTests(SamePerson):

@@ -186,6 +186,41 @@ class ClientCase(unittest.TestCase):
         self.assertEqual(reconciled['id'], client.list_tasks(project)['items'][0]['id'])
 
 
+class ClientReviewBodyTests(unittest.TestCase):
+    def test_recommend_delegates_to_add_review_without_a_previous_record(self):
+        client = Client('http://127.0.0.1:1')
+        with mock.patch.object(client, 'add_review', return_value={'recorded': True}) as add_review:
+            result = client.recommend('p', 't', 'contribution-1', 'a' * 40, 'approve',
+                                      'Checked', items=[], key='key-1')
+        self.assertEqual(result, {'recorded': True})
+        add_review.assert_called_once_with(
+            'p', 't', 'recommend', contribution='contribution-1', commit='a' * 40,
+            verdict='approve', summary='Checked', items=[], key='key-1')
+
+    def test_review_bodies_omit_unset_optional_nulls(self):
+        client = Client('http://127.0.0.1:1')
+        with mock.patch.object(client, 'request', return_value={}) as request:
+            client.add_review('p', 't', 'recommend', operation_id='operation-1',
+                              contribution='contribution-1', commit='a' * 40,
+                              verdict='approve', summary='Checked', items=[], key='key-1')
+            client.add_review('p', 't', 'contribute', operation_id='operation-2',
+                              commit='b' * 40, key='key-2')
+        recommend = request.call_args_list[0]
+        self.assertEqual(recommend.args[:2], ('POST', '/v1/projects/p/tasks/t/reviews'))
+        self.assertEqual(recommend.args[2], {
+            'schema_version': 1, 'operation': 'recommend', 'operation_id': 'operation-1',
+            'contribution': 'contribution-1', 'commit': 'a' * 40,
+            'verdict': 'approve', 'summary': 'Checked', 'items': []})
+        self.assertEqual(recommend.kwargs, {'key': 'key-1'})
+        self.assertNotIn('previous', recommend.args[2])
+        self.assertFalse([name for name, value in recommend.args[2].items() if value is None])
+        contribute = request.call_args_list[1].args[2]
+        self.assertEqual([name for name, value in contribute.items() if value is None],
+                         ['previous', 'supersedes'])
+        self.assertNotIn('summary', contribute)
+        self.assertNotIn('items', contribute)
+
+
 DASH_TOKEN = '-abc.def_-ghi--jkl'
 
 

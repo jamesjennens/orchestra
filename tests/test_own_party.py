@@ -286,6 +286,21 @@ class SettingOnTests(Party):
             with self.subTest(name=name):
                 self.assertEqual(self.service.actor_parties(name, self.project), both)
 
+    def test_an_approval_traces_a_credential_name_case_folded(self):
+        worker, _ = self.worker_of('olive', 'Case-Lane')
+        task, contribution = self.deliver(worker)
+        self.backend._task(self.project, task)['assignee'] = self.ids['carl']
+        record = [row for row in self.backend.state['contributions'][task] if row['id'] == contribution][0]
+        record['actor'] = 'case-lane'
+        self.refused(self.approve(self.tokens['olive'], task, contribution))
+        self.assertEqual(201, self.approve(self.tokens['oscar'], task, contribution).status)
+
+    def test_a_name_that_only_begins_like_an_account_id_can_be_issued(self):
+        actor = 'usr_' + 'a' * 17
+        made = self.issue('olive', actor)
+        self.assertEqual(201, made.status, made.data)
+        self.assertEqual(actor, made.data['credential']['actor'])
+
     def test_an_account_id_in_capitals_is_still_that_account_id(self):
         """N8: the actor namespace accepted another account's id in capitals (``USR_.../x``), which only
         looks like that account. The id shape is read case-folded; the issuer's own id is still its own."""
@@ -452,6 +467,29 @@ class SettingOnTests(Party):
         self.assertIn("nor a worker credential issued by the contribution's author or by the task's assignee",
                       refused.data['error']['message'])
 
+    def test_the_recommendation_sentence_covers_every_same_party_refusal(self):
+        answers = []
+        author_agent = self.agent_of('olive', 'Kestrel')
+        author_worker, _ = self.worker_of('olive', 'lane-agent-owner')
+        task, contribution = self.deliver(author_agent)
+        answers.append(self.recommend(author_worker, task, contribution))
+
+        delivery_worker, _ = self.worker_of('olive', 'lane-delivered')
+        another_worker, _ = self.worker_of('olive', 'lane-same-issuer')
+        task, contribution = self.deliver(delivery_worker)
+        answers.append(self.recommend(another_worker, task, contribution))
+
+        self.worker_of('olive', 'lane-assignee')
+        task, contribution = self.deliver(self.tokens['carl'])
+        self.backend._task(self.project, task)['assignee'] = 'lane-assignee'
+        answers.append(self.recommend(self.tokens['olive'], task, contribution))
+
+        for answer in answers:
+            self.assertEqual(403, answer.status, answer.data)
+            self.assertEqual(API.NOT_INDEPENDENT_PARTY, answer.data['error']['message'])
+            self.assertIn('nor anything else of the same party as the author or the assignee',
+                          answer.data['error']['message'])
+
     def test_my_work_does_not_offer_own_party_work_for_approval(self):
         """N4: with the setting on, ``GET /v1/me/work`` ``to_review`` leaves out the caller's own party's
         contributions, which approving is refused for; another party's stay. Off, it lists as it always did."""
@@ -459,13 +497,63 @@ class SettingOnTests(Party):
         other_task, _ = self.deliver(self.tokens['carl'])
         answer = self.request('GET', '/v1/me/work', token=self.tokens['olive'])
         self.assertEqual(200, answer.status, answer.data)
+        self.assertEqual('Only work you may approve is listed; own-party contributions are left out in every review '
+                         'state. Open the project review queue to request changes on one.', answer.data['to_review_note'])
         shown = {row['id'] for row in answer.data['to_review']}
         self.assertNotIn(own_task, shown)
         self.assertIn(other_task, shown)
         self.service.approval_by_another_party = False
-        shown_off = {row['id'] for row in self.request('GET', '/v1/me/work', token=self.tokens['olive']).data['to_review']}
+        answer_off = self.request('GET', '/v1/me/work', token=self.tokens['olive'])
+        shown_off = {row['id'] for row in answer_off.data['to_review']}
+        self.assertIsNone(answer_off.data['to_review_note'])
         self.assertIn(own_task, shown_off)
         self.assertIn(other_task, shown_off)
+
+    def test_my_work_traces_a_delivery_credential_in_its_project(self):
+        worker, _ = self.worker_of('olive', 'lane-my-work')
+        own_task, _ = self.deliver(worker)
+        other_task, _ = self.deliver(self.tokens['carl'])
+        answer = self.request('GET', '/v1/me/work', token=self.tokens['olive'])
+        self.assertEqual(200, answer.status, answer.data)
+        shown = {row['id'] for row in answer.data['to_review']}
+        self.assertNotIn(own_task, shown)
+        self.assertIn(other_task, shown)
+
+    def test_my_work_checks_the_credential_assignee_as_well_as_the_author(self):
+        self.worker_of('olive', 'lane-assigned')
+        task, _ = self.deliver(self.tokens['carl'])
+        self.backend._task(self.project, task)['assignee'] = 'lane-assigned'
+        brief = self.request('GET', self.base(task) + '/brief', token=self.tokens['olive']).data
+        self.assertEqual(self.ids['carl'], brief['review']['contribution']['author'])
+        self.assertEqual('lane-assigned', brief['task']['assignee'])
+        answer = self.request('GET', '/v1/me/work', token=self.tokens['olive'])
+        self.assertNotIn(task, {row['id'] for row in answer.data['to_review']})
+
+    def test_my_work_checks_the_credential_author_as_well_as_the_assignee(self):
+        worker, _ = self.worker_of('olive', 'lane-author')
+        task, _ = self.deliver(worker)
+        self.backend._task(self.project, task)['assignee'] = self.ids['carl']
+        brief = self.request('GET', self.base(task) + '/brief', token=self.tokens['olive']).data
+        self.assertEqual('lane-author', brief['review']['contribution']['author'])
+        self.assertEqual(self.ids['carl'], brief['task']['assignee'])
+        answer = self.request('GET', '/v1/me/work', token=self.tokens['olive'])
+        self.assertNotIn(task, {row['id'] for row in answer.data['to_review']})
+
+    def test_own_party_work_stays_hidden_after_approval_but_can_be_sent_back(self):
+        task, contribution = self.deliver(self.tokens['olive'])
+        self.assertEqual(201, self.approve(self.tokens['oscar'], task, contribution).status)
+        self.assertEqual('approved', self.state_of(task))
+        answer = self.request('GET', '/v1/me/work', token=self.tokens['olive'])
+        self.assertNotIn(task, {row['id'] for row in answer.data['to_review']})
+        self.assertEqual('Only work you may approve is listed; own-party contributions are left out in every review '
+                         'state. Open the project review queue to request changes on one.', answer.data['to_review_note'])
+        review = self.request('GET', self.base(task) + '/brief', token=self.tokens['olive']).data['review']
+        asked = self.request('POST', self.base(task) + '/reviews', {
+            'operation': 'request-changes', 'schema_version': 1, 'operation_id': 'ask-own-party-after-approval',
+            'contribution': contribution, 'previous': review['latest_id'],
+            'items': [{'id': 'fix-1', 'text': 'Please revise'}]}, token=self.tokens['olive'])
+        self.assertEqual(201, asked.status, asked.data)
+        self.assertEqual('changes-requested', self.state_of(task))
 
     def test_a_name_is_traced_in_the_project_of_the_work(self):
         """`lane-a` is olive's in Alpha and oscar's in Beta. Work under it in Alpha is olive's alone: oscar's agent

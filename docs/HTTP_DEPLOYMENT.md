@@ -24,11 +24,45 @@ names exactly the authorized projects covered.
 
 Send `since=FINGERPRINT` from the previous reply to receive `changed: false` when
 the fact is unchanged, or `true` when it differs. Invalid fingerprints or forms
-are refused. This does not block, sleep, acknowledge any work or schedule a poll:
-the Bridge or caller decides when to read again. The coordinator projection and
+are refused. Without `timeout` this does not block, sleep, acknowledge any work or
+schedule a poll: the Bridge or caller decides when to read again. The coordinator projection and
 its trigger rules are shared with the CLI unchanged. The default worker form
 remains the agent's own work read. The generated `.orchestra/AGENT.md` describes
 both roles and uses the existing secret-safe curl credential file.
+
+### Blocking form and comment wakes (kittrial-5bb.457)
+
+`timeout=SECONDS` (whole seconds, 0..50, default 0 = today's read) holds the request on the
+server until the fingerprint differs from `since`, then answers at once with `changed: true`;
+at the bound it answers `changed: false`. The bound is soft: it counts from the first backend
+read (not from authentication or admission, which come before it), and the server only starts a
+pass when the slowest pass so far still fits in the time left, but it cannot interrupt a read
+that is running. A read that is slower than every earlier one, or a loaded backend, can
+therefore make the request last longer than `timeout` (no new pass starts after the bound, but
+the last read can run past it); `wait.seconds` reports how long the request really held. The reply carries `wait`: `blocked`, `timed_out` and `seconds`. A read
+without `since` (a baseline) never blocks. The server re-reads every 5 seconds, or every four
+times the cost of a read when that is longer, so a slow backend is read less often, never more.
+It holds no lock, transaction or backend connection between passes, so writers are never kept
+waiting. Each pass judges the credential and the grant afresh: a revoked credential or a lost
+grant ends the wait with that refusal and nothing further is read. A client that hangs up ends
+the loop at once (the socket is watched while it sleeps). At most 20 waits are held per service
+and one per credential; beyond either the route answers at once with today's read and
+`wait: {blocked: false, reason: busy}`, and the caller waits itself and calls again. Each held
+wait occupies one of the service's 200 connection slots and one request thread, so 20 waiters
+leave 180 slots for everything else.
+
+`comments=others` adds the newest 20 comments by anybody but the caller to the answer and
+folds them into the fingerprint: `comments` lists pointers (`task`, `comment`, `author`, `at`;
+never the text) for every task of the project, unassigned and closed ones included, and for the
+projects the caller coordinates only. "Own" is the caller's actor and its sub-labels; another
+actor of the same person wakes it. Reference, proposal and lane-state record comments are not
+comments anybody wrote to the coordinator. The pointers are read from the same export rows as
+the rest of the wait, never from the paged history. Without the parameter the fingerprint is
+byte-identical to the CLI's. Unsettled notes (kittrial-5bb.447) fold into the fingerprint as
+before, so a note wakes a blocked wait. To read a pointed-at comment use
+`GET /v1/projects/PROJECT/tasks/TASK/history?recent=10` (newest first): the default order of
+`/history` is oldest first, a long comment is several entries and a page holds at most 75
+entries, so reading only its first page misses new comments on a busy task.
 
 ## Guidance and onboarding disclosure
 
@@ -1977,10 +2011,24 @@ previous page did not return, at any page size).
 - **`since_checkpoint=true`** selects the entries the task's newest valid checkpoint
   did not incorporate (the client's `history --since-checkpoint`), in either order. The
   answer then also names the checkpoint: `since_checkpoint`, `checkpoint_author`,
-  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A legacy
-  record (no per-entry digests) reports `timestamp`: the released timestamp rule selects
-  the entries, so a backdated arrival or an older edit can be missed. A checkpoint by
-  the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
+  `checkpoint_timestamp`, `checkpoint_coverage`, `unverified_entries` and
+  `checkpoint_note`. A legacy record (no per-entry digests) reports `timestamp`: the
+  released timestamp rule selects the entries, so a backdated arrival or an older edit
+  can be missed.
+- **`kind=comment|event`** is the client's `history --kind`, and combines with either
+  direction and with either checkpoint selector.
+- **`since_my_checkpoint=true`** is the client's `--since-my-checkpoint`: the baseline is
+  the caller's own newest valid checkpoint, not the newest one by anyone. It needs the
+  caller's canonical actor, so it runs under the same `CAP_READ` gate and the same
+  refusals as the rest of this read, and the answer's `checkpoint_note` says "your newest
+  valid checkpoint" (or says plainly that the caller has none and the whole history was
+  returned).
+- **`latest_checkpoint=true`** answers the newest checkpoint's keys
+  (`since_checkpoint`, `checkpoint_author`, `checkpoint_timestamp`,
+  `checkpoint_coverage`, `unverified_entries`, `checkpoint_note`) with `items: []`,
+  `total: 0`, `latest_checkpoint: true` and no entries. It takes no other selector;
+  giving `recent`, `limit`, `cursor`, `kind`, `since_checkpoint=true` or
+  `since_my_checkpoint=true` with it is refused.
 - **The cursor** is bound to the caller, the project (and task) and the query, and is
   signed with a per-installation HMAC key (`cursor_key`) kept in the service's state file
   (`http-state.json`, or the `--state` path). When an upgraded installation loads a state
@@ -2000,7 +2048,8 @@ previous page did not return, at any page size).
   compact binding digest and packs the canonical history token without repeating route
   identifiers, staying well under the 512-character `MAX_CURSOR` limit even for the
   longest valid project and task IDs (kittrial-5bb.368).
-- **Every answer** says `order` (`oldest-first` or `newest-first`) and `truncated`.
+- **Every answer** says `order` (`oldest-first` or `newest-first`; `null` for the
+  `latest_checkpoint=true` read, which has no entries) and `truncated`.
   `truncated` is true, with one sentence in `truncated_note`, when entries exist that the
   answer neither returned nor can continue to. That is the in-process backend
   (`--backend inprocess`), which has no continuation cursor, past its first page.
@@ -2234,11 +2283,16 @@ that account made, and every worker credential that account issued. From the nex
   agent of the account that issued a worker credential can no longer recommend work
   delivered under it (with the setting off that work is nobody's, and it can). My work's
   `to_review` holds only work the caller may actually approve: a contribution of the
-  caller's own party is left out of that list, since approving it would be refused
-  (the project's review queue still lists every row for everybody, with no per-caller
-  mark). The refusal of a recommendation names the worker credential as one of its reasons,
-  in both directions: work delivered under a credential the person issued, and a credential
-  the person issued recommending that person's own work.
+  caller's own party is left out of that list in every review state (`awaiting-review`,
+  `legacy-review-ready`, `awaiting-integration` and `approved`), since approving it would
+  be refused. The response's `to_review_note` and the page disclose that omission (the
+  field is null with the setting off). The project's review queue still lists every row
+  for everybody, with no per-caller mark, so the owner can open an own-party row there
+  and request changes on it. The refusal of a recommendation ends by refusing "anything
+  else of the same party as the author or the assignee": that covers a credential of the
+  agent owner's account, another credential of the account whose credential delivered the
+  work, and every account, agent or credential of the assignee's party, as well as the two
+  worker-credential directions named earlier in the sentence.
 
 **Whose party a name is.**
 
@@ -2403,6 +2457,10 @@ credential approved anything; this is the one place where that is lifted.
     the assignee, the mode, and who set it (or `default`) and when.
   - If the caller's summary leaves no room for that sentence within the 1200-character bound,
     the route answers `422` and says how many characters to cut. Nothing is written.
+  - The web route refuses a caller-written basis sentence on `approve` or `recommend` with `422`
+    (after NFKC, casefold, Unicode format-character removal, whitespace collapse and
+    punctuation/bracket stripping; lookalike letters remain), while the host route does not, so
+    the audit entry stays the authority.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
   the grant is removed; the account is made a contributor or a viewer; the account is
@@ -2711,8 +2769,10 @@ screen at a time: a short title, at most two short sentences, the screen's one a
 choice, or one command with its Copy button) and `Back` / `Next`; any explanation is behind a
 collapsed "More about this". Only the current screen is in the dialog, so another screen's command
 is absent, not hidden. The first screen chooses the **operating system** (`Windows (PowerShell)`,
-`macOS`, `Linux`, auto-detected from `navigator`) and whether that computer's VS Code has
-**Orchestra Bridge 0.14 or later**; the second chooses what the agent does (worker first; reviewer
+`macOS`, `Linux`, auto-detected from `navigator`) and what the agent runs in (`kittrial-5bb.456`:
+VS Code with **Orchestra Bridge 0.14 or later**, VS Code with an older Bridge or none yet, or **No Bridge**:
+Claude Code, Codex, a command-line agent, which takes the longer path without the *Set up in VS Code*
+screen; `screenPlan({vscode: false})`); the second chooses what the agent does (worker first; reviewer
 also gets other people's deliveries). The rest of the screens are `screenPlan()` in
 `web/js/agentSetup.js`:
 
@@ -3550,7 +3610,13 @@ line separately and unconfined.
   was delivered), the caller's own claimed tasks and then other claimed tasks where the
   caller approves (blocked when the latest checkpoint lists unresolved items). Rows past
   the bound still say "read the task brief" and "wait time unknown" and are not marked
-  blocked. My work rows show "Blocked" and the open request ids where known.
+  blocked. My work rows show "Blocked" when the latest checkpoint lists unresolved
+  items, "Blocked?" when an explicit blocking count could not be read
+  (`blocking_unknown`; a null count is not "not blocked"), and the open request ids
+  where known. An agent whose work read failed or was incomplete stays in the
+  "Your agents need you" panel: the `error` and `unknown` states are never shown as
+  idle, and the defensive `not-computed` state reads as unknown, not as
+  "Could take more work".
 - **A per-agent limit on claimed, undelivered tasks.** Each personal agent carries
   `claim_limit` on its record: a whole number from 1 to 50, default 1, editable by the
   agent's owner on My agents and with `PATCH /v1/agents/{id}` (`422` outside the bounds,
@@ -3657,10 +3723,14 @@ line separately and unconfined.
   single-agent route, an incomplete snapshot falls back to paged owner-filtered
   work so tasks beyond the project snapshot bound are recovered. When the first
   page's total exceeds the 1,000-row bound, stop once there are enough claimable
-  suggestions to fill the 30-action list. If the first page fills them, 250 own
-  tasks need three owner pages, four work commands in total. A first page filled
-  by other people's review states continues paging for claimable suggestions,
-  up to ten pages (1,000 rows). Owner-filtered recovery also stops at 1,000 rows;
+  suggestions to fill the 50-action list (`AGENT_ACTION_LIMIT`). If the first page
+  fills them, 250 own tasks need three owner pages, four work commands in total. A
+  first page filled by other people's review states continues paging for claimable
+  suggestions, up to ten pages (1,000 rows). When those ten pages still hold fewer
+  than 50 claimable suggestions the snapshot stays incomplete, and the single-agent
+  route adds up to ten owner-filtered pages to recover its own tasks: at most
+  twenty `work` commands in all (250 own tasks after ten unfiltered pages cost
+  thirteen). Owner-filtered recovery also stops at 1,000 rows;
   its counts are lower bounds when more remain. Owner lists reuse the bounded
   unfiltered snapshot and can under-count own tasks beyond it. In-process projects cost one
   snapshot read. `snapshot_truncated` marks incomplete project suggestions/counts;
@@ -3668,7 +3738,10 @@ line separately and unconfined.
   suggestion or action cap. `truncated` is their combined signal. Counts over an
   incomplete source are lower bounds, not project totals: summaries say "at least N".
   An incomplete read with no observed own work says `unknown`, never `idle`;
-  observed claimable actions are still offered. A failed work read of a still-authorized
+  observed claimable actions are still offered. A view that was never computed is
+  the separate state `not-computed`, so the two meanings (`unknown` = an incomplete
+  read with lower bounds; `not-computed` = no read at all) cannot be confused.
+  A failed work read of a still-authorized
   project says `error`, increments `read_errors`, and marks snapshot and own counts
   incomplete. Successful projects retain their actions. Projects the principal can
   no longer read are excluded. Nothing is cached across requests

@@ -301,11 +301,32 @@ class Slice5PageTests(unittest.TestCase):
         self.assertEqual(['Then this \u2014 Then do the next thing'], seen['ownerRest'])
         self.assertEqual(['Next: nothing from you. It holds nightly report '], seen['agentNext'])
         self.assertEqual([], seen['agentWho'])
+        # kittrial-5bb.237 (G2): a failed read and an incomplete read each have their
+        # own chip, and neither is the idle heading "Could take more work".
+        self.assertEqual(['Could not read its work', 'Work read incomplete',
+                          'Work read incomplete', 'Could take more work'],
+                         seen['attentionChips'])
+        for case, heading in (('errorCard', 'Could not read its work'),
+                              ('unknownCard', 'Work read incomplete'),
+                              ('notComputedCard', 'Work read incomplete')):
+            self.assertIn(heading, seen[case]['text'])
+            self.assertNotIn('Could take more work', seen[case]['text'])
+            self.assertIn(heading, seen[case]['chip'])
+        # F1: the My work panel keeps the agents whose read failed or was incomplete
+        # (and the defensive not-computed state), instead of dropping them at work.js:51.
+        for name in ('failed-agent', 'partial-agent', 'not-computed-agent'):
+            self.assertIn(name, seen['workFull']['text'])
+        # kittrial-5bb.237 (G6): an unreadable blocking count is shown as unknown,
+        # never as a plain not-blocked row.
+        self.assertIn('Blocked?', seen['workFull']['text'])
         # My work renders the one row that needs its owner and no empty
         # section; the empty case renders the one-line empties.
-        self.assertIn('1 need you', seen['workFull']['text'])
-        self.assertEqual(1, seen['workFull']['agentSections'])
+        self.assertIn('4 need you', seen['workFull']['text'])
+        self.assertEqual(4, seen['workFull']['agentSections'])
         self.assertEqual(['No revisions requested.'], seen['workFull']['empty'])
+        for view in ('workFull', 'workEmpty'):
+            self.assertIn('Only work you may approve is listed; own-party contributions are left out in every review state.',
+                          seen[view]['text'])
         self.assertEqual(['No revisions requested.', 'Nothing to review.', 'Nothing assigned.'],
                          seen['workEmpty']['empty'])
 

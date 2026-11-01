@@ -588,6 +588,42 @@ class NativeAssignmentTests(RulesHelpers,unittest.TestCase):
         self.assertIsNotNone(task_assignment.parse_comment(restored_notice,project='pp',task=tid))
         self.assertEqual(before,self.rows())
 
+    def test_a_project_restored_under_a_new_name_assigns_and_reads_its_slot_like_its_source(self):
+        """kittrial-5bb.463, through the real restore-new command: the clone keeps the source's
+        prefix and its slot `pp-merge-slot`; assigning, and the slot page, answer as on the source."""
+        import admin, subprocess
+        harness,owner=self.web();old=harness.admin_user['id'];target,_=self.member(harness,owner,'restored-target')
+        ordinary=self.task(assignee=old)
+        def assign(project,tid,expected,new,key):
+            return harness.request('POST','/v1/projects/%s/tasks/%s/assign'%(project,tid),
+                                   self.assignment_body(expected,new),token=owner,key=key)
+        on_source=assign('pp','pp-merge-slot',None,target,'restored-source-slot-0001')
+        self.assertEqual((422,'Assignment cannot change a record anchor or internal row.'),
+                         (on_source.status,on_source.data['error']['message']),on_source.data)
+        backups=self.root/'backups';backups.mkdir(exist_ok=True)
+        init=self.r.bd('backup','init',str(backups/'pp'));self.assertEqual(0,init.returncode,init.stderr)
+        def command(*args):
+            return subprocess.run([sys.executable,str(KIT/'admin.py'),'--root',str(self.root),*args],
+                env=admin.environment(self.root),capture_output=True,text=True,timeout=300)
+        made=command('backup','pp');self.assertEqual(0,made.returncode,made.stdout+made.stderr)
+        made=command('restore-new','pp','ppnew');self.assertEqual(0,made.returncode,made.stdout+made.stderr)
+        # The shape that made the 503: bd's slot in the clone is the source's, by prefix.
+        checked=json.loads(admin.run_bd(self.root,'ppnew',['merge-slot','check','--json']))
+        self.assertEqual(('pp-merge-slot',True),(checked.get('id'),checked.get('available')),checked)
+        self.assertEqual(201,harness.request('POST','/v1/projects',{'project_id':'ppnew','name':'Restored'},token=owner).status)
+        self.assertEqual(200,harness.request('PUT','/v1/projects/ppnew/members/'+target,{'role':'contributor'},token=owner).status)
+        page=harness.request('GET','/v1/projects/ppnew/merge-slot',None,token=owner)
+        self.assertEqual(200,page.status,page.data);self.assertTrue(page.data['available'])
+        on_clone=assign('ppnew','pp-merge-slot',None,target,'restored-clone-slot-0001')
+        self.assertEqual((422,'Assignment cannot change a record anchor or internal row.'),
+                         (on_clone.status,on_clone.data['error']['message']),on_clone.data)
+        moved=assign('ppnew',ordinary,old,target,'restored-clone-ordinary-0001')
+        self.assertEqual(200,moved.status,moved.data);self.assertEqual(target,moved.data['assignee'])
+        rows=[json.loads(line) for line in admin.run_bd(self.root,'ppnew',['export','--all']).splitlines() if line.strip()]
+        self.assertEqual(target,next(x for x in rows if x['id']==ordinary)['assignee'])
+        # The source is untouched by the clone's assignment.
+        self.assertEqual(old,next(x for x in self.rows() if x['id']==ordinary)['assignee'])
+
     def test_web_agent_display_name_assignment_stores_the_actor_and_says_so(self):
         harness, owner = self.web()
         old = harness.admin_user['id']

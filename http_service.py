@@ -42,6 +42,7 @@ import ssl
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -51,6 +52,7 @@ import actor_names
 import agent_prompts
 import bd_refusals
 from field_limits import DESCRIPTION_MAX, DESCRIPTION_TOO_LONG
+from review_workflow import TEXT_LIMITS
 import claim_limit
 import handover_steps
 import project_setup
@@ -440,11 +442,14 @@ def _pack_history_cursor(cursor, project_id, task_id, recent):
         snap_b64 = base64.urlsafe_b64encode(snap_bytes).decode('ascii').rstrip('=')
         packed = [snap_b64, c['index'], c['offset']]
         scp = c.get('scp')
-        if scp is not None:
+        mcp = bool(c.get('mcp'))
+        if scp is not None or mcp:
             prefix = str(task_id) + '-'
             if isinstance(scp, str) and scp.startswith(prefix):
                 scp = '~' + scp[len(prefix):]
             packed.append(scp)
+            if mcp:
+                packed.append(True)
         return packed
     except Exception:
         return cursor
@@ -454,7 +459,7 @@ def _unpack_history_cursor(packed, project_id, task_id, recent):
     """Restore a canonical ``briefing.history_page`` token from :func:`_pack_history_cursor`."""
     if packed is None or isinstance(packed, str):
         return packed
-    if not isinstance(packed, list) or len(packed) not in (3, 4):
+    if not isinstance(packed, list) or len(packed) not in (3, 4, 5):
         raise conflict('Invalid cursor')
     snap_b64, index, start = packed[0], packed[1], packed[2]
     if not isinstance(snap_b64, str) or type(index) is not int or type(start) is not int:
@@ -469,13 +474,17 @@ def _unpack_history_cursor(packed, project_id, task_id, recent):
              'snapshot': digest, 'since': None, 'index': index, 'offset': start}
         if recent:
             c['order'] = 'newest'
-        if len(packed) == 4 and packed[3] is not None:
+        if len(packed) >= 4 and packed[3] is not None:
             scp = packed[3]
             if not isinstance(scp, str):
                 raise ValueError('bad scp')
             if scp.startswith('~'):
                 scp = str(task_id) + '-' + scp[1:]
             c['scp'] = scp
+        if len(packed) == 5:
+            if packed[4] is not True:
+                raise ValueError('bad mcp')
+            c['mcp'] = True
         return token(c)
     except Exception:
         raise conflict('Invalid cursor') from None
@@ -1222,9 +1231,9 @@ class InProcessBackend:
             task['version'] += 1
             self._event(project_id, task['id'], 'contribution', principal, record['actor'])
             # The canonical answer's additive `open_items` and `open_items_total` (kittrial-5bb.431,
-            # .435). This backend caps each request at 20 items but not their sum, so more than 20 can be
-            # open: it counts and words the warning from every one, with this task's route, and cuts only
-            # the list.
+            # .435, .436). Like the canonical projection, this backend refuses a request-changes that
+            # would leave more than 20 unresolved blocking items on the task; `open_items_total` is
+            # still counted before slicing to `OPEN_ITEMS_MAX`.
             from review_state import OPEN_ITEMS_MAX, open_items_warnings
             every = [{'request': r['request'], 'item': r['id'], 'contribution': r['contribution']}
                      for r in still_open]
@@ -1244,21 +1253,36 @@ class InProcessBackend:
             raise conflict('A newer contribution arrived; reread the task before reviewing',
                            {'current_contribution': current[-1]['id']})
         actor = payload.get('actor') or principal.actor
+        summary = (payload.get('summary') or '')[:1200]
+        operation_id = payload.get('operation_id')
         items, resolutions = [], []
         if operation == 'request-changes':
-            items = self._review_items(payload.get('items'))
+            items = self._review_items(payload.get('items'), allow_severity=True)
+            if isinstance(operation_id, str) and operation_id:
+                for stored in contributions:
+                    if stored.get('kind') != 'request-changes' or stored.get('operation_id') != operation_id:
+                        continue
+                    if stored.get('actor') == actor and stored.get('contribution_id') == current[-1]['id'] \
+                            and stored.get('summary') == summary and stored.get('items') == items:
+                        return {'review': stored, 'task_version': task['version']}
+                    raise invalid('Operation ID already used with different payload or actor')
+            blocking = [i for i in items if i.get('severity') != 'note'] if items else (
+                [{'id': 'item-1', 'text': summary}] if summary else [])
+            if len(self._requests(contributions, True)) + len(blocking) > 20:
+                raise invalid('At most 20 unresolved review items are allowed')
         elif operation == 'respond':
             # Canonical rule (review_workflow.execute): only the current assignee may
             # respond, and every resolution must name a still-open request item.
             if not task.get('assignee') or actor != task['assignee']:
                 raise forbidden('Only the task assignee may respond to requested changes')
             resolutions = self._resolutions(payload.get('resolutions'),
-                                            self._requests(contributions, True))
+                                            [r for r in self._requests(contributions) if r['status'] == 'open'])
         elif operation == 'approve' and self._requests(contributions, True):
-            raise conflict('Cannot approve while requested changes remain unresolved')
+            from review_workflow import unresolved_changes_approval_refusal
+            raise conflict(unresolved_changes_approval_refusal(task.get('assignee')))
         record = {'id': 'rev_' + secrets.token_hex(6), 'task_id': task['id'], 'kind': operation,
                   'contribution_id': current[-1]['id'],
-                  'summary': (payload.get('summary') or '')[:1200],
+                  'summary': summary,
                   'items': items,
                   'actor': actor,
                   'created_at': now_iso(self.service._now())}
@@ -1268,6 +1292,8 @@ class InProcessBackend:
             # rule (a later revision resolves them), so older disposable state reads
             # the same as before.
             record['needs_respond'] = True
+            if isinstance(operation_id, str) and operation_id:
+                record['operation_id'] = operation_id
         if operation == 'respond':
             record['resolutions'] = resolutions
         contributions.append(record)
@@ -1412,6 +1438,8 @@ class InProcessBackend:
                 entry = {'id': item['id'], 'request': record['id'], 'text': item['text'],
                          'contribution': record['contribution_id'], 'author': record['actor'],
                          'at': record['created_at'], 'status': 'open', 'resolution': None}
+                if item.get('severity') == 'note':
+                    entry['severity'] = 'note'
                 answer = resolved.get((record['id'], item['id']))
                 if answer is not None:
                     entry.update(status='resolved', resolution=answer['reason'],
@@ -1421,7 +1449,7 @@ class InProcessBackend:
                     entry.update(status='resolved', resolution='Addressed in revision %d'
                                  % (contributions.index(later[0]) + 1))
                 found.append(entry)
-        return [r for r in found if r['status'] == 'open'] if open_only else found
+        return [r for r in found if r['status'] == 'open' and r.get('severity') != 'note'] if open_only else found
 
     @staticmethod
     def _resolutions(raw, open_requests):
@@ -1453,7 +1481,7 @@ class InProcessBackend:
         return clean
 
     @staticmethod
-    def _review_items(raw):
+    def _review_items(raw, allow_severity=False):
         """Normalize requested-change items: plain strings or canonical ``{id, text}``."""
         if raw is None:
             return []
@@ -1467,7 +1495,13 @@ class InProcessBackend:
                     not item['text'].strip() or len(item['text']) > 1000 or \
                     not isinstance(item.get('id'), str) or not SAFE_ID.fullmatch(item['id']):
                 raise invalid('Each review item needs an id and 1-1000 characters of text')
-            items.append({'id': item['id'], 'text': item['text'].strip()})
+            entry = {'id': item['id'], 'text': item['text'].strip()}
+            if allow_severity and item.get('severity') is not None:
+                if item.get('severity') not in ('blocking', 'note'):
+                    raise invalid('Review item severity must be blocking or note')
+                if item['severity'] == 'note':
+                    entry['severity'] = 'note'
+            items.append(entry)
         return items
 
     def _feedback_add(self, principal, project_id, payload):
@@ -1648,31 +1682,54 @@ class InProcessBackend:
         raise not_found('Contribution not found')
 
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
-                     recent=False, since_checkpoint=False):
+                     recent=False, since_checkpoint=False, kind=None,
+                     since_my_checkpoint=False, my_actor=None, latest_checkpoint=False,
+                     authority=None):
         """The task's events, oldest first or (``recent``) newest first. This backend has no
         continuation cursor, so only the first page is reachable: the route says so in
         ``truncated`` when more exists (kittrial-5bb.353). ``since_checkpoint`` keeps the
-        events after the newest ``checkpoint-added`` (all of them when there is none)."""
+        events after the newest ``checkpoint-added`` (all of them when there is none);
+        ``since_my_checkpoint`` uses only a checkpoint of ``my_actor`` and
+        ``latest_checkpoint`` answers the checkpoint keys with no entries
+        (kittrial-5bb.244)."""
         self._task(project_id, task_id)
         events = [e for e in self.state.get('events', [])
                   if e.get('project') == project_id and e.get('task') == task_id]
         checkpoint = None
-        if since_checkpoint:
-            marks = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added']
+        if since_checkpoint or since_my_checkpoint or latest_checkpoint:
+            marks = [i for i, e in enumerate(events) if e.get('action') == 'checkpoint-added'
+                     and (not since_my_checkpoint or e.get('actor') == my_actor)]
             if marks:
                 checkpoint = events[marks[-1]]
                 events = events[marks[-1] + 1:]
+        selection = {}
+        if since_checkpoint or since_my_checkpoint or latest_checkpoint:
+            if checkpoint:
+                who = ('your newest valid checkpoint: ' if since_my_checkpoint
+                       else 'newest valid checkpoint, by anyone: ')
+                note = who + str(checkpoint.get('time')) + ' by ' + str(checkpoint.get('actor'))
+            elif since_my_checkpoint:
+                note = ('you have no checkpoint of your own on this task, so --since-my-checkpoint returned the '
+                        'whole history with a null baseline; write a checkpoint to make this a delta read.')
+            else:
+                note = None
+            selection = {'since_checkpoint': checkpoint.get('time') if checkpoint else None,
+                         'checkpoint_author': checkpoint.get('actor') if checkpoint else None,
+                         'checkpoint_timestamp': checkpoint.get('time') if checkpoint else None,
+                         'checkpoint_coverage': None, 'unverified_entries': 0,
+                         'checkpoint_note': note}
+        if latest_checkpoint:
+            return dict({'items': [], 'total': 0, 'canonical_cursor': None,
+                         'activity_cursor': None}, **selection)
+        if kind is not None:
+            events = [e for e in events if (e.get('action') == 'comment') == (kind == 'comment')]
         logical = _logical_entries(events)
         if recent:
             logical = logical[::-1]
         selected = [item for group in logical[offset:offset + limit] for item in group]
         result = {'items': selected, 'total': len(logical),
                   'canonical_cursor': None, 'activity_cursor': None}
-        if since_checkpoint:
-            result.update({'since_checkpoint': checkpoint.get('time') if checkpoint else None,
-                           'checkpoint_author': checkpoint.get('actor') if checkpoint else None,
-                           'checkpoint_timestamp': checkpoint.get('time') if checkpoint else None,
-                           'checkpoint_coverage': None, 'unverified_entries': 0})
+        result.update(selection)
         return result
 
     def list_feedback(self, project_id, limit, offset):
@@ -1709,7 +1766,7 @@ class InProcessBackend:
                 'recommendation_keys': [{'author': record['actor'], 'operation_id': record.get('operation_id')}
                                         for record in records_standing],
                 'requests': requests,
-                'open_requests': sum(1 for r in requests if r['status'] == 'open'),
+                'open_requests': sum(1 for r in requests if r['status'] == 'open' and r.get('severity') != 'note'),
                 'latest_id': records[-1]['id'] if records else None,
                 'latest_at': records[-1]['created_at'] if records else None,
                 'revisions': len(contributions)}
@@ -2007,7 +2064,7 @@ class InProcessBackend:
         return lanes_read(rows, actor, {'schema_version': 1, 'records': {}}, list(args),
                           journal=None, scope=scope)
 
-    def coordinator_wait(self, project_id, principal, idle_minutes):
+    def coordinator_wait(self, project_id, principal, idle_minutes, comments=False):
         """The disposable model's queue and board at one locked state."""
         import waiting
         from lanes import LANES_LIMIT_MAX
@@ -2023,10 +2080,12 @@ class InProcessBackend:
                     assignee=row['owner'], closed=row['status'] == 'closed', claimable=item['claimable'],
                     comment_pending=attention_field(item, 'assignee_comment_pending') is True)
                 rows.append(row)
+            pointers = waiting.comment_pointers(self._project_rows(project_id), actor) if comments else None
             return waiting.coordinator_view(
                 rows,
                 self.lanes_read(project_id, principal, ['--idle-minutes', str(idle_minutes),
-                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'))
+                                            '--limit', str(LANES_LIMIT_MAX)], actor, scope='all'),
+                pointers)
 
     def review_queue(self, project_id):
         """Every task with current work, highest-attention review states first.
@@ -3601,10 +3660,11 @@ class EndpointBackend:
             return None
         return path if path.is_dir() else None
 
-    def coordinator_wait(self, project_id, principal, idle_minutes):
+    def coordinator_wait(self, project_id, principal, idle_minutes, comments=False):
         """One canonical wait read: queue and lanes share the endpoint's export."""
         reply = self._endpoint('wait', project_id, self.service.bind_actor(principal, None),
-                               ['--coordinator', '--idle-minutes', str(idle_minutes)],
+                               ['--coordinator', '--idle-minutes', str(idle_minutes)]
+                               + (['--comments-others'] if comments else []),
                                authority=authority_request(principal, project_id, CAP_COORDINATE,
                                                            now=self.service._expiry_now()),
                                extra={'lanes_scope': 'all'})
@@ -3925,14 +3985,24 @@ class EndpointBackend:
                 return item
         raise not_found('Contribution not found')
 
+    #: The checkpoint keys every checkpoint-relative history answer carries.
+    HISTORY_CHECKPOINT_KEYS = ('since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
+                               'checkpoint_coverage', 'unverified_entries', 'checkpoint_note')
+
     def task_history(self, project_id, task_id, limit, offset, canonical=None,
-                     recent=False, since_checkpoint=False):
+                     recent=False, since_checkpoint=False, kind=None,
+                     since_my_checkpoint=False, my_actor=None, latest_checkpoint=False,
+                     authority=None):
         """Page the canonical snapshot cursor, never asking for more than its limit.
 
         ``recent`` reads the same snapshot newest first (the canonical ``--recent``, whose
         cursor walks toward older entries and keeps a long comment's fragments together in
         body order); ``since_checkpoint`` passes ``--since-checkpoint``, whose boundary the
-        canonical cursor carries (kittrial-5bb.353).
+        canonical cursor carries (kittrial-5bb.353). ``kind`` filters comment/event,
+        ``since_my_checkpoint`` reads from the caller's own newest checkpoint (the
+        canonical ``--since-my-checkpoint`` requires that caller as its actor), and
+        ``latest_checkpoint`` returns the newest checkpoint's keys with no entries
+        (kittrial-5bb.244 G1/G2/G4 and the HTTP read).
 
         The canonical ``history`` action accepts 1..20 entries per call and binds its
         continuation cursor to a snapshot digest. Accumulating exact-size canonical
@@ -3952,13 +4022,29 @@ class EndpointBackend:
         fall at a different character than a whole read does; concatenating the fragments
         in page order reconstructs the body exactly, whatever page size a walk uses.
         """
+        actor = my_actor if since_my_checkpoint and my_actor else self.actor_namespace + '/read'
+        # A caller-account actor is an HTTP-shaped actor, so the canonical endpoint needs
+        # the verified live-authority descriptor that the rest of the HTTP surface sends
+        # for it; the fixed read actor needs none (kittrial-5bb.70).
+        run_options = {'authority': authority, 'require_authority': True} if authority else {}
+        activity = None
+        selection = {}
+        if latest_checkpoint:
+            # One canonical checkpoint-relative read is the only read that returns the
+            # baseline's identity and coverage; discard its one entry (kittrial-5bb.244).
+            reply = self._run('history', project_id, actor,
+                              [str(task_id), '--limit', '1', '--json', '--since-checkpoint'],
+                              **run_options)
+            if isinstance(reply, dict):
+                selection = {key: reply.get(key) for key in self.HISTORY_CHECKPOINT_KEYS}
+                activity = reply.get('activity_cursor')
+            return dict({'items': [], 'total': 0, 'canonical_cursor': None,
+                         'activity_cursor': activity}, **selection)
         needed = limit if canonical else offset + limit
         collected = []
         completed = 0
         cursor = _unpack_history_cursor(canonical, project_id, task_id, recent)
         total = 0
-        activity = None
-        selection = {}
         pages = 0
         while completed < needed and pages < 500:
             pages += 1
@@ -3966,9 +4052,13 @@ class EndpointBackend:
                     str(min(20, needed - completed)), '--json']
             if since_checkpoint:
                 argv.append('--since-checkpoint')
+            if since_my_checkpoint:
+                argv.append('--since-my-checkpoint')
+            if kind is not None:
+                argv += ['--kind', kind]
             if cursor:
                 argv += ['--cursor', cursor]
-            reply = self._run('history', project_id, self.actor_namespace + '/read', argv)
+            reply = self._run('history', project_id, actor, argv, **run_options)
             if isinstance(reply, list):
                 collected.extend(reply)
                 total = len(_logical_entries(reply))
@@ -3977,10 +4067,8 @@ class EndpointBackend:
             entries = reply.get('entries') or []
             if reply.get('activity_cursor'):
                 activity = reply['activity_cursor']
-            if since_checkpoint:
-                selection = {key: reply.get(key) for key in (
-                    'since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
-                    'checkpoint_coverage', 'unverified_entries')}
+            if since_checkpoint or since_my_checkpoint:
+                selection = {key: reply.get(key) for key in self.HISTORY_CHECKPOINT_KEYS}
             collected.extend(entries)
             completed = _logical_entry_count(collected)
             total = reply.get('total_entries', len(_logical_entries(collected)))
@@ -5384,6 +5472,30 @@ def serves_web_guidance(routes=None):
     return read, ack
 
 
+class WaitSlots:
+    """Counts the blocking coordinator waits being held (kittrial-5bb.457)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._total = 0
+        self._by_key = {}
+
+    def take(self, key, total_cap, key_cap):
+        with self._lock:
+            if self._total >= total_cap or self._by_key.get(key, 0) >= key_cap:
+                return False
+            self._total += 1
+            self._by_key[key] = self._by_key.get(key, 0) + 1
+            return True
+
+    def release(self, key):
+        with self._lock:
+            self._total -= 1
+            self._by_key[key] -= 1
+            if not self._by_key[key]:
+                del self._by_key[key]
+
+
 class ApiHandler(BaseHTTPRequestHandler):
     """One request per call. Class attributes are supplied by :func:`build_handler`."""
 
@@ -6765,7 +6877,10 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: your own work (round 2, N6).
     NOT_INDEPENDENT_PARTY = (NOT_INDEPENDENT + '; and on this server neither can the account that issued the worker '
                              'credential it was delivered under, nor that account\'s agents, nor a worker credential '
-                             'issued by the contribution\'s author or by the task\'s assignee')
+                             'issued by the contribution\'s author or by the task\'s assignee, nor anything else of '
+                             'the same party as the author or the assignee')
+    ME_WORK_PARTY_NOTE = ('Only work you may approve is listed; own-party contributions are left out in every review '
+                          'state. Open the project review queue to request changes on one.')
 
     #: Said to an approver of the party the work belongs to (the setting of kittrial-5bb.199). Which of
     #: the three is said depends on what is true; each ends with OWN_PARTY_NEXT.
@@ -6808,7 +6923,24 @@ class ApiHandler(BaseHTTPRequestHandler):
     #: Added to the summary of an approval that only this setting let through, so the record says so.
     SAME_PERSON_APPROVAL = ('Approved by a coordinator agent of the same person as the agent that delivered it '
                             '(project setting agent_approval: by-agent).')
-    SUMMARY_MAX = 1200                 # review_workflow.TEXT_LIMITS['summary']
+    SUMMARY_MAX = TEXT_LIMITS['summary']
+
+    @staticmethod
+    def _normalize_basis_text(text):
+        folded = unicodedata.normalize('NFKC', text).casefold()
+        stripped = ''.join(
+            ch for ch in folded
+            if unicodedata.category(ch) != 'Cf'
+            and not unicodedata.category(ch).startswith('P')
+            and ch not in '[](){}<>'
+        )
+        return ' '.join(stripped.split())
+
+    def _contains_same_person_approval(self, summary):
+        if not isinstance(summary, str):
+            return False
+        target = self._normalize_basis_text(self.SAME_PERSON_APPROVAL)
+        return bool(target) and target in self._normalize_basis_text(summary)
 
     def _another_agent_only(self, agent_id, names, parties, project):
         """Whether every one of ``parties`` of the approver's party is ANOTHER agent of its person (kittrial-5bb.438).
@@ -9755,7 +9887,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         from work import move_decision
         agent = self.service.agent_for_credential(ctx.principal)
         actor = agent.get('actor') or agent.get('id')
-        refuse_ambiguous_query(urlsplit(self.path).query, ('form', 'since', 'idle_minutes'))
+        refuse_ambiguous_query(urlsplit(self.path).query, ('form', 'since', 'idle_minutes', 'timeout', 'comments'))
         # Both forms share this query, so a malformed threshold is refused even on the
         # worker form, where the value is otherwise unused (kittrial-5bb.389).
         self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
@@ -9878,11 +10010,123 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _agent_coordinator_wait(self, ctx, agent):
         """Live project grants bound this read, never the service's host identity."""
         import waiting
-        refuse_unknown_fields(ctx.query, ('form', 'since', 'idle_minutes'), 'Coordinator wait query')
+        refuse_unknown_fields(ctx.query, ('form', 'since', 'idle_minutes', 'timeout', 'comments'),
+                              'Coordinator wait query')
         since = ctx.query.get('since')
         if since is not None and not waiting.is_fingerprint(since):
             raise HttpError(400, 'invalid_request', 'since must be a wait fingerprint')
         idle_minutes = self._lanes_idle_minutes(ctx.query.get('idle_minutes'))
+        timeout = ctx.query.get('timeout', '0')
+        if not re.fullmatch(r'[0-9]{1,3}', timeout) or int(timeout) > self.WAIT_TIMEOUT_MAX:
+            raise HttpError(400, 'invalid_request',
+                            'timeout must be whole seconds from 0 to %d' % self.WAIT_TIMEOUT_MAX)
+        timeout = int(timeout)
+        comments = ctx.query.get('comments')
+        if comments is not None and comments != 'others':
+            raise HttpError(400, 'invalid_request', 'comments must be others')
+        began = time.monotonic()
+        view = self._coordinator_pass(ctx, agent, idle_minutes, comments is not None, since)
+        cost = time.monotonic() - began
+        # A baseline read (no since) has nothing to wait for, so it never blocks.
+        if timeout == 0 or since is None or view['changed']:
+            return 200, view
+        key = agent.get('id')
+        if not self._wait_slots.take(key, self.WAIT_GLOBAL_CAP, self.WAIT_PER_CREDENTIAL):
+            view['wait'] = {'blocked': False, 'reason': 'busy'}
+            return 200, view
+        try:
+            # A soft bound, not a hard one: the deadline counts from before the first read (not from
+            # authentication or admission), and a pass only starts when the slowest pass so far
+            # still fits in what is left. A pass slower than every earlier one, or a loaded
+            # backend, can overrun it because nothing interrupts a read. wait.seconds says so.
+            deadline = began + timeout
+            pause = self._wait_pause(deadline, cost)
+            while pause > 0:
+                # Nothing is held here: no lock, no transaction and no backend read while asleep.
+                if not self._sleep_unless_gone(pause):
+                    break
+                # Each pass re-decides the caller's authority; a revoked credential or a lost
+                # grant raises here and the wait ends with that refusal.
+                agent = self.service.agent_for_credential(ctx.principal)
+                pass_began = time.monotonic()
+                view = self._coordinator_pass(ctx, agent, idle_minutes, comments is not None, since)
+                cost = max(cost, time.monotonic() - pass_began)
+                if view['changed']:
+                    break
+                pause = self._wait_pause(deadline, cost)
+        finally:
+            self._wait_slots.release(key)
+        view['wait'] = {'blocked': True, 'timed_out': not view['changed'],
+                        'seconds': round(time.monotonic() - began, 1)}
+        return 200, view
+
+    WAIT_TIMEOUT_MAX = 50
+    WAIT_INTERVAL = 5.0
+    WAIT_GLOBAL_CAP = 20
+    WAIT_PER_CREDENTIAL = 1
+    _wait_slots = WaitSlots()
+
+    def _wait_pause(self, deadline, cost):
+        """How long to sleep before the next pass; zero or less when that pass would not fit.
+
+        Each waiter's reads take at most about a fifth of its own time: a slow backend (many waiters,
+        a big project) makes the interval longer, never the load higher."""
+        return min(max(self.WAIT_INTERVAL, 4 * cost), deadline - time.monotonic() - cost)
+
+    def _sleep_unless_gone(self, seconds):
+        """Sleep up to ``seconds``; False as soon as the client has hung up."""
+        import select
+        import socket
+        connection = getattr(self, 'connection', None)
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            left = max(end - time.monotonic(), 0.0)
+            if connection is None:
+                time.sleep(left)
+                continue
+            try:
+                # Bytes the TLS layer has decrypted already are never in front of the socket.
+                readable = [connection] if isinstance(connection, ssl.SSLSocket) and connection.pending() \
+                    else select.select([connection], [], [], left)[0]
+                if readable and isinstance(connection, ssl.SSLSocket):
+                    if self._tls_peer_gone(connection):
+                        return False
+                elif readable and socket.socket.recv(connection, 1, socket.MSG_PEEK) == b'':
+                    return False
+            except (OSError, ValueError):
+                return False
+            if readable:
+                time.sleep(min(left, 0.05))   # bytes the client sent early: not a hang-up
+        return True
+
+    def _tls_peer_gone(self, connection):
+        """Whether a readable TLS socket says the client is gone.
+
+        Peeking the raw socket sees only an encrypted record, never the close_notify in front of the
+        EOF, so the decrypting read is used, without waiting. A real byte here is a request sent
+        during the wait; it cannot be handed back, so the connection is closed after the answer."""
+        timeout = connection.gettimeout()
+        try:
+            connection.settimeout(0.0)
+            try:
+                data = connection.recv(1)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                return False       # part of a record: nothing to tell yet
+            except (OSError, ValueError):
+                return True        # reset, or an unclean end
+            if data == b'':
+                return True
+            self.close_connection = True
+            return False
+        finally:
+            try:
+                connection.settimeout(timeout)
+            except (OSError, ValueError):
+                pass
+
+    def _coordinator_pass(self, ctx, agent, idle_minutes, comments, since):
+        """One read of the coordinator wait: the grant is judged afresh for every project."""
+        import waiting
         projects = []
         for project_id in sorted(set(agent.get('projects') or [])):
             try:
@@ -9896,7 +10140,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise forbidden('A current project coordinator grant is required for coordinator wait')
         if not hasattr(self.backend, 'coordinator_wait'):
             raise not_implemented('Coordinator wait is unavailable on this server')
-        reads = [(project, self.backend.coordinator_wait(project, ctx.principal, idle_minutes))
+        extra = {'comments': True} if comments else {}
+        reads = [(project, self.backend.coordinator_wait(project, ctx.principal, idle_minutes, **extra))
                  for project in projects]
         # A one-project fingerprint is EXACTLY the CLI fact. Multiple projects have
         # an explicit project namespace, including empty projects and grant changes.
@@ -9912,15 +10157,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                     'items': [dict(row, trigger=name) for name in triggers for row in triggers[name]],
                     'fingerprint': waiting.digest([{'project': project, 'fingerprint': read['fingerprint']}
                                                    for project, read in reads])}
+            if comments:
+                view['comments'] = [dict(row, project=project) for project, read in reads
+                                    for row in read.get('comments') or []]
         view['projects'] = projects
         view['agent'] = agent.get('id')
         view['generated_at'] = now_iso(self.service._now())
+        self._fold_notes(view, self._notes_waking(ctx.principal), since)
         if since is not None:
             view['changed'] = since != view['fingerprint']
-        self._fold_notes(view, self._notes_waking(ctx.principal), since)
         view['manual_cadence'] = ('Read this route again with form=coordinator and since=FINGERPRINT; '
-                                  'it never blocks, sleeps or schedules work.')
-        return 200, view
+                                  'it never blocks unless timeout=SECONDS is given (at most %d).'
+                                  % self.WAIT_TIMEOUT_MAX)
+        return view
 
     # -- coordinator notes (kittrial-5bb.447) ---------------------------------------------------------------------
     def _notes_waking(self, principal):
@@ -11317,7 +11566,10 @@ class ApiHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _agent_attention_view(agent, attention=None):
         if attention is None:
-            attention = {'state': 'unknown', 'summary': 'Not computed.',
+            # kittrial-5bb.237 (G5): a view that was never computed is its own state.
+            # The routes always compute attention; 'unknown' on a computed read means
+            # the read was INCOMPLETE (lower bounds), never "not computed".
+            attention = {'state': 'not-computed', 'summary': 'Not computed.',
                          'counts': {}, 'actions': [], 'truncated': False,
                          'snapshot_truncated': False, 'own_tasks_truncated': False,
                          'actions_truncated': False,
@@ -14122,6 +14374,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         def add():
             delivered = (current.get('review') or {}).get('contribution') or {} if current else {}
             pid = ctx.params['pid']
+            setting = None
             if judged:
                 # Nobody approves work of their own party: the account that approves, against the
                 # account behind the contribution's author and behind the task's assignee. A
@@ -14135,23 +14388,28 @@ class ApiHandler(BaseHTTPRequestHandler):
                     # project's owner chose the strict rule. Read here, inside the mutation, every time.
                     refusal, setting = self._agent_approval_refusal(ctx.principal, names, assignee,
                                                                     delivered.get('author'), pid)
-                    if refusal is None:
-                        summary = payload.get('summary')
-                        if isinstance(summary, str):
-                            joined = (summary.rstrip() + ' ' if summary.strip() else '') + self.SAME_PERSON_APPROVAL
-                            over = len(joined) - self.SUMMARY_MAX
-                            if over > 0:
-                                raise invalid('This approval is allowed by the project\'s agent-approval setting, and '
-                                              'its summary must then say so in a sentence of %d characters; shorten '
-                                              'the summary by %d characters and send it again'
-                                              % (len(self.SAME_PERSON_APPROVAL), over))
-                            payload['summary'] = joined
-                        same_person.update(same_person_coordinator=True, author=delivered.get('author'),
-                                           assignee=assignee, agent_approval=setting['mode'],
-                                           agent_approval_set_by=setting.get('set_by') or 'default',
-                                           agent_approval_set_at=setting.get('set_at'))
                 if refusal:
                     raise forbidden(refusal)
+            if payload.get('operation') == 'approve':
+                summary = payload.get('summary')
+                if self._contains_same_person_approval(summary):
+                    raise invalid('The approval summary may not contain %r; the server adds that sentence itself'
+                                  % self.SAME_PERSON_APPROVAL)
+                if setting is not None:
+                    if isinstance(summary, str):
+                        joined = (summary.rstrip() + ' ' if summary.strip() else '') + self.SAME_PERSON_APPROVAL
+                        over = len(joined) - self.SUMMARY_MAX
+                        if over > 0:
+                            raise invalid('This approval is allowed by the project\'s agent-approval setting, and '
+                                          'its summary must then say so in a sentence of %d characters; shorten '
+                                          'the summary by %d characters and send it again'
+                                          % (len(self.SAME_PERSON_APPROVAL), over))
+                        payload['summary'] = joined
+                    same_person.update(same_person_coordinator=True, author=delivered.get('author'),
+                                       assignee=(current.get('task') or {}).get('assignee'),
+                                       agent_approval=setting['mode'],
+                                       agent_approval_set_by=setting.get('set_by') or 'default',
+                                       agent_approval_set_at=setting.get('set_at'))
             if recommending:
                 # Independence by PERSON, which only the web service can know; the
                 # canonical write then applies the name rule and every other rule.
@@ -14160,6 +14418,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self._independent_all([actor, ctx.principal.user_id], parties, pid):
                     raise forbidden(self.NOT_INDEPENDENT_PARTY if self.service.approval_by_another_party
                                     else self.NOT_INDEPENDENT)
+                if self._contains_same_person_approval(payload.get('summary')):
+                    raise invalid('The recommendation summary may not contain %r; the server adds that sentence itself'
+                                  % self.SAME_PERSON_APPROVAL)
                 # One standing recommendation for a contribution from each PERSON
                 # (kittrial-5bb.154): a second one, by the same actor or by another agent of
                 # the same person, is refused and nothing is stored. Read from EVERY standing
@@ -14210,6 +14471,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if recommending and refusal.status == 422 and isinstance(refusal.detail, str) \
                         and refusal.detail.startswith('ValueError: '):
                     raise invalid(refusal.detail[len('ValueError: '):], refusal.detail) from None
+                if refusal.status == 422 and refusal.detail == 'ValueError: At most 20 unresolved review items are allowed':
+                    raise invalid('At most 20 unresolved review items are allowed', refusal.detail) from None
                 # So does a refused follow-on base (kittrial-5bb.158): the sentence says which
                 # base is acceptable, why this one is not and what an operator does about it.
                 sentence = EndpointBackend.base_refusal(refusal.detail) if refusal.status == 422 else None
@@ -14600,20 +14863,42 @@ class ApiHandler(BaseHTTPRequestHandler):
         query, so it continues only the same direction and selection. ``order`` says
         which direction a page is in, and ``truncated`` is true when entries exist that
         this answer neither returned nor can continue to (a backend that cannot page).
+
+        ``kind=comment|event`` is the client's ``history --kind``. ``since_my_checkpoint=
+        true`` is the client's ``--since-my-checkpoint``: only the caller's own newest
+        valid checkpoint is the baseline (the same CAP_READ gate as the rest of this
+        read). ``latest_checkpoint=true`` answers the newest checkpoint's keys
+        (``since_checkpoint``, ``checkpoint_author``, ``checkpoint_timestamp``,
+        ``checkpoint_coverage``, ``unverified_entries``, ``checkpoint_note``) with no
+        entries, and takes no other selector (kittrial-5bb.244).
         """
         self._project(ctx, CAP_READ)
         self._refuse_record_anchor(self.backend.get_task(ctx.params['pid'], ctx.params['tid']))
+        refuse_ambiguous_query(urlsplit(self.path).query,
+                               ('kind', 'since_my_checkpoint', 'latest_checkpoint'))
         scope_id = ctx.params['pid'] + '/' + ctx.params['tid']
-        recent, since_checkpoint = self._history_selection(ctx.query)
-        if recent is not None:
+        selection = self._history_selection(ctx.query)
+        recent = selection['recent']
+        since_checkpoint = selection['since_checkpoint']
+        since_my_checkpoint = selection['since_my_checkpoint']
+        latest_checkpoint = selection['latest_checkpoint']
+        if latest_checkpoint:
+            limit, state = 1, {'o': 0, 'x': None}
+        elif recent is not None:
             limit = recent
             state = read_cursor(ctx.principal, scope_id, ctx.query, ctx.query.get('cursor'),
                                 key=self.service.cursor_key())
         else:
             limit, state = self._page(ctx, ctx.query, project_id=scope_id)
-        result = self.backend.task_history(ctx.params['pid'], ctx.params['tid'], limit,
-                                           state['o'], canonical=state['x'],
-                                           recent=recent is not None, since_checkpoint=since_checkpoint)
+        authority = (authority_request(ctx.principal, ctx.params['pid'], CAP_READ,
+                                       now=self.service._expiry_now())
+                     if since_my_checkpoint else None)
+        result = self.backend.task_history(
+            ctx.params['pid'], ctx.params['tid'], limit, state['o'], canonical=state['x'],
+            recent=recent is not None, since_checkpoint=since_checkpoint,
+            kind=selection['kind'], since_my_checkpoint=since_my_checkpoint,
+            my_actor=ctx.principal.actor or ctx.principal.user_id,
+            latest_checkpoint=latest_checkpoint, authority=authority)
         who = lambda e: (e.get('user_id') or e.get('author')) if isinstance(e, dict) else None
         # (A canonical entry's author may be structured; ActorNames.get ignores it.)
         names = self._actor_names([who(e) for e in result['items']], ctx.params['pid'])
@@ -14627,7 +14912,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             make_cursor(ctx.principal, scope_id, ctx.query,
                         returned, continuation, key=self.service.cursor_key())
             if continuation else None)
-        body['order'] = 'newest-first' if recent is not None else 'oldest-first'
+        body['order'] = None if latest_checkpoint else ('newest-first' if recent is not None else 'oldest-first')
+        body['kind'] = selection['kind']
         # Entries this answer neither returned nor can continue to: a backend without a
         # continuation cursor (the in-process one) cannot page past its first page, so the
         # answer says so instead of looking complete (kittrial-5bb.353).
@@ -14636,15 +14922,27 @@ class ApiHandler(BaseHTTPRequestHandler):
             body['truncated_note'] = (
                 '%d of %d entries are not in this answer and this server cannot page to them: '
                 'read them with the client\'s history command.' % (result['total'] - returned, result['total']))
-        if since_checkpoint:
-            for key in ('since_checkpoint', 'checkpoint_author', 'checkpoint_timestamp',
-                        'checkpoint_coverage', 'unverified_entries'):
-                body[key] = result.get(key)
+        # The ten additive history keys are on every answer, as on the CLI: a plain read
+        # carries the checkpoint keys as null/0 rather than omitting them
+        # (kittrial-5bb.244 G3).
+        checkpoint_defaults = {'since_checkpoint': None, 'checkpoint_author': None,
+                               'checkpoint_timestamp': None, 'checkpoint_coverage': None,
+                               'unverified_entries': 0, 'checkpoint_note': None}
+        for key in EndpointBackend.HISTORY_CHECKPOINT_KEYS:
+            body[key] = result.get(key, checkpoint_defaults[key])
+        if latest_checkpoint:
+            body['latest_checkpoint'] = True
         return 200, body
 
     @staticmethod
     def _history_selection(query):
-        """``recent`` (1..MAX_PAGE, or None) and ``since_checkpoint`` (a bool) of a history read."""
+        """The validated selectors of a history read (kittrial-5bb.244).
+
+        ``recent`` is 1..MAX_PAGE (or None); ``since_checkpoint``, ``since_my_checkpoint``
+        and ``latest_checkpoint`` are booleans spelled ``true``/``false`` only; ``kind`` is
+        ``comment`` or ``event`` (or None). ``latest_checkpoint`` is a read of its own and
+        refuses every other selector instead of silently combining them.
+        """
         recent = query.get('recent')
         if recent is not None:
             if 'limit' in query:
@@ -14655,10 +14953,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise invalid('recent must be an integer')
             if not 1 <= recent <= MAX_PAGE:
                 raise invalid('recent must be between 1 and %d' % MAX_PAGE)
-        since = query.get('since_checkpoint', 'false')
-        if since not in ('true', 'false'):
-            raise invalid('since_checkpoint must be true or false')
-        return recent, since == 'true'
+        kind = query.get('kind')
+        if kind is not None and kind not in ('comment', 'event'):
+            raise invalid('kind must be comment or event')
+
+        def flag(name):
+            value = query.get(name, 'false')
+            if value not in ('true', 'false'):
+                raise invalid('%s must be true or false' % name)
+            return value == 'true'
+
+        since = flag('since_checkpoint')
+        since_my = flag('since_my_checkpoint')
+        latest = flag('latest_checkpoint')
+        if latest:
+            conflicts = [name for name in ('recent', 'limit', 'cursor', 'kind') if name in query]
+            if since:
+                conflicts.append('since_checkpoint=true')
+            if since_my:
+                conflicts.append('since_my_checkpoint=true')
+            if conflicts:
+                raise invalid('latest_checkpoint takes no other selector: %s' % ', '.join(conflicts))
+        return {'recent': recent, 'since_checkpoint': since,
+                'since_my_checkpoint': since_my, 'latest_checkpoint': latest, 'kind': kind}
 
     # -- review queue and personal work ---------------------------------------
     @route('GET', r'/v1/projects/(?P<pid>' + ID + r')/queue')
@@ -14991,9 +15308,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         one queue read per project and at most :data:`ME_WORK_MAX_PROJECTS` projects.
         ``to_review`` lists contributions only in projects where the caller holds the
         approval capability. With the party rule on it holds only work the caller may
-        actually approve: a row of the caller's own party is left out, since approving it
-        would be refused (kittrial-5bb.199 review, N4). Computed at read time; nothing is
-        scheduled or marked.
+        actually approve: a row of the caller's own party is left out in every review state,
+        since approving it would be refused (kittrial-5bb.199 review, N4). ``to_review_note``
+        discloses that omission and points to the project queue for requesting changes;
+        it is null with the party rule off. Computed at read time; nothing is scheduled or marked.
         """
         principal = ctx.principal
         if principal.via == 'credential':
@@ -15080,6 +15398,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             for agent in agents if agent.get('owner') == principal.user_id]
         return 200, {'assigned': self._task_views(assigned[:MAX_PAGE]),
                      'to_review': self._task_views(to_review[:MAX_PAGE]),
+                     'to_review_note': (self.ME_WORK_PARTY_NOTE
+                                        if self.service.approval_by_another_party else None),
                      'agents': agents, 'agent_prompts': prompts,
                      'truncated': truncated, 'unavailable': unavailable,
                      'generated_at': generated_at}
@@ -15133,8 +15453,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             if isinstance(detail, dict):
                 row=attention_rows[(project_id,task_id)]
                 blocking=attention_blocking_items(row.get('attention') or {})
-                detail=dict(detail,blocked=row.get('review_state') in (None,'none')
-                            and not row.get('contribution') and type(blocking) is int and blocking>0)
+                undelivered=row.get('review_state') in (None,'none') and not row.get('contribution')
+                # kittrial-5bb.237 (G6): an explicit null blocking count is not
+                # "not blocked". Keep `blocked` false (nothing observed is blocked)
+                # and carry the unreadable count as its own signal, dropped by the
+                # None filter below when the count is known.
+                detail=dict(detail,blocked=undelivered and type(blocking) is int and blocking>0,
+                            blocking_unknown=True if undelivered and blocking is None else None)
                 details[(project_id, task_id)] = {k: v for k, v in detail.items()
                                                   if v is not None}
         return details
