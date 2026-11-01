@@ -144,8 +144,8 @@ after the durable file becomes unreadable or changes. No large-state performance
 optimization is claimed. For an installation already above this bound, leave the
 adapter disabled until its storage validation is revised; that rollout/restart is
 an operator action. Link reads through the tracker run outside the enrollment and
-web state locks; only live authorization, in-memory checks and the atomic effect
-run under those locks.
+web state locks; live authorization, durable-state preflight, in-memory checks
+and the atomic effect remain under those locks.
 
 ## Request retry window
 
