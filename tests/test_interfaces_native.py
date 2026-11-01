@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 sys.path[:0]=[str(Path(__file__).resolve().parents[1]),str(Path(__file__).resolve().parent)]
 import test_program_links as fixture
@@ -257,3 +258,139 @@ class NativeInterfaceConcurrencyTests(NativeInterfaceTests):
                     responses=[one.result(timeout=15),two.result(timeout=15)]
                 self.assertLess(time.monotonic()-before,15,'the two routes formed a lock cycle')
                 for response in responses:self.assertEqual(201,response.status,response.data)
+
+
+class NativeProgramViewInterfacesBase(NativeInterfaceTests):
+    """kittrial-5bb.467 r2: the program view's interfaces section through the real stack (real bd + Dolt, the real
+    HTTP service, the canonical endpoint subprocess), not the in-process backend that never supplies interfaces."""
+    test_http_interface_capability_v2_complete_retirement_and_host_read=None
+
+    def build_program(self,ghost=True):
+        """Program pp with an accepted interface owned by north; areas ghost (no project), north and south, both
+        linked and each with an accepted capability consuming it; viewer 'rita' reads pp and north, not south;
+        'rhea' also reads south. One test per class: the real bd runtime is built once per class."""
+        self.deployment(operators=['ops'],coordinator_writes=True,independent_approval=False)
+        h=self.harness
+        for name in ('north','south'):
+            folder=self.root/'projects'/name;folder.mkdir()
+            init=subprocess.run([str(self.r.bd_path),'init','--server','--external','--server-host','127.0.0.1',
+                 '--server-port',str(self.runtime.port),'--server-user','root','--prefix',name,'--database',name,
+                 '--skip-agents','--skip-hooks','--non-interactive'],cwd=folder,
+                 env=native_fixture.admin.environment(self.root),capture_output=True,text=True,timeout=90)
+            self.assertEqual(0,init.returncode,init.stderr)
+            made=h.request('POST','/v1/projects',{'project_id':name,'name':'Synthetic '+name},token=self.owner)
+            self.assertEqual(201,made.status,made.data)
+        links=[('pp','program.area.ghost','Area: ghost\nState: in')] if ghost else []
+        for name in ('north','south'):
+            links+=[('pp','program.area.'+name,'Area: %s\nState: in'%name),
+                    (name,'program.member-of','Program: pp\nState: in')]
+        for project,key,text in links:
+            run=lambda args,project=project:native_fixture.admin.run_bd(self.root,project,['--actor','ops',*args])
+            decision=json.loads(run(['create','Join program','--type','decision','--json']))['id']
+            body={'schema_version':1,'operation':'draft','operation_id':'native-%s-%s'%(project,key),'key':key,
+                  'title':'Synthetic link','statement':text,'authority':{'type':'decision','id':decision},
+                  'owner':'person:maintainer','review_by':(datetime.date.today()+datetime.timedelta(days=90)).isoformat(),
+                  'tags':[],'decisions':[],'acceptance_state':'accepted','acceptance':acceptance(decision_id=decision)}
+            refs.apply_native(body,'ops',run,self.root/'projects'/project,operator=True,operators=['ops'])
+        body=payload(owner_project='north')
+        for key in ('operation','operation_id','schema_version','revision','expected_sha256'):body.pop(key,None)
+        proposed=h.request('POST','/v1/projects/pp/interfaces',body,token=self.owner,key='gate-interface')
+        self.assertEqual(201,proposed.status,proposed.data)
+        selected=h.request('POST','/v1/projects/pp/interfaces/iface.quotes.v1/accept',
+            {'expected_revision':1,'record_sha256':proposed.data['sha256'],'evidence':'Synthetic review'},
+            token=self.owner,key='gate-interface-accept')
+        self.assertEqual(200,selected.status,selected.data)
+        for name in ('north','south'):
+            cap=_valid_cap_propose('synthetic.'+name)
+            cap['interfaces']=[{'iface':'iface:pp/iface.quotes.v1@1','role':'consumes'}]
+            created=h.request('POST','/v1/projects/%s/capabilities'%name,cap,token=self.owner,key='gate-cap-'+name)
+            self.assertEqual(201,created.status,created.data)
+            accepted=h.request('POST','/v1/projects/%s/capabilities/synthetic.%s/accept'%(name,name),
+                {'expected_revision':1,'record_sha256':created.data['sha256'],'evidence':'Synthetic consumer',
+                 'unverified_pointer_reason':'Synthetic test pointers; no checkout verification claimed'},
+                token=self.owner,key='gate-cap-accept-'+name)
+            self.assertEqual(200,accepted.status,accepted.data)
+        tokens={}
+        for who,projects in (('rita',('pp','north')),('rhea',('pp','north','south'))):
+            uid=h.create_account(self.owner,who,who+'-password-1')
+            for project in projects:
+                self.assertEqual(200,h.request('PUT','/v1/projects/%s/members/%s'%(project,uid),{'role':'viewer'},
+                                               token=self.owner).status)
+            tokens[who]=h.login(who,who+'-password-1')[0]
+        return tokens
+
+    def interfaces_of(self,token,query=''):
+        answer=self.harness.request('GET','/v1/projects/pp/program'+query,token=token)
+        self.assertEqual(200,answer.status,answer.data)
+        return answer.data['interfaces']
+
+    @staticmethod
+    def consumers(section):
+        return {use['area'] for row in section.get('items') or [] for use in row['consumers']}
+
+
+class NativeProgramViewInterfacesGateTests(NativeProgramViewInterfacesBase):
+    def test_program_view_interfaces_gate_through_the_real_stack(self):
+        # No ghost here: a linked area with no project makes every read incomplete, even the owner's.
+        tokens=self.build_program(ghost=False)
+        import program_isolation
+        reader=self.interfaces_of(tokens['rita'])
+        self.assertEqual('ok',reader['state'],reader)
+        self.assertIn('north',self.consumers(reader))
+        self.assertNotIn('south',json.dumps(reader))
+        self.assertFalse(reader['complete'])
+        program_isolation.assert_interfaces_section_hidden(self,reader,{'south','ghost'},'reader of north')
+        wide=self.interfaces_of(self.owner)
+        self.assertEqual('ok',wide['state'],wide)
+        self.assertLessEqual({'north','south'},self.consumers(wide))
+        self.assertTrue(wide['complete'],wide)
+
+
+class NativeProgramViewInterfacesOffPageTests(NativeProgramViewInterfacesBase):
+    def test_offpage_area_losing_its_right_mid_read_is_not_named(self):
+        tokens=self.build_program()
+        import http_service,http_auth
+        # The areas page orders ghost, north, south: limit=2 leaves south off the page.
+        page=self.harness.request('GET','/v1/projects/pp/program?limit=2',token=tokens['rhea'])
+        self.assertEqual(200,page.status,page.data)
+        self.assertEqual(['ghost','north'],[row['area'] for row in page.data['areas']['items']])
+        before=page.data['interfaces']
+        self.assertIn('south',self.consumers(before),'south is read before its right is lost')
+        service=self.harness.service
+        real=service.coordinators_of
+        def lose_south(principal,area):
+            if area=='south':raise http_auth.forbidden('right lost during the read')
+            return real(principal,area)
+        stale=http_service.ApiHandler._readable_projects
+        seen=[]
+        def stale_set(handler,principal):
+            seen.append(1);return list(stale(handler,principal))
+        with unittest.mock.patch.object(service,'coordinators_of',side_effect=lose_south), \
+             unittest.mock.patch.object(http_service.ApiHandler,'_readable_projects',stale_set):
+            answer=self.harness.request('GET','/v1/projects/pp/program?limit=2',token=tokens['rhea'])
+        self.assertTrue(seen)
+        self.assertEqual(200,answer.status,answer.data)
+        self.assertNotIn('south',json.dumps(answer.data['interfaces']))
+        self.assertIn('north',self.consumers(answer.data['interfaces']))
+
+
+class NativeProgramViewInterfacesUnsettledTests(NativeProgramViewInterfacesBase):
+    def test_rights_lost_on_every_read_make_the_section_unsettled(self):
+        tokens=self.build_program()
+        import http_service,http_auth
+        service=self.harness.service
+        real=service.coordinators_of
+        def lose_south(principal,area):
+            if area=='south':raise http_auth.forbidden('right lost during the read')
+            return real(principal,area)
+        backend=self.harness.backend
+        real_program=backend.program
+        def stale_program(*args,readable=(),**more):
+            # Every attempt is read with south still in the set, as if its right were lost again each time.
+            return real_program(*args,readable=sorted({*readable,'south'}),**more)
+        with unittest.mock.patch.object(service,'coordinators_of',side_effect=lose_south), \
+             unittest.mock.patch.object(backend,'program',stale_program):
+            answer=self.harness.request('GET','/v1/projects/pp/program?limit=2',token=tokens['rhea'])
+        self.assertEqual(200,answer.status,answer.data)
+        self.assertEqual('unsettled',answer.data['interfaces']['state'])
+        self.assertNotIn('south',json.dumps(answer.data['interfaces']))

@@ -377,6 +377,9 @@ class WebTests(LinkCase):
             self, self.request, 'prog', {'south', 'ghost'},
             {'program contributor': self.tokens['carl'], 'program owner': self.tokens['pat'],
              'reader of another area': self.tokens['vera'], 'agent without the area': self.tokens['wren']})
+        # In-process backend only: its program() never supplies interfaces (http_service.py InProcessBackend), so this
+        # checks the not-available path and the 422, NOT the may_read gate. The real gate is pinned by
+        # tests/test_interfaces_native.py NativeProgramViewInterfacesGateTests (fails with allowed() forced True).
         data = self.view(self.tokens['vera'], '?interfaces_offset=0')
         self.assertEqual('not-available', data['interfaces']['state'])
         self.assertEqual(422, self.request('GET', '/v1/projects/prog/program?interfaces_offset=x',

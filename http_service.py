@@ -12666,6 +12666,28 @@ class ApiHandler(BaseHTTPRequestHandler):
                     hidden = program_view.area_row(row['area'], row['state'])
                     row.clear()
                     row.update(hidden)
+            # kittrial-5bb.467 r2: the interfaces section names areas read from EVERY linked readable area, not
+            # only those on this areas page (interface_records.areas/usage, endpoint.interface_section). Each area
+            # it names is rechecked with the same gate as a page row; one whose right was lost during the read
+            # makes the answer read again without it, so its role and minimum revision are never shown.
+            rechecked = {row.get('area') for row in (result.get('areas') or {}).get('items') or []
+                         if isinstance(row, dict) and row.get('visible')}
+            interfaces = result.get('interfaces') if isinstance(result.get('interfaces'), dict) else {}
+            named = set()
+            for item in interfaces.get('items') or []:
+                for side in ('providers', 'consumers'):
+                    for use in (item.get(side) or []) if isinstance(item, dict) else []:
+                        if isinstance(use, dict) and isinstance(use.get('area'), str):
+                            named.add(use['area'])
+            for area in sorted(named - rechecked):
+                try:
+                    self.service.coordinators_of(ctx.principal, area)
+                except HttpError:
+                    lost.append(area)
+            if lost and isinstance(result.get('interfaces'), dict) and result['interfaces'].get('state') == 'ok':
+                # Never left in an answer, even for a moment: the re-read below replaces it, and the last attempt's
+                # else branch answers unsettled.
+                result['interfaces'] = program_view.interfaces_unsettled()
             if not lost:
                 break
             # Review of .453, B2 (N1): a right lost after the read. The row is hidden above, and the page is read
