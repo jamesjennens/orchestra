@@ -90,3 +90,11 @@ export function switchTarget(route, targetPid, sections) {
   }
   return { path: `/p/${targetPid}`, fellBack: true, section };
 }
+
+// The sentence the switcher's toast shows after a fallback. `label` is the section's name in
+// the project the user left (the target lacks the section, so it cannot supply the name).
+export function fallbackMessage(name, label) {
+  return label
+    ? `${name} has no ${label} page, so it opened on Tasks.`
+    : `Task pages belong to one project, so ${name} opened on Tasks.`;
+}

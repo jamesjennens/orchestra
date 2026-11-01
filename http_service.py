@@ -14035,7 +14035,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             text=APPROVAL_WAIT
         review['waiting_for_approval']=text
         actors = [brief['task'].get('assignee')]
-        actors += [checkpoint.get('author')] if checkpoint else []
+        actors += [checkpoint.get('author', {}).get('text') if checkpoint and isinstance(checkpoint.get('author'), dict)
+                   else checkpoint.get('author')] if checkpoint else []
         actors += [contribution.get('author')] if contribution else []
         actors += [r.get('author') for r in review.get('requests') or []]
         # Only a recommendation by a different person from the contribution's author is
@@ -14064,7 +14065,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         task = dict(brief['task'], review_state=review.get('state') or 'none')
         brief['task'] = self._task_view(task, names, project_id=ctx.params['pid'])
         if checkpoint:
-            checkpoint['author_name'] = names.get(checkpoint.get('author'))
+            author = checkpoint.get('author')
+            author_id = author.get('text') if isinstance(author, dict) else author
+            checkpoint['author_name'] = checkpoint.get('author_name') or names.get(author_id)
         if contribution:
             contribution['author_name'] = names.get(contribution.get('author'))
         for request in review.get('requests') or []:

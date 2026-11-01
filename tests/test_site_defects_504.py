@@ -68,6 +68,25 @@ class ActorWordsCase(unittest.TestCase):
         self.assertEqual('someone', obj)
 
 
+class FallbackMessageCase(unittest.TestCase):
+    def test_fallback_message_under_node(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the source checks still apply')
+        routes = (WEB / 'js' / 'routes.js').as_uri()
+        script = (
+            "const r = await import(process.argv[1]);"
+            "console.log(JSON.stringify([r.fallbackMessage('Infrastructure', 'Set up'),"
+            "r.fallbackMessage('Infrastructure', '')]));"
+        )
+        out = subprocess.run([node, '--input-type=module', '-e', script, routes],
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, out.returncode, out.stderr)
+        named, generic = json.loads(out.stdout)
+        self.assertEqual('Infrastructure has no Set up page, so it opened on Tasks.', named)
+        self.assertEqual('Task pages belong to one project, so Infrastructure opened on Tasks.', generic)
+
+
 class LayoutSourceCase(unittest.TestCase):
     def read(self, rel):
         return (WEB / rel).read_text(encoding='utf-8')
@@ -85,7 +104,8 @@ class LayoutSourceCase(unittest.TestCase):
 
     def test_switch_notice_is_a_toast_not_a_banner(self):
         app = self.read('js/app.js')
-        self.assertIn("toast(label ? `${name} has no ${label} page", app)
+        self.assertIn('toast(fallbackMessage(name, label));', app)
+        self.assertIn("const here = ctx.projects.find((p) => p.id === projectOf(currentRoute()));", app)
         self.assertNotIn("class: 'banner', role: 'status'", app)
         self.assertNotIn('ctx.notice', app)
 

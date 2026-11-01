@@ -2,7 +2,7 @@
 import { h, mount, brandMark, initials, confirmDialog, toast } from './dom.js';
 import { createApi, fetchTransport } from './api.js';
 import { describe } from './ui.js';
-import { matchRoute, projectOf, RECORD_ROUTES, switchTarget } from './routes.js';
+import { matchRoute, projectOf, RECORD_ROUTES, switchTarget, fallbackMessage } from './routes.js';
 import * as auth from './views/auth.js';
 import * as work from './views/work.js';
 import * as project from './views/project.js';
@@ -109,8 +109,10 @@ export async function start(root, options = {}) {
     ctx.go(t.path);
     if (t.fellBack) {
       const name = target ? target.name : 'that project';
-      const label = t.section && (sections.find(([seg]) => seg === t.section) || [])[1];
-      toast(label ? `${name} has no ${label} page, so it opened on Tasks.` : `Task pages belong to one project, so ${name} opened on Tasks.`);
+      const here = ctx.projects.find((p) => p.id === projectOf(currentRoute()));
+      const hereSections = here ? projectSections(here) : [];
+      const label = t.section && (hereSections.find(([seg]) => seg === t.section) || [])[1];
+      toast(fallbackMessage(name, label));
     }
   }
 
