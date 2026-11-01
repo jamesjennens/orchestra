@@ -635,8 +635,8 @@ class BootstrapSentenceTests(unittest.TestCase):
         code, _stdout, stderr = self.bootstrap(password='')
         self.assertEqual(code, 1, stderr)
         self.assertIn('Refusing to bootstrap admin', stderr)
-        self.assertIn('Password must be 1-1024 characters', stderr)
-        self.assertIn('Run the command again with a password of 1 to 1024 characters.', stderr)
+        self.assertIn('Password must be 12-1024 characters', stderr)         # the default since kittrial-5bb.501
+        self.assertIn('Run the command again with a password of 12 to 1024 characters.', stderr)
         # No superuser exists yet, so nobody can add this person inside the service.
         self.assertNotIn('Add this person as an account inside the service', stderr)
         self.assertNotIn('Traceback', stderr)
@@ -658,7 +658,8 @@ class BootstrapSentenceTests(unittest.TestCase):
     @unittest.skipUnless(POSIX, 'the runtime lock needs fcntl')
     def test_one_character_is_accepted_and_a_raised_minimum_says_its_range(self):
         state = Path(self.tmp.name) / 'one-char.json'
-        code, stdout, stderr = self.bootstrap(password='x', state=state)
+        # An installation that sets the minimum to 1 keeps it (the default is 12 since kittrial-5bb.501).
+        code, stdout, stderr = self.bootstrap(password='x', state=state, extra=('--password-min-length', '1'))
         self.assertEqual(code, 0, stderr)
         self.assertIn('Bootstrapped admin', stdout)
         self.assertNotIn('Traceback', stderr)

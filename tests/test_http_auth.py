@@ -112,12 +112,13 @@ class AuthCase(unittest.TestCase):
         self.assertEqual('Password must be 8-1024 characters', caught.exception.message)
         self.assertTrue(verify_password(hash_password('12345678', minimum=8), '12345678'))
 
-    def test_the_service_minimum_applies_to_a_change_and_a_one_character_default(self):
+    def test_the_service_minimum_applies_to_a_change_and_an_explicit_one_character_minimum(self):
+        # The default is 12 since kittrial-5bb.501; an installation that sets 1 keeps it.
         admin = self.principal_for(self.service.login(ADMIN, ADMIN_PASSWORD)['session_token'])
         created = self.service.create_user(admin, 'alex')
-        # The default: one character is accepted end to end.
-        self.service.change_password(admin, created['id'], None, 'x')
-        self.assertTrue(self.service.login('alex', 'x')['session_token'])
+        one = Service(self.store, password_min_length=1)
+        one.change_password(admin, created['id'], None, 'x')
+        self.assertTrue(one.login('alex', 'x')['session_token'])
         # A raised setting refuses a shorter password with the configured range, and writes
         # nothing; a password at the new minimum is then accepted.
         service = Service(self.store, password_min_length=8)

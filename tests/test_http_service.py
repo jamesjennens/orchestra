@@ -263,10 +263,10 @@ class HttpContractCase(ServerHarness):
         # kittrial-5bb.363: the pages read the installation's minimum from the same answer
         # they already fetch, on sign-in and on the authenticated session read.
         token, _, user = self.login(ADMIN, ADMIN_PASSWORD)
-        self.assertEqual(1, user['password_min_length'])
+        self.assertEqual(12, user['password_min_length'])      # the default since kittrial-5bb.501
         who = self.request('GET', '/v1/sessions/current', token=token)
         self.assertEqual(200, who.status)
-        self.assertEqual(1, who.data['user']['password_min_length'])
+        self.assertEqual(12, who.data['user']['password_min_length'])
 
     def test_expired_session_and_logout(self):
         self.create_account(self.admin_token(), 'alex', 'alex-password-1')

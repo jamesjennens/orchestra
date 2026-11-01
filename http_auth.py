@@ -30,6 +30,7 @@ service is a single process with a per-process lock, and the deployment runbook 
 that.
 """
 import hashlib
+import heapq
 import copy
 from contextlib import contextmanager
 import hmac
@@ -74,10 +75,13 @@ from http_authority import (ALL_CAPABILITIES, CAP_ACCOUNTS_ADMIN, CAP_AGENT_SELF
 # memory-hard scheme available in the standard library without third-party wheels.
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
 SCRYPT_DKLEN, SCRYPT_SALT = 32, 16
-#: The installation's password rule (kittrial-5bb.363). The minimum is a setting,
-#: default 1: any non-empty password is accepted. The maximum is a bound on the work
+#: The installation's password rule (kittrial-5bb.363). The minimum is a setting, from
+#: MIN_PASSWORD (1) up; its default is DEFAULT_PASSWORD_MIN (below). The maximum is a bound on the work
 #: one request may ask for, not a policy about what a password should look like.
 MIN_PASSWORD, MAX_PASSWORD = 1, 1024
+#: The installation's password minimum when nothing sets one (kittrial-5bb.501). MIN_PASSWORD stays the
+#: lowest value an installation may choose; a password already stored is never checked against either.
+DEFAULT_PASSWORD_MIN = 12
 
 # Provisional local lifecycle defaults from the reviewed design, all configurable
 # at the Service boundary.
@@ -107,6 +111,23 @@ RESET_TTL_SECONDS = 30 * 60
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_ATTEMPTS = 10
+#: Beside the count per (account, source group) above, two aggregate counts (kittrial-5bb.501):
+#: failures against one account from anywhere, and failures from one source group against
+#: any account. Over its limit, a count does not refuse for good: it lets one checked attempt
+#: through per slot and answers 429 with Retry-After for the rest (docs/HTTP_TRANSPORT_DESIGN.md s4).
+ACCOUNT_FAIL_LIMIT = 30
+ACCOUNT_FAIL_WINDOW = 15 * 60
+ACCOUNT_SLOT_SECONDS = 20
+SOURCE_FAIL_LIMIT = 100
+SHARED_SOURCE_FAIL_LIMIT = 300        # the address everybody arrives from (the SSH tunnel)
+SOURCE_FAIL_WINDOW = 15 * 60
+SOURCE_SLOT_SECONDS = 5
+#: A source group that signed in to an account this recently is "known" to it, and skips both aggregate counts.
+KNOWN_SOURCE_SECONDS = 30 * 24 * 60 * 60
+KNOWN_SOURCES_PER_ACCOUNT = 4
+#: Every sign-in map holds at most this many keys; see _count_add for what happens at the cap.
+THROTTLE_KEY_CAP = 10000
+SHARED_SOURCE_KEY = '(shared)'        # not an address, so no client's group can equal it
 #: Account lookups (``GET /v1/accounts/lookup``) one principal may make per window. Any
 #: session can create a project and so administer one; the bound keeps the exact-match
 #: lookup from becoming a fast username enumerator. Every lookup is also audited.
@@ -401,7 +422,8 @@ def validate_password_min_length(value):
     """The installation's password minimum: a whole number from 1 to ``MAX_PASSWORD``.
 
     One rule for the web service flag and the office configuration, so neither clamps
-    a value to the bounds (kittrial-5bb.363). The default is 1: any non-empty password.
+    a value to the bounds (kittrial-5bb.363). The default is ``DEFAULT_PASSWORD_MIN`` (12,
+    kittrial-5bb.501); an installation may still choose any value from 1.
     """
     if isinstance(value, bool) or not isinstance(value, int) or not MIN_PASSWORD <= value <= MAX_PASSWORD:
         raise ValueError('password_min_length must be a whole number from %d to %d'
@@ -428,6 +450,47 @@ def _dummy_verifier():
     if _DUMMY_VERIFIER is None:
         _DUMMY_VERIFIER = hash_password('orchestra-dummy-password')
     return _DUMMY_VERIFIER
+
+
+def _count_recent(table, key, now, window):
+    """How many times in ``window`` seconds the list under ``key`` holds; the list is pruned to them."""
+    times = table.get(key)
+    if not times:
+        return 0
+    cutoff = now - window
+    fresh = [moment for moment in times if moment >= cutoff]
+    if fresh:
+        table[key] = fresh
+    else:
+        del table[key]
+    return len(fresh)
+
+
+def _count_add(table, key, now, window, limit, cap=THROTTLE_KEY_CAP):
+    """Record one failure at ``now`` under ``key``, keeping ``table`` bounded (kittrial-5bb.501).
+
+    A list holds at most ``limit + 1`` times, all inside the window. The table holds at most
+    ``cap`` keys: at the cap a new key first sweeps the keys with nothing inside the window and,
+    if the table is still full, evicts the tenth of the cap with the FEWEST recent failures (the oldest of
+    those on a tie). An attacker who invents names to push a target's count out must therefore
+    hold ``cap`` other keys each with at least as many failures as the target: see the numbers
+    in docs/HTTP_TRANSPORT_DESIGN.md s4.
+    """
+    times = table.get(key)
+    if times is None:
+        if len(table) >= cap:
+            cutoff = now - window
+            for stale in [k for k, v in table.items() if not v or v[-1] < cutoff]:
+                del table[stale]
+            if len(table) >= cap:
+                # A tenth of the cap at once, so the scan is paid once per cap/10 new keys.
+                for victim in heapq.nsmallest(max(1, cap // 10), table, key=lambda k: (len(table[k]), table[k][-1])):
+                    del table[victim]
+        times = table[key] = []
+    cutoff = now - window
+    times[:] = [moment for moment in times if moment >= cutoff]
+    times.append(now)
+    del times[:-(limit + 1)]
 
 
 # ------------------------------------------------------------------------- principal
@@ -1059,7 +1122,7 @@ class Service:
                  login_max_attempts=LOGIN_MAX_ATTEMPTS, public_url=None,
                  lookup_max=LOOKUP_MAX_PER_WINDOW, lookup_window=LOOKUP_WINDOW_SECONDS,
                  approval_by_another_party=False, agent_credential_days=_AGENT_LIFETIME_DEFAULT,
-                 password_min_length=MIN_PASSWORD):
+                 password_min_length=DEFAULT_PASSWORD_MIN):
         self.store = store
         #: Per-agent locks spanning the claim gate's held-set read and the claim write
         #: (kittrial-5bb.276 revision; per-agent in kittrial-5bb.300). Keyed by the
@@ -1073,7 +1136,7 @@ class Service:
         self.approval_by_another_party = approval_by_another_party is True
         self.session_idle = session_idle
         self.session_absolute = session_absolute
-        #: The installation's password minimum (kittrial-5bb.363), default 1. Every
+        #: The installation's password minimum (kittrial-5bb.363), default 12 (kittrial-5bb.501). Every
         #: writer goes through hash_password/redeem_reset with this value, so the rule
         #: cannot drift between the bootstrap prompt and the web forms.
         self.password_min_length = validate_password_min_length(password_min_length)
@@ -1095,7 +1158,12 @@ class Service:
             if problem:
                 raise ValueError(problem)
         self.public_url = (public_url or '').rstrip('/') or None
-        self._failures = {}
+        self._failures = {}              # 'account|source group' -> failure times (the pair count)
+        self._failures_account = {}      # account -> failure times, any source
+        self._failures_source = {}       # source group (SHARED_SOURCE_KEY for the tunnel) -> failure times, any account
+        self._slot_account = {}          # account -> time of the last attempt let through in slow mode
+        self._slot_source = {}           # source group -> the same
+        self._known_sources = {}         # account -> [[source group, time of its last sign-in], ...], at most 4
         self._audit_defer_trim = 0
         self._logins_guard = threading.Lock()
         self._logins_room = threading.Condition(self._logins_guard)   # told whenever a log-in ends
@@ -1308,7 +1376,7 @@ class Service:
     # -- bootstrap (operator, out of band; never an HTTP route) -----------------
     @classmethod
     def bootstrap_superuser(cls, store, username, password, display_name=None,
-                            password_min_length=MIN_PASSWORD):
+                            password_min_length=DEFAULT_PASSWORD_MIN):
         """Create the first protected superuser. Refuses once any account exists."""
         minimum = validate_password_min_length(password_min_length)
         with store.lock:
@@ -1469,7 +1537,8 @@ class Service:
             self.store.save()
             return self.project_view(principal, project_id)
 
-    def change_password(self, principal, user_id, current_password, new_password):
+    def change_password(self, principal, user_id, current_password, new_password,
+                        source='local', shared_source=False):
         if principal is None or principal.via == 'credential':
             raise forbidden('Session authority required for password changes')
         with self.store.lock:
@@ -1478,13 +1547,23 @@ class Service:
             if not principal.superuser and principal.user_id != user_id:
                 raise not_found('Account not found')
             if not principal.superuser:
+                # Guessing the current password is guessing the sign-in password: it is held to the
+                # same counts, and a wrong guess feeds them (kittrial-5bb.501 F4). A superuser's
+                # change names no current password, so there is nothing to guess and no count.
+                self._check_throttle(user['username'], source, shared_source)
                 if not verify_password(user.get('password'), current_password or ''):
+                    self._record_failure(user['username'], source, shared_source)
                     raise forbidden('Current password is incorrect')
             if verify_password(user.get('password'), new_password):
                 raise invalid('New password must differ from the current password')
             user['password'] = hash_password(new_password, minimum=self.password_min_length)
             if user.get('reset_token'):
                 user.pop('reset_token')
+            # A pending reset value must not outlive the password it was meant to replace
+            # (kittrial-5bb.501 F2); the same loop as issue_reset.
+            for existing, record in list(self.state['reset_tokens'].items()):
+                if record['user_id'] == user_id and not record['used']:
+                    del self.state['reset_tokens'][existing]
             self._revoke_sessions_for(user_id)
             self._revoke_credentials_for(user_id)
             self.store.save()
@@ -1586,20 +1665,103 @@ class Service:
                 credential['revoked'] = True
 
     # -- login, sessions and credentials ---------------------------------------
-    def _throttle_key(self, username, source):
-        return '%s|%s' % ((username or '').lower(), source or 'local')
+    def _throttle_key(self, username, source, shared_source=False):
+        """The pair key: the account and the source's group (one /64 for IPv6), not the raw address."""
+        return '%s|%s' % ((username or '').lower(), self._source_key(source, shared_source))
 
-    def _check_throttle(self, username, source):
-        key = self._throttle_key(username, source)
-        cutoff = self._now() - LOGIN_WINDOW_SECONDS
-        attempts = [t for t in self._failures.get(key, []) if t >= cutoff]
-        self._failures[key] = attempts
-        if len(attempts) >= self.login_max_attempts:
-            raise throttled()
+    @staticmethod
+    def _source_key(source, shared_source=False):
+        return SHARED_SOURCE_KEY if shared_source else address_group(source or 'local')
 
-    def _record_failure(self, username, source):
-        key = self._throttle_key(username, source)
-        self._failures.setdefault(key, []).append(self._now())
+    def _is_known_source(self, account, group, now):
+        for known, moment in self._known_sources.get(account, ()):
+            if known == group and now - moment <= KNOWN_SOURCE_SECONDS:
+                return True
+        return False
+
+    def _note_known_source(self, account, group, now):
+        entries = [entry for entry in self._known_sources.get(account, [])
+                   if entry[0] != group and now - entry[1] <= KNOWN_SOURCE_SECONDS]
+        entries.append([group, now])
+        if account not in self._known_sources and len(self._known_sources) >= THROTTLE_KEY_CAP:
+            for stale in [k for k, v in self._known_sources.items() if now - v[-1][1] > KNOWN_SOURCE_SECONDS]:
+                del self._known_sources[stale]
+            if len(self._known_sources) >= THROTTLE_KEY_CAP:
+                del self._known_sources[min(self._known_sources, key=lambda k: self._known_sources[k][-1][1])]
+        self._known_sources[account] = entries[-KNOWN_SOURCES_PER_ACCOUNT:]
+
+    def _slot_wait(self, slots, key, now, interval):
+        """Seconds until the next checked attempt of ``key`` in slow mode (0: one may go now)."""
+        last = slots.get(key)
+        if last is None or not 0 <= now - last < interval:
+            return 0
+        return max(1, int(math.ceil(interval - (now - last))))
+
+    def _take_slot(self, slots, key, now, interval):
+        if key not in slots and len(slots) >= THROTTLE_KEY_CAP:
+            for stale in [k for k, v in slots.items() if now - v >= interval]:
+                del slots[stale]
+            if len(slots) >= THROTTLE_KEY_CAP:
+                del slots[min(slots, key=slots.get)]
+        slots[key] = now
+
+    def _check_throttle(self, username, source, shared_source=False):
+        """Refuse with 429 when this attempt is over a limit; raises nothing when it may be checked.
+
+        The pair count (account, source group) refuses outright, as it always did. The two
+        aggregate counts, per account and per source group, only slow: over its limit a count
+        lets one checked attempt through per slot (the slot is taken here, under the store's
+        lock, so two at once cannot both take it) and answers 429 with Retry-After for the
+        rest. A source that signed in to this account in the last 30 days skips both
+        aggregates: someone failing against the name elsewhere cannot lock its user out.
+        """
+        with self.store.lock:
+            now = self._now()
+            account = (username or '').lower()
+            group = self._source_key(source, shared_source)
+            pair = '%s|%s' % (account, group)
+            if _count_recent(self._failures, pair, now, LOGIN_WINDOW_SECONDS) >= self.login_max_attempts:
+                raise throttled()
+            if self._is_known_source(account, group, now):
+                return
+            account_over = _count_recent(self._failures_account, account, now,
+                                         ACCOUNT_FAIL_WINDOW) >= ACCOUNT_FAIL_LIMIT
+            source_limit = SHARED_SOURCE_FAIL_LIMIT if shared_source else SOURCE_FAIL_LIMIT
+            source_over = _count_recent(self._failures_source, group, now,
+                                        SOURCE_FAIL_WINDOW) >= source_limit
+            if not (account_over or source_over):
+                return
+            wait = max(self._slot_wait(self._slot_account, account, now, ACCOUNT_SLOT_SECONDS) if account_over else 0,
+                       self._slot_wait(self._slot_source, group, now, SOURCE_SLOT_SECONDS) if source_over else 0)
+            if wait:
+                error = throttled('Too many sign-in attempts. Try again in %d seconds.' % wait)
+                error.retry_after = wait
+                raise error
+            if account_over:
+                self._take_slot(self._slot_account, account, now, ACCOUNT_SLOT_SECONDS)
+            if source_over:
+                self._take_slot(self._slot_source, group, now, SOURCE_SLOT_SECONDS)
+
+    def _record_failure(self, username, source, shared_source=False):
+        """One failure feeds all three counts, from a known source too."""
+        with self.store.lock:
+            now = self._now()
+            account = (username or '').lower()
+            group = self._source_key(source, shared_source)
+            _count_add(self._failures, '%s|%s' % (account, group), now, LOGIN_WINDOW_SECONDS,
+                       self.login_max_attempts)
+            _count_add(self._failures_account, account, now, ACCOUNT_FAIL_WINDOW, ACCOUNT_FAIL_LIMIT)
+            _count_add(self._failures_source, group, now, SOURCE_FAIL_WINDOW,
+                       SHARED_SOURCE_FAIL_LIMIT if shared_source else SOURCE_FAIL_LIMIT)
+
+    def _record_success(self, username, source, shared_source=False):
+        """A success clears this pair only (not the aggregates, which an attacker with an account of
+        their own could otherwise reset) and makes the source known to the account."""
+        with self.store.lock:
+            account = (username or '').lower()
+            group = self._source_key(source, shared_source)
+            self._failures.pop('%s|%s' % (account, group), None)
+            self._note_known_source(account, group, self._now())
 
     #: Log-in attempts in flight at once: one being checked and the rest waiting their turn
     #: (the check is made under the state lock, one at a time, about 0.1 s each). One more is
@@ -1680,7 +1842,7 @@ class Service:
             # audit log.
             raise busy(refused, retry_after=5)
         try:
-            return self._login(username, password, source, request_id)
+            return self._login(username, password, source, request_id, shared_source)
         finally:
             with self._logins_room:
                 self._logins -= 1
@@ -1692,9 +1854,9 @@ class Service:
                         self._logins_by_address.pop(group, None)
                 self._logins_room.notify_all()            # a place is free: whoever waits for one of this address's looks again
 
-    def _login(self, username, password, source, request_id):
+    def _login(self, username, password, source, request_id, shared_source=False):
         try:
-            self._check_throttle(username, source)
+            self._check_throttle(username, source, shared_source)
         except HttpError:
             self.audit(request_id, None, 'login', 'throttled', reason='rate limited')
             self.store.save()
@@ -1702,10 +1864,12 @@ class Service:
         with self.store.lock:
             user_id = self.state['usernames'].get((username or '').lower())
             user = self.state['users'].get(user_id) if user_id else None
-            verifier = user.get('password') if user else _dummy_verifier()
+            # An account with no password yet (invited) is checked against the dummy too, so it
+            # costs the same one scrypt as a missing account and a wrong password (kittrial-5bb.501 F1).
+            verifier = (user.get('password') if user else None) or _dummy_verifier()
             good = verify_password(verifier, password or '')
             if not user or not good or user['disabled'] or not user.get('password'):
-                self._record_failure(username, source)
+                self._record_failure(username, source, shared_source)
                 self.audit(request_id, None, 'login', 'failed', reason='invalid credentials')
                 self.store.save()
                 raise unauthenticated('Invalid credentials')
@@ -1729,7 +1893,7 @@ class Service:
                 'revoked': False,
                 'csrf': csrf,
             }
-            self._failures.pop(self._throttle_key(username, source), None)
+            self._record_success(username, source, shared_source)
             self.audit(request_id, Principal(user['id'], user['display_name'],
                                              user['superuser'], 'session', user['id']),
                        'login', 'committed')

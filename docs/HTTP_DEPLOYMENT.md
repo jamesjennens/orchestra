@@ -387,7 +387,8 @@ sudo -u <SERVICE_USER> python3 http_service.py \
   --state <RUNTIME_ROOT>/http-state.json --root <RUNTIME_ROOT> \
   --bootstrap-user <ADMIN_USERNAME>
 # the operator types the password twice at the prompts; it is never echoed or logged
-# (--password-min-length N raises the default minimum of 1; see "Password rule")
+# (the password must have at least 12 characters; --password-min-length N changes that
+#  minimum, 1 to 1024; see "Password rule")
 ```
 
 Bootstrap refuses to run once any account exists, so it cannot silently reset a
@@ -4118,7 +4119,8 @@ agent set-up wizard is what uses it (kittrial-5bb.329).
 
 The installation's password minimum is a setting, `--password-min-length N` on the web
 service and `"password_min_length": N` in the private office JSON, a whole number from 1
-to 1024, default **1**: any non-empty password is accepted. A value outside the bounds, or
+to 1024, default **12** (kittrial-5bb.501; it was 1). An installation that sets another value, 1
+included, keeps it. A value outside the bounds, or
 one that is not a whole number, is refused at startup with one sentence and a non-zero
 exit before the state document is opened; nothing is clamped. The **1024 maximum stays**,
 documented as a bound on the work one request may ask for, not as a policy about what a
@@ -4135,7 +4137,10 @@ The account page states the server's rule from `GET /v1/sessions/current`:
 `user.password_min_length` (the same value is in the sign-in answer), so no hard-coded
 minimum remains in the browser code. The reset page is signed out, so there is no session
 answer to read: it states no number and shows the server's own 422 sentence, which names
-the configured range, when the password is sent. The log-in rate limits are unchanged.
+the configured range, when the password is sent. The host bootstrap prompt names the range
+(`New superuser password (12 to 1024 characters)`). The log-in limits are those of
+`docs/HTTP_TRANSPORT_DESIGN.md` section 4: a pair count, a per-account and a per-source count
+with slow mode, and a password change shares them.
 
 The server remains the authority: `http_auth.py` refuses an empty password and one longer
 than 1024 characters, refuses one shorter than the configured minimum with a sentence

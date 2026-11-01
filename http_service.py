@@ -70,7 +70,7 @@ from http_auth import (AGENT_ROLES, AGENT_SECRET_ENV, agent_secret_file, CAP_ACC
                        CAP_RELEASE,
                        CAP_PROJECT_ADMIN, CAP_PROJECT_CREATE, CAP_PROJECT_HOST_CREATE, CAP_READ,
                        CAP_RECORDS, CAP_REVIEWS,
-                       CAP_TASKS, MAX_PASSWORD, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
+                       CAP_TASKS, DEFAULT_PASSWORD_MIN, MAX_PASSWORD, RESULT_RETENTION_SECONDS, HttpError, Service, Store,
                        address_group, authority_request, busy, canonical_json, conflict, forbidden, invalid, not_found,
                        not_implemented, now_iso, request_hash, session_limit_seconds, unauthenticated,
                        uncertain, unsupported, validate_agent_credential_days, validate_agent_role,
@@ -8180,7 +8180,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         def change():
             result = self.service.change_password(ctx.principal, ctx.params['uid'],
                                                   payload.get('current_password'),
-                                                  payload.get('new_password'))
+                                                  payload.get('new_password'),
+                                                  source=self._source(),
+                                                  shared_source=self._source_is_shared())
             return result, result
         return self._mutate(ctx, 'accounts.password', None, change,
                             capability=CAP_ACCOUNTS_ADMIN,
@@ -16083,7 +16085,7 @@ def runtime_service_lock(root):
     return fd
 
 
-def bootstrap_refusal_advice(error, password_min_length=1):
+def bootstrap_refusal_advice(error, password_min_length=DEFAULT_PASSWORD_MIN):
     """What the person at the terminal has to do about a refused ``--bootstrap-user``.
 
     Only "a superuser already exists" can be answered with "add this person as an account
@@ -16179,9 +16181,10 @@ def main(argv=None):
     parser.add_argument('--public-url',
                         help='canonical base URL of this service, used only to render '
                              'copyable agent setup/resume snippets (e.g. https://host)')
-    parser.add_argument('--password-min-length', type=int, default=1, metavar='N',
-                        help='the installation password minimum: 1 to 1024 characters (default 1, '
-                             'any non-empty password). The 1024 maximum is a bound on the work one '
+    parser.add_argument('--password-min-length', type=int, default=DEFAULT_PASSWORD_MIN, metavar='N',
+                        help='the installation password minimum: 1 to 1024 characters (default '
+                             + str(DEFAULT_PASSWORD_MIN) + '). A password already set keeps working '
+                             'whatever this is. The 1024 maximum is a bound on the work one '
                              'request may ask for, not a policy')
     parser.add_argument('--bootstrap-user', help='one-time operator bootstrap superuser')
     parser.add_argument('--list-unconfirmed-projects', action='store_true',
@@ -16266,7 +16269,8 @@ def main(argv=None):
         import getpass
         try:
             store = Store(args.state)
-            password = getpass.getpass('New superuser password: ')
+            password = getpass.getpass('New superuser password (%d to %d characters): '
+                                       % (password_min_length, MAX_PASSWORD))
             confirmation = getpass.getpass('Repeat new superuser password: ')
             if password != confirmation:
                 # The host bootstrap is one of the places a password is set (kittrial-5bb.363):

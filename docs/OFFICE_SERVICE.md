@@ -803,7 +803,7 @@ not rewritten when configuration changes.
 ## Password minimum configuration
 
 The same private office JSON accepts `"password_min_length": 8` (a whole number from 1
-through 1024); omission keeps 1, which accepts any non-empty password. It is passed as
+through 1024); omission keeps the default of 12 (kittrial-5bb.501; it was 1). It is passed as
 `--password-min-length`. 1024 stays the maximum as a bound on the work one request may ask
 for, not a policy about what a password should look like. The browser account page states
 the configured minimum; the signed-out reset page states no number and shows the server's
