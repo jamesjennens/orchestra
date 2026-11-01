@@ -1051,10 +1051,12 @@ class HttpStateBackupTests(unittest.TestCase):
         admin.backup_http_state(self.root)
         live.unlink()
         Path(str(live) + '.records.sqlite3').unlink()
-        sentence = admin.restore_http_state(self.root)
-        self.assertIn('INVALIDATED', sentence)
-        self.assertEqual(live.read_text(encoding='utf-8'),
-                         (self.root / 'backups' / admin.HTTP_STATE_JSON).read_text(encoding='utf-8'))
+        # kittrial-5bb.500 F1: --credentials is required; the sessions are really revoked (the document is
+        # edited, so the live file is no longer the backup's bytes; this state has no sessions to revoke).
+        sentence = admin.restore_http_state(self.root, credentials='keep')
+        self.assertIn('Every session in it was revoked', sentence)
+        self.assertEqual(json.loads(live.read_text(encoding='utf-8')),
+                         json.loads((self.root / 'backups' / admin.HTTP_STATE_JSON).read_text(encoding='utf-8')))
         # POSIX-only mode assertions (review item 'posix-mode-asserts').
         if os.name != 'nt':
             self.assertEqual(oct(live.stat().st_mode & 0o777), '0o600')
@@ -1062,7 +1064,7 @@ class HttpStateBackupTests(unittest.TestCase):
 
     def test_restore_refuses_without_a_pair_and_targets_the_default(self):
         with self.assertRaisesRegex(ValueError, 'no HTTP state pair'):
-            admin.restore_http_state(self.root)
+            admin.restore_http_state(self.root, credentials='keep')
         # Back up the default-path state FIRST (no deployment config yet) ...
         self.state()                                 # the live files exist at the default
         admin.backup_http_state(self.root)            # the pair lands in backups/
@@ -1072,8 +1074,8 @@ class HttpStateBackupTests(unittest.TestCase):
         (self.root / 'deployment.private.json').write_text(
             json.dumps({'password': 'x', 'http_state': str(self.root / 'configured.json')}),
             encoding='utf-8')
-        sentence = admin.restore_http_state(self.root)
-        self.assertIn('INVALIDATED', sentence)
+        sentence = admin.restore_http_state(self.root, credentials='revoke')
+        self.assertIn('Every session in it was revoked', sentence)
         self.assertTrue((self.root / 'configured.json').is_file())
         self.assertTrue(Path(str(self.root / 'configured.json') + '.records.sqlite3').is_file())
 
@@ -1087,7 +1089,9 @@ class HttpStateBackupTests(unittest.TestCase):
         nxt = body.find('\n    elif ')
         if nxt != -1:
             body = body[:nxt]
-        self.assertIn("if getattr(args,'restore_http_state',False):", body)
-        self.assertIn('print(restore_http_state(root))', body)
+        # kittrial-5bb.500: the state is written inside the office lock, after the project restored, and printed
+        # after the project's own line; still only under the flag, still once.
+        self.assertIn("if args.restore_http_state:", body)
+        self.assertIn('restore_http_state(root,credentials=args.credentials)', body)
         self.assertIn('was left ', body)
-        self.assertEqual(body.count('restore_http_state(root)'), 1)
+        self.assertEqual(body.count('restore_http_state(root,'), 1)

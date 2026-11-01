@@ -3866,6 +3866,13 @@ def refuse_retired_name(root,name):
         raise ValueError('Project name %s is retired (%s/%s): its database is still on the server, so the '
                          'name is not reused. Choose another name.'%(name,RETIRED_DIR,held[-1]))
 
+#: The marker ``restore-new`` leaves in the destination from the moment it exists until the restore has put the
+#: tracker, the coordination files and the journals in it, i.e. until ``finish_restore`` reaches the merge-slot
+#: step (kittrial-5bb.500 F4). ``backup_project`` refuses a project that carries it, so a half
+#: restore is recorded incomplete by ``backup --all`` and fails ``backup-status --require-complete``,
+#: as the restore notice says. ``retire-project`` moves the directory, marker and all.
+RESTORE_INCOMPLETE_MARKER='.restore-incomplete'
+
 def restore_lock_path(root,name):
     """The lock ``restore-new`` holds for its DESTINATION for its whole run.
 
@@ -3875,6 +3882,18 @@ def restore_lock_path(root,name):
     """
     validate_name(name)
     return root/'backups'/(name+'.restore.lock')
+
+def write_restore_marker(root,destination,source):
+    """Leave ``RESTORE_INCOMPLETE_MARKER`` in the destination (atomic, mode 0600): see the constant."""
+    path=project_dir(root,destination)/RESTORE_INCOMPLETE_MARKER
+    atomic_private_write(path,json.dumps({'schema_version':1,'restore_of':source,'started_at':utc_stamp()},sort_keys=True)+'\n')
+
+def clear_restore_marker(root,destination):
+    """Remove the marker once ``finish_restore`` has succeeded. A marker that is already gone is fine."""
+    try:
+        (project_dir(root,destination)/RESTORE_INCOMPLETE_MARKER).unlink()
+    except FileNotFoundError:
+        pass
 
 #: Ceiling for each SQL probe ``retire-project`` sends the Dolt server. Retire holds the
 #: restore, backup and coordination locks while it probes, so a frozen server must not
@@ -4877,7 +4896,11 @@ def backup_project(root,name):
     # cannot leave a failed marker beside a foreign target (and cannot overwrite the
     # source project's backup). native_backup_sync repeats the check for direct callers.
     validate_backup_target(root,name)
-    with (path/'.coordination.lock').open('a') as lock, backup_lock(root,name), \
+    # kittrial-5bb.500 F6: the termination guard is entered FIRST, around the lock and the guard that
+    # copies the last-complete sidecar. last_complete_guard's entry copy (_atomic_copy) used to run
+    # before any guard: a SIGTERM there ran the default action, the interpreter died, and the copy's
+    # '*.restore' temporary was left in backups/. The guard nests (the section below enters it again).
+    with signal_termination_guard(), (path/'.coordination.lock').open('a') as lock, backup_lock(root,name), \
             last_complete_guard(root,name) as (bundle,last_complete,guard_state):
         fcntl.flock(lock,fcntl.LOCK_EX)
         atomic(bundle,{'schema_version':1,'status':'pending'})
@@ -4886,6 +4909,14 @@ def backup_project(root,name):
         void_journal = read_void_journal(path)
         if void_journal['invalid']:
             raise ValueError('Cannot back up an unreadable/incomplete lifecycle VOID family')
+        # kittrial-5bb.500 F4: after the refusals that name their own cause (a leftover whose restore stopped at
+        # the VOID family keeps the message test_lifecycle_voids_native pins), a project that carries the
+        # restore marker is still not backed up. It fails here, inside the guard, like any refused backup.
+        if os.path.lexists(str(path/RESTORE_INCOMPLETE_MARKER)):
+            raise ValueError('Project %s is the leftover of a restore-new that did not complete (%s is in it): it is not a '
+                             'tracker to back up, so this backup is refused and the backup gate reports the runtime '
+                             'incomplete until it is gone. Retire it with admin.py retire-project %s --actor OPERATOR '
+                             '--reason REASON.'%(name,RESTORE_INCOMPLETE_MARKER,name))
         from requirement_governance import snapshot as governance_snapshot
         files.update(governance_snapshot(path,name))
         from requirement_baselines import backup_files as baseline_backup_files
@@ -5604,6 +5635,13 @@ def merged_backup_status(root,record):
     merged['projects']=[entries[name] for name in sorted(entries)]
     complete=sum(1 for entry in merged['projects'] if entry['status']=='complete')
     merged['status']='complete' if complete==len(merged['projects']) else 'incomplete'
+    # kittrial-5bb.500 F2: the run's HTTP state counts here too, as in backup_status_record. Without
+    # it, every run after the first that had a degraded HTTP state built a 'complete' record that
+    # validate_backup_status refused, so the run died with that ValueError and left the previous
+    # status file standing.
+    http_state=merged.get('http_state')
+    if isinstance(http_state,dict) and http_state.get('status') not in (None,'complete','absent'):
+        merged['status']='incomplete'
     return merged
 
 def failure_reason(error):
@@ -6463,6 +6501,25 @@ def copy_sqlite_consistently(source, destination):
     return ('no consistent SQLite copy is available on this host: no sqlite3 CLI and this '
             'Python lacks Connection.backup (the office server runs Python 3.6)')
 
+def http_state_missing_entry(root,source,origin):
+    """The ``degraded`` entry for a configured HTTP state path that is not a regular file."""
+    where={'flag':'named with --http-state','deployment':'named by http_state in deployment.private.json'}.get(
+        origin,'configured')
+    what='is missing' if not os.path.lexists(str(source)) else 'is not a regular file'
+    stale=root/'backups'/HTTP_STATE_JSON
+    try:
+        when=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(stale.stat().st_mtime)) if stale.is_file() else None
+    except OSError:
+        when=None
+    if when is None:
+        tail='there is no earlier copy of the HTTP state in backups/ either, so nothing of the accounts and agents is backed up'
+    else:
+        tail=('backups/%s is the copy from %s (its file time) and was NOT refreshed by this run: it is stale, and '
+              'restore-new --restore-http-state would bring that older state back'%(HTTP_STATE_JSON,when))
+    return {'status':'degraded','path':str(source),'origin':origin,
+            'reason':'the HTTP state file %s (%s) %s; %s. Fix the path or restore the file, then run backup again'
+                     %(source,where,what,tail)}
+
 def backup_http_state(root, named=None):
     """The runtime's HTTP state into backups/, mode 0600; the status entry for the report.
 
@@ -6478,7 +6535,12 @@ def backup_http_state(root, named=None):
         return {'status':'absent'}
     entry={'status':'absent','path':str(source)}
     if not source.is_file():
-        return entry
+        # kittrial-5bb.500 F2: only the office default can be absent, and resolve_http_state_path
+        # returns that one only when the file exists. A path the operator NAMED (--http-state, or
+        # http_state in deployment.private.json) that is not a regular file is a moved file or a
+        # typo: the run is degraded, so it is INCOMPLETE and exits non-zero, and the reason says
+        # that the copy already in backups/ is stale instead of leaving it there unremarked.
+        return http_state_missing_entry(root,source,origin)
     if source.is_symlink():
         raise ValueError('The HTTP state file %s must not be a symlink'%source)
     import shutil
@@ -6516,20 +6578,103 @@ def backup_http_state(root, named=None):
     entry.update(status='complete',files=files,origin=origin)
     return entry
 
-def restore_http_state(root, named=None):
-    """Restore the backed-up HTTP state pair to the live path; the sentence to print.
+#: --credentials values of ``restore-new --restore-http-state`` (kittrial-5bb.500 F1).
+HTTP_CREDENTIALS_CHOICES=('keep','revoke')
 
-    The ONLY caller is ``restore-new --restore-http-state`` (kittrial-5bb.331): the
-    accounts, agents and memberships come back with their password and credential
-    hashes, and every SESSION in the restored state is invalidated - the hashes
-    return, the sign-ins do not survive the restore. Mode 0600, copied to a temporary
-    name and renamed, never by default.
-    """
-    backups=root/'backups'
-    source_json=backups/HTTP_STATE_JSON
+def _age_text(seconds):
+    seconds=max(0,int(seconds))
+    hours,minutes=divmod(seconds//60,60)
+    return '%d h %02d min'%(hours,minutes)
+
+def _utc_text(epoch):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(epoch))
+
+def http_state_backup_time(root):
+    """``(epoch, how, disagreement)`` for the HTTP state pair in ``backups/`` (kittrial-5bb.500 F1).
+
+    The OLDER of the pair's file time and ``backup-status.json``'s ``generated_at`` (when that file is
+    there and readable): a copy that did not keep its timestamps looks younger than it is, and a
+    backup that looks newer than it is misleads in the unsafe direction. ``how`` says which one is
+    printed; ``disagreement`` is None, or the sentence to print when they differ by more than a minute."""
+    import calendar
+    source_json=root/'backups'/HTTP_STATE_JSON
+    mtime=source_json.stat().st_mtime
+    generated=None
+    try:
+        stamp=read_backup_status(root).get('generated_at')
+        if utc_timestamp(stamp):generated=calendar.timegm(time.strptime(stamp,'%Y-%m-%dT%H:%M:%SZ'))
+    except (OSError,ValueError,KeyError,TypeError,AttributeError):
+        generated=None
+    if generated is None:
+        return mtime,'the file time of backups/%s'%HTTP_STATE_JSON,None
+    older,how=((generated,'generated_at in backups/%s'%BACKUP_STATUS_NAME) if generated<=mtime
+               else (mtime,'the file time of backups/%s'%HTTP_STATE_JSON))
+    disagreement=None
+    if abs(mtime-generated)>60:
+        disagreement=('The two times differ by %s: backups/%s was last written %s and backups/%s says its run '
+                      'started %s. A long run, or a copy that did not keep file times, explains it; the older one '
+                      'is the one used above.'%(_age_text(abs(mtime-generated)),HTTP_STATE_JSON,_utc_text(mtime),
+                                                BACKUP_STATUS_NAME,_utc_text(generated)))
+    return older,how,disagreement
+
+def prepare_http_state_restore(root,credentials):
+    """Read and check the backed-up state document; the parsed document. Raises ValueError, changes nothing.
+
+    ``restore-new`` calls this BEFORE it creates anything, so a missing or unusable pair refuses the
+    restore with no destination project and no half restore (kittrial-5bb.500 F1)."""
+    if credentials not in HTTP_CREDENTIALS_CHOICES:
+        raise ValueError('--restore-http-state needs --credentials keep or --credentials revoke')
+    source_json=root/'backups'/HTTP_STATE_JSON
     if not source_json.is_file():
         raise ValueError('This backup set has no HTTP state pair to restore (no %s in %s); '
-                         'nothing was changed'%(HTTP_STATE_JSON,backups))
+                         'nothing was changed'%(HTTP_STATE_JSON,root/'backups'))
+    try:
+        document=record_json.loads(read_regular_text(source_json))
+    except ValueError as error:
+        raise ValueError('The HTTP state in %s cannot be restored: it is not valid JSON (%s); nothing was changed'
+                         %(source_json,str(error)[:120])) from None
+    from http_auth import SCHEMA_VERSION
+    if not isinstance(document,dict) or document.get('schema_version')!=SCHEMA_VERSION:
+        raise ValueError('The HTTP state in %s cannot be restored: it is not a web service state document of '
+                         'schema %s; nothing was changed'%(source_json,SCHEMA_VERSION))
+    for key in ('sessions','credentials','reset_tokens'):
+        value=document.get(key,{})
+        if not isinstance(value,dict) or not all(isinstance(item,dict) for item in value.values()):
+            raise ValueError('The HTTP state in %s cannot be restored: its %s are not a map of records; '
+                             'nothing was changed'%(source_json,key))
+    return document
+
+def restore_http_state(root, named=None, credentials='keep', now=None):
+    """Restore the backed-up HTTP state pair to the live path; the text to print.
+
+    The ONLY caller is ``restore-new --restore-http-state`` (kittrial-5bb.331). The accounts, agents
+    and memberships come back with their password and credential hashes. kittrial-5bb.500 F1: the
+    sessions in the restored document are really revoked (it used to claim so and revoke nothing, so
+    a signed-out token and a revoked credential were accepted again), and ``credentials`` says what
+    happens to the worker and agent credentials in it: ``keep`` leaves them as the backup had them
+    (one revoked since then is live again), ``revoke`` revokes every one. Unused password-reset
+    values are revoked too: one redeemed since the backup would otherwise be live again. The
+    document is edited in memory and written once, atomically, mode 0600; the service loads it as
+    any state document (there is no integrity value or generation beside it to update). The caller
+    holds the office lock, so no service is writing the file.
+
+    ``credentials`` defaults to ``keep`` for the DIRECT callers that restore a pair in a fixture
+    (test_agent_self_check, test_coordinator_notes, test_handover_note); the command line has no
+    default and refuses to run without a choice (``restore-new``'s own check, before anything is made).
+    """
+    backups=root/'backups'
+    document=prepare_http_state_restore(root,credentials)
+    when,how,disagreement=http_state_backup_time(root)
+    now=time.time() if now is None else now
+    sessions=document.get('sessions',{})
+    for record in sessions.values():record['revoked']=True
+    resets=document.get('reset_tokens',{})
+    unused=[record for record in resets.values() if not record.get('used')]
+    for record in resets.values():record['used']=True
+    stored=document.get('credentials',{})
+    revoked_before=sum(1 for record in stored.values() if record.get('revoked'))
+    if credentials=='revoke':
+        for record in stored.values():record['revoked']=True
     live,origin=resolve_http_state_path(root,named)
     if live is None:
         # The disaster this restores from is exactly the live file being GONE, so the
@@ -6540,17 +6685,19 @@ def restore_http_state(root, named=None):
     import shutil
     import tempfile
     handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-restore-')
-    os.close(handle);os.unlink(temp)
     try:
-        shutil.copyfile(str(source_json),temp)
+        with os.fdopen(handle,'w',encoding='utf-8') as stream:
+            stream.write(json.dumps(document,ensure_ascii=False,indent=2)+'\n')
+            stream.flush()
+            os.fsync(stream.fileno())
         os.chmod(temp,0o600)
         os.replace(temp,str(live))
     finally:
         if os.path.exists(temp):os.unlink(temp)
     restored=[HTTP_STATE_JSON]
     records=backups/HTTP_STATE_RECORDS
+    records_live=Path(str(live)+'.records.sqlite3')
     if records.is_file():
-        records_live=Path(str(live)+'.records.sqlite3')
         handle,temp=tempfile.mkstemp(dir=str(live.parent),prefix='.http-state-records-restore-')
         os.close(handle);os.unlink(temp)
         try:
@@ -6560,9 +6707,109 @@ def restore_http_state(root, named=None):
             restored.append(HTTP_STATE_RECORDS)
         finally:
             if os.path.exists(temp):os.unlink(temp)
-    return ('Restored the HTTP state pair (%s) to %s (mode 0600). Every session in it is '
-            'INVALIDATED: users and agents must sign in again; password and credential hashes '
-            'are back as they were at the backup.'%(', '.join(restored),live))
+        records_note=''
+    else:
+        records_note=(' The records file was not in this backup set; '+
+                      ('the live records file %s was left as it was.'%records_live if records_live.exists()
+                       else 'there is no live records file (%s does not exist), so none was written.'%records_live))
+    stamp=_utc_text(when)
+    lines=['Restored the HTTP state %s (%s) to %s (mode 0600).%s'
+           %('pair' if len(restored)==2 else 'JSON half only',', '.join(restored),live,records_note),
+           'The HTTP state in this backup is from %s UTC (%s old; %s).'%(stamp,_age_text(now-when),how)]
+    if disagreement:lines.append(disagreement)
+    lines.append('Every session in it was revoked (%d): users and agents must sign in again.'%len(sessions))
+    if credentials=='revoke':
+        lines.append('Every worker and agent credential in it was revoked (%d); issue new ones.'%len(stored))
+    else:
+        lines.append('Worker and agent credentials revoked since %s UTC are live again (%d of the %d in it were '
+                     'revoked in the backup and stay revoked); credentials issued after that time are not in it.'
+                     %(stamp,revoked_before,len(stored)))
+    if unused:lines.append('Unused password-reset values in it were revoked (%d).'%len(unused))
+    lines.append('Passwords changed since %s UTC are back to their values at that time.'%stamp)
+    return '\n'.join(lines)
+
+def office_service_lock(root):
+    """The office lock ``<root>/office-service.lock``, held exclusively and without waiting; the fd.
+
+    The same file and the same flock the supervisor (``office_service.py run``) holds for its whole life
+    and ``http_service.py --bootstrap-user`` tests. Raises ValueError, naming the way out, when a
+    supervisor holds it, or when the host has no ``fcntl`` (a POSIX deployment: skipping the guard
+    would reintroduce the loss it exists for). admin.py does not import http_service for it."""
+    try:
+        import fcntl
+    except ImportError:
+        raise ValueError('--restore-http-state needs the runtime lock to know no web service is running, and '
+                         'this host has no fcntl; run restore-new on the POSIX host that runs the service. '
+                         'Nothing was changed.') from None
+    fd=os.open(str(root/'office-service.lock'),os.O_CREAT|os.O_RDWR,0o600)
+    try:
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise ValueError('Refusing --restore-http-state: a web service is running for this runtime (it holds %s). '
+                         'Stop the service first, then run restore-new again: a running service keeps the state in '
+                         'memory and writes it back over the restored file, so the restore would be silently undone. '
+                         'Nothing was changed.'%(root/'office-service.lock')) from None
+    return fd
+
+def http_service_processes(root,live):
+    """Pids of other ``http_service.py`` processes serving this runtime's HTTP state (Linux ``/proc``).
+
+    A plain ``http_service.py`` holds NO office lock - only ``office_service.py run`` does - yet
+    it keeps the state in memory and writes it back (kittrial-5bb.500 F3). A process counts when its
+    ``--state`` is the live state file or its ``--root`` is this runtime. Empty where ``/proc`` is
+    not there: the lock above is then the only check."""
+    found=[]
+    try:
+        entries=[name for name in os.listdir('/proc') if name.isdigit()]
+    except OSError:
+        return found
+    def same(left,right,cwd):
+        try:
+            return os.path.realpath(os.path.join(cwd,left))==os.path.realpath(str(right))
+        except (OSError,ValueError):
+            return False
+    for entry in entries:
+        if int(entry)==os.getpid():continue
+        try:
+            with open('/proc/%s/cmdline'%entry,'rb') as stream:arguments=stream.read().decode('utf-8','replace').split('\0')
+        except OSError:
+            continue
+        if not any(os.path.basename(item)=='http_service.py' for item in arguments[:4]):continue
+        try:cwd=os.readlink('/proc/%s/cwd'%entry)
+        except OSError:cwd='/'
+        values={}
+        for position,item in enumerate(arguments):
+            for flag in ('--state','--root'):
+                if item==flag and position+1<len(arguments):values[flag]=arguments[position+1]
+                elif item.startswith(flag+'='):values[flag]=item[len(flag)+1:]
+        if ('--state' in values and same(values['--state'],live,cwd)) or ('--root' in values and same(values['--root'],root,cwd)):
+            found.append(int(entry))
+    return found
+
+@contextmanager
+def http_restore_hold(root,args):
+    """What ``restore-new --restore-http-state`` holds from before anything is created to its end.
+
+    kittrial-5bb.500 F3: the office lock (``office_service_lock``) AND a check for a plain
+    ``http_service.py`` serving this state, which holds no lock. Nothing without the flag."""
+    if not getattr(args,'restore_http_state',False):
+        yield
+        return
+    fd=office_service_lock(root)
+    try:
+        live,_=resolve_http_state_path(root)
+        pids=http_service_processes(root,live if live is not None else root/HTTP_STATE_JSON)
+        if pids:
+            raise ValueError('Refusing --restore-http-state: an http_service.py process (pid %s) is serving this '
+                             'runtime\'s HTTP state. Stop the service first, then run restore-new again: a running '
+                             'service keeps the state in memory and writes it back over the restored file, so the '
+                             'restore would be silently undone. Nothing was changed.'%', '.join(map(str,pids)))
+        yield
+    finally:
+        import fcntl
+        try:fcntl.flock(fd,fcntl.LOCK_UN)
+        finally:os.close(fd)
 
 
 def task_files_backup_path(root,name):
@@ -6725,6 +6972,12 @@ def backup_projects(root,names,all_projects=False,named_http_state=None):
             print('Backup of %s; http-state degraded: %s'%(targets[0],http_state.get('reason')))
         elif degraded:
             print('Backup of %s is complete but degraded: %s'%(degraded[0][0],degraded[0][1]))
+    # kittrial-5bb.500 F2: a degraded HTTP state makes the run incomplete in the status file (above) and
+    # now in its exit status too, as OPERATIONS.md says it does: a timer that only reads the exit code
+    # used to see a clean run while the accounts and agents were not being backed up.
+    if http_state.get('status')=='degraded':
+        raise SystemExit('backup incomplete for: '+' '.join(incomplete+['the HTTP state'])+
+                         ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME)+unfinished_creation_hint(root,incomplete))
     if incomplete:
         raise SystemExit('backup incomplete for: '+' '.join(incomplete)+
                          ' (see %s)'%(root/'backups'/BACKUP_STATUS_NAME)+unfinished_creation_hint(root,incomplete))
@@ -10833,8 +11086,15 @@ def _main():
     a.add_argument('--restore-http-state',action='store_true',dest='restore_http_state',
                    help='ALSO restore the runtime HTTP state pair this backup set carries (accounts, agents, '
                         'memberships; mode 0600). The ONLY way it comes back: without the flag a restore never '
-                        'touches the live HTTP state. Restoring it INVALIDATES every session recorded in it - '
-                        'users and agents must sign in again (kittrial-5bb.331)')
+                        'touches the live HTTP state. Every session recorded in it is revoked - '
+                        'users and agents must sign in again - and --credentials says what happens to the '
+                        'credentials. Refused while a web service is running; needs --credentials '
+                        '(kittrial-5bb.331, kittrial-5bb.500)')
+    a.add_argument('--credentials',choices=HTTP_CREDENTIALS_CHOICES,default=None,
+                   help='REQUIRED with --restore-http-state, refused without it, no default: keep = the worker and '
+                        'agent credentials in the restored state stay as the backup had them (one revoked since then '
+                        'is live again); revoke = every worker and agent credential in it is revoked. Every session '
+                        'in the restored state is revoked either way')
     a.epilog=('Exit status: 0 restored; 3 restored, but --restore-operators/--restore-verifiers could not '
               're-grant (another change held the deployment lock, or the authority-changes audit is damaged): '
               'the last lines say what, with the commands to re-grant it; 1 failed. --actor OPERATOR and '
@@ -12067,6 +12327,15 @@ def _main():
                   file=__import__('sys').stderr)
     elif args.command=='restore-new':
         validate_name(args.project);validate_name(args.destination)
+        # kittrial-5bb.500 F1: --credentials is checked HERE, before the lock or anything is created.
+        if getattr(args,'credentials',None) is not None and not args.restore_http_state:
+            raise ValueError('--credentials is only for --restore-http-state; without that flag restore-new does '
+                             'not touch the live HTTP state. Nothing was changed.')
+        if args.restore_http_state and getattr(args,'credentials',None) is None:
+            raise ValueError('--restore-http-state needs --credentials keep or --credentials revoke, with no default. '
+                             'keep: the worker and agent credentials in the backup stay as they were then (one '
+                             'revoked since is live again). revoke: every one is revoked and new ones are issued. '
+                             'Every session in the restored state is revoked either way. Nothing was changed.')
         # --actor/--reason record the re-grant the two restore flags make (kittrial-5bb.192 review
         # item 2). Everything about them is checked HERE, before the destination exists: a bad
         # value must not be discovered after the native restore, when the re-grant step runs last.
@@ -12082,7 +12351,7 @@ def _main():
         backup=root/'backups'/args.project
         if not backup.is_dir():raise ValueError('Source backup missing')
         if args.project==args.destination:raise ValueError('Restore requires a different destination')
-        with backup_lock(root,args.project):
+        with http_restore_hold(root,args), backup_lock(root,args.project):
             # The sidecar decides first, before anything is created (kittrial-5bb.152): a copy
             # that exists but cannot be used refuses the restore unless --without-coordination
             # asks for the native tracker data alone; a backup with no copy at all is legacy.
@@ -12099,7 +12368,16 @@ def _main():
                 raise ValueError('--without-coordination is only for a backup whose coordination sidecar cannot be '
                                  'used; this backup\'s can be, so restore it without the flag')
             else:
-                coordination_backup(root,args.project)
+                # kittrial-5bb.500 F4: the project binding of the governance and baseline history is checked
+                # HERE, with the other sidecar checks, by the same calls restore_coordination makes later.
+                # A sidecar that belongs to another project used to pass every check, fail after the native
+                # restore and leave a half-restored project.
+                sidecar_files=coordination_backup(root,args.project)
+                if sidecar_files is not None:
+                    from requirement_governance import restored_files as restored_governance_files
+                    from requirement_baselines import restored_files as restored_baseline_files
+                    restored_baseline_files(restored_governance_files(sidecar_files,args.project,args.destination),
+                                            args.project,args.destination)
             args.flag_had_nothing=args.without_coordination and outcome=='legacy'
             # The rooms file is validated BEFORE the destination exists too: a damaged one must
             # not leave a half-restored project behind (the same rule as the sidecar).
@@ -12123,6 +12401,9 @@ def _main():
             operators(root);verifiers(root)
             if (args.restore_operators or args.restore_verifiers) and not (root/'deployment.private.json').is_file():
                 raise ValueError('Deployment is not installed; run install first')
+            # kittrial-5bb.500 F1: the HTTP state pair is read and checked here too, so a missing or unusable
+            # one refuses the restore before the destination exists, not after the native restore.
+            if args.restore_http_state:prepare_http_state_restore(root,args.credentials)
             # From here the destination starts to exist. Hold its restore lock to the end,
             # so retire-project cannot pull it away mid-restore, and print the notice for
             # every way the rest can stop (kittrial-5bb.85 review 01a10219): a failure, a
@@ -12141,6 +12422,9 @@ def _main():
                 # end the process with no notice at all (review 01a1026a).
                 with signal_termination_guard():
                     add_project(root,args.destination,requirements_default=False)
+                    # kittrial-5bb.500 F4: from here until finish_restore has succeeded the project is a
+                    # leftover if anything stops: backup_project refuses it (see RESTORE_INCOMPLETE_MARKER).
+                    write_restore_marker(root,args.destination,args.project)
                     # The native restore runs through the Dolt SQL client (no bd ~10 s read
                     # timeout), in its own process group, and adopts the restored project
                     # identity; a destination without server metadata keeps `bd backup restore`.
@@ -12148,6 +12432,8 @@ def _main():
                     print(native_restore(root,args.project,args.destination))
                     step[0]='re-point and coordination'
                     warning=finish_restore(root,args,snapshot,step)
+                    step[0]='restore marker'
+                    clear_restore_marker(root,args.destination)
             except BaseException as error:
                 # add-project's own refusals (a populated or retired destination) are raised
                 # before it creates anything: they need no notice about a leftover project.
@@ -12173,16 +12459,26 @@ def _main():
                 raise
             finally:
                 restoring.close()
+            # Still under the office lock (F3): the state is written once the project has restored.
+            http_text=None
+            if args.restore_http_state:
+                try:
+                    http_text=restore_http_state(root,credentials=args.credentials)
+                except BaseException as error:
+                    print('The project %s was restored, but the HTTP state was NOT: %s'%(args.destination,error),
+                          file=sys.stderr)
+                    raise
         print('Restored only into the newly created project; retained original issue IDs. Never use this clone as a second live tracker.')
         # kittrial-5bb.331: the HTTP state pair comes back ONLY on the explicit request.
-        if getattr(args,'restore_http_state',False):
-            print(restore_http_state(root))
+        if http_text is not None:
+            print(http_text)
         else:
             # 'left unrestored', never 'NOT restored': a restore prints that phrase for
             # capability verifiers (tests pin its absence), and this line must not collide.
             print('The HTTP state pair in this backup set (accounts, agents, memberships) was left '
-                  'unrestored: pass --restore-http-state to restore it. Restoring it INVALIDATES every '
-                  'session recorded in it - users and agents must sign in again.')
+                  'unrestored: pass --restore-http-state (with --credentials keep or revoke, and the web service '
+                  'stopped) to restore it. Restoring it revokes every session recorded in it - users and agents '
+                  'must sign in again.')
         # A backup recorded degraded restores its tracker, and nothing says what is
         # missing unless this does (kittrial-5bb.105). The run record is advisory here:
         # an unreadable one must not fail a restore that has already succeeded.
@@ -12320,6 +12616,11 @@ def finish_restore(root,args,snapshot,step=None):
     # (kittrial-5bb.202 item 3; rev-3 item 1, review F1: it ran BEFORE them and the notice
     # then claimed journals that were never restored). It still runs for a native-only
     # restore, whose journal step above is kept.
+    # kittrial-5bb.500 F4: the clone now holds the restored tracker, its own backup target, its coordination
+    # files and its journals, which is exactly what the notices of a failure from here on say (they promise
+    # nothing about its backup failing, and test_merge_slot_real_bd pins that it succeeds): the leftover
+    # marker, which makes backup refuse a half restore, ends here, not at the end of this function.
+    clear_restore_marker(root,args.destination)
     at(MERGE_SLOT_STEP)
     provision_merge_slot(root,args.destination)
     at('task files')
