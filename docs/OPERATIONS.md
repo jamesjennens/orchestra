@@ -482,12 +482,23 @@ python3 admin.py --root /path/to/root delegation-check --project PROJECT --state
 
 `uncovered` lists the agents still without one.
 
-**A narrowing or revocation that did not finish is not in force.** Each grant, narrowing and
-revocation is a comment plus its host journal entry, and only the pair counts. If the journal
-write fails after the comment (a full disk, a permission change), the answer is an error or an
-unknown outcome, and that narrowing or revocation does **not** apply: the delegation stays as it
-was. Retry it (the same request on the web, or `delegation-record` again) until it succeeds, and
-confirm with `delegation-check` or the Settings page that the delegation reads as intended.
+**A missing or unfinished restriction never restores authority.** Each grant, narrowing and
+revocation is a comment plus its host journal entry; only the pair grants authority. If a
+delegation comment has no matching journal entry (loss, damage, or failure between
+comment and publication), the decision grants nothing, including its earlier wider scope.
+An unreadable ordering also fails closed. The list and `delegation-check` explain the
+unhonoured evidence. Older evidence is not assumed harmless: losing an older grant from an
+ambiguous two-grant history, or an older revoke before a legacy narrowing, must not grant
+authority either. A damaged decision therefore stays inert regardless of comment order.
+
+**Recovery:** first read the decision and reconcile the error/unknown outcome; do not delete
+its comments or fabricate a receipt to resurrect the old grant. A current person owner uses
+the web delegation form with a NEW decision (or a configured operator uses
+`delegation-record` with a new decision), explicitly choosing the intended current scope and
+grantee. Confirm that new decision with Settings or `delegation-check`, and supply its ID on
+future agent acceptances. The damaged decision stays inert; a fresh legitimate delegation
+does not require repairing it. A write to an ambiguous/unhonoured decision returns 409 with
+this recovery instruction, rather than silently creating a second grant on it.
 
 **Backups.** `admin.py backup` collects `<project>/.delegations/` with the coordination
 sidecar and `restore-new` validates and restores it. A delegation is honoured only with
@@ -2009,13 +2020,20 @@ that does not change the value appends nothing instead of overwriting the record
 `audit_agrees`, and **warns when the switch and the last recorded entry disagree**
 - what an older kit, which does not know the audit file, or a hand edit leaves
 behind. A **damaged** audit file - not JSON, not an object, an unknown schema, or
-malformed entries - is reported the same way and reads `audit_agrees: false`; the
-next flip does not silently overwrite it. Before writing the fresh history the flip
-renames the damaged bytes aside, in the same directory, as
+malformed entries - gets a damage warning and reads `audit_agrees: false`; the stale
+warning is separate and appears only when a readable last entry's value differs from
+the switch. The next flip does not silently overwrite damage. Before writing the fresh
+history the flip renames the damaged bytes aside, in the same directory, as
 `review-writes.audit.json.damaged-<UTC date-time>` (`.N` on a collision) and says so
 in its warning. The audit file is read through the same bounded-nesting JSON guard as
 every other caller-written file, so a deeply nested one is refused cleanly instead of
 crashing `status` with a `RecursionError`.
+
+The kit does not prune set-aside files automatically. An operator should review the
+`review-writes.audit.json.damaged-*` files periodically and remove old copies that are
+no longer needed, keeping the newest few if that helps local retention. This cleanup
+applies only to set-aside copies: do not remove or replace the active
+`review-writes.audit.json` as part of it.
 
 **Deployment order and rollback.** Deploy this kit with the switch off, verify the
 reads (`review`, `brief`, `work`, `history`), and leave it off for as long as a

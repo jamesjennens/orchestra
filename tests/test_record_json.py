@@ -342,7 +342,9 @@ class NoUnguardedParseTests(unittest.TestCase):
             'lifecycle_voids.py': 7,
             'followon.py': 4,
             'fault_clear.py': 3,
-            'delegations.py': 4,
+            # .462 also reads an unhonoured comment's time through the guard;
+            # that untrusted data can only remove authority, never grant it.
+            'delegations.py': 5,
             # kittrial-5bb.454 r2: a comment's record, a journal entry and the comment-write receipt.
             # endpoint.py's seventeenth is the same action's request body. r6: the time a comment no journal
             # honours states, which is text nobody has validated.
