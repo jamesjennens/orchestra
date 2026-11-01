@@ -2702,6 +2702,9 @@ BLOCK_CAPABILITIES = {
            'update': CAP_TASKS,            # tasks.update, tasks.claim
            'comments': CAP_TASKS},         # tasks.comment; raw reserved guards still apply
     'checkpoint': CAP_CHECKPOINTS,         # checkpoints.add
+    # A history read under the caller's own actor (the HTTP `since_my_checkpoint`, which
+    # the canonical command resolves from that actor): read-only, like the route's CAP_READ.
+    'history': CAP_READ,
     'task-assign': CAP_COORDINATE,         # dedicated assignee-only guarded operation
     'task-release': CAP_TASKS,             # releasing your OWN claim (kittrial-5bb.301)
     'assignment-roster': CAP_COORDINATE,   # project-scoped existing assignment targets

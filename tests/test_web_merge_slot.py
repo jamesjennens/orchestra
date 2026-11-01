@@ -66,6 +66,55 @@ class BoundaryTests(unittest.TestCase):
             with self.subTest(operation=operation), self.assertRaises(web_merge_slot.SlotError):
                 web_merge_slot.validate(body)
 
+    def test_the_slot_row_read_is_the_one_bd_answered_for_not_the_folder_name(self):
+        # kittrial-5bb.463: a project restored under a new name keeps its source's prefix, so
+        # bd's slot is `src-merge-slot` while the folder is `dst`.
+        def native(slot_id, check_id='keep'):
+            check = {'available': True, 'holder': None, 'waiters': None}
+            if check_id == 'keep':
+                check['id'] = slot_id
+            elif check_id is not None:
+                check['id'] = check_id
+            shown = []
+            def run(argv):
+                if argv[:2] == ['merge-slot', 'check']:
+                    return json.dumps(check)
+                if argv[0] == 'show':
+                    shown.append(argv[1])
+                    if argv[1] != slot_id:
+                        raise ValueError('no issue found matching ' + argv[1])
+                    return json.dumps([{'id': slot_id, 'status': 'open', 'labels': ['gt:slot'], 'assignee': None}])
+                raise AssertionError(argv)
+            return run, shown
+        project = str(Path('absent-root') / 'projects' / 'dst')
+        run, shown = native('src-merge-slot')
+        read = web_merge_slot.snapshot(run, project)
+        self.assertEqual((read['available'], read['holder'], read['missing'], read['damaged']), (True, None, False, False))
+        self.assertEqual(shown, ['src-merge-slot'])
+        # A project whose prefix is its name reads as before.
+        run, shown = native('dst-merge-slot')
+        self.assertTrue(web_merge_slot.snapshot(run, project)['available']);self.assertEqual(shown, ['dst-merge-slot'])
+        # An answer with no id keeps the folder name, as before this change.
+        run, shown = native('dst-merge-slot', check_id=None)
+        self.assertTrue(web_merge_slot.snapshot(run, project)['available']);self.assertEqual(shown, ['dst-merge-slot'])
+        # ...unvalidated, as before (r2): the stand-ins of tests/test_web_lifecycle*.py answer without an id for
+        # a project folder `p`, whose `p-merge-slot` is no shape bd gives, and that read must not change.
+        run, shown = native('p-merge-slot', check_id=None)
+        self.assertTrue(web_merge_slot.snapshot(run, str(Path('absent-root') / 'projects' / 'p'))['available'])
+        self.assertEqual(shown, ['p-merge-slot'])
+        # An id that is not a slot id is refused before any row is read.
+        for bad in ('pp-1', '../x-merge-slot', 'dst-merge-slot\n', 7, None):
+            run, shown = native('dst-merge-slot', check_id=bad)
+            if bad is None:
+                run, shown = native('dst-merge-slot')
+                def run(argv, inner=run):
+                    return json.dumps({'available': True, 'holder': None, 'waiters': None, 'id': None}) \
+                        if argv[:2] == ['merge-slot', 'check'] else inner(argv)
+            with self.subTest(id=bad), self.assertRaises(web_merge_slot.SlotError) as raised:
+                web_merge_slot.snapshot(run, project)
+            self.assertEqual(raised.exception.status, 503)
+            self.assertEqual(shown, [])
+
     def test_slot_operations_share_the_endpoint_capability_table(self):
         cases = {
             'coordinate': {'merge-check': http_authority.CAP_READ,

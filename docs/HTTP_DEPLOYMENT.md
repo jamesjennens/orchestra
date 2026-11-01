@@ -2011,10 +2011,24 @@ previous page did not return, at any page size).
 - **`since_checkpoint=true`** selects the entries the task's newest valid checkpoint
   did not incorporate (the client's `history --since-checkpoint`), in either order. The
   answer then also names the checkpoint: `since_checkpoint`, `checkpoint_author`,
-  `checkpoint_timestamp`, `checkpoint_coverage` and `unverified_entries`. A legacy
-  record (no per-entry digests) reports `timestamp`: the released timestamp rule selects
-  the entries, so a backdated arrival or an older edit can be missed. A checkpoint by
-  the caller only (`since_my_checkpoint`) is not offered here (kittrial-5bb.354).
+  `checkpoint_timestamp`, `checkpoint_coverage`, `unverified_entries` and
+  `checkpoint_note`. A legacy record (no per-entry digests) reports `timestamp`: the
+  released timestamp rule selects the entries, so a backdated arrival or an older edit
+  can be missed.
+- **`kind=comment|event`** is the client's `history --kind`, and combines with either
+  direction and with either checkpoint selector.
+- **`since_my_checkpoint=true`** is the client's `--since-my-checkpoint`: the baseline is
+  the caller's own newest valid checkpoint, not the newest one by anyone. It needs the
+  caller's canonical actor, so it runs under the same `CAP_READ` gate and the same
+  refusals as the rest of this read, and the answer's `checkpoint_note` says "your newest
+  valid checkpoint" (or says plainly that the caller has none and the whole history was
+  returned).
+- **`latest_checkpoint=true`** answers the newest checkpoint's keys
+  (`since_checkpoint`, `checkpoint_author`, `checkpoint_timestamp`,
+  `checkpoint_coverage`, `unverified_entries`, `checkpoint_note`) with `items: []`,
+  `total: 0`, `latest_checkpoint: true` and no entries. It takes no other selector;
+  giving `recent`, `limit`, `cursor`, `kind`, `since_checkpoint=true` or
+  `since_my_checkpoint=true` with it is refused.
 - **The cursor** is bound to the caller, the project (and task) and the query, and is
   signed with a per-installation HMAC key (`cursor_key`) kept in the service's state file
   (`http-state.json`, or the `--state` path). When an upgraded installation loads a state
@@ -2034,7 +2048,8 @@ previous page did not return, at any page size).
   compact binding digest and packs the canonical history token without repeating route
   identifiers, staying well under the 512-character `MAX_CURSOR` limit even for the
   longest valid project and task IDs (kittrial-5bb.368).
-- **Every answer** says `order` (`oldest-first` or `newest-first`) and `truncated`.
+- **Every answer** says `order` (`oldest-first` or `newest-first`; `null` for the
+  `latest_checkpoint=true` read, which has no entries) and `truncated`.
   `truncated` is true, with one sentence in `truncated_note`, when entries exist that the
   answer neither returned nor can continue to. That is the in-process backend
   (`--backend inprocess`), which has no continuation cursor, past its first page.
@@ -2442,6 +2457,10 @@ credential approved anything; this is the one place where that is lifted.
     the assignee, the mode, and who set it (or `default`) and when.
   - If the caller's summary leaves no room for that sentence within the 1200-character bound,
     the route answers `422` and says how many characters to cut. Nothing is written.
+  - The web route refuses a caller-written basis sentence on `approve` or `recommend` with `422`
+    (after NFKC, casefold, Unicode format-character removal, whitespace collapse and
+    punctuation/bracket stripping; lookalike letters remain), while the host route does not, so
+    the audit entry stays the authority.
 - It is read from the present state on every request, by the web service and again when
   the endpoint authorizes the write. Each of these ends it at the agent's next request:
   the grant is removed; the account is made a contributor or a viewer; the account is
@@ -3591,7 +3610,13 @@ line separately and unconfined.
   was delivered), the caller's own claimed tasks and then other claimed tasks where the
   caller approves (blocked when the latest checkpoint lists unresolved items). Rows past
   the bound still say "read the task brief" and "wait time unknown" and are not marked
-  blocked. My work rows show "Blocked" and the open request ids where known.
+  blocked. My work rows show "Blocked" when the latest checkpoint lists unresolved
+  items, "Blocked?" when an explicit blocking count could not be read
+  (`blocking_unknown`; a null count is not "not blocked"), and the open request ids
+  where known. An agent whose work read failed or was incomplete stays in the
+  "Your agents need you" panel: the `error` and `unknown` states are never shown as
+  idle, and the defensive `not-computed` state reads as unknown, not as
+  "Could take more work".
 - **A per-agent limit on claimed, undelivered tasks.** Each personal agent carries
   `claim_limit` on its record: a whole number from 1 to 50, default 1, editable by the
   agent's owner on My agents and with `PATCH /v1/agents/{id}` (`422` outside the bounds,
@@ -3698,10 +3723,14 @@ line separately and unconfined.
   single-agent route, an incomplete snapshot falls back to paged owner-filtered
   work so tasks beyond the project snapshot bound are recovered. When the first
   page's total exceeds the 1,000-row bound, stop once there are enough claimable
-  suggestions to fill the 30-action list. If the first page fills them, 250 own
-  tasks need three owner pages, four work commands in total. A first page filled
-  by other people's review states continues paging for claimable suggestions,
-  up to ten pages (1,000 rows). Owner-filtered recovery also stops at 1,000 rows;
+  suggestions to fill the 50-action list (`AGENT_ACTION_LIMIT`). If the first page
+  fills them, 250 own tasks need three owner pages, four work commands in total. A
+  first page filled by other people's review states continues paging for claimable
+  suggestions, up to ten pages (1,000 rows). When those ten pages still hold fewer
+  than 50 claimable suggestions the snapshot stays incomplete, and the single-agent
+  route adds up to ten owner-filtered pages to recover its own tasks: at most
+  twenty `work` commands in all (250 own tasks after ten unfiltered pages cost
+  thirteen). Owner-filtered recovery also stops at 1,000 rows;
   its counts are lower bounds when more remain. Owner lists reuse the bounded
   unfiltered snapshot and can under-count own tasks beyond it. In-process projects cost one
   snapshot read. `snapshot_truncated` marks incomplete project suggestions/counts;
@@ -3709,7 +3738,10 @@ line separately and unconfined.
   suggestion or action cap. `truncated` is their combined signal. Counts over an
   incomplete source are lower bounds, not project totals: summaries say "at least N".
   An incomplete read with no observed own work says `unknown`, never `idle`;
-  observed claimable actions are still offered. A failed work read of a still-authorized
+  observed claimable actions are still offered. A view that was never computed is
+  the separate state `not-computed`, so the two meanings (`unknown` = an incomplete
+  read with lower bounds; `not-computed` = no read at all) cannot be confused.
+  A failed work read of a still-authorized
   project says `error`, increments `read_errors`, and marks snapshot and own counts
   incomplete. Successful projects retain their actions. Projects the principal can
   no longer read are excluded. Nothing is cached across requests

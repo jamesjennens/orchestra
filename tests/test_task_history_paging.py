@@ -596,5 +596,187 @@ class InProcessRecentCase(service_harness.ServerHarness):
         self.assertIn('2 of 12 entries are not in this answer', page['truncated_note'])
 
 
+@only_own_tests
+class HistorySelectorsCase(fixes.CanonicalEndpointCase):
+    """The history selectors beyond recent/since_checkpoint (kittrial-5bb.244).
+
+    ``kind`` selects comment/event, ``since_my_checkpoint`` reads from the caller's own
+    newest checkpoint (and says so, or says it has none), and ``latest_checkpoint``
+    answers the checkpoint keys with no entries. Every selector is bound to the cursor
+    and every malformed or conflicting spelling is refused.
+    """
+
+    def a_task(self, key):
+        alex, project = self._setup_project()
+        created = self.create_task(alex, project, 'a task with history selectors', key=key)
+        self.assertEqual(201, created.status, created.data)
+        return alex, project, created.data['id']
+
+    def read(self, token, project, task, query, cursor=None, status=200):
+        path = '/v1/projects/%s/tasks/%s/history?%s' % (project, task, query)
+        if cursor:
+            path += '&cursor=' + cursor
+        response = self.request('GET', path, token=token)
+        self.assertEqual(status, response.status, response.data)
+        return response.data
+
+    def seed_comments(self, task, texts, start=1, stamp='2026-02-01T%02d:%02d:%02dZ'):
+        state_path = self.canonical_root / 'canonical.json'
+        state = json.loads(state_path.read_text(encoding='utf-8'))
+        row = next(row for row in state['rows'] if row['id'] == task)
+        row.setdefault('comments', [])
+        for offset, text in enumerate(texts):
+            n = start + offset
+            row['comments'].append({'id': 'seeded-%d' % n, 'author': 'alex', 'text': text,
+                                    'created_at': stamp % (n // 60, n % 60, 1)})
+        state_path.write_text(json.dumps(state), encoding='utf-8')
+
+    def seed_event(self, task, event_id, text='state changed'):
+        state_path = self.canonical_root / 'canonical.json'
+        state = json.loads(state_path.read_text(encoding='utf-8'))
+        state['rows'].append({
+            'id': event_id, 'title': 'an event', 'description': text, 'issue_type': 'event',
+            'status': 'closed', 'created_at': '2026-02-01T00:00:00Z', 'created_by': 'alex',
+            'comments': [],
+            'dependencies': [{'issue_id': event_id, 'depends_on_id': task,
+                              'type': 'parent-child'}]})
+        state_path.write_text(json.dumps(state), encoding='utf-8')
+
+    def checkpoint(self, token, project, task):
+        claimed = self.request('POST', '/v1/projects/%s/tasks/%s/claim' % (project, task), {}, token=token)
+        self.assertEqual(200, claimed.status, claimed.data)
+        cursor = self.read(token, project, task, 'limit=1')['activity_cursor']
+        response = self.request(
+            'POST', '/v1/projects/%s/tasks/%s/checkpoints' % (project, task),
+            {'schema_version': 1, 'previous': None, 'activity_cursor': cursor,
+             'source_commit': fixes.COMMIT, 'branch': 'contrib/test',
+             'intent': 'a baseline', 'acceptance': 'a baseline',
+             'summary': 'the baseline', 'next_action': 'read what came after',
+             'open_items': [], 'resolved': []}, token=token)
+        self.assertEqual(201, response.status, response.data)
+        # The read names the baseline it just wrote, whatever the write receipt's shape.
+        baseline = self.read(token, project, task, 'since_checkpoint=true&limit=1')['since_checkpoint']
+        self.assertTrue(baseline, response.data)
+        return baseline
+
+    def test_kind_selects_comments_or_events_and_every_bad_spelling_is_refused(self):
+        alex, project, task = self.a_task('history-kind-0001')
+        self.seed_comments(task, ['first', 'second', 'third'])
+        self.seed_event(task, 'kittrial-5bb.9001')
+        whole = self.read(alex, project, task, 'limit=50')
+        self.assertEqual(4, whole['total'])
+        comments = self.read(alex, project, task, 'kind=comment&limit=50')
+        events = self.read(alex, project, task, 'kind=event&limit=50')
+        self.assertEqual([e['kind'] for e in comments['items']], ['comment'] * 3)
+        self.assertEqual([e['kind'] for e in events['items']], ['event'])
+        # A plain answer carries the ten additive keys too, null/0.
+        for key in ('order', 'kind', 'since_checkpoint', 'checkpoint_author',
+                    'checkpoint_timestamp', 'checkpoint_coverage', 'unverified_entries',
+                    'checkpoint_note'):
+            self.assertIn(key, whole)
+        self.assertIsNone(whole['checkpoint_note'])
+        self.assertEqual(0, whole['unverified_entries'])
+        # The cursor is bound to the kind filter.
+        first = self.read(alex, project, task, 'kind=comment&recent=2')
+        self.assertTrue(first['next_cursor'])
+        self.read(alex, project, task, 'kind=event&recent=2', first['next_cursor'], status=409)
+        for query, said in (('kind=', 'kind must not be blank'),
+                            ('kind', 'kind must not be blank'),
+                            ('kind=bogus', 'kind must be comment or event'),
+                            ('kind=comment&kind=event', 'Use kind only once')):
+            with self.subTest(query=query):
+                response = self.request(
+                    'GET', '/v1/projects/%s/tasks/%s/history?%s' % (project, task, query), token=alex)
+                self.assertGreaterEqual(response.status, 400, response.data)
+                self.assertIn(said, json.dumps(response.data))
+
+    def test_since_my_checkpoint_names_the_readers_own_baseline(self):
+        alex, project, task = self.a_task('history-my-checkpoint-0001')
+        self.seed_comments(task, ['before %d' % n for n in range(3)],
+                           stamp='2025-06-01T%02d:%02d:%02dZ')
+        checkpoint = self.checkpoint(alex, project, task)
+        self.assertTrue(checkpoint)
+        self.seed_comments(task, ['after %d' % n for n in range(3)], start=100,
+                           stamp='2099-01-01T%02d:%02d:%02dZ')
+        mine = self.read(alex, project, task, 'since_my_checkpoint=true&limit=50')
+        self.assertEqual(checkpoint, mine['since_checkpoint'])
+        self.assertTrue(mine['checkpoint_note'].startswith('your newest valid checkpoint:'))
+        bodies = [e['body'] for e in mine['items']]
+        self.assertFalse([b for b in bodies if b.startswith('before ')], bodies)
+        self.assertEqual(['after 0', 'after 1', 'after 2'], [b for b in bodies if b.startswith('after ')])
+        anyone = self.read(alex, project, task, 'since_checkpoint=true&limit=50')
+        self.assertTrue(anyone['checkpoint_note'].startswith('newest valid checkpoint, by anyone:'))
+        # Another project member with no checkpoint of its own gets a note, not silence,
+        # and the whole history (G4).
+        admin = self.admin_token()
+        blair_id = self.create_account(admin, 'blair', 'blair-password-1')
+        self.assertEqual(200, self.request(
+            'PUT', '/v1/projects/%s/members/%s' % (project, blair_id),
+            {'role': 'contributor'}, token=alex).status)
+        blair = self.login('blair', 'blair-password-1')[0]
+        blair_mine = self.read(blair, project, task, 'since_my_checkpoint=true&limit=2')
+        self.assertIsNone(blair_mine['since_checkpoint'])
+        self.assertIn('no checkpoint of your own', blair_mine['checkpoint_note'])
+        self.assertGreater(blair_mine['total'], 2)
+        # The selector travels with the cursor: the continuation still says it has none.
+        continued = self.read(blair, project, task, 'since_my_checkpoint=true&limit=2',
+                              blair_mine['next_cursor'])
+        self.assertIn('no checkpoint of your own', continued['checkpoint_note'])
+        blair_anyone = self.read(blair, project, task, 'since_checkpoint=true&limit=50')
+        self.assertEqual(checkpoint, blair_anyone['since_checkpoint'])
+        self.assertTrue(blair_anyone['checkpoint_note'].startswith('newest valid checkpoint, by anyone:'))
+        # false is the released default, not a selector.
+        plain = self.read(alex, project, task, 'since_my_checkpoint=false&limit=5')
+        self.assertIsNone(plain['checkpoint_note'])
+        self.assertIsNone(plain['since_checkpoint'])
+
+    def test_latest_checkpoint_reads_the_keys_with_no_entries(self):
+        alex, project, task = self.a_task('history-latest-checkpoint-0001')
+        self.seed_comments(task, ['before'])
+        checkpoint = self.checkpoint(alex, project, task)
+        self.seed_comments(task, ['after'], start=100, stamp='2099-01-01T%02d:%02d:%02dZ')
+        latest = self.read(alex, project, task, 'latest_checkpoint=true')
+        self.assertEqual([], latest['items'])
+        self.assertEqual(0, latest['total'])
+        self.assertTrue(latest['latest_checkpoint'])
+        self.assertIsNone(latest['order'])
+        self.assertEqual(checkpoint, latest['since_checkpoint'])
+        self.assertIn('newest valid checkpoint, by anyone:', latest['checkpoint_note'])
+        self.assertTrue(latest['checkpoint_note'].startswith(
+            'newest valid checkpoint, by anyone: ' + checkpoint + ' by '))
+        self.assertEqual(0, latest['unverified_entries'])
+        # It takes no other selector, and its booleans admit only true/false.
+        for query in ('latest_checkpoint=true&recent=2', 'latest_checkpoint=true&limit=2',
+                      'latest_checkpoint=true&kind=comment', 'latest_checkpoint=true&since_checkpoint=true',
+                      'latest_checkpoint=true&since_my_checkpoint=true', 'latest_checkpoint=yes',
+                      'latest_checkpoint=true&latest_checkpoint=true',
+                      'since_my_checkpoint=yes', 'since_my_checkpoint='):
+            with self.subTest(query=query):
+                response = self.request(
+                    'GET', '/v1/projects/%s/tasks/%s/history?%s' % (project, task, query), token=alex)
+                self.assertGreaterEqual(response.status, 400, response.data)
+        # The same read under the CAP_READ gate: a stranger cannot use any new spelling.
+        admin = self.admin_token()
+        self.create_account(admin, 'charlie', 'charlie-password-1')
+        charlie = self.login('charlie', 'charlie-password-1')[0]
+        for query in ('kind=comment', 'since_my_checkpoint=true', 'latest_checkpoint=true'):
+            with self.subTest(query=query):
+                response = self.request(
+                    'GET', '/v1/projects/%s/tasks/%s/history?%s' % (project, task, query), token=charlie)
+                self.assertGreaterEqual(response.status, 400, response.data)
+
+    def test_latest_checkpoint_without_any_checkpoint_says_so(self):
+        alex, project, task = self.a_task('history-latest-none-0001')
+        self.seed_comments(task, ['only'])
+        latest = self.read(alex, project, task, 'latest_checkpoint=true')
+        self.assertEqual([], latest['items'])
+        self.assertIsNone(latest['since_checkpoint'])
+        self.assertIsNone(latest['checkpoint_note'])
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
 if __name__ == '__main__':
     unittest.main()
