@@ -2204,8 +2204,9 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertEqual(first['Kestrel']['line'], 'May: read.')
         self.assertNotIn('These scopes are inferred', first['Kestrel']['panelText'])
         self.assertNotIn('These scopes are inferred', first['Lone']['panelText'])
-        self.assertEqual(first['Kestrel']['boxes'], {'read': [True, True], 'tasks': [False, False], 'checkpoints': [False, False],
-                                                     'reviews': [False, False], 'feedback': [False, False], 'proposals': [False, False]})
+        self.assertEqual(first['Kestrel']['boxes'], {'read': [True, True], 'tasks': [False, False], 'records': [False, False],
+                                                     'checkpoints': [False, False], 'reviews': [False, False], 'feedback': [False, False],
+                                                     'proposals': [False, False]})
         self.assertEqual([(row['working'], row['differs'], row['buttons'], 'Expired' in row['text']) for row in first['Kestrel']['rows']],
                          [('false', 'false', [], True), ('true', 'false', ['Extend existing credential', 'Revoke'], False)])
         self.assertEqual((first['Wren']['scopes'], first['Wren']['source'], first['Wren']['differ'], first['Wren']['summary']),
@@ -2243,7 +2244,8 @@ class AgentsPageTests(RenewalScopeTests):
         self.assertIn('1 working credential allows something else than that.', seen['afterWiden']['line'])
         # 6. A superuser: what the agent does not have cannot be ticked, and is not sent when it is.
         self.assertEqual({name: disabled for name, (_, disabled) in seen['admin']['boxes'].items()},
-                         {'read': True, 'tasks': False, 'checkpoints': True, 'reviews': True, 'feedback': True, 'proposals': True})
+                         {'read': True, 'tasks': False, 'records': True, 'checkpoints': True, 'reviews': True, 'feedback': True,
+                          'proposals': True})
         self.assertEqual(seen['afterNarrow']['scopes'], 'read')
         self.assertEqual(seen['adminUnknown'], {'boxes': {}, 'ownerChoice': 1, 'save': False})
         self.assertEqual(seen['adminInferredSetup'], {'needed': 1, 'issue': False})
