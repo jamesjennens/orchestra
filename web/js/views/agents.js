@@ -85,7 +85,7 @@ function manages(ctx, raw) {
 export const CLAIM_LIMIT_MIN = 1;
 export const CLAIM_LIMIT_MAX = 50;
 
-export const SCOPES = [['read', 'Read (every agent can read)'], ['tasks', 'Claim and change tasks'], ['checkpoints', 'Write checkpoints'],
+export const SCOPES = [['read', 'Read (every agent can read)'], ['tasks', 'Claim and change tasks'], ['records', 'File and change records'], ['checkpoints', 'Write checkpoints'],
   ['reviews', 'Deliver and review (needed to deliver at all)'], ['feedback', 'Send feedback'], ['proposals', 'Propose requirements']];
 const scopeNames = (scopes) => (Array.isArray(scopes) && scopes.length ? scopes.join(', ') : 'nothing beyond reading');
 const sameScopes = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((s) => b.includes(s));

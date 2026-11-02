@@ -683,3 +683,32 @@ client.getresponse()
         raw = json.dumps(events)
         for private in ['PRIVATE LABEL', reply.data['credential']['secret'], 'token_hash', 'working_directory']:
             self.assertNotIn(private, raw)
+
+
+class AgentScopePinTests(unittest.TestCase):
+    """The My agents scope list offers exactly the server's credential scopes (kittrial-5bb.505).
+
+    A scope the server can grant but the form does not offer is unusable by its owner; one the
+    form offers that the server lacks is refused on save. The nudge carrier is never a form choice.
+    """
+
+    def web_scopes(self):
+        from test_http_web import run_node_module
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node is not installed; the My agents scope list is not read')
+        root = test_http_agents.ROOT
+        done = run_node_module(self, node, 'const m = await import(process.argv[1]); '
+                               'console.log(JSON.stringify(m.SCOPES));',
+                               (root / 'web/js/views/agents.js').as_uri())
+        self.assertEqual(0, done.returncode, done.stderr[-3000:])
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_the_form_offers_every_server_scope_except_nudges(self):
+        import http_authority
+        offered = self.web_scopes()
+        names = [scope for scope, _ in offered]
+        self.assertEqual(len(names), len(set(names)))
+        expected = set(http_authority.SCOPE_CAPABILITIES) - {http_authority.NUDGES_SCOPE}
+        self.assertEqual(expected, set(names))
+        self.assertIn(['records', 'File and change records'], [list(item) for item in offered])
